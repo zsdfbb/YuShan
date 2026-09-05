@@ -45,7 +45,7 @@ graph TD
 4. append 助手消息（**cancel 于调用期间置位时，响应仍照常 append**——不丢数据），usage 按值累加
 5. 无 ToolCall → ●`RunFinished{Completed}`，`Ok(RunResult{final_message: Some})`
 6. 有 ToolCall：v0 逐个串行——●`ToolCall` → registry 查名 → miss 则合成 `is_error` 结果（ADR-0001）/ 命中则 `tool.call(args, ToolContext{cancel})` → ●`ToolResult` → 全部完成后 append 单条按源顺序的 tool-result 消息 → 轮数 +1 → 回 3
-7. `Err(ToolError)` → **先 append 合成 `is_error` 结果（协议配对，见 ADR-0004 第 6 条）→ ●`RunFailed` → `Err(LoopError::Tool)`**；`ModelError` → ●`RunFailed` → `Err(LoopError::Model)`
+7. `Err(ToolError)` → **先 append 协议配对消息（见 ADR-0004 第 6 条）：该助手消息中的每个 tool_use 都必须得到结果——已执行的用真实结果，失败与未执行的用合成 `is_error` 结果 → ●`RunFailed` → `Err(LoopError::Tool)`**；`ModelError` → ●`RunFailed` → `Err(LoopError::Model)`
 8. 触顶（下一轮边界）→ ●`RunFinished{MaxRounds}`，`final_message: None`
 
 **终局不变式**：每个 run 恰好一个终局事件（`RunFinished` 或 `RunFailed`）；错误路径先 emit 终局事件再返回 Err；若终局事件自身发送失败，只返回 Err（不重试）。
@@ -126,6 +126,16 @@ impl Agent {
 }
 pub struct AgentBuilder;   // build() -> Result<Agent, BuildError>：重复工具名、缺组件在组装期报错
 ```
+
+### 实现注记（review 后补充）
+
+- `EventError` 定于 **agent-core**：`EventSink`（agent-event）与 `ModelEventSink`（agent-model）共用，避免 model→event 依赖
+- `ModelError` 需含 `Sink(EventError)` 变体：模型经 Forwarder 写 sink 失败时的错误通道
+- `RuntimeContext` 与 `ToolContext` 标记 `#[non_exhaustive]` 后**不可跨 crate 字面构造**：各自提供 `new(...)` 伴生构造器
+- `max_rounds` 语义 = 单回合模型调用次数上限；触顶检查发生在下一轮模型调用之前
+- `Agent` 单实例同时只允许一个 run（`run_turn(&mut self)`，组件独占借用）；多 run 并发留待 v2 评估
+- 同步 emit 在 async 上下文中执行，**慢 sink 会阻塞执行器线程**：v0 仅 Noop/Collecting sink；v2 起慢 sink 一律走 channel 适配器
+- 测试矩阵追加（design.md §12 BasicLoop 行）：增量事件拼接结果 == 最终消息文本
 
 ## 候选方案对比
 

@@ -1,0 +1,20 @@
+[package]
+name = "agent-model-openai-compatible"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core = { path = "../../crates/agent-core" }
+agent-model = { path = "../../crates/agent-model" }
+agent-event = { path = "../../crates/agent-event" }
+agent-tool = { path = "../../crates/agent-tool" }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["rt", "time", "io-util", "fs", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

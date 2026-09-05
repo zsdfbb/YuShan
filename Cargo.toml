@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-core",
+    "crates/agent-event",
+    "crates/agent-model",
+    "crates/agent-tool",
+    "crates/agent-session",
+    "crates/agent-component",
+    "crates/agent-loop",
+    "crates/agent-runtime",
+    "adapters/model-openai-compatible",
+    "adapters/tools-basic",
+    "apps/coding-agent",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"

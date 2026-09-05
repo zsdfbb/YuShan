@@ -1,0 +1,21 @@
+[package]
+name = "coding-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core = { path = "../../crates/agent-core" }
+agent-model = { path = "../../crates/agent-model" }
+agent-tool = { path = "../../crates/agent-tool" }
+agent-session = { path = "../../crates/agent-session" }
+agent-event = { path = "../../crates/agent-event" }
+agent-component = { path = "../../crates/agent-component" }
+agent-loop = { path = "../../crates/agent-loop" }
+agent-runtime = { path = "../../crates/agent-runtime" }
+agent-model-openai-compatible = { path = "../../adapters/model-openai-compatible" }
+agent-tools-basic = { path = "../../adapters/tools-basic" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
+serde_json = "1"
+
+[dev-dependencies]
+async-trait = "0.1"

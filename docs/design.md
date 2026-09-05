@@ -219,7 +219,7 @@ ToolError（工具无法产出可回喂的结果）   → 终止回合，返回 
 EventSink 发送失败                      → 终止回合（观察者不阻断属于后续 Hook 阶段的语义）
 ```
 
-`RunResult` 携带终止原因、累计 `Usage`、轮数和最终消息（终止于错误时为空）。错误回喂与协作式取消的决策记录见 ADR-0001 与 ADR-0002。
+`RunResult` 携带终止原因、累计 `Usage`、轮数和最终消息（仅 Completed 时为 Some）；错误路径经 `Err(LoopError)` 返回，不产生 `RunResult`。错误回喂与协作式取消的决策记录见 ADR-0001 与 ADR-0002，终局事件不变式见 ADR-0004。
 
 ## 6. Runtime Hook
 
@@ -495,7 +495,7 @@ let agent = AgentBuilder::new()
 | 模块  | 重点测试 |
 | --- | --- |
 | `agent-core` | 消息、Tool Call、事件和序列化 |
-| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数 |
+| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致 |
 | `Registry` | 注册、查找、重复名称和缺失组件 |
 | `Session` | 追加消息、保存恢复、空会话和损坏数据 |
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |

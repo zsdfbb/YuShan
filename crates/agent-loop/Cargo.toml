@@ -1,0 +1,22 @@
+[package]
+name = "agent-loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-component = { path = "../agent-component" }
+agent-model = { path = "../agent-model" }
+agent-tool = { path = "../agent-tool" }
+agent-session = { path = "../agent-session" }
+agent-event = { path = "../agent-event" }
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

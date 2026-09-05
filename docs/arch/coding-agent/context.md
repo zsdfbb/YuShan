@@ -108,9 +108,9 @@ agent-runtime (AgentBuilder + Agent)
 
 **E. CLI Binary**
 
-16. `coding-agent` 二进制入口（apps/coding-agent/）
-    - Print 模式：`coding-agent -p "task"` — 单次任务
-    - 简易 TUI：`coding-agent` — stdin/stdout 交互循环
+16. `yushan-coding-agent` 二进制入口（apps/coding-agent/）
+    - Print 模式：`yushan-coding-agent -p "task"` — 单次任务
+    - 简易 TUI：`yushan-coding-agent` — stdin/stdout 交互循环
     - 配置：环境变量或配置文件读取 `api_base`、`api_key`、`model`
 
 ### 范围外（明确不做的）
@@ -130,9 +130,9 @@ agent-runtime (AgentBuilder + Agent)
 
 ### 关键场景
 
-1. **单次编码任务**: `coding-agent -p "在 src/lib.rs 添加 hello world 函数"` → 模型读文件、写代码、执行验证
-2. **交互式开发**: `coding-agent` → 用户输入任务 → agent 执行 → 用户追加指令 → 循环
-3. **JSON 事件流**: `coding-agent --json -p "..."` → 外部程序消费事件流做 UI/日志
+1. **单次编码任务**: `yushan-coding-agent -p "在 src/lib.rs 添加 hello world 函数"` → 模型读文件、写代码、执行验证
+2. **交互式开发**: `yushan-coding-agent` → 用户输入任务 → agent 执行 → 用户追加指令 → 循环
+3. **JSON 事件流**: `yushan-coding-agent --json -p "..."` → 外部程序消费事件流做 UI/日志
 4. **文件编辑工作流**: 模型 read 文件 → 分析 → edit 精确修改 → 验证
 5. **命令执行验证**: 模型写代码 → bash `cargo test` → 根据输出修复
 

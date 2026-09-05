@@ -1,5 +1,5 @@
 [package]
-name = "coding-agent"
+name = "yushan-coding-agent"
 version.workspace = true
 edition.workspace = true
 

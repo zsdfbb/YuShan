@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse simple args
     let task = if args.len() > 2 && args[1] == "-p" {
-        // Print mode: coding-agent -p "task"
+        // Print mode: yushan-coding-agent -p "task"
         Some(args[2..].join(" "))
     } else {
         // Interactive mode

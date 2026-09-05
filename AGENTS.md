@@ -19,7 +19,7 @@ YuShan/
 │   ├── model-openai-compatible  # OpenAI 兼容 HTTP 模型后端
 │   └── tools-basic            # BashTool / ReadTool / WriteTool / EditTool
 ├── apps/                      # 产品层应用
-│   └── coding-agent           # 编码 Agent 二进制入口，组装全套组件
+│   └── yushan-coding-agent    # YuShan Coding Agent 二进制入口，组装全套组件
 ├── docs/                      # 文档
 │   ├── design.md              # 总体设计：原则、crate 划分、核心 trait、Hook/Event 边界、路线图、测试矩阵
 │   ├── CONTEXT.md             # 领域术语表

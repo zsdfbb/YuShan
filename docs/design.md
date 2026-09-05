@@ -453,10 +453,10 @@ run_finished          → 生成变更与验证摘要
 Coding Session 在通用消息之外记录工作目录、模型、Git 分支、Agent 配置和上下文压缩信息。建议提供四种入口：
 
 ```text
-coding-agent                 交互式 TUI
-coding-agent -p "task"       单次 Print 模式
-coding-agent --json          JSON 事件模式
-coding-agent --rpc           RPC 集成模式
+yushan-coding-agent                 交互式 TUI
+yushan-coding-agent -p "task"       单次 Print 模式
+yushan-coding-agent --json          JSON 事件模式
+yushan-coding-agent --rpc           RPC 集成模式
 ```
 
 第一版必须支持交互式 CLI、Print 模式和 JSON 事件模式；TUI、RPC、会话分支和上下文压缩可以后续增加。

@@ -1215,7 +1215,7 @@ fn tool_guidelines(tools: &[&str]) -> String {
 **Print 模式**：
 
 ```bash
-coding-agent -p "在 src/lib.rs 添加 hello world 函数"
+yushan-coding-agent -p "在 src/lib.rs 添加 hello world 函数"
 # 输出: 模型的最终回答（文本）
 # 退出码: 0 成功, 1 失败
 ```
@@ -1223,7 +1223,7 @@ coding-agent -p "在 src/lib.rs 添加 hello world 函数"
 **简易 TUI 模式**：
 
 ```bash
-coding-agent
+yushan-coding-agent
 # 交互式 stdin/stdout 循环
 # > 用户输入
 # 模型回答（带工具调用过程）

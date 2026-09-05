@@ -109,13 +109,22 @@ impl Command for LoginCommand {
         // Determine which provider to use
         let provider = if arg.is_empty() {
             // Interactive selection with arrow keys
+            // Mark providers that already have credentials configured
+            let current_base = ctx.config.api_base.as_deref().unwrap_or("");
+            let has_creds = ctx.config.api_key.is_some();
+
             let provider_labels: Vec<String> = providers
                 .iter()
                 .map(|p| {
-                    if p.name == "custom" {
-                        "Custom (manual URL)".to_string()
+                    let status = if has_creds && !current_base.is_empty() && p.api_base == current_base {
+                        " ✓"
                     } else {
-                        format!("{name} ({base})", name = p.name, base = p.api_base)
+                        ""
+                    };
+                    if p.name == "custom" {
+                        format!("Custom (manual URL){status}")
+                    } else {
+                        format!("{name} ({base}){status}", name = p.name, base = p.api_base)
                     }
                 })
                 .collect();
@@ -131,9 +140,9 @@ impl Command for LoginCommand {
                         .iter()
                         .position(|p| {
                             if p.name == "custom" {
-                                label.contains("Custom")
+                                label.starts_with("Custom")
                             } else {
-                                label.contains(p.name)
+                                label.starts_with(p.name)
                             }
                         })
                         .ok_or_else(|| {

@@ -10,4 +10,6 @@ pub enum LoopError {
     Tool(String),
     #[error("event error: {0}")]
     Event(#[from] EventError),
+    #[error("configuration error: {0}")]
+    ConfigError(String),
 }

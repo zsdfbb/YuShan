@@ -10,7 +10,7 @@ use agent_tool::{ApprovalHandler, ToolRegistry};
 
 pub struct Agent {
     loop_impl: Box<dyn AgentLoop>,
-    model: Box<dyn Model>,
+    model: Option<Box<dyn Model>>,
     registry: ToolRegistry,
     session: Box<dyn Session>,
     events: Box<dyn EventSink>,
@@ -26,7 +26,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         loop_impl: Box<dyn AgentLoop>,
-        model: Box<dyn Model>,
+        model: Option<Box<dyn Model>>,
         registry: ToolRegistry,
         session: Box<dyn Session>,
         events: Box<dyn EventSink>,
@@ -52,10 +52,18 @@ impl Agent {
         }
     }
 
+    /// Whether a model has been configured for this agent.
+    pub fn is_configured(&self) -> bool {
+        self.model.is_some()
+    }
+
     /// Run a single turn. Takes &mut self to ensure single concurrent run.
     pub async fn run_turn(&mut self, input: AgentInput) -> Result<RunResult, LoopError> {
+        let model = self.model.as_deref().ok_or_else(|| {
+            LoopError::ConfigError("No model configured. Use /login to configure an API provider.".into())
+        })?;
         let mut ctx = RuntimeContext::new(
-            self.model.as_ref(),
+            model,
             &self.registry,
             self.session.as_mut(),
             self.events.as_mut(),

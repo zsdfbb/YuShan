@@ -34,29 +34,16 @@
 | 并发安全 | 🟢 | TUI 单线程，无并发问题 |
 | 资源管理 | 🟡 | /login 的 stdin.read_line() 阻塞 Tokio runtime |
 
-**发现 3 个可维护性问题**：
+**发现 3 个可维护性问题**（已在设计阶段修正）：
 
-**Issue 1: Command 对 Adapter 的耦合** 🟡
-```
-builtin.rs 中的 ModelCommand 和 LoginCommand 需要：
-  use agent_model_openai_compatible::{OpenAICompatibleModel, OpenAICompatibleConfig};
-```
-这意味着加一个新适配器（如 Anthropic 原生），需要改 commands/builtin.rs。
-**影响范围**：当前可接受（单一适配器），但如果未来支持多适配器会成为问题。
+~~**Issue 1: Command 对 Adapter 的耦合**~~ ✅ 已修正
+- 修正方案：引入 `ModelFactory`（`Config.build_model()`），Command 只调用 `ctx.config.build_model()`，不 import 任何 adapter 类型
 
-建议：在 Config 中增加 `provider` 字段，或引入 model factory 函数。不阻塞 MVP。
+~~**Issue 2: CommandError 缺乏结构化**~~ ✅ 已修正
+- 修正方案：`CommandError::UserError(String)`（用户可恢复）+ `CommandError::Internal(String)`（系统错误）
 
-**Issue 2: CommandError 缺乏结构化** 🟡
-当前 `CommandError::Message(String)` 无法区分：
-- 用户可恢复错误（"No API key configured"）→ 应打印提示
-- 系统内部错误（IO 失败）→ 应记录日志
-
-建议：增加 `CommandError` 变体，如 `UserError(String)` 和 `Internal(String)`。MVP 可先用单一 Message，后续迭代。
-
-**Issue 3: /login 的 stdin 阻塞** 🟡
-`std::io::stdin().read_line()` 是同步阻塞调用，在 `#[tokio::main]` 的 runtime 上会阻塞线程。当前 TUI 本身就是同步的，所以没问题。但如果未来迁移到 crossterm/ratatui 异步 TUI，这里会成为阻塞点。
-
-建议：MVP 先用同步 stdin，记录为技术债。后续迁 async TUI 时改用 `tokio::task::spawn_blocking` 或 `async-std` 的异步 stdin。
+~~**Issue 3: /login 的 stdin 阻塞**~~ ✅ 已记录
+- 处理方案：记录为已知限制，明确演进路径（Phase 2 async TUI 时改用 spawn_blocking）
 
 ### 可理解性 — 🟢 绿
 
@@ -78,11 +65,11 @@ builtin.rs 中的 ModelCommand 和 LoginCommand 需要：
 
 ## 风险排序
 
-| # | 风险 | 影响 | 可能性 | 等级 |
-|---|------|------|--------|------|
-| 1 | /login stdin 阻塞 Tokio runtime | 低（当前同步 TUI） | 高 | 🟡 中 |
-| 2 | Command 直接依赖 adapter 类型 | 中（多适配器时需重构） | 中 | 🟡 中 |
-| 3 | CommandError 缺乏结构化 | 低（MVP 足够） | 高 | 🟡 低 |
+| # | 风险 | 影响 | 可能性 | 等级 | 状态 |
+|---|------|------|--------|------|------|
+| 1 | /login stdin 阻塞 Tokio runtime | 低 | 高 | 🟡 中 | ✅ 已记录演进路径 |
+| 2 | Command 直接依赖 adapter 类型 | 中 | 中 | 🟡 中 | ✅ 已用 ModelFactory 解耦 |
+| 3 | CommandError 缺乏结构化 | 低 | 高 | 🟡 低 | ✅ 已增加 UserError/Internal |
 | 4 | async_trait 堆分配 | 无（用户触发） | 确定 | 🟢 忽略 |
 
 ## 改进建议
@@ -113,8 +100,8 @@ builtin.rs 中的 ModelCommand 和 LoginCommand 需要：
 | 维度 | 判定 | 说明 |
 |------|------|------|
 | 可行性 | 🟢 绿 | 所有技术验证通过，无阻塞项 |
-| 可维护性 | 🟡 黄 | 3 个中等问题，均不阻塞 MVP |
+| 可维护性 | 🟢 绿 | 3 个问题已在设计阶段修正（ModelFactory 解耦、CommandError 结构化、stdin 限制记录） |
 | 可理解性 | 🟢 绿 | 模式一致，上手成本低 |
 | 性能与可靠性 | 🟢 绿 | 无性能风险，故障隔离良好 |
 
-**整体判定：🟢 可以实现**。3 个黄灯问题均为非阻塞性改进项，可在 MVP 实现后迭代优化。
+**整体判定：🟢 可以实现**。所有审查发现已在设计阶段修正。

@@ -146,10 +146,16 @@ pub enum CommandResult { Continue, Exit }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
+    /// 用户可恢复错误，打印提示即可（如 "No API key configured"）
     #[error("{0}")]
-    Message(String),
+    UserError(String),
+    /// 系统内部错误，应记录日志（如 IO 失败、序列化错误）
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 ```
+
+TUI 层区分处理：`UserError` 打印到 stderr，`Internal` 打印到 stderr 并（未来）记日志。
 
 ### Agent 新增方法（agent-runtime）
 
@@ -171,17 +177,79 @@ async fn clear(&mut self) -> Result<(), SessionError> {
 }
 ```
 
+### Config 新增 ModelFactory（coding-agent 产品层）
+
+为解耦 Command 对 adapter 类型的直接依赖，引入 model factory 模式。Config 持有工厂函数，Command 通过 `ctx.config.build_model()` 构造模型，不需要知道具体适配器类型。
+
+```rust
+// apps/coding-agent/src/config.rs
+
+use agent_model::Model;
+
+/// Model factory function type. Captures adapter-specific construction logic.
+/// Returns None if config is incomplete (missing api_base/api_key).
+type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
+
+pub struct Config {
+    pub api_base: Option<String>,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub cwd: PathBuf,
+    model_factory: Option<ModelFactory>,
+}
+
+impl Config {
+    /// Set the model factory. Called once in main.rs after adapter types are known.
+    pub fn set_model_factory(&mut self, factory: impl Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync + 'static) {
+        self.model_factory = Some(Box::new(factory));
+    }
+
+    /// Build a model from current config. Delegates to the factory.
+    pub fn build_model(&self) -> Option<Box<dyn Model>> {
+        self.model_factory.as_ref().map(|f| f(self))
+    }
+}
+```
+
+`main.rs` 中注册工厂（adapter 类型只在这里 import）：
+
+```rust
+config.set_model_factory(|cfg| {
+    let base = cfg.api_base.as_ref()?;
+    let key = cfg.api_key.as_ref()?;
+    Some(Box::new(OpenAICompatibleModel::new(OpenAICompatibleConfig {
+        api_base: base.clone(),
+        api_key: key.clone(),
+        model: cfg.model.clone(),
+        max_tokens: Some(4096),
+        temperature: Some(0.7),
+        compat: ProviderCompat::standard(),
+    })))
+});
+```
+
+Command 中使用（不 import 任何 adapter 类型）：
+
+```rust
+// 在 ModelCommand::execute() 中：
+let model = ctx.config.build_model()
+    .ok_or_else(|| CommandError::UserError("No API credentials. Use /login first.".into()))?;
+ctx.agent.set_model(Some(model));
+```
+
+这样 `commands/builtin.rs` 只依赖 `agent-model`（Model trait）和 `agent-runtime`（Agent），不依赖任何具体 adapter crate。
+
 ## 文件结构
 
 ```
 apps/coding-agent/src/
-  main.rs              — 构建 CommandRegistry，传入 tui
+  main.rs              — 构建 CommandRegistry，注册 ModelFactory，传入 tui
   tui.rs               — 检测 '/' 前缀，调用 registry.execute()
-  config.rs            — 不变
+  config.rs            — Config + ModelFactory（模型构造解耦）
   prompt.rs            — 不变
   commands/
     mod.rs             — Command trait, CommandResult, CommandError, CommandContext, CommandRegistry
-    builtin.rs         — 10 个内置命令实现
+    builtin.rs         — 10 个内置命令实现（只依赖 agent-model, agent-runtime，不依赖 adapter）
 ```
 
 ## 关键场景
@@ -193,7 +261,8 @@ apps/coding-agent/src/
   → LoginCommand.execute("deepseek", ctx)
   → 提示输入 api_key（stdin）
   → ctx.config.api_key = Some(key)
-  → ctx.agent.set_model(Some(OpenAICompatibleModel::new(...)))
+  → ctx.config.build_model() → Some(OpenAICompatibleModel)
+  → ctx.agent.set_model(Some(model))
   → 打印确认
 ```
 
@@ -202,12 +271,14 @@ apps/coding-agent/src/
 ```
 /model claude-sonnet-4
   → ModelCommand.execute("claude-sonnet-4", ctx)
-  → 检查 ctx.config.api_base 和 api_key 存在
-  → 创建 OpenAICompatibleModel
-  → ctx.agent.set_model(Some(new_model))
+  → ctx.config.model = "claude-sonnet-4"
+  → ctx.config.build_model() → Some(OpenAICompatibleModel)
+  → ctx.agent.set_model(Some(model))
   → 打印确认
   → 会话保留不变
 ```
+
+Command 不知道具体用了什么适配器，只调用 `config.build_model()`。
 
 ### /help 流程
 
@@ -223,3 +294,16 @@ apps/coding-agent/src/
 - [ ] `/copy` 是否需要跨平台剪贴板 crate（如 `arboard`）？MVP 可先用 `pbcopy`/`xclip` 命令行调用。
 - [ ] `/compact` 的完整实现依赖 session 的 compact 能力，MVP 可先做「清空 + 打印提示」。
 - [ ] Command trait 是否需要 `aliases() -> Vec<&str>` 支持别名？MVP 不需要，预留即可（加方法不破坏）。
+
+## 已知限制与演进路径
+
+### /login 的 stdin 阻塞
+
+**现状**：`/login` 交互式提示使用 `std::io::stdin().read_line()`，同步阻塞 Tokio runtime 线程。
+
+**影响**：当前 TUI 本身就是同步的（read_line → run_turn → 打印），所以无实际问题。但如果未来迁移到 crossterm/ratatui 异步 TUI，这里会阻塞 event loop。
+
+**演进路径**：
+- **MVP**：同步 stdin，无需改动
+- **Phase 2（async TUI）**：改用 `tokio::task::spawn_blocking(|| read_line())` 或 `rustyline-async`
+- 触发条件：TUI 从 stdin loop 迁移到 crossterm event loop 时

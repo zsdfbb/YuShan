@@ -14,6 +14,23 @@ pub struct Provider {
     pub default_model: &'static str,
 }
 
+/// Known model entry with provider association.
+#[derive(Debug, Clone)]
+pub struct KnownModel {
+    pub provider: &'static str,
+    pub model_id: &'static str,
+    pub display: &'static str,
+}
+
+/// All known models across providers.
+pub fn known_models() -> Vec<KnownModel> {
+    vec![
+        KnownModel { provider: "deepseek", model_id: "deepseek-chat", display: "deepseek-chat (DeepSeek V3)" },
+        KnownModel { provider: "deepseek", model_id: "deepseek-reasoner", display: "deepseek-reasoner (DeepSeek R1)" },
+        KnownModel { provider: "minimax", model_id: "MiniMax-Text-01", display: "MiniMax-Text-01" },
+    ]
+}
+
 /// Built-in provider registry.
 pub fn known_providers() -> Vec<Provider> {
     vec![

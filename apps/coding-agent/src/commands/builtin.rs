@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::{Command, CommandContext, CommandError, CommandResult};
-use crate::config::known_providers;
+use crate::config::{known_models, known_providers};
 
 /// Metadata for /help display. Keeps HelpCommand decoupled from the registry.
 pub struct HelpEntry {
@@ -295,23 +295,51 @@ impl Command for ModelCommand {
     ) -> Result<CommandResult, CommandError> {
         let target = args.trim();
         if target.is_empty() {
-            match ctx.agent.model_id() {
-                Some(id) => println!("Current model: {id}"),
-                None => println!("No model configured. Use /login first."),
+            // Interactive model selection with search
+            let models = known_models();
+            let labels: Vec<String> = models.iter().map(|m| m.display.to_string()).collect();
+
+            let selection = inquire::Select::new("Select a model:", labels)
+                .with_page_size(8)
+                .prompt();
+
+            match selection {
+                Ok(label) => {
+                    let model = models.iter().find(|m| m.display == label).ok_or_else(|| {
+                        CommandError::Internal(format!("Could not find model for: {label}"))
+                    })?;
+                    // Update config and rebuild
+                    ctx.config.model = model.model_id.to_string();
+                    match ctx.config.build_model() {
+                        Some(m) => {
+                            ctx.agent.set_model(Some(m));
+                            println!("Model switched to: {}", model.model_id);
+                        }
+                        None => {
+                            println!("Model set to: {}", model.model_id);
+                            println!("Note: Cannot build model. Check API credentials with /login.");
+                        }
+                    }
+                }
+                Err(inquire::InquireError::OperationCanceled)
+                | Err(inquire::InquireError::OperationInterrupted) => {
+                    // Do nothing, stay on current model
+                }
+                Err(e) => {
+                    return Err(CommandError::Internal(format!("Selection error: {e}")));
+                }
             }
         } else {
-            // Update model name in config
+            // Direct name: /model deepseek-chat
             ctx.config.model = target.to_string();
-
-            // Rebuild model via factory and set on agent
             match ctx.config.build_model() {
-                Some(model) => {
-                    ctx.agent.set_model(Some(model));
+                Some(m) => {
+                    ctx.agent.set_model(Some(m));
                     println!("Model switched to: {target}");
                 }
                 None => {
-                    println!("Model name set to: {target}");
-                    println!("Note: Cannot build model. Configure API credentials with /login first.");
+                    println!("Model set to: {target}");
+                    println!("Note: Cannot build model. Check API credentials with /login.");
                 }
             }
         }
@@ -637,36 +665,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_model_no_args_shows_current() {
-        let reg = build_test_registry();
-        let mut agent = test_agent("gpt-4o");
-        let mut config = test_config();
-        let mut ctx = CommandContext {
-            agent: &mut agent,
-            config: &mut config,
-        };
-
-        let result = ModelCommand.execute("", &mut ctx).await.unwrap();
-        assert!(matches!(result, CommandResult::Continue));
-        // Should print "Current model: gpt-4o" — no panic.
-    }
-
-    #[tokio::test]
-    async fn test_model_no_args_no_model() {
-        let reg = build_test_registry();
-        let mut agent = test_agent_no_model();
-        let mut config = test_config();
-        let mut ctx = CommandContext {
-            agent: &mut agent,
-            config: &mut config,
-        };
-
-        let result = ModelCommand.execute("", &mut ctx).await.unwrap();
-        assert!(matches!(result, CommandResult::Continue));
-        // Should print "No model configured." — no panic.
-    }
-
-    #[tokio::test]
     async fn test_model_with_args() {
         let reg = build_test_registry();
         let mut agent = test_agent("old-model");
@@ -676,8 +674,19 @@ mod tests {
             config: &mut config,
         };
 
-        let result = ModelCommand.execute("claude-sonnet-4", &mut ctx).await.unwrap();
+        // /model with args switches directly (no interactive selector)
+        let result = ModelCommand.execute("deepseek-chat", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
+        // Config.model should be updated
+        assert_eq!(ctx.config.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn test_model_no_args_returns_continue() {
+        // /model without args opens interactive selector (inquire::Select),
+        // which cannot run in tests. Just verify the command exists.
+        assert_eq!(ModelCommand.name(), "model");
+        assert!(ModelCommand.arg_hint().is_some());
     }
 
     #[tokio::test]

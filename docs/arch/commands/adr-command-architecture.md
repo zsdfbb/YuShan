@@ -43,6 +43,7 @@ coding-agent 需要斜杠命令系统（/login、/model、/new 等 10 个 MVP �
 
 - agent-runtime 需新增 4 个方法（set_model, clear_session, model_id, session_messages）
 - agent-session 的 MemorySession 需实现真实的 clear()
+- Config 引入 ModelFactory 解耦 adapter（coding-agent 产品层改动）
 - async_trait 堆分配（对用户触发的命令系统可忽略）
 - 框架代码 ~110 行 + 10 个命令实现 ~175 行 = 总计 ~475 行
 

@@ -86,7 +86,6 @@ impl AgentBuilder {
     }
 
     pub fn build(self) -> Result<Agent, BuildError> {
-        let model = self.model.ok_or(BuildError::MissingModel)?;
         let session = self.session.ok_or(BuildError::MissingSession)?;
         let events = self.events.ok_or(BuildError::MissingEvents)?;
 
@@ -102,7 +101,7 @@ impl AgentBuilder {
 
         Ok(Agent::new(
             loop_impl,
-            model,
+            self.model,
             registry,
             session,
             events,

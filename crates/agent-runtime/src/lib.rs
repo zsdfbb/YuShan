@@ -51,13 +51,33 @@ mod tests {
         assert_eq!(result.stop_reason, StopReason::Completed);
     }
 
-    #[test]
-    fn test_build_error_missing_model() {
-        let result = AgentBuilder::new()
+    #[tokio::test]
+    async fn test_build_without_model() {
+        // Building without model is allowed — agent can start in command-only mode
+        let agent = AgentBuilder::new()
             .session(MemorySession::new())
             .events(CollectingSink::new())
-            .build();
-        assert!(matches!(result, Err(BuildError::MissingModel)));
+            .build()
+            .unwrap();
+
+        assert!(!agent.is_configured());
+    }
+
+    #[tokio::test]
+    async fn test_run_without_model_fails() {
+        let mut agent = AgentBuilder::new()
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+
+        let result = agent.run_turn(AgentInput::text("hi")).await;
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("No model configured"),
+            "error should mention no model: {msg}"
+        );
     }
 
     #[test]
@@ -125,10 +145,12 @@ mod tests {
 
     #[test]
     fn test_builder_default() {
-        // Verify default builder can be created
-        let _builder = AgentBuilder::new();
-        // Building without required fields should fail
+        // Building without session/events should fail
         let result = AgentBuilder::new().build();
         assert!(result.is_err());
+        assert!(
+            matches!(result.err().unwrap(), BuildError::MissingSession),
+            "expected MissingSession"
+        );
     }
 }

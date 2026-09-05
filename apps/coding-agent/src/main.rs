@@ -29,22 +29,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = config.cwd.clone();
     let system_prompt = prompt::build_system_prompt(&cwd);
 
-    // Build model
-    let model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
-        api_base: config.api_base,
-        api_key: config.api_key,
-        model: config.model,
-        max_tokens: Some(4096),
-        temperature: Some(0.7),
-        compat: ProviderCompat::standard(),
-    });
+    // Build model (optional — agent can start without API credentials)
+    let model = if config.is_configured() {
+        Some(OpenAICompatibleModel::new(OpenAICompatibleConfig {
+            api_base: config.api_base.clone().unwrap(),
+            api_key: config.api_key.clone().unwrap(),
+            model: config.model.clone(),
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            compat: ProviderCompat::standard(),
+        }))
+    } else {
+        None
+    };
 
     // Build workspace for tools
     let workspace = config.cwd.clone();
 
     // Build agent
-    let mut agent = AgentBuilder::new()
-        .model(model)
+    let mut builder = AgentBuilder::new()
         .tool(ReadTool::new(workspace.clone()))
         .tool(WriteTool::new(workspace.clone()))
         .tool(EditTool::new(workspace.clone()))
@@ -53,11 +56,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .working_dir(workspace.clone(), workspace.clone())
         .approval(agent_tool::AutoApprove)
         .session(MemorySession::new())
-        .events(NoopEventSink)
-        .build()?;
+        .events(NoopEventSink);
+
+    if let Some(model) = model {
+        builder = builder.model(model);
+    }
+
+    let mut agent = builder.build()?;
 
     if let Some(task) = task {
-        // Print mode
+        // Print mode — requires model
+        if !agent.is_configured() {
+            eprintln!("Error: No model configured.");
+            eprintln!("Set environment variables:");
+            eprintln!("  YUSHAN_API_BASE  — API endpoint URL");
+            eprintln!("  YUSHAN_API_KEY   — API authentication key");
+            eprintln!("  YUSHAN_MODEL     — Model name (optional, default: deepseek-chat)");
+            eprintln!("Or run in interactive mode and use /login to configure.");
+            std::process::exit(1);
+        }
         let input = AgentInput::text(&task);
         let result = agent.run_turn(input).await?;
         if let Some(msg) = &result.final_message {
@@ -69,6 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         // Interactive mode
+        if !agent.is_configured() {
+            println!("No API credentials configured. Use /login to set up, or set environment variables:");
+            println!("  YUSHAN_API_BASE  — API endpoint URL");
+            println!("  YUSHAN_API_KEY   — API authentication key");
+            println!();
+        }
         tui::run_interactive(&mut agent).await?;
     }
 

@@ -24,7 +24,7 @@ YuShan/
 │   ├── design.md              # 总体设计：原则、crate 划分、核心 trait、Hook/Event 边界、路线图、测试矩阵
 │   ├── CONTEXT.md             # 领域术语表
 │   ├── adr/                   # 架构决策记录（工具失败双通道、协作取消、会话异步追加、v0 分层骨架）
-│   ├── arch/                  # 架构图（coding-agent、v0 最小循环）
+│   ├── arch/                  # 架构分析（coding-agent、v0 最小循环、runtime commands）
 │   ├── design-plans/          # 设计方案
 │   ├── exec-plans/            # 执行计划
 │   └── reports/               # 报告

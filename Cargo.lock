@@ -192,25 +192,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "coding-agent"
-version = "0.0.1"
-dependencies = [
- "agent-component",
- "agent-core",
- "agent-event",
- "agent-loop",
- "agent-model",
- "agent-model-openai-compatible",
- "agent-runtime",
- "agent-session",
- "agent-tool",
- "agent-tools-basic",
- "async-trait",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1700,6 +1681,25 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "yushan-coding-agent"
+version = "0.0.1"
+dependencies = [
+ "agent-component",
+ "agent-core",
+ "agent-event",
+ "agent-loop",
+ "agent-model",
+ "agent-model-openai-compatible",
+ "agent-runtime",
+ "agent-session",
+ "agent-tool",
+ "agent-tools-basic",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

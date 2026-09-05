@@ -153,4 +153,62 @@ mod tests {
             "expected MissingSession"
         );
     }
+
+    #[tokio::test]
+    async fn test_agent_model_id() {
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test-model"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+        assert_eq!(agent.model_id(), Some("test-model"));
+    }
+
+    #[test]
+    fn test_agent_model_id_none() {
+        let agent = AgentBuilder::new()
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+        assert_eq!(agent.model_id(), None);
+    }
+
+    #[tokio::test]
+    async fn test_agent_set_model() {
+        let mut agent = AgentBuilder::new()
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+        assert_eq!(agent.model_id(), None);
+
+        let model = MockModel::new("new-model");
+        agent.set_model(Some(Box::new(model)));
+        assert_eq!(agent.model_id(), Some("new-model"));
+
+        agent.set_model(None);
+        assert_eq!(agent.model_id(), None);
+    }
+
+    #[tokio::test]
+    async fn test_agent_clear_session() {
+        let model = MockModel::new("test");
+        model.push_text("hi");
+
+        let mut agent = AgentBuilder::new()
+            .model(model)
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+
+        // Run a turn to add messages to session
+        agent.run_turn(AgentInput::text("hello")).await.unwrap();
+        assert!(!agent.session_messages().is_empty());
+
+        agent.clear_session().await.unwrap();
+        assert!(agent.session_messages().is_empty());
+    }
 }

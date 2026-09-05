@@ -1,3 +1,4 @@
+mod commands;
 mod config;
 mod prompt;
 mod tui;
@@ -14,7 +15,26 @@ use agent_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let config = config::Config::from_env()?;
+    let mut config = config::Config::from_env()?;
+
+    // Register the model factory (adapter-specific construction logic)
+    config.set_model_factory(|cfg| {
+        let base = cfg.api_base.as_ref()?;
+        let key = cfg.api_key.as_ref()?;
+        Some(Box::new(OpenAICompatibleModel::new(
+            OpenAICompatibleConfig {
+                api_base: base.clone(),
+                api_key: key.clone(),
+                model: cfg.model.clone(),
+                max_tokens: Some(4096),
+                temperature: Some(0.7),
+                compat: ProviderCompat::standard(),
+            },
+        )))
+    });
+
+    // Build the command registry
+    let command_registry = commands::build_registry();
 
     // Parse simple args
     let task = if args.len() > 2 && args[1] == "-p" {
@@ -92,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  YUSHAN_API_KEY   — API authentication key");
             println!();
         }
-        tui::run_interactive(&mut agent).await?;
+        tui::run_interactive(&mut agent, &mut config, &command_registry).await?;
     }
 
     Ok(())

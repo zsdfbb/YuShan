@@ -23,16 +23,6 @@ pub fn known_providers() -> Vec<Provider> {
             default_model: "deepseek-chat",
         },
         Provider {
-            name: "openai",
-            api_base: "https://api.openai.com/v1",
-            default_model: "gpt-4o",
-        },
-        Provider {
-            name: "anthropic",
-            api_base: "https://api.anthropic.com/v1",
-            default_model: "claude-sonnet-4-20250514",
-        },
-        Provider {
             name: "minimax",
             api_base: "https://api.minimax.chat/v1",
             default_model: "MiniMax-Text-01",

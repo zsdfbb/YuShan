@@ -2,8 +2,15 @@ use agent_loop::AgentInput;
 use agent_runtime::Agent;
 use std::io::{self, Write};
 
-pub async fn run_interactive(agent: &mut Agent) -> Result<(), Box<dyn std::error::Error>> {
-    println!("YuShan Coding Agent (type 'exit' to quit)");
+use crate::commands::{CommandContext, CommandRegistry, CommandResult};
+use crate::config::Config;
+
+pub async fn run_interactive(
+    agent: &mut Agent,
+    config: &mut Config,
+    commands: &CommandRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("YuShan Coding Agent (type /help for commands, 'exit' to quit)");
     println!();
 
     loop {
@@ -21,6 +28,29 @@ pub async fn run_interactive(agent: &mut Agent) -> Result<(), Box<dyn std::error
             break;
         }
 
+        // Intercept slash commands
+        if input.starts_with('/') {
+            let result = {
+                let mut ctx = CommandContext {
+                    agent,
+                    config,
+                    commands,
+                };
+                match commands.execute(input, &mut ctx).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        CommandResult::Continue
+                    }
+                }
+            };
+            match result {
+                CommandResult::Continue => continue,
+                CommandResult::Exit => break,
+            }
+        }
+
+        // Normal agent turn
         let agent_input = AgentInput::text(input);
         match agent.run_turn(agent_input).await {
             Ok(result) => {

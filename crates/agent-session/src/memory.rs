@@ -31,4 +31,9 @@ impl Session for MemorySession {
         self.messages.push(message);
         Ok(())
     }
+
+    async fn clear(&mut self) -> Result<(), SessionError> {
+        self.messages.clear();
+        Ok(())
+    }
 }

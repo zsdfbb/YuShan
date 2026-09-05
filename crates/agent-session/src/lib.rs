@@ -98,4 +98,31 @@ mod tests {
             .await;
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_memory_session_clear() {
+        let mut session = MemorySession::new();
+        session
+            .append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        session
+            .append(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "world".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.messages().len(), 2);
+
+        session.clear().await.unwrap();
+        assert!(session.messages().is_empty());
+    }
 }

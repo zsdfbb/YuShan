@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use agent_component::{RunLimits, RuntimeContext};
-use agent_core::CancelToken;
+use agent_core::{CancelToken, Message};
 use agent_event::EventSink;
 use agent_loop::{AgentInput, AgentLoop, LoopError, RunResult};
 use agent_model::Model;
@@ -75,5 +75,25 @@ impl Agent {
             self.system_prompt.clone(),
         );
         self.loop_impl.run_turn(input, &mut ctx).await
+    }
+
+    /// Get the model identifier, if configured.
+    pub fn model_id(&self) -> Option<&str> {
+        self.model.as_deref().map(|m| m.model_id())
+    }
+
+    /// Replace the model. Pass None to remove (e.g., /logout).
+    pub fn set_model(&mut self, model: Option<Box<dyn Model>>) {
+        self.model = model;
+    }
+
+    /// Clear all messages from the session.
+    pub async fn clear_session(&mut self) -> Result<(), agent_session::SessionError> {
+        self.session.clear().await
+    }
+
+    /// Read all session messages.
+    pub fn session_messages(&self) -> &[Message] {
+        self.session.messages()
     }
 }

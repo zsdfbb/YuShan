@@ -1699,6 +1699,7 @@ dependencies = [
  "agent-tools-basic",
  "async-trait",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 

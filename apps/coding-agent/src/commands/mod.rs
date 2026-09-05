@@ -36,8 +36,7 @@ pub trait Command: Send + Sync {
 /// The mutable world a command can touch during execution.
 pub struct CommandContext<'a> {
     pub agent: &'a mut Agent,
-    pub config: &'a Config,
-    pub commands: &'a CommandRegistry,
+    pub config: &'a mut Config,
 }
 
 /// What the TUI loop should do after a command finishes.
@@ -226,11 +225,10 @@ mod tests {
             .events(agent_event::CollectingSink::new())
             .build()
             .unwrap();
-        let config = Config::from_env().unwrap();
+        let mut config = Config::from_env().unwrap();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
         let result = reg.execute("/nonexistent", &mut ctx).await;
         assert!(result.is_err());

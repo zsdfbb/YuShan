@@ -6,6 +6,45 @@ use agent_model::Model;
 /// Returns None if config is incomplete (missing api_base/api_key).
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
 
+/// Known API provider with preset configuration.
+#[derive(Debug, Clone)]
+pub struct Provider {
+    pub name: &'static str,
+    pub api_base: &'static str,
+    pub default_model: &'static str,
+}
+
+/// Built-in provider registry.
+pub fn known_providers() -> Vec<Provider> {
+    vec![
+        Provider {
+            name: "deepseek",
+            api_base: "https://api.deepseek.com",
+            default_model: "deepseek-chat",
+        },
+        Provider {
+            name: "openai",
+            api_base: "https://api.openai.com/v1",
+            default_model: "gpt-4o",
+        },
+        Provider {
+            name: "anthropic",
+            api_base: "https://api.anthropic.com/v1",
+            default_model: "claude-sonnet-4-20250514",
+        },
+        Provider {
+            name: "minimax",
+            api_base: "https://api.minimax.chat/v1",
+            default_model: "MiniMax-Text-01",
+        },
+        Provider {
+            name: "custom",
+            api_base: "",
+            default_model: "",
+        },
+    ]
+}
+
 pub struct Config {
     pub api_base: Option<String>,
     pub api_key: Option<String>,

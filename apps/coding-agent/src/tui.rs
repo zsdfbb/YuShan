@@ -34,7 +34,6 @@ pub async fn run_interactive(
                 let mut ctx = CommandContext {
                     agent,
                     config,
-                    commands,
                 };
                 match commands.execute(input, &mut ctx).await {
                     Ok(r) => r,

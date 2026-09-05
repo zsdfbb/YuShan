@@ -3,6 +3,30 @@ use std::io::{self, Write};
 use async_trait::async_trait;
 
 use super::{Command, CommandContext, CommandError, CommandResult};
+use crate::config::known_providers;
+
+/// Metadata for /help display. Keeps HelpCommand decoupled from the registry.
+pub struct HelpEntry {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub arg_hint: Option<&'static str>,
+}
+
+/// All built-in command metadata for /help display.
+pub fn builtin_help_entries() -> Vec<HelpEntry> {
+    vec![
+        HelpEntry { name: "help", description: "Show available commands", arg_hint: Some("[command]") },
+        HelpEntry { name: "login", description: "Configure API credentials", arg_hint: Some("[provider]") },
+        HelpEntry { name: "logout", description: "Clear API credentials", arg_hint: None },
+        HelpEntry { name: "model", description: "Show or switch the current model", arg_hint: Some("[model_name]") },
+        HelpEntry { name: "new", description: "Start a new conversation", arg_hint: None },
+        HelpEntry { name: "compact", description: "Compact conversation context", arg_hint: None },
+        HelpEntry { name: "status", description: "Show current configuration", arg_hint: None },
+        HelpEntry { name: "copy", description: "Copy last response to clipboard", arg_hint: None },
+        HelpEntry { name: "export", description: "Export conversation to file", arg_hint: Some("[filename]") },
+        HelpEntry { name: "quit", description: "Exit the agent", arg_hint: None },
+    ]
+}
 
 // ---------------------------------------------------------------------------
 // HelpCommand
@@ -20,32 +44,35 @@ impl Command for HelpCommand {
         "Show available commands"
     }
 
+    fn arg_hint(&self) -> Option<&str> {
+        Some("[command]")
+    }
+
     async fn execute(
         &self,
         args: &str,
-        ctx: &mut CommandContext<'_>,
+        _ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
+        let entries = builtin_help_entries();
         let target = args.trim();
         if !target.is_empty() {
-            // Show help for a specific command
-            let cmd = ctx.commands.get(target).ok_or_else(|| {
+            let entry = entries.iter().find(|e| e.name == target).ok_or_else(|| {
                 CommandError::UserError(format!("Unknown command: /{target}"))
             })?;
-            let hint = cmd.arg_hint().unwrap_or("");
+            let hint = entry.arg_hint.unwrap_or("");
             if hint.is_empty() {
-                println!("/{} — {}", cmd.name(), cmd.description());
+                println!("/{} — {}", entry.name, entry.description);
             } else {
-                println!("/{} {} — {}", cmd.name(), hint, cmd.description());
+                println!("/{} {} — {}", entry.name, hint, entry.description);
             }
         } else {
-            // List all commands
             println!("Available commands:");
-            for cmd in ctx.commands.all() {
-                let hint = cmd.arg_hint().unwrap_or("");
+            for entry in &entries {
+                let hint = entry.arg_hint.unwrap_or("");
                 if hint.is_empty() {
-                    println!("  /{:<12} {}", cmd.name(), cmd.description());
+                    println!("  /{:<12} {}", entry.name, entry.description);
                 } else {
-                    println!("  /{:<12} {} {}", cmd.name(), hint, cmd.description());
+                    println!("  /{:<12} {} {}", entry.name, hint, entry.description);
                 }
             }
         }
@@ -78,20 +105,76 @@ impl Command for LoginCommand {
         args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        let _provider = args.trim();
+        let providers = known_providers();
+        let arg = args.trim();
 
-        // Note: In the interactive TUI, stdout is captured for display.
-        // These prints go to the raw terminal.
-        print!("API base URL: ");
-        io::stdout().flush().map_err(|e| {
-            CommandError::Internal(format!("flush failed: {e}"))
-        })?;
-        let mut api_base = String::new();
-        io::stdin().read_line(&mut api_base).map_err(|e| {
-            CommandError::Internal(format!("read_line failed: {e}"))
-        })?;
-        let api_base = api_base.trim().to_string();
+        // Determine which provider to use
+        let provider = if arg.is_empty() {
+            // Interactive selection
+            println!("Select a provider:");
+            for (i, p) in providers.iter().enumerate() {
+                if p.name == "custom" {
+                    println!("  {}.) Custom (manual URL)", i + 1);
+                } else {
+                    println!("  {}.) {} ({})", i + 1, p.name, p.api_base);
+                }
+            }
+            print!("\nEnter number [1-{}]: ", providers.len());
+            io::stdout().flush().map_err(|e| {
+                CommandError::Internal(format!("flush failed: {e}"))
+            })?;
 
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice).map_err(|e| {
+                CommandError::Internal(format!("read_line failed: {e}"))
+            })?;
+            let choice = choice.trim();
+
+            let idx: usize = choice.parse().map_err(|_| {
+                CommandError::UserError(format!(
+                    "Invalid choice: {choice}. Enter a number between 1 and {}.",
+                    providers.len()
+                ))
+            })?;
+
+            if idx < 1 || idx > providers.len() {
+                return Err(CommandError::UserError(format!(
+                    "Invalid choice: {idx}. Enter a number between 1 and {}.",
+                    providers.len()
+                )));
+            }
+            providers[idx - 1].clone()
+        } else {
+            // Match by name
+            providers.iter().find(|p| p.name == arg).cloned().ok_or_else(|| {
+                let names: Vec<&str> = providers.iter().map(|p| p.name).collect();
+                CommandError::UserError(format!(
+                    "Unknown provider: {arg}. Available: {}",
+                    names.join(", ")
+                ))
+            })?
+        };
+
+        // For custom provider, prompt for api_base
+        let api_base = if provider.api_base.is_empty() {
+            print!("API base URL: ");
+            io::stdout().flush().map_err(|e| {
+                CommandError::Internal(format!("flush failed: {e}"))
+            })?;
+            let mut base = String::new();
+            io::stdin().read_line(&mut base).map_err(|e| {
+                CommandError::Internal(format!("read_line failed: {e}"))
+            })?;
+            let base = base.trim().to_string();
+            if base.is_empty() {
+                return Err(CommandError::UserError("API base URL is required.".into()));
+            }
+            base
+        } else {
+            provider.api_base.to_string()
+        };
+
+        // Prompt for api_key
         print!("API key: ");
         io::stdout().flush().map_err(|e| {
             CommandError::Internal(format!("flush failed: {e}"))
@@ -101,28 +184,39 @@ impl Command for LoginCommand {
             CommandError::Internal(format!("read_line failed: {e}"))
         })?;
         let api_key = api_key.trim().to_string();
-
-        if api_base.is_empty() || api_key.is_empty() {
-            return Err(CommandError::UserError(
-                "API base and API key are required.".into(),
-            ));
+        if api_key.is_empty() {
+            return Err(CommandError::UserError("API key is required.".into()));
         }
 
-        // Config is passed as immutable; we cannot mutate it here.
-        // In the real TUI flow, the caller must rebuild config after login.
-        // For now, print the values so the caller can handle mutation.
-        println!("Credentials received. Config update requires caller support.");
-        println!("  API base: {api_base}");
-        println!("  API key:  {}...", &api_key[..api_key.len().min(8)]);
-
-        // Try to build model via factory
-        if let Some(_model) = ctx.config.build_model() {
-            println!("Model built successfully.");
+        let model_name = if provider.default_model.is_empty() {
+            "deepseek-chat".to_string()
         } else {
-            println!(
-                "Note: Model factory not configured or credentials incomplete. \
-                 Model will be available after main.rs registers the factory."
-            );
+            provider.default_model.to_string()
+        };
+
+        // Update config
+        ctx.config.api_base = Some(api_base.clone());
+        ctx.config.api_key = Some(api_key.clone());
+        ctx.config.model = model_name.clone();
+
+        // Build and set the model
+        println!();
+        println!("Provider:   {}", provider.name);
+        println!("API base:   {api_base}");
+        println!("API key:    {}...", &api_key[..api_key.len().min(8)]);
+        println!("Model:      {model_name}");
+
+        // Build model via factory and set on agent
+        match ctx.config.build_model() {
+            Some(model) => {
+                ctx.agent.set_model(Some(model));
+                println!();
+                println!("Logged in. Model {model_name} ready.");
+            }
+            None => {
+                println!();
+                println!("Credentials saved. Model will be available once factory is configured.");
+            }
         }
 
         Ok(CommandResult::Continue)
@@ -189,13 +283,20 @@ impl Command for ModelCommand {
                 None => println!("No model configured. Use /login first."),
             }
         } else {
-            // Try to build a model with the new name.
-            // NOTE: Config.model is not mutated here because Config is immutable
-            // in CommandContext. The TUI layer must handle config mutation.
-            // For now, we attempt to build via factory (which uses the current
-            // config.model) and report the situation.
-            println!("Switching model to: {target}");
-            println!("Note: Config update requires caller support.");
+            // Update model name in config
+            ctx.config.model = target.to_string();
+
+            // Rebuild model via factory and set on agent
+            match ctx.config.build_model() {
+                Some(model) => {
+                    ctx.agent.set_model(Some(model));
+                    println!("Model switched to: {target}");
+                }
+                None => {
+                    println!("Model name set to: {target}");
+                    println!("Note: Cannot build model. Configure API credentials with /login first.");
+                }
+            }
         }
         Ok(CommandResult::Continue)
     }
@@ -443,11 +544,10 @@ mod tests {
     async fn test_help_lists_commands() {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = HelpCommand.execute("", &mut ctx).await.unwrap();
@@ -459,11 +559,10 @@ mod tests {
     async fn test_help_specific_command() {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = HelpCommand.execute("quit", &mut ctx).await.unwrap();
@@ -474,11 +573,10 @@ mod tests {
     async fn test_help_unknown_command() {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let err = HelpCommand.execute("nonexistent", &mut ctx)
@@ -491,11 +589,10 @@ mod tests {
     async fn test_quit_returns_exit() {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = QuitCommand.execute("", &mut ctx).await.unwrap();
@@ -506,11 +603,10 @@ mod tests {
     async fn test_unknown_returns_user_error() {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = reg.execute("/foobar", &mut ctx).await;
@@ -527,11 +623,10 @@ mod tests {
     async fn test_model_no_args_shows_current() {
         let reg = build_test_registry();
         let mut agent = test_agent("gpt-4o");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = ModelCommand.execute("", &mut ctx).await.unwrap();
@@ -543,11 +638,10 @@ mod tests {
     async fn test_model_no_args_no_model() {
         let reg = build_test_registry();
         let mut agent = test_agent_no_model();
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = ModelCommand.execute("", &mut ctx).await.unwrap();
@@ -559,11 +653,10 @@ mod tests {
     async fn test_model_with_args() {
         let reg = build_test_registry();
         let mut agent = test_agent("old-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = ModelCommand.execute("claude-sonnet-4", &mut ctx).await.unwrap();
@@ -586,11 +679,10 @@ mod tests {
         agent.run_turn(agent_loop::AgentInput::text("hi")).await.unwrap();
         assert!(!agent.session_messages().is_empty());
 
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = NewCommand.execute("", &mut ctx).await.unwrap();
@@ -602,11 +694,10 @@ mod tests {
     async fn test_status_shows_config() {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = StatusCommand.execute("", &mut ctx).await.unwrap();
@@ -617,11 +708,10 @@ mod tests {
     async fn test_copy_mvp() {
         let reg = build_test_registry();
         let mut agent = test_agent("test");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = CopyCommand.execute("", &mut ctx).await.unwrap();
@@ -632,11 +722,10 @@ mod tests {
     async fn test_export_mvp() {
         let reg = build_test_registry();
         let mut agent = test_agent("test");
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = ExportCommand.execute("output.md", &mut ctx).await.unwrap();
@@ -658,11 +747,10 @@ mod tests {
         agent.run_turn(agent_loop::AgentInput::text("hi")).await.unwrap();
         assert!(!agent.session_messages().is_empty());
 
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = CompactCommand.execute("", &mut ctx).await.unwrap();
@@ -676,11 +764,10 @@ mod tests {
         let mut agent = test_agent("test-model");
         assert!(agent.model_id().is_some());
 
-        let config = test_config();
+        let mut config = test_config();
         let mut ctx = CommandContext {
             agent: &mut agent,
-            config: &config,
-            commands: &reg,
+            config: &mut config,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();

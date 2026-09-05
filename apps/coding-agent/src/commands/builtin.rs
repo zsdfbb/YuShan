@@ -1,5 +1,3 @@
-use std::io::{self, Write};
-
 use async_trait::async_trait;
 
 use super::{Command, CommandContext, CommandError, CommandResult};
@@ -110,40 +108,48 @@ impl Command for LoginCommand {
 
         // Determine which provider to use
         let provider = if arg.is_empty() {
-            // Interactive selection
-            println!("Select a provider:");
-            for (i, p) in providers.iter().enumerate() {
-                if p.name == "custom" {
-                    println!("  {}.) Custom (manual URL)", i + 1);
-                } else {
-                    println!("  {}.) {} ({})", i + 1, p.name, p.api_base);
+            // Interactive selection with arrow keys
+            let provider_labels: Vec<String> = providers
+                .iter()
+                .map(|p| {
+                    if p.name == "custom" {
+                        "Custom (manual URL)".to_string()
+                    } else {
+                        format!("{name} ({base})", name = p.name, base = p.api_base)
+                    }
+                })
+                .collect();
+
+            let selection = inquire::Select::new("Select a provider:", provider_labels)
+                .with_page_size(10)
+                .prompt();
+
+            match selection {
+                Ok(label) => {
+                    // Find the provider by matching the label
+                    let idx = providers
+                        .iter()
+                        .position(|p| {
+                            if p.name == "custom" {
+                                label.contains("Custom")
+                            } else {
+                                label.contains(p.name)
+                            }
+                        })
+                        .ok_or_else(|| {
+                            CommandError::Internal(format!("Could not find provider for: {label}"))
+                        })?;
+                    providers[idx].clone()
+                }
+                Err(inquire::InquireError::OperationCanceled)
+                | Err(inquire::InquireError::OperationInterrupted) => {
+                    println!("Login cancelled.");
+                    return Ok(CommandResult::Continue);
+                }
+                Err(e) => {
+                    return Err(CommandError::Internal(format!("Selection error: {e}")));
                 }
             }
-            print!("\nEnter number [1-{}]: ", providers.len());
-            io::stdout().flush().map_err(|e| {
-                CommandError::Internal(format!("flush failed: {e}"))
-            })?;
-
-            let mut choice = String::new();
-            io::stdin().read_line(&mut choice).map_err(|e| {
-                CommandError::Internal(format!("read_line failed: {e}"))
-            })?;
-            let choice = choice.trim();
-
-            let idx: usize = choice.parse().map_err(|_| {
-                CommandError::UserError(format!(
-                    "Invalid choice: {choice}. Enter a number between 1 and {}.",
-                    providers.len()
-                ))
-            })?;
-
-            if idx < 1 || idx > providers.len() {
-                return Err(CommandError::UserError(format!(
-                    "Invalid choice: {idx}. Enter a number between 1 and {}.",
-                    providers.len()
-                )));
-            }
-            providers[idx - 1].clone()
         } else {
             // Match by name
             providers.iter().find(|p| p.name == arg).cloned().ok_or_else(|| {
@@ -157,36 +163,47 @@ impl Command for LoginCommand {
 
         // For custom provider, prompt for api_base
         let api_base = if provider.api_base.is_empty() {
-            print!("API base URL: ");
-            io::stdout().flush().map_err(|e| {
-                CommandError::Internal(format!("flush failed: {e}"))
-            })?;
-            let mut base = String::new();
-            io::stdin().read_line(&mut base).map_err(|e| {
-                CommandError::Internal(format!("read_line failed: {e}"))
-            })?;
-            let base = base.trim().to_string();
-            if base.is_empty() {
-                return Err(CommandError::UserError("API base URL is required.".into()));
+            let base = inquire::Text::new("API base URL:")
+                .with_help_message("e.g. https://api.deepseek.com")
+                .prompt();
+
+            match base {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => {
+                    return Err(CommandError::UserError("API base URL is required.".into()));
+                }
+                Err(inquire::InquireError::OperationCanceled)
+                | Err(inquire::InquireError::OperationInterrupted) => {
+                    println!("Login cancelled.");
+                    return Ok(CommandResult::Continue);
+                }
+                Err(e) => {
+                    return Err(CommandError::Internal(format!("Input error: {e}")));
+                }
             }
-            base
         } else {
             provider.api_base.to_string()
         };
 
         // Prompt for api_key
-        print!("API key: ");
-        io::stdout().flush().map_err(|e| {
-            CommandError::Internal(format!("flush failed: {e}"))
-        })?;
-        let mut api_key = String::new();
-        io::stdin().read_line(&mut api_key).map_err(|e| {
-            CommandError::Internal(format!("read_line failed: {e}"))
-        })?;
-        let api_key = api_key.trim().to_string();
-        if api_key.is_empty() {
-            return Err(CommandError::UserError("API key is required.".into()));
-        }
+        let api_key = inquire::Text::new("API key:")
+            .with_help_message("Your authentication key for this provider")
+            .prompt();
+
+        let api_key = match api_key {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => {
+                return Err(CommandError::UserError("API key is required.".into()));
+            }
+            Err(inquire::InquireError::OperationCanceled)
+            | Err(inquire::InquireError::OperationInterrupted) => {
+                println!("Login cancelled.");
+                return Ok(CommandResult::Continue);
+            }
+            Err(e) => {
+                return Err(CommandError::Internal(format!("Input error: {e}")));
+            }
+        };
 
         let model_name = if provider.default_model.is_empty() {
             "deepseek-chat".to_string()

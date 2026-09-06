@@ -19,12 +19,26 @@ YuShan/
 │   ├── model-openai-compatible  # OpenAI 兼容 HTTP 模型后端
 │   └── tools-basic            # BashTool / ReadTool / WriteTool / EditTool
 ├── apps/                      # 产品层应用
-│   └── yushan-coding-agent    # YuShan Coding Agent 二进制入口，组装全套组件
+│   └── coding-agent           # YuShan Coding Agent 二进制入口
+│       ├── src/
+│       │   ├── main.rs        # 入口：组装 Agent、启动恢复、model factory
+│       │   ├── config.rs      # Config 结构体 + ProviderRegistry 持有
+│       │   ├── provider.rs    # ProviderRegistry：provider 目录、auth 持久化、模型获取
+│       │   ├── commands/
+│       │   │   ├── mod.rs     # Command trait + CommandRegistry
+│       │   │   └── builtin.rs # 内置命令：/login /logout /model /help /status 等
+│       │   ├── prompt.rs      # 系统提示词构建
+│       │   └── tui.rs         # 交互式 REPL 循环
+│       └── tests/
+│           ├── integration.rs # 工具层集成测试
+│           └── e2e_tools.rs   # 端到端测试：真实 API + 四工具协作（#[ignore]）
 ├── docs/                      # 文档
 │   ├── design.md              # 总体设计：原则、crate 划分、核心 trait、Hook/Event 边界、路线图、测试矩阵
 │   ├── CONTEXT.md             # 领域术语表
 │   ├── adr/                   # 架构决策记录（工具失败双通道、协作取消、会话异步追加、v0 分层骨架）
-│   ├── arch/                  # 架构分析（coding-agent、v0 最小循环、runtime commands）
+│   ├── arch/                  # 架构分析
+│   │   └── commands/
+│   │       └── login-model-behavior/  # /login & /model 行为改进（context/design/ADR/review）
 │   ├── design-plans/          # 设计方案
 │   ├── exec-plans/            # 执行计划
 │   └── reports/               # 报告
@@ -37,6 +51,25 @@ YuShan/
 - `cargo test` — 测试
 - `cargo clippy --all-targets` — lint
 - `cargo fmt` — 格式化
+- `cargo test -p coding-agent e2e -- --ignored --nocapture` — 端到端测试（需 YUSHAN_API_BASE + YUSHAN_API_KEY）
+
+## coding-agent 模块说明
+
+`apps/coding-agent/` 是产品层二进制，组装全部组件。内部模块：
+
+| 模块 | 职责 |
+|------|------|
+| `config` | Config 结构体，持有 ProviderRegistry，管理运行时配置 |
+| `provider` | ProviderRegistry：内置 provider 目录、auth.json 持久化（~/.yushan/）、GET /v1/models 动态模型获取、ProviderCompat 映射 |
+| `commands` | Command trait + CommandRegistry + 内置命令（/login /logout /model /help /new /compact /status /copy /export /quit） |
+| `prompt` | 系统提示词构建 |
+| `tui` | 交互式 REPL 循环（stdin → 命令拦截 → agent turn） |
+
+关键设计：
+- `ProviderRegistry` 作为 `Config` 的 pub 字段，命令通过 `ctx.config.registry` 访问
+- `CommandContext` 只持有 `&mut Agent` + `&mut Config`，不直接持有 registry
+- 凭证持久化到 `~/.yushan/auth.json`（0o600 权限），启动时自动恢复
+- 模型列表优先从 API 动态获取，失败 fallback 到静态列表
 
 ## 硬性约束
 
@@ -67,3 +100,4 @@ YuShan/
 | 架构决策的 why | `docs/adr/` |
 | 各 crate 的 API 和实现细节 | 对应 crate 的 `src/lib.rs` |
 | coding-agent 产品层设计 | `docs/arch/` + `apps/coding-agent/src/main.rs` |
+| /login & /model 行为设计 | `docs/arch/commands/login-model-behavior/` |

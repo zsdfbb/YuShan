@@ -2,61 +2,19 @@ use std::path::PathBuf;
 
 use agent_model::Model;
 
+use crate::provider::ProviderRegistry;
+
 /// Model factory function type. Captures adapter-specific construction logic.
 /// Returns None if config is incomplete (missing api_base/api_key).
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
-
-/// Known API provider with preset configuration.
-#[derive(Debug, Clone)]
-pub struct Provider {
-    pub name: &'static str,
-    pub api_base: &'static str,
-    pub default_model: &'static str,
-}
-
-/// Known model entry with provider association.
-#[derive(Debug, Clone)]
-pub struct KnownModel {
-    pub provider: &'static str,
-    pub model_id: &'static str,
-    pub display: &'static str,
-}
-
-/// All known models across providers.
-pub fn known_models() -> Vec<KnownModel> {
-    vec![
-        KnownModel { provider: "deepseek", model_id: "deepseek-chat", display: "deepseek-chat (DeepSeek V3)" },
-        KnownModel { provider: "deepseek", model_id: "deepseek-reasoner", display: "deepseek-reasoner (DeepSeek R1)" },
-        KnownModel { provider: "minimax", model_id: "MiniMax-Text-01", display: "MiniMax-Text-01" },
-    ]
-}
-
-/// Built-in provider registry.
-pub fn known_providers() -> Vec<Provider> {
-    vec![
-        Provider {
-            name: "deepseek",
-            api_base: "https://api.deepseek.com",
-            default_model: "deepseek-chat",
-        },
-        Provider {
-            name: "minimax",
-            api_base: "https://api.minimax.chat/v1",
-            default_model: "MiniMax-Text-01",
-        },
-        Provider {
-            name: "custom",
-            api_base: "",
-            default_model: "",
-        },
-    ]
-}
 
 pub struct Config {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub model: String,
     pub cwd: PathBuf,
+    pub provider: Option<String>,
+    pub registry: ProviderRegistry,
     model_factory: Option<ModelFactory>,
 }
 
@@ -79,6 +37,8 @@ impl Config {
             api_key,
             model,
             cwd,
+            provider: None,
+            registry: ProviderRegistry::new(),
             model_factory: None,
         })
     }
@@ -98,6 +58,12 @@ impl Config {
     /// Build a model from current config. Delegates to the factory.
     pub fn build_model(&self) -> Option<Box<dyn Model>> {
         self.model_factory.as_ref().and_then(|f| f(self))
+    }
+
+    /// Return ProviderCompat for the current provider (or "custom" if none set).
+    pub fn current_compat(&self) -> agent_model_openai_compatible::compat::ProviderCompat {
+        let name = self.provider.as_deref().unwrap_or("custom");
+        self.registry.compat_for(name)
     }
 }
 
@@ -135,6 +101,7 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert!(!config.is_configured());
         assert!(config.build_model().is_none());
+        assert!(config.registry.find_provider("deepseek").is_some());
     }
 
     #[test]
@@ -166,5 +133,73 @@ mod tests {
         });
 
         assert!(config.build_model().is_some());
+    }
+
+    #[test]
+    fn test_config_current_compat() {
+        let mut config = Config::from_env().unwrap();
+        config.provider = Some("deepseek".into());
+        let compat = config.current_compat();
+        assert!(compat.has_reasoning_content);
+    }
+
+    #[test]
+    fn test_config_current_compat_unknown() {
+        let config = Config::from_env().unwrap();
+        // No provider set -> "custom" -> standard
+        let compat = config.current_compat();
+        assert!(!compat.has_reasoning_content);
+        assert!(!compat.tool_calls_as_text);
+    }
+
+    #[test]
+    fn test_startup_recovery_from_auth() {
+        // Prepare a temp auth.json with deepseek credentials
+        let dir = std::env::temp_dir().join("yushan_test_startup_recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+
+        let auth_data = serde_json::json!({
+            "deepseek": {
+                "api_base": "https://api.deepseek.com",
+                "api_key": "sk-test-recovery",
+                "model": "deepseek-chat"
+            }
+        });
+        std::fs::write(&auth_path, serde_json::to_string_pretty(&auth_data).unwrap()).unwrap();
+
+        // Create Config with no env vars (not configured)
+        unsafe {
+            std::env::remove_var("YUSHAN_API_BASE");
+            std::env::remove_var("YUSHAN_API_KEY");
+            std::env::remove_var("OPENAI_API_BASE");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+
+        let mut config = Config::from_env().unwrap();
+        config.registry.set_auth_override(auth_path);
+        config.registry.load_auth();
+
+        // Simulate the main.rs recovery loop
+        if !config.is_configured() {
+            for provider in config.registry.providers() {
+                if let Some(entry) = config.registry.auth_for(&provider.name) {
+                    config.api_base = Some(entry.api_base.clone());
+                    config.api_key = Some(entry.api_key.clone());
+                    config.model = entry.model.clone();
+                    config.provider = Some(provider.name.clone());
+                    break;
+                }
+            }
+        }
+
+        assert!(config.is_configured());
+        assert_eq!(config.api_base.as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-test-recovery"));
+        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

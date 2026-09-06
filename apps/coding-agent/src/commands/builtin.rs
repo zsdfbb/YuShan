@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::{Command, CommandContext, CommandError, CommandResult};
-use crate::config::{known_models, known_providers};
+use crate::provider::{AuthEntry, ProviderRegistry};
 
 /// Metadata for /help display. Keeps HelpCommand decoupled from the registry.
 pub struct HelpEntry {
@@ -103,20 +103,17 @@ impl Command for LoginCommand {
         args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        let providers = known_providers();
+        let providers = ctx.config.registry.providers().to_vec();
         let arg = args.trim();
 
         // Determine which provider to use
         let provider = if arg.is_empty() {
             // Interactive selection with arrow keys
-            // Mark providers that already have credentials configured
-            let current_base = ctx.config.api_base.as_deref().unwrap_or("");
-            let has_creds = ctx.config.api_key.is_some();
-
+            // Mark providers that already have stored auth with ✓
             let provider_labels: Vec<String> = providers
                 .iter()
                 .map(|p| {
-                    let status = if has_creds && !current_base.is_empty() && p.api_base == current_base {
+                    let status = if ctx.config.registry.auth_for(&p.name).is_some() {
                         " ✓"
                     } else {
                         ""
@@ -142,7 +139,7 @@ impl Command for LoginCommand {
                             if p.name == "custom" {
                                 label.starts_with("Custom")
                             } else {
-                                label.starts_with(p.name)
+                                label.starts_with(&p.name)
                             }
                         })
                         .ok_or_else(|| {
@@ -162,7 +159,7 @@ impl Command for LoginCommand {
         } else {
             // Match by name
             providers.iter().find(|p| p.name == arg).cloned().ok_or_else(|| {
-                let names: Vec<&str> = providers.iter().map(|p| p.name).collect();
+                let names: Vec<String> = providers.iter().map(|p| p.name.clone()).collect();
                 CommandError::UserError(format!(
                     "Unknown provider: {arg}. Available: {}",
                     names.join(", ")
@@ -220,12 +217,25 @@ impl Command for LoginCommand {
             provider.default_model.to_string()
         };
 
-        // Update config
+        // Save credentials to registry (persisted to auth.json)
+        if let Err(e) = ctx.config.registry.save_auth(
+            &provider.name,
+            &AuthEntry {
+                api_base: api_base.clone(),
+                api_key: api_key.clone(),
+                model: model_name.clone(),
+            },
+        ) {
+            eprintln!("Warning: Could not persist credentials: {e}");
+        }
+
+        // Update config fields
         ctx.config.api_base = Some(api_base.clone());
         ctx.config.api_key = Some(api_key.clone());
         ctx.config.model = model_name.clone();
+        ctx.config.provider = Some(provider.name.clone());
 
-        // Build and set the model
+        // Print status
         println!();
         println!("Provider:   {}", provider.name);
         println!("API base:   {api_base}");
@@ -242,6 +252,20 @@ impl Command for LoginCommand {
             None => {
                 println!();
                 println!("Credentials saved. Model will be available once factory is configured.");
+            }
+        }
+
+        // Best-effort: fetch models to populate cache
+        println!("Fetching available models...");
+        match ProviderRegistry::fetch_models(&api_base, &api_key).await {
+            crate::provider::FetchModelsResult::Success(models) => {
+                println!("Fetched {} model(s).", models.len());
+            }
+            crate::provider::FetchModelsResult::AuthError(e) => {
+                println!("Warning: Could not fetch models (auth error): {e}");
+            }
+            crate::provider::FetchModelsResult::NetworkError(e) => {
+                println!("Warning: Could not fetch models (network error): {e}");
             }
         }
 
@@ -270,8 +294,21 @@ impl Command for LogoutCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        // Config is immutable in CommandContext; we can only clear the agent's model.
+        // Remove auth from registry if a provider is set
+        if let Some(ref provider_name) = ctx.config.provider.clone() {
+            if let Err(e) = ctx.config.registry.remove_auth(provider_name) {
+                eprintln!("Warning: Could not remove persisted credentials: {e}");
+            }
+        }
+
+        // Clear all config fields
+        ctx.config.api_base = None;
+        ctx.config.api_key = None;
+        ctx.config.provider = None;
+
+        // Clear the agent's model
         ctx.agent.set_model(None);
+
         println!("Logged out. API credentials cleared.");
         Ok(CommandResult::Continue)
     }
@@ -304,9 +341,26 @@ impl Command for ModelCommand {
     ) -> Result<CommandResult, CommandError> {
         let target = args.trim();
         if target.is_empty() {
-            // Interactive model selection with search
-            let models = known_models();
-            let labels: Vec<String> = models.iter().map(|m| m.display.to_string()).collect();
+            // Interactive model selection
+            let models = if ctx.config.is_configured() {
+                let api_base = ctx.config.api_base.as_deref().unwrap_or("");
+                let api_key = ctx.config.api_key.as_deref().unwrap_or("");
+                ctx.config.registry.available_models(api_base, api_key).await
+            } else {
+                ProviderRegistry::known_models_static()
+            };
+
+            let current = &ctx.config.model;
+            let labels: Vec<String> = models
+                .iter()
+                .map(|m| {
+                    if m.id == *current {
+                        format!("✓ {}", m.id)
+                    } else {
+                        m.id.clone()
+                    }
+                })
+                .collect();
 
             let selection = inquire::Select::new("Select a model:", labels)
                 .with_page_size(8)
@@ -314,18 +368,23 @@ impl Command for ModelCommand {
 
             match selection {
                 Ok(label) => {
-                    let model = models.iter().find(|m| m.display == label).ok_or_else(|| {
-                        CommandError::Internal(format!("Could not find model for: {label}"))
+                    let id = if let Some(rest) = label.strip_prefix("✓ ") {
+                        rest.to_string()
+                    } else {
+                        label
+                    };
+                    let model = models.iter().find(|m| m.id == id).ok_or_else(|| {
+                        CommandError::Internal(format!("Could not find model for: {id}"))
                     })?;
                     // Update config and rebuild
-                    ctx.config.model = model.model_id.to_string();
+                    ctx.config.model = model.id.clone();
                     match ctx.config.build_model() {
                         Some(m) => {
                             ctx.agent.set_model(Some(m));
-                            println!("Model switched to: {}", model.model_id);
+                            println!("Model switched to: {}", model.id);
                         }
                         None => {
-                            println!("Model set to: {}", model.model_id);
+                            println!("Model set to: {}", model.id);
                             println!("Note: Cannot build model. Check API credentials with /login.");
                         }
                     }
@@ -566,15 +625,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Helper: build a test agent without a model.
-    fn test_agent_no_model() -> agent_runtime::Agent {
-        AgentBuilder::new()
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap()
-    }
-
     fn test_config() -> Config {
         Config::from_env().unwrap()
     }
@@ -596,7 +646,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_help_lists_commands() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -611,7 +660,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_help_specific_command() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -625,7 +673,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_help_unknown_command() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -641,7 +688,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_quit_returns_exit() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -675,7 +721,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_with_args() {
-        let reg = build_test_registry();
         let mut agent = test_agent("old-model");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -690,6 +735,21 @@ mod tests {
         assert_eq!(ctx.config.model, "deepseek-chat");
     }
 
+    #[tokio::test]
+    async fn test_model_with_args_sets_config() {
+        let mut agent = test_agent("old-model");
+        let mut config = test_config();
+
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+        };
+
+        let result = ModelCommand.execute("deepseek-reasoner", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+        assert_eq!(ctx.config.model, "deepseek-reasoner");
+    }
+
     #[test]
     fn test_model_no_args_returns_continue() {
         // /model without args opens interactive selector (inquire::Select),
@@ -700,7 +760,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_clears_session() {
-        let reg = build_test_registry();
         let model = agent_model::MockModel::new("test");
         model.push_text("hello");
         let mut agent = AgentBuilder::new()
@@ -727,7 +786,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_shows_config() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -741,7 +799,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_mvp() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -755,7 +812,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_mvp() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test");
         let mut config = test_config();
         let mut ctx = CommandContext {
@@ -769,7 +825,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_mvp() {
-        let reg = build_test_registry();
         let model = agent_model::MockModel::new("test");
         model.push_text("hello");
         let mut agent = AgentBuilder::new()
@@ -795,7 +850,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_logout_clears_model() {
-        let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         assert!(agent.model_id().is_some());
 
@@ -808,6 +862,95 @@ mod tests {
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
         assert!(ctx.agent.model_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_logout_clears_config_fields() {
+        let mut agent = test_agent("test-model");
+        let mut config = test_config();
+
+        // Set config fields
+        config.api_base = Some("https://api.example.com".into());
+        config.api_key = Some("sk-test".into());
+        config.provider = Some("deepseek".into());
+
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+        };
+
+        let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+
+        // All config fields should be cleared
+        assert!(ctx.config.api_base.is_none());
+        assert!(ctx.config.api_key.is_none());
+        assert!(ctx.config.provider.is_none());
+        assert!(ctx.agent.model_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_logout_removes_from_auth_json() {
+        let dir = std::env::temp_dir().join("yushan_test_logout_persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+
+        let mut registry = ProviderRegistry::new();
+        registry.set_auth_override(auth_path.clone());
+        registry
+            .save_auth(
+                "deepseek",
+                &AuthEntry {
+                    api_base: "https://api.deepseek.com".into(),
+                    api_key: "sk-test-logout".into(),
+                    model: "deepseek-chat".into(),
+                },
+            )
+            .unwrap();
+
+        let mut config = test_config();
+        config.registry = registry;
+        config.provider = Some("deepseek".into());
+
+        let mut agent = test_agent("test-model");
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+        };
+
+        let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+
+        // Create a NEW registry to verify the file was updated on disk
+        let mut registry2 = ProviderRegistry::new();
+        registry2.set_auth_override(auth_path);
+        registry2.load_auth();
+        assert!(registry2.auth_for("deepseek").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_login_rejects_unknown_provider() {
+        let mut agent = test_agent("test-model");
+        let mut config = test_config();
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+        };
+
+        let err = LoginCommand
+            .execute("nonexistent", &mut ctx)
+            .await
+            .unwrap_err();
+        match err {
+            CommandError::UserError(msg) => {
+                assert!(msg.contains("Unknown provider"), "msg: {msg}");
+                assert!(msg.contains("nonexistent"), "msg: {msg}");
+            }
+            other => panic!("expected UserError, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

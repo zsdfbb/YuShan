@@ -1,12 +1,13 @@
 mod commands;
 mod config;
+mod provider;
 mod prompt;
 mod tui;
 
 use agent_event::NoopEventSink;
 use agent_loop::AgentInput;
 use agent_model_openai_compatible::{
-    OpenAICompatibleConfig, OpenAICompatibleModel, compat::ProviderCompat,
+    OpenAICompatibleConfig, OpenAICompatibleModel,
 };
 use agent_runtime::AgentBuilder;
 use agent_session::MemorySession;
@@ -17,10 +18,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut config = config::Config::from_env()?;
 
+    // Load saved credentials from auth.json
+    config.registry.load_auth();
+
+    // Startup recovery: if env vars don't provide full credentials,
+    // try to restore from auth.json by finding the first stored provider.
+    if !config.is_configured() {
+        for provider in config.registry.providers() {
+            if let Some(entry) = config.registry.auth_for(&provider.name) {
+                config.api_base = Some(entry.api_base.clone());
+                config.api_key = Some(entry.api_key.clone());
+                config.model = entry.model.clone();
+                config.provider = Some(provider.name.clone());
+                break;
+            }
+        }
+    }
+
     // Register the model factory (adapter-specific construction logic)
     config.set_model_factory(|cfg| {
         let base = cfg.api_base.as_ref()?;
         let key = cfg.api_key.as_ref()?;
+        let compat = cfg.current_compat();
         Some(Box::new(OpenAICompatibleModel::new(
             OpenAICompatibleConfig {
                 api_base: base.clone(),
@@ -28,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model: cfg.model.clone(),
                 max_tokens: Some(4096),
                 temperature: Some(0.7),
-                compat: ProviderCompat::standard(),
+                compat,
             },
         )))
     });
@@ -51,13 +70,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build model (optional — agent can start without API credentials)
     let model = if config.is_configured() {
+        let compat = config.current_compat();
         Some(OpenAICompatibleModel::new(OpenAICompatibleConfig {
             api_base: config.api_base.clone().unwrap(),
             api_key: config.api_key.clone().unwrap(),
             model: config.model.clone(),
             max_tokens: Some(4096),
             temperature: Some(0.7),
-            compat: ProviderCompat::standard(),
+            compat,
         }))
     } else {
         None

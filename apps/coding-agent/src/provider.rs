@@ -110,7 +110,7 @@ impl ProviderRegistry {
     }
 
     /// Return the path to the auth.json file.
-    fn auth_path(&self) -> PathBuf {
+    pub fn auth_path(&self) -> PathBuf {
         if let Some(ref p) = self.auth_override {
             return p.clone();
         }
@@ -149,6 +149,16 @@ impl ProviderRegistry {
     /// Look up credentials for a provider.
     pub fn auth_for(&self, provider_name: &str) -> Option<&AuthEntry> {
         self.auth_store.get(provider_name)
+    }
+
+    /// Names of providers that have stored credentials (logged in).
+    /// Returned in registration order (deepseek, minimax, custom).
+    pub fn logged_in_providers(&self) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|p| self.auth_store.contains_key(&p.name))
+            .map(|p| p.name.clone())
+            .collect()
     }
 
     fn write_auth(&self) -> Result<(), String> {

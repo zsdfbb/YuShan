@@ -13,10 +13,10 @@ pub struct HelpEntry {
 /// All built-in command metadata for /help display.
 pub fn builtin_help_entries() -> Vec<HelpEntry> {
     vec![
-        HelpEntry { name: "help", description: "Show available commands", arg_hint: Some("[command]") },
-        HelpEntry { name: "login", description: "Configure API credentials", arg_hint: Some("[provider]") },
-        HelpEntry { name: "logout", description: "Clear API credentials", arg_hint: None },
-        HelpEntry { name: "model", description: "Show or switch the current model", arg_hint: Some("[model_name]") },
+        HelpEntry { name: "help", description: "Show available commands (or /help <name> for details)", arg_hint: Some("[command]") },
+        HelpEntry { name: "login", description: "Configure API credentials (interactive picker if no arg)", arg_hint: Some("[provider]") },
+        HelpEntry { name: "logout", description: "Clear API credentials and reset to default", arg_hint: None },
+        HelpEntry { name: "model", description: "Show or switch the current model (interactive picker if no arg)", arg_hint: Some("[model_name]") },
         HelpEntry { name: "new", description: "Start a new conversation", arg_hint: None },
         HelpEntry { name: "compact", description: "Compact conversation context", arg_hint: None },
         HelpEntry { name: "status", description: "Show current configuration", arg_hint: None },
@@ -39,7 +39,7 @@ impl Command for HelpCommand {
     }
 
     fn description(&self) -> &str {
-        "Show available commands"
+        "Show available commands (or /help <name> for details)"
     }
 
     fn arg_hint(&self) -> Option<&str> {
@@ -91,7 +91,7 @@ impl Command for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Configure API credentials"
+        "Configure API credentials (interactive picker if no arg)"
     }
 
     fn arg_hint(&self) -> Option<&str> {
@@ -235,28 +235,17 @@ impl Command for LoginCommand {
         ctx.config.model = model_name.clone();
         ctx.config.provider = Some(provider.name.clone());
 
-        // Print status
-        println!();
-        println!("Provider:   {}", provider.name);
-        println!("API base:   {api_base}");
-        println!("API key:    {}...", &api_key[..api_key.len().min(8)]);
-        println!("Model:      {model_name}");
-
         // Build model via factory and set on agent
         match ctx.config.build_model() {
             Some(model) => {
                 ctx.agent.set_model(Some(model));
-                println!();
-                println!("Logged in. Model {model_name} ready.");
             }
             None => {
-                println!();
-                println!("Credentials saved. Model will be available once factory is configured.");
+                eprintln!("Warning: Could not build model. Check API credentials.");
             }
         }
 
         // Best-effort: fetch models to populate cache
-        println!("Fetching available models...");
         match ProviderRegistry::fetch_models(&api_base, &api_key).await {
             crate::provider::FetchModelsResult::Success(models) => {
                 println!("Fetched {} model(s).", models.len());
@@ -268,6 +257,16 @@ impl Command for LoginCommand {
                 println!("Warning: Could not fetch models (network error): {e}");
             }
         }
+
+        if let Err(e) = ctx.state.save(&crate::state::AppState {
+            last_active_provider: Some(provider.name.clone()),
+            last_active_model: Some(model_name.clone()),
+        }) {
+            eprintln!("Warning: Could not persist state: {e}");
+        }
+
+        println!();
+        println!("✓ Logged in to {} ({}).", provider.name, model_name);
 
         Ok(CommandResult::Continue)
     }
@@ -286,7 +285,7 @@ impl Command for LogoutCommand {
     }
 
     fn description(&self) -> &str {
-        "Clear API credentials"
+        "Clear API credentials and reset to default"
     }
 
     async fn execute(
@@ -309,6 +308,9 @@ impl Command for LogoutCommand {
         // Clear the agent's model
         ctx.agent.set_model(None);
 
+        // Persist cleared state
+        let _ = ctx.state.save(&crate::state::AppState::default());
+
         println!("Logged out. API credentials cleared.");
         Ok(CommandResult::Continue)
     }
@@ -327,7 +329,7 @@ impl Command for ModelCommand {
     }
 
     fn description(&self) -> &str {
-        "Show or switch the current model"
+        "Show or switch the current model (interactive picker if no arg)"
     }
 
     fn arg_hint(&self) -> Option<&str> {
@@ -378,6 +380,10 @@ impl Command for ModelCommand {
                     })?;
                     // Update config and rebuild
                     ctx.config.model = model.id.clone();
+                    let _ = ctx.state.save(&crate::state::AppState {
+                        last_active_provider: ctx.config.provider.clone(),
+                        last_active_model: Some(model.id.clone()),
+                    });
                     match ctx.config.build_model() {
                         Some(m) => {
                             ctx.agent.set_model(Some(m));
@@ -400,6 +406,10 @@ impl Command for ModelCommand {
         } else {
             // Direct name: /model deepseek-chat
             ctx.config.model = target.to_string();
+            let _ = ctx.state.save(&crate::state::AppState {
+                last_active_provider: ctx.config.provider.clone(),
+                last_active_model: Some(target.to_string()),
+            });
             match ctx.config.build_model() {
                 Some(m) => {
                     ctx.agent.set_model(Some(m));
@@ -498,11 +508,21 @@ impl Command for StatusCommand {
         // v0: token totals are not shown because TurnStats is owned by main.rs and not
         // threaded through CommandContext. Future work: extend CommandContext with
         // &mut TurnStats (or Arc<Mutex<>>).
-        let model_id = ctx.agent.model_id();
+        //
+        // Grouping B: build a temporary AppView using the real `from_sources` constructor
+        // (passing through `ctx.state`). Token fields default to 0 since stats is not in ctx.
+        let stats = crate::status::TurnStats::default();
+        let snapshot = crate::view::AppView::from_sources(
+            ctx.config,
+            ctx.agent,
+            &ctx.config.registry,
+            ctx.state,
+            &stats,
+            std::time::Instant::now(),
+        );
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        let stats = crate::status::TurnStats::default();
-        crate::format::render_status(&mut out, ctx.config, model_id, &stats)
+        crate::format::render_status(&mut out, &snapshot)
             .map_err(|e| CommandError::Internal(e.to_string()))?;
         Ok(CommandResult::Continue)
     }
@@ -617,6 +637,23 @@ mod tests {
         Config::from_env().unwrap()
     }
 
+    /// Helper: build a throwaway StateStore pointing at a temp directory so
+    /// tests never touch the real ~/.yushan/state.json.
+    fn test_state_store() -> crate::state::StateStore {
+        let mut store = crate::state::StateStore::new();
+        let dir = std::env::temp_dir().join(format!(
+            "yushan_test_state_{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        store.set_override(dir.join("state.json"));
+        store
+    }
+
     fn build_test_registry() -> CommandRegistry {
         let mut reg = CommandRegistry::new();
         reg.register(HelpCommand);
@@ -636,9 +673,11 @@ mod tests {
     async fn test_help_lists_commands() {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = HelpCommand.execute("", &mut ctx).await.unwrap();
@@ -650,9 +689,11 @@ mod tests {
     async fn test_help_specific_command() {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = HelpCommand.execute("quit", &mut ctx).await.unwrap();
@@ -663,9 +704,11 @@ mod tests {
     async fn test_help_unknown_command() {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let err = HelpCommand.execute("nonexistent", &mut ctx)
@@ -678,9 +721,11 @@ mod tests {
     async fn test_quit_returns_exit() {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = QuitCommand.execute("", &mut ctx).await.unwrap();
@@ -692,9 +737,11 @@ mod tests {
         let reg = build_test_registry();
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = reg.execute("/foobar", &mut ctx).await;
@@ -711,9 +758,11 @@ mod tests {
     async fn test_model_with_args() {
         let mut agent = test_agent("old-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         // /model with args switches directly (no interactive selector)
@@ -728,9 +777,11 @@ mod tests {
         let mut agent = test_agent("old-model");
         let mut config = test_config();
 
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = ModelCommand.execute("deepseek-reasoner", &mut ctx).await.unwrap();
@@ -762,9 +813,11 @@ mod tests {
         assert!(!agent.session_messages().is_empty());
 
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = NewCommand.execute("", &mut ctx).await.unwrap();
@@ -776,9 +829,11 @@ mod tests {
     async fn test_status_shows_config() {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = StatusCommand.execute("", &mut ctx).await.unwrap();
@@ -789,9 +844,11 @@ mod tests {
     async fn test_copy_mvp() {
         let mut agent = test_agent("test");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = CopyCommand.execute("", &mut ctx).await.unwrap();
@@ -802,9 +859,11 @@ mod tests {
     async fn test_export_mvp() {
         let mut agent = test_agent("test");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = ExportCommand.execute("output.md", &mut ctx).await.unwrap();
@@ -826,9 +885,11 @@ mod tests {
         assert!(!agent.session_messages().is_empty());
 
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = CompactCommand.execute("", &mut ctx).await.unwrap();
@@ -842,9 +903,11 @@ mod tests {
         assert!(agent.model_id().is_some());
 
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
@@ -862,9 +925,11 @@ mod tests {
         config.api_key = Some("sk-test".into());
         config.provider = Some("deepseek".into());
 
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
@@ -902,9 +967,11 @@ mod tests {
         config.provider = Some("deepseek".into());
 
         let mut agent = test_agent("test-model");
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
@@ -923,9 +990,11 @@ mod tests {
     async fn test_login_rejects_unknown_provider() {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
+        let mut state_store = test_state_store();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
 
         let err = LoginCommand
@@ -942,6 +1011,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_logout_clears_state() {
+        let dir = std::env::temp_dir().join("yushan_test_logout_state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+
+        let mut config = test_config();
+        config.api_base = Some("https://api.example.com".into());
+        config.api_key = Some("sk-test".into());
+        config.provider = Some("deepseek".into());
+        config.model = "deepseek-chat".into();
+
+        let mut state_store = test_state_store();
+        state_store.set_override(state_path.clone());
+        // Pre-populate state.json simulating a previous active session
+        state_store
+            .save(&crate::state::AppState {
+                last_active_provider: Some("deepseek".into()),
+                last_active_model: Some("deepseek-chat".into()),
+            })
+            .unwrap();
+
+        let mut agent = test_agent("test-model");
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+            state: &mut state_store,
+        };
+        LogoutCommand.execute("", &mut ctx).await.unwrap();
+
+        let loaded = state_store.load();
+        assert_eq!(loaded.last_active_provider, None);
+        assert_eq!(loaded.last_active_model, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_build_registry_all_commands() {
         let reg = build_test_registry();
         let all = reg.all();
@@ -954,6 +1061,35 @@ mod tests {
                 "help", "login", "logout", "model", "new", "compact", "status",
                 "copy", "export", "quit"
             ]
+        );
+    }
+
+    #[test]
+    fn test_help_enhanced_descriptions() {
+        let entries = builtin_help_entries();
+        let login = entries.iter().find(|e| e.name == "login").unwrap();
+        assert!(
+            login.description.contains("interactive picker"),
+            "login description should mention interactive picker: {}",
+            login.description
+        );
+        let model = entries.iter().find(|e| e.name == "model").unwrap();
+        assert!(
+            model.description.contains("interactive picker"),
+            "model description should mention interactive picker: {}",
+            model.description
+        );
+        let logout = entries.iter().find(|e| e.name == "logout").unwrap();
+        assert!(
+            logout.description.contains("reset"),
+            "logout description should mention reset: {}",
+            logout.description
+        );
+        let help = entries.iter().find(|e| e.name == "help").unwrap();
+        assert!(
+            help.description.contains("/help <name>"),
+            "help description should mention /help <name>: {}",
+            help.description
         );
     }
 }

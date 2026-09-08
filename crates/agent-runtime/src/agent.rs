@@ -82,6 +82,21 @@ impl Agent {
         self.model.as_deref().map(|m| m.model_id())
     }
 
+    /// Return tool names (owned String list). Used by banner/footer to display available tools.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.registry.names().iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Return the model context window size in tokens.
+    pub fn context_window(&self) -> usize {
+        self.limits.context_window
+    }
+
+    /// Cancel the current run. The next iteration of the agent loop will stop.
+    pub fn cancel(&mut self) {
+        self.cancel.cancel();
+    }
+
     /// Replace the model. Pass None to remove (e.g., /logout).
     pub fn set_model(&mut self, model: Option<Box<dyn Model>>) {
         self.model = model;
@@ -95,5 +110,90 @@ impl Agent {
     /// Read all session messages.
     pub fn session_messages(&self) -> &[Message] {
         self.session.messages()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentBuilder;
+    use agent_event::CollectingSink;
+    use agent_model::MockModel;
+    use agent_session::MemorySession;
+    use agent_tool::{Tool, ToolContext, ToolResult, ToolSpec};
+
+    struct MockTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for MockTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.0, "desc", serde_json::json!({}))
+        }
+
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolResult, agent_tool::ToolError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn test_tool_names_empty_by_default() {
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+        let names = agent.tool_names();
+        // Default builder registers no tools.
+        assert_eq!(names.len(), 0);
+    }
+
+    #[test]
+    fn test_tool_names_returns_registered_tools() {
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .tool(MockTool("read"))
+            .tool(MockTool("write"))
+            .build()
+            .unwrap();
+        let names = agent.tool_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&"write".to_string()));
+    }
+
+    #[test]
+    fn test_context_window_default() {
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+        // RunLimits::default().context_window = 128_000
+        assert_eq!(agent.context_window(), 128_000);
+    }
+
+    #[test]
+    fn test_cancel_signals_token() {
+        let cancel = CancelToken::new();
+        let token_clone = cancel.clone();
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .cancel_token(cancel)
+            .build()
+            .unwrap();
+        assert!(!token_clone.is_cancelled());
+        let mut agent = agent;
+        agent.cancel();
+        assert!(token_clone.is_cancelled());
     }
 }

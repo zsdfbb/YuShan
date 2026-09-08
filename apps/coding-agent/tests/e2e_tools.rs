@@ -8,7 +8,7 @@
 use agent_event::NoopEventSink;
 use agent_loop::AgentInput;
 use agent_model_openai_compatible::{
-    compat::ProviderCompat, OpenAICompatibleConfig, OpenAICompatibleModel,
+    OpenAICompatibleConfig, OpenAICompatibleModel, compat::ProviderCompat,
 };
 use agent_runtime::AgentBuilder;
 use agent_session::MemorySession;
@@ -67,13 +67,10 @@ async fn e2e_four_tools_calculator() {
         .expect("failed to build agent");
 
     let input = AgentInput::text(&task);
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        agent.run_turn(input),
-    )
-    .await
-    .expect("test timed out after 120s")
-    .expect("agent run_turn failed");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), agent.run_turn(input))
+        .await
+        .expect("test timed out after 120s")
+        .expect("agent run_turn failed");
 
     // Verify the agent produced a response
     assert!(

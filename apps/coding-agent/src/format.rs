@@ -1,13 +1,16 @@
+#[cfg(feature = "tui-stdout")]
 use std::io::{self, Write};
 
 use agent_core::StopReason;
 
+#[cfg(feature = "tui-stdout")]
 use crate::prompt;
 use crate::view::AppView;
 
 /// Startup banner. Called once at the top of the interactive loop.
 /// Only shows startup-class information (version, capabilities, help hint).
 /// Runtime state (provider / model / cwd / tokens) lives in the footer.
+#[cfg(feature = "tui-stdout")]
 pub fn print_banner<W: Write>(out: &mut W, view: &AppView) -> io::Result<()> {
     writeln!(
         out,
@@ -23,6 +26,7 @@ pub fn print_banner<W: Write>(out: &mut W, view: &AppView) -> io::Result<()> {
 
 /// Resident footer line printed before each prompt. Box-drawing style
 /// mirrors Pi's interactive footer.
+#[cfg(feature = "tui-stdout")]
 pub fn print_footer<W: Write>(out: &mut W, view: &AppView) -> io::Result<()> {
     writeln!(
         out,
@@ -37,6 +41,7 @@ pub fn print_footer<W: Write>(out: &mut W, view: &AppView) -> io::Result<()> {
 }
 
 /// Single-line turn summary, printed right after `final_message`.
+#[cfg(feature = "tui-stdout")]
 pub fn print_turn_summary<W: Write>(
     out: &mut W,
     view: &AppView,
@@ -79,6 +84,7 @@ fn approx_session_tokens(view: &AppView) -> u64 {
 }
 
 /// `/status` command detail output.
+#[cfg(feature = "tui-stdout")]
 pub fn render_status<W: Write>(out: &mut W, view: &AppView) -> io::Result<()> {
     writeln!(out, "YuShan Coding Agent")?;
     writeln!(out, "Dir:        {}", prompt::format_cwd_tilde(&view.cwd))?;
@@ -150,7 +156,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    fn make_view() -> AppView {
+    pub(super) fn make_view() -> AppView {
         AppView {
             cwd: PathBuf::from("/tmp"),
             provider: Some("deepseek".into()),
@@ -194,7 +200,9 @@ mod tests {
         let _lock = crate::ansi::tests::env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR"); }
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
         let completed = status_symbol(&StopReason::Completed);
         assert!(completed.contains("✓"));
         assert!(completed.starts_with("\x1b[32m"));
@@ -205,6 +213,23 @@ mod tests {
         assert!(cancelled.contains("✗ Cancelled"));
         assert!(cancelled.starts_with("\x1b[31m"));
     }
+
+    #[test]
+    fn test_approx_session_tokens_sums_cumulative() {
+        let mut view = make_view();
+        view.total_input_tokens = 100;
+        view.total_output_tokens = 50;
+        assert_eq!(approx_session_tokens(&view), 150);
+        view.total_input_tokens = 0;
+        view.total_output_tokens = 0;
+        assert_eq!(approx_session_tokens(&view), 0);
+    }
+}
+
+#[cfg(all(test, feature = "tui-stdout"))]
+mod stdout_tests {
+    use super::tests::make_view;
+    use super::*;
 
     #[test]
     fn test_print_banner_omits_runtime_state() {
@@ -248,7 +273,11 @@ mod tests {
         // into a "" then nothing after; the function ends without trailing \n,
         // so split produces the 4-part expected).
         let parts: Vec<&str> = out.split('\n').collect();
-        assert_eq!(parts.len(), 5, "banner should be 5 parts (title + tools + help + empty + empty from trailing \\n), got {parts:?}");
+        assert_eq!(
+            parts.len(),
+            5,
+            "banner should be 5 parts (title + tools + help + empty + empty from trailing \\n), got {parts:?}"
+        );
         assert!(parts[0].contains("YuShan Coding Agent"));
         assert!(parts[1].starts_with("Tools:"));
         assert!(parts[2].starts_with("Type /help"));
@@ -278,7 +307,9 @@ mod tests {
         let _lock = crate::ansi::tests::env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR"); }
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
         let mut buf = Vec::new();
         let view = make_view();
         print_turn_summary(&mut buf, &view, 1, &StopReason::Completed, 2.3).unwrap();
@@ -293,7 +324,9 @@ mod tests {
         let _lock = crate::ansi::tests::env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR"); }
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
         let mut buf = Vec::new();
         let mut view = make_view();
         view.total_input_tokens = 12_400;
@@ -309,7 +342,9 @@ mod tests {
         let _lock = crate::ansi::tests::env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR"); }
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
         let mut buf = Vec::new();
         let mut view = make_view();
         view.total_input_tokens = 1_200;
@@ -339,7 +374,9 @@ mod tests {
         let _lock = crate::ansi::tests::env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::remove_var("NO_COLOR"); }
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
         let mut buf = Vec::new();
         let mut view = make_view();
         view.context_window = Some(128_000);
@@ -378,16 +415,5 @@ mod tests {
         print_turn_summary(&mut buf, &view, 1, &StopReason::Completed, 2.3).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(!out.contains("%/"));
-    }
-
-    #[test]
-    fn test_approx_session_tokens_sums_cumulative() {
-        let mut view = make_view();
-        view.total_input_tokens = 100;
-        view.total_output_tokens = 50;
-        assert_eq!(approx_session_tokens(&view), 150);
-        view.total_input_tokens = 0;
-        view.total_output_tokens = 0;
-        assert_eq!(approx_session_tokens(&view), 0);
     }
 }

@@ -32,8 +32,14 @@ mod tests {
     #[test]
     fn test_record_normal() {
         let mut stats = TurnStats::default();
-        stats.record(&Usage { input_tokens: 100, output_tokens: 200 });
-        stats.record(&Usage { input_tokens: 50, output_tokens: 75 });
+        stats.record(&Usage {
+            input_tokens: 100,
+            output_tokens: 200,
+        });
+        stats.record(&Usage {
+            input_tokens: 50,
+            output_tokens: 75,
+        });
         assert_eq!(stats.total_input_tokens, 150);
         assert_eq!(stats.total_output_tokens, 275);
         assert_eq!(stats.turn_count, 2);
@@ -45,7 +51,10 @@ mod tests {
             total_input_tokens: u32::MAX,
             ..Default::default()
         };
-        stats.record(&Usage { input_tokens: 100, output_tokens: 200 });
+        stats.record(&Usage {
+            input_tokens: 100,
+            output_tokens: 200,
+        });
         assert_eq!(stats.total_input_tokens, u32::MAX); // Does not overflow
         assert_eq!(stats.total_output_tokens, 200);
     }
@@ -54,7 +63,10 @@ mod tests {
     fn test_record_count() {
         let mut stats = TurnStats::default();
         for _ in 0..3 {
-            stats.record(&Usage { input_tokens: 1, output_tokens: 1 });
+            stats.record(&Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            });
         }
         assert_eq!(stats.turn_count, 3);
         assert_eq!(stats.total_input_tokens, 3);

@@ -13,16 +13,56 @@ pub struct HelpEntry {
 /// All built-in command metadata for /help display.
 pub fn builtin_help_entries() -> Vec<HelpEntry> {
     vec![
-        HelpEntry { name: "help", description: "Show available commands (or /help <name> for details)", arg_hint: Some("[command]") },
-        HelpEntry { name: "login", description: "Configure API credentials (interactive picker if no arg)", arg_hint: Some("[provider]") },
-        HelpEntry { name: "logout", description: "Clear API credentials and reset to default", arg_hint: None },
-        HelpEntry { name: "model", description: "Show or switch the current model (interactive picker if no arg)", arg_hint: Some("[model_name]") },
-        HelpEntry { name: "new", description: "Start a new conversation", arg_hint: None },
-        HelpEntry { name: "compact", description: "Compact conversation context", arg_hint: None },
-        HelpEntry { name: "status", description: "Show current configuration", arg_hint: None },
-        HelpEntry { name: "copy", description: "Copy last response to clipboard", arg_hint: None },
-        HelpEntry { name: "export", description: "Export conversation to file", arg_hint: Some("[filename]") },
-        HelpEntry { name: "quit", description: "Exit the agent", arg_hint: None },
+        HelpEntry {
+            name: "help",
+            description: "Show available commands (or /help <name> for details)",
+            arg_hint: Some("[command]"),
+        },
+        HelpEntry {
+            name: "login",
+            description: "Configure API credentials (interactive picker if no arg)",
+            arg_hint: Some("[provider]"),
+        },
+        HelpEntry {
+            name: "logout",
+            description: "Clear API credentials and reset to default",
+            arg_hint: None,
+        },
+        HelpEntry {
+            name: "model",
+            description: "Show or switch the current model (interactive picker if no arg)",
+            arg_hint: Some("[model_name]"),
+        },
+        HelpEntry {
+            name: "new",
+            description: "Start a new conversation",
+            arg_hint: None,
+        },
+        HelpEntry {
+            name: "compact",
+            description: "Compact conversation context",
+            arg_hint: None,
+        },
+        HelpEntry {
+            name: "status",
+            description: "Show current configuration",
+            arg_hint: None,
+        },
+        HelpEntry {
+            name: "copy",
+            description: "Copy last response to clipboard",
+            arg_hint: None,
+        },
+        HelpEntry {
+            name: "export",
+            description: "Export conversation to file",
+            arg_hint: Some("[filename]"),
+        },
+        HelpEntry {
+            name: "quit",
+            description: "Exit the agent",
+            arg_hint: None,
+        },
     ]
 }
 
@@ -54,9 +94,10 @@ impl Command for HelpCommand {
         let entries = builtin_help_entries();
         let target = args.trim();
         if !target.is_empty() {
-            let entry = entries.iter().find(|e| e.name == target).ok_or_else(|| {
-                CommandError::UserError(format!("Unknown command: /{target}"))
-            })?;
+            let entry = entries
+                .iter()
+                .find(|e| e.name == target)
+                .ok_or_else(|| CommandError::UserError(format!("Unknown command: /{target}")))?;
             let hint = entry.arg_hint.unwrap_or("");
             if hint.is_empty() {
                 println!("/{} — {}", entry.name, entry.description);
@@ -158,13 +199,17 @@ impl Command for LoginCommand {
             }
         } else {
             // Match by name
-            providers.iter().find(|p| p.name == arg).cloned().ok_or_else(|| {
-                let names: Vec<String> = providers.iter().map(|p| p.name.clone()).collect();
-                CommandError::UserError(format!(
-                    "Unknown provider: {arg}. Available: {}",
-                    names.join(", ")
-                ))
-            })?
+            providers
+                .iter()
+                .find(|p| p.name == arg)
+                .cloned()
+                .ok_or_else(|| {
+                    let names: Vec<String> = providers.iter().map(|p| p.name.clone()).collect();
+                    CommandError::UserError(format!(
+                        "Unknown provider: {arg}. Available: {}",
+                        names.join(", ")
+                    ))
+                })?
         };
 
         // For custom provider, prompt for api_base
@@ -347,7 +392,10 @@ impl Command for ModelCommand {
             let models = if ctx.config.is_configured() {
                 let api_base = ctx.config.api_base.as_deref().unwrap_or("");
                 let api_key = ctx.config.api_key.as_deref().unwrap_or("");
-                ctx.config.registry.available_models(api_base, api_key).await
+                ctx.config
+                    .registry
+                    .available_models(api_base, api_key)
+                    .await
             } else {
                 ProviderRegistry::known_models_static()
             };
@@ -391,7 +439,9 @@ impl Command for ModelCommand {
                         }
                         None => {
                             println!("Model set to: {}", model.id);
-                            println!("Note: Cannot build model. Check API credentials with /login.");
+                            println!(
+                                "Note: Cannot build model. Check API credentials with /login."
+                            );
                         }
                     }
                 }
@@ -446,9 +496,10 @@ impl Command for NewCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        ctx.agent.clear_session().await.map_err(|e| {
-            CommandError::Internal(format!("Failed to clear session: {e}"))
-        })?;
+        ctx.agent
+            .clear_session()
+            .await
+            .map_err(|e| CommandError::Internal(format!("Failed to clear session: {e}")))?;
         println!("New conversation started. Session cleared.");
         Ok(CommandResult::Continue)
     }
@@ -476,9 +527,10 @@ impl Command for CompactCommand {
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
         // MVP: clear session as a stand-in for compaction.
-        ctx.agent.clear_session().await.map_err(|e| {
-            CommandError::Internal(format!("Failed to compact session: {e}"))
-        })?;
+        ctx.agent
+            .clear_session()
+            .await
+            .map_err(|e| CommandError::Internal(format!("Failed to compact session: {e}")))?;
         println!("Compacting... Session cleared (full compaction TBD).");
         Ok(CommandResult::Continue)
     }
@@ -503,7 +555,10 @@ impl Command for StatusCommand {
     async fn execute(
         &self,
         _args: &str,
-        ctx: &mut CommandContext<'_>,
+        // In `tui-ratatui` mode the status panel is rendered directly by
+        // `ui/draw::draw_status_panel`, so /status is a no-op and `ctx` is unused.
+        // In `tui-stdout` mode we read ctx.{config,agent,state} below.
+        #[cfg_attr(feature = "tui-ratatui", allow(unused_variables))] ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
         // v0: token totals are not shown because TurnStats is owned by main.rs and not
         // threaded through CommandContext. Future work: extend CommandContext with
@@ -511,19 +566,26 @@ impl Command for StatusCommand {
         //
         // Grouping B: build a temporary AppView using the real `from_sources` constructor
         // (passing through `ctx.state`). Token fields default to 0 since stats is not in ctx.
-        let stats = crate::status::TurnStats::default();
-        let snapshot = crate::view::AppView::from_sources(
-            ctx.config,
-            ctx.agent,
-            &ctx.config.registry,
-            ctx.state,
-            &stats,
-            std::time::Instant::now(),
-        );
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        crate::format::render_status(&mut out, &snapshot)
-            .map_err(|e| CommandError::Internal(e.to_string()))?;
+        //
+        // `render_status` is gated to `tui-stdout`; in `tui-ratatui` mode the status
+        // panel is rendered directly by `ui/draw::draw_status_panel`, so /status is a
+        // no-op there.
+        #[cfg(feature = "tui-stdout")]
+        {
+            let stats = crate::status::TurnStats::default();
+            let snapshot = crate::view::AppView::from_sources(
+                ctx.config,
+                ctx.agent,
+                &ctx.config.registry,
+                ctx.state,
+                &stats,
+                std::time::Instant::now(),
+            );
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            crate::format::render_status(&mut out, &snapshot)
+                .map_err(|e| CommandError::Internal(e.to_string()))?;
+        }
         Ok(CommandResult::Continue)
     }
 }
@@ -616,8 +678,8 @@ impl Command for QuitCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::commands::CommandRegistry;
+    use crate::config::Config;
     use agent_event::CollectingSink;
     use agent_runtime::AgentBuilder;
     use agent_session::MemorySession;
@@ -711,7 +773,8 @@ mod tests {
             state: &mut state_store,
         };
 
-        let err = HelpCommand.execute("nonexistent", &mut ctx)
+        let err = HelpCommand
+            .execute("nonexistent", &mut ctx)
             .await
             .unwrap_err();
         assert!(matches!(err, CommandError::UserError(_)));
@@ -748,7 +811,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             CommandError::UserError(msg) => {
-                assert!(msg.contains("foobar"), "error should mention the bad command name");
+                assert!(
+                    msg.contains("foobar"),
+                    "error should mention the bad command name"
+                );
             }
             other => panic!("expected UserError, got: {other:?}"),
         }
@@ -766,7 +832,10 @@ mod tests {
         };
 
         // /model with args switches directly (no interactive selector)
-        let result = ModelCommand.execute("deepseek-chat", &mut ctx).await.unwrap();
+        let result = ModelCommand
+            .execute("deepseek-chat", &mut ctx)
+            .await
+            .unwrap();
         assert!(matches!(result, CommandResult::Continue));
         // Config.model should be updated
         assert_eq!(ctx.config.model, "deepseek-chat");
@@ -784,7 +853,10 @@ mod tests {
             state: &mut state_store,
         };
 
-        let result = ModelCommand.execute("deepseek-reasoner", &mut ctx).await.unwrap();
+        let result = ModelCommand
+            .execute("deepseek-reasoner", &mut ctx)
+            .await
+            .unwrap();
         assert!(matches!(result, CommandResult::Continue));
         assert_eq!(ctx.config.model, "deepseek-reasoner");
     }
@@ -809,7 +881,10 @@ mod tests {
             .unwrap();
 
         // Run a turn to add messages
-        agent.run_turn(agent_loop::AgentInput::text("hi")).await.unwrap();
+        agent
+            .run_turn(agent_loop::AgentInput::text("hi"))
+            .await
+            .unwrap();
         assert!(!agent.session_messages().is_empty());
 
         let mut config = test_config();
@@ -881,7 +956,10 @@ mod tests {
             .build()
             .unwrap();
 
-        agent.run_turn(agent_loop::AgentInput::text("hi")).await.unwrap();
+        agent
+            .run_turn(agent_loop::AgentInput::text("hi"))
+            .await
+            .unwrap();
         assert!(!agent.session_messages().is_empty());
 
         let mut config = test_config();
@@ -1058,8 +1136,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "login", "logout", "model", "new", "compact", "status",
-                "copy", "export", "quit"
+                "help", "login", "logout", "model", "new", "compact", "status", "copy", "export",
+                "quit"
             ]
         );
     }

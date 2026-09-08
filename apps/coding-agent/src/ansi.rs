@@ -56,15 +56,21 @@ pub(crate) mod tests {
         fn new() -> Self {
             let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
             let previous = env::var_os("NO_COLOR");
-            unsafe { env::set_var("NO_COLOR", "1"); }
+            unsafe {
+                env::set_var("NO_COLOR", "1");
+            }
             NoColorGuard { previous, _lock }
         }
     }
     impl Drop for NoColorGuard {
         fn drop(&mut self) {
             match &self.previous {
-                Some(v) => unsafe { env::set_var("NO_COLOR", v); },
-                None => unsafe { env::remove_var("NO_COLOR"); },
+                Some(v) => unsafe {
+                    env::set_var("NO_COLOR", v);
+                },
+                None => unsafe {
+                    env::remove_var("NO_COLOR");
+                },
             }
         }
     }
@@ -72,7 +78,9 @@ pub(crate) mod tests {
     /// Wrap a closure with the env lock held and NO_COLOR unset.
     fn with_color_enabled<F: FnOnce()>(f: F) {
         let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { env::remove_var("NO_COLOR"); }
+        unsafe {
+            env::remove_var("NO_COLOR");
+        }
         f();
     }
 

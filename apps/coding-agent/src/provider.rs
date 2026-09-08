@@ -175,8 +175,7 @@ impl ProviderRegistry {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms)
-                .map_err(|e| format!("set permissions: {e}"))?;
+            std::fs::set_permissions(&path, perms).map_err(|e| format!("set permissions: {e}"))?;
         }
 
         Ok(())
@@ -225,7 +224,8 @@ impl ProviderRegistry {
 
         match Self::fetch_models(api_base, api_key).await {
             FetchModelsResult::Success(models) => {
-                self.model_cache.insert(api_base.to_string(), models.clone());
+                self.model_cache
+                    .insert(api_base.to_string(), models.clone());
                 models
             }
             FetchModelsResult::AuthError(_) | FetchModelsResult::NetworkError(_) => {
@@ -426,7 +426,12 @@ mod tests {
 
         let metadata = std::fs::metadata(&auth_path).unwrap();
         let mode = metadata.permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "auth.json should have 0600 permissions, got {:#o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "auth.json should have 0600 permissions, got {:#o}",
+            mode & 0o777
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

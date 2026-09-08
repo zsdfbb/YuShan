@@ -28,8 +28,7 @@ impl Config {
         let api_key = std::env::var("YUSHAN_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
-        let model = std::env::var("YUSHAN_MODEL")
-            .unwrap_or_else(|_| "deepseek-chat".into());
+        let model = std::env::var("YUSHAN_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
 
         Ok(Self {
@@ -167,7 +166,11 @@ mod tests {
                 "model": "deepseek-chat"
             }
         });
-        std::fs::write(&auth_path, serde_json::to_string_pretty(&auth_data).unwrap()).unwrap();
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&auth_data).unwrap(),
+        )
+        .unwrap();
 
         // Create Config with no env vars (not configured)
         unsafe {

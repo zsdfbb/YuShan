@@ -15,8 +15,8 @@ use agent_runtime::Agent;
 /// A slash command that can be registered in the CommandRegistry.
 #[async_trait]
 #[allow(dead_code)] // description / arg_hint are part of the public Command
-                   // contract but not consumed by v0 render paths (completer
-                   // uses its own CmdEntry; /help reads builtin_help_entries).
+// contract but not consumed by v0 render paths (completer
+// uses its own CmdEntry; /help reads builtin_help_entries).
 pub trait Command: Send + Sync {
     /// Command name without the leading `/` (e.g., "help", "model").
     fn name(&self) -> &str;
@@ -90,7 +90,9 @@ impl CommandRegistry {
 
     /// Look up a command by name (without leading `/`).
     pub fn get(&self, name: &str) -> Option<&dyn Command> {
-        self.by_name.get(name).map(|&idx| self.commands[idx].as_ref())
+        self.by_name
+            .get(name)
+            .map(|&idx| self.commands[idx].as_ref())
     }
 
     /// All commands in registration order.
@@ -114,9 +116,11 @@ impl CommandRegistry {
             None => (without_slash, ""),
         };
 
-        let cmd = self
-            .get(name)
-            .ok_or_else(|| CommandError::UserError(format!("unknown command: /{name}.\nType /help for available commands.")))?;
+        let cmd = self.get(name).ok_or_else(|| {
+            CommandError::UserError(format!(
+                "unknown command: /{name}.\nType /help for available commands."
+            ))
+        })?;
 
         cmd.execute(args, ctx).await
     }

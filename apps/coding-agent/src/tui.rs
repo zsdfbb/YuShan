@@ -11,8 +11,8 @@
 
 use agent_loop::AgentInput;
 use agent_runtime::Agent;
-use rustyline::history::DefaultHistory;
 use rustyline::Editor;
+use rustyline::history::DefaultHistory;
 use std::io::{self};
 use std::time::Instant;
 

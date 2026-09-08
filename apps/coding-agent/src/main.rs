@@ -2,19 +2,22 @@ mod ansi;
 mod commands;
 mod config;
 mod format;
-mod provider;
 mod prompt;
+mod provider;
 mod state;
 mod status;
-mod tui;
 mod tui_completer;
 mod view;
 
+#[cfg(feature = "tui-ratatui")]
+mod ui;
+
+#[cfg(feature = "tui-stdout")]
+mod tui;
+
 use agent_event::NoopEventSink;
 use agent_loop::AgentInput;
-use agent_model_openai_compatible::{
-    OpenAICompatibleConfig, OpenAICompatibleModel,
-};
+use agent_model_openai_compatible::{OpenAICompatibleConfig, OpenAICompatibleModel};
 use agent_runtime::AgentBuilder;
 use agent_session::MemorySession;
 use agent_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
@@ -90,13 +93,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command_registry = commands::build_registry();
 
     // Parse simple args
-    let task = if args.len() > 2 && args[1] == "-p" {
-        // Print mode: yushan-coding-agent -p "task"
-        Some(args[2..].join(" "))
-    } else {
-        // Interactive mode
-        None
-    };
+    let mut stdout_mode = false;
+    let mut task: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--stdout" => stdout_mode = true,
+            "-p" => {
+                if i + 1 < args.len() {
+                    task = Some(args[i + 1..].join(" "));
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 
     // Build system prompt
     let cwd = config.cwd.clone();
@@ -161,16 +173,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        // Interactive mode. Unconfigured state is communicated by the banner's
-        // "(not configured)" placeholders — no separate multi-line hint needed.
-        tui::run_interactive(
-            &mut agent,
-            &mut config,
-            &command_registry,
-            &mut stats,
-            &mut state_store,
-        )
-        .await?;
+        // Interactive mode. The active UI is selected at compile time via the
+        // `tui-ratatui` / `tui-stdout` feature flag, then further refined at
+        // runtime by the `--stdout` flag (which only succeeds under
+        // `tui-stdout`).
+        match (
+            stdout_mode,
+            cfg!(feature = "tui-ratatui"),
+            cfg!(feature = "tui-stdout"),
+        ) {
+            #[cfg(feature = "tui-stdout")]
+            (true, _, true) => {
+                tui::run_interactive(
+                    &mut agent,
+                    &mut config,
+                    &command_registry,
+                    &mut stats,
+                    &mut state_store,
+                )
+                .await?;
+            }
+            #[cfg(feature = "tui-ratatui")]
+            (false, true, _) => {
+                ui::run(
+                    &mut agent,
+                    &mut config,
+                    &command_registry,
+                    &mut stats,
+                    &mut state_store,
+                )
+                .await?;
+            }
+            _ => {
+                eprintln!(
+                    "Configuration mismatch: --stdout requires feature `tui-stdout` (default: tui-ratatui)."
+                );
+                eprintln!(
+                    "Build with: cargo build --release --no-default-features --features tui-stdout"
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())

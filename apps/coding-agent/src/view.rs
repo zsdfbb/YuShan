@@ -23,8 +23,8 @@ use crate::status::TurnStats;
 /// completer (groups E / D).
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // description / arg_hint are consumed by /help and the completer
-                   // (tui_completer + format.rs); the v0 code path doesn't reach
-                   // them yet but the fields are part of the public data model.
+// (tui_completer + format.rs); the v0 code path doesn't reach
+// them yet but the fields are part of the public data model.
 pub struct CommandMeta {
     pub name: &'static str,
     pub description: &'static str,
@@ -95,7 +95,7 @@ impl AppView {
             tools: agent.tool_names(),
             context_window: Some(agent.context_window()),
             is_first_run,
-            commands: Vec::new(),      // populated by caller
+            commands: Vec::new(), // populated by caller
         }
     }
 

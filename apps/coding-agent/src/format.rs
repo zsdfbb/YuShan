@@ -6,29 +6,17 @@ use crate::prompt;
 use crate::view::AppView;
 
 /// Startup banner. Called once at the top of the interactive loop.
+/// Only shows startup-class information (version, capabilities, help hint).
+/// Runtime state (provider / model / cwd / tokens) lives in the footer.
 pub fn print_banner<W: Write>(out: &mut W, view: &AppView) -> io::Result<()> {
     writeln!(
         out,
         "{}",
         crate::ansi::bold(&format!("YuShan Coding Agent v{}", view.version))
     )?;
-    writeln!(
-        out,
-        "Provider: {} | Model: {} | Dir: {}",
-        view.provider.as_deref().unwrap_or("(not configured)"),
-        view.model.as_deref().unwrap_or("(not configured)"),
-        prompt::format_cwd_tilde(&view.cwd),
-    )?;
     if !view.tools.is_empty() {
-        writeln!(out, "Tools:     {}", view.tools.join(", "))?;
+        writeln!(out, "Tools: {}", view.tools.join(", "))?;
     }
-    writeln!(
-        out,
-        "Config:    {} ({} providers, {} logged in)",
-        view.config_path.display(),
-        view.total_known_providers,
-        view.logged_in_providers.len()
-    )?;
     writeln!(out, "Type /help for commands, 'exit' to quit")?;
     writeln!(out)
 }
@@ -176,7 +164,7 @@ mod tests {
             turn_count: 1,
             session_started: Instant::now(),
             message_count: 0,
-            tools: vec![],
+            tools: vec!["read".into(), "write".into(), "edit".into(), "bash".into()],
             context_window: None,
             is_first_run: false,
             commands: vec![],
@@ -219,26 +207,53 @@ mod tests {
     }
 
     #[test]
-    fn test_print_banner_uses_view() {
+    fn test_print_banner_omits_runtime_state() {
+        // Banner shows startup-class info only (version + tools + hint).
+        // Runtime state (provider / model / cwd / config path) belongs in
+        // the footer, not here.
         let mut buf = Vec::new();
         let view = make_view();
         print_banner(&mut buf, &view).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("YuShan Coding Agent"));
-        assert!(out.contains("Provider: deepseek"));
-        assert!(out.contains("Model: deepseek-chat"));
-        assert!(out.contains("/help"));
+        assert!(out.contains("Tools: read, write, edit, bash"));
+        assert!(out.contains("Type /help"));
+        // Must NOT contain runtime state
+        assert!(!out.contains("Provider:"));
+        assert!(!out.contains("Model:"));
+        assert!(!out.contains("Config:"));
+        assert!(!out.contains("Dir:"));
     }
 
     #[test]
-    fn test_print_banner_unconfigured() {
-        let mut view = make_view();
-        view.provider = None;
-        view.model = None;
+    fn test_print_banner_omits_tools_when_empty() {
         let mut buf = Vec::new();
+        let mut view = make_view();
+        view.tools.clear();
         print_banner(&mut buf, &view).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("(not configured)"));
+        assert!(out.contains("YuShan Coding Agent"));
+        assert!(!out.contains("Tools:"));
+    }
+
+    #[test]
+    fn test_print_banner_layout() {
+        // Verify exact line layout: title + tools + help + trailing newline
+        let mut buf = Vec::new();
+        let view = make_view();
+        print_banner(&mut buf, &view).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // print_banner emits title \n tools \n help \n \n — split('\n')
+        // yields [title, tools, help, "", ""] (the trailing \n splits once
+        // into a "" then nothing after; the function ends without trailing \n,
+        // so split produces the 4-part expected).
+        let parts: Vec<&str> = out.split('\n').collect();
+        assert_eq!(parts.len(), 5, "banner should be 5 parts (title + tools + help + empty + empty from trailing \\n), got {parts:?}");
+        assert!(parts[0].contains("YuShan Coding Agent"));
+        assert!(parts[1].starts_with("Tools:"));
+        assert!(parts[2].starts_with("Type /help"));
+        assert_eq!(parts[3], "");
+        assert_eq!(parts[4], "");
     }
 
     #[test]
@@ -317,36 +332,6 @@ mod tests {
         assert!(out.contains("Turns:      1"));
         assert!(out.contains("↑320"));
         assert!(out.contains("↓1.2k"));
-    }
-
-    #[test]
-    fn test_print_banner_includes_tools_and_config() {
-        let mut buf = Vec::new();
-        let mut view = make_view();
-        view.version = "0.2.0";
-        view.tools = vec!["read".into(), "write".into(), "edit".into(), "bash".into()];
-        view.total_known_providers = 3;
-        view.logged_in_providers = vec!["deepseek".into()];
-        print_banner(&mut buf, &view).unwrap();
-        let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("YuShan Coding Agent v0.2.0"));
-        assert!(out.contains("Tools:     read, write, edit, bash"));
-        assert!(out.contains("Config:"));
-        assert!(out.contains("3 providers"));
-        assert!(out.contains("1 logged in"));
-    }
-
-    #[test]
-    fn test_print_banner_omits_tools_when_empty() {
-        // Empty tool list should not produce a "Tools:" line — keeps banner
-        // tight when no tools are registered (e.g. test harness).
-        let mut buf = Vec::new();
-        let view = make_view();
-        assert!(view.tools.is_empty());
-        print_banner(&mut buf, &view).unwrap();
-        let out = String::from_utf8(buf).unwrap();
-        assert!(!out.contains("Tools:"));
-        assert!(out.contains("Config:"));
     }
 
     #[test]

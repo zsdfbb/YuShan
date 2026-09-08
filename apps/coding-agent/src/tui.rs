@@ -37,10 +37,9 @@ pub async fn run_interactive(
     let mut view = build_view(config, agent, state_store, stats, session_started);
     inject_command_meta(&mut view, commands);
 
-    // One-shot banner + first footer.
+    // One-shot first-run hint + banner + first footer.
     if view.is_first_run {
-        println!("Welcome to YuShan!");
-        println!("No API credentials found. Run /login to set up your provider.");
+        println!("No API credentials. Run /login to set up your provider.");
         println!();
     }
     {

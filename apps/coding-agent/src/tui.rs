@@ -4,14 +4,18 @@ use std::io::{self, Write};
 
 use crate::commands::{CommandContext, CommandRegistry, CommandResult};
 use crate::config::Config;
+use crate::format;
+use crate::status::TurnStats;
 
 pub async fn run_interactive(
     agent: &mut Agent,
     config: &mut Config,
     commands: &CommandRegistry,
+    stats: &mut TurnStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("YuShan Coding Agent (type /help for commands, 'exit' to quit)");
-    println!();
+    let mut stdout = io::stdout().lock();
+    format::print_banner(&mut stdout, config, agent.model_id())?;
+    drop(stdout);
 
     loop {
         print!("> ");
@@ -60,6 +64,11 @@ pub async fn run_interactive(
                         }
                     }
                 }
+                println!();
+                let mut stdout = io::stdout().lock();
+                stats.record(&result.usage);
+                format::print_turn_summary(&mut stdout, stats, result.rounds, &result.stop_reason)?;
+                drop(stdout);
                 println!();
             }
             Err(e) => {

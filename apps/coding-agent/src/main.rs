@@ -1,10 +1,14 @@
+mod ansi;
 mod commands;
 mod config;
 mod format;
 mod provider;
 mod prompt;
+mod state;
 mod status;
 mod tui;
+mod tui_completer;
+mod view;
 
 use agent_event::NoopEventSink;
 use agent_loop::AgentInput;
@@ -23,16 +27,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load saved credentials from auth.json
     config.registry.load_auth();
 
+    // Load saved session state from state.json
+    let mut state_store = state::StateStore::new();
+    let saved_state = state_store.load();
+
     // Startup recovery: if env vars don't provide full credentials,
-    // try to restore from auth.json by finding the first stored provider.
+    // try to restore from state.json (last-active provider+model) first,
+    // then fall back to the first provider with stored auth.
     if !config.is_configured() {
-        for provider in config.registry.providers() {
-            if let Some(entry) = config.registry.auth_for(&provider.name) {
-                config.api_base = Some(entry.api_base.clone());
-                config.api_key = Some(entry.api_key.clone());
-                config.model = entry.model.clone();
-                config.provider = Some(provider.name.clone());
-                break;
+        // Try state.json recovery: last_active_provider + matching auth entry
+        let recovered = saved_state
+            .last_active_provider
+            .as_deref()
+            .and_then(|name| config.registry.find_provider(name))
+            .zip(
+                saved_state
+                    .last_active_provider
+                    .as_deref()
+                    .and_then(|name| config.registry.auth_for(name)),
+            );
+
+        if let Some((provider, entry)) = recovered {
+            config.api_base = Some(entry.api_base.clone());
+            config.api_key = Some(entry.api_key.clone());
+            config.model = saved_state
+                .last_active_model
+                .clone()
+                .unwrap_or_else(|| entry.model.clone());
+            config.provider = Some(provider.name.clone());
+        } else {
+            // Fallback: first provider with stored credentials
+            for provider in config.registry.providers() {
+                if let Some(entry) = config.registry.auth_for(&provider.name) {
+                    config.api_base = Some(entry.api_base.clone());
+                    config.api_key = Some(entry.api_key.clone());
+                    config.model = entry.model.clone();
+                    config.provider = Some(provider.name.clone());
+                    break;
+                }
             }
         }
     }
@@ -131,7 +163,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Interactive mode. Unconfigured state is communicated by the banner's
         // "(not configured)" placeholders — no separate multi-line hint needed.
-        tui::run_interactive(&mut agent, &mut config, &command_registry, &mut stats).await?;
+        tui::run_interactive(
+            &mut agent,
+            &mut config,
+            &command_registry,
+            &mut stats,
+            &mut state_store,
+        )
+        .await?;
     }
 
     Ok(())

@@ -9,10 +9,14 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::config::Config;
+use crate::state::StateStore;
 use agent_runtime::Agent;
 
 /// A slash command that can be registered in the CommandRegistry.
 #[async_trait]
+#[allow(dead_code)] // description / arg_hint are part of the public Command
+                   // contract but not consumed by v0 render paths (completer
+                   // uses its own CmdEntry; /help reads builtin_help_entries).
 pub trait Command: Send + Sync {
     /// Command name without the leading `/` (e.g., "help", "model").
     fn name(&self) -> &str;
@@ -37,6 +41,7 @@ pub trait Command: Send + Sync {
 pub struct CommandContext<'a> {
     pub agent: &'a mut Agent,
     pub config: &'a mut Config,
+    pub state: &'a mut StateStore,
 }
 
 /// What the TUI loop should do after a command finishes.
@@ -226,9 +231,11 @@ mod tests {
             .build()
             .unwrap();
         let mut config = Config::from_env().unwrap();
+        let mut state_store = crate::state::StateStore::new();
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
+            state: &mut state_store,
         };
         let result = reg.execute("/nonexistent", &mut ctx).await;
         assert!(result.is_err());

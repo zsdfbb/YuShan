@@ -43,6 +43,11 @@ impl ToolRegistry {
         &self.specs
     }
 
+    /// Get all tool names (borrowed from cached specs, zero allocation).
+    pub fn names(&self) -> Vec<&str> {
+        self.specs.iter().map(|s| s.name.as_str()).collect()
+    }
+
     /// Number of registered tools
     pub fn len(&self) -> usize {
         self.tools.len()
@@ -51,5 +56,47 @@ impl ToolRegistry {
     /// Check if registry is empty
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Tool, ToolContext, ToolResult, ToolSpec};
+
+    struct MockTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for MockTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.0, "desc", serde_json::json!({}))
+        }
+
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn test_names_returns_all_tool_names() {
+        let registry = ToolRegistry::build(vec![
+            Box::new(MockTool("read")),
+            Box::new(MockTool("write")),
+        ])
+        .unwrap();
+        let names = registry.names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"write"));
+    }
+
+    #[test]
+    fn test_names_empty_registry() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        assert!(registry.names().is_empty());
     }
 }

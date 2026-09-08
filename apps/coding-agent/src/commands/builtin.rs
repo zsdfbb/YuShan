@@ -495,27 +495,15 @@ impl Command for StatusCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        let model_id = ctx.agent.model_id().unwrap_or("none");
-        let base = match &ctx.config.api_base {
-            Some(b) => {
-                // Mask the URL for security
-                if b.len() > 20 {
-                    format!("{}...{}", &b[..12], &b[b.len() - 6..])
-                } else {
-                    b.clone()
-                }
-            }
-            None => "not set".into(),
-        };
-        let has_key = ctx.config.api_key.is_some();
-        let cwd = ctx.config.cwd.display();
-        let configured = ctx.agent.is_configured();
-
-        println!("Model:        {model_id}");
-        println!("API base:     {base}");
-        println!("API key:      {}", if has_key { "set" } else { "not set" });
-        println!("Working dir:  {cwd}");
-        println!("Configured:   {configured}");
+        // v0: token totals are not shown because TurnStats is owned by main.rs and not
+        // threaded through CommandContext. Future work: extend CommandContext with
+        // &mut TurnStats (or Arc<Mutex<>>).
+        let model_id = ctx.agent.model_id();
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let stats = crate::status::TurnStats::default();
+        crate::format::render_status(&mut out, ctx.config, model_id, &stats)
+            .map_err(|e| CommandError::Internal(e.to_string()))?;
         Ok(CommandResult::Continue)
     }
 }

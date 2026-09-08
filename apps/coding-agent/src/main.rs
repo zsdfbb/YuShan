@@ -1,7 +1,9 @@
 mod commands;
 mod config;
+mod format;
 mod provider;
 mod prompt;
+mod status;
 mod tui;
 
 use agent_event::NoopEventSink;
@@ -104,6 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut agent = builder.build()?;
 
+    let mut stats = status::TurnStats::default();
+
     if let Some(task) = task {
         // Print mode — requires model
         if !agent.is_configured() {
@@ -125,14 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        // Interactive mode
-        if !agent.is_configured() {
-            println!("No API credentials configured. Use /login to set up, or set environment variables:");
-            println!("  YUSHAN_API_BASE  — API endpoint URL");
-            println!("  YUSHAN_API_KEY   — API authentication key");
-            println!();
-        }
-        tui::run_interactive(&mut agent, &mut config, &command_registry).await?;
+        // Interactive mode. Unconfigured state is communicated by the banner's
+        // "(not configured)" placeholders — no separate multi-line hint needed.
+        tui::run_interactive(&mut agent, &mut config, &command_registry, &mut stats).await?;
     }
 
     Ok(())

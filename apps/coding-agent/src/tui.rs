@@ -37,7 +37,8 @@ pub async fn run_interactive(
     let mut view = build_view(config, agent, state_store, stats, session_started);
     inject_command_meta(&mut view, commands);
 
-    // One-shot first-run hint + banner + first footer.
+    // One-shot first-run hint + banner. The first footer will be
+    // emitted by the loop entry (`view_dirty = true`).
     if view.is_first_run {
         println!("No API credentials. Run /login to set up your provider.");
         println!();
@@ -45,7 +46,6 @@ pub async fn run_interactive(
     {
         let mut stdout = io::stdout().lock();
         format::print_banner(&mut stdout, &view)?;
-        format::print_footer(&mut stdout, &view)?;
     }
 
     // Build rustyline + completer from the same command metadata.

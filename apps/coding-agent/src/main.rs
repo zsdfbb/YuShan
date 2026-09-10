@@ -6,14 +6,10 @@ mod prompt;
 mod provider;
 mod state;
 mod status;
-mod tui_completer;
 mod view;
 
 #[cfg(feature = "tui-ratatui")]
 mod ui;
-
-#[cfg(feature = "tui-stdout")]
-mod tui;
 
 use agent_event::NoopEventSink;
 use agent_loop::AgentInput;
@@ -93,12 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command_registry = commands::build_registry();
 
     // Parse simple args
-    let mut stdout_mode = false;
     let mut task: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--stdout" => stdout_mode = true,
             "-p" => {
                 if i + 1 < args.len() {
                     task = Some(args[i + 1..].join(" "));
@@ -173,46 +167,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        // Interactive mode. The active UI is selected at compile time via the
-        // `tui-ratatui` / `tui-stdout` feature flag, then further refined at
-        // runtime by the `--stdout` flag (which only succeeds under
-        // `tui-stdout`).
-        match (
-            stdout_mode,
-            cfg!(feature = "tui-ratatui"),
-            cfg!(feature = "tui-stdout"),
-        ) {
-            #[cfg(feature = "tui-stdout")]
-            (true, _, true) => {
-                tui::run_interactive(
-                    &mut agent,
-                    &mut config,
-                    &command_registry,
-                    &mut stats,
-                    &mut state_store,
-                )
-                .await?;
-            }
-            #[cfg(feature = "tui-ratatui")]
-            (false, true, _) => {
-                ui::run(
-                    &mut agent,
-                    &mut config,
-                    &command_registry,
-                    &mut stats,
-                    &mut state_store,
-                )
-                .await?;
-            }
-            _ => {
-                eprintln!(
-                    "Configuration mismatch: --stdout requires feature `tui-stdout` (default: tui-ratatui)."
-                );
-                eprintln!(
-                    "Build with: cargo build --release --no-default-features --features tui-stdout"
-                );
-                std::process::exit(1);
-            }
+        // Interactive mode — ratatui only (tui-stdout path removed in c phase).
+        // `state_store` 与恢复逻辑已在入口早期完成（line 33-73）。
+        #[cfg(feature = "tui-ratatui")]
+        {
+            ui::run(
+                &mut agent,
+                &mut config,
+                &command_registry,
+                &mut stats,
+                &mut state_store,
+            )
+            .await?;
+        }
+        #[cfg(not(feature = "tui-ratatui"))]
+        {
+            return Err("ratatui mode required for interactive TUI; build with --features tui-ratatui".into());
         }
     }
 

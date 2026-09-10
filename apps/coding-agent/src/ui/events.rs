@@ -2,9 +2,18 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::tui_completer::CmdEntry;
-
 use super::app::{App, CompletionItem, CompletionState};
+
+/// Metadata for one slash command, used by Tab completion.
+///
+/// **c phase**：原 `crate::tui_completer::CmdEntry` 复制到 `ui/events.rs` 内部；
+/// ratatui 模式不依赖 rustyline（rustyline 已在 c 阶段删除）。
+#[derive(Clone)]
+pub struct CmdEntry {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub arg_hint: Option<&'static str>,
+}
 
 /// 处理单个 Event。App 状态变化由事件驱动。
 pub fn handle_event(event: Event, app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
@@ -26,9 +35,12 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<(), Box<dyn std::error::Er
         return handle_completion_key(key, app);
     }
 
-    // 2. Ctrl-C
+    // 2. Ctrl-C — 调 token.cancel()（不需 &mut Agent）
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.cancel_requested = true;
+        if let Some(token) = app.cancel_token.as_ref() {
+            token.cancel();
+        }
+        app.cancel_requested = true; // 意图标记（debug 观测）
         return Ok(());
     }
 
@@ -38,10 +50,19 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<(), Box<dyn std::error::Er
         return Ok(());
     }
 
-    // 4. Esc 清空 input
+    // 4. Esc — turn 进行中触发取消；idle 清空 input
     if key.code == KeyCode::Esc {
-        app.input.clear();
-        app.input_cursor = 0;
+        if app.is_turning {
+            // turn 进行中：触发取消（与 Ctrl-C 等效）
+            if let Some(token) = app.cancel_token.as_ref() {
+                token.cancel();
+            }
+            app.cancel_requested = true;
+        } else {
+            // idle：保留旧行为 —— 清空 input
+            app.input.clear();
+            app.input_cursor = 0;
+        }
         return Ok(());
     }
 
@@ -196,4 +217,86 @@ struct CmdPair {
 /// 一致）。max scroll = transcript 行数 - 1（保证至少 1 行可见）。
 fn compute_max_scroll(app: &App) -> usize {
     app.transcript.len().saturating_sub(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    use agent_core::CancelToken;
+
+    use super::handle_key;
+    use crate::view::AppView;
+    use crate::ui::app::App;
+
+    /// 构造一个测试 App：view 是 placeholder，cancel_token 已挂。
+    fn make_test_app() -> App {
+        let view = AppView {
+            cwd: PathBuf::from("/tmp"),
+            provider: None,
+            model: None,
+            config_path: PathBuf::from("/tmp/auth.json"),
+            logged_in_providers: vec![],
+            total_known_providers: 0,
+            version: "test",
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            turn_count: 0,
+            session_started: Instant::now(),
+            message_count: 0,
+            tools: vec![],
+            context_window: None,
+            is_first_run: false,
+            commands: vec![],
+        };
+        let mut app = App::new(view);
+        app.cancel_token = Some(CancelToken::new());
+        app
+    }
+
+    /// Esc 在 turn 进行中应触发 cancel。
+    #[test]
+    fn test_esc_cancels_running_turn() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_test_app();
+        app.is_turning = true;
+        let token = app.cancel_token.as_ref().unwrap().clone();
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(key, &mut app).unwrap();
+
+        assert!(token.is_cancelled(), "Esc during turn should trigger cancel");
+    }
+
+    /// Esc 在 idle 时应清空 input（保留旧行为），不触发 cancel。
+    #[test]
+    fn test_esc_idle_clears_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_test_app();
+        app.is_turning = false;
+        let token = app.cancel_token.as_ref().unwrap().clone();
+        app.input = "/mo".to_string();
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(key, &mut app).unwrap();
+
+        assert!(!token.is_cancelled(), "Esc when idle should NOT cancel");
+        assert_eq!(app.input, "", "Esc when idle should clear input");
+    }
+
+    /// Ctrl-C 总是触发 cancel（不论 is_turning）；idle 时不修改 input。
+    #[test]
+    fn test_ctrl_c_always_cancels() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_test_app();
+        app.is_turning = false; // 即使 idle
+        let token = app.cancel_token.as_ref().unwrap().clone();
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(key, &mut app).unwrap();
+
+        assert!(token.is_cancelled(), "Ctrl-C should always cancel");
+        assert_eq!(app.input, "", "Ctrl-C should NOT clear input (idle)");
+    }
 }

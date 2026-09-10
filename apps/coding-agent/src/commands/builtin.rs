@@ -557,35 +557,14 @@ impl Command for StatusCommand {
         _args: &str,
         // In `tui-ratatui` mode the status panel is rendered directly by
         // `ui/draw::draw_status_panel`, so /status is a no-op and `ctx` is unused.
-        // In `tui-stdout` mode we read ctx.{config,agent,state} below.
-        #[cfg_attr(feature = "tui-ratatui", allow(unused_variables))] ctx: &mut CommandContext<'_>,
+        // **c phase**: `tui-stdout` 已删除；tui-stdout 路径下的 `render_status` 调用
+        // 也随 tui-stdout feature 一起删除；/status 在 ratatui 模式仅作为 ui 面板
+        // 入口（draw_status_panel 自动渲染）。
+        _ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
         // v0: token totals are not shown because TurnStats is owned by main.rs and not
         // threaded through CommandContext. Future work: extend CommandContext with
         // &mut TurnStats (or Arc<Mutex<>>).
-        //
-        // Grouping B: build a temporary AppView using the real `from_sources` constructor
-        // (passing through `ctx.state`). Token fields default to 0 since stats is not in ctx.
-        //
-        // `render_status` is gated to `tui-stdout`; in `tui-ratatui` mode the status
-        // panel is rendered directly by `ui/draw::draw_status_panel`, so /status is a
-        // no-op there.
-        #[cfg(feature = "tui-stdout")]
-        {
-            let stats = crate::status::TurnStats::default();
-            let snapshot = crate::view::AppView::from_sources(
-                ctx.config,
-                ctx.agent,
-                &ctx.config.registry,
-                ctx.state,
-                &stats,
-                std::time::Instant::now(),
-            );
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            crate::format::render_status(&mut out, &snapshot)
-                .map_err(|e| CommandError::Internal(e.to_string()))?;
-        }
         Ok(CommandResult::Continue)
     }
 }

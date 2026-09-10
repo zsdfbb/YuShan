@@ -24,6 +24,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use tokio::time::interval;
 
+use agent_core::CancelToken;
 use agent_runtime::Agent;
 
 use crate::commands::CommandRegistry;
@@ -45,7 +46,7 @@ pub async fn run(
     let mut terminal = setup_terminal()?;
 
     let session_started = Instant::now();
-    let app = App::new(crate::view::AppView::from_sources(
+    let mut app = App::new(crate::view::AppView::from_sources(
         config,
         agent,
         &config.registry,
@@ -53,6 +54,10 @@ pub async fn run(
         stats,
         session_started,
     ));
+
+    // 启动时构造 cancel token clone，写进 App（events.rs / Esc-Ctrl-C 分流用）
+    let cancel_token = agent.cancel_handle();
+    app.cancel_token = Some(cancel_token);
 
     let result = event_loop(
         &mut terminal,
@@ -204,7 +209,7 @@ async fn dispatch_input(
     let t0 = Instant::now();
     let turn_input = AgentInput::text(&input);
 
-    let turn_result = run_turn_with_ticks(agent, turn_input).await;
+    let turn_result = run_turn_with_ticks(agent, turn_input, agent.cancel_handle()).await;
     let elapsed = t0.elapsed().as_secs_f32();
 
     app.is_turning = false;
@@ -240,18 +245,35 @@ async fn dispatch_input(
     Ok(())
 }
 
-/// R3 阶段 — agent.run_turn 直通。
+/// R3 阶段 — agent.run_turn 直通 + Ctrl-C 中断（select! 三路）。
 ///
-/// 100ms tick 由外层 event_loop 处理（`is_turning` 时刷新 view）；
-/// Ctrl-C 由 events.rs 捕获并设置 `app.cancel_requested`，agent 的
-/// BasicLoop 在 round 间检查 cancel token，当前迭代自然完成后返回
-/// Cancelled。R3 阶段不实现 turn 中途立即中断。
+/// 100ms tick 由 select! 第二路处理（view refresh 由 event_loop 外层判断）；
+/// Ctrl-C 由 select! 第三路捕获，触发 `cancel_token.cancel()`，BasicLoop
+/// 在 round 边界检测 cancel 后返回 `Ok(RunResult { stop_reason: Cancelled, .. })`，
+/// turn_fut 自然完成。不 drop future — 走 Ok 分支。
 async fn run_turn_with_ticks(
     agent: &mut Agent,
     input: agent_loop::AgentInput,
+    cancel_token: CancelToken,
 ) -> Result<agent_loop::RunResult, Box<dyn std::error::Error>> {
-    agent
-        .run_turn(input)
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    use std::time::Duration;
+
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut turn_fut = Box::pin(agent.run_turn(input));
+
+    loop {
+        tokio::select! {
+            biased;
+            // 1. turn 完成（自然 / Cancelled 都会走这里 — BasicLoop 返回 Ok(.. stop_reason: Cancelled)）
+            res = &mut turn_fut => {
+                return res.map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
+            }
+            // 2. 100ms tick — view_dirty 由 is_turning 在 event_loop 外层判断
+            _ = tick.tick() => { /* view 由 event_loop refresh */ }
+            // 3. Ctrl-C — 触发 cancel，turn_fut 不 drop，等 round 边界 BasicLoop 检测 cancel 返回 Cancelled
+            _ = tokio::signal::ctrl_c() => {
+                cancel_token.cancel();
+            }
+        }
+    }
 }

@@ -97,6 +97,21 @@ impl Agent {
         self.cancel.cancel();
     }
 
+    /// Clone-able handle to the internal cancel token.
+    ///
+    /// 返回的 `CancelToken` 与 `self.cancel` 共享底层 `Arc<AtomicBool>`，
+    /// 调用方可在 `tokio::select!` 内持 `cancel_token.cancel()` 而无需借用 `&mut Agent`。
+    ///
+    /// Why `&self` (not `&mut self`): `run_turn(input).await` 借用 `&mut Agent` 整生命周期；
+    /// select! 内调 `agent.cancel(&mut self)` 与 `&mut turn_fut` borrow 冲突（E0499）。
+    /// 返回 Clone handle 让调用方跨借用边界触发取消。
+    ///
+    /// 与 `cancel(&mut self)` 共存；后者保留向后兼容（未来若 BasicLoop 加 abort 回调需要 &mut self，
+    /// 仍可走 `&mut self` 路径）。
+    pub fn cancel_handle(&self) -> agent_core::CancelToken {
+        self.cancel.clone()
+    }
+
     /// Replace the model. Pass None to remove (e.g., /logout).
     pub fn set_model(&mut self, model: Option<Box<dyn Model>>) {
         self.model = model;
@@ -195,5 +210,45 @@ mod tests {
         let mut agent = agent;
         agent.cancel();
         assert!(token_clone.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_handle_is_clone_and_signals() {
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+
+        let handle = agent.cancel_handle();
+        let handle2 = handle.clone();
+        assert!(!handle.is_cancelled());
+
+        // 通过 handle 触发取消 —— 无需 &mut agent
+        handle.cancel();
+        assert!(handle2.is_cancelled()); // 共享 Arc — 立即可见
+    }
+
+    #[tokio::test]
+    async fn test_cancel_handle_triggers_cancellation() {
+        use agent_core::StopReason;
+
+        let agent = AgentBuilder::new()
+            .model(MockModel::new("test"))
+            .session(MemorySession::new())
+            .events(CollectingSink::new())
+            .build()
+            .unwrap();
+
+        let mut agent = agent;
+        let handle = agent.cancel_handle();
+
+        // 通过 handle 触发取消 —— 无需 &mut agent
+        // (BasicLoop 在入口边界检查 cancel — 命中后立即返回 Cancelled)
+        handle.cancel();
+
+        let result = agent.run_turn(agent_loop::AgentInput::text("go")).await.unwrap();
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
     }
 }

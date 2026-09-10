@@ -20,11 +20,9 @@ use crate::state::StateStore;
 use crate::status::TurnStats;
 
 /// Metadata for one slash command, used by `/help` output and the
-/// completer (groups E / D).
+/// ratatui Tab completer (ui/events.rs).
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // description / arg_hint are consumed by /help and the completer
-// (tui_completer + format.rs); the v0 code path doesn't reach
-// them yet but the fields are part of the public data model.
+#[allow(dead_code)] // description / arg_hint consumed by /help and ratatui Tab completer
 pub struct CommandMeta {
     pub name: &'static str,
     pub description: &'static str,

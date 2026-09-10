@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = ["tui-ratatui"]
 tui-ratatui = ["dep:ratatui", "dep:crossterm", "dep:futures"]
-tui-stdout = []
+# tui-stdout removed (c phase)
 
 [dependencies]
 agent-core = { path = "../../crates/agent-core" }
@@ -26,7 +26,7 @@ reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
 thiserror = "2"
 inquire = "0.8"
-rustyline = "14"
+# rustyline removed (c phase — ratatui mode handles input via crossterm events)
 
 # ratatui mode only (optional)
 ratatui = { version = "0.29", optional = true }

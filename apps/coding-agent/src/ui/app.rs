@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use agent_core::StopReason;
+use agent_core::{CancelToken, StopReason};
 
 use crate::view::AppView;
 
@@ -26,6 +26,9 @@ pub struct App {
     pub cancel_requested: bool,
     pub should_quit: bool,
     pub pending_submit: Option<String>,
+    /// Cancel token clone — event_loop 构造时 set。Esc/Ctrl-C 触发 cancel。
+    /// 由 `Agent::cancel_handle()` 拿 Clone 写进来。
+    pub cancel_token: Option<CancelToken>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +76,7 @@ impl App {
             cancel_requested: false,
             should_quit: false,
             pending_submit: None,
+            cancel_token: None, // NEW: event_loop 构造时 set
         }
     }
 

@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::app::{App, CompletionItem, CompletionState};
 
-/// Metadata for one slash command, used by Tab completion.
+/// 单个 slash command 的元数据，用于 Tab 补全。
 ///
 /// **c phase**：原 `crate::tui_completer::CmdEntry` 复制到 `ui/events.rs` 内部；
 /// ratatui 模式不依赖 rustyline（rustyline 已在 c 阶段删除）。

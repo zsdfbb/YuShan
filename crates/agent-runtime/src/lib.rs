@@ -53,7 +53,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_without_model() {
-        // Building without model is allowed — agent can start in command-only mode
+        // 允许不配置 model 构建 —— agent 可以以仅命令模式启动
         let agent = AgentBuilder::new()
             .session(MemorySession::new())
             .events(CollectingSink::new())
@@ -103,7 +103,7 @@ mod tests {
     #[tokio::test]
     async fn test_agent_run_with_limits() {
         let model = MockModel::new("test");
-        // Set up tool calls that will be executed (echo tool registered)
+        // 配置将被执行的 tool call（已注册 echo 工具）
         model.push_tool_call("echo", serde_json::json!({}));
         model.push_tool_call("echo", serde_json::json!({}));
         model.push_text("done");
@@ -119,7 +119,7 @@ mod tests {
 
         let mut agent = agent;
         let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
-        // Should hit max rounds after 2 rounds
+        // 两轮后应命中最大 round 数
         assert_eq!(result.stop_reason, StopReason::MaxRounds);
         assert_eq!(result.rounds, 2);
     }
@@ -128,7 +128,7 @@ mod tests {
     async fn test_agent_cancel_token() {
         let model = MockModel::new("test");
         let cancel = CancelToken::new();
-        cancel.cancel(); // Cancel before run
+        cancel.cancel(); // 运行前取消
 
         let agent = AgentBuilder::new()
             .model(model)
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_builder_default() {
-        // Building without session/events should fail
+        // 缺少 session/events 的构建应失败
         let result = AgentBuilder::new().build();
         assert!(result.is_err());
         assert!(
@@ -204,7 +204,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // Run a turn to add messages to session
+        // 运行一个 turn 以向 session 添加消息
         agent.run_turn(AgentInput::text("hello")).await.unwrap();
         assert!(!agent.session_messages().is_empty());
 

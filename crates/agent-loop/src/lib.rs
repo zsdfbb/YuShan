@@ -1,4 +1,4 @@
-//! Agent execution loop and orchestration logic.
+//! Agent 执行循环与编排逻辑。
 
 mod basic;
 mod error;
@@ -13,7 +13,7 @@ pub use result::*;
 
 use agent_component::RuntimeContext;
 
-/// Agent loop trait - replaceable execution strategy
+/// Agent loop trait —— 可替换的执行策略
 #[async_trait::async_trait]
 pub trait AgentLoop: Send + Sync {
     async fn run_turn(
@@ -34,7 +34,7 @@ mod tests {
     use agent_tool::{Tool, ToolContext, ToolRegistry};
     use std::path::PathBuf;
 
-    /// Helper to create a RuntimeContext with default cwd/workspace
+    /// 用默认 cwd/workspace 创建 RuntimeContext 的辅助函数
     fn make_ctx<'a>(
         model: &'a dyn agent_model::Model,
         registry: &'a ToolRegistry,
@@ -57,10 +57,10 @@ mod tests {
         )
     }
 
-    // Helper: echo tool
+    // 辅助工具：echo 工具
     struct EchoTool;
 
-    // Helper: failing tool
+    // 辅助工具：failing 工具
     struct FailingTool;
 
     #[async_trait::async_trait]
@@ -96,7 +96,7 @@ mod tests {
         }
     }
 
-    // TC2: Pure text reply
+    // TC2：纯文本回复
     #[tokio::test]
     async fn test_basic_text_reply() {
         let model = MockModel::new("m");
@@ -125,7 +125,7 @@ mod tests {
         assert!(result.final_message.is_some());
         assert_eq!(result.rounds, 1);
 
-        // Check events
+        // 检查事件（纯文本路径）
         let evts = events.events();
         assert!(matches!(&evts[0], AgentEvent::UserMessage { .. }));
         assert!(matches!(&evts[1], AgentEvent::ModelTextDelta { text } if text == "hello world"));
@@ -138,7 +138,7 @@ mod tests {
         ));
     }
 
-    // TC3: Tool call loop
+    // TC3：工具调用循环
     #[tokio::test]
     async fn test_tool_call_loop() {
         let model = MockModel::new("m");
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(result.stop_reason, StopReason::Completed);
         assert_eq!(result.rounds, 2);
 
-        // Check events contain ToolCall, ToolResult, ModelTextDelta
+        // 检查事件包含 ToolCall、ToolResult、ModelTextDelta
         let evts = events.events();
         let has_tool_call = evts
             .iter()
@@ -179,14 +179,14 @@ mod tests {
         assert!(has_tool_result);
     }
 
-    // TC6: Cancellation
+    // TC6：取消
     #[tokio::test]
     async fn test_cancellation() {
         let model = MockModel::new("m");
         let mut session = MemorySession::new();
         let mut events = CollectingSink::new();
         let cancel = CancelToken::new();
-        cancel.cancel(); // Cancel before run
+        cancel.cancel(); // 运行前取消
         let registry = ToolRegistry::build(vec![]).unwrap();
         let limits = RunLimits::new(5);
 
@@ -206,11 +206,11 @@ mod tests {
         assert_eq!(result.rounds, 0);
     }
 
-    // TC7: Max rounds
+    // TC7：最大 round 数
     #[tokio::test]
     async fn test_max_rounds() {
         let model = MockModel::new("m");
-        // Always return tool calls to exhaust rounds
+        // 一直返回 tool call 以耗尽 round
         model.push_tool_call("echo", serde_json::json!({}));
         model.push_tool_call("echo", serde_json::json!({}));
         model.push_tool_call("echo", serde_json::json!({}));
@@ -218,7 +218,7 @@ mod tests {
         let mut events = CollectingSink::new();
         let cancel = CancelToken::new();
         let registry = ToolRegistry::build(vec![Box::new(EchoTool)]).unwrap();
-        let limits = RunLimits::new(2); // max 2 rounds
+        let limits = RunLimits::new(2); // 最多 2 个 round
 
         let mut ctx = make_ctx(
             &model,
@@ -236,12 +236,12 @@ mod tests {
         assert_eq!(result.rounds, 2);
     }
 
-    // TC5/TC13: ToolError path - errors are fed back to model, not terminating
+    // TC5/TC13：ToolError 路径 —— 错误回喂给模型，而非终止
     #[tokio::test]
     async fn test_tool_error_path() {
         let model = MockModel::new("m");
         model.push_tool_call("fail", serde_json::json!({}));
-        // After tool error is fed back, model responds with text
+        // tool 错误回喂后，模型以文本回复
         model.push_text("tool failed, but I'll continue");
         let mut session = MemorySession::new();
         let mut events = CollectingSink::new();
@@ -263,12 +263,12 @@ mod tests {
             loop_impl.run_turn(input, &mut ctx).await
         };
 
-        // Should succeed - tool errors are fed back as results, not terminating
+        // 应成功 —— tool 错误作为结果回喂，不终止
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(result.stop_reason, StopReason::Completed);
 
-        // Check events: UserMessage, ToolCall, ToolResult, ModelTextDelta, RunFinished
+        // 检查事件：UserMessage、ToolCall、ToolResult、ModelTextDelta、RunFinished
         let evts = events.events();
         let has_tool_call = evts
             .iter()
@@ -279,7 +279,7 @@ mod tests {
         assert!(has_tool_call, "should emit ToolCall");
         assert!(has_tool_result, "should emit ToolResult");
 
-        // Exactly one terminal event
+        // 恰好一个终止事件
         let terminal_count = evts
             .iter()
             .filter(|e| {
@@ -292,19 +292,19 @@ mod tests {
         assert_eq!(terminal_count, 1, "exactly one terminal event");
     }
 
-    // Missing test: Cancel during loop iteration (mid-loop)
+    // 缺失测试：循环迭代中途取消（mid-loop）
     #[tokio::test]
     async fn test_cancel_during_loop() {
         let model = MockModel::new("m");
         model.push_tool_call("echo", serde_json::json!({}));
-        // After first round's tool call, cancel is set before next model call
+        // 第一轮 tool call 之后、下一次 model 调用之前设置 cancel
         let mut session = MemorySession::new();
         let mut events = CollectingSink::new();
         let cancel = CancelToken::new();
         let cancel_clone = cancel.clone();
         let limits = RunLimits::new(5);
 
-        // We need a tool that cancels mid-execution
+        // 需要一个在执行中途取消的工具
         struct CancelingTool {
             cancel: CancelToken,
         }
@@ -342,11 +342,11 @@ mod tests {
         let loop_impl = BasicLoop;
         let result = loop_impl.run_turn(input, &mut ctx).await.unwrap();
 
-        // Should complete with Cancelled at next round boundary
+        // 应在下一个 round 边界以 Cancelled 完成
         assert_eq!(result.stop_reason, StopReason::Cancelled);
     }
 
-    // TC9: Terminal event invariant - exactly one terminal event
+    // TC9：终止事件不变量 —— 恰好一个终止事件
     #[tokio::test]
     async fn test_terminal_event_invariant() {
         let model = MockModel::new("m");

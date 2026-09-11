@@ -1,7 +1,7 @@
-//! Minimal inline ANSI helpers.
+//! 最小化的内联 ANSI 辅助。
 //!
-//! Honours `NO_COLOR` (https://no-color.org/) — if set, returns plain text.
-//! No TTY detection — ANSI escape codes are harmless on non-TTY output.
+//! 遵循 `NO_COLOR`（https://no-color.org/）约定——设置了该变量时返回纯文本。
+//! 不做 TTY 检测——ANSI escape codes 在非 TTY 输出上无害。
 
 fn colorize(code: &str, s: &str) -> String {
     if std::env::var_os("NO_COLOR").is_some() {
@@ -36,18 +36,18 @@ pub(crate) mod tests {
     use std::env;
     use std::sync::{Mutex, OnceLock};
 
-    /// Process-wide lock for tests that mutate the `NO_COLOR` env var.
-    /// Prevents parallel-test races (Rust runs tests in parallel by default).
-    /// Shared across modules via `crate::ansi::tests::env_lock` — must be a
-    /// single static so all tests serialize on the same mutex.
+    /// 进程级锁，用于修改 `NO_COLOR` 环境变量的测试。
+    /// 防止并行测试竞争（Rust 默认并行运行测试）。
+    /// 通过 `crate::ansi::tests::env_lock` 跨模块共享——必须是
+    /// 单一 static，使所有测试在同一 mutex 上串行。
     pub fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// Helper: set NO_COLOR for the test scope; restore at end.
-    /// Holds `env_lock()` for the guard's lifetime so concurrent env-var
-    /// mutations cannot race with this test.
+    /// 辅助：为测试作用域设置 NO_COLOR；结束时恢复。
+    /// 在 guard 存活期内持有 `env_lock()`，使并发环境变量修改
+    /// 不会与本测试竞争。
     struct NoColorGuard {
         previous: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -75,7 +75,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Wrap a closure with the env lock held and NO_COLOR unset.
+    /// 持有 env lock 且未设置 NO_COLOR 时执行闭包。
     fn with_color_enabled<F: FnOnce()>(f: F) {
         let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         unsafe {

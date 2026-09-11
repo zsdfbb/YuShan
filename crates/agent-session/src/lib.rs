@@ -6,27 +6,27 @@ mod memory;
 pub use jsonl::JsonlSession;
 pub use memory::*;
 
-// Re-export Session trait for convenience
+// 为方便起见重导出 Session trait
 pub use agent_core::Message;
 
 use async_trait::async_trait;
 
-/// Session trait - message history management
+/// Session trait —— 消息历史管理
 #[async_trait]
 pub trait Session: Send {
-    /// Get all messages in the session
+    /// 获取 session 中的所有消息
     fn messages(&self) -> &[Message];
 
-    /// Append a message to the session
+    /// 向 session 追加一条消息
     async fn append(&mut self, message: Message) -> Result<(), SessionError>;
 
-    /// Clear all messages from the session
+    /// 清空 session 中的所有消息
     async fn clear(&mut self) -> Result<(), SessionError> {
         Ok(())
     }
 }
 
-/// Session error types
+/// Session 错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("session storage error: {0}")]
@@ -89,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_session_never_fails() {
         let mut session = MemorySession::new();
-        // MemorySession append should never fail
+        // MemorySession 的 append 不应失败
         let result = session
             .append(Message {
                 role: Role::User,

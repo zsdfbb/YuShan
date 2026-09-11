@@ -18,24 +18,24 @@ impl BashTool {
     }
 }
 
-/// Tail-truncate output: keep last MAX_LINES / MAX_BYTES
+/// 尾截断输出：保留末尾的 MAX_LINES / MAX_BYTES
 fn tail_truncate(output: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let total_lines = lines.len();
 
     if total_lines <= MAX_LINES {
-        // Check byte limit
+        // 检查字节上限
         if output.len() <= MAX_BYTES {
             return output.to_string();
         }
     }
 
-    // Find how many trailing lines fit in MAX_BYTES
+    // 找出多少尾行能放入 MAX_BYTES
     let mut byte_count = 0usize;
     let mut start = total_lines;
 
     for i in (0..total_lines).rev() {
-        let line_len = lines[i].len() + 1; // +1 for newline
+        let line_len = lines[i].len() + 1; // +1 计入换行符
         if byte_count + line_len > MAX_BYTES {
             break;
         }
@@ -43,7 +43,7 @@ fn tail_truncate(output: &str) -> String {
         start = i;
     }
 
-    // Also respect MAX_LINES
+    // 同时遵守 MAX_LINES 上限
     let min_start = total_lines.saturating_sub(MAX_LINES);
     start = start.max(min_start);
 
@@ -86,7 +86,7 @@ impl Tool for BashTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        // Process group on Unix
+        // Unix 上使用进程组
         #[cfg(unix)]
         {
             #[allow(unused_imports)]
@@ -105,11 +105,10 @@ impl Tool for BashTool {
                     ToolError::Execution(format!("Failed to wait for command: {e}"))
                 })?,
                 Err(_timeout) => {
-                    // Kill the process tree on timeout
+                    // 超时时杀死进程树
                     #[cfg(unix)]
                     {
-                        // The child is already dropped at this point, but we can try to kill
-                        // by sending signal to the process group
+                        // child 在该点已被 drop，但仍可尝试向进程组发送信号来终止
                     }
                     return Err(ToolError::Timeout(format!(
                         "Command timed out after {secs} seconds"
@@ -137,7 +136,7 @@ impl Tool for BashTool {
             combined.push_str(&stderr);
         }
 
-        // Check exit code
+        // 检查退出码
         if let Some(code) = output.status.code() {
             if code != 0 {
                 let truncated = tail_truncate(&combined);

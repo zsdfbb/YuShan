@@ -8,7 +8,7 @@ use agent_session::MemorySession;
 use agent_tool::{Tool, ToolContext};
 use agent_tools_basic::{EditTool, ReadTool, WriteTool};
 
-// Mock model that echoes tool calls
+// 回显 tool call 的 mock model
 struct MockCodingModel;
 
 #[async_trait::async_trait]
@@ -21,7 +21,7 @@ impl Model for MockCodingModel {
         request: ModelRequest,
         _sink: &mut dyn ModelEventSink,
     ) -> Result<ModelResponse, ModelError> {
-        // Check if there are tool results - if so, finish
+        // 检查是否有 tool result——若有则结束
         let has_tool_results = request
             .messages
             .last()
@@ -44,7 +44,7 @@ impl Model for MockCodingModel {
                 stop_reason: Some("stop".into()),
             })
         } else {
-            // Return a read tool call
+            // 返回一个 read tool call
             Ok(ModelResponse {
                 message: Message {
                     role: Role::Assistant,
@@ -68,7 +68,7 @@ async fn test_read_write_edit_roundtrip() {
 
     let cancel = CancelToken::new();
 
-    // Write a file
+    // 写入文件
     let write_tool = WriteTool::new(tmp.clone());
     let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
     let result = write_tool
@@ -80,7 +80,7 @@ async fn test_read_write_edit_roundtrip() {
         .unwrap();
     assert!(!result.is_error);
 
-    // Read it back
+    // 读回
     let read_tool = ReadTool::new(tmp.clone());
     let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
     let result = read_tool
@@ -89,7 +89,7 @@ async fn test_read_write_edit_roundtrip() {
         .unwrap();
     assert!(result.content.contains("hello world"));
 
-    // Edit it
+    // 编辑它
     let edit_tool = EditTool::new(tmp.clone());
     let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
     let result = edit_tool
@@ -104,7 +104,7 @@ async fn test_read_write_edit_roundtrip() {
         .unwrap();
     assert!(!result.is_error);
 
-    // Read again to verify
+    // 再次读取以验证
     let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
     let result = read_tool
         .call(serde_json::json!({ "path": "test.txt" }), ctx)
@@ -112,7 +112,7 @@ async fn test_read_write_edit_roundtrip() {
         .unwrap();
     assert!(result.content.contains("goodbye"));
 
-    // Cleanup
+    // 清理
     std::fs::remove_dir_all(&tmp).ok();
 }
 
@@ -154,6 +154,6 @@ async fn test_full_agent_turn_with_mock_model() {
     assert_eq!(result.stop_reason, agent_core::StopReason::Completed);
     assert!(result.final_message.is_some());
 
-    // Cleanup
+    // 清理
     std::fs::remove_dir_all(&tmp).ok();
 }

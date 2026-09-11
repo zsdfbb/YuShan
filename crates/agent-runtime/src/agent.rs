@@ -52,12 +52,12 @@ impl Agent {
         }
     }
 
-    /// Whether a model has been configured for this agent.
+    /// 该 agent 是否已配置 model。
     pub fn is_configured(&self) -> bool {
         self.model.is_some()
     }
 
-    /// Run a single turn. Takes &mut self to ensure single concurrent run.
+    /// 运行单个 turn。取 &mut self 以保证同时只运行一次。
     pub async fn run_turn(&mut self, input: AgentInput) -> Result<RunResult, LoopError> {
         let model = self.model.as_deref().ok_or_else(|| {
             LoopError::ConfigError("No model configured. Use /login to configure an API provider.".into())
@@ -77,27 +77,27 @@ impl Agent {
         self.loop_impl.run_turn(input, &mut ctx).await
     }
 
-    /// Get the model identifier, if configured.
+    /// 获取 model 标识符（若已配置）。
     pub fn model_id(&self) -> Option<&str> {
         self.model.as_deref().map(|m| m.model_id())
     }
 
-    /// Return tool names (owned String list). Used by banner/footer to display available tools.
+    /// 返回工具名称（自有 String 列表）。供 banner/footer 展示可用工具。
     pub fn tool_names(&self) -> Vec<String> {
         self.registry.names().iter().map(|s| s.to_string()).collect()
     }
 
-    /// Return the model context window size in tokens.
+    /// 返回以 token 计的 model context window 大小。
     pub fn context_window(&self) -> usize {
         self.limits.context_window
     }
 
-    /// Cancel the current run. The next iteration of the agent loop will stop.
+    /// 取消当前运行。agent loop 的下一次迭代将停止。
     pub fn cancel(&mut self) {
         self.cancel.cancel();
     }
 
-    /// Clone-able handle to the internal cancel token.
+    /// 内部 cancel token 的可克隆句柄。
     ///
     /// 返回的 `CancelToken` 与 `self.cancel` 共享底层 `Arc<AtomicBool>`，
     /// 调用方可在 `tokio::select!` 内持 `cancel_token.cancel()` 而无需借用 `&mut Agent`。
@@ -112,17 +112,17 @@ impl Agent {
         self.cancel.clone()
     }
 
-    /// Replace the model. Pass None to remove (e.g., /logout).
+    /// 替换 model。传 None 移除（例如 /logout）。
     pub fn set_model(&mut self, model: Option<Box<dyn Model>>) {
         self.model = model;
     }
 
-    /// Clear all messages from the session.
+    /// 清空 session 中的所有消息。
     pub async fn clear_session(&mut self) -> Result<(), agent_session::SessionError> {
         self.session.clear().await
     }
 
-    /// Read all session messages.
+    /// 读取所有 session 消息。
     pub fn session_messages(&self) -> &[Message] {
         self.session.messages()
     }
@@ -163,7 +163,7 @@ mod tests {
             .build()
             .unwrap();
         let names = agent.tool_names();
-        // Default builder registers no tools.
+        // 默认 builder 不注册任何工具。
         assert_eq!(names.len(), 0);
     }
 
@@ -191,7 +191,7 @@ mod tests {
             .events(CollectingSink::new())
             .build()
             .unwrap();
-        // RunLimits::default().context_window = 128_000
+        // RunLimits::default() 的 context_window = 128_000
         assert_eq!(agent.context_window(), 128_000);
     }
 

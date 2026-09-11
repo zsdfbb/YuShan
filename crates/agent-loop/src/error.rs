@@ -1,7 +1,7 @@
 use agent_core::EventError;
 use agent_model::ModelError;
 
-/// Error from agent loop execution
+/// agent loop 执行产生的错误
 #[derive(Debug, thiserror::Error)]
 pub enum LoopError {
     #[error("model error: {0}")]

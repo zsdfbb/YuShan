@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-/// OpenAI chat completion response
+/// OpenAI chat completion 响应体
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
@@ -21,7 +21,7 @@ pub struct ChatUsage {
     pub total_tokens: u32,
 }
 
-/// SSE streaming chunk
+/// SSE 流式 chunk
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,

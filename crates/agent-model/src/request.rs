@@ -2,7 +2,7 @@ use agent_core::Message;
 use agent_tool::ToolSpec;
 use serde::{Deserialize, Serialize};
 
-/// Request sent to a model for completion.
+/// 发送给 model 以完成 completion 的请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRequest {
     pub messages: Vec<Message>,
@@ -27,7 +27,7 @@ impl Default for ModelRequest {
     }
 }
 
-/// Response received from a model.
+/// 从 model 收到的响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelResponse {
     pub message: Message,

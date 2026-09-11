@@ -12,19 +12,19 @@ pub use error::*;
 pub use registry::*;
 pub use spec::*;
 
-// Re-export from agent-core for convenience
+// 为方便起见从 agent-core 再导出
 pub use agent_core::{ToolCallId, ToolResult};
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// Tool interface - self-describing + execute
+/// Tool 接口 — 自描述 + 执行
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Return the tool specification (called once at build time, cached)
+    /// 返回 tool 的 spec（构建时调用一次，缓存）
     fn spec(&self) -> ToolSpec;
 
-    /// Execute the tool with given input
+    /// 用给定输入执行 tool
     async fn call(&self, input: Value, ctx: ToolContext<'_>) -> Result<ToolResult, ToolError>;
 }
 

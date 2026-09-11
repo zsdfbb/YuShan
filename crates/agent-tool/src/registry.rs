@@ -16,7 +16,7 @@ impl std::fmt::Debug for ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Build a registry from a list of tools, checking for duplicate names
+    /// 从一组 tool 构建 registry，并检查是否是重名
     pub fn build(tools: Vec<Box<dyn Tool>>) -> Result<Self, ToolError> {
         let mut map = HashMap::new();
         for tool in tools {
@@ -33,27 +33,27 @@ impl ToolRegistry {
         Ok(Self { tools: map, specs })
     }
 
-    /// Lookup tool by name
+    /// 按名字查找 tool
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    /// Get all tool specs (cached at build time)
+    /// 获取全部 tool spec（构建时缓存）
     pub fn specs(&self) -> &[ToolSpec] {
         &self.specs
     }
 
-    /// Get all tool names (borrowed from cached specs, zero allocation).
+    /// 获取全部 tool 名字（借用自缓存的 spec，零分配）。
     pub fn names(&self) -> Vec<&str> {
         self.specs.iter().map(|s| s.name.as_str()).collect()
     }
 
-    /// Number of registered tools
+    /// 已注册 tool 的数量
     pub fn len(&self) -> usize {
         self.tools.len()
     }
 
-    /// Check if registry is empty
+    /// 判断 registry 是否为空
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

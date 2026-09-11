@@ -14,19 +14,19 @@ impl EditTool {
     }
 }
 
-/// Normalize text for fuzzy matching: NFKC + smart quotes + dash + trim
+/// 为模糊匹配规范化文本：NFKC + 智能引号 + 破折号 + 去空格
 fn fuzzy_normalize(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for ch in s.nfkc() {
         match ch {
-            // Smart quotes -> ASCII
+            // 智能引号转为 ASCII
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{2039}' | '\u{203A}'
             | '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => result.push('"'),
-            // En/em dash -> ASCII dash
+            // En/Em 破折号转为 ASCII 连字符
             '\u{2013}' | '\u{2014}' | '\u{2015}' => result.push('-'),
-            // Non-breaking space -> ASCII space
+            // 不间断空格转为 ASCII 空格
             '\u{00A0}' => result.push(' '),
-            // Zero-width spaces and joiners -> remove
+            // 零宽空格与连接符 —— 移除
             '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => {}
             _ => result.push(ch),
         }
@@ -34,14 +34,14 @@ fn fuzzy_normalize(s: &str) -> String {
     result.trim().to_string()
 }
 
-/// Detect line ending style: returns true if CRLF is dominant
+/// 检测换行风格：CRLF 占主导时返回 true
 fn detect_crlf(content: &str) -> bool {
     let crlf_count = content.matches("\r\n").count();
     let lf_count = content.matches('\n').count() - crlf_count;
     crlf_count > lf_count
 }
 
-/// Strip BOM from the beginning of content
+/// 去掉内容开头的 BOM
 fn strip_bom(content: &str) -> &str {
     content.strip_prefix('\u{FEFF}').unwrap_or(content)
 }
@@ -56,14 +56,14 @@ fn resolve_path(input: &Value, path_field: &str) -> Result<String, ToolError> {
 fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
     let mut edits: Vec<(String, String)> = Vec::new();
 
-    // Try legacy top-level oldText/newText
+    // 尝试旧版顶层 oldText/newText
     if let Some(old) = input.get("oldText").and_then(|v| v.as_str()) {
         let new = input.get("newText").and_then(|v| v.as_str()).unwrap_or("");
         edits.push((old.to_string(), new.to_string()));
         return Ok(edits);
     }
 
-    // Try edits field
+    // 尝试 edits 字段
     match input.get("edits") {
         Some(Value::Array(arr)) => {
             for (i, item) in arr.iter().enumerate() {
@@ -78,11 +78,11 @@ fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
             }
         }
         Some(Value::String(s)) => {
-            // edits is a string — treat as single oldText
+            // edits 是字符串 —— 当作单个 oldText 处理
             edits.push((s.clone(), String::new()));
         }
         Some(Value::Object(_)) => {
-            // Single object treated as array
+            // 单个对象当作数组处理
             let old = input["edits"]["oldText"]
                 .as_str()
                 .ok_or_else(|| ToolError::InvalidInput("edits: missing 'oldText'".into()))?;
@@ -99,15 +99,15 @@ fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
     Ok(edits)
 }
 
-/// Try to find old_text in content. First exact, then fuzzy.
-/// Returns (byte_offset, was_fuzzy) or None.
+/// 尝试在 content 中查找 old_text：先精确匹配，再模糊匹配。
+/// 返回 (byte_offset, was_fuzzy) 或 None。
 fn find_match(content: &str, old_text: &str) -> Option<(usize, bool)> {
-    // Exact match first
+    // 先精确匹配
     if let Some(idx) = content.find(old_text) {
         return Some((idx, false));
     }
 
-    // Fuzzy match — search character by character
+    // 模糊匹配 —— 逐字符搜索
     if let Some(idx) = find_match_fuzzy(content, old_text) {
         return Some((idx, true));
     }
@@ -172,18 +172,18 @@ impl Tool for EditTool {
         let crlf = detect_crlf(&raw_content);
         let content = strip_bom(&raw_content);
 
-        // Apply all edits against the original content (non-incremental matching)
+        // 在原始内容上应用所有 edits（非增量匹配）
         let mut result = content.to_string();
         let mut replaced_count = 0u32;
 
         for (old_text, new_text) in &edits {
-            // Count occurrences before replacing to ensure uniqueness
+            // 替换前统计出现次数，确保唯一性
             let count = result.matches(old_text.as_str()).count();
 
             if count == 0 {
-                // Try fuzzy match
+                // 尝试模糊匹配
                 if let Some((_offset, _was_fuzzy)) = find_match(content, old_text) {
-                    // For fuzzy, we re-find in the current result
+                    // 模糊匹配时，在当前 result 中重新查找
                     if let Some(fuzzy_offset) = find_match_fuzzy(&result, old_text) {
                         let end = fuzzy_offset + old_text.len();
                         result.replace_range(fuzzy_offset..end, new_text);
@@ -202,7 +202,7 @@ impl Tool for EditTool {
                 )));
             }
 
-            // Single exact match — replace
+            // 单一精确匹配 —— 替换
             if let Some(idx) = result.find(old_text.as_str()) {
                 let end = idx + old_text.len();
                 result.replace_range(idx..end, new_text);
@@ -210,12 +210,12 @@ impl Tool for EditTool {
             }
         }
 
-        // Restore line endings
+        // 恢复换行符
         if crlf {
             result = result.replace('\n', "\r\n");
         }
 
-        // Restore BOM if original had it
+        // 若原文有 BOM 则恢复
         if raw_content.starts_with('\u{FEFF}') {
             result.insert(0, '\u{FEFF}');
         }
@@ -231,11 +231,11 @@ impl Tool for EditTool {
     }
 }
 
-/// Find old_text using fuzzy matching in the given content
+/// 在给定 content 中使用模糊匹配查找 old_text
 fn find_match_fuzzy(content: &str, old_text: &str) -> Option<usize> {
     let fuzzy_old = fuzzy_normalize(old_text);
 
-    // Walk through content character by character, checking fuzzy matches
+    // 逐字符遍历 content，检查模糊匹配
     let chars: Vec<char> = content.chars().collect();
     let fuzzy_old_chars: Vec<char> = fuzzy_old.chars().collect();
 
@@ -248,7 +248,7 @@ fn find_match_fuzzy(content: &str, old_text: &str) -> Option<usize> {
         let fuzzy_candidate = fuzzy_normalize(&candidate);
 
         if fuzzy_candidate == fuzzy_old {
-            // Convert char index to byte index
+            // 将字符索引转换为字节索引
             let byte_offset: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
             return Some(byte_offset);
         }

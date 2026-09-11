@@ -2,7 +2,7 @@ use agent_core::Message;
 
 use super::{Session, SessionError};
 
-/// In-memory session implementation
+/// 内存版 session 实现
 pub struct MemorySession {
     messages: Vec<Message>,
 }

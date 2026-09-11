@@ -1,7 +1,7 @@
 use super::{AgentEvent, EventSink};
 use agent_core::EventError;
 
-/// An event sink that silently discards all events.
+/// 静默丢弃全部事件的 event sink。
 pub struct NoopEventSink;
 
 impl EventSink for NoopEventSink {

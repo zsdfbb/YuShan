@@ -1,20 +1,20 @@
 use async_trait::async_trait;
 
-/// Approval decision
+/// 审批决策
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
-    /// Allow execution
+    /// 允许执行
     Approved,
-    /// Deny execution, with reason
+    /// 拒绝执行，附原因
     Denied { reason: String },
 }
 
-/// Tool approval interface (async, supports TUI interaction)
+/// Tool 审批接口（async，支持 TUI 交互）
 #[async_trait]
 pub trait ApprovalHandler: Send + Sync {
-    /// Determine if a tool call requires approval
+    /// 判断某个 tool call 是否需要审批
     fn needs_approval(&self, tool_name: &str, input: &serde_json::Value) -> bool;
-    /// Request user approval
+    /// 请求用户审批
     async fn request_approval(
         &self,
         tool_name: &str,
@@ -22,7 +22,7 @@ pub trait ApprovalHandler: Send + Sync {
     ) -> ApprovalDecision;
 }
 
-/// Default no-op approver -- allows all operations
+/// 默认的 no-op 审批器 —— 放行全部操作
 pub struct AutoApprove;
 
 #[async_trait]

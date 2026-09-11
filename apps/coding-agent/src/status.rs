@@ -1,6 +1,6 @@
 use agent_core::Usage;
 
-/// TUI layer accumulator. Source: `RunResult.usage` at the end of each turn.
+/// TUI 层累加器。数据来源：每个 turn 结束时的 `RunResult.usage`。
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TurnStats {
     pub total_input_tokens: u32,
@@ -55,7 +55,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 200,
         });
-        assert_eq!(stats.total_input_tokens, u32::MAX); // Does not overflow
+        assert_eq!(stats.total_input_tokens, u32::MAX); // 不应溢出
         assert_eq!(stats.total_output_tokens, 200);
     }
 

@@ -1,12 +1,12 @@
-/// Execution limits for a run
+/// 一次 run 的执行限制
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RunLimits {
-    /// Maximum number of model calls (rounds) per turn
+    /// 每个 turn 中 model call（rounds）的最大次数
     pub max_rounds: u32,
-    /// Bash command timeout in milliseconds (None = no default timeout)
+    /// Bash 命令超时毫秒数（None = 无默认超时）
     pub bash_timeout: Option<u64>,
-    /// Model context window size in tokens
+    /// model context window 大小（以 token 计）
     pub context_window: usize,
 }
 

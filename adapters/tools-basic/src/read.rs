@@ -109,10 +109,10 @@ mod tests {
     use agent_core::CancelToken;
 
     fn make_ctx() -> (CancelToken, ToolContext<'static>) {
-        // Leak the tokens so they live long enough for ToolContext<'static>
+        // 泄漏这些 tokens，使其存续时间足以满足 ToolContext<'static>
         let token = Box::leak(Box::new(CancelToken::new()));
         let ctx = ToolContext::new(token, PathBuf::from("."), PathBuf::from("."));
-        // SAFETY: We leak the CancelToken so the reference is valid for 'static
+        // SAFETY: 我们泄漏了 CancelToken，保证该引用在 'static 期间有效
         let ctx: ToolContext<'static> = unsafe { std::mem::transmute(ctx) };
         (CancelToken::new(), ctx)
     }

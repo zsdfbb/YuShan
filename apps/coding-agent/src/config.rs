@@ -4,8 +4,8 @@ use agent_model::Model;
 
 use crate::provider::ProviderRegistry;
 
-/// Model factory function type. Captures adapter-specific construction logic.
-/// Returns None if config is incomplete (missing api_base/api_key).
+/// Model factory 函数类型。封装适配器特有的构建逻辑。
+/// config 不完整（缺 api_base/api_key）时返回 None。
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
 
 pub struct Config {
@@ -19,8 +19,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load from environment variables. All fields except `cwd` are optional.
-    /// The agent can start without API credentials; configure via `/login`.
+    /// 从环境变量加载。除 `cwd` 外所有字段都是可选的。
+    /// agent 可在无 API 凭证时启动；通过 `/login` 配置。
     pub fn from_env() -> Result<Self, String> {
         let api_base = std::env::var("YUSHAN_API_BASE")
             .or_else(|_| std::env::var("OPENAI_API_BASE"))
@@ -46,7 +46,7 @@ impl Config {
         self.api_base.is_some() && self.api_key.is_some()
     }
 
-    /// Set the model factory. Called once in main.rs after adapter types are known.
+    /// 设置 model factory。适配器类型确定后在 main.rs 中调用一次。
     pub fn set_model_factory(
         &mut self,
         factory: impl Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync + 'static,
@@ -54,12 +54,12 @@ impl Config {
         self.model_factory = Some(Box::new(factory));
     }
 
-    /// Build a model from current config. Delegates to the factory.
+    /// 从当前 config 构建 model。委托给 factory。
     pub fn build_model(&self) -> Option<Box<dyn Model>> {
         self.model_factory.as_ref().and_then(|f| f(self))
     }
 
-    /// Return ProviderCompat for the current provider (or "custom" if none set).
+    /// 返回当前 provider 的 ProviderCompat（未设置时为 "custom"）。
     pub fn current_compat(&self) -> agent_model_openai_compatible::compat::ProviderCompat {
         let name = self.provider.as_deref().unwrap_or("custom");
         self.registry.compat_for(name)
@@ -70,7 +70,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    // Dummy model for testing
+    // 测试用的 dummy model
     struct DummyModel;
 
     #[async_trait::async_trait]
@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_config_from_env_no_vars() {
-        // Clear any existing env vars
+        // 清空任何已存在的环境变量
         unsafe {
             std::env::remove_var("YUSHAN_API_BASE");
             std::env::remove_var("YUSHAN_API_KEY");
@@ -115,14 +115,14 @@ mod tests {
         let mut config = Config::from_env().unwrap();
         assert!(config.build_model().is_none());
 
-        // Set up config with credentials
+        // 用凭证设置 config
         config.api_base = Some("https://api.example.com".into());
         config.api_key = Some("sk-test".into());
 
-        // Without factory, still returns None
+        // 没有 factory 时仍返回 None
         assert!(config.build_model().is_none());
 
-        // Register a factory
+        // 注册 factory
         config.set_model_factory(|cfg| {
             if cfg.api_base.is_some() && cfg.api_key.is_some() {
                 Some(Box::new(DummyModel))
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_config_current_compat_unknown() {
         let config = Config::from_env().unwrap();
-        // No provider set -> "custom" -> standard
+        // 未设置 provider -> "custom" -> standard
         let compat = config.current_compat();
         assert!(!compat.has_reasoning_content);
         assert!(!compat.tool_calls_as_text);
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_startup_recovery_from_auth() {
-        // Prepare a temp auth.json with deepseek credentials
+        // 准备一个含 deepseek 凭证的临时 auth.json
         let dir = std::env::temp_dir().join("yushan_test_startup_recovery");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -172,7 +172,7 @@ mod tests {
         )
         .unwrap();
 
-        // Create Config with no env vars (not configured)
+        // 用无环境变量（未配置）的方式创建 Config
         unsafe {
             std::env::remove_var("YUSHAN_API_BASE");
             std::env::remove_var("YUSHAN_API_KEY");
@@ -184,7 +184,7 @@ mod tests {
         config.registry.set_auth_override(auth_path);
         config.registry.load_auth();
 
-        // Simulate the main.rs recovery loop
+        // 模拟 main.rs 的恢复循环
         if !config.is_configured() {
             for provider in config.registry.providers() {
                 if let Some(entry) = config.registry.auth_for(&provider.name) {

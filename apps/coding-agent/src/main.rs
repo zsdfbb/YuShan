@@ -23,18 +23,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut config = config::Config::from_env()?;
 
-    // Load saved credentials from auth.json
+    // 从 auth.json 加载已保存的凭证
     config.registry.load_auth();
 
-    // Load saved session state from state.json
+    // 从 state.json 加载已保存的会话状态
     let mut state_store = state::StateStore::new();
     let saved_state = state_store.load();
 
-    // Startup recovery: if env vars don't provide full credentials,
-    // try to restore from state.json (last-active provider+model) first,
-    // then fall back to the first provider with stored auth.
+    // 启动恢复：若环境变量未提供完整凭证，
+    // 先尝试从 state.json（last-active provider+model）恢复，
+    // 再回退到第一个存有 auth 的 provider。
     if !config.is_configured() {
-        // Try state.json recovery: last_active_provider + matching auth entry
+        // 尝试 state.json 恢复：last_active_provider + 匹配的 auth entry
         let recovered = saved_state
             .last_active_provider
             .as_deref()
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| entry.model.clone());
             config.provider = Some(provider.name.clone());
         } else {
-            // Fallback: first provider with stored credentials
+            // 回退：第一个存有凭证的 provider
             for provider in config.registry.providers() {
                 if let Some(entry) = config.registry.auth_for(&provider.name) {
                     config.api_base = Some(entry.api_base.clone());
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Register the model factory (adapter-specific construction logic)
+    // 注册 model factory（适配器特有的构建逻辑）
     config.set_model_factory(|cfg| {
         let base = cfg.api_base.as_ref()?;
         let key = cfg.api_key.as_ref()?;
@@ -85,10 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
     });
 
-    // Build the command registry
+    // 构建 command registry
     let command_registry = commands::build_registry();
 
-    // Parse simple args
+    // 解析简单参数
     let mut task: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -104,11 +104,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    // Build system prompt
+    // 构建 system prompt
     let cwd = config.cwd.clone();
     let system_prompt = prompt::build_system_prompt(&cwd);
 
-    // Build model (optional — agent can start without API credentials)
+    // 构建 model（可选——agent 可在无 API 凭证时启动）
     let model = if config.is_configured() {
         let compat = config.current_compat();
         Some(OpenAICompatibleModel::new(OpenAICompatibleConfig {
@@ -123,10 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Build workspace for tools
+    // 为工具构建 workspace
     let workspace = config.cwd.clone();
 
-    // Build agent
+    // 构建 agent
     let mut builder = AgentBuilder::new()
         .tool(ReadTool::new(workspace.clone()))
         .tool(WriteTool::new(workspace.clone()))
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stats = status::TurnStats::default();
 
     if let Some(task) = task {
-        // Print mode — requires model
+        // 打印模式——需要 model
         if !agent.is_configured() {
             eprintln!("Error: No model configured.");
             eprintln!("Set environment variables:");
@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        // Interactive mode — ratatui only (tui-stdout path removed in c phase).
+        // 交互模式——仅 ratatui（tui-stdout 路径已在 c 阶段删除）。
         // `state_store` 与恢复逻辑已在入口早期完成（line 33-73）。
         #[cfg(feature = "tui-ratatui")]
         {

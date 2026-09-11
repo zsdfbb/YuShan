@@ -11,12 +11,12 @@ pub struct App {
     pub view: AppView,
     pub view_built_at: Instant,
 
-    // transcript
+    // 会话记录
     pub transcript: Vec<TranscriptLine>,
     pub scroll_offset: usize,
     pub follow: bool,
 
-    // input
+    // 输入
     pub input: String,
     pub input_cursor: usize,
     pub completion: Option<CompletionState>,
@@ -29,6 +29,14 @@ pub struct App {
     /// Cancel token clone — event_loop 构造时 set。Esc/Ctrl-C 触发 cancel。
     /// 由 `Agent::cancel_handle()` 拿 Clone 写进来。
     pub cancel_token: Option<CancelToken>,
+
+    // turn 活渲染（pi 模型：动画节拍 + 按需绘制）
+    pub turn_started_at: Option<Instant>,
+    pub working_dot: u8,
+
+    // 面板挂载（默认仅对话窗口；status/footer 为可选面板）
+    pub show_status: bool,
+    pub show_footer: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +84,11 @@ impl App {
             cancel_requested: false,
             should_quit: false,
             pending_submit: None,
-            cancel_token: None, // NEW: event_loop 构造时 set
+            cancel_token: None, // 新增：event_loop 构造时 set
+            turn_started_at: None,
+            working_dot: 0,
+            show_status: false, // 默认仅对话窗口；status/footer 为可选面板
+            show_footer: false,
         }
     }
 

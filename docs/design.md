@@ -501,7 +501,7 @@ let agent = AgentBuilder::new()
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |
 | `HookDispatcher` | Hook 顺序、Observer 错误、Transform 修改和 Control 决策 |
 | 动态插件 | Manifest、ABI 版本、组件注册、Hook 注册、初始化失败和生命周期 |
-| Coding Agent | 项目上下文发现、四个默认工具、Print 模式、JSON 事件和会话恢复 |
+| Coding Agent | 项目上下文发现、四个默认工具、Print 模式、JSON 事件和会话恢复；TUI：turn 活渲染（提交即见 + Working 动画 + Turn 行）、事件路径取消、退出打印完整对话、单键退出、默认仅对话窗口（status/footer 可选面板） |
 
 ## 13. 总结
 

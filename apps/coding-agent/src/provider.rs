@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use agent_model_openai_compatible::compat::ProviderCompat;
 use serde::{Deserialize, Serialize};
 
-/// A known provider with metadata.
+/// 带元数据的已知 provider。
 #[derive(Debug, Clone)]
 pub struct ProviderInfo {
     pub name: String,
@@ -13,7 +13,7 @@ pub struct ProviderInfo {
     pub compat: ProviderCompat,
 }
 
-/// Credentials stored per provider in auth.json.
+/// auth.json 中按 provider 存储的凭证。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthEntry {
     pub api_base: String,
@@ -21,7 +21,7 @@ pub struct AuthEntry {
     pub model: String,
 }
 
-/// A model returned by the provider's /v1/models endpoint.
+/// provider 的 /v1/models endpoint 返回的 model。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ApiModel {
     pub id: String,
@@ -29,34 +29,34 @@ pub struct ApiModel {
     pub owned_by: Option<String>,
 }
 
-/// Result of fetching models from API, distinguishing error types.
+/// 从 API 拉取 models 的结果，区分错误类型。
 pub enum FetchModelsResult {
     Success(Vec<ApiModel>),
-    /// 401 -> prompt user to re-login
+    /// 401 —— 提示用户重新登录
     AuthError(String),
-    /// timeout/DNS -> silent fallback
+    /// timeout/DNS —— 静默回退
     NetworkError(String),
 }
 
-/// Response from GET /v1/models.
+/// GET /v1/models 的响应。
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Vec<ApiModel>,
 }
 
-/// Map of provider name -> credentials.
+/// provider 名称到凭证的映射。
 type AuthStore = HashMap<String, AuthEntry>;
 
 pub struct ProviderRegistry {
     providers: Vec<ProviderInfo>,
     auth_store: AuthStore,
     model_cache: HashMap<String, Vec<ApiModel>>,
-    /// Override for auth file path (used in tests).
+    /// auth 文件路径的覆盖项（测试用）。
     auth_override: Option<PathBuf>,
 }
 
 impl ProviderRegistry {
-    /// Create with built-in providers.
+    /// 创建带内置 provider 的 registry。
     pub fn new() -> Self {
         let providers = vec![
             ProviderInfo {
@@ -86,30 +86,30 @@ impl ProviderRegistry {
         }
     }
 
-    /// Return reference to built-in providers.
+    /// 返回内置 provider 的引用。
     pub fn providers(&self) -> &[ProviderInfo] {
         &self.providers
     }
 
-    /// Find a provider by name.
+    /// 按名称查找 provider。
     pub fn find_provider(&self, name: &str) -> Option<&ProviderInfo> {
         self.providers.iter().find(|p| p.name == name)
     }
 
-    /// Return compat for provider name, or standard() if unknown.
+    /// 返回 provider 名称对应的 compat，未知时返回 standard()。
     pub fn compat_for(&self, name: &str) -> ProviderCompat {
         self.find_provider(name)
             .map(|p| p.compat.clone())
             .unwrap_or_else(ProviderCompat::standard)
     }
 
-    /// Set an override path for auth storage (useful for testing).
+    /// 设置 auth 存储的覆盖路径（便于测试）。
     #[cfg(test)]
     pub(crate) fn set_auth_override(&mut self, path: PathBuf) {
         self.auth_override = Some(path);
     }
 
-    /// Return the path to the auth.json file.
+    /// 返回 auth.json 文件的路径。
     pub fn auth_path(&self) -> PathBuf {
         if let Some(ref p) = self.auth_override {
             return p.clone();
@@ -120,7 +120,7 @@ impl ProviderRegistry {
         PathBuf::from(home).join(".yushan").join("auth.json")
     }
 
-    /// Read auth.json from disk. If file doesn't exist, do nothing.
+    /// 从磁盘读取 auth.json。文件不存在时什么都不做。
     pub fn load_auth(&mut self) {
         let path = self.auth_path();
         let data = match std::fs::read_to_string(&path) {
@@ -133,26 +133,26 @@ impl ProviderRegistry {
         }
     }
 
-    /// Insert credentials for a provider and persist to disk.
+    /// 插入 provider 的凭证并持久化到磁盘。
     pub fn save_auth(&mut self, provider_name: &str, entry: &AuthEntry) -> Result<(), String> {
         self.auth_store
             .insert(provider_name.to_string(), entry.clone());
         self.write_auth()
     }
 
-    /// Remove credentials for a provider and persist to disk.
+    /// 移除 provider 的凭证并持久化到磁盘。
     pub fn remove_auth(&mut self, provider_name: &str) -> Result<(), String> {
         self.auth_store.remove(provider_name);
         self.write_auth()
     }
 
-    /// Look up credentials for a provider.
+    /// 查找 provider 的凭证。
     pub fn auth_for(&self, provider_name: &str) -> Option<&AuthEntry> {
         self.auth_store.get(provider_name)
     }
 
-    /// Names of providers that have stored credentials (logged in).
-    /// Returned in registration order (deepseek, minimax, custom).
+    /// 存有凭证（已登录）的 provider 名称。
+    /// 按注册顺序返回（deepseek、minimax、custom）。
     pub fn logged_in_providers(&self) -> Vec<String> {
         self.providers
             .iter()
@@ -170,7 +170,7 @@ impl ProviderRegistry {
             .map_err(|e| format!("serialize: {e}"))?;
         std::fs::write(&path, &json).map_err(|e| format!("write auth.json: {e}"))?;
 
-        // Set restrictive permissions on Unix.
+        // 在 Unix 上设置受限权限。
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -181,7 +181,7 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Fetch models from a provider's /v1/models endpoint.
+    /// 从 provider 的 /v1/models endpoint 拉取 models。
     pub async fn fetch_models(api_base: &str, api_key: &str) -> FetchModelsResult {
         let url = build_models_url(api_base);
         let client = match reqwest::Client::builder()
@@ -215,8 +215,8 @@ impl ProviderRegistry {
         }
     }
 
-    /// Return available models, using cache or fetching from API.
-    /// Falls back to static known models on error.
+    /// 返回可用 models，优先用 cache，否则从 API 拉取。
+    /// 出错时回退到静态已知 models。
     pub async fn available_models(&mut self, api_base: &str, api_key: &str) -> Vec<ApiModel> {
         if let Some(cached) = self.model_cache.get(api_base) {
             return cached.clone();
@@ -234,7 +234,7 @@ impl ProviderRegistry {
         }
     }
 
-    /// Hardcoded fallback models when API is unreachable.
+    /// API 不可达时硬编码的回退 models。
     pub fn known_models_static() -> Vec<ApiModel> {
         vec![
             ApiModel {
@@ -253,9 +253,9 @@ impl ProviderRegistry {
     }
 }
 
-/// Build the URL for the /v1/models endpoint.
-/// If base already ends with "/v1" or "/v1/", append "/models".
-/// Otherwise append "/v1/models".
+/// 构建 /v1/models endpoint 的 URL。
+/// 若 base 已以 "/v1" 或 "/v1/" 结尾，则追加 "/models"。
+/// 否则追加 "/v1/models"。
 pub fn build_models_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/v1") {
@@ -291,7 +291,7 @@ mod tests {
         };
         reg.save_auth("deepseek", &entry).unwrap();
 
-        // Create a new registry and load from disk
+        // 创建新 registry 并从磁盘加载
         let mut reg2 = ProviderRegistry::new();
         reg2.set_auth_override(auth_path);
         reg2.load_auth();
@@ -324,7 +324,7 @@ mod tests {
         reg.save_auth("minimax", &entry2).unwrap();
         reg.remove_auth("deepseek").unwrap();
 
-        // Reload and verify
+        // 重新加载并验证
         let mut reg2 = ProviderRegistry::new();
         reg2.set_auth_override(auth_path);
         reg2.load_auth();
@@ -399,7 +399,7 @@ mod tests {
 
         let mut reg = ProviderRegistry::new();
         reg.set_auth_override(auth_path);
-        reg.load_auth(); // Should not panic or error
+        reg.load_auth(); // 不应 panic 或报错
 
         assert!(reg.auth_for("deepseek").is_none());
 

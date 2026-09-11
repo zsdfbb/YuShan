@@ -2,7 +2,7 @@ use super::response::{ChatCompletionChunk, ChunkToolCall};
 use futures::StreamExt;
 use reqwest::Response;
 
-/// SSE stream event
+/// SSE 流事件
 pub enum StreamEvent {
     Delta {
         content: Option<String>,
@@ -12,7 +12,7 @@ pub enum StreamEvent {
     Error(String),
 }
 
-/// Parse SSE stream from OpenAI-compatible API
+/// 从 OpenAI 兼容 API 解析 SSE 流
 pub async fn parse_sse_stream(response: Response) -> Vec<StreamEvent> {
     let mut events = Vec::new();
     let mut buffer = String::new();
@@ -51,7 +51,7 @@ pub async fn parse_sse_stream(response: Response) -> Vec<StreamEvent> {
                             });
                         }
                     }
-                    Err(_) => {} // Skip non-JSON chunks
+                    Err(_) => {} // 跳过非 JSON 的 chunk
                 }
             }
         }

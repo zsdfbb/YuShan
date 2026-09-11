@@ -1,4 +1,4 @@
-//! Slash command system for the coding-agent TUI.
+//! coding-agent TUI 的 slash command 系统。
 
 pub mod builtin;
 
@@ -12,24 +12,24 @@ use crate::config::Config;
 use crate::state::StateStore;
 use agent_runtime::Agent;
 
-/// A slash command that can be registered in the CommandRegistry.
+/// 可注册进 CommandRegistry 的 slash command。
 #[async_trait]
-#[allow(dead_code)] // description / arg_hint are part of the public Command
-// contract but not consumed by v0 render paths (completer
-// uses its own CmdEntry; /help reads builtin_help_entries).
+#[allow(dead_code)] // description / arg_hint 属于公共 Command
+// contract，但 v0 渲染路径不消费（completer
+// 用自有的 CmdEntry；/help 读 builtin_help_entries）。
 pub trait Command: Send + Sync {
-    /// Command name without the leading `/` (e.g., "help", "model").
+    /// 不带前导 `/` 的 command 名（如 "help"、"model"）。
     fn name(&self) -> &str;
 
-    /// One-line description shown in /help output.
+    /// 显示在 /help 输出中的一行描述。
     fn description(&self) -> &str;
 
-    /// Optional argument hint shown in /help (e.g., "<model_name>").
+    /// /help 中显示的可选参数提示（如 "<model_name>"）。
     fn arg_hint(&self) -> Option<&str> {
         None
     }
 
-    /// Execute the command.
+    /// 执行 command。
     async fn execute(
         &self,
         args: &str,
@@ -37,34 +37,34 @@ pub trait Command: Send + Sync {
     ) -> Result<CommandResult, CommandError>;
 }
 
-/// The mutable world a command can touch during execution.
+/// command 执行期间可接触的可变环境（mutable world）。
 pub struct CommandContext<'a> {
     pub agent: &'a mut Agent,
     pub config: &'a mut Config,
     pub state: &'a mut StateStore,
 }
 
-/// What the TUI loop should do after a command finishes.
+/// command 结束后 TUI 循环应采取的后续动作。
 #[derive(Debug)]
 pub enum CommandResult {
-    /// Continue the REPL loop normally.
+    /// 正常继续 REPL 循环。
     Continue,
-    /// Exit the REPL.
+    /// 退出 REPL。
     Exit,
 }
 
-/// Errors from command execution.
+/// command 执行的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
-    /// User-recoverable error (e.g., "No API key configured").
+    /// 用户可恢复的错误（如 "No API key configured"）。
     #[error("{0}")]
     UserError(String),
-    /// Internal error (e.g., IO failure).
+    /// 内部错误（如 IO 失败）。
     #[error("internal error: {0}")]
     Internal(String),
 }
 
-/// Registry of available slash commands.
+/// 可用 slash command 的 registry。
 pub struct CommandRegistry {
     commands: Vec<Box<dyn Command>>,
     by_name: HashMap<String, usize>,
@@ -78,7 +78,7 @@ impl CommandRegistry {
         }
     }
 
-    /// Register a command. Panics on duplicate name (caught at startup).
+    /// 注册 command。重复名称时 panic（启动期捕获）。
     pub fn register(&mut self, cmd: impl Command + 'static) {
         let name = cmd.name().to_string();
         let idx = self.commands.len();
@@ -88,19 +88,19 @@ impl CommandRegistry {
         }
     }
 
-    /// Look up a command by name (without leading `/`).
+    /// 按名称查找 command（不带前导 `/`）。
     pub fn get(&self, name: &str) -> Option<&dyn Command> {
         self.by_name
             .get(name)
             .map(|&idx| self.commands[idx].as_ref())
     }
 
-    /// All commands in registration order.
+    /// 按注册顺序返回全部 command。
     pub fn all(&self) -> Vec<&dyn Command> {
         self.commands.iter().map(|c| c.as_ref()).collect()
     }
 
-    /// Parse input, look up command, execute it.
+    /// 解析输入、查找 command、执行之。
     pub async fn execute(
         &self,
         input: &str,
@@ -132,9 +132,9 @@ impl Default for CommandRegistry {
     }
 }
 
-// ---- Registry builder ----
+// ---- Registry 构建器 ----
 
-/// Build a CommandRegistry with all built-in commands registered.
+/// 构建注册了全部内置 command 的 CommandRegistry。
 pub fn build_registry() -> CommandRegistry {
     let mut reg = CommandRegistry::new();
     reg.register(HelpCommand);
@@ -150,13 +150,13 @@ pub fn build_registry() -> CommandRegistry {
     reg
 }
 
-// ---- Tests ----
+// ---- 测试 ----
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Stub command for testing registry
+    // 测试 registry 用的 stub command
     struct StubCmd {
         name: String,
         desc: String,

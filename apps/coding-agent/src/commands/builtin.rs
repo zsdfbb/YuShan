@@ -3,14 +3,14 @@ use async_trait::async_trait;
 use super::{Command, CommandContext, CommandError, CommandResult};
 use crate::provider::{AuthEntry, ProviderRegistry};
 
-/// Metadata for /help display. Keeps HelpCommand decoupled from the registry.
+/// /help 展示所需的元数据。让 HelpCommand 与 registry 解耦。
 pub struct HelpEntry {
     pub name: &'static str,
     pub description: &'static str,
     pub arg_hint: Option<&'static str>,
 }
 
-/// All built-in command metadata for /help display.
+/// 所有内置 command 的元数据，用于 /help 展示。
 pub fn builtin_help_entries() -> Vec<HelpEntry> {
     vec![
         HelpEntry {
@@ -147,10 +147,10 @@ impl Command for LoginCommand {
         let providers = ctx.config.registry.providers().to_vec();
         let arg = args.trim();
 
-        // Determine which provider to use
+        // 决定使用哪个 provider
         let provider = if arg.is_empty() {
-            // Interactive selection with arrow keys
-            // Mark providers that already have stored auth with ✓
+            // 用方向键做交互式选择
+            // 已存储 auth 的 provider 打 ✓ 标记
             let provider_labels: Vec<String> = providers
                 .iter()
                 .map(|p| {
@@ -173,7 +173,7 @@ impl Command for LoginCommand {
 
             match selection {
                 Ok(label) => {
-                    // Find the provider by matching the label
+                    // 通过匹配 label 找到对应 provider
                     let idx = providers
                         .iter()
                         .position(|p| {
@@ -198,7 +198,7 @@ impl Command for LoginCommand {
                 }
             }
         } else {
-            // Match by name
+            // 按名称匹配
             providers
                 .iter()
                 .find(|p| p.name == arg)
@@ -212,7 +212,7 @@ impl Command for LoginCommand {
                 })?
         };
 
-        // For custom provider, prompt for api_base
+        // 对 custom provider，提示输入 api_base
         let api_base = if provider.api_base.is_empty() {
             let base = inquire::Text::new("API base URL:")
                 .with_help_message("e.g. https://api.deepseek.com")
@@ -236,7 +236,7 @@ impl Command for LoginCommand {
             provider.api_base.to_string()
         };
 
-        // Prompt for api_key
+        // 提示输入 api_key
         let api_key = inquire::Text::new("API key:")
             .with_help_message("Your authentication key for this provider")
             .prompt();
@@ -262,7 +262,7 @@ impl Command for LoginCommand {
             provider.default_model.to_string()
         };
 
-        // Save credentials to registry (persisted to auth.json)
+        // 保存凭证到 registry（持久化到 auth.json）
         if let Err(e) = ctx.config.registry.save_auth(
             &provider.name,
             &AuthEntry {
@@ -274,13 +274,13 @@ impl Command for LoginCommand {
             eprintln!("Warning: Could not persist credentials: {e}");
         }
 
-        // Update config fields
+        // 更新 config 字段
         ctx.config.api_base = Some(api_base.clone());
         ctx.config.api_key = Some(api_key.clone());
         ctx.config.model = model_name.clone();
         ctx.config.provider = Some(provider.name.clone());
 
-        // Build model via factory and set on agent
+        // 通过 factory 构建 model 并设到 agent
         match ctx.config.build_model() {
             Some(model) => {
                 ctx.agent.set_model(Some(model));
@@ -290,7 +290,7 @@ impl Command for LoginCommand {
             }
         }
 
-        // Best-effort: fetch models to populate cache
+        // 尽力而为：拉取 models 填充 cache
         match ProviderRegistry::fetch_models(&api_base, &api_key).await {
             crate::provider::FetchModelsResult::Success(models) => {
                 println!("Fetched {} model(s).", models.len());
@@ -338,22 +338,22 @@ impl Command for LogoutCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        // Remove auth from registry if a provider is set
+        // 若已设置 provider，则从 registry 移除其 auth
         if let Some(ref provider_name) = ctx.config.provider.clone() {
             if let Err(e) = ctx.config.registry.remove_auth(provider_name) {
                 eprintln!("Warning: Could not remove persisted credentials: {e}");
             }
         }
 
-        // Clear all config fields
+        // 清空所有 config 字段
         ctx.config.api_base = None;
         ctx.config.api_key = None;
         ctx.config.provider = None;
 
-        // Clear the agent's model
+        // 清空 agent 的 model
         ctx.agent.set_model(None);
 
-        // Persist cleared state
+        // 持久化已清空的状态
         let _ = ctx.state.save(&crate::state::AppState::default());
 
         println!("Logged out. API credentials cleared.");
@@ -388,7 +388,7 @@ impl Command for ModelCommand {
     ) -> Result<CommandResult, CommandError> {
         let target = args.trim();
         if target.is_empty() {
-            // Interactive model selection
+            // 交互式 model 选择
             let models = if ctx.config.is_configured() {
                 let api_base = ctx.config.api_base.as_deref().unwrap_or("");
                 let api_key = ctx.config.api_key.as_deref().unwrap_or("");
@@ -426,7 +426,7 @@ impl Command for ModelCommand {
                     let model = models.iter().find(|m| m.id == id).ok_or_else(|| {
                         CommandError::Internal(format!("Could not find model for: {id}"))
                     })?;
-                    // Update config and rebuild
+                    // 更新 config 并重建
                     ctx.config.model = model.id.clone();
                     let _ = ctx.state.save(&crate::state::AppState {
                         last_active_provider: ctx.config.provider.clone(),
@@ -447,14 +447,14 @@ impl Command for ModelCommand {
                 }
                 Err(inquire::InquireError::OperationCanceled)
                 | Err(inquire::InquireError::OperationInterrupted) => {
-                    // Do nothing, stay on current model
+                    // 不做任何事，保持当前 model
                 }
                 Err(e) => {
                     return Err(CommandError::Internal(format!("Selection error: {e}")));
                 }
             }
         } else {
-            // Direct name: /model deepseek-chat
+            // 直接指定名称：/model deepseek-chat
             ctx.config.model = target.to_string();
             let _ = ctx.state.save(&crate::state::AppState {
                 last_active_provider: ctx.config.provider.clone(),
@@ -526,7 +526,7 @@ impl Command for CompactCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        // MVP: clear session as a stand-in for compaction.
+        // MVP：以清空 session 代替 compaction。
         ctx.agent
             .clear_session()
             .await
@@ -555,16 +555,16 @@ impl Command for StatusCommand {
     async fn execute(
         &self,
         _args: &str,
-        // In `tui-ratatui` mode the status panel is rendered directly by
-        // `ui/draw::draw_status_panel`, so /status is a no-op and `ctx` is unused.
+        // 在 `tui-ratatui` 模式下，status 面板由 `ui/draw::draw_status_panel` 直接渲染，
+        // 故 /status 是 no-op，`ctx` 未使用。
         // **c phase**: `tui-stdout` 已删除；tui-stdout 路径下的 `render_status` 调用
         // 也随 tui-stdout feature 一起删除；/status 在 ratatui 模式仅作为 ui 面板
         // 入口（draw_status_panel 自动渲染）。
         _ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        // v0: token totals are not shown because TurnStats is owned by main.rs and not
-        // threaded through CommandContext. Future work: extend CommandContext with
-        // &mut TurnStats (or Arc<Mutex<>>).
+        // v0：不显示 token 总数，因为 TurnStats 归 main.rs 所有，未穿过
+        // CommandContext。后续工作：给 CommandContext 增加
+        // &mut TurnStats（或 Arc<Mutex<>>）。
         Ok(CommandResult::Continue)
     }
 }
@@ -651,7 +651,7 @@ impl Command for QuitCommand {
 }
 
 // ===========================================================================
-// Tests
+// 测试
 // ===========================================================================
 
 #[cfg(test)]
@@ -663,7 +663,7 @@ mod tests {
     use agent_runtime::AgentBuilder;
     use agent_session::MemorySession;
 
-    /// Helper: build a test agent with a mock model.
+    /// 辅助：用 mock model 构建测试 agent。
     fn test_agent(model_name: &str) -> agent_runtime::Agent {
         let model = agent_model::MockModel::new(model_name);
         AgentBuilder::new()
@@ -678,8 +678,8 @@ mod tests {
         Config::from_env().unwrap()
     }
 
-    /// Helper: build a throwaway StateStore pointing at a temp directory so
-    /// tests never touch the real ~/.yushan/state.json.
+    /// 辅助：构建指向临时目录的一次性 StateStore，
+    /// 使测试永不触碰真实的 ~/.yushan/state.json。
     fn test_state_store() -> crate::state::StateStore {
         let mut store = crate::state::StateStore::new();
         let dir = std::env::temp_dir().join(format!(
@@ -723,7 +723,7 @@ mod tests {
 
         let result = HelpCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
-        // HelpCommand prints to stdout; verify it doesn't panic.
+        // HelpCommand 打印到 stdout；验证它不 panic。
     }
 
     #[tokio::test]
@@ -810,13 +810,13 @@ mod tests {
             state: &mut state_store,
         };
 
-        // /model with args switches directly (no interactive selector)
+        // /model 带参数直接切换（不走交互式选择器）
         let result = ModelCommand
             .execute("deepseek-chat", &mut ctx)
             .await
             .unwrap();
         assert!(matches!(result, CommandResult::Continue));
-        // Config.model should be updated
+        // Config.model 应被更新
         assert_eq!(ctx.config.model, "deepseek-chat");
     }
 
@@ -842,8 +842,8 @@ mod tests {
 
     #[test]
     fn test_model_no_args_returns_continue() {
-        // /model without args opens interactive selector (inquire::Select),
-        // which cannot run in tests. Just verify the command exists.
+        // /model 不带参数会打开交互式选择器（inquire::Select），
+        // 无法在测试中运行。仅验证 command 存在。
         assert_eq!(ModelCommand.name(), "model");
         assert!(ModelCommand.arg_hint().is_some());
     }
@@ -859,7 +859,7 @@ mod tests {
             .build()
             .unwrap();
 
-        // Run a turn to add messages
+        // 跑一个 turn 以添加消息
         agent
             .run_turn(agent_loop::AgentInput::text("hi"))
             .await
@@ -977,7 +977,7 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
 
-        // Set config fields
+        // 设置 config 字段
         config.api_base = Some("https://api.example.com".into());
         config.api_key = Some("sk-test".into());
         config.provider = Some("deepseek".into());
@@ -992,7 +992,7 @@ mod tests {
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
 
-        // All config fields should be cleared
+        // 所有 config 字段都应被清空
         assert!(ctx.config.api_base.is_none());
         assert!(ctx.config.api_key.is_none());
         assert!(ctx.config.provider.is_none());
@@ -1034,7 +1034,7 @@ mod tests {
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
 
-        // Create a NEW registry to verify the file was updated on disk
+        // 创建新 registry，验证文件已更新到磁盘
         let mut registry2 = ProviderRegistry::new();
         registry2.set_auth_override(auth_path);
         registry2.load_auth();
@@ -1082,7 +1082,7 @@ mod tests {
 
         let mut state_store = test_state_store();
         state_store.set_override(state_path.clone());
-        // Pre-populate state.json simulating a previous active session
+        // 预先填充 state.json，模拟之前的一次活跃会话
         state_store
             .save(&crate::state::AppState {
                 last_active_provider: Some("deepseek".into()),

@@ -10,7 +10,7 @@ pub struct JsonlSession {
 }
 
 impl JsonlSession {
-    /// Open or create a JSONL session file
+    /// 打开或创建 JSONL session 文件
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, SessionError> {
         let path = path.into();
         let messages = if path.exists() {
@@ -38,7 +38,7 @@ impl JsonlSession {
             match serde_json::from_str::<Message>(&line) {
                 Ok(msg) => msgs.push(msg),
                 Err(e) => {
-                    // Corrupt line: skip + warn, don't terminate (fix C3)
+                    // 损坏行：跳过并告警、不终止（修复 C3）
                     eprintln!("Warning: skipping corrupt session line {line_num}: {e}");
                 }
             }
@@ -46,7 +46,7 @@ impl JsonlSession {
         Ok(msgs)
     }
 
-    /// Atomic write: write to tmp file, then rename (prevent data loss on crash)
+    /// 原子写入：先写临时文件，再 rename（防止崩溃时数据丢失）
     async fn flush_to_file(&self) -> Result<(), SessionError> {
         let tmp_path = self.path.with_extension("jsonl.tmp");
         {
@@ -64,7 +64,7 @@ impl JsonlSession {
                     .map_err(|e| SessionError::Storage(format!("write newline failed: {e}")))?;
             }
         }
-        // Atomic rename
+        // 原子 rename
         tokio::fs::rename(&tmp_path, &self.path)
             .await
             .map_err(|e| SessionError::Storage(format!("rename failed: {e}")))?;
@@ -128,7 +128,7 @@ mod tests {
             assert_eq!(session.messages().len(), 2);
         }
 
-        // Reopen and verify recovery
+        // 重新打开并验证恢复
         {
             let session = JsonlSession::open(&path).await.unwrap();
             assert_eq!(session.messages().len(), 2);
@@ -159,7 +159,7 @@ mod tests {
             assert!(session.messages().is_empty());
         }
 
-        // Reopen and verify empty
+        // 重新打开并验证为空
         {
             let session = JsonlSession::open(&path).await.unwrap();
             assert!(session.messages().is_empty());
@@ -173,7 +173,7 @@ mod tests {
         let path = std::env::temp_dir().join("test_jsonl_corrupt.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
 
-        // Write a corrupt line followed by a valid line
+        // 先写一行损坏数据，后跟一条有效行
         let valid_msg = Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -185,7 +185,7 @@ mod tests {
         tokio::fs::write(&path, content).await.unwrap();
 
         let session = JsonlSession::open(&path).await.unwrap();
-        // Corrupt line should be skipped, only valid message recovered
+        // 损坏行应被跳过，只恢复有效消息
         assert_eq!(session.messages().len(), 1);
         assert_eq!(session.messages()[0].role, Role::User);
 

@@ -1,6 +1,6 @@
 use agent_core::{ContentBlock, Message};
 
-/// Estimate the number of tokens in a message (chars/4 + CJK compensation)
+/// 估算一条消息中的 token 数（字符数/4 + CJK 补偿）
 pub fn estimate_tokens(message: &Message) -> usize {
     message
         .content
@@ -14,14 +14,14 @@ pub fn estimate_tokens(message: &Message) -> usize {
         .sum()
 }
 
-/// Estimate the number of tokens in a text string
+/// 估算文本字符串中的 token 数
 pub fn estimate_text_tokens(text: &str) -> usize {
     let mut cjk_count = 0u64;
     let mut total_bytes = text.len() as u64;
     for ch in text.chars() {
         if is_cjk(ch) {
             cjk_count += 1;
-            // UTF-8 CJK = 3 bytes, counted in len(), adjust for /4
+            // UTF-8 CJK = 3 字节，已计入 len()，需按 /4 调整
             total_bytes -= 2;
         }
     }
@@ -40,7 +40,7 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
-/// Estimate total tokens for a session's messages
+/// 估算 session 中全部消息的总 token 数
 pub fn estimate_session_tokens(messages: &[Message]) -> usize {
     messages.iter().map(|m| estimate_tokens(m)).sum()
 }
@@ -52,22 +52,22 @@ mod tests {
 
     #[test]
     fn test_estimate_text_tokens_ascii() {
-        // "hello" = 5 bytes, 5/4 = 1
+        // "hello" = 5 字节，5/4 = 1
         assert_eq!(estimate_text_tokens("hello"), 1);
-        // "abcdefgh" = 8 bytes, 8/4 = 2
+        // "abcdefgh" = 8 字节，8/4 = 2
         assert_eq!(estimate_text_tokens("abcdefgh"), 2);
     }
 
     #[test]
     fn test_estimate_text_tokens_cjk() {
-        // "你好" = 2 CJK chars, 6 bytes total, adjust: 6-2*2=2, 2/4=0, cjk: 2*1.5=3
+        // "你好" = 2 个 CJK 字符，共 6 字节，调整：6-2*2=2，2/4=0，cjk：2*1.5=3
         assert_eq!(estimate_text_tokens("你好"), 3);
     }
 
     #[test]
     fn test_estimate_text_tokens_mixed() {
-        // "hi你好" = "hi" (2 bytes) + "你好" (6 bytes, 2 CJK)
-        // total_bytes = 8, adjust: 8-2*2=4, ascii=4/4=1, cjk=2*1.5=3, total=4
+        // "hi你好" = "hi"（2 字节）+ "你好"（6 字节，2 个 CJK 字符）
+        // total_bytes = 8，调整：8-2*2=4，ascii=4/4=1，cjk=2*1.5=3，合计 4
         assert_eq!(estimate_text_tokens("hi你好"), 4);
     }
 
@@ -84,7 +84,7 @@ mod tests {
                 text: "hello world".into(),
             }],
         };
-        // "hello world" = 11 bytes, 11/4 = 2
+        // "hello world" = 11 字节，11/4 = 2
         assert_eq!(estimate_tokens(&msg), 2);
     }
 
@@ -104,7 +104,7 @@ mod tests {
                 }],
             },
         ];
-        // "hello" = 1 token, "world" = 1 token
+        // "hello" = 1 个 token，"world" = 1 个 token
         assert_eq!(estimate_session_tokens(&messages), 2);
     }
 }

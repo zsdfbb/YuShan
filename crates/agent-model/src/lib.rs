@@ -1,4 +1,4 @@
-//! Model abstraction layer for LLM backends.
+//! LLM 后端的 model 抽象层。
 
 mod error;
 mod event;

@@ -1,7 +1,7 @@
-//! End-to-end test: agent uses all 4 tools (Write, Bash, Edit, Read) to complete a task.
+//! 端到端测试：agent 用全部 4 个工具（Write、Bash、Edit、Read）完成任务。
 //!
-//! REQUIRES: YUSHAN_API_BASE and YUSHAN_API_KEY environment variables.
-//! Run with:
+//! 要求：YUSHAN_API_BASE 与 YUSHAN_API_KEY 环境变量。
+//! 运行方式：
 //!   YUSHAN_API_BASE=https://api.deepseek.com YUSHAN_API_KEY=sk-xxx \
 //!     cargo test -p yushan-coding-agent e2e -- --ignored --nocapture
 
@@ -17,14 +17,14 @@ use std::path::PathBuf;
 
 fn workdir() -> PathBuf {
     let dir = std::env::temp_dir().join("yushan_e2e_test");
-    // Clean up from previous runs
+    // 清理之前的运行残留
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
 #[tokio::test]
-#[ignore] // Requires real API credentials. Run: cargo test -- --ignored
+#[ignore] // 需要真实 API 凭证。运行：cargo test -- --ignored
 async fn e2e_four_tools_calculator() {
     let api_base = std::env::var("YUSHAN_API_BASE")
         .or_else(|_| std::env::var("OPENAI_API_BASE"))
@@ -35,7 +35,7 @@ async fn e2e_four_tools_calculator() {
 
     let wd = workdir();
 
-    // Build real agent with low temperature for determinism
+    // 用低温构建真实 agent 以保证确定性
     let model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
         api_base,
         api_key,
@@ -72,13 +72,13 @@ async fn e2e_four_tools_calculator() {
         .expect("test timed out after 120s")
         .expect("agent run_turn failed");
 
-    // Verify the agent produced a response
+    // 验证 agent 产出了响应
     assert!(
         result.final_message.is_some(),
         "agent should produce a final message"
     );
 
-    // Verify calc.py was created with both functions
+    // 验证 calc.py 已创建且含两个函数
     let calc_py = wd.join("calc.py");
     assert!(
         calc_py.exists(),
@@ -96,6 +96,6 @@ async fn e2e_four_tools_calculator() {
         "calc.py should contain multiply function. Content:\n{content}"
     );
 
-    // Cleanup
+    // 清理
     let _ = std::fs::remove_dir_all(&wd);
 }

@@ -1,6 +1,6 @@
 use agent_core::Message;
 
-/// Input for a single agent turn
+/// 单次 agent turn 的输入
 pub struct AgentInput {
     pub message: Message,
 }
@@ -10,7 +10,7 @@ impl AgentInput {
         Self { message }
     }
 
-    /// Convenience: create from text string
+    /// 便捷方法：从文本字符串创建
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             message: Message {

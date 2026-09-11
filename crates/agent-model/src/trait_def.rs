@@ -2,13 +2,13 @@ use async_trait::async_trait;
 
 use super::{ModelError, ModelEventSink, ModelRequest, ModelResponse};
 
-/// Interface for LLM backends.
+/// LLM 后端的接口。
 #[async_trait]
 pub trait Model: Send + Sync {
-    /// Returns the model identifier (e.g. "claude-sonnet-4-20250514").
+    /// 返回 model 标识符（例如 "claude-sonnet-4-20250514"）。
     fn model_id(&self) -> &str;
 
-    /// Send a completion request and stream events to `sink`.
+    /// 发送 completion 请求，并把事件流式推送到 `sink`。
     async fn complete(
         &self,
         request: ModelRequest,

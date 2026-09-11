@@ -1,4 +1,4 @@
-//! Token formatting helpers shared by ratatui UI rendering.
+//! ratatui UI 渲染共享的 token 格式化辅助。
 //!
 //! **c phase**: `tui-stdout` 已删除；本文件仅保留 ratatui mode 仍需要的
 //! `format_tokens` / `format_scaled_k` / `format_scaled_m`。`print_banner` /
@@ -17,9 +17,8 @@ pub fn format_tokens(n: u32) -> String {
 
 fn format_scaled_k(n: u32) -> String {
     let v = n as f64 / 1_000.0;
-    // For n in [1k, 10k) always keep one decimal. For n >= 10k, drop the
-    // trailing ".0" so exact-thousand values like 10_000 render as "10k"
-    // instead of "10.0k".
+    // n 在 [1k, 10k) 时始终保留一位小数；n >= 10k 时去掉末尾
+    // 的 ".0"，使 10_000 这类整千值渲染为 "10k" 而不是 "10.0k"。
     let with_decimal = format!("{:.1}k", v);
     if n >= 10_000 && with_decimal.ends_with(".0k") {
         format!("{}k", v.round() as u64)

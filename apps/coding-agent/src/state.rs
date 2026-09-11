@@ -1,11 +1,11 @@
-//! Session state persistence (state.json).
+//! 会话状态持久化（state.json）。
 //!
-//! State lives independently from auth.json — no sensitive data, but we still
-//! restrict to 0o600 for consistency with `ProviderRegistry::write_auth`.
+//! state 独立于 auth.json 存放——不含敏感数据，但为与 `ProviderRegistry::write_auth`
+//! 保持一致仍限制为 0o600。
 //!
-//! Persisted fields (extensible):
-//! - `last_active_provider` — name of the most recently logged-in provider
-//! - `last_active_model` — name of the most recently selected model
+//! 持久化字段（可扩展）：
+//! - `last_active_provider` — 最近一次登录的 provider 名称
+//! - `last_active_model` — 最近一次选中的 model 名称
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

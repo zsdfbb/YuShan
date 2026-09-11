@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// OpenAI chat completion request
+/// OpenAI chat completion 请求体
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,

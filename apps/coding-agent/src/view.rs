@@ -1,13 +1,11 @@
-//! `AppView` — the sole display-side data source.
+//! `AppView` —— 唯一的展示侧数据源。
 //!
-//! `format.rs::print_*` functions take `&AppView` and know nothing about
-//! `Config` / `Agent` / `ProviderRegistry`. `AppView::from_sources` rebuilds
-//! the snapshot whenever `view_dirty = true` (set by `tui.rs` after any
-//! command execution or completed turn).
+//! `format.rs::print_*` 函数接收 `&AppView`，对 `Config` / `Agent` / `ProviderRegistry`
+//! 一无所知。当 `view_dirty = true`（`tui.rs` 在任何 command 执行或 turn 完成后设置）
+//! 时，`AppView::from_sources` 重建快照。
 //!
-//! Grouping A note: `tools` and `context_window` are placeholders (`Vec::new()`
-//! / `None`). They will be populated in grouping C once `Agent::tool_names()`
-//! and `Agent::context_window()` land (ADR-0007).
+//! Grouping A 说明：`tools` 与 `context_window` 是占位（`Vec::new()` / `None`）。
+//! 待 Grouping C 中 `Agent::tool_names()` 与 `Agent::context_window()` 落地后填充（ADR-0007）。
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -19,20 +17,20 @@ use crate::provider::ProviderRegistry;
 use crate::state::StateStore;
 use crate::status::TurnStats;
 
-/// Metadata for one slash command, used by `/help` output and the
-/// ratatui Tab completer (ui/events.rs).
+/// 单个 slash command 的元数据，供 `/help` 输出和
+/// ratatui Tab completer（ui/events.rs）使用。
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // description / arg_hint consumed by /help and ratatui Tab completer
+#[allow(dead_code)] // description / arg_hint 由 /help 与 ratatui Tab completer 消费
 pub struct CommandMeta {
     pub name: &'static str,
     pub description: &'static str,
     pub arg_hint: Option<&'static str>,
 }
 
-/// Snapshot of all display-relevant state. Cheap to clone (`~10 small fields`).
+/// 全部与展示相关的状态快照。克隆开销低（约 `10 个小字段`）。
 #[derive(Clone, Debug)]
 pub struct AppView {
-    // identity
+    // 身份信息
     pub cwd: PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -41,32 +39,31 @@ pub struct AppView {
     pub total_known_providers: usize,
     pub version: &'static str,
 
-    // stats
+    // 统计
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     pub turn_count: u32,
 
-    // session
+    // 会话
     pub session_started: Instant,
-    /// Number of messages in the current session. Read by future
-    /// "context full" warnings and `/status`; not consumed by v0 render paths.
+    /// 当前会话中的消息数。供未来的 "context full" 警告与 `/status` 读取；
+    /// v0 渲染路径不消费。
     #[allow(dead_code)]
     pub message_count: usize,
 
-    // capabilities
+    // 能力
     pub tools: Vec<String>,
     pub context_window: Option<usize>,
     pub is_first_run: bool,
 
-    // commands
+    // 命令
     pub commands: Vec<CommandMeta>,
 }
 
 impl AppView {
-    /// Build a snapshot from the live sources. Called by `tui.rs` whenever
-    /// `view_dirty = true`. The caller is responsible for keeping `stats` and
-    /// `session_started` consistent across rebuilds (typically both are owned
-    /// by `tui.rs`).
+    /// 从实时数据源构建快照。当 `view_dirty = true` 时由 `tui.rs` 调用。
+    /// 调用方负责在重建之间保持 `stats` 与 `session_started` 一致
+    /// （通常二者都由 `tui.rs` 持有）。
     pub fn from_sources(
         cfg: &Config,
         agent: &Agent,
@@ -93,11 +90,11 @@ impl AppView {
             tools: agent.tool_names(),
             context_window: Some(agent.context_window()),
             is_first_run,
-            commands: Vec::new(), // populated by caller
+            commands: Vec::new(), // 由调用方填充
         }
     }
 
-    /// Human-readable session uptime: `Ns` / `Nm Ms` / `Nh Mm`.
+    /// 人类可读的会话时长：`Ns` / `Nm Ms` / `Nh Mm`。
     pub fn session_duration_str(&self) -> String {
         let secs = self.session_started.elapsed().as_secs();
         if secs < 60 {
@@ -151,14 +148,14 @@ mod tests {
     fn test_session_duration_str_sub_minute() {
         let view = make_view(Instant::now());
         let s = view.session_duration_str();
-        // Sub-minute rendering always ends with "s" (e.g., "0s", "12s").
+        // 不足一分钟的渲染总以 "s" 结尾（如 "0s"、"12s"）。
         assert!(s.ends_with('s'), "expected trailing 's', got {s:?}");
         assert!(!s.contains(' '), "sub-minute form must not contain spaces");
     }
 
     #[test]
     fn test_command_meta_field_types_static() {
-        // Compile-time check: &'static str fields are well-formed.
+        // 编译期检查：&'static str 字段形态良好。
         let meta = CommandMeta {
             name: "help",
             description: "Show available commands",

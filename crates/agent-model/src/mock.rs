@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use super::{Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse};
 
-/// Scripted responses for the mock model.
+/// 供 mock model 使用的预写响应。
 pub enum MockResponse {
     Text(String),
     ToolCall {
@@ -15,7 +15,7 @@ pub enum MockResponse {
     Error(String),
 }
 
-/// A test model that returns pre-programmed responses.
+/// 返回预设响应（pre-programmed）的测试 model。
 pub struct MockModel {
     id: String,
     responses: Mutex<Vec<MockResponse>>,
@@ -29,7 +29,7 @@ impl MockModel {
         }
     }
 
-    /// Push a text response.
+    /// 压入一个文本响应。
     pub fn push_text(&self, text: impl Into<String>) {
         self.responses
             .lock()
@@ -37,7 +37,7 @@ impl MockModel {
             .push(MockResponse::Text(text.into()));
     }
 
-    /// Push a tool call response.
+    /// 压入一个 tool call 响应。
     pub fn push_tool_call(&self, name: impl Into<String>, arguments: serde_json::Value) {
         self.responses.lock().unwrap().push(MockResponse::ToolCall {
             name: name.into(),
@@ -45,7 +45,7 @@ impl MockModel {
         });
     }
 
-    /// Push an error response.
+    /// 压入一个错误响应。
     pub fn push_error(&self, msg: impl Into<String>) {
         self.responses
             .lock()

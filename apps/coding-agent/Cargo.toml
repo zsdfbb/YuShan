@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = ["tui-ratatui"]
 tui-ratatui = ["dep:ratatui", "dep:crossterm", "dep:futures"]
-# tui-stdout removed (c phase)
+# tui-stdout 已移除（c 阶段）
 
 [dependencies]
 agent-core = { path = "../../crates/agent-core" }
@@ -26,9 +26,9 @@ reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
 thiserror = "2"
 inquire = "0.8"
-# rustyline removed (c phase — ratatui mode handles input via crossterm events)
+# rustyline 已移除（c 阶段——ratatui 模式通过 crossterm events 处理输入）
 
-# ratatui mode only (optional)
+# 仅 ratatui 模式使用（可选依赖）
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true, features = ["event-stream"] }
 futures = { version = "0.3", optional = true }

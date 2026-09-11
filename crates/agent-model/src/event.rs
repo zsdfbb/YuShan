@@ -1,14 +1,14 @@
 use agent_core::EventError;
 use serde::{Deserialize, Serialize};
 
-/// Events emitted by a model during streaming.
+/// model 在 streaming 期间发出的事件。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelEvent {
     TextDelta { text: String },
 }
 
-/// Narrow event sink for model-level events.
+/// 面向 model 级事件的窄化 event sink。
 pub trait ModelEventSink: Send {
     fn emit(&mut self, event: ModelEvent) -> Result<(), EventError>;
 }

@@ -1,6 +1,6 @@
 use agent_core::{Message, StopReason, Usage};
 
-/// Result of a single agent turn
+/// 单次 agent turn 的结果
 pub struct RunResult {
     pub stop_reason: StopReason,
     pub usage: Usage,

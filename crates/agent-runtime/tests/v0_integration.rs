@@ -1,7 +1,7 @@
-//! v0 end-to-end integration tests
+//! v0 端到端集成测试
 //!
-//! Uses AgentBuilder to assemble complete Agent, verifying all key scenarios
-//! through both the Agent API and the lower-level BasicLoop API.
+//! 使用 AgentBuilder 组装完整的 Agent，
+//! 通过 Agent API 与低层 BasicLoop API 共同验证所有关键场景。
 
 use agent_core::{ContentBlock, Message, Role};
 use agent_event::CollectingSink;
@@ -11,7 +11,7 @@ use agent_runtime::prelude::*;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
-// Test Tools
+// 测试工具
 // ---------------------------------------------------------------------------
 
 struct EchoTool;
@@ -49,7 +49,7 @@ impl agent_tool::Tool for FailingTool {
     }
 }
 
-/// Helper to create a RuntimeContext with default cwd/workspace
+/// 用默认 cwd/workspace 创建 RuntimeContext 的辅助函数
 fn make_ctx<'a>(
     model: &'a dyn agent_model::Model,
     registry: &'a agent_tool::ToolRegistry,
@@ -73,7 +73,7 @@ fn make_ctx<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// TC2: Pure text reply
+// TC2：纯文本回复
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -97,7 +97,7 @@ async fn tc2_pure_text_reply() {
 }
 
 // ---------------------------------------------------------------------------
-// TC3: Single tool call loop
+// TC3：单工具调用循环
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -118,12 +118,12 @@ async fn tc3_single_tool_call() {
     let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Completed);
-    assert_eq!(result.rounds, 2); // 1 tool round + 1 text round
+    assert_eq!(result.rounds, 2); // 1 个工具 round + 1 个文本 round
     assert!(result.final_message.is_some());
 }
 
 // ---------------------------------------------------------------------------
-// TC4: Multi-round tool loop (2 consecutive tool calls, then text)
+// TC4：多轮工具循环（连续 2 次工具调用，然后文本）
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -145,18 +145,18 @@ async fn tc4_multi_round_tool_loop() {
     let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Completed);
-    assert_eq!(result.rounds, 3); // 2 tool rounds + 1 text round
+    assert_eq!(result.rounds, 3); // 2 个工具 round + 1 个文本 round
 }
 
 // ---------------------------------------------------------------------------
-// TC5: Tool error fed back to model (T11c: error recovery, not termination)
+// TC5：tool 错误回喂给模型（T11c：错误恢复而非终止）
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn tc5_tool_error_fed_back_to_model() {
     let model = MockModel::new("test");
     model.push_tool_call("fail", serde_json::json!({}));
-    // After tool error, model responds with text (error was fed back as result)
+    // tool 错误之后，模型以文本回复（错误已作为结果回喂）
     model.push_text("I see the tool failed, continuing anyway");
 
     let agent = AgentBuilder::new()
@@ -170,13 +170,13 @@ async fn tc5_tool_error_fed_back_to_model() {
     let mut agent = agent;
     let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
-    // Tool errors are now fed back as results, loop continues
+    // tool 错误现在作为结果回喂，循环继续
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert!(result.final_message.is_some());
 }
 
 // ---------------------------------------------------------------------------
-// TC8: Incremental text concatenation == final message
+// TC8：增量文本拼接 == 最终消息
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -206,7 +206,7 @@ async fn tc8_incremental_concat_matches_final() {
             .unwrap()
     };
 
-    // Collect all ModelTextDelta texts
+    // 收集所有 ModelTextDelta 文本
     let delta_text: String = events
         .events()
         .iter()
@@ -219,7 +219,7 @@ async fn tc8_incremental_concat_matches_final() {
         })
         .collect();
 
-    // Final message text
+    // 最终消息文本
     let final_text = result
         .final_message
         .as_ref()
@@ -245,7 +245,7 @@ async fn tc8_incremental_concat_matches_final() {
 }
 
 // ---------------------------------------------------------------------------
-// TC9: Terminal event invariant - exactly one RunFinished or RunFailed
+// TC9：终止事件不变量 —— 恰好一个 RunFinished 或 RunFailed
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -285,7 +285,7 @@ async fn tc9_terminal_event_invariant() {
 }
 
 // ---------------------------------------------------------------------------
-// TC14: Continuation with pre-filled history
+// TC14：带预填历史记录继续会话
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -328,7 +328,7 @@ async fn tc14_continuation_with_history() {
 }
 
 // ---------------------------------------------------------------------------
-// TC10: Duplicate tool name causes build error
+// TC10：重复工具名称导致构建错误
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -338,7 +338,7 @@ fn tc10_duplicate_tool_name_build_error() {
         .session(MemorySession::new())
         .events(CollectingSink::new())
         .tool(EchoTool)
-        .tool(EchoTool) // duplicate name "echo"
+        .tool(EchoTool) // 重复名称 "echo"
         .build();
 
     assert!(result.is_err());
@@ -355,7 +355,7 @@ fn tc10_duplicate_tool_name_build_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Cancel: mid-loop cancel via tool execution
+// 取消：经工具执行在循环中途取消
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -401,6 +401,6 @@ async fn cancel_mid_loop() {
     let mut agent = agent;
     let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
-    // Cancel was set during tool execution, next loop boundary detects it
+    // 工具执行期间已设置取消，下一个 loop 边界检测到它
     assert_eq!(result.stop_reason, StopReason::Cancelled);
 }

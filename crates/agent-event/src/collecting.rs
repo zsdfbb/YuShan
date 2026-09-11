@@ -1,7 +1,7 @@
 use super::{AgentEvent, EventSink};
 use agent_core::EventError;
 
-/// An event sink that collects all emitted events in memory.
+/// 在内存中收集所有已发出事件的 event sink。
 pub struct CollectingSink {
     events: Vec<AgentEvent>,
 }

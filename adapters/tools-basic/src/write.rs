@@ -40,7 +40,7 @@ impl Tool for WriteTool {
 
         let abs_path = self.workspace.join(path);
 
-        // Create parent directories
+        // 创建父目录
         if let Some(parent) = abs_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await

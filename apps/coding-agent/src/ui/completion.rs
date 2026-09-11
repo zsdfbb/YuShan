@@ -1,5 +1,5 @@
 #![cfg(feature = "tui-ratatui")]
-//! Completion popup extension point.
+//! 补全弹窗（completion popup）扩展点。
 //!
 //! v0 简化：completion popup 复用 events.rs 的 inline 实现（`complete_inline`）。
 //! 此文件作为扩展点预留——未来 popup 用 ratatui List widget 渲染时可放这里。

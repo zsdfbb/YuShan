@@ -84,7 +84,7 @@ pub fn translate_request(
 ) -> Result<ChatCompletionRequest, ModelError> {
     let mut messages = Vec::new();
 
-    // System prompt
+    // 系统提示词
     if let Some(system) = &request.system {
         messages.push(ChatMessage {
             role: "system".into(),
@@ -95,7 +95,7 @@ pub fn translate_request(
         });
     }
 
-    // Session messages
+    // Session 消息
     for msg in &request.messages {
         let role = match msg.role {
             Role::User => "user",
@@ -128,7 +128,7 @@ pub fn translate_request(
                     content,
                     is_error,
                 } => {
-                    // OpenAI format: role="tool", tool_call_id, content
+                    // OpenAI 格式：role="tool"、tool_call_id、content
                     messages.push(ChatMessage {
                         role: "tool".into(),
                         content: Some(if *is_error {
@@ -141,11 +141,11 @@ pub fn translate_request(
                         name: None,
                     });
                 }
-                _ => {} // Handle future ContentBlock variants
+                _ => {} // 处理未来的 ContentBlock 变体
             }
         }
 
-        // Add the main message
+        // 追加主消息
         if !text_content.is_empty() || !tool_calls.is_empty() {
             messages.push(ChatMessage {
                 role: role.into(),
@@ -165,7 +165,7 @@ pub fn translate_request(
         }
     }
 
-    // Tools
+    // Tools 列表
     let tools = if request.tools.is_empty() {
         None
     } else {
@@ -207,16 +207,16 @@ fn translate_response(
 
     let mut content_blocks = Vec::new();
 
-    // Text content
+    // 文本内容
     if let Some(text) = choice.message.content {
         if !text.is_empty() {
-            // Emit text delta event
+            // 发出 text delta 事件
             let _ = sink.emit(ModelEvent::TextDelta { text: text.clone() });
             content_blocks.push(ContentBlock::Text { text });
         }
     }
 
-    // Tool calls
+    // 工具调用（tool calls）
     if let Some(tool_calls) = choice.message.tool_calls {
         for tc in tool_calls {
             let arguments: serde_json::Value =
@@ -281,7 +281,7 @@ mod tests {
 
         let chat_req = translate_request(&request, &config).unwrap();
         assert_eq!(chat_req.model, "deepseek-chat");
-        assert_eq!(chat_req.messages.len(), 2); // system + user
+        assert_eq!(chat_req.messages.len(), 2); // system + user 各一条
         assert_eq!(chat_req.messages[0].role, "system");
         assert_eq!(chat_req.messages[1].role, "user");
     }

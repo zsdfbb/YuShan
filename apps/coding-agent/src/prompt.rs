@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
-/// Build system prompt with tool snippets and dynamic guidelines.
+/// 用工具片段和动态 guideline 构建 system prompt。
 pub fn build_system_prompt(cwd: &Path) -> String {
-    // 1. Check for custom prompt files
+    // 1. 检查是否有自定义 prompt 文件
     if let Some(custom) = find_custom_prompt(cwd) {
         return custom;
     }
 
-    // 2. Build default prompt
+    // 2. 构建默认 prompt
     let tools = ["read", "write", "edit", "bash"];
     let tool_list: Vec<String> = tools
         .iter()
@@ -27,7 +27,7 @@ Guidelines:
 {guidelines}"#
     );
 
-    // 3. Append project context (AGENTS.md / YUSHAN.md)
+    // 3. 追加项目上下文（AGENTS.md / YUSHAN.md）
     let context_files = load_project_context(cwd);
     if !context_files.is_empty() {
         prompt.push_str("\n\n<project_context>\n\n");
@@ -96,7 +96,7 @@ fn load_project_context(cwd: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // Global context
+    // 全局上下文
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         try_load(
             &std::path::PathBuf::from(home).join(".yushan/AGENTS.md"),
@@ -105,7 +105,7 @@ fn load_project_context(cwd: &Path) -> Vec<ContextFile> {
         );
     }
 
-    // Walk up from cwd
+    // 从 cwd 逐级向父目录遍历
     let mut current = cwd.to_path_buf();
     loop {
         for name in &["AGENTS.override.md", "AGENTS.md", "YUSHAN.md", "CLAUDE.md"] {
@@ -118,7 +118,7 @@ fn load_project_context(cwd: &Path) -> Vec<ContextFile> {
         current = parent.unwrap().to_path_buf();
     }
 
-    files.reverse(); // Ancestors from far to near
+    files.reverse(); // 祖先目录从远到近
     files
 }
 
@@ -139,12 +139,12 @@ fn try_load(
 }
 
 fn find_custom_prompt(cwd: &Path) -> Option<String> {
-    // Check .yushan/SYSTEM.md
+    // 检查 .yushan/SYSTEM.md
     let project_path = cwd.join(".yushan/SYSTEM.md");
     if project_path.exists() {
         return std::fs::read_to_string(project_path).ok();
     }
-    // Check ~/.yushan/SYSTEM.md
+    // 检查 ~/.yushan/SYSTEM.md
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let global_path = std::path::PathBuf::from(home).join(".yushan/SYSTEM.md");
         if global_path.exists() {
@@ -154,7 +154,7 @@ fn find_custom_prompt(cwd: &Path) -> Option<String> {
     None
 }
 
-/// Render cwd with $HOME prefix replaced by `~/`. Falls back to absolute path if cwd is outside $HOME.
+/// 渲染 cwd，将 $HOME 前缀替换为 `~/`。若 cwd 在 $HOME 之外则回退为绝对路径。
 pub fn format_cwd_tilde(cwd: &Path) -> String {
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home_path = PathBuf::from(home);

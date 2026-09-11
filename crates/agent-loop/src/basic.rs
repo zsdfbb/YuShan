@@ -11,12 +11,12 @@ use async_trait::async_trait;
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
-/// Token budget reserved for summary when compressing context
+/// 压缩上下文时为 summary 预留的 token 预算
 const COMPACT_KEEP_TOKENS: usize = 20_000;
 
 pub struct BasicLoop;
 
-/// Forwarder bridges ModelEvent -> AgentEvent, forwarding to EventSink.
+/// Forwarder 桥接 ModelEvent → AgentEvent，转发到 EventSink。
 struct Forwarder<'a> {
     sink: &'a mut dyn agent_event::EventSink,
 }
@@ -41,7 +41,7 @@ impl AgentLoop for BasicLoop {
         let mut total_usage = Usage::default();
         let mut consecutive_errors: HashMap<String, u32> = HashMap::new();
 
-        // Step 1: Entry boundary -- check cancel
+        // Step 1：入口边界 —— 检查 cancel
         if ctx.cancel.is_cancelled() {
             ctx.events
                 .emit(AgentEvent::RunFinished {
@@ -58,7 +58,7 @@ impl AgentLoop for BasicLoop {
             });
         }
 
-        // Step 2: Append user message, emit UserMessage
+        // Step 2：追加用户消息，发出 UserMessage
         let user_message = input.message.clone();
         ctx.session
             .append(input.message)
@@ -70,9 +70,9 @@ impl AgentLoop for BasicLoop {
             })
             .map_err(LoopError::Event)?;
 
-        // Main loop
+        // 主循环
         loop {
-            // Step 3: Check cancel before model call
+            // Step 3：调用 model 前检查 cancel
             if ctx.cancel.is_cancelled() {
                 ctx.events
                     .emit(AgentEvent::RunFinished {
@@ -89,7 +89,7 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 4: Check max rounds BEFORE model call
+            // Step 4：在调用 model 之前检查最大 round 数
             if rounds >= ctx.limits.max_rounds {
                 ctx.events
                     .emit(AgentEvent::RunFinished {
@@ -106,7 +106,7 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 4b: Context compression check (T11e)
+            // Step 4b：上下文压缩检查（T11e）
             {
                 let messages = ctx.session.messages();
                 let total_tokens = crate::token::estimate_session_tokens(messages);
@@ -115,7 +115,7 @@ impl AgentLoop for BasicLoop {
                 }
             }
 
-            // Step 5: Assemble ModelRequest (ToolSpec already cached at build time)
+            // Step 5：组装 ModelRequest（ToolSpec 已在构建时缓存）
             rounds += 1;
             let tools = ctx.registry.specs().to_vec();
             let request = ModelRequest {
@@ -125,21 +125,21 @@ impl AgentLoop for BasicLoop {
                 ..Default::default()
             };
 
-            // Step 6: Call model with Forwarder
+            // Step 6：通过 Forwarder 调用 model
             let mut forwarder = Forwarder { sink: ctx.events };
             let response = ctx
                 .model
                 .complete(request, &mut forwarder)
                 .await
                 .map_err(|e| {
-                    // Emit RunFailed before returning error (terminal event invariant)
+                    // 返回错误前发出 RunFailed（终止事件不变量）
                     let _ = ctx.events.emit(AgentEvent::RunFailed {
                         error: e.to_string(),
                     });
                     LoopError::Model(e)
                 })?;
 
-            // Step 7: Append assistant message (cancel during call -> still append)
+            // Step 7：追加 assistant 消息（调用中取消 -> 仍要追加）
             let assistant_message = response.message.clone();
             total_usage = total_usage + response.usage;
             ctx.session
@@ -147,7 +147,7 @@ impl AgentLoop for BasicLoop {
                 .await
                 .map_err(|_| LoopError::Event(agent_core::EventError::SendFailed))?;
 
-            // Extract text content for final_message
+            // 提取文本内容作为 final_message
             let mut text_content = String::new();
             for block in &assistant_message.content {
                 if let ContentBlock::Text { text } = block {
@@ -155,7 +155,7 @@ impl AgentLoop for BasicLoop {
                 }
             }
 
-            // Step 8: Check for tool calls
+            // Step 8：检查 tool call
             let tool_calls: Vec<_> = assistant_message
                 .content
                 .iter()
@@ -174,7 +174,7 @@ impl AgentLoop for BasicLoop {
                 .collect();
 
             if tool_calls.is_empty() {
-                // No tool calls -> completed
+                // 无 tool call -> 完成
                 let final_msg = if text_content.is_empty() {
                     None
                 } else {
@@ -195,11 +195,11 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 9: Execute tool calls serially (v0)
+            // Step 9：串行执行工具调用（v0）
             let mut tool_results_for_message: Vec<ContentBlock> = Vec::new();
 
             for (tool_call_id, tool_name, tool_args) in &tool_calls {
-                // T11a: Approval check
+                // T11a：审批检查
                 if let Some(approval) = &ctx.approval {
                     if approval.needs_approval(tool_name, tool_args) {
                         match approval.request_approval(tool_name, tool_args).await {
@@ -216,7 +216,7 @@ impl AgentLoop for BasicLoop {
                     }
                 }
 
-                // Emit ToolCall event
+                // 发出 ToolCall 事件
                 ctx.events
                     .emit(AgentEvent::ToolCall {
                         call: agent_core::ToolCall {
@@ -227,7 +227,7 @@ impl AgentLoop for BasicLoop {
                     })
                     .map_err(LoopError::Event)?;
 
-                // Lookup in registry and execute with timeout (T11b) and error recovery (T11c)
+                // 在 registry 中查找并带超时执行（T11b）与错误恢复（T11c）
                 let result = match ctx.registry.get(tool_name) {
                     Some(tool) => {
                         let tool_ctx = ToolContext::new(
@@ -270,7 +270,7 @@ impl AgentLoop for BasicLoop {
                         }
                     }
                     None => {
-                        // Registry miss -> synthesize is_error result (ADR-0001)
+                        // registry 未命中 -> 合成 is_error 结果（ADR-0001）
                         CoreToolResult {
                             content: format!("tool not found: {tool_name}"),
                             is_error: true,
@@ -278,19 +278,19 @@ impl AgentLoop for BasicLoop {
                     }
                 };
 
-                // T11c: Consecutive error tracking
+                // T11c：连续错误跟踪
                 if result.is_error {
                     let count = consecutive_errors.entry(tool_name.clone()).or_insert(0);
                     *count += 1;
                     if *count >= MAX_CONSECUTIVE_ERRORS {
-                        // Continue loop but the error result will be fed to model
-                        // The model should see the repeated errors and stop calling the tool
+                        // 继续循环，但错误结果会回喂给模型
+                        // 模型应看到反复出现的错误并停止调用该工具
                     }
                 } else {
                     consecutive_errors.remove(tool_name);
                 }
 
-                // Emit ToolResult event
+                // 发出 ToolResult 事件
                 ctx.events
                     .emit(AgentEvent::ToolResult {
                         id: tool_call_id.clone(),
@@ -298,7 +298,7 @@ impl AgentLoop for BasicLoop {
                     })
                     .map_err(LoopError::Event)?;
 
-                // Prepare content block for appending
+                // 准备待追加的 content block
                 tool_results_for_message.push(ContentBlock::ToolResult {
                     tool_call_id: tool_call_id.clone(),
                     content: result.content,
@@ -306,7 +306,7 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Append tool results as a single message and continue loop
+            // 将工具结果作为单条消息追加并继续循环
             let tool_result_message = Message {
                 role: Role::User,
                 content: tool_results_for_message,
@@ -319,11 +319,11 @@ impl AgentLoop for BasicLoop {
     }
 }
 
-/// Compact session by summarizing old messages when context window is near limit.
+/// 当 context window 接近上限时，通过总结旧消息来压缩 session。
 async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> {
     let messages: Vec<Message> = ctx.session.messages().to_vec();
 
-    // Find the keep point: scan from newest, keep ~COMPACT_KEEP_TOKENS tokens
+    // 计算保留点：从最新消息往回扫，保留约 COMPACT_KEEP_TOKENS 个 token
     let mut keep_from = messages.len();
     let mut kept_tokens = 0usize;
     for msg in messages.iter().rev() {
@@ -335,7 +335,7 @@ async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> 
         keep_from -= 1;
     }
 
-    // Nothing to compress if keep_from is 0 or 1
+    // keep_from 为 0 或 1 时无需压缩
     if keep_from <= 1 {
         return Ok(());
     }
@@ -343,16 +343,16 @@ async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> 
     let to_summarize = &messages[..keep_from];
     let to_keep = &messages[keep_from..];
 
-    // Generate summary using the model
+    // 使用模型生成 summary
     let summary = generate_summary(ctx.model, to_summarize).await;
 
-    // Rebuild session: summary message + kept messages
+    // 重建 session：summary 消息 + 保留的消息
     ctx.session
         .clear()
         .await
         .map_err(|_| LoopError::Event(agent_core::EventError::SendFailed))?;
 
-    // Write summary as system context
+    // 以 system context 形式写入 summary
     let summary_text = match summary {
         Ok(text) => format!("[Context Summary]\n{text}\n[/Context Summary]"),
         Err(_) => "[Context Summary]\n[Compression failed — proceeding with truncated history]\n[/Context Summary]".into(),
@@ -365,7 +365,7 @@ async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> 
         .await
         .map_err(|_| LoopError::Event(agent_core::EventError::SendFailed))?;
 
-    // Keep a synthetic assistant acknowledgment
+    // 保留一条合成的 assistant 确认消息
     ctx.session
         .append(Message {
             role: Role::Assistant,
@@ -376,7 +376,7 @@ async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> 
         .await
         .map_err(|_| LoopError::Event(agent_core::EventError::SendFailed))?;
 
-    // Re-append the kept messages
+    // 重新追加保留的消息
     for msg in to_keep {
         ctx.session
             .append(msg.clone())
@@ -387,7 +387,7 @@ async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> 
     Ok(())
 }
 
-/// Generate a summary of old messages using the model.
+/// 使用模型生成旧消息的 summary。
 async fn generate_summary(
     model: &dyn agent_model::Model,
     messages: &[Message],
@@ -412,7 +412,7 @@ async fn generate_summary(
         ..Default::default()
     };
     let response = model.complete(request, &mut sink).await?;
-    // Extract text from response
+    // 从响应中提取文本
     for block in &response.message.content {
         if let ContentBlock::Text { text } = block {
             return Ok(text.clone());

@@ -1,7 +1,7 @@
 use agent_core::{Message, StopReason, ToolCall, ToolCallId, ToolResult, Usage};
 use serde::{Deserialize, Serialize};
 
-/// Runtime-level events emitted during an agent run.
+/// agent run 期间发出的 runtime 级事件。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {

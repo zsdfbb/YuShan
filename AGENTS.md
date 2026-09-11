@@ -63,13 +63,15 @@ YuShan/
 | `provider` | ProviderRegistry：内置 provider 目录、auth.json 持久化（~/.yushan/）、GET /v1/models 动态模型获取、ProviderCompat 映射 |
 | `commands` | Command trait + CommandRegistry + 内置命令（/login /logout /model /help /new /compact /status /copy /export /quit） |
 | `prompt` | 系统提示词构建 |
-| `tui` | 交互式 REPL 循环（stdin → 命令拦截 → agent turn） |
+| `view` | `AppView` 显示快照（provider/model/tokens/turn_count/session/cwd/tools…），唯一显示数据源 |
+| `ui` | ratatui TUI（feature `tui-ratatui`，默认开）：事件循环、三栏渲染、slash/agent turn 桥接、退出打印完整对话；默认仅对话窗口，status/footer 面板可选挂载 |
 
 关键设计：
 - `ProviderRegistry` 作为 `Config` 的 pub 字段，命令通过 `ctx.config.registry` 访问
 - `CommandContext` 只持有 `&mut Agent` + `&mut Config`，不直接持有 registry
 - 凭证持久化到 `~/.yushan/auth.json`（0o600 权限），启动时自动恢复
 - 模型列表优先从 API 动态获取，失败 fallback 到静态列表
+- 数据/显示分离：`AppView::from_sources` 是唯一显示数据源快照；`App` 管 UI 交互状态（transcript/input/滚动/turn 状态）；显示组件只经快照读，不经运行时可变对象直读写
 
 ## 硬性约束
 
@@ -86,7 +88,8 @@ YuShan/
 
 - 实现顺序遵循路线图：最小闭环 → 可用适配器 → 静态组件生态 → 动态插件 → Coding Agent MVP
 - 新模块和接口改动须能对应上 `docs/design.md` §12 测试矩阵中的条目
-- 文档、讨论、commit message 用中文；代码标识符与注释用英文
+- 文档、注释、讨论、commit message、PR 描述用中文；代码标识符用英文（技术术语/专名可夹英文）
+- 数据与显示分离：显示层只消费只读快照（coding-agent 的 `AppView`）与事件，不直接读写运行时可变对象；UI 交互状态（`App`）与显示快照解耦；面板默认仅对话窗口、其余可选挂载
 - `tmp/` 目录已被 `.gitignore` 忽略，勿将正式内容放入
 
 ## 参考资料

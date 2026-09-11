@@ -91,6 +91,42 @@ fn setup_terminal()
     Ok(terminal)
 }
 
+/// 执行 slash command 前暂停 TUI：离开 alt-screen + 关闭 raw mode，
+/// 让命令（含 `inquire` 交互）在真实终端运行，避免其 stdout/键盘操作污染 alt-screen。
+/// 期间不 poll 事件流 → crossterm 后台线程停在 channel recv，不抢 stdin。
+fn suspend_terminal<B: Backend + Write>(
+    terminal: &mut Terminal<B>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crossterm::{
+        cursor::Show,
+        execute,
+        terminal::{EnableLineWrap, LeaveAlternateScreen, disable_raw_mode},
+    };
+    execute!(terminal.backend_mut(), EnableLineWrap)?;
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), Show)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// 命令执行完恢复 TUI：重进 alt-screen + raw mode + 清空 ratatui 缓冲（避免与旧帧 diff）。
+fn resume_terminal<B: Backend + Write>(
+    terminal: &mut Terminal<B>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crossterm::{
+        execute,
+        terminal::{DisableLineWrap, EnterAlternateScreen, enable_raw_mode},
+    };
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        DisableLineWrap
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
 fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &App,
@@ -125,7 +161,7 @@ fn restore_terminal(
     Ok(())
 }
 
-async fn event_loop<B: Backend>(
+async fn event_loop<B: Backend + Write>(
     terminal: &mut Terminal<B>,
     agent: &mut Agent,
     config: &mut Config,
@@ -171,7 +207,7 @@ async fn event_loop<B: Backend>(
 }
 
 /// R3 阶段完整实现 — slash command 分发 + agent turn 桥接（带 spin 节拍 + 事件路径取消）。
-async fn dispatch_input<B: Backend>(
+async fn dispatch_input<B: Backend + Write>(
     terminal: &mut Terminal<B>,
     input: String,
     events: &mut EventStream,
@@ -201,8 +237,10 @@ async fn dispatch_input<B: Backend>(
     app.transcript.push(TranscriptLine::User(input.clone()));
     app.follow = true;
 
-    // slash command
+    // slash command —— TUI 让位：命令（含 inquire 交互）在真实终端运行，
+    // 避免其 stdout/键盘操作污染 alt-screen（修复"交互错位"根因）
     if input.starts_with('/') {
+        suspend_terminal(terminal)?;
         let result = {
             let mut ctx = CommandContext {
                 agent,
@@ -211,6 +249,9 @@ async fn dispatch_input<B: Backend>(
             };
             commands.execute(&input, &mut ctx).await
         };
+        if let Err(e) = resume_terminal(terminal) {
+            return Err(e.into());
+        }
         match result {
             Ok(CommandResult::Continue) => {
                 app.view = crate::view::AppView::from_sources(

@@ -74,15 +74,15 @@ TUI 提交 /login → dispatch_input
 - `/quit` → suspend→resume→should_quit 置位（最终由外层 break + restore）。
 - `suspend` 失败 → 传播错误（当前 `?` 语义），不进入执行。
 
-## 未澄清问题
+## 未澄清问题（已解决 → 见 design.md + ADR）
 
-- [ ] `Prompter`/`TuiSurface` 放哪里：`commands/` 内 trait vs `ui/` 模块内 trait？`CommandContext` 增 `&dyn Prompter` 字段 vs 独立参数（后者改动最小，但让 `execute` 签名加参）？
-- [ ] 值得为真实 tty 交互引 `portable-pty`/`rexpect` dev-dep 吗（收益 vs 依赖体积/脆弱性）；还是 Prompter 假实现 + 少量人工验足够？
-- [ ] 先抽「纯」逻辑（如 `/model` 无参 → 决策需要 select）把 inquire 依赖压到最小注入面，还是全量抽 trait？
-- [ ] 命令逻辑单测放模块内（builtin.rs `#[cfg(test)]`）还是 `tests/` 集成？前者贴近现有 draw.rs 风格。
+- [x] `Prompter`/`TuiSurface` 放哪里 → Prompter 嵌入 `CommandContext`（commands/mod.rs）；TuiSurface 独立于 `ui/mod.rs`
+- [x] 要不要引 `portable-pty`/`rexpect` → 不引，Prompter fake 足够覆盖控制逻辑
+- [x] 先抽纯逻辑还是全量抽 → 全量抽，4 个 inquire 调用点全替换
+- [x] 测试放模块内还是 `tests/` → `builtin.rs` 的 `#[cfg(test)]` 模块内
 
 ## 后续建议
 
-- 用 `arch-design` 出 `Prompter`/`TuiSurface` 两个抽象的具体设计（trait 形状、注入点、fake 测试形态），再行实施。
-- 用 `tdd`：先写 fake 驱动的命令单测（红）→ 再引入 trait（绿）→ 收敛生产 impl。
-- 交互「控制逻辑」进包内单测后，真 tty 行为只需 `#[ignore]` 或人工轻量兜底即可。
+- ✅ 已完成 arch-design：`docs/arch/tui-interaction-test/design.md` + `adr-prompter-surface-trait.md`
+- ✅ 已完成实施（quick 模式）：Prompter trait + InquirePrompter + 4 决策测试 + 4 渲染测试（`cargo test` 84+2 全绿）
+- 真 tty 行为（inquire 方向键选择、suspend/resume 字节级）留 `#[ignore]` 或人工轻量兜底

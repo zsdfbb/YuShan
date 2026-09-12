@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
-use ys_channel::{Envelope, LifecyclePolicy};
+use ys_channel::{Envelope, Inbox, Intent, LifecyclePolicy};
 use ys_event::{AgentEvent, EventSink, NoopEventSink};
 use ys_loop::AgentInput;
 use ys_model::Model;
@@ -267,13 +267,16 @@ async fn run_print_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured(agent)?;
 
-    // 消费与 turn 必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
-    let (turn_result, consume_result) = tokio::join!(
-        agent.run_turn(AgentInput::text(task.as_str())),
-        consume_print_events(rx, io::stdout()),
-    );
+    // 走自转接口 `Agent::run`（而非 `run_turn`）：它每回合调 `begin_turn(n)`，
+    // 使 `Envelope.turn` 从 1 起递增。一次用户输入 = 一个 followUp 回合。
+    let inbox = Inbox::new();
+    inbox.push(AgentInput::text(task.as_str()).message, Intent::FollowUp);
 
-    turn_result?;
+    // 消费与 run 必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
+    let (run_result, consume_result) =
+        tokio::join!(agent.run(&inbox), consume_print_events(rx, io::stdout()),);
+
+    run_result?;
     let printed_any = consume_result?;
 
     if printed_any {
@@ -290,12 +293,16 @@ async fn run_json_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured(agent)?;
 
-    let (turn_result, consume_result) = tokio::join!(
-        agent.run_turn(AgentInput::text(task.as_str())),
+    // 同 `-p`：走 `Agent::run` 以获得逐回合的 `turn`（从 1 起递增）。
+    let inbox = Inbox::new();
+    inbox.push(AgentInput::text(task.as_str()).message, Intent::FollowUp);
+
+    let (run_result, consume_result) = tokio::join!(
+        agent.run(&inbox),
         consume_events(rx, io::stdout(), write_json_envelope),
     );
 
-    turn_result?;
+    run_result?;
     consume_result?;
     Ok(())
 }
@@ -762,5 +769,53 @@ mod tests {
 
         // 显式保留到断言之后：证明 consume_print_events 未依赖 tx 被 drop。
         drop(tx);
+    }
+
+    /// 12. **迁移步 4 回归**：`-p`/`--json` 走 `Agent::run(&inbox)`（而非 `run_turn`），
+    ///     `begin_turn(1)` 被驱动 → 信道上所有 `Envelope.turn` 从 **1** 起（不再恒为 0）。
+    ///
+    ///     修复前：`run_print_mode`/`run_json_mode` 调 `run_turn`，`begin_turn` 从不触发，
+    ///     `ChannelSink.turn` 保持初值 0 → 断言失败。
+    #[tokio::test]
+    async fn run_via_inbox_sets_turn_from_one() {
+        use ys_model::MockModel;
+
+        let model = MockModel::new("m");
+        model.push_text("hello");
+
+        let (sink, rx) = ChannelSink::new(
+            DEFAULT_CHANNEL_CAPACITY,
+            LifecyclePolicy::StopWhenConsumerGone,
+        );
+        let mut agent = build_agent(Some(model), String::new(), PathBuf::from("."), sink).unwrap();
+
+        // 与 `-p`/`--json` 相同的构造：一次用户输入作为 followUp 入队。
+        let inbox = Inbox::new();
+        inbox.push(AgentInput::text("hi").message, Intent::FollowUp);
+
+        let mut out: Vec<u8> = Vec::new();
+        let (run_result, consume_result) = tokio::join!(
+            agent.run(&inbox),
+            consume_events(rx, &mut out, write_json_envelope),
+        );
+        run_result.expect("run 应成功");
+        consume_result.expect("consume 应成功");
+
+        let text = String::from_utf8(out).unwrap();
+        let turns: Vec<u64> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["turn"]
+                    .as_u64()
+                    .expect("Envelope 应含 turn 字段")
+            })
+            .collect();
+
+        assert!(!turns.is_empty(), "应至少收到一个信封；text = {text}");
+        assert!(text.contains("RunFinished"), "text = {text}");
+        assert!(
+            turns.iter().all(|&t| t == 1),
+            "所有信封的 turn 应从 1 开始；turns = {turns:?}"
+        );
     }
 }

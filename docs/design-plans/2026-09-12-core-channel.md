@@ -177,7 +177,7 @@ pub struct Envelope { pub source: Source, pub turn: u32, pub event: AgentEvent }
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecyclePolicy {
-    StopWhenConsumerGone,      // 消费者消失 → 干完当前轮收摊（交互式默认）
+    StopWhenConsumerGone,      // 消费者消失 → 干完当前轮收摊，以 Err(LoopError::Event(SendFailed)) 返回（交互式默认）
     ContinueWithoutConsumer,   // 消费者消失 → 继续跑（事件落盘兜底；后台长任务）
 }
 
@@ -293,7 +293,7 @@ impl ChannelSink { pub fn stats(&self) -> ChannelStats; }
 | 12 | 2.4 | `-p` 流式 | 集成测：增量文本按序到达（可注入 writer） | **必测** |
 | 13 | 3.1 | 轮边界注入 | 轮边界注入后模型看到新 user 消息；**不增 rounds** | **必测** |
 | 14 | 3.1 | 向后兼容 | `inbox = None` 时行为与今日一致（存量测试即证） | **必测** |
-| 15 | 4.1 | 自转语义 | followUp 排队→自动下一趟；inbox 空→立即返回；消费者消失→收摊；`run_one_turn` 语义保持 | **必测** |
+| 15 | 4.1 | 自转语义 | followUp 排队→自动下一趟；inbox 空→立即返回；消费者消失→以 `Err(LoopError::Event(SendFailed))` 返回；`run_one_turn` 语义保持 | **必测** |
 | 16 | 4.1 | 自转集成 | `crates/ys-runtime/tests/` 跨 crate 集成测（`Agent::run` + ChannelSink） | **必测** |
 | — | — | 真实 API 端到端 | `cargo test -p ys-coding-agent e2e -- --ignored` 需凭证 | MANUAL_ACK_REQUIRED |
 | — | — | TUI 终端观感 | 渲染有 `TestBackend` 可测，但**实际终端观感**需人工确认 | MANUAL_ACK_REQUIRED |

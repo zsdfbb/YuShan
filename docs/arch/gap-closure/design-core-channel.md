@@ -355,7 +355,8 @@ pub struct Envelope {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecyclePolicy {
-    /// 消费者消失 → 干完当前轮收摊（交互式默认）
+    /// 消费者消失 → 干完当前轮收摊，以 `Err(LoopError::Event(SendFailed))` 终止当前 run
+    /// （交互式默认；其返回类型不同于「用户取消」的 `Ok(RunResult { stop_reason: Cancelled })`）
     StopWhenConsumerGone,
     /// 消费者消失 → 继续跑（事件落盘兜底；后台长任务）
     ContinueWithoutConsumer,
@@ -387,7 +388,14 @@ impl Agent {
     pub async fn run(&mut self, inbox: &Inbox) -> Result<RunSummary, LoopError>;
 
     /// 内部：跑一个回合。原 `run_turn`，保持可用（测试直接调用）。
-    async fn run_one_turn(&mut self, input: AgentInput) -> Result<RunResult, LoopError>;
+    ///
+    /// `inbox` 为 `Some` 时才注入 steering 源——在构造 `RuntimeContext` 时
+    /// `.with_inbox(...)`；`run_turn`（兼容入口）传 `None`，行为与改动前一致。
+    async fn run_one_turn(
+        &mut self,
+        input: AgentInput,
+        inbox: Option<&Inbox>,
+    ) -> Result<RunResult, LoopError>;
 }
 
 pub struct RunSummary { pub turns: u32, pub usage: Usage, pub last_stop: Option<StopReason> }
@@ -425,11 +433,13 @@ impl ChannelSink { pub fn stats(&self) -> ChannelStats; }
 | 1 | **`EventSink` 改 try/await 双路径** + `begin_turn`；`BasicLoop`/`Forwarder` 适配；`Noop`/`Collecting` 跟进 | `ys-event` `ys-loop` | 事件顺序不变；**`ModelEventSink` 未被触碰** |
 | 2 | **建 `ys-channel` 契约**（`Envelope`/`Source`/`Inbox`/`QueueMode`/`LifecyclePolicy`）+ `ChannelSink`（含 overflow 与 stats）+ 置 `main.rs` 「先定模式→选消费者→建 agent」；实现 `--json`、`-p` 流式 | `ys-channel`(新) 接线器 | `--json` 逐事件输出；「增量拼接 == 终态」不变式；**背压时事件不丢** |
 | 3 | **`RuntimeContext.inbox` + `BasicLoop` 轮边界 steering** | `ys-component` `ys-loop` | 新单测：轮边界注入后模型看到新 user 消息；**注入不改变 `turn`** |
-| 4 | **`Agent::run(inbox)`**（不收 policy）；TUI/`-p` 改调 `run`；`run_turn` → 内部 `run_one_turn` | `ys-runtime` 接线器 | 「followUp 排队→结束后自动下一趟」；「消费者消失→交互式收摊」 |
+| 4 | **`Agent::run(inbox)`**（不收 policy）；**`-p`/`--json` 改调 `run`**；`run_turn` → 内部 `run_one_turn` | `ys-runtime` 接线器 | 「followUp 排队→结束后自动下一趟」；「消费者消失→以 `Err(LoopError::Event(SendFailed))` 终止当前 run」 |
 | 5 | **ADR-0010 所有权收敛**（可选、独立）：session/events 移出 `Agent`；`/new` = 新 `Session` + 新空 `Inbox`（**pending 丢弃**）；`CommandContext` 不再持 `&mut Agent` | `ys-runtime` 接线器 `commands` | ~20 处测试改构造；`/new` 后旧会话文件保留 |
 | 6 | 独立后续项（**不在本设计**）：`Arc<Vec<Message>>` 请求快照、`Bytes` delta、`Usage`/`StopReason: Copy`、`max_rounds`/`bash_timeout` 显式配置、事件落盘 | — | 计数分配器断言；长任务解锁 |
 
 **顺序理由**：步 1（信道契约就绪）→ 步 2（事件出口，后台 agent 的标准出口，风险最低）→ 步 3/4（消息模型）。步 5 与信道解耦，可最后做或不做。
+
+> **注（TUI 为何不在步 4 改）**：步 4 只把 **`-p`/`--json`** 切到 `run`；**TUI 仍走 `run_turn`**，本轮不改。原因：TUI 生产路径挂的是 `NoopEventSink`（`main.rs` 按 `Mode::Interactive` 选 `SinkChoice::Noop`），事件发出即被丢弃，既收不到 `Envelope`、也没有 `begin_turn` 的 turn 语义可受益；且 TUI 的 turn future 与键鼠收取本就在同一任务内 `select!` 交错，切 `run` 无收益（context.md 明确「TUI 本轮不改」）。待 TUI 接上事件流（把 `NoopEventSink` 换成信道接收端）时再一并改为 `run`。
 
 ## 6. 扩展点（记录，不实现）
 

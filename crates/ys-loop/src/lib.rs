@@ -388,7 +388,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("hello");
         let mut session = MemorySession::new();
-        // 首次投递即失败：快路径失败 → 回落慢路径 → 慢路径也失败
+        // 首次投递即失败：自由函数总走慢路径，慢路径也失败
         let mut events = FailingSink::new(0);
         events.set_fail_slow(true);
         let cancel = CancelToken::new();
@@ -412,8 +412,8 @@ mod tests {
             matches!(err, LoopError::Event(ys_core::EventError::SendFailed)),
             "expected LoopError::Event(SendFailed), got {err:?}"
         );
-        assert_eq!(events.try_calls(), 1, "首条事件失败后不再尝试投递");
-        assert_eq!(events.slow_calls(), 1, "回落慢路径一次");
+        assert_eq!(events.try_calls(), 0, "自由函数总走慢路径，不触碰快路径");
+        assert_eq!(events.slow_calls(), 1, "慢路径失败一次即终止");
         assert!(events.emitted().is_empty(), "不应有事件被静默投递");
     }
 }

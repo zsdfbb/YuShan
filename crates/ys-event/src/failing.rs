@@ -7,24 +7,26 @@ use ys_core::EventError;
 /// 测试用的失败替身：从第 `succeed_first` 次调用起让投递失败。
 ///
 /// **生产导出**（照 `ys_model::MockModel` 先例，非 `#[cfg(test)]`）：跨 crate 复用，
-/// `ys-loop` / `ys-runtime` / `ys-coding-agent` 的测试都需要一个能走完
-/// 「快路径失败 → 回落慢路径 → 慢路径失败 → `EventError::SendFailed`」全路径的 sink。
+/// `ys-loop` / `ys-runtime` / `ys-coding-agent` 的测试都需要一个能注入
+/// 「投递失败 → `EventError::SendFailed`」的 sink。
 ///
 /// 两条路径各自独立计数：
-/// - 快路径 `try_emit`：前 `succeed_first` 次成功，之后返回 `Err(event)` —— **原样退回**事件，
-///   使自由函数 [`emit`](crate::emit) 能带着同一事件回落慢路径。
+/// - 快路径 `try_emit`：前 `succeed_first` 次成功，之后返回 `Err(event)`（原样退回）。
 /// - 慢路径 `emit`：仅当已开启 [`set_fail_slow`](FailingSink::set_fail_slow) 且自身调用次数
 ///   达到同一阈值时返回 `Err(EventError::SendFailed)`。
 ///
-/// **慢路径默认成功**（`fail_slow == false`）：于是 `FailingSink::new(0)` 恰是
-/// 「快路径必失败 + 慢路径可成功」——自由函数回落逻辑要覆盖的正是这个场景；
+/// **慢路径默认成功**（`fail_slow == false`），故 `FailingSink::new(0)` 恰是
+/// 「快路径必失败、慢路径可成功」——用于直接测 `try_emit` / `emit` 两条路径本身；
 /// 要测慢路径失败（`SendFailed` 直达调用方），显式 `set_fail_slow(true)`。
+///
+/// **注意**：自由函数 [`emit`](crate::emit) **已不再**「先试快路径、失败再回落慢路径」，
+/// 而是总走慢路径。因此本替身的 `try_emit` 不再服务于自由函数的回落逻辑，只服务于
+/// 直接调用 `try_emit` 的场景（如 `Forwarder`）。
 ///
 /// **与 [`EventSink`] 契约的关系（测试工具的宽松语义）**：生产实现须遵守
 /// 「`Err` 仅表示消费者消失、满时内部缓冲、不得返回 `Err`」的契约；而本替身是
-/// **通用失败注入器**，其 `try_emit` 返回 `Err(event)` 同时模拟两种测试场景——
-/// 「消费者消失」与「快路径失败、回落慢路径」。故 `FailingSink` 的 `Err` 语义
-/// 比契约更宽松，仅供测试注入失败，不代表生产实现应照此返回 `Err`。
+/// **通用失败注入器**，其 `try_emit` 返回 `Err(event)` 为模拟「投递失败」，
+/// 语义比契约更宽松，仅供测试注入失败，不代表生产实现应照此返回 `Err`。
 pub struct FailingSink {
     /// 前 `succeed_first` 次调用成功，之后失败
     succeed_first: usize,
@@ -51,7 +53,7 @@ impl FailingSink {
         }
     }
 
-    /// 永不失败的便捷构造（快路径恒 `Ok`），用于断言稳态不走慢路径。
+    /// 永不失败的便捷构造（快路径恒 `Ok`）。
     pub fn always_ok() -> Self {
         Self::new(usize::MAX)
     }
@@ -95,7 +97,7 @@ impl EventSink for FailingSink {
             self.emitted.push(event);
             Ok(())
         } else {
-            // 原样退回：自由函数据此把同一事件转入慢路径
+            // 原样退回事件（供调用方按需处置）
             Err(event)
         }
     }

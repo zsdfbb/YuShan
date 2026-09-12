@@ -55,27 +55,29 @@ mod tests {
         );
     }
 
-    // Task 4 合同 (a)：自由函数稳态只走快路径
+    // 自由函数**总是**走慢路径（死锁修复）：不再先试同步快路径。
+    // 旧实现「稳态走快路径」会在信道满时把终局事件缓冲进 sink 而无人冲刷 → 死锁。
     #[tokio::test]
-    async fn test_free_emit_fast_path_only() {
+    async fn test_free_emit_always_goes_slow_path() {
         let mut sink = FailingSink::always_ok();
         emit(&mut sink, AgentEvent::ModelTextDelta { text: "a".into() })
             .await
             .unwrap();
-        assert_eq!(sink.slow_calls(), 0, "稳态不应走慢路径");
-        assert_eq!(sink.try_calls(), 1);
+        assert_eq!(sink.slow_calls(), 1, "自由函数必须走慢路径");
+        assert_eq!(sink.try_calls(), 0, "自由函数不再调用同步快路径");
         assert_eq!(sink.emitted().len(), 1);
     }
 
-    // Task 4 合同 (b)：快路径失败 → 回落慢路径
+    // 自由函数经慢路径投递，且不依赖快路径是否成功
+    // （FailingSink::new(0) 的快路径必失败，但自由函数根本不调用它）。
     #[tokio::test]
-    async fn test_free_emit_falls_back_to_slow_path() {
-        let mut sink = FailingSink::new(0); // 首次就失败
+    async fn test_free_emit_delivers_via_slow_path() {
+        let mut sink = FailingSink::new(0);
         emit(&mut sink, AgentEvent::ModelTextDelta { text: "a".into() })
             .await
             .unwrap();
-        assert_eq!(sink.try_calls(), 1, "快路径应被尝试一次");
-        assert_eq!(sink.slow_calls(), 1, "快路径失败应回落慢路径");
+        assert_eq!(sink.try_calls(), 0, "自由函数不应触碰快路径");
+        assert_eq!(sink.slow_calls(), 1);
         assert_eq!(sink.emitted().len(), 1, "慢路径应成功投递该事件");
         assert!(
             matches!(&sink.emitted()[0], AgentEvent::ModelTextDelta { text } if text == "a"),
@@ -114,9 +116,9 @@ mod tests {
         sink.set_fail_slow(true); // 让慢路径也失败
         let r = emit(&mut sink, AgentEvent::ModelTextDelta { text: "a".into() }).await;
         assert!(matches!(r, Err(EventError::SendFailed)));
-        assert_eq!(sink.try_calls(), 1);
+        assert_eq!(sink.try_calls(), 0, "自由函数不再触碰快路径");
         assert_eq!(sink.slow_calls(), 1);
-        assert!(sink.emitted().is_empty(), "两条路径都失败，不应有投递");
+        assert!(sink.emitted().is_empty(), "慢路径失败，不应有投递");
     }
 
     #[test]

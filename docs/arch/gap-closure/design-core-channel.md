@@ -133,22 +133,36 @@ pub trait EventSink: Send {
     fn begin_turn(&mut self, _turn: u32) {}
 }
 
-/// 循环内唯一出口：自由函数组合两条路径，稳态不产生任何 Future。
-#[inline(always)]
+/// 循环内唯一出口：**总是**走异步慢路径。
+///
+/// 注意：**不再**「先试同步快路径、失败再回落」——见下「实施勘误」。
+/// 同步快路径（`try_emit`）的唯一消费者是 `Forwarder`（同步 `ModelEventSink`
+/// 回调，不能 `await`）；循环内的所有调用点本就在 async 上下文，没有理由走快路径。
+#[inline]
 pub async fn emit(sink: &mut dyn EventSink, event: AgentEvent) -> Result<(), EventError> {
-    match sink.try_emit(event) {
-        Ok(()) => Ok(()),
-        Err(event) => sink.emit(event).await,
-    }
+    sink.emit(event).await
 }
 ```
 
 **为什么值得破例移植**（超出「简单」的收益）：
 
 - **保住 `ModelEventSink` 的同步性**。`Forwarder` 实现的是**同步** `ModelEventSink`，要转发到 `EventSink`。若 `EventSink::emit` 只有 async 形态，`ModelEventSink` **也被迫 async** → 改动所有模型适配器，且 ADR-0004 点 2 的「模型适配器最小 ABI 面」被破坏（**async trait 跨动态库边界困难**，而 v3 动态插件需要它）。
-- 附带：稳态零装箱（性能）。
+- 附带：`Forwarder` 同步回调内零装箱（它直调 `try_emit`，不经自由函数）。
 
-**代价**：`EventSink` 从 1 个方法变 2 个 + 1 个自由函数；调用点由 `ctx.events.emit(e)` 改为 `emit(ctx.events, e)`。
+**代价**：`EventSink` 从 1 个方法变 2 个 + 1 个自由函数；调用点由 `ctx.events.emit(e)` 改为 `emit(ctx.events, e)`；循环内每个事件多一次 `Box::pin`（相对流式 20–200 events/s 可忽略）。
+
+**实施勘误（死锁，实施后回改）**：原伪代码让自由函数「先试同步快路径，仅当 `try_emit` 返回 `Err` 才走慢路径」。这与 §3「移植 1」的 `ChannelSink::try_emit` 契约**相互作用成死锁**：
+
+1. `ChannelSink::try_emit` 信道满时把信封缓冲进 `overflow` 并返回 `Ok`（契约如此）；
+2. 自由函数见 `Ok` 即返回，**永不进入慢路径** → `overflow` 永不冲刷；
+3. 终局事件（`RunFinished`/`RunFailed`）恰是最后一个事件，其后无人再 `emit().await`；
+4. `consume_events` 等终局事件 → 永不返回 → `tokio::join!(run_turn, consume)` 挂起。
+
+**第二个后果**：旧实现下 `overflow` 只增不减（自由函数永不进慢路径冲刷），跨回合持续累积——与「有界信道防 DoS」相悖，背压失效。触发条件仅为「信道被填满」（`YUSHAN_CHANNEL_CAPACITY` 很小，或接上流式后 20–200 events/s 持续超过消费速率），默认容量 1024 + 当前非流式下不可达，故潜伏至今。修复后的作用范围见下「背压的作用范围」。
+
+**修法**：自由函数**一律** `sink.emit(event).await`（见上伪代码）。`try_emit` 的契约**不变**（满时内部缓冲、返 `Ok`；`Err` 仅表示消费者消失），它仍服务 `Forwarder`；`ChannelSink::emit`（慢路径）本就先冲 `overflow` 再发本次，无需改动。回归测试：`apps/coding-agent/src/channel.rs` 的 `small_channel_no_deadlock_capacity_{1,2}`（直接 `ChannelSink::new(1/2, …)` + 自由函数 `emit`）、`apps/coding-agent/src/main.rs` 的 `run_turn_and_consume_do_not_deadlock_at_small_capacity`（`run_turn` 与 `consume_events` 并发，容量 2）。三者均在旧实现下超时挂起、修复后通过。
+
+**背压的作用范围（精确表述）**：异步路径（自由函数 `emit` → `ChannelSink::emit`）背压生效；同步路径（`Forwarder` → `try_emit`）不生效——`Forwarder` 实现同步的 `ModelEventSink`（async trait 跨动态库边界困难，ADR-0004 点 2），不能 `await`，满时只能缓冲。其 `overflow` 上界 ≈ **单次模型响应的增量事件数**，非严格无界（也远大于信道容量）。这是「同步回调无法背压」的固有取舍，非缺陷。若将来需要模型流式期间的强背压，需改 `Forwarder` 的异步形态（会牵动模型适配器 ABI），本设计明确不做。
 
 **（修订 R2）overflow 放在 sink 内，不放 `Forwarder`：**
 
@@ -233,8 +247,9 @@ impl ModelEventSink for Forwarder<'_> {
 
 **`try_emit` 的 `Err` 语义（已定）**：`Err` 仅表示「消费者已消失」。
 信道满时 `ChannelSink` 必须内部缓冲（`overflow`），不得返回 Err。
-据此：自由函数 `emit()` 收到 Err 意味着「该走慢路径 / 消费者已走」，
-而 `Forwarder`（同步回调）丢弃 Err 是正确的——消费者没了，丢弃合理。
+据此：`Forwarder`（同步回调）丢弃 Err 是正确的——消费者没了，丢弃合理。
+（自由函数 `emit()` **不经** `try_emit`，故不存在「收到 Err → 回落慢路径」这层；
+详见上文「实施勘误（死锁）」。）
 
 **勘误（实施后回改）**：原伪代码把 overflow 存为 `VecDeque<AgentEvent>`，
 撞满时只留裸事件、丢弃了 wrap 时的 turn；冲刷时用当前 turn 重新包装，
@@ -465,6 +480,9 @@ impl ChannelSink { pub fn stats(&self) -> ChannelStats; }
 | **R6** 🟡 | 背压不可观测 | 新增 `ChannelStats { backpressure_waits, buffered, consumer_gone }`（§4） |
 | **R7** 🟡 | `Envelope` 尺寸 96 B 是按 `SourceId(u32)` 算的，与实际所选 `Source(String)` 不符 | `Source` 改 `Arc<str>`（clone 仅一次原子加）；尺寸重算为 **~112 B**（§8） |
 | **R8** 🟡 | `LifecyclePolicy` 指定在两处（sink + `run()`），优先级不明 | **只留在 sink**；`Agent::run(inbox)` 不收 policy（§4） |
+| **R9** 🔴 | **实施后新发现（死锁）**：自由函数「先试快路径、失败才回落」与 `try_emit`「满时缓冲返 `Ok`」的契约相互作用 → 终局事件滞留 `overflow` 无人冲刷 → `tokio::join!(run_turn, consume)` 挂起、背压失效 | 自由函数**总走异步慢路径**；`try_emit` 仅服务 `Forwarder`（§3 移植 1「实施勘误（死锁）」） |
+
+**与 review.md 的关系**：R1–R8 出自 [`review.md`](./review.md) 的质量分析（3 🔴 / 5 🟡）；R9 是**实施阶段**发现的承重缺陷，同样为 🔴，回补于此。
 
 **未在本轮处理**（review 的架构级建议 9）：完整的 metrics/tracing 体系。R6 只提供最小读数，不引入埋点框架——待有真实运维需求时再做。
 

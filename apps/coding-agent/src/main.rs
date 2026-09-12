@@ -238,6 +238,25 @@ fn ensure_configured(agent: &Agent) -> Result<(), Box<dyn std::error::Error>> {
     std::process::exit(1);
 }
 
+/// `-p` 模式的事件消费：只把 [`AgentEvent::ModelTextDelta`] 的文本增量写入 `w`
+/// （**不换行、按序拼接**），其余事件不产出任何输出；返回是否写出过文本。
+///
+/// 写出目标参数化为 `W: Write`：生产传 `io::stdout()`，测试传 `Vec<u8>`，
+/// 保证被测的就是生产消费路径（`consume_events` + `print_delta_text`）。
+/// 终止由 `consume_events` 依**终局事件**判定，不依赖信道关闭。
+async fn consume_print_events<W: Write>(rx: mpsc::Receiver<Envelope>, w: W) -> io::Result<bool> {
+    let mut printed_any = false;
+    consume_events(rx, w, |w, env| {
+        if let Some(text) = print_delta_text(env) {
+            w.write_all(text.as_bytes())?;
+            printed_any = true;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(printed_any)
+}
+
 /// `-p` 模式：并发消费事件流，把文本增量实时写到 stdout。
 ///
 /// 收尾补一个换行，与旧实现（`println!` final_message）的输出保持一致。
@@ -248,21 +267,14 @@ async fn run_print_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured(agent)?;
 
-    let mut printed_any = false;
     // 消费与 turn 必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
     let (turn_result, consume_result) = tokio::join!(
         agent.run_turn(AgentInput::text(task.as_str())),
-        consume_events(rx, io::stdout(), |w, env| {
-            if let Some(text) = print_delta_text(env) {
-                w.write_all(text.as_bytes())?;
-                printed_any = true;
-            }
-            Ok(())
-        }),
+        consume_print_events(rx, io::stdout()),
     );
 
     turn_result?;
-    consume_result?;
+    let printed_any = consume_result?;
 
     if printed_any {
         println!();
@@ -435,7 +447,7 @@ mod tests {
     use std::time::Duration;
 
     use ys_channel::Source;
-    use ys_core::{StopReason, ToolCall, ToolCallId, Usage};
+    use ys_core::{ContentBlock, Message, Role, StopReason, ToolCall, ToolCallId, Usage};
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -456,6 +468,28 @@ mod tests {
             stop_reason: StopReason::Completed,
             usage: Usage::default(),
             rounds: 1,
+        }
+    }
+
+    /// 记录每次 `write` 调用的 writer，用于断言「分次写出」而非「缓冲后一次写出」。
+    ///
+    /// `flush` 不计入 `write_calls`（`consume_events` 每事件后都会 flush，
+    /// 若计入则无法区分写出次数与冲刷次数）。
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        write_calls: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -662,5 +696,71 @@ mod tests {
             clamp_capacity(DEFAULT_CHANNEL_CAPACITY),
             DEFAULT_CHANNEL_CAPACITY
         );
+    }
+
+    /// 12. **-p 按序增量拼接（Task 14 核心不变量）**：多个 `ModelTextDelta` 必须**按序、
+    ///     分次**拼接到写出目标；非文本事件（`UserMessage` / `ToolCall`）不产出；
+    ///     终局事件（`RunFinished`）不产出且触发**正常返回**（不依赖 sender drop）。
+    ///     拼接结果恰为 `"Hello world"` —— 锁定「无丢字、无重复、无多余换行」。
+    ///
+    ///     **「增量」语义单独锁定**：用 [`CountingWriter`] 断言 `write_calls >= 3`
+    ///     （每个 delta 至少一次 write）。若实现退化为「全部缓冲、收到终局事件后
+    ///     一次性写出」，内容仍为 `"Hello world"` 但 `write_calls == 1`，此断言失败。
+    ///
+    ///     说明：当前模型适配器 `stream: false`，每次响应只发 **1 个** delta，
+    ///     故生产中的 `-p` 目前只会写出一个增量。本测试**手工投递多个 delta**，
+    ///     模拟「流式接通」后的多增量场景；真实多 delta 要等流式接通（后续任务）
+    ///     才在生产中走此路径。消费走**生产路径** `consume_print_events`
+    ///     （内部即 `consume_events` + `print_delta_text`），未重写逻辑。
+    #[tokio::test]
+    async fn print_mode_writes_deltas_in_order() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(env(AgentEvent::UserMessage {
+            message: Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+        }))
+        .await
+        .unwrap();
+        tx.send(env(delta("Hel"))).await.unwrap();
+        tx.send(env(delta("lo"))).await.unwrap();
+        tx.send(env(delta(" world"))).await.unwrap();
+        tx.send(env(AgentEvent::ToolCall {
+            call: ToolCall {
+                id: ToolCallId("c1".into()),
+                name: "bash".into(),
+                arguments: serde_json::Value::Null,
+            },
+        }))
+        .await
+        .unwrap();
+        tx.send(env(finished())).await.unwrap();
+
+        let mut out = CountingWriter::default();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), consume_print_events(rx, &mut out)).await;
+
+        assert!(
+            result.is_ok(),
+            "收到 RunFinished 应即返回，而非等待信道关闭"
+        );
+        let printed_any = result.unwrap().unwrap();
+        assert!(printed_any, "应写出过文本增量");
+
+        // 顺序正确、无非文本事件输出、无多余换行：恰为 "Hello world"。
+        assert_eq!(out.bytes.len(), "Hello world".len(), "字节数应恰为 11");
+        assert_eq!(String::from_utf8(out.bytes).unwrap(), "Hello world");
+
+        // **增量写出**：3 个 delta 各写一次，而非缓冲后一次写出。
+        // 用 `>= 3`（而非 `== 3`）容忍 `write_all` 内部可能的合并写出。
+        assert!(
+            out.write_calls >= 3,
+            "每个 delta 至少一次 write，证明是增量写出而非缓冲后一次写出；write_calls = {}",
+            out.write_calls
+        );
+
+        // 显式保留到断言之后：证明 consume_print_events 未依赖 tx 被 drop。
+        drop(tx);
     }
 }

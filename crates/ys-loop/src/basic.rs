@@ -131,6 +131,20 @@ impl AgentLoop for BasicLoop {
                 }
             }
 
+            // 轮边界：拉取中途插话（steering），注入后进入本轮的 ModelRequest。
+            // 不增 rounds、不改 turn —— 它们是轮内的额外输入，不是新一轮。
+            if let Some(inbox) = ctx.inbox {
+                for msg in inbox.take_steering() {
+                    ctx.session
+                        .append(msg.clone())
+                        .await
+                        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                    emit(ctx.events, AgentEvent::UserMessage { message: msg })
+                        .await
+                        .map_err(LoopError::Event)?;
+                }
+            }
+
             // Step 5：组装 ModelRequest（ToolSpec 已在构建时缓存）
             rounds += 1;
             let tools = ctx.registry.specs().to_vec();

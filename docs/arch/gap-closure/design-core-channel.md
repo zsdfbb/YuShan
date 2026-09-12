@@ -156,10 +156,25 @@ pub async fn emit(sink: &mut dyn EventSink, event: AgentEvent) -> Result<(), Eve
 // 接线器：ChannelSink 自带积压缓冲——长生命周期，不会被中途 drop
 pub struct ChannelSink {
     tx: mpsc::Sender<Envelope>,
-    overflow: VecDeque<AgentEvent>,   // 仅 try_send 撞满时使用
+    // 仅 try_send 撞满时使用。存**已包装的信封**（而非裸事件）：
+    // turn 随信封冻结，积压跨回合存活也不会被改写成当前回合号（勘误，见下）。
+    overflow: VecDeque<Envelope>,
     source: Source,
     turn: u32,
     policy: LifecyclePolicy,          // 生命周期策略**只在这里**（见「R8」）
+}
+impl ChannelSink {
+    /// 同步尽力冲积压：**原样** try_send 整个信封（不再 wrap），撞满/关闭则放回队首保序。
+    fn drain_overflow_best_effort(&mut self) {
+        while let Some(env) = self.overflow.pop_front() {
+            match self.tx.try_send(env) {
+                Ok(()) => {}
+                Err(TrySendError::Full(env)) => { self.overflow.push_front(env); break; }
+                Err(TrySendError::Closed(env)) => { self.consumer_gone = true;
+                                                    self.overflow.push_front(env); break; }
+            }
+        }
+    }
 }
 impl EventSink for ChannelSink {
     fn try_emit(&mut self, event: AgentEvent) -> Result<(), AgentEvent> {
@@ -167,7 +182,7 @@ impl EventSink for ChannelSink {
         match self.tx.try_send(self.wrap(event)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(env)) => {                // 撞满 → 缓冲，**不算失败**
-                self.overflow.push_back(env.event);
+                self.overflow.push_back(env);                // 存整个信封（turn 随信封冻结）
                 Ok(())
             }
             Err(TrySendError::Closed(_)) => match self.policy {   // 消费者消失
@@ -178,10 +193,19 @@ impl EventSink for ChannelSink {
     }
     fn emit<'a>(&'a mut self, event: AgentEvent) -> Pin<Box<dyn Future<…> + Send + 'a>> {
         Box::pin(async move {
-            while let Some(ev) = self.overflow.pop_front() {  // 先冲积压（背压点在此）
-                self.tx.send(self.wrap(ev)).await.map_err(|_| EventError::SendFailed)?;
+            while let Some(env) = self.overflow.pop_front() {          // 先冲积压（背压点在此）
+                if let Err(SendError(env)) = self.tx.send(env).await { // 原样发送，不重新 wrap
+                    self.overflow.push_front(env);                     // 保留，不静默丢弃（同 drain）
+                    return if self.policy == ContinueWithoutConsumer { Ok(()) }
+                           else { Err(EventError::SendFailed) };
+                }
             }
-            self.tx.send(self.wrap(event)).await.map_err(|_| EventError::SendFailed)
+            if let Err(SendError(env)) = self.tx.send(self.wrap(event)).await {
+                self.overflow.push_front(env);                         // 本次事件同样保留
+                return if self.policy == ContinueWithoutConsumer { Ok(()) }
+                       else { Err(EventError::SendFailed) };
+            }
+            Ok(())
         })
     }
     fn begin_turn(&mut self, turn: u32) { self.turn = turn; }
@@ -211,6 +235,12 @@ impl ModelEventSink for Forwarder<'_> {
 信道满时 `ChannelSink` 必须内部缓冲（`overflow`），不得返回 Err。
 据此：自由函数 `emit()` 收到 Err 意味着「该走慢路径 / 消费者已走」，
 而 `Forwarder`（同步回调）丢弃 Err 是正确的——消费者没了，丢弃合理。
+
+**勘误（实施后回改）**：原伪代码把 overflow 存为 `VecDeque<AgentEvent>`，
+撞满时只留裸事件、丢弃了 wrap 时的 turn；冲刷时用当前 turn 重新包装，
+会使跨回合存活的积压事件被误标为后一回合（破坏 `--json` 分组）。
+改为存 `VecDeque<Envelope>`（turn 随信封冻结），冲刷时原样发送。
+另：`emit` 冲刷失败时改为 `push_front` 保留事件，与 `drain` 的语义一致。
 
 ### 移植 2：`Inbox` 的产消模型（C 的动机 + 落法经修订）
 

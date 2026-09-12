@@ -9,6 +9,7 @@ members = [
     "crates/ys-component",
     "crates/ys-loop",
     "crates/ys-runtime",
+    "crates/ys-channel",
     "adapters/model-openai-compatible",
     "adapters/tools-basic",
     "apps/coding-agent",

@@ -1,4 +1,5 @@
 mod ansi;
+mod channel;
 mod commands;
 mod config;
 mod format;

@@ -42,6 +42,32 @@ pub struct CommandContext<'a> {
     pub agent: &'a mut Agent,
     pub config: &'a mut Config,
     pub state: &'a mut StateStore,
+    pub prompter: &'a dyn Prompter,
+}
+
+/// 命令交互输入面——从 inquire 抽象而来，支持测试 fake。
+pub trait Prompter: Send + Sync {
+    /// 展示选项列表，返回用户选中的 label。
+    fn select(
+        &self,
+        prompt: &str,
+        options: Vec<String>,
+        page_size: usize,
+    ) -> Result<String, PromptError>;
+
+    /// 文本输入（含可选 help message）。
+    fn text(&self, prompt: &str, help: Option<&str>) -> Result<String, PromptError>;
+}
+
+/// 交互取消/失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptError {
+    /// 用户取消或中断（Esc / Ctrl-C）。
+    /// 当前 inquire 的 OperationCanceled 和 OperationInterrupted 始终合并处理，
+    /// 故统一为一个变体；若未来需区分，可拆为 Canceled / Interrupted。
+    Cancelled,
+    /// 其他错误。
+    Other(String),
 }
 
 /// command 结束后 TUI 循环应采取的后续动作。
@@ -179,6 +205,23 @@ mod tests {
         }
     }
 
+    // 测试用的最小 Prompter 实现（不交互，永远取消）。
+    struct StubPrompter;
+
+    impl Prompter for StubPrompter {
+        fn select(
+            &self,
+            _prompt: &str,
+            _options: Vec<String>,
+            _page_size: usize,
+        ) -> Result<String, PromptError> {
+            Err(PromptError::Cancelled)
+        }
+        fn text(&self, _prompt: &str, _help: Option<&str>) -> Result<String, PromptError> {
+            Err(PromptError::Cancelled)
+        }
+    }
+
     #[test]
     fn test_registry_register_and_get() {
         let mut reg = CommandRegistry::new();
@@ -236,10 +279,12 @@ mod tests {
             .unwrap();
         let mut config = Config::from_env().unwrap();
         let mut state_store = crate::state::StateStore::new();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
         let result = reg.execute("/nonexistent", &mut ctx).await;
         assert!(result.is_err());

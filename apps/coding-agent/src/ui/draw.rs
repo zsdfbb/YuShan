@@ -494,4 +494,104 @@ mod tests {
             "long lines wrap to width"
         );
     }
+
+    #[test]
+    fn test_multi_turn_conversation() {
+        let mut app = make_app();
+        // 清空 make_app 默认内容，构造全新多轮对话
+        app.transcript.clear();
+        app.transcript
+            .push(TranscriptLine::User("first question".into()));
+        app.transcript
+            .push(TranscriptLine::Assistant("first answer".into()));
+        app.transcript
+            .push(TranscriptLine::User("second question".into()));
+        app.transcript
+            .push(TranscriptLine::Assistant("second answer".into()));
+        app.transcript.push(TranscriptLine::Summary {
+            rounds: 2,
+            stop: StopReason::Completed,
+            elapsed_secs: 5.0,
+        });
+        let text = render_to_text(&mut app);
+        assert!(
+            text.contains("first question"),
+            "first user message should be visible"
+        );
+        assert!(
+            text.contains("second answer"),
+            "last assistant message should be visible"
+        );
+    }
+
+    #[test]
+    fn test_empty_transcript_shows_placeholder() {
+        let mut app = make_app();
+        app.transcript.clear();
+        let text = render_to_text(&mut app);
+        assert!(
+            text.contains("(no messages yet)"),
+            "empty transcript should show placeholder"
+        );
+    }
+
+    #[test]
+    fn test_scroll_offset_changes_visible() {
+        // follow=true 时所有消息可见
+        let mut app = make_app();
+        app.follow = true;
+        let text_follow = render_to_text(&mut app);
+        assert!(
+            text_follow.contains("hello"),
+            "follow=true should show first user message"
+        );
+        assert!(
+            text_follow.contains("hi there"),
+            "follow=true should show assistant message"
+        );
+
+        // follow=false + 大 scroll_offset：compute_visible 的 v0 简化逻辑中
+        // start 恒为 0（visible_height = end），scroll_offset 只截断尾部行数。
+        // effective_offset 被 clamp 到 total-1 后 end=1，即只保留第 1 个 buffer 行。
+        // 先添加足够多的行使 total 足够大
+        for i in 0..20 {
+            app.transcript
+                .push(TranscriptLine::User(format!("msg-{i}")));
+            app.transcript
+                .push(TranscriptLine::Assistant(format!("reply-{i}")));
+        }
+        app.follow = false;
+        // 极大 scroll_offset 使 effective_offset clamp 到 total-1，end=1
+        app.scroll_offset = usize::MAX;
+        let text_scrolled = render_to_text(&mut app);
+        // 尾部消息应被截断（end=1，只保留第 1 行）
+        assert!(
+            !text_scrolled.contains("msg-19"),
+            "max scroll_offset should truncate tail message msg-19"
+        );
+        assert!(
+            !text_scrolled.contains("reply-19"),
+            "max scroll_offset should truncate tail reply-19"
+        );
+        // 首行仍然可见（start 恒为 0，v0 简化未实现真正的窗口滚动）
+        assert!(
+            text_scrolled.contains("hello"),
+            "first line stays visible since start is fixed at 0 in v0 scroll"
+        );
+    }
+
+    #[test]
+    fn test_working_animation_three_states() {
+        // 测试 Working. / Working.. / Working... 三个状态
+        for (dot, expected) in [(0u8, "Working."), (1u8, "Working.."), (2u8, "Working...")] {
+            let mut app = make_app();
+            app.is_turning = true;
+            app.working_dot = dot;
+            let text = render_to_text(&mut app);
+            assert!(
+                text.contains(expected),
+                "working_dot={dot} should render \"{expected}\""
+            );
+        }
+    }
 }

@@ -1,7 +1,41 @@
 use async_trait::async_trait;
 
-use super::{Command, CommandContext, CommandError, CommandResult};
+use super::{Command, CommandContext, CommandError, CommandResult, PromptError, Prompter};
 use crate::provider::{AuthEntry, ProviderRegistry};
+
+/// 生产 Prompter：包装 inquire，在 suspend 后的真实终端交互。
+pub struct InquirePrompter;
+
+impl Prompter for InquirePrompter {
+    fn select(
+        &self,
+        prompt: &str,
+        options: Vec<String>,
+        page_size: usize,
+    ) -> Result<String, PromptError> {
+        inquire::Select::new(prompt, options)
+            .with_page_size(page_size)
+            .prompt()
+            .map_err(map_inquire_err)
+    }
+
+    fn text(&self, prompt: &str, help: Option<&str>) -> Result<String, PromptError> {
+        let mut q = inquire::Text::new(prompt);
+        if let Some(h) = help {
+            q = q.with_help_message(h);
+        }
+        q.prompt().map_err(map_inquire_err)
+    }
+}
+
+fn map_inquire_err(e: inquire::InquireError) -> PromptError {
+    match e {
+        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
+            PromptError::Cancelled
+        }
+        e => PromptError::Other(e.to_string()),
+    }
+}
 
 /// /help 展示所需的元数据。让 HelpCommand 与 registry 解耦。
 pub struct HelpEntry {
@@ -167,9 +201,9 @@ impl Command for LoginCommand {
                 })
                 .collect();
 
-            let selection = inquire::Select::new("Select a provider:", provider_labels)
-                .with_page_size(10)
-                .prompt();
+            let selection = ctx
+                .prompter
+                .select("Select a provider:", provider_labels, 10);
 
             match selection {
                 Ok(label) => {
@@ -188,13 +222,12 @@ impl Command for LoginCommand {
                         })?;
                     providers[idx].clone()
                 }
-                Err(inquire::InquireError::OperationCanceled)
-                | Err(inquire::InquireError::OperationInterrupted) => {
+                Err(PromptError::Cancelled) => {
                     println!("Login cancelled.");
                     return Ok(CommandResult::Continue);
                 }
                 Err(e) => {
-                    return Err(CommandError::Internal(format!("Selection error: {e}")));
+                    return Err(CommandError::Internal(format!("Selection error: {e:?}")));
                 }
             }
         } else {
@@ -214,22 +247,21 @@ impl Command for LoginCommand {
 
         // 对 custom provider，提示输入 api_base
         let api_base = if provider.api_base.is_empty() {
-            let base = inquire::Text::new("API base URL:")
-                .with_help_message("e.g. https://api.deepseek.com")
-                .prompt();
+            let base = ctx
+                .prompter
+                .text("API base URL:", Some("e.g. https://api.deepseek.com"));
 
             match base {
                 Ok(b) if !b.is_empty() => b,
                 Ok(_) => {
                     return Err(CommandError::UserError("API base URL is required.".into()));
                 }
-                Err(inquire::InquireError::OperationCanceled)
-                | Err(inquire::InquireError::OperationInterrupted) => {
+                Err(PromptError::Cancelled) => {
                     println!("Login cancelled.");
                     return Ok(CommandResult::Continue);
                 }
                 Err(e) => {
-                    return Err(CommandError::Internal(format!("Input error: {e}")));
+                    return Err(CommandError::Internal(format!("Input error: {e:?}")));
                 }
             }
         } else {
@@ -237,22 +269,22 @@ impl Command for LoginCommand {
         };
 
         // 提示输入 api_key
-        let api_key = inquire::Text::new("API key:")
-            .with_help_message("Your authentication key for this provider")
-            .prompt();
+        let api_key = ctx.prompter.text(
+            "API key:",
+            Some("Your authentication key for this provider"),
+        );
 
         let api_key = match api_key {
             Ok(k) if !k.is_empty() => k,
             Ok(_) => {
                 return Err(CommandError::UserError("API key is required.".into()));
             }
-            Err(inquire::InquireError::OperationCanceled)
-            | Err(inquire::InquireError::OperationInterrupted) => {
+            Err(PromptError::Cancelled) => {
                 println!("Login cancelled.");
                 return Ok(CommandResult::Continue);
             }
             Err(e) => {
-                return Err(CommandError::Internal(format!("Input error: {e}")));
+                return Err(CommandError::Internal(format!("Input error: {e:?}")));
             }
         };
 
@@ -412,9 +444,7 @@ impl Command for ModelCommand {
                 })
                 .collect();
 
-            let selection = inquire::Select::new("Select a model:", labels)
-                .with_page_size(8)
-                .prompt();
+            let selection = ctx.prompter.select("Select a model:", labels, 8);
 
             match selection {
                 Ok(label) => {
@@ -445,12 +475,11 @@ impl Command for ModelCommand {
                         }
                     }
                 }
-                Err(inquire::InquireError::OperationCanceled)
-                | Err(inquire::InquireError::OperationInterrupted) => {
+                Err(PromptError::Cancelled) => {
                     // 不做任何事，保持当前 model
                 }
                 Err(e) => {
-                    return Err(CommandError::Internal(format!("Selection error: {e}")));
+                    return Err(CommandError::Internal(format!("Selection error: {e:?}")));
                 }
             }
         } else {
@@ -675,7 +704,19 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        Config::from_env().unwrap()
+        let mut config = Config::from_env().unwrap();
+        // 指向临时 auth.json，避免测试（如 logout）误写真实的 ~/.yushan/auth.json。
+        let dir = std::env::temp_dir().join(format!(
+            "yushan_test_auth_{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        config.registry.set_auth_override(dir.join("auth.json"));
+        config
     }
 
     /// 辅助：构建指向临时目录的一次性 StateStore，
@@ -693,6 +734,58 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         store.set_override(dir.join("state.json"));
         store
+    }
+
+    /// 测试用 Prompter：返回预设答案队列，记录调用。
+    struct FakePrompter {
+        answers: std::sync::Mutex<std::collections::VecDeque<Result<String, PromptError>>>,
+    }
+
+    impl FakePrompter {
+        fn with_answers(answers: Vec<Result<String, PromptError>>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.into()),
+            }
+        }
+
+        fn next(&self) -> Result<String, PromptError> {
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(PromptError::Cancelled))
+        }
+    }
+
+    impl Prompter for FakePrompter {
+        fn select(
+            &self,
+            _prompt: &str,
+            _options: Vec<String>,
+            _page_size: usize,
+        ) -> Result<String, PromptError> {
+            self.next()
+        }
+        fn text(&self, _prompt: &str, _help: Option<&str>) -> Result<String, PromptError> {
+            self.next()
+        }
+    }
+
+    /// 测试用 Prompter：无交互，永远返回取消。用于不触发交互路径的测试。
+    struct StubPrompter;
+
+    impl Prompter for StubPrompter {
+        fn select(
+            &self,
+            _prompt: &str,
+            _options: Vec<String>,
+            _page_size: usize,
+        ) -> Result<String, PromptError> {
+            Err(PromptError::Cancelled)
+        }
+        fn text(&self, _prompt: &str, _help: Option<&str>) -> Result<String, PromptError> {
+            Err(PromptError::Cancelled)
+        }
     }
 
     fn build_test_registry() -> CommandRegistry {
@@ -715,10 +808,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = HelpCommand.execute("", &mut ctx).await.unwrap();
@@ -731,10 +826,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = HelpCommand.execute("quit", &mut ctx).await.unwrap();
@@ -746,10 +843,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let err = HelpCommand
@@ -764,10 +863,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = QuitCommand.execute("", &mut ctx).await.unwrap();
@@ -780,10 +881,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = reg.execute("/foobar", &mut ctx).await;
@@ -804,10 +907,12 @@ mod tests {
         let mut agent = test_agent("old-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         // /model 带参数直接切换（不走交互式选择器）
@@ -826,10 +931,12 @@ mod tests {
         let mut config = test_config();
 
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = ModelCommand
@@ -868,10 +975,12 @@ mod tests {
 
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = NewCommand.execute("", &mut ctx).await.unwrap();
@@ -884,10 +993,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = StatusCommand.execute("", &mut ctx).await.unwrap();
@@ -899,10 +1010,12 @@ mod tests {
         let mut agent = test_agent("test");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = CopyCommand.execute("", &mut ctx).await.unwrap();
@@ -914,10 +1027,12 @@ mod tests {
         let mut agent = test_agent("test");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = ExportCommand.execute("output.md", &mut ctx).await.unwrap();
@@ -943,10 +1058,12 @@ mod tests {
 
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = CompactCommand.execute("", &mut ctx).await.unwrap();
@@ -961,10 +1078,12 @@ mod tests {
 
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
@@ -983,10 +1102,12 @@ mod tests {
         config.provider = Some("deepseek".into());
 
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
@@ -1025,10 +1146,12 @@ mod tests {
 
         let mut agent = test_agent("test-model");
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
@@ -1048,10 +1171,12 @@ mod tests {
         let mut agent = test_agent("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
 
         let err = LoginCommand
@@ -1091,10 +1216,12 @@ mod tests {
             .unwrap();
 
         let mut agent = test_agent("test-model");
+        let prompter = StubPrompter;
         let mut ctx = CommandContext {
             agent: &mut agent,
             config: &mut config,
             state: &mut state_store,
+            prompter: &prompter,
         };
         LogoutCommand.execute("", &mut ctx).await.unwrap();
 
@@ -1148,5 +1275,90 @@ mod tests {
             "help description should mention /help <name>: {}",
             help.description
         );
+    }
+
+    // ---- 交互决策逻辑测试（FakePrompter 注入） ----
+
+    /// /model 无参：config 未配置时走 static models（不触发网络），
+    /// select 返回 "deepseek-chat" → config.model 切换。
+    #[tokio::test]
+    async fn test_model_interactive_selects_model() {
+        let mut agent = test_agent("test-model");
+        let mut config = test_config();
+        let mut state_store = test_state_store();
+        // test_config 未设置 api_base/api_key → is_configured()==false → 走 static models
+        let prompter = FakePrompter::with_answers(vec![Ok("deepseek-chat".into())]);
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+            state: &mut state_store,
+            prompter: &prompter,
+        };
+
+        let result = ModelCommand.execute("", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+        assert_eq!(ctx.config.model, "deepseek-chat");
+    }
+
+    /// /model 无参：select 取消 → 保持原 model 不变。
+    #[tokio::test]
+    async fn test_model_interactive_cancelled_keeps_model() {
+        let mut agent = test_agent("test-model");
+        let mut config = test_config();
+        config.model = "deepseek-chat".into();
+        let mut state_store = test_state_store();
+        let prompter = FakePrompter::with_answers(vec![Err(PromptError::Cancelled)]);
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+            state: &mut state_store,
+            prompter: &prompter,
+        };
+
+        let result = ModelCommand.execute("", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+        assert_eq!(ctx.config.model, "deepseek-chat", "cancel keeps model");
+    }
+
+    /// /login 无参：provider 选择时取消 → Continue，不持久化 auth。
+    #[tokio::test]
+    async fn test_login_cancelled_at_provider_select() {
+        let mut agent = test_agent("test-model");
+        let mut config = test_config();
+        let mut state_store = test_state_store();
+        let prompter = FakePrompter::with_answers(vec![Err(PromptError::Cancelled)]);
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+            state: &mut state_store,
+            prompter: &prompter,
+        };
+
+        let result = LoginCommand.execute("", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+        assert!(ctx.config.api_key.is_none(), "no auth persisted on cancel");
+    }
+
+    /// /login 无参：provider 选 deepseek 后，api_key 输入取消 → Continue，不持久化。
+    #[tokio::test]
+    async fn test_login_cancelled_at_api_key() {
+        let mut agent = test_agent("test-model");
+        let mut config = test_config();
+        let mut state_store = test_state_store();
+        // deepseek 非 custom → 跳过 api_base 输入；第二个答案是 api_key 输入
+        let prompter = FakePrompter::with_answers(vec![
+            Ok("deepseek (https://api.deepseek.com)".into()),
+            Err(PromptError::Cancelled),
+        ]);
+        let mut ctx = CommandContext {
+            agent: &mut agent,
+            config: &mut config,
+            state: &mut state_store,
+            prompter: &prompter,
+        };
+
+        let result = LoginCommand.execute("", &mut ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::Continue));
+        assert!(ctx.config.api_key.is_none(), "no auth persisted on cancel");
     }
 }

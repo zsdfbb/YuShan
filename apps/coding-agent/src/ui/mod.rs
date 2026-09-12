@@ -218,7 +218,7 @@ async fn dispatch_input<B: Backend + Write>(
     stats: &mut TurnStats,
     state_store: &mut StateStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::commands::{CommandContext, CommandResult};
+    use crate::commands::{CommandContext, CommandResult, InquirePrompter};
     use agent_core::ContentBlock;
     use agent_loop::AgentInput;
 
@@ -242,10 +242,12 @@ async fn dispatch_input<B: Backend + Write>(
     if input.starts_with('/') {
         suspend_terminal(terminal)?;
         let result = {
+            let prompter = InquirePrompter;
             let mut ctx = CommandContext {
                 agent,
                 config,
                 state: state_store,
+                prompter: &prompter,
             };
             commands.execute(&input, &mut ctx).await
         };

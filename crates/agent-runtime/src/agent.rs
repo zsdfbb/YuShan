@@ -60,7 +60,9 @@ impl Agent {
     /// 运行单个 turn。取 &mut self 以保证同时只运行一次。
     pub async fn run_turn(&mut self, input: AgentInput) -> Result<RunResult, LoopError> {
         let model = self.model.as_deref().ok_or_else(|| {
-            LoopError::ConfigError("No model configured. Use /login to configure an API provider.".into())
+            LoopError::ConfigError(
+                "No model configured. Use /login to configure an API provider.".into(),
+            )
         })?;
         let mut ctx = RuntimeContext::new(
             model,
@@ -84,7 +86,11 @@ impl Agent {
 
     /// 返回工具名称（自有 String 列表）。供 banner/footer 展示可用工具。
     pub fn tool_names(&self) -> Vec<String> {
-        self.registry.names().iter().map(|s| s.to_string()).collect()
+        self.registry
+            .names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// 返回以 token 计的 model context window 大小。
@@ -248,7 +254,10 @@ mod tests {
         // (BasicLoop 在入口边界检查 cancel — 命中后立即返回 Cancelled)
         handle.cancel();
 
-        let result = agent.run_turn(agent_loop::AgentInput::text("go")).await.unwrap();
+        let result = agent
+            .run_turn(agent_loop::AgentInput::text("go"))
+            .await
+            .unwrap();
         assert_eq!(result.stop_reason, StopReason::Cancelled);
     }
 }

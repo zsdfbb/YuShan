@@ -182,7 +182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(feature = "tui-ratatui"))]
         {
-            return Err("ratatui mode required for interactive TUI; build with --features tui-ratatui".into());
+            return Err(
+                "ratatui mode required for interactive TUI; build with --features tui-ratatui"
+                    .into(),
+            );
         }
     }
 

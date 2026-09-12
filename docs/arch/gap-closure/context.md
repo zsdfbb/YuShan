@@ -247,7 +247,9 @@ pi 的三层（`agent._state.messages` 工作上下文 / `steeringQueue`+`follow
 
 **为什么必须是独立 crate**：`CONTEXT.md` 定义"**事件 = 已经发生之事的记录，只可观察**"，而**发给 agent 的消息是请求**（想让它发生）——二者是不同概念，不能同 crate。且 `ys-tui` 要认信封但**不许依赖 runtime**，信封类型必须在它下面。
 
-**为什么不装实现**：`tokio::mpsc` 的实现放接线器。若把实现放 `ys-channel`，`ys-loop` 依赖它就会**间接拖进 tokio**，违反「`ys-core` 零 Tokio」的第一硬约束。
+**为什么不装实现**：`tokio::mpsc` 的实现放接线器（`ChannelSink`）。理由是**契约不该指定传输**——若把 `tokio::sync::mpsc` 焊进 `ys-channel`，就等于声明该信道只能是 tokio 的；将来换传输（测试用同步实现、别的 runtime）就得改契约。纯数据 + 纯枚举的契约天然与传输无关。
+
+（**更正**：早先此处写作「避免 `ys-loop` 间接拖进 tokio，违反 `ys-core` 零 Tokio」——**该理由不成立**，因为 `ys-loop` 自 v1 起已直接依赖 `tokio`（`tokio::time::timeout`，`basic.rs:239`），`ys-session` 亦然（`tokio::fs`）。详见 ADR-0012。）
 
 ### 界面 crate 边界（本轮定稿）
 
@@ -354,7 +356,7 @@ apps/coding-agent config/provider/commands/ui/view/state
 ## 约束
 
 - **技术**：`Model` trait **不改**（`complete() + &mut dyn ModelEventSink` 已是流式就绪）；流式是适配器实现细节。新参数加到 `ModelRequest`，不加到 `Model`。
-- **依赖单向**：`agent-core` 不依赖 Tokio/HTTP/TUI；任何 UI 逻辑不进 core/loop。
+- **依赖单向**：**纯契约层**（`ys-core`/`ys-event`/`ys-channel`/`ys-component`）**不依赖 Tokio**/HTTP/TUI；执行层（`ys-session`/`ys-loop`/`ys-runtime`）可直接用 tokio（`ys-session` 用 `tokio::fs`、`ys-loop` 用 `tokio::time`——见 ADR-0012）。任何 UI 逻辑不进 core/loop。
 - **事件是一等接口**：UI、持久化、日志都走事件流，UI 不直接读写运行时可变对象（coding-agent 已用 `AppView` 快照隔离，本约束延续到增量事件）。
 - **最小核心**：Session 文件管理、Markdown 渲染、provider 目录都是 coding-agent / adapter 层，不进通用核心。
 - **演进**：`ModelEvent`/`AgentEvent` 均已 `#[non_exhaustive]`，新增变体是向后兼容扩展，不破坏既有 match（F4 的 `_ =>` 兜底正好利用这一点）。

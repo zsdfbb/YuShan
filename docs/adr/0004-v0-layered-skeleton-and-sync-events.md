@@ -29,3 +29,4 @@ v0 多方案评审（最小复杂度 2-crate / 可扩展 8-crate / 资源优先 
 ## 修订
 
 - **决策点 3（`EventSink::emit` 定为同步）已被 [ADR-0009](./0009-async-event-channel.md) 修订**：为接入有界异步信道，`emit` 改为 async。点 3 中「热路径零装箱」的理由因信道引入而不再成立；本 ADR 其余决策不变。
+- **决策点 7 中的「零 tokio 生产依赖」已被 [ADR-0012](./0012-runtime-dependency-boundary.md) 更正**：该表述只对 `ys-core` 及纯契约层（`ys-event`/`ys-channel`/`ys-component`）成立；`ys-session`（`tokio::fs`）与 `ys-loop`（`tokio::time`）自 v1 起已直接依赖 tokio，且不打算做 `runtime-tokio` feature 门控。点 7 其余内容（v0 工具串行、schemars 推迟）不变。

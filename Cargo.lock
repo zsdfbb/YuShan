@@ -1954,6 +1954,7 @@ name = "ys-component"
 version = "0.0.1"
 dependencies = [
  "tokio",
+ "ys-channel",
  "ys-core",
  "ys-event",
  "ys-model",
@@ -1990,6 +1991,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "ys-channel",
  "ys-component",
  "ys-core",
  "ys-event",

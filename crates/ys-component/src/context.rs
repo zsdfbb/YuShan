@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::RunLimits;
+use ys_channel::Inbox;
 use ys_core::CancelToken;
 use ys_event::EventSink;
 use ys_model::Model;
@@ -19,6 +20,8 @@ pub struct RuntimeContext<'a> {
     pub workspace_root: PathBuf,
     pub approval: Option<&'a dyn ApprovalHandler>,
     pub system_prompt: Option<String>,
+    /// 轮边界可查的掌舵队列（None = 行为与今日逐字节一致）。
+    pub inbox: Option<&'a Inbox>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -46,6 +49,13 @@ impl<'a> RuntimeContext<'a> {
             workspace_root,
             approval,
             system_prompt,
+            inbox: None,
         }
+    }
+
+    /// 链式挂载掌舵队列（轮边界 steering 来源）。`None` 时行为不变。
+    pub fn with_inbox(mut self, inbox: &'a Inbox) -> Self {
+        self.inbox = Some(inbox);
+        self
     }
 }

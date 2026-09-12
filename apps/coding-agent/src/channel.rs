@@ -4,6 +4,11 @@
 //! `docs/arch/gap-closure/design-core-channel.md` §3「移植 1」：
 //! `try_emit` 同步快路径（满则内部缓冲，**不失败**），`emit` 异步慢路径
 //! （先冲 overflow，再发本次；这是背压点）。
+//!
+//! **死锁勘误（实施后）**：自由函数 `ys_event::emit()` 现在**总是**走
+//! `emit().await`，不再先试 `try_emit`。若走同步快路径，信道满时终局事件会被
+//! 缓冲进 `overflow` 并返回 `Ok`，其后无人再冲刷 → 消费者等不到终局事件 →
+//! 死锁，且背压失效。`try_emit` 的唯一消费者是 `Forwarder`（同步回调，不能 await）。
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -17,6 +22,10 @@ use ys_core::EventError;
 use ys_event::{AgentEvent, EventSink};
 
 /// 背压可观测读数（设计修订 R6）。
+///
+/// 尚无生产调用者（仅测试读取）：当前 `--json`/`-p` 的消费循环未接指标输出。
+/// 保留为公开读数接口，待需要观测背压时接线。
+#[allow(dead_code)] // 字段仅在测试中被读取
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelStats {
     /// `try_send` 撞满次数（backpressure 次数）。
@@ -31,7 +40,6 @@ pub struct ChannelStats {
 ///
 /// overflow 缓冲**长生命周期**（随 sink，不随 `Forwarder` drop），
 /// 由每次 `emit().await` 自动冲掉，故撞满时快路径不失败。
-#[allow(dead_code)] // 接线（main 装配）在后续任务，暂未接入
 pub struct ChannelSink {
     tx: mpsc::Sender<Envelope>,
     /// 仅 `try_send` 撞满时使用；长生命周期，不随 `Forwarder` drop。
@@ -47,7 +55,6 @@ pub struct ChannelSink {
     consumer_gone: bool,
 }
 
-#[allow(dead_code)] // 接线（main 装配）在后续任务，暂未接入
 impl ChannelSink {
     /// 新建 sink 与配套接收端。容量由调用方传：
     /// 交互模式（`-p`/`--json`/TUI）建议 1024，后台长任务 4096。
@@ -107,6 +114,7 @@ impl ChannelSink {
     }
 
     /// 背压可观测读数。
+    #[allow(dead_code)] // 尚无生产调用者（仅测试读取），待接指标输出
     pub fn stats(&self) -> ChannelStats {
         ChannelStats {
             backpressure_waits: self.backpressure_waits,
@@ -183,11 +191,30 @@ impl ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use ys_core::{StopReason, Usage};
+    use ys_event::emit;
 
     fn delta(text: &str) -> AgentEvent {
         AgentEvent::ModelTextDelta {
             text: text.to_string(),
         }
+    }
+
+    fn finished() -> AgentEvent {
+        AgentEvent::RunFinished {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            rounds: 1,
+        }
+    }
+
+    fn is_terminal(ev: &AgentEvent) -> bool {
+        matches!(
+            ev,
+            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. }
+        )
     }
 
     /// 1. 投递 → 收到 `Envelope`，字段与来源正确。
@@ -366,5 +393,94 @@ mod tests {
         let retained = sink.overflow_front().expect("overflow 应保留失败事件");
         assert_eq!(retained.event, delta("B"));
         assert_eq!(retained.turn, 0);
+    }
+
+    /// **死锁回归（关键）**：小容量下经**自由函数** `emit`（总走慢路径）
+    /// 连续投递多于容量的事件，含终局事件在最后，并发消费。
+    ///
+    /// 断言：不挂起（timeout）、全部按序送达、无丢失、终局事件在最后。
+    ///
+    /// 旧实现下本测试必死锁：自由函数先试 `try_emit`，信道满时把事件
+    /// （含终局事件）缓冲进 `overflow` 并返回 `Ok`。`try_emit` 不 yield，
+    /// 生产者一口气跑完；此后无人再冲刷 `overflow`，消费者永远等不到终局事件。
+    async fn assert_no_deadlock_at_capacity(capacity: usize, deltas: usize) {
+        let (mut sink, mut rx) = ChannelSink::new(capacity, LifecyclePolicy::StopWhenConsumerGone);
+
+        let events: Vec<AgentEvent> = (0..deltas).map(|i| delta(&format!("e{i}"))).collect();
+        let terminal = finished();
+
+        // 并发消费者：收到终局事件即退出（与 main 的 consume_events 同义）。
+        let consumer = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some(env) = rx.recv().await {
+                let term = is_terminal(&env.event);
+                got.push(env.event);
+                if term {
+                    break;
+                }
+            }
+            got
+        });
+
+        // 生产者：事件数 > 容量，最后一个是终局事件。
+        let produce = async {
+            for ev in events.iter().cloned() {
+                emit(&mut sink, ev).await.unwrap();
+            }
+            emit(&mut sink, terminal.clone()).await.unwrap();
+        };
+        let produced = tokio::time::timeout(Duration::from_secs(5), produce).await;
+        assert!(produced.is_ok(), "capacity={capacity} 连续 emit 不得挂起");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("消费者应收到终局事件，不得挂起")
+            .unwrap();
+
+        let expected: Vec<AgentEvent> = events
+            .iter()
+            .cloned()
+            .chain(std::iter::once(terminal))
+            .collect();
+        assert_eq!(got, expected, "事件应按序送达、无丢失");
+        assert!(is_terminal(got.last().unwrap()), "终局事件必须在最后");
+    }
+
+    #[tokio::test]
+    async fn small_channel_no_deadlock_capacity_1() {
+        assert_no_deadlock_at_capacity(1, 5).await;
+    }
+
+    #[tokio::test]
+    async fn small_channel_no_deadlock_capacity_2() {
+        assert_no_deadlock_at_capacity(2, 6).await;
+    }
+
+    /// 自由函数走慢路径时背压确实生效：无消费者时，投递多于容量后
+    /// overflow 不再无界增长（生产者阻塞在 `send().await`，而非无限缓冲）。
+    ///
+    /// 用 `timeout` 证明生产者**确实被阻塞**（这正是背压），
+    /// 而非「假成功」地继续把事件塞进 overflow。
+    #[tokio::test]
+    async fn slow_path_applies_backpressure_when_consumer_stalls() {
+        let (mut sink, _rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
+        // 接收端不消费（仅持有）。容量 2 填满后，第 3 次 `emit` 应阻塞。
+        let send_third = async {
+            for i in 0..3 {
+                let _ = emit(&mut sink, delta(&format!("e{i}"))).await;
+            }
+        };
+        let r = tokio::time::timeout(Duration::from_millis(200), send_third).await;
+        assert!(
+            r.is_err(),
+            "容量 2 且无消费者时，第 3 次 emit 应阻塞在背压点，而非无限缓冲"
+        );
+        // 阻塞期间前两个事件在信道、无 overflow 积压
+        assert_eq!(sink.stats().buffered, 0, "背压生效时不应有 overflow 积压");
+        assert_eq!(
+            sink.stats().backpressure_waits,
+            0,
+            "慢路径不增快路径撞满计数"
+        );
     }
 }

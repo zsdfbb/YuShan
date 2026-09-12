@@ -688,13 +688,13 @@ mod tests {
     use super::*;
     use crate::commands::CommandRegistry;
     use crate::config::Config;
-    use agent_event::CollectingSink;
-    use agent_runtime::AgentBuilder;
-    use agent_session::MemorySession;
+    use ys_event::CollectingSink;
+    use ys_runtime::AgentBuilder;
+    use ys_session::MemorySession;
 
     /// 辅助：用 mock model 构建测试 agent。
-    fn test_agent(model_name: &str) -> agent_runtime::Agent {
-        let model = agent_model::MockModel::new(model_name);
+    fn test_agent(model_name: &str) -> ys_runtime::Agent {
+        let model = ys_model::MockModel::new(model_name);
         AgentBuilder::new()
             .model(model)
             .session(MemorySession::new())
@@ -967,7 +967,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_clears_session() {
-        let model = agent_model::MockModel::new("test");
+        let model = ys_model::MockModel::new("test");
         model.push_text("hello");
         let mut agent = AgentBuilder::new()
             .model(model)
@@ -978,7 +978,7 @@ mod tests {
 
         // 跑一个 turn 以添加消息
         agent
-            .run_turn(agent_loop::AgentInput::text("hi"))
+            .run_turn(ys_loop::AgentInput::text("hi"))
             .await
             .unwrap();
         assert!(!agent.session_messages().is_empty());
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_mvp() {
-        let model = agent_model::MockModel::new("test");
+        let model = ys_model::MockModel::new("test");
         model.push_text("hello");
         let mut agent = AgentBuilder::new()
             .model(model)
@@ -1061,7 +1061,7 @@ mod tests {
             .unwrap();
 
         agent
-            .run_turn(agent_loop::AgentInput::text("hi"))
+            .run_turn(ys_loop::AgentInput::text("hi"))
             .await
             .unwrap();
         assert!(!agent.session_messages().is_empty());

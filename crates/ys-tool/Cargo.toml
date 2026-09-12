@@ -1,0 +1,16 @@
+[package]
+name = "ys-tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ys-core = { path = "../ys-core" }
+serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+thiserror = "2"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

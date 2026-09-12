@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-use agent_core::StopReason;
+use ys_core::StopReason;
 
 use super::app::{App, TranscriptLine};
 
@@ -293,11 +293,11 @@ mod tests {
     use super::*;
     use crate::ui::app::{App, TranscriptLine};
     use crate::view::AppView;
-    use agent_core::StopReason;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
     use std::time::Instant;
+    use ys_core::StopReason;
 
     fn make_app() -> App {
         let view = AppView {

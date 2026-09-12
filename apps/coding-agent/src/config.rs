@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_model::Model;
+use ys_model::Model;
 
 use crate::provider::ProviderRegistry;
 
@@ -60,7 +60,7 @@ impl Config {
     }
 
     /// 返回当前 provider 的 ProviderCompat（未设置时为 "custom"）。
-    pub fn current_compat(&self) -> agent_model_openai_compatible::compat::ProviderCompat {
+    pub fn current_compat(&self) -> ys_model_openai_compat::compat::ProviderCompat {
         let name = self.provider.as_deref().unwrap_or("custom");
         self.registry.compat_for(name)
     }
@@ -74,15 +74,15 @@ mod tests {
     struct DummyModel;
 
     #[async_trait::async_trait]
-    impl agent_model::Model for DummyModel {
+    impl ys_model::Model for DummyModel {
         fn model_id(&self) -> &str {
             "dummy"
         }
         async fn complete(
             &self,
-            _request: agent_model::ModelRequest,
-            _sink: &mut dyn agent_model::ModelEventSink,
-        ) -> Result<agent_model::ModelResponse, agent_model::ModelError> {
+            _request: ys_model::ModelRequest,
+            _sink: &mut dyn ys_model::ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
             unimplemented!("test dummy")
         }
     }

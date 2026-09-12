@@ -1,13 +1,13 @@
 [package]
-name = "agent-model-openai-compatible"
+name = "ys-model-openai-compat"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-agent-core = { path = "../../crates/agent-core" }
-agent-model = { path = "../../crates/agent-model" }
-agent-event = { path = "../../crates/agent-event" }
-agent-tool = { path = "../../crates/agent-tool" }
+ys-core = { path = "../../crates/ys-core" }
+ys-model = { path = "../../crates/ys-model" }
+ys-event = { path = "../../crates/ys-event" }
+ys-tool = { path = "../../crates/ys-tool" }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { version = "1", features = ["rt", "time", "io-util", "fs", "net"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,12 +1,12 @@
-use agent_component::{RunLimits, RuntimeContext};
-use agent_core::CancelToken;
-use agent_core::{ContentBlock, Message, Role, ToolCallId};
-use agent_event::CollectingSink;
-use agent_loop::{AgentInput, AgentLoop, BasicLoop};
-use agent_model::{Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
-use agent_session::MemorySession;
-use agent_tool::{Tool, ToolContext};
-use agent_tools_basic::{EditTool, ReadTool, WriteTool};
+use ys_component::{RunLimits, RuntimeContext};
+use ys_core::CancelToken;
+use ys_core::{ContentBlock, Message, Role, ToolCallId};
+use ys_event::CollectingSink;
+use ys_loop::{AgentInput, AgentLoop, BasicLoop};
+use ys_model::{Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+use ys_session::MemorySession;
+use ys_tool::{Tool, ToolContext};
+use ys_tools_basic::{EditTool, ReadTool, WriteTool};
 
 // 回显 tool call 的 mock model
 struct MockCodingModel;
@@ -126,7 +126,7 @@ async fn test_full_agent_turn_with_mock_model() {
     let mut session = MemorySession::new();
     let mut events = CollectingSink::new();
     let cancel = CancelToken::new();
-    let registry = agent_tool::ToolRegistry::build(vec![
+    let registry = ys_tool::ToolRegistry::build(vec![
         Box::new(ReadTool::new(tmp.clone())),
         Box::new(WriteTool::new(tmp.clone())),
         Box::new(EditTool::new(tmp.clone())),
@@ -151,7 +151,7 @@ async fn test_full_agent_turn_with_mock_model() {
         BasicLoop.run_turn(input, &mut ctx).await.unwrap()
     };
 
-    assert_eq!(result.stop_reason, agent_core::StopReason::Completed);
+    assert_eq!(result.stop_reason, ys_core::StopReason::Completed);
     assert!(result.final_message.is_some());
 
     // 清理

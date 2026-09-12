@@ -1,0 +1,16 @@
+[package]
+name = "ys-component"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ys-core = { path = "../ys-core" }
+ys-model = { path = "../ys-model" }
+ys-tool = { path = "../ys-tool" }
+ys-session = { path = "../ys-session" }
+ys-event = { path = "../ys-event" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

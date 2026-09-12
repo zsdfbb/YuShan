@@ -3,11 +3,11 @@ pub mod request;
 pub mod response;
 pub mod stream;
 
-use agent_core::{ContentBlock, Message, Role, ToolCallId, Usage};
-use agent_model::{Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse};
 use compat::ProviderCompat;
 use request::*;
 use response::*;
+use ys_core::{ContentBlock, Message, Role, ToolCallId, Usage};
+use ys_model::{Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse};
 
 pub struct OpenAICompatibleConfig {
     pub api_base: String,
@@ -252,7 +252,7 @@ fn translate_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_model::ModelRequest;
+    use ys_model::ModelRequest;
 
     // 简单测试：验证 translate_request 生成正确的 JSON
     #[test]
@@ -267,7 +267,7 @@ mod tests {
         };
 
         let request = ModelRequest {
-            messages: vec![agent_core::Message {
+            messages: vec![ys_core::Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "hello".into(),
@@ -299,7 +299,7 @@ mod tests {
         };
 
         let request = ModelRequest {
-            messages: vec![agent_core::Message {
+            messages: vec![ys_core::Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_call_id: ToolCallId("call_1".into()),

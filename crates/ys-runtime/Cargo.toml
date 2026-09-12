@@ -1,0 +1,21 @@
+[package]
+name = "ys-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ys-core = { path = "../ys-core" }
+ys-loop = { path = "../ys-loop" }
+ys-component = { path = "../ys-component" }
+ys-model = { path = "../ys-model" }
+ys-tool = { path = "../ys-tool" }
+ys-session = { path = "../ys-session" }
+ys-event = { path = "../ys-event" }
+async-trait = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

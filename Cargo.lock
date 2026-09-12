@@ -3,138 +3,6 @@
 version = 4
 
 [[package]]
-name = "agent-component"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "agent-event",
- "agent-model",
- "agent-session",
- "agent-tool",
- "tokio",
-]
-
-[[package]]
-name = "agent-core"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-event"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-loop"
-version = "0.0.1"
-dependencies = [
- "agent-component",
- "agent-core",
- "agent-event",
- "agent-model",
- "agent-session",
- "agent-tool",
- "async-trait",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-model"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "agent-event",
- "agent-tool",
- "async-trait",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-model-openai-compatible"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "agent-event",
- "agent-model",
- "agent-tool",
- "async-trait",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-runtime"
-version = "0.0.1"
-dependencies = [
- "agent-component",
- "agent-core",
- "agent-event",
- "agent-loop",
- "agent-model",
- "agent-session",
- "agent-tool",
- "async-trait",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-session"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "async-trait",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-tool"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "async-trait",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "agent-tools-basic"
-version = "0.0.1"
-dependencies = [
- "agent-core",
- "agent-tool",
- "async-trait",
- "serde_json",
- "tokio",
- "unicode-normalization",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2045,19 +1913,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "yushan-coding-agent"
+name = "ys-coding-agent"
 version = "0.0.1"
 dependencies = [
- "agent-component",
- "agent-core",
- "agent-event",
- "agent-loop",
- "agent-model",
- "agent-model-openai-compatible",
- "agent-runtime",
- "agent-session",
- "agent-tool",
- "agent-tools-basic",
  "async-trait",
  "crossterm",
  "futures",
@@ -2068,6 +1926,148 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "ys-component",
+ "ys-core",
+ "ys-event",
+ "ys-loop",
+ "ys-model",
+ "ys-model-openai-compat",
+ "ys-runtime",
+ "ys-session",
+ "ys-tool",
+ "ys-tools-basic",
+]
+
+[[package]]
+name = "ys-component"
+version = "0.0.1"
+dependencies = [
+ "tokio",
+ "ys-core",
+ "ys-event",
+ "ys-model",
+ "ys-session",
+ "ys-tool",
+]
+
+[[package]]
+name = "ys-core"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "ys-event"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-core",
+]
+
+[[package]]
+name = "ys-loop"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-component",
+ "ys-core",
+ "ys-event",
+ "ys-model",
+ "ys-session",
+ "ys-tool",
+]
+
+[[package]]
+name = "ys-model"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-core",
+ "ys-event",
+ "ys-tool",
+]
+
+[[package]]
+name = "ys-model-openai-compat"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-core",
+ "ys-event",
+ "ys-model",
+ "ys-tool",
+]
+
+[[package]]
+name = "ys-runtime"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-component",
+ "ys-core",
+ "ys-event",
+ "ys-loop",
+ "ys-model",
+ "ys-session",
+ "ys-tool",
+]
+
+[[package]]
+name = "ys-session"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-core",
+]
+
+[[package]]
+name = "ys-tool"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "ys-core",
+]
+
+[[package]]
+name = "ys-tools-basic"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "unicode-normalization",
+ "ys-core",
+ "ys-tool",
 ]
 
 [[package]]

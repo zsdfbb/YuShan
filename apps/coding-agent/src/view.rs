@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use agent_runtime::Agent;
+use ys_runtime::Agent;
 
 use crate::config::Config;
 use crate::provider::ProviderRegistry;

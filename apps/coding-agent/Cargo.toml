@@ -1,5 +1,5 @@
 [package]
-name = "yushan-coding-agent"
+name = "ys-coding-agent"
 version.workspace = true
 edition.workspace = true
 
@@ -9,16 +9,16 @@ tui-ratatui = ["dep:ratatui", "dep:crossterm", "dep:futures"]
 # tui-stdout 已移除（c 阶段）
 
 [dependencies]
-agent-core = { path = "../../crates/agent-core" }
-agent-model = { path = "../../crates/agent-model" }
-agent-tool = { path = "../../crates/agent-tool" }
-agent-session = { path = "../../crates/agent-session" }
-agent-event = { path = "../../crates/agent-event" }
-agent-component = { path = "../../crates/agent-component" }
-agent-loop = { path = "../../crates/agent-loop" }
-agent-runtime = { path = "../../crates/agent-runtime" }
-agent-model-openai-compatible = { path = "../../adapters/model-openai-compatible" }
-agent-tools-basic = { path = "../../adapters/tools-basic" }
+ys-core = { path = "../../crates/ys-core" }
+ys-model = { path = "../../crates/ys-model" }
+ys-tool = { path = "../../crates/ys-tool" }
+ys-session = { path = "../../crates/ys-session" }
+ys-event = { path = "../../crates/ys-event" }
+ys-component = { path = "../../crates/ys-component" }
+ys-loop = { path = "../../crates/ys-loop" }
+ys-runtime = { path = "../../crates/ys-runtime" }
+ys-model-openai-compat = { path = "../../adapters/model-openai-compatible" }
+ys-tools-basic = { path = "../../adapters/tools-basic" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,30 @@
+use super::{AgentEvent, EventSink};
+use ys_core::EventError;
+
+/// 在内存中收集所有已发出事件的 event sink。
+pub struct CollectingSink {
+    events: Vec<AgentEvent>,
+}
+
+impl CollectingSink {
+    pub fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+
+    pub fn events(&self) -> &[AgentEvent] {
+        &self.events
+    }
+}
+
+impl Default for CollectingSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventSink for CollectingSink {
+    fn emit(&mut self, event: AgentEvent) -> Result<(), EventError> {
+        self.events.push(event);
+        Ok(())
+    }
+}

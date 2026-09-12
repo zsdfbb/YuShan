@@ -1,8 +1,8 @@
-use agent_core::ToolResult;
-use agent_tool::{Tool, ToolContext, ToolError, ToolSpec};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use unicode_normalization::UnicodeNormalization;
+use ys_core::ToolResult;
+use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
 pub struct EditTool {
     workspace: PathBuf,
@@ -260,7 +260,7 @@ fn find_match_fuzzy(content: &str, old_text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::CancelToken;
+    use ys_core::CancelToken;
 
     fn make_ctx() -> (CancelToken, ToolContext<'static>) {
         let token = Box::leak(Box::new(CancelToken::new()));

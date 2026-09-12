@@ -1,7 +1,7 @@
-use agent_core::ToolResult;
-use agent_tool::{Tool, ToolContext, ToolError, ToolSpec};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use ys_core::ToolResult;
+use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
 pub struct WriteTool {
     workspace: PathBuf,
@@ -61,7 +61,7 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::CancelToken;
+    use ys_core::CancelToken;
 
     fn make_ctx() -> (CancelToken, ToolContext<'static>) {
         let token = Box::leak(Box::new(CancelToken::new()));

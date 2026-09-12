@@ -11,12 +11,12 @@ mod view;
 #[cfg(feature = "tui-ratatui")]
 mod ui;
 
-use agent_event::NoopEventSink;
-use agent_loop::AgentInput;
-use agent_model_openai_compatible::{OpenAICompatibleConfig, OpenAICompatibleModel};
-use agent_runtime::AgentBuilder;
-use agent_session::MemorySession;
-use agent_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
+use ys_event::NoopEventSink;
+use ys_loop::AgentInput;
+use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
+use ys_runtime::AgentBuilder;
+use ys_session::MemorySession;
+use ys_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tool(BashTool::new(workspace.clone()))
         .system_prompt(system_prompt)
         .working_dir(workspace.clone(), workspace.clone())
-        .approval(agent_tool::AutoApprove)
+        .approval(ys_tool::AutoApprove)
         .session(MemorySession::new())
         .events(NoopEventSink);
 
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let result = agent.run_turn(input).await?;
         if let Some(msg) = &result.final_message {
             for block in &msg.content {
-                if let agent_core::ContentBlock::Text { text } = block {
+                if let ys_core::ContentBlock::Text { text } = block {
                     println!("{text}");
                 }
             }

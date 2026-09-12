@@ -3,17 +3,17 @@
 //! 要求：YUSHAN_API_BASE 与 YUSHAN_API_KEY 环境变量。
 //! 运行方式：
 //!   YUSHAN_API_BASE=https://api.deepseek.com YUSHAN_API_KEY=sk-xxx \
-//!     cargo test -p yushan-coding-agent e2e -- --ignored --nocapture
+//!     cargo test -p ys-coding-agent e2e -- --ignored --nocapture
 
-use agent_event::NoopEventSink;
-use agent_loop::AgentInput;
-use agent_model_openai_compatible::{
+use std::path::PathBuf;
+use ys_event::NoopEventSink;
+use ys_loop::AgentInput;
+use ys_model_openai_compat::{
     OpenAICompatibleConfig, OpenAICompatibleModel, compat::ProviderCompat,
 };
-use agent_runtime::AgentBuilder;
-use agent_session::MemorySession;
-use agent_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
-use std::path::PathBuf;
+use ys_runtime::AgentBuilder;
+use ys_session::MemorySession;
+use ys_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
 
 fn workdir() -> PathBuf {
     let dir = std::env::temp_dir().join("yushan_e2e_test");

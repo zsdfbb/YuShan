@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use agent_core::{CancelToken, StopReason};
+use ys_core::{CancelToken, StopReason};
 
 use crate::view::AppView;
 

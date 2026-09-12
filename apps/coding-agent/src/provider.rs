@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agent_model_openai_compatible::compat::ProviderCompat;
 use serde::{Deserialize, Serialize};
+use ys_model_openai_compat::compat::ProviderCompat;
 
 /// 带元数据的已知 provider。
 #[derive(Debug, Clone)]

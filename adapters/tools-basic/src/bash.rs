@@ -1,9 +1,9 @@
-use agent_core::ToolResult;
-use agent_tool::{Tool, ToolContext, ToolError, ToolSpec};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
+use ys_core::ToolResult;
+use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
@@ -158,7 +158,7 @@ impl Tool for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::CancelToken;
+    use ys_core::CancelToken;
 
     fn make_ctx() -> (CancelToken, ToolContext<'static>) {
         let token = Box::leak(Box::new(CancelToken::new()));

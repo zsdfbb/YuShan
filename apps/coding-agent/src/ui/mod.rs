@@ -26,8 +26,8 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use crossterm::event::EventStream;
 use std::io::Write;
 
-use agent_core::CancelToken;
-use agent_runtime::Agent;
+use ys_core::CancelToken;
+use ys_runtime::Agent;
 
 use crate::commands::CommandRegistry;
 use crate::config::Config;
@@ -219,8 +219,8 @@ async fn dispatch_input<B: Backend + Write>(
     state_store: &mut StateStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::commands::{CommandContext, CommandResult, InquirePrompter};
-    use agent_core::ContentBlock;
-    use agent_loop::AgentInput;
+    use ys_core::ContentBlock;
+    use ys_loop::AgentInput;
 
     let input = input.trim().to_string();
     if input.is_empty() {
@@ -333,10 +333,10 @@ async fn run_turn_with_ticks<B: Backend>(
     terminal: &mut Terminal<B>,
     events: &mut EventStream,
     agent: &mut Agent,
-    input: agent_loop::AgentInput,
+    input: ys_loop::AgentInput,
     cancel_token: CancelToken,
     app: &mut App,
-) -> Result<agent_loop::RunResult, Box<dyn std::error::Error>> {
+) -> Result<ys_loop::RunResult, Box<dyn std::error::Error>> {
     use futures::StreamExt;
 
     let mut ticker = tokio::time::interval(Duration::from_millis(300));

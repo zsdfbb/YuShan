@@ -56,10 +56,10 @@ flowchart LR
 ```mermaid
 flowchart TB
     APP[应用层Coding Agent / Web / 自定义应用]
-    RT[agent-runtimeAgentBuilder / Agent / RuntimeContext]
-    LOOP[agent-loopBasicLoop / StreamingLoop / WorkflowLoop]
+    RT[ys-runtimeAgentBuilder / Agent / RuntimeContext]
+    LOOP[ys-loopBasicLoop / StreamingLoop / WorkflowLoop]
     COMP[组件接口Model / Tool / Session / EventSink]
-    CORE[agent-coreMessage / ToolCall / Event / Error]
+    CORE[ys-coreMessage / ToolCall / Event / Error]
     APP --> RT
     RT --> LOOP
     RT --> COMP
@@ -70,16 +70,16 @@ flowchart TB
 依赖方向保持单向：
 
 ```text
-agent-core
+ys-core
   ↑
-agent-model / agent-tool / agent-session / agent-event
+ys-model / ys-tool / ys-session / ys-event
   ↑
-agent-loop / agent-runtime
+ys-loop / ys-runtime
   ↑
 Coding Agent / UI / 适配器 / 插件
 ```
 
-`agent-core` 不依赖 Tokio、HTTP Client、数据库、TUI 或具体模型 SDK。
+`ys-core` 不依赖 Tokio、HTTP Client、数据库、TUI 或具体模型 SDK。
 
 ## 4. 运行时组件关系
 
@@ -104,7 +104,7 @@ sequenceDiagram
     Agent-->>App: RunResult
 ```
 
-### `agent-core`
+### `ys-core`
 
 定义所有组件共享的稳定数据：
 
@@ -129,7 +129,7 @@ pub struct ToolCall {
 
 核心类型还包括 `ModelRequest`、`ModelResponse`、`Usage`、`AgentEvent`、`AgentError`、`SessionError` 和各类 ID。
 
-### `agent-model`
+### `ys-model`
 
 模型只负责把请求转换成模型响应，并可输出增量事件：
 
@@ -146,9 +146,9 @@ pub trait Model: Send + Sync {
 }
 ```
 
-`ModelEventSink` 是模型侧窄事件口（只承载模型事件），与 run 级 `EventSink` 分离，为动态插件保持模型适配器的最小 ABI 面（ADR-0004）。适配器单独实现，例如 `agent-model-openai-compatible`、`agent-model-deepseek` 和 `agent-model-ollama`。
+`ModelEventSink` 是模型侧窄事件口（只承载模型事件），与 run 级 `EventSink` 分离，为动态插件保持模型适配器的最小 ABI 面（ADR-0004）。适配器单独实现，例如 `ys-model-openai-compat`、`ys-model-deepseek` 和 `ys-model-ollama`。
 
-### `agent-tool`
+### `ys-tool`
 
 工具只描述自身并执行输入：
 
@@ -167,7 +167,7 @@ pub trait Tool: Send + Sync {
 
 `ToolSpec` 至少包含 `name`、`description` 和 `input_schema`。`ToolRegistry` 只负责按名称查找工具，不负责权限判断。`ToolContext` 至少携带取消句柄，工具可自愿检查，Loop 不会强制中断执行中的工具。
 
-### `agent-session` 与 `agent-event`
+### `ys-session` 与 `ys-event`
 
 ```rust
 pub trait Session {
@@ -319,9 +319,9 @@ flowchart LR
 [features]
 default = ["runtime-tokio"]
 runtime-tokio = ["dep:tokio"]
-model-openai-compatible = ["dep:agent-model-openai-compatible"]
-session-jsonl = ["dep:agent-session-jsonl"]
-session-sqlite = ["dep:agent-session-sqlite"]
+model-openai-compatible = ["dep:ys-model-openai-compat"]
+session-jsonl = ["dep:ys-session-jsonl"]
+session-sqlite = ["dep:ys-session-sqlite"]
 ```
 
 **运行时依赖边界（ADR-0012）**：不宜对 tokio 做 feature 门控。实际边界是——**纯契约层**（`ys-core`/`ys-event`/`ys-channel`/`ys-component`）保持运行时无关；**执行层**（`ys-session`/`ys-loop`/`ys-runtime`）可直接依赖 tokio。上表 `runtime-tokio` 一项**不实施**。
@@ -356,16 +356,16 @@ plugin_shutdown
 ```text
 agent/
 ├── crates/
-│   ├── agent-core/              # 基础数据类型
-│   ├── agent-component/         # Component 与 Registry
-│   ├── agent-model/             # Model 接口
-│   ├── agent-tool/              # Tool 与 ToolRegistry
-│   ├── agent-session/           # Session 接口
-│   ├── agent-event/             # AgentEvent 与 EventSink
-│   ├── agent-loop/              # AgentLoop 与 BasicLoop
-│   ├── agent-runtime/           # AgentBuilder 与 Agent
-│   ├── agent-plugin-api/        # 动态插件 ABI
-│   └── agent-plugin-loader/     # 动态库加载器
+│   ├── ys-core/              # 基础数据类型
+│   ├── ys-component/         # Component 与 Registry
+│   ├── ys-model/             # Model 接口
+│   ├── ys-tool/              # Tool 与 ToolRegistry
+│   ├── ys-session/           # Session 接口
+│   ├── ys-event/             # AgentEvent 与 EventSink
+│   ├── ys-loop/              # AgentLoop 与 BasicLoop
+│   ├── ys-runtime/           # AgentBuilder 与 Agent
+│   ├── ys-plugin-api/        # 动态插件 ABI
+│   └── ys-plugin-loader/     # 动态库加载器
 ├── adapters/
 │   ├── model-openai-compatible/
 │   ├── model-deepseek/
@@ -455,10 +455,10 @@ run_finished          → 生成变更与验证摘要
 Coding Session 在通用消息之外记录工作目录、模型、Git 分支、Agent 配置和上下文压缩信息。建议提供四种入口：
 
 ```text
-yushan-coding-agent                 交互式 TUI
-yushan-coding-agent -p "task"       单次 Print 模式
-yushan-coding-agent --json          JSON 事件模式
-yushan-coding-agent --rpc           RPC 集成模式
+ys-coding-agent                 交互式 TUI
+ys-coding-agent -p "task"       单次 Print 模式
+ys-coding-agent --json          JSON 事件模式
+ys-coding-agent --rpc           RPC 集成模式
 ```
 
 第一版必须支持交互式 CLI、Print 模式和 JSON 事件模式；TUI、RPC、会话分支和上下文压缩可以后续增加。
@@ -500,7 +500,7 @@ let agent = AgentBuilder::new()
 
 | 模块  | 重点测试 |
 | --- | --- |
-| `agent-core` | 消息、Tool Call、事件和序列化 |
+| `ys-core` | 消息、Tool Call、事件和序列化 |
 | `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致 |
 | `Registry` | 注册、查找、重复名称和缺失组件 |
 | `Session` | 追加消息、保存恢复、空会话和损坏数据 |

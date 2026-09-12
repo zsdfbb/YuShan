@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::config::Config;
 use crate::state::StateStore;
-use agent_runtime::Agent;
+use ys_runtime::Agent;
 
 /// 可注册进 CommandRegistry 的 slash command。
 #[async_trait]
@@ -272,9 +272,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_unknown_command() {
         let reg = CommandRegistry::new();
-        let mut agent = agent_runtime::AgentBuilder::new()
-            .session(agent_session::MemorySession::new())
-            .events(agent_event::CollectingSink::new())
+        let mut agent = ys_runtime::AgentBuilder::new()
+            .session(ys_session::MemorySession::new())
+            .events(ys_event::CollectingSink::new())
             .build()
             .unwrap();
         let mut config = Config::from_env().unwrap();

@@ -224,7 +224,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use agent_core::CancelToken;
+    use ys_core::CancelToken;
 
     use super::handle_key;
     use crate::ui::app::App;

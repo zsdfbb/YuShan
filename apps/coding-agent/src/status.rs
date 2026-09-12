@@ -1,4 +1,4 @@
-use agent_core::Usage;
+use ys_core::Usage;
 
 /// TUI 层累加器。数据来源：每个 turn 结束时的 `RunResult.usage`。
 #[derive(Default, Clone, Copy, Debug)]

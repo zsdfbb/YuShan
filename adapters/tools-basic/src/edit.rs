@@ -270,11 +270,24 @@ mod tests {
     }
 
     fn test_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("agent_tools_basic_edit_test_{id}"))
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agent_tools_basic_edit_test_{id}_{}_{seq}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn test_test_dir_is_unique() {
+        let a = test_dir();
+        let b = test_dir();
+        assert_ne!(a, b, "consecutive test_dir() calls must not collide");
     }
 
     #[tokio::test]

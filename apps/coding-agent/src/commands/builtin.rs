@@ -706,12 +706,17 @@ mod tests {
     fn test_config() -> Config {
         let mut config = Config::from_env().unwrap();
         // 指向临时 auth.json，避免测试（如 logout）误写真实的 ~/.yushan/auth.json。
+        // 目录名含时间戳 + 进程 id + 进程内原子序号，避免并行测试拿到同名目录。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "yushan_test_auth_{:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "yushan_test_auth_{id}_{}_{seq}",
+            std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -723,12 +728,17 @@ mod tests {
     /// 使测试永不触碰真实的 ~/.yushan/state.json。
     fn test_state_store() -> crate::state::StateStore {
         let mut store = crate::state::StateStore::new();
+        // 目录名含时间戳 + 进程 id + 进程内原子序号，避免并行测试拿到同名目录。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "yushan_test_state_{:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "yushan_test_state_{id}_{}_{seq}",
+            std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

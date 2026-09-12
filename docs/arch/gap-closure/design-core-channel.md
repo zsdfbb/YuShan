@@ -207,6 +207,11 @@ impl ModelEventSink for Forwarder<'_> {
 
 **turn 的显式化（修订 R4）**：原设计让 sink 从 `AgentEvent::UserMessage` **推导** turn。但本设计的轮边界 steering 注入**也**会发 `UserMessage`（语义上它确实是用户消息），推导会**误增 turn**，破坏 `--json` 的分组。改为显式——`Agent::run` 每回合开始调 `sink.begin_turn(n)`（它知道回合号）。
 
+**`try_emit` 的 `Err` 语义（已定）**：`Err` 仅表示「消费者已消失」。
+信道满时 `ChannelSink` 必须内部缓冲（`overflow`），不得返回 Err。
+据此：自由函数 `emit()` 收到 Err 意味着「该走慢路径 / 消费者已走」，
+而 `Forwarder`（同步回调）丢弃 Err 是正确的——消费者没了，丢弃合理。
+
 ### 移植 2：`Inbox` 的产消模型（C 的动机 + 落法经修订）
 
 ```rust

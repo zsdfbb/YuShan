@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use super::{AgentEvent, EventSink};
 use ys_core::EventError;
 
@@ -23,8 +26,19 @@ impl Default for CollectingSink {
 }
 
 impl EventSink for CollectingSink {
-    fn emit(&mut self, event: AgentEvent) -> Result<(), EventError> {
+    fn try_emit(&mut self, event: AgentEvent) -> Result<(), AgentEvent> {
         self.events.push(event);
         Ok(())
+    }
+
+    fn emit<'a>(
+        &'a mut self,
+        event: AgentEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventError>> + Send + 'a>> {
+        Box::pin(async move {
+            // 无背压：`try_emit` 恒 `Ok`，直接委托以免两条路径各写一份 push
+            let _ = self.try_emit(event);
+            Ok(())
+        })
     }
 }

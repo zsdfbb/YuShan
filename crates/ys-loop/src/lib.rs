@@ -29,7 +29,7 @@ mod tests {
     use std::path::PathBuf;
     use ys_component::{RunLimits, RuntimeContext};
     use ys_core::*;
-    use ys_event::{AgentEvent, CollectingSink};
+    use ys_event::{AgentEvent, CollectingSink, FailingSink};
     use ys_model::MockModel;
     use ys_session::MemorySession;
     use ys_tool::{Tool, ToolContext, ToolRegistry};
@@ -380,5 +380,40 @@ mod tests {
             })
             .count();
         assert_eq!(terminal_count, 1, "exactly one terminal event required");
+    }
+
+    // Task 6：EventError::SendFailed → LoopError::Event 的首个覆盖
+    #[tokio::test]
+    async fn test_send_failed_propagates_as_loop_error() {
+        let model = MockModel::new("m");
+        model.push_text("hello");
+        let mut session = MemorySession::new();
+        // 首次投递即失败：快路径失败 → 回落慢路径 → 慢路径也失败
+        let mut events = FailingSink::new(0);
+        events.set_fail_slow(true);
+        let cancel = CancelToken::new();
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let limits = RunLimits::new(5);
+
+        let mut ctx = make_ctx(
+            &model,
+            &registry,
+            &mut session,
+            &mut events,
+            &cancel,
+            limits,
+        );
+        let input = AgentInput::text("hi");
+        let result = BasicLoop.run_turn(input, &mut ctx).await;
+
+        // 终局不变式：emit 失败即终止当前 turn，不静默续跑
+        let err = result.err().expect("emit 失败应终止 turn");
+        assert!(
+            matches!(err, LoopError::Event(ys_core::EventError::SendFailed)),
+            "expected LoopError::Event(SendFailed), got {err:?}"
+        );
+        assert_eq!(events.try_calls(), 1, "首条事件失败后不再尝试投递");
+        assert_eq!(events.slow_calls(), 1, "回落慢路径一次");
+        assert!(events.emitted().is_empty(), "不应有事件被静默投递");
     }
 }

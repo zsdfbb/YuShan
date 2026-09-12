@@ -5,7 +5,7 @@ use super::{AgentInput, AgentLoop, LoopError, RunResult};
 use async_trait::async_trait;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
-use ys_event::AgentEvent;
+use ys_event::{AgentEvent, emit};
 use ys_model::{ModelEvent, ModelEventSink, ModelRequest};
 use ys_tool::{ToolContext, ToolError};
 
@@ -24,7 +24,11 @@ struct Forwarder<'a> {
 impl<'a> ModelEventSink for Forwarder<'a> {
     fn emit(&mut self, event: ModelEvent) -> Result<(), ys_core::EventError> {
         match event {
-            ModelEvent::TextDelta { text } => self.sink.emit(AgentEvent::ModelTextDelta { text }),
+            // 同步回调里只走快路径（满 / 关闭都由 sink 内部处置，此处不做背压）
+            ModelEvent::TextDelta { text } => {
+                let _ = self.sink.try_emit(AgentEvent::ModelTextDelta { text });
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -43,13 +47,16 @@ impl AgentLoop for BasicLoop {
 
         // Step 1：入口边界 —— 检查 cancel
         if ctx.cancel.is_cancelled() {
-            ctx.events
-                .emit(AgentEvent::RunFinished {
+            emit(
+                ctx.events,
+                AgentEvent::RunFinished {
                     stop_reason: StopReason::Cancelled,
                     usage: Usage::default(),
                     rounds: 0,
-                })
-                .map_err(LoopError::Event)?;
+                },
+            )
+            .await
+            .map_err(LoopError::Event)?;
             return Ok(RunResult {
                 stop_reason: StopReason::Cancelled,
                 usage: Usage::default(),
@@ -64,23 +71,29 @@ impl AgentLoop for BasicLoop {
             .append(input.message)
             .await
             .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-        ctx.events
-            .emit(AgentEvent::UserMessage {
+        emit(
+            ctx.events,
+            AgentEvent::UserMessage {
                 message: user_message,
-            })
-            .map_err(LoopError::Event)?;
+            },
+        )
+        .await
+        .map_err(LoopError::Event)?;
 
         // 主循环
         loop {
             // Step 3：调用 model 前检查 cancel
             if ctx.cancel.is_cancelled() {
-                ctx.events
-                    .emit(AgentEvent::RunFinished {
+                emit(
+                    ctx.events,
+                    AgentEvent::RunFinished {
                         stop_reason: StopReason::Cancelled,
                         usage: total_usage.clone(),
                         rounds,
-                    })
-                    .map_err(LoopError::Event)?;
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 return Ok(RunResult {
                     stop_reason: StopReason::Cancelled,
                     usage: total_usage,
@@ -91,13 +104,16 @@ impl AgentLoop for BasicLoop {
 
             // Step 4：在调用 model 之前检查最大 round 数
             if rounds >= ctx.limits.max_rounds {
-                ctx.events
-                    .emit(AgentEvent::RunFinished {
+                emit(
+                    ctx.events,
+                    AgentEvent::RunFinished {
                         stop_reason: StopReason::MaxRounds,
                         usage: total_usage.clone(),
                         rounds,
-                    })
-                    .map_err(LoopError::Event)?;
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 return Ok(RunResult {
                     stop_reason: StopReason::MaxRounds,
                     usage: total_usage,
@@ -127,17 +143,22 @@ impl AgentLoop for BasicLoop {
 
             // Step 6：通过 Forwarder 调用 model
             let mut forwarder = Forwarder { sink: ctx.events };
-            let response = ctx
-                .model
-                .complete(request, &mut forwarder)
-                .await
-                .map_err(|e| {
+            let model_result = ctx.model.complete(request, &mut forwarder).await;
+            let response = match model_result {
+                Ok(response) => response,
+                Err(e) => {
                     // 返回错误前发出 RunFailed（终止事件不变量）
-                    let _ = ctx.events.emit(AgentEvent::RunFailed {
-                        error: e.to_string(),
-                    });
-                    LoopError::Model(e)
-                })?;
+                    // （同步闭包内无法 await，故把 emit 提到闭包外）
+                    let _ = emit(
+                        ctx.events,
+                        AgentEvent::RunFailed {
+                            error: e.to_string(),
+                        },
+                    )
+                    .await;
+                    return Err(LoopError::Model(e));
+                }
+            };
 
             // Step 7：追加 assistant 消息（调用中取消 -> 仍要追加）
             let assistant_message = response.message.clone();
@@ -180,13 +201,16 @@ impl AgentLoop for BasicLoop {
                 } else {
                     Some(assistant_message)
                 };
-                ctx.events
-                    .emit(AgentEvent::RunFinished {
+                emit(
+                    ctx.events,
+                    AgentEvent::RunFinished {
                         stop_reason: StopReason::Completed,
                         usage: total_usage.clone(),
                         rounds,
-                    })
-                    .map_err(LoopError::Event)?;
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 return Ok(RunResult {
                     stop_reason: StopReason::Completed,
                     usage: total_usage,
@@ -217,15 +241,18 @@ impl AgentLoop for BasicLoop {
                 }
 
                 // 发出 ToolCall 事件
-                ctx.events
-                    .emit(AgentEvent::ToolCall {
+                emit(
+                    ctx.events,
+                    AgentEvent::ToolCall {
                         call: ys_core::ToolCall {
                             id: tool_call_id.clone(),
                             name: tool_name.clone(),
                             arguments: tool_args.clone(),
                         },
-                    })
-                    .map_err(LoopError::Event)?;
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
 
                 // 在 registry 中查找并带超时执行（T11b）与错误恢复（T11c）
                 let result = match ctx.registry.get(tool_name) {
@@ -291,12 +318,15 @@ impl AgentLoop for BasicLoop {
                 }
 
                 // 发出 ToolResult 事件
-                ctx.events
-                    .emit(AgentEvent::ToolResult {
+                emit(
+                    ctx.events,
+                    AgentEvent::ToolResult {
                         id: tool_call_id.clone(),
                         result: result.clone(),
-                    })
-                    .map_err(LoopError::Event)?;
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
 
                 // 准备待追加的 content block
                 tool_results_for_message.push(ContentBlock::ToolResult {

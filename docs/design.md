@@ -183,7 +183,7 @@ pub trait EventSink: Send {
 
 首批 Session 实现为 `MemorySession`、`JsonlSessionStore` 和可选的 `SqliteSessionStore`。默认 EventSink 为 `NoopEventSink`。
 
-`EventSink` 是同步推式出口：emit 失败即终止 run，慢 sink 以背压反作用于上游；每个 run 恰好一个终局事件（RunFinished / RunFailed），异步 sink 由 channel 适配器实现（ADR-0004）。
+`EventSink` 是异步推式出口：emit 失败即终止 run，信道满时等待以背压反作用于上游；每个 run 恰好一个终局事件（RunFinished / RunFailed），信道为有界、容量可配，传递 `Envelope { source, turn, event }`（ADR-0009 修订 ADR-0004 的同步定义）。
 
 ## 5. Agent Loop
 
@@ -461,6 +461,8 @@ yushan-coding-agent --rpc           RPC 集成模式
 
 第一版必须支持交互式 CLI、Print 模式和 JSON 事件模式；TUI、RPC、会话分支和上下文压缩可以后续增加。
 
+**会话归属（ADR-0010）**：会话由接线器持有，不由 Agent 持有。`/new` 是**换一条会话日志**（agent 不知情）；队列即该日志「处理到哪了」游标之后的视图。详见 `docs/arch/gap-closure/context.md`。
+
 ### Coding Agent 组装
 
 ```rust
@@ -472,10 +474,12 @@ let agent = AgentBuilder::new()
     .tool(BashTool::new(workspace.clone()))
     .hook(ProjectContextHook::new(context_provider))
     .hook(CodingPromptHook::new(prompt_renderer))
-    .session(session)
-    .events(events)
+    .session(session)      // 会话实例；agent 不持有其所有权语义，见 ADR-0010
+    .events(events)        // 事件出口；异步推式，见 ADR-0009
     .build();
 ```
+
+**事件出口（ADR-0009）**：`EventSink::emit` 为异步；信道有界、容量可配，传递 `Envelope { source, turn, event }`。消费者可为 `-p` / `--json` / TUI / 回放。
 
 ## 11. 实现路线
 

@@ -1,12 +1,26 @@
 use std::path::PathBuf;
 
+use ys_channel::Inbox;
 use ys_component::{RunLimits, RuntimeContext};
-use ys_core::{CancelToken, Message};
+use ys_core::{CancelToken, Message, StopReason, Usage};
 use ys_event::EventSink;
 use ys_loop::{AgentInput, AgentLoop, LoopError, RunResult};
 use ys_model::Model;
 use ys_session::Session;
 use ys_tool::{ApprovalHandler, ToolRegistry};
+
+/// 自转驱动的返回值。
+///
+/// 一次 `run()` 可能跑多个回合（followUp 排队时），故用汇总而非单个 `RunResult`。
+#[derive(Debug, Default, Clone)]
+pub struct RunSummary {
+    /// 本次自转实际执行的回合数。
+    pub turns: u32,
+    /// 所有回合的 usage 累计。
+    pub usage: Usage,
+    /// 最后一个回合的停止原因；一个回合都没跑时为 `None`。
+    pub last_stop: Option<StopReason>,
+}
 
 pub struct Agent {
     loop_impl: Box<dyn AgentLoop>,
@@ -58,7 +72,64 @@ impl Agent {
     }
 
     /// 运行单个 turn。取 &mut self 以保证同时只运行一次。
+    ///
+    /// **兼容入口**：既有测试与 `-p`/TUI 调用点都用它。内部委托
+    /// [`run_one_turn`](Self::run_one_turn)，语义与历史实现逐字节一致
+    /// （不挂载 inbox，无轮边界 steering）。
     pub async fn run_turn(&mut self, input: AgentInput) -> Result<RunResult, LoopError> {
+        self.run_one_turn(input, None).await
+    }
+
+    /// 自转：从 inbox 取消息 → 跑回合 → 投事件，直到 inbox 空闲。
+    ///
+    /// - **不收 policy**——生命周期策略只由 sink 持有（它才知道消费者是否消失）。
+    ///   遇 `emit` 报错即终止，沿用既有语义（见下「消费者消失」）。
+    /// - 每个回合开始调 [`EventSink::begin_turn`]，使 `Envelope` 的 turn 正确
+    ///   （不从 `UserMessage` 推导——轮边界 steering 注入也发 `UserMessage`，
+    ///   推导会误增 turn）。
+    /// - followUp 在**回合**边界拉（steering 在**轮**边界，已由 `BasicLoop` 处理）。
+    /// - inbox 空即返回，agent 不休眠（ADR-0011 点 6）；接线器按需重驱动。
+    ///
+    /// **消费者消失的语义取舍**：设计文档曾写「消费者消失 → 正常收场（非故障）」，
+    /// 但既有 ADR-0004 的语义是「emit 失败即终止当前 run（`Err`）」——`ChannelSink`
+    /// 在 `StopWhenConsumerGone` 下让 `try_emit` / `emit` 返回 `Err`，经自由函数
+    /// `emit` 传播为 `LoopError::Event(SendFailed)`，`run` 随之以 `Err` 返回。
+    /// 本轮保持既有语义（Err），不引入新的 `StopReason`；「正常收场」的措辞
+    /// 需与设计文档对齐。
+    ///
+    /// **`/new` 契约**（本轮不做命令层，留迁移步 5）：接线器换上新 `Session` +
+    /// 新空 `Inbox`，agent 全程不知情。
+    pub async fn run(&mut self, inbox: &Inbox) -> Result<RunSummary, LoopError> {
+        let mut summary = RunSummary::default();
+        loop {
+            let batch = inbox.take_followup();
+            if batch.is_empty() {
+                return Ok(summary); // inbox 空 → 收摊
+            }
+            for message in batch {
+                summary.turns += 1;
+                self.events.begin_turn(summary.turns);
+                let result = self
+                    .run_one_turn(AgentInput::new(message), Some(inbox))
+                    .await?;
+                summary.usage = summary.usage + result.usage;
+                summary.last_stop = Some(result.stop_reason);
+            }
+        }
+    }
+
+    /// 内部原语：跑一个回合（原 `run_turn` 的实现）。
+    ///
+    /// `inbox` 为 `Some` 时挂到 `RuntimeContext` 上，使 `BasicLoop` 在轮边界
+    /// 能拉取 steering；为 `None` 时行为与历史实现逐字节一致。
+    ///
+    /// 取 `Option<&Inbox>` 参数（而非让 `Agent` 持有跨 await 的引用）——避免
+    /// 在 `Agent` 上存借用的队列句柄。
+    async fn run_one_turn(
+        &mut self,
+        input: AgentInput,
+        inbox: Option<&Inbox>,
+    ) -> Result<RunResult, LoopError> {
         let model = self.model.as_deref().ok_or_else(|| {
             LoopError::ConfigError(
                 "No model configured. Use /login to configure an API provider.".into(),
@@ -76,6 +147,9 @@ impl Agent {
             self.approval.as_deref(),
             self.system_prompt.clone(),
         );
+        if let Some(inbox) = inbox {
+            ctx = ctx.with_inbox(inbox);
+        }
         self.loop_impl.run_turn(input, &mut ctx).await
     }
 

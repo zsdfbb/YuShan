@@ -41,7 +41,7 @@
    好处：`ys-event` 保持纯事件定义不受污染；`--json` 的**信封格式现在就能定死**，将来加多 agent 只换 `source` 的值，不构成破坏性变更。
 3. **信道是有界的，容量可配**（不是无界）。理由：防 DoS（内存被撑爆）。默认值给宽裕配置，具体数值在设计阶段定。
 4. **`emit` 改为异步**（推翻 ADR-0004 点 3）——见下节「推翻既有决策」。信道满了，agent **等待**，不丢弃、不崩溃。这正是 ADR-0004 想要的背压语义，只是实现路径变了。
-5. **消费者消失 → agent 收摊**：等待中发现接收端已关闭（信道报错），agent **结束本轮、正常收场**（与「用户取消」同类，非故障）。无需额外检测机制——信道自己会报错。
+5. **消费者消失 → agent 收摊**：等待中发现接收端已关闭（信道报错），agent **结束本轮并以 `Err(LoopError::Event(SendFailed))` 返回**。这是**策略预期内的终止**（非内部故障）——由接线器按正常关机处理。注意这与「用户取消」的**返回类型不同**：取消路径是 `Ok(RunResult { stop_reason: Cancelled })`，本路径是 `Err`。无需额外检测机制——信道自己会报错。
 6. **异步形态**：沿用现有 `tokio::select!` 结构（`ui/mod.rs:344-366`），turn future 与事件收取在同一任务内交错，不 `spawn`（`run_turn` 需要 `&mut Agent`，不能搬到后台线程）。
 
 ### 推翻既有决策：`EventSink::emit` 从同步改为异步
@@ -111,7 +111,8 @@
 
 ```rust
 enum LifecyclePolicy {
-    /// 消费者消失 → 干完当前轮就收摊（交互式默认）
+    /// 消费者消失 → 干完当前轮就收摊，以 `Err(LoopError::Event(SendFailed))` 终止当前 run
+    /// （交互式默认；其返回类型不同于「用户取消」的 `Ok(RunResult { stop_reason: Cancelled })`）
     StopWhenConsumerGone,
     /// 消费者消失 → 继续跑（后台长任务）
     ContinueWithoutConsumer,

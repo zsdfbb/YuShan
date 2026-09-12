@@ -227,8 +227,8 @@ mod tests {
     use agent_core::CancelToken;
 
     use super::handle_key;
-    use crate::view::AppView;
     use crate::ui::app::App;
+    use crate::view::AppView;
 
     /// 构造一个测试 App：view 是 placeholder，cancel_token 已挂。
     fn make_test_app() -> App {
@@ -266,7 +266,10 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle_key(key, &mut app).unwrap();
 
-        assert!(token.is_cancelled(), "Esc during turn should trigger cancel");
+        assert!(
+            token.is_cancelled(),
+            "Esc during turn should trigger cancel"
+        );
     }
 
     /// Esc 在 idle 时应清空 input（保留旧行为），不触发 cancel。

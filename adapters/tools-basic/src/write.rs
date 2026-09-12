@@ -71,11 +71,17 @@ mod tests {
     }
 
     fn test_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("agent_tools_basic_write_test_{id}"))
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agent_tools_basic_write_test_{id}_{}_{seq}",
+            std::process::id()
+        ))
     }
 
     #[tokio::test]

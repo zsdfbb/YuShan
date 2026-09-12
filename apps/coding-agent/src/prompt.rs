@@ -169,6 +169,43 @@ pub fn format_cwd_tilde(cwd: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// 串行化会改写进程级 HOME 的测试（避免并行交错）。
+    /// 这些测试共享进程全局状态，Rust 测试默认并行执行，必须互斥。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 记录进入测试前的 HOME / USERPROFILE，Drop 时恢复原值。
+    /// 用 Drop 而非测试末尾手动恢复：断言 panic 时也能恢复，
+    /// 避免污染同二进制内其他读 HOME 的测试。
+    struct EnvRestore {
+        home: Option<std::ffi::OsString>,
+        userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture() -> Self {
+            EnvRestore {
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: 调用方持有 ENV_LOCK，独占进程环境变量的修改与恢复。
+            unsafe {
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_default_prompt_contains_tools() {
         let prompt = build_system_prompt(Path::new("/tmp"));
@@ -194,6 +231,8 @@ mod tests {
 
     #[test]
     fn test_format_cwd_tilde_inside_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::capture();
         unsafe {
             std::env::set_var("HOME", "/test/home");
             std::env::remove_var("USERPROFILE");
@@ -204,6 +243,8 @@ mod tests {
 
     #[test]
     fn test_format_cwd_tilde_at_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::capture();
         unsafe {
             std::env::set_var("HOME", "/test/home");
             std::env::remove_var("USERPROFILE");
@@ -214,6 +255,8 @@ mod tests {
 
     #[test]
     fn test_format_cwd_tilde_outside_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::capture();
         unsafe {
             std::env::set_var("HOME", "/test/home");
             std::env::remove_var("USERPROFILE");
@@ -224,6 +267,8 @@ mod tests {
 
     #[test]
     fn test_format_cwd_tilde_no_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvRestore::capture();
         unsafe {
             std::env::remove_var("HOME");
             std::env::remove_var("USERPROFILE");

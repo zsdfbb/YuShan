@@ -188,6 +188,8 @@ pi 的三层（`agent._state.messages` 工作上下文 / `steeringQueue`+`follow
 
 **同时必须守住边界**：待处理消息与已落盘历史若混成一个对象、不复用游标概念，持久化边界就会模糊。上面的准确表述避免了这一点。
 
+**实现落法（据 `design-core-channel.md` §3 + `review.md` R3）**：不必真的做成"单一缓冲 + 游标"——`Inbox`（只装 pending）**加** `Session`（历史）**合起来**就是那条日志，"消费" = 把 pending **转移**进 Session（即游标前移）。**是转移，不是拷贝**，故无重复持有。单一缓冲写法会要求 `Session` 暴露"已处理前缀"，改动 ADR-0003 的 `messages()` 契约，收益仅为记法统一——不做。
+
 ### 第二个产品形态：投资调研 Agent（设计不拦，本轮不做）
 
 `docs/arch/etf-display-tool/context.md` 已记录该场景。**它是第二个产品，不是 coding agent 的一个模式**：

@@ -387,7 +387,78 @@ UI 若用「发一个 GetView 请求 → 等响应」拿状态，**app 线程在
 
 ---
 
-## 未澄清问题
+## rustyline 行为核实（源码级，已定）
+
+**结论：`readline()` 返回时 raw mode 已被恢复为进入前的原状。** 方案的地基成立，**无需原型验证**。
+
+**方法**：下载 `rustyline-14.0.0` 源码（历史实现用的版本）逐行核对。
+
+### 证据
+
+`src/lib.rs:664-677` 的 `readline_with`：
+
+```rust
+} else if self.term.is_input_tty() {
+    let (original_mode, term_key_map) = self.term.enable_raw_mode()?;
+    let guard = Guard(&original_mode);          // ← RAII
+    let user_input = self.readline_edit(...);
+    ...
+    drop(guard);                                // ← 显式 drop
+    self.term.writeln()?;                        // ← 收尾换行已在 cooked mode
+    user_input
+}
+```
+
+`src/lib.rs:446-454` 的 `Guard`（**且标了 `#[must_use]`**）：
+
+```rust
+#[must_use = "You must restore default mode (disable_raw_mode)"]
+struct Guard<'m>(&'m tty::Mode);
+impl Drop for Guard<'_> {
+    fn drop(&mut self) { mode.disable_raw_mode(); }
+}
+```
+
+`src/tty/unix.rs:122-130` 的 `disable_raw_mode` —— **写回的是进入时保存的原始 termios**，不是盲目 disable：
+
+```rust
+fn disable_raw_mode(&self) -> Result<()> {
+    termios_::disable_raw_mode(self.tty_in, &self.termios)?;   // &self.termios = 原始值
+    if let Some(out) = self.tty_out { write_all(out, BRACKETED_PASTE_OFF)?; }
+    self.raw_mode.store(false, Ordering::SeqCst);
+}
+```
+（`enable_raw_mode`（:1376）先 `tcgetattr` 存原值；`disable`（:1532）用 `tcsetattr(original)` 写回。）
+
+### 四个疑虑逐一落地
+
+| 疑虑 | 结论 |
+|---|---|
+| 所有退出路径都恢复吗？ | ✅ **RAII** —— 正常返回 / `Err(Interrupted)`（Ctrl-C）/ `Err(Eof)`（Ctrl-D）/ unwind 都恢复 |
+| 恢复成"原状"还是简单关掉？ | ✅ **写回原始 termios** |
+| bracketed paste 会残留吗？ | ✅ disable 时一并发 `BRACKETED_PASTE_OFF` |
+| stdin 不是 tty 时？ | ✅ **根本不进 raw mode**，走 `readline_direct`（`is_input_tty()` 分支） |
+
+**关键细节**：`drop(guard)` 在函数体内、`self.term.writeln()` 在它**之后** —— 连收尾换行都在 cooked mode 下写。
+
+### 顺带答掉：`inquire` 与 rustyline 的 raw mode 交替
+
+**两者各自 RAII 恢复原状**，交替安全：rustyline 退出 → cooked；inquire 进入 raw、退出 → cooked；rustyline 再进。
+（`Cmd::Suspend` 那条印证同一模式：`disable_raw_mode` → `suspend` → `enable_raw_mode`。）
+
+### 待验清单（已收窄）
+
+**源码答不了的**只剩三条，且都是**我们的集成细节**，不是库行为：
+
+| # | 待验 | 为什么源码答不了 |
+|---|---|---|
+| 1 | `select!(agent.run(ports,&inbox), tokio::signal::ctrl_c())` 能否真打断 turn | 是**我们的**集成，非库职责 |
+| 2 | `PushKeyboardEnhancementFlags` 在**目标终端**的实际支持 | 取决于终端，不取决于库 |
+| 3 | spinner 的 `\r` 刷新在真终端的观感 | 观感，非正确性 |
+
+**注意**：rustyline **当前不在依赖树**（c 阶段删除），版本需重新选（历史用 14.0.0，核对即基于该版本）。
+
+
 
 ### 本轮已定
 
@@ -412,15 +483,15 @@ UI 若用「发一个 GetView 请求 → 等响应」拿状态，**app 线程在
 - [ ] **快照的更新策略**：全量推 vs 增量折叠（pi-mini 用复制状态折叠）
 - [ ] **出站多消费者**（现在不需要，但要知道边界）
 - [ ] **`format.rs` 归属**（只被 `ui/draw.rs` 用；REPL 需要另写 `print_*`）
-- [ ] **原型归属与判据**（Q5，见下文）
-- [ ] **`^C` 在 `readline`/`turn` 两段的边界**
-- [ ] **`inquire` 与 rustyline 的 raw mode 交替**
-- [ ] **键盘协议异常清理**（RAII guard / panic hook）
+- [x] ~~**原型归属与判据**~~ → **已收窄为三条集成细节**，见上「待验清单」
+- [ ] **`^C` 在 `readline`/`turn` 两段的边界**（rustyline 侧已确认：Ctrl-C → `Err(Interrupted)`；turn 侧待验）
+- [x] ~~**`inquire` 与 rustyline 的 raw mode 交替**~~ → **已由源码答掉**（两者各自 RAII 恢复）
+- [ ] **键盘协议异常清理**（RAII guard / panic hook）—— 注意 rustyline 自己的 `Guard` 是 RAII 的，我们的 `PushKeyboardEnhancementFlags` 应对齐同一模式
 - [ ] **文档回改**：`architecture.md` 的「四路 select!」与 `gap-closure/context.md` 的「TUI 本轮不改」**均已被推翻**
 
 ## 后续建议
 
-1. **先用 `prototype` 验证三件事**（尤其「readline 返回后是否恢复 cooked mode」——它是整个方案的地基；若不过，收益大打折扣）
+1. **原型已大幅收窄**：原以为要验「地基」（`readline` 返回后是否恢复 cooked mode）——**已由源码证实成立**。现在只剩三条**集成细节**（见上「待验清单」），且都不是正确性风险
 2. **再进 `arch-design`**，重点解「仍待决」里的四项结构性选择：协议 crate 名、`Inbox` 存废、`CancelToken` 去向、两 feature 的互斥规则
 3. **`borrow 文档` 的 9 处矛盾**（A–I）建议在进入设计前先修，尤其是 **I（`v1 补遗` 不存在）**——悬空引用比没有更糟
 4. **两个真 bug 可独立先修**（与架构无关）：中文退格 panic、补全 popup 从未渲染

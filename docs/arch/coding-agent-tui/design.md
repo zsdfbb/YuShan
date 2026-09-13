@@ -243,7 +243,113 @@ pub enum Outbound<V> {
 
 ---
 
-## 7. 作为独立 crate 的形态（**定稿：路线 B**）
+## 7. 接线器 app 侧循环（解 review R4）
+
+```
+┌─ UI 线程 ─────────────────────────────────────────────────────┐
+│  ui::run(view₀, rx_out, tx_req, tx_boundary)                  │
+│                                                                │
+│  loop {                                                        │
+│    terminal.draw(...)                                          │
+│    select! {                                                   │
+│      crossterm 事件   → 按键（输入 / Tab 补全 / Esc 取消 / 滚动）│
+│      rx_out.recv()    → 更新 transcript · view · 打印 Output    │
+│      ticker (300ms)   → Working 动画                           │
+│    }                                                           │
+│    提交输入 → tx_req.send(Request::Prompt(msg))                 │
+│    中途插话 → tx_boundary.send(Boundary::Steer(msg))            │
+│  }                                                             │
+└──────────────┬─────────────────────────────────▲───────────────┘
+      tx_req / tx_boundary              rx_out（Outbound<V>）
+               │                                  │
+               ▼                                  │
+┌─ app / agent 线程 ─────────────────────────────┴──────────────┐
+│  loop {                        // ① 回合之间                   │
+│    let req = request_rx.recv().await?;                         │
+│    match req {                                                 │
+│      Prompt(msg) => {                                          │
+│        // ② 回合之内：turn 与事件转发交错                       │
+│        let res = {                 // ← 块：让 ports 的借用     │
+│          let mut turn = Box::pin(  //    在块尾结束            │
+│            agent.run_turn(input, wiring.ports(boundary_rx)));  │
+│          loop { select! {                                      │
+│            r   = &mut turn        => break r,                  │
+│            env = event_rx.recv()  => out.send(Event(env)).await?,│
+│          }}                                                    │
+│        };                                                      │
+│        stats.record(&res.usage);                               │
+│        out.send(View(build_view())).await?;                    │
+│      }                                                         │
+│      SetModel{m} => { wiring.set_model(...); emit_view() }     │
+│      Login{..}   => { ...;                   emit_view() }     │
+│      NewSession  => { wiring.new_session();  emit_view() }     │
+│      Compact     => { compact(&mut wiring);  emit_view() }     │
+│      Export{p}   => { export(&wiring); out.send(Output(..)) }  │
+│      Quit        => { out.send(Quit).await?; return Ok(()) }   │
+│    }                                                           │
+│  }                                                             │
+│                                                                │
+│  轮边界（`BasicLoop` 内）：`boundary_rx.try_recv()`             │
+│    · Steer(msg) → 注入本轮                                     │
+│    · Abort      → 置取消标志，回合以 `Cancelled` 收场           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 它不是"从零重写"
+
+**现有结构已经是这个两层形状**（`ui/mod.rs`）：
+
+| 现有 | 新 |
+|---|---|
+| `event_loop`（外层，收 crossterm 事件） | **UI 线程**的循环（收 crossterm + `Outbound` + ticker） |
+| `dispatch_input` → slash 分发 或 起回合 | **app 线程**的循环（收 `Request`） |
+| `run_turn_with_ticks`（内层 `select!`：turn + 键鼠 + ticker） | **app 线程**的内层 `select!`：turn + 事件转发 |
+
+**主要变化**：
+
+1. **键鼠分支移出**内层 select（按键归 UI 线程；app 线程不需要键盘）
+2. **ticker 留在 UI 线程**（它驱动重绘；app 线程不画屏）
+3. **外层从"收 crossterm"变成"收 `Request`"**
+4. **事件不再由 UI 直接读**，改由 app 转发（见下）
+
+### 两个设计要点
+
+**① 为什么内层 `select!` 要包在一个块里**
+
+`wiring.ports()` 返回的 `AgentPorts` **可变借用 `wiring`**，且被 `turn` future 持有整个回合。
+若把它写在 `match` 臂里跨到外层循环，**外层就无法再碰 `wiring`**（`SetModel`/`NewSession` 都碰它）。
+用 `{ … }` 包成块，借用随块结束 —— 这是 Block B 那次 `future 跨 await 持 &mut Wiring` 的同类解法。
+
+**② 为什么事件要经 app 转发（而不是 UI 直读事件信道）**
+
+**单一出站写者**：`Outbound<V>` 是 UI 唯一的输入流。若 UI 同时直读事件信道，**事件与 `Output` 的先后就无法保证**（两条信道各排各的）。
+
+```
+agent ──emit──► ChannelSink ──mpsc──► app 循环 ──Outbound::Event──► UI
+                                        ▲
+              app 自己发的 Output/View ──┘
+```
+
+代价是每事件多一跳（`ChannelSink` 的信道 → app → `Outbound`）。按既有估算，信道开销 ~0.02% CPU，**可忽略**；换来的是**单一写者 + 确定的顺序**。
+
+**顺带**：`ChannelSink` **不用改**（它继续写 `Envelope` 到自己的信道），只多一个转发循环。
+
+### 初始化顺序（含 review R7 的阻塞提前返回）
+
+```
+1. 建三条信道
+2. 建 ChannelSink（此时 policy 已定）
+3. 【阻塞】Wiring / model 构造   ← 可能失败并提前返回
+4. 建 Agent（挂 sink）           ← begin_turn 在此之前不会发生
+5. 构造 view₀
+6. spawn app 线程（循环） + 当前线程跑 ui::run
+```
+
+**R7**：若第 3 步失败早退，`turn` 恒 0 也无所谓（根本没有事件发出）。**顺序保证 `begin_turn` 只在 agent 真正跑 turn 时发生。**
+
+---
+
+## 8. 作为独立 crate 的形态（**定稿：路线 B**）
 
 **路线 B** = 拆 crate + 分线程 + 信道 + `ys-protocol`。
 
@@ -303,7 +409,7 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 
 ---
 
-## 8. 决策汇总与未决
+## 9. 决策汇总与未决
 
 ### 结构（路线 B）
 
@@ -341,6 +447,6 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 ### 未决（只剩三条）
 
 - [ ] **`CodingView` 的字段清单**（含 `ToolCallId → ToolCall` 映射，供工具结果回填）—— 可在写 exec-plan 时一次给出
-- [ ] **接线器 app 侧循环的形状**（review R4）—— 它是现有 `select!` 的**重写**：何时 `recv` ①（空闲才收）、如何驱动 `turn_fut`、如何把事件转成 `Outbound`、`CommandError` 怎么回给 UI。**这是设计还差的一块**
+- [x] ~~**接线器 app 侧循环的形状**~~ → **已解**（§7）。**它不是从零重写**：现有 `event_loop` / `dispatch_input` / `run_turn_with_ticks` 已经是同一两层结构，主要变化是"键鼠归 UI、事件经 app 转发"
 - [ ] **两个真 bug 与重构的先后** —— 可独立先修（半小时量级），但会落在**将被重写**的 `ui/` 上；倾向「随手在重构里修掉」
 

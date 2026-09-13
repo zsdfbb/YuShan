@@ -342,18 +342,25 @@ mod tests {
         let ds = reg.compat_for("deepseek");
         assert!(ds.has_reasoning_content);
         assert!(!ds.tool_calls_as_text);
+        assert!(ds.supports_stream_usage);
 
         let mm = reg.compat_for("minimax");
         assert!(!mm.has_reasoning_content);
         assert!(mm.tool_calls_as_text);
+        assert!(!mm.supports_stream_usage);
 
         let custom = reg.compat_for("custom");
         assert!(!custom.has_reasoning_content);
         assert!(!custom.tool_calls_as_text);
+        // standard() 默认开启流式 usage：env-var 配置落到 custom，
+        // 若默认关闭则 token 统计恒为 0（回归点）。
+        assert!(custom.supports_stream_usage);
 
+        // 未知 provider 同样回退到 standard() → 默认开启。
         let unknown = reg.compat_for("nonexistent");
         assert!(!unknown.has_reasoning_content);
         assert!(!unknown.tool_calls_as_text);
+        assert!(unknown.supports_stream_usage);
     }
 
     #[test]

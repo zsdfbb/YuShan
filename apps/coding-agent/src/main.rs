@@ -8,6 +8,7 @@ mod provider;
 mod state;
 mod status;
 mod view;
+mod wiring;
 
 /// 测试专用：进程级 env 互斥与恢复，供各模块测试复用。
 #[cfg(test)]
@@ -21,16 +22,16 @@ use std::path::PathBuf;
 
 use tokio::sync::mpsc;
 
-use ys_channel::{Envelope, Inbox, Intent, LifecyclePolicy};
-use ys_event::{AgentEvent, EventSink};
+use ys_channel::{Envelope, Intent, LifecyclePolicy};
+use ys_event::AgentEvent;
 use ys_loop::AgentInput;
 use ys_model::Model;
 use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
 use ys_runtime::{Agent, AgentBuilder, BuildError};
-use ys_session::MemorySession;
 use ys_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
 
-use channel::ChannelSink;
+use channel::{ChannelSink, ChannelStatsHandle};
+use wiring::Wiring;
 
 /// 运行模式。
 #[derive(Debug, PartialEq, Eq)]
@@ -47,51 +48,69 @@ enum Mode {
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     mode: Mode,
+    /// `--stats`：显式要求把背压读数摘要写到 stderr（无论有无背压）。
+    stats: bool,
+}
+
+/// 摘掉紧随模式 flag 之后、任务文本之前的可选 `--stats`。
+///
+/// 只认**紧邻**位置（`-p --stats "任务"`）：任务文本一旦开始，`--stats`
+/// 就是文本的一部分（`-p "任务" --stats` → 文本 `"任务 --stats"`），
+/// 从而保住「任务文本逐字保留」的既有语义。
+fn split_stats_flag(rest: &[String]) -> (bool, &[String]) {
+    match rest.first().map(String::as_str) {
+        Some("--stats") => (true, &rest[1..]),
+        _ => (false, rest),
+    }
 }
 
 /// 解析 argv（不含 argv[0]）。
 ///
-/// **只在首个参数位置判定 flag**：任务文本本身可能以 `-` 开头，
+/// **只在首个参数位置判定模式 flag**：任务文本本身可能以 `-` 开头，
 /// 例如 `-p --help me` 的任务文本就是 `--help me`。
+/// 唯一的例外是 `--stats`——见 [`split_stats_flag`]。
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let Some(first) = argv.first().map(String::as_str) else {
         return Ok(Args {
             mode: Mode::Interactive,
+            stats: false,
         });
     };
 
-    // `-p` / `--json` 之后全部参数 join 成任务文本（保持与旧实现一致）。
-    let task = || argv[1..].join(" ");
-
     match first {
         "-p" => {
-            let task = task();
+            let (stats, rest) = split_stats_flag(&argv[1..]);
+            let task = rest.join(" ");
             if task.is_empty() {
                 Err("-p 需要一个任务参数，例如：ys-coding-agent -p \"修复这个 bug\"".into())
             } else {
                 Ok(Args {
                     mode: Mode::Print(task),
+                    stats,
                 })
             }
         }
         "--json" => {
-            let task = task();
+            let (stats, rest) = split_stats_flag(&argv[1..]);
+            let task = rest.join(" ");
             if task.is_empty() {
                 Err("--json 需要一个任务参数，例如：ys-coding-agent --json \"修复这个 bug\"".into())
             } else {
                 Ok(Args {
                     mode: Mode::Json(task),
+                    stats,
                 })
             }
         }
         // 未知 flag：仅当它出现在**首个**位置时才算 flag（其余位置属任务文本）。
         // 单独的 `-` 视为普通参数（约定：读 stdin 的占位，本轮不支持）。
-        f if f.starts_with('-') && f != "-" => {
-            Err(format!("未知参数：{f}（可用：-p <任务> | --json <任务>）"))
-        }
+        f if f.starts_with('-') && f != "-" => Err(format!(
+            "未知参数：{f}（可用：-p [--stats] <任务> | --json [--stats] <任务>）"
+        )),
         // 无 flag：交互式（与旧实现一致）。
         _ => Ok(Args {
             mode: Mode::Interactive,
+            stats: false,
         }),
     }
 }
@@ -183,15 +202,13 @@ where
     w.flush()
 }
 
-/// 组装 agent。sink 由调用方按模式选定 —— 这是「先定模式 → 选消费者 → 建 agent」
-/// 的落点：agent 构建发生在模式判定之后。
-fn build_agent<M: Model + 'static>(
-    model: Option<M>,
-    system_prompt: String,
-    workspace: PathBuf,
-    events: impl EventSink + 'static,
-) -> Result<Agent, BuildError> {
-    let mut builder = AgentBuilder::new()
+/// 组装 agent（无状态执行器）。
+///
+/// ADR-0010：会话、事件出口与模型不再进入 agent —— 它们归 [`Wiring`]，
+/// 运行时经端口传入。sink 由调用方按模式选定 —— 这是「先定模式 → 选消费者 →
+/// 建 agent」的落点。
+fn build_agent(system_prompt: String, workspace: PathBuf) -> Result<Agent, BuildError> {
+    AgentBuilder::new()
         .tool(ReadTool::new(workspace.clone()))
         .tool(WriteTool::new(workspace.clone()))
         .tool(EditTool::new(workspace.clone()))
@@ -199,19 +216,24 @@ fn build_agent<M: Model + 'static>(
         .system_prompt(system_prompt)
         .working_dir(workspace.clone(), workspace)
         .approval(ys_tool::AutoApprove)
-        .session(MemorySession::new())
-        .events(events);
+        .build()
+}
 
-    if let Some(model) = model {
-        builder = builder.model(model);
+/// 会话落盘目录：`$YUSHAN_SESSIONS_DIR` 覆盖，否则 `~/.yushan/sessions`。
+fn sessions_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("YUSHAN_SESSIONS_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
     }
-
-    builder.build()
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    home.map(|h| PathBuf::from(h).join(".yushan").join("sessions"))
+        .unwrap_or_else(|| PathBuf::from(".yushan/sessions"))
 }
 
 /// print / json 模式的前置检查：无 model 时给出可操作提示并退出。
-fn ensure_configured(agent: &Agent) -> Result<(), Box<dyn std::error::Error>> {
-    if agent.is_configured() {
+fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> {
+    if wiring.is_configured() {
         return Ok(());
     }
     eprintln!("Error: No model configured.");
@@ -242,25 +264,50 @@ async fn consume_print_events<W: Write>(rx: mpsc::Receiver<Envelope>, w: W) -> i
     Ok(printed_any)
 }
 
+/// 把背压读数摘要写到 **stderr**（固定不污染 stdout 的 JSON / 文本流）。
+///
+/// 仅在「有事发生」（有背压 / 有积压 / 消费者消失）或 `--stats` 显式要求时
+/// 输出一行；否则保持 stderr 干净，正常运行时零噪音。
+fn report_channel_stats(handle: &ChannelStatsHandle, force: bool) {
+    let snapshot = handle.snapshot();
+    let line = if force {
+        Some(channel::format_stats_forced(&snapshot))
+    } else {
+        channel::format_stats(&snapshot)
+    };
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+}
+
 /// `-p` 模式：并发消费事件流，把文本增量实时写到 stdout。
 ///
 /// 收尾补一个换行，与旧实现（`println!` final_message）的输出保持一致。
+/// turn 结束、消费排空后，把背压读数写到 stderr（见 [`report_channel_stats`]）。
 async fn run_print_mode(
     agent: &mut Agent,
+    wiring: &mut Wiring,
     rx: mpsc::Receiver<Envelope>,
     task: String,
+    stats: &ChannelStatsHandle,
+    force_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ensure_configured(agent)?;
+    ensure_configured(wiring)?;
 
     // 走自转接口 `Agent::run`（而非 `run_turn`）：它每回合调 `begin_turn(n)`，
     // 使 `Envelope.turn` 从 1 起递增。一次用户输入 = 一个 followUp 回合。
-    let inbox = Inbox::new();
+    // Inbox 为克隆句柄（内为 Arc），与 wiring 持有的是同一底层队列。
+    let inbox = wiring.inbox();
     inbox.push(AgentInput::text(task.as_str()).message, Intent::FollowUp);
 
     // 消费与 run 必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
-    let (run_result, consume_result) =
-        tokio::join!(agent.run(&inbox), consume_print_events(rx, io::stdout()),);
+    let (run_result, consume_result) = tokio::join!(
+        agent.run(wiring.ports(), &inbox),
+        consume_print_events(rx, io::stdout()),
+    );
 
+    // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
+    report_channel_stats(stats, force_stats);
     run_result?;
     let printed_any = consume_result?;
 
@@ -271,22 +318,28 @@ async fn run_print_mode(
 }
 
 /// `--json` 模式：并发消费事件流，逐行输出 `Envelope` 的 JSON。
+///
+/// 背压读数走 stderr（[`report_channel_stats`]），不混入 stdout 的 JSON 流。
 async fn run_json_mode(
     agent: &mut Agent,
+    wiring: &mut Wiring,
     rx: mpsc::Receiver<Envelope>,
     task: String,
+    stats: &ChannelStatsHandle,
+    force_stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ensure_configured(agent)?;
+    ensure_configured(wiring)?;
 
     // 同 `-p`：走 `Agent::run` 以获得逐回合的 `turn`（从 1 起递增）。
-    let inbox = Inbox::new();
+    let inbox = wiring.inbox();
     inbox.push(AgentInput::text(task.as_str()).message, Intent::FollowUp);
 
     let (run_result, consume_result) = tokio::join!(
-        agent.run(&inbox),
+        agent.run(wiring.ports(), &inbox),
         consume_events(rx, io::stdout(), write_json_envelope),
     );
 
+    report_channel_stats(stats, force_stats);
     run_result?;
     consume_result?;
     Ok(())
@@ -387,34 +440,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 为工具构建 workspace
     let workspace = config.cwd.clone();
 
+    // model 装箱为 trait object，供接线器持有（ADR-0010：模型归接线器）。
+    let model: Option<Box<dyn Model>> = model.map(|m| Box::new(m) as Box<dyn Model>);
+
     // 「先定模式 → 选消费者 → 建 agent」：三种模式共用有界信道 `ChannelSink`。
     // TUI 也转为信道消费（块 C）——它必须在 turn 的 select! 里并发收事件，
     // 否则有界信道撞满即阻塞 agent（死锁）。
-    match args.mode {
+    let Args {
+        mode,
+        stats: with_stats,
+    } = args;
+    match mode {
         Mode::Print(task) => {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
-            let mut agent = build_agent(model, system_prompt, workspace, sink)?;
-            run_print_mode(&mut agent, rx, task).await?;
+            // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
+            let stats_handle = sink.stats_handle();
+            let mut agent = build_agent(system_prompt, workspace)?;
+            // `-p` 是一次性会话：MemorySession，不落盘、不恢复（行为与改动前一致）。
+            let mut wiring = Wiring::ephemeral(model, Box::new(sink));
+            run_print_mode(&mut agent, &mut wiring, rx, task, &stats_handle, with_stats).await?;
         }
         Mode::Json(task) => {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
-            let mut agent = build_agent(model, system_prompt, workspace, sink)?;
-            run_json_mode(&mut agent, rx, task).await?;
+            let stats_handle = sink.stats_handle();
+            let mut agent = build_agent(system_prompt, workspace)?;
+            let mut wiring = Wiring::ephemeral(model, Box::new(sink));
+            run_json_mode(&mut agent, &mut wiring, rx, task, &stats_handle, with_stats).await?;
         }
         Mode::Interactive => {
             // 交互模式——仅 ratatui（tui-stdout 路径已在 c 阶段删除）。
             // 事件出口为有界信道；接收端交给 ui::run，在 turn 期间增量消费。
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
-            let mut agent = build_agent(model, system_prompt, workspace, sink)?;
+            let mut agent = build_agent(system_prompt, workspace)?;
+            // 交互式会话持久化到 `~/.yushan/sessions/{id}.jsonl`，启动恢复最近一个。
+            let mut wiring = Wiring::persistent(model, Box::new(sink), sessions_dir()).await?;
             let mut stats = status::TurnStats::default();
 
             #[cfg(feature = "tui-ratatui")]
             {
                 ui::run(
                     &mut agent,
+                    &mut wiring,
                     &mut config,
                     &command_registry,
                     &mut stats,
@@ -425,7 +494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             #[cfg(not(feature = "tui-ratatui"))]
             {
-                let _ = rx;
+                // 取可变借用即算「用到 mut」，同时避免未用变量告警。
+                let _ = (&mut agent, &mut wiring, &mut stats, &mut state_store, rx);
                 return Err(
                     "ratatui mode required for interactive TUI; build with --features tui-ratatui"
                         .into(),
@@ -495,7 +565,8 @@ mod tests {
         assert_eq!(
             parse_args(&s(&["-p", "hello"])).unwrap(),
             Args {
-                mode: Mode::Print("hello".into())
+                mode: Mode::Print("hello".into()),
+                stats: false,
             }
         );
     }
@@ -506,7 +577,8 @@ mod tests {
         assert_eq!(
             parse_args(&s(&["--json", "do", "x"])).unwrap(),
             Args {
-                mode: Mode::Json("do x".into())
+                mode: Mode::Json("do x".into()),
+                stats: false,
             }
         );
     }
@@ -517,7 +589,8 @@ mod tests {
         assert_eq!(
             parse_args(&[]).unwrap(),
             Args {
-                mode: Mode::Interactive
+                mode: Mode::Interactive,
+                stats: false,
             }
         );
     }
@@ -545,6 +618,55 @@ mod tests {
             parse_args(&s(&["-p", "--help", "me"])).unwrap().mode,
             Mode::Print("--help me".into())
         );
+    }
+
+    /// `--stats` 紧随模式 flag → 识别为 flag，任务文本不含它；两种模式均可组合。
+    #[test]
+    fn parse_stats_flag_after_mode() {
+        assert_eq!(
+            parse_args(&s(&["-p", "--stats", "hi"])).unwrap(),
+            Args {
+                mode: Mode::Print("hi".into()),
+                stats: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&s(&["--json", "--stats", "do", "x"])).unwrap(),
+            Args {
+                mode: Mode::Json("do x".into()),
+                stats: true,
+            }
+        );
+    }
+
+    /// `--stats` 只认「模式 flag 之后、任务文本之前」：任务文本一旦开始（含
+    /// 首参数被 `--stats` 后仍有文本），后续 `--stats` 就是文本的一部分。
+    #[test]
+    fn parse_stats_after_task_text_is_verbatim() {
+        assert_eq!(
+            parse_args(&s(&["-p", "hi", "--stats"])).unwrap(),
+            Args {
+                mode: Mode::Print("hi --stats".into()),
+                stats: false,
+            }
+        );
+        // 既有语义不破：`--help` 从来不是 flag（仅首位置判定，且此处非 `--stats`）。
+        assert_eq!(
+            parse_args(&s(&["-p", "--help", "me"])).unwrap(),
+            Args {
+                mode: Mode::Print("--help me".into()),
+                stats: false,
+            }
+        );
+    }
+
+    /// `-p --stats`（有 flag 无任务）→ Err，不会把 `--stats` 当任务。
+    #[test]
+    fn parse_stats_without_task_errors() {
+        let err = parse_args(&s(&["-p", "--stats"])).unwrap_err();
+        assert!(err.contains("-p"), "err = {err}");
+        let err = parse_args(&s(&["--json", "--stats"])).unwrap_err();
+        assert!(err.contains("--json"), "err = {err}");
     }
 
     /// 6. `write_json_envelope`：合法 JSON、含 `event` 字段、以 `\n` 结尾；
@@ -694,10 +816,9 @@ mod tests {
     ///     （每个 delta 至少一次 write）。若实现退化为「全部缓冲、收到终局事件后
     ///     一次性写出」，内容仍为 `"Hello world"` 但 `write_calls == 1`，此断言失败。
     ///
-    ///     说明：当前模型适配器 `stream: false`，每次响应只发 **1 个** delta，
-    ///     故生产中的 `-p` 目前只会写出一个增量。本测试**手工投递多个 delta**，
-    ///     模拟「流式接通」后的多增量场景；真实多 delta 要等流式接通（后续任务）
-    ///     才在生产中走此路径。消费走**生产路径** `consume_print_events`
+    ///     说明：模型适配器已接通流式（`stream: true`），生产中一次响应会发多个
+    ///     delta，本路径即为其真实消费路径；本测试**手工投递多个 delta**锁定顺序
+    ///     与增量写出语义。消费走**生产路径** `consume_print_events`
     ///     （内部即 `consume_events` + `print_delta_text`），未重写逻辑。
     #[tokio::test]
     async fn print_mode_writes_deltas_in_order() {
@@ -767,15 +888,16 @@ mod tests {
             DEFAULT_CHANNEL_CAPACITY,
             LifecyclePolicy::StopWhenConsumerGone,
         );
-        let mut agent = build_agent(Some(model), String::new(), PathBuf::from("."), sink).unwrap();
+        let mut agent = build_agent(String::new(), PathBuf::from(".")).unwrap();
+        let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         // 与 `-p`/`--json` 相同的构造：一次用户输入作为 followUp 入队。
-        let inbox = Inbox::new();
+        let inbox = wiring.inbox();
         inbox.push(AgentInput::text("hi").message, Intent::FollowUp);
 
         let mut out: Vec<u8> = Vec::new();
         let (run_result, consume_result) = tokio::join!(
-            agent.run(&inbox),
+            agent.run(wiring.ports(), &inbox),
             consume_events(rx, &mut out, write_json_envelope),
         );
         run_result.expect("run 应成功");

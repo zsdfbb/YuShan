@@ -312,10 +312,10 @@ impl Command for LoginCommand {
         ctx.config.model = model_name.clone();
         ctx.config.provider = Some(provider.name.clone());
 
-        // 通过 factory 构建 model 并设到 agent
+        // 通过 factory 构建 model 并交给接线器（ADR-0010：配置归接线器）
         match ctx.config.build_model() {
             Some(model) => {
-                ctx.agent.set_model(Some(model));
+                ctx.wiring.set_model(Some(model));
             }
             None => {
                 eprintln!("Warning: Could not build model. Check API credentials.");
@@ -382,8 +382,8 @@ impl Command for LogoutCommand {
         ctx.config.api_key = None;
         ctx.config.provider = None;
 
-        // 清空 agent 的 model
-        ctx.agent.set_model(None);
+        // 清空接线器的 model（配置归接线器，不伸手进 agent）
+        ctx.wiring.set_model(None);
 
         // 持久化已清空的状态
         let _ = ctx.state.save(&crate::state::AppState::default());
@@ -464,7 +464,7 @@ impl Command for ModelCommand {
                     });
                     match ctx.config.build_model() {
                         Some(m) => {
-                            ctx.agent.set_model(Some(m));
+                            ctx.wiring.set_model(Some(m));
                             println!("Model switched to: {}", model.id);
                         }
                         None => {
@@ -491,7 +491,7 @@ impl Command for ModelCommand {
             });
             match ctx.config.build_model() {
                 Some(m) => {
-                    ctx.agent.set_model(Some(m));
+                    ctx.wiring.set_model(Some(m));
                     println!("Model switched to: {target}");
                 }
                 None => {
@@ -525,11 +525,17 @@ impl Command for NewCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        ctx.agent
-            .clear_session()
+        // ADR-0010：`/new` = 换队列——接线器换上新 Session + 新空 Inbox
+        //（旧会话文件保留、pending 丢弃）；agent 全程不知情。
+        let path = ctx
+            .wiring
+            .new_session()
             .await
-            .map_err(|e| CommandError::Internal(format!("Failed to clear session: {e}")))?;
-        println!("New conversation started. Session cleared.");
+            .map_err(|e| CommandError::Internal(format!("Failed to start new session: {e}")))?;
+        match path {
+            Some(p) => println!("New conversation started. Session: {}", p.display()),
+            None => println!("New conversation started. Session cleared."),
+        }
         Ok(CommandResult::Continue)
     }
 }
@@ -555,8 +561,8 @@ impl Command for CompactCommand {
         _args: &str,
         ctx: &mut CommandContext<'_>,
     ) -> Result<CommandResult, CommandError> {
-        // MVP：以清空 session 代替 compaction。
-        ctx.agent
+        // MVP：以清空 session 代替 compaction（会话归接线器）。
+        ctx.wiring
             .clear_session()
             .await
             .map_err(|e| CommandError::Internal(format!("Failed to compact session: {e}")))?;
@@ -688,19 +694,18 @@ mod tests {
     use super::*;
     use crate::commands::CommandRegistry;
     use crate::config::Config;
+    use crate::wiring::Wiring;
     use ys_event::CollectingSink;
-    use ys_runtime::AgentBuilder;
-    use ys_session::MemorySession;
 
-    /// 辅助：用 mock model 构建测试 agent。
-    fn test_agent(model_name: &str) -> ys_runtime::Agent {
+    /// 辅助：用 mock model + 内存会话构建测试接线器（ADR-0010：会话/模型归接线器）。
+    fn test_wiring(model_name: &str) -> Wiring {
         let model = ys_model::MockModel::new(model_name);
-        AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap()
+        Wiring::ephemeral(Some(Box::new(model)), Box::new(CollectingSink::new()))
+    }
+
+    /// 辅助：无状态 agent（测试里配合 `wiring.ports()` 跑 turn）。
+    fn test_agent() -> ys_runtime::Agent {
+        ys_runtime::AgentBuilder::new().build().unwrap()
     }
 
     fn test_config() -> Config {
@@ -815,12 +820,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_help_lists_commands() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -833,12 +838,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_help_specific_command() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -850,12 +855,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_help_unknown_command() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -870,12 +875,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_quit_returns_exit() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -888,12 +893,12 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_returns_user_error() {
         let reg = build_test_registry();
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -914,12 +919,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_with_args() {
-        let mut agent = test_agent("old-model");
+        let mut wiring = test_wiring("old-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -937,13 +942,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_with_args_sets_config() {
-        let mut agent = test_agent("old-model");
+        let mut wiring = test_wiring("old-model");
         let mut config = test_config();
 
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -966,28 +971,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_clears_session() {
+    async fn test_new_swaps_session() {
         let model = ys_model::MockModel::new("test");
         model.push_text("hello");
-        let mut agent = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
+        let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(CollectingSink::new()));
+        let mut agent = test_agent();
 
-        // 跑一个 turn 以添加消息
+        // 跑一个 turn 以向当前会话添加消息
         agent
-            .run_turn(ys_loop::AgentInput::text("hi"))
+            .run_turn(ys_loop::AgentInput::text("hi"), wiring.ports())
             .await
             .unwrap();
-        assert!(!agent.session_messages().is_empty());
+        assert!(!wiring.session_messages().is_empty());
+
+        // pending：/new 应连队列一起换掉（丢弃）
+        wiring.inbox().push(
+            ys_loop::AgentInput::text("pending").message,
+            ys_channel::Intent::FollowUp,
+        );
 
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -995,17 +1002,18 @@ mod tests {
 
         let result = NewCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
-        assert!(ctx.agent.session_messages().is_empty());
+        assert!(ctx.wiring.session_messages().is_empty(), "新会话历史为空");
+        assert!(ctx.wiring.inbox().is_empty(), "pending 应被丢弃");
     }
 
     #[tokio::test]
     async fn test_status_shows_config() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1017,12 +1025,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_mvp() {
-        let mut agent = test_agent("test");
+        let mut wiring = test_wiring("test");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1034,12 +1042,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_export_mvp() {
-        let mut agent = test_agent("test");
+        let mut wiring = test_wiring("test");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1053,24 +1061,20 @@ mod tests {
     async fn test_compact_mvp() {
         let model = ys_model::MockModel::new("test");
         model.push_text("hello");
-        let mut agent = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
+        let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(CollectingSink::new()));
+        let mut agent = test_agent();
 
         agent
-            .run_turn(ys_loop::AgentInput::text("hi"))
+            .run_turn(ys_loop::AgentInput::text("hi"), wiring.ports())
             .await
             .unwrap();
-        assert!(!agent.session_messages().is_empty());
+        assert!(!wiring.session_messages().is_empty());
 
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1078,19 +1082,19 @@ mod tests {
 
         let result = CompactCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
-        assert!(ctx.agent.session_messages().is_empty());
+        assert!(ctx.wiring.session_messages().is_empty());
     }
 
     #[tokio::test]
     async fn test_logout_clears_model() {
-        let mut agent = test_agent("test-model");
-        assert!(agent.model_id().is_some());
+        let mut wiring = test_wiring("test-model");
+        assert!(wiring.model_id().is_some());
 
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1098,12 +1102,12 @@ mod tests {
 
         let result = LogoutCommand.execute("", &mut ctx).await.unwrap();
         assert!(matches!(result, CommandResult::Continue));
-        assert!(ctx.agent.model_id().is_none());
+        assert!(ctx.wiring.model_id().is_none());
     }
 
     #[tokio::test]
     async fn test_logout_clears_config_fields() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
 
         // 设置 config 字段
@@ -1114,7 +1118,7 @@ mod tests {
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1127,7 +1131,7 @@ mod tests {
         assert!(ctx.config.api_base.is_none());
         assert!(ctx.config.api_key.is_none());
         assert!(ctx.config.provider.is_none());
-        assert!(ctx.agent.model_id().is_none());
+        assert!(ctx.wiring.model_id().is_none());
     }
 
     #[tokio::test]
@@ -1154,11 +1158,11 @@ mod tests {
         config.registry = registry;
         config.provider = Some("deepseek".into());
 
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1178,12 +1182,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_rejects_unknown_provider() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1225,10 +1229,10 @@ mod tests {
             })
             .unwrap();
 
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1293,13 +1297,13 @@ mod tests {
     /// select 返回 "deepseek-chat" → config.model 切换。
     #[tokio::test]
     async fn test_model_interactive_selects_model() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         // test_config 未设置 api_base/api_key → is_configured()==false → 走 static models
         let prompter = FakePrompter::with_answers(vec![Ok("deepseek-chat".into())]);
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1313,13 +1317,13 @@ mod tests {
     /// /model 无参：select 取消 → 保持原 model 不变。
     #[tokio::test]
     async fn test_model_interactive_cancelled_keeps_model() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         config.model = "deepseek-chat".into();
         let mut state_store = test_state_store();
         let prompter = FakePrompter::with_answers(vec![Err(PromptError::Cancelled)]);
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1333,12 +1337,12 @@ mod tests {
     /// /login 无参：provider 选择时取消 → Continue，不持久化 auth。
     #[tokio::test]
     async fn test_login_cancelled_at_provider_select() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         let prompter = FakePrompter::with_answers(vec![Err(PromptError::Cancelled)]);
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,
@@ -1352,7 +1356,7 @@ mod tests {
     /// /login 无参：provider 选 deepseek 后，api_key 输入取消 → Continue，不持久化。
     #[tokio::test]
     async fn test_login_cancelled_at_api_key() {
-        let mut agent = test_agent("test-model");
+        let mut wiring = test_wiring("test-model");
         let mut config = test_config();
         let mut state_store = test_state_store();
         // deepseek 非 custom → 跳过 api_base 输入；第二个答案是 api_key 输入
@@ -1361,7 +1365,7 @@ mod tests {
             Err(PromptError::Cancelled),
         ]);
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,

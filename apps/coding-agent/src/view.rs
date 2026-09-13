@@ -4,8 +4,8 @@
 //! 一无所知。当 `view_dirty = true`（`tui.rs` 在任何 command 执行或 turn 完成后设置）
 //! 时，`AppView::from_sources` 重建快照。
 //!
-//! Grouping A 说明：`tools` 与 `context_window` 是占位（`Vec::new()` / `None`）。
-//! 待 Grouping C 中 `Agent::tool_names()` 与 `Agent::context_window()` 落地后填充（ADR-0007）。
+//! `tools` 与 `context_window` 由 [`AppView::from_sources`] 从
+//! `Agent::tool_names()` / `Agent::context_window()` 填充（ADR-0007）。
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,11 +16,16 @@ use crate::config::Config;
 use crate::provider::ProviderRegistry;
 use crate::state::StateStore;
 use crate::status::TurnStats;
+use crate::wiring::Wiring;
 
-/// 单个 slash command 的元数据，供 `/help` 输出和
-/// ratatui Tab completer（ui/events.rs）使用。
+/// 单个 slash command 的元数据（**依赖域占位**）。
+///
+/// **当前无生产消费者**：`/help` 直接读 `builtin_help_entries()`，
+/// ratatui Tab completer 用 `ui/events.rs` 自有的 `CmdEntry`，故
+/// [`AppView::commands`] 恒为空 `Vec`。保留该类型作为后续「统一命令元数据源」
+/// 的落点，因此显式允许 dead_code。
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // description / arg_hint 由 /help 与 ratatui Tab completer 消费
+#[allow(dead_code)] // 生产路径尚未接线（见上）；仅测试构造
 pub struct CommandMeta {
     pub name: &'static str,
     pub description: &'static str,
@@ -46,8 +51,8 @@ pub struct AppView {
 
     // 会话
     pub session_started: Instant,
-    /// 当前会话中的消息数。供未来的 "context full" 警告与 `/status` 读取；
-    /// v0 渲染路径不消费。
+    /// 当前会话中的消息数。供未来的 "context full" 警告读取；
+    /// 当前渲染路径与 `/status` 均不消费。
     #[allow(dead_code)]
     pub message_count: usize,
 
@@ -67,6 +72,7 @@ impl AppView {
     pub fn from_sources(
         cfg: &Config,
         agent: &Agent,
+        wiring: &Wiring,
         registry: &ProviderRegistry,
         state: &StateStore,
         stats: &TurnStats,
@@ -77,7 +83,7 @@ impl AppView {
         Self {
             cwd: cfg.cwd.clone(),
             provider: cfg.provider.clone(),
-            model: agent.model_id().map(String::from),
+            model: wiring.model_id().map(String::from),
             config_path: registry.auth_path(),
             logged_in_providers: logged_in,
             total_known_providers: registry.providers().len(),
@@ -86,11 +92,11 @@ impl AppView {
             total_output_tokens: stats.total_output_tokens,
             turn_count: stats.turn_count,
             session_started,
-            message_count: agent.session_messages().len(),
+            message_count: wiring.session_messages().len(),
             tools: agent.tool_names(),
             context_window: Some(agent.context_window()),
             is_first_run,
-            commands: Vec::new(), // 由调用方填充
+            commands: Vec::new(), // 暂未接线（见 CommandMeta 说明）
         }
     }
 

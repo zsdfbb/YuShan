@@ -11,7 +11,7 @@ use ys_loop::AgentInput;
 use ys_model_openai_compat::{
     OpenAICompatibleConfig, OpenAICompatibleModel, compat::ProviderCompat,
 };
-use ys_runtime::AgentBuilder;
+use ys_runtime::{AgentBuilder, AgentPorts};
 use ys_session::MemorySession;
 use ys_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
 
@@ -56,21 +56,27 @@ async fn e2e_four_tools_calculator() {
     );
 
     let mut agent = AgentBuilder::new()
-        .model(model)
         .tool(ReadTool::new(wd.clone()))
         .tool(WriteTool::new(wd.clone()))
         .tool(EditTool::new(wd.clone()))
         .tool(BashTool::new(wd.clone()))
-        .session(MemorySession::new())
-        .events(NoopEventSink)
         .build()
         .expect("failed to build agent");
 
+    // ADR-0010：会话、事件出口与模型经端口传入（不再进 builder）。
+    let mut session = MemorySession::new();
+    let mut events = NoopEventSink;
     let input = AgentInput::text(&task);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(120), agent.run_turn(input))
-        .await
-        .expect("test timed out after 120s")
-        .expect("agent run_turn failed");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        agent.run_turn(
+            input,
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        ),
+    )
+    .await
+    .expect("test timed out after 120s")
+    .expect("agent run_turn failed");
 
     // 验证 agent 产出了响应
     assert!(

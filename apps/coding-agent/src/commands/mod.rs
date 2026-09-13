@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::config::Config;
 use crate::state::StateStore;
-use ys_runtime::Agent;
+use crate::wiring::Wiring;
 
 /// 可注册进 CommandRegistry 的 slash command。
 #[async_trait]
@@ -38,8 +38,11 @@ pub trait Command: Send + Sync {
 }
 
 /// command 执行期间可接触的可变环境（mutable world）。
+///
+/// **ADR-0010**：不再持有 `&mut Agent`——命令**不伸手进 agent**。会话、模型
+/// （配置）与队列归 [`Wiring`]；命令改配置后经端口在 `run` 时传入。
 pub struct CommandContext<'a> {
-    pub agent: &'a mut Agent,
+    pub wiring: &'a mut Wiring,
     pub config: &'a mut Config,
     pub state: &'a mut StateStore,
     pub prompter: &'a dyn Prompter,
@@ -272,16 +275,12 @@ mod tests {
     #[tokio::test]
     async fn test_execute_unknown_command() {
         let reg = CommandRegistry::new();
-        let mut agent = ys_runtime::AgentBuilder::new()
-            .session(ys_session::MemorySession::new())
-            .events(ys_event::CollectingSink::new())
-            .build()
-            .unwrap();
+        let mut wiring = Wiring::ephemeral(None, Box::new(ys_event::CollectingSink::new()));
         let mut config = Config::from_env().unwrap();
         let mut state_store = crate::state::StateStore::new();
         let prompter = StubPrompter;
         let mut ctx = CommandContext {
-            agent: &mut agent,
+            wiring: &mut wiring,
             config: &mut config,
             state: &mut state_store,
             prompter: &prompter,

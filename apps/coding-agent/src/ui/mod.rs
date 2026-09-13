@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use crossterm::event::EventStream;
 use std::io::Write;
 
-use ys_channel::{Envelope, Inbox, Intent};
+use ys_channel::{Envelope, Intent};
 use ys_core::{CancelToken, ContentBlock, Message, StopReason};
 use ys_event::AgentEvent;
 use ys_runtime::{Agent, RunSummary};
@@ -36,13 +36,18 @@ use crate::commands::CommandRegistry;
 use crate::config::Config;
 use crate::state::StateStore;
 use crate::status::TurnStats;
+use crate::wiring::Wiring;
 
 /// 进入 ratatui TUI 模式。
 ///
 /// `rx` 是 [`ChannelSink`](crate::channel::ChannelSink) 的接收端；TUI 在 turn 期间
 /// 通过 `select!` 增量消费事件做流式渲染（块 C）。
+///
+/// `wiring` 是接线器（ADR-0010）：持有会话 + 队列 + 模型 + 事件出口。
+/// `/new` 后其 session/inbox 已换新，下一次 turn 自动用新会话。
 pub async fn run(
     agent: &mut Agent,
+    wiring: &mut Wiring,
     config: &mut Config,
     commands: &CommandRegistry,
     stats: &mut TurnStats,
@@ -55,6 +60,7 @@ pub async fn run(
     let mut app = App::new(crate::view::AppView::from_sources(
         config,
         agent,
+        wiring,
         &config.registry,
         state_store,
         stats,
@@ -68,6 +74,7 @@ pub async fn run(
     let result = event_loop(
         &mut terminal,
         agent,
+        wiring,
         config,
         commands,
         stats,
@@ -169,6 +176,7 @@ fn restore_terminal(
 async fn event_loop<B: Backend + Write>(
     terminal: &mut Terminal<B>,
     agent: &mut Agent,
+    wiring: &mut Wiring,
     config: &mut Config,
     commands: &CommandRegistry,
     stats: &mut TurnStats,
@@ -196,6 +204,7 @@ async fn event_loop<B: Backend + Write>(
                         &mut events,
                         app,
                         agent,
+                        wiring,
                         config,
                         commands,
                         stats,
@@ -222,6 +231,7 @@ async fn dispatch_input<B: Backend + Write>(
     events: &mut EventStream,
     app: &mut App,
     agent: &mut Agent,
+    wiring: &mut Wiring,
     config: &mut Config,
     commands: &CommandRegistry,
     stats: &mut TurnStats,
@@ -253,7 +263,7 @@ async fn dispatch_input<B: Backend + Write>(
         let result = {
             let prompter = InquirePrompter;
             let mut ctx = CommandContext {
-                agent,
+                wiring,
                 config,
                 state: state_store,
                 prompter: &prompter,
@@ -265,9 +275,12 @@ async fn dispatch_input<B: Backend + Write>(
         }
         match result {
             Ok(CommandResult::Continue) => {
+                // 命令可能换了会话（/new）或模型（/model、/login），重建快照；
+                // wiring 是同一句柄，无需重新取。
                 app.view = crate::view::AppView::from_sources(
                     config,
                     agent,
+                    wiring,
                     &config.registry,
                     state_store,
                     stats,
@@ -291,6 +304,7 @@ async fn dispatch_input<B: Backend + Write>(
         terminal,
         events,
         agent,
+        wiring,
         turn_input,
         agent.cancel_handle(),
         app,
@@ -315,6 +329,7 @@ async fn dispatch_input<B: Backend + Write>(
             app.view = crate::view::AppView::from_sources(
                 config,
                 agent,
+                wiring,
                 &config.registry,
                 state_store,
                 stats,
@@ -408,10 +423,12 @@ fn drain_pending_events(
 ///
 /// 返回 `(RunSummary, streamed)`：`streamed` 表示本回合是否收到过文本增量，
 /// 供调用方决定是否走 `final_message` 兜底。
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_with_ticks<B: Backend>(
     terminal: &mut Terminal<B>,
     events: &mut EventStream,
     agent: &mut Agent,
+    wiring: &mut Wiring,
     input: ys_loop::AgentInput,
     cancel_token: CancelToken,
     app: &mut App,
@@ -424,9 +441,10 @@ async fn run_turn_with_ticks<B: Backend>(
 
     // 用户输入作为 followUp 入队，走 `run(&inbox)`（而非 `run_turn`）：
     // 自转会调 `begin_turn(n)`，使信封携带正确 turn 号，TUI 也看到 turn 语义。
-    let inbox = Inbox::new();
+    // inbox 是接线器的克隆句柄——`/new` 换掉的正是它，故这里每次重新取。
+    let inbox = wiring.inbox();
     inbox.push(input.message, Intent::FollowUp);
-    let mut turn_fut = Box::pin(agent.run(&inbox));
+    let mut turn_fut = Box::pin(agent.run(wiring.ports(), &inbox));
 
     // 本回合是否已建 assistant 行（增量渲染标志）；亦作为「是否收到过 delta」的判据。
     let mut assistant_started = false;

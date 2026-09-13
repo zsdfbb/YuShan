@@ -31,12 +31,46 @@ pub struct RunSummary {
     pub last_message: Option<Message>,
 }
 
+/// 一次 `run` / `run_turn` 所需的**外部端口**。
+///
+/// **ADR-0010**：会话与配置（当前模型）的所有权归**接线器**，Agent 不持有它们。
+/// 故这些能力经此结构**借用**传入——Agent 只执行、只产出事件。
+///
+/// 选择「端口结构」(a) 而非「多参数」(b)：与会话的端口概念一致，且后续
+/// 再加端口（如工具审批流、记忆）时**不破签名**。
+pub struct AgentPorts<'a> {
+    /// 当前模型。`None` = 未配置（`run`/`run_turn` 返回
+    /// [`LoopError::ConfigError`]）。
+    pub model: Option<&'a dyn Model>,
+    /// 会话（消息历史）。归接线器所有；`/new` 换的就是它。
+    pub session: &'a mut dyn Session,
+    /// 事件出口。归接线器所有。
+    pub events: &'a mut dyn EventSink,
+}
+
+impl<'a> AgentPorts<'a> {
+    /// 便捷构造：顺序 `model, session, events`。
+    pub fn new(
+        model: Option<&'a dyn Model>,
+        session: &'a mut dyn Session,
+        events: &'a mut dyn EventSink,
+    ) -> Self {
+        Self {
+            model,
+            session,
+            events,
+        }
+    }
+}
+
+/// **无状态**执行器。
+///
+/// 持有的是*执行所需*的东西（工具、取消句柄、限制、系统提示、工作目录），
+/// **不持有**会话态（历史、当前模型选择、事件出口）——那些归接线器
+/// （ADR-0010）。「当前是哪个会话」由调用方经 [`AgentPorts`] 每次传入。
 pub struct Agent {
     loop_impl: Box<dyn AgentLoop>,
-    model: Option<Box<dyn Model>>,
     registry: ToolRegistry,
-    session: Box<dyn Session>,
-    events: Box<dyn EventSink>,
     cancel: CancelToken,
     limits: RunLimits,
     cwd: PathBuf,
@@ -49,10 +83,7 @@ impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         loop_impl: Box<dyn AgentLoop>,
-        model: Option<Box<dyn Model>>,
         registry: ToolRegistry,
-        session: Box<dyn Session>,
-        events: Box<dyn EventSink>,
         cancel: CancelToken,
         limits: RunLimits,
         cwd: PathBuf,
@@ -62,10 +93,7 @@ impl Agent {
     ) -> Self {
         Self {
             loop_impl,
-            model,
             registry,
-            session,
-            events,
             cancel,
             limits,
             cwd,
@@ -75,18 +103,17 @@ impl Agent {
         }
     }
 
-    /// 该 agent 是否已配置 model。
-    pub fn is_configured(&self) -> bool {
-        self.model.is_some()
-    }
-
-    /// 运行单个 turn。取 &mut self 以保证同时只运行一次。
+    /// 运行单个 turn。取 `&mut self` 以保证同时只运行一次。
     ///
-    /// **兼容入口**：既有测试与 `-p`/TUI 调用点都用它。内部委托
+    /// **兼容入口**：既有测试与调用点都用它。内部委托
     /// [`run_one_turn`](Self::run_one_turn)，语义与历史实现逐字节一致
     /// （不挂载 inbox，无轮边界 steering）。
-    pub async fn run_turn(&mut self, input: AgentInput) -> Result<RunResult, LoopError> {
-        self.run_one_turn(input, None).await
+    pub async fn run_turn(
+        &mut self,
+        input: AgentInput,
+        ports: AgentPorts<'_>,
+    ) -> Result<RunResult, LoopError> {
+        self.run_one_turn(input, None, ports).await
     }
 
     /// 自转：从 inbox 取消息 → 跑回合 → 投事件，直到 inbox 空闲。
@@ -106,9 +133,13 @@ impl Agent {
     /// 本轮保持既有语义（Err），不引入新的 `StopReason`；「正常收场」的措辞
     /// 需与设计文档对齐。
     ///
-    /// **`/new` 契约**（本轮不做命令层，留迁移步 5）：接线器换上新 `Session` +
-    /// 新空 `Inbox`，agent 全程不知情。
-    pub async fn run(&mut self, inbox: &Inbox) -> Result<RunSummary, LoopError> {
+    /// **`/new` 契约**（ADR-0010）：接线器换上新 `Session` + 新空 `Inbox`，
+    /// 下次传进来的 [`AgentPorts`] 与 inbox 即指向新会话；**agent 全程不知情**。
+    pub async fn run(
+        &mut self,
+        ports: AgentPorts<'_>,
+        inbox: &Inbox,
+    ) -> Result<RunSummary, LoopError> {
         let mut summary = RunSummary::default();
         loop {
             let batch = inbox.take_followup();
@@ -117,9 +148,17 @@ impl Agent {
             }
             for message in batch {
                 summary.turns += 1;
-                self.events.begin_turn(summary.turns);
+                ports.events.begin_turn(summary.turns);
                 let result = self
-                    .run_one_turn(AgentInput::new(message), Some(inbox))
+                    .run_one_turn(
+                        AgentInput::new(message),
+                        Some(inbox),
+                        AgentPorts {
+                            model: ports.model,
+                            session: &mut *ports.session,
+                            events: &mut *ports.events,
+                        },
+                    )
                     .await?;
                 let RunResult {
                     stop_reason,
@@ -146,8 +185,9 @@ impl Agent {
         &mut self,
         input: AgentInput,
         inbox: Option<&Inbox>,
+        ports: AgentPorts<'_>,
     ) -> Result<RunResult, LoopError> {
-        let model = self.model.as_deref().ok_or_else(|| {
+        let model = ports.model.ok_or_else(|| {
             LoopError::ConfigError(
                 "No model configured. Use /login to configure an API provider.".into(),
             )
@@ -155,8 +195,8 @@ impl Agent {
         let mut ctx = RuntimeContext::new(
             model,
             &self.registry,
-            self.session.as_mut(),
-            self.events.as_mut(),
+            ports.session,
+            ports.events,
             &self.cancel,
             self.limits.clone(),
             self.cwd.clone(),
@@ -170,12 +210,9 @@ impl Agent {
         self.loop_impl.run_turn(input, &mut ctx).await
     }
 
-    /// 获取 model 标识符（若已配置）。
-    pub fn model_id(&self) -> Option<&str> {
-        self.model.as_deref().map(|m| m.model_id())
-    }
-
     /// 返回工具名称（自有 String 列表）。供 banner/footer 展示可用工具。
+    ///
+    /// ADR-0007 保留：只读查询，不依赖 `&mut Agent`，消费者仍需要。
     pub fn tool_names(&self) -> Vec<String> {
         self.registry
             .names()
@@ -185,11 +222,15 @@ impl Agent {
     }
 
     /// 返回以 token 计的 model context window 大小。
+    ///
+    /// ADR-0007 保留：只读查询，不依赖 `&mut Agent`。
     pub fn context_window(&self) -> usize {
         self.limits.context_window
     }
 
     /// 取消当前运行。agent loop 的下一次迭代将停止。
+    ///
+    /// ADR-0007 保留：被动式强制打断，仍有调用场景。
     pub fn cancel(&mut self) {
         self.cancel.cancel();
     }
@@ -199,29 +240,9 @@ impl Agent {
     /// 返回的 `CancelToken` 与 `self.cancel` 共享底层 `Arc<AtomicBool>`，
     /// 调用方可在 `tokio::select!` 内持 `cancel_token.cancel()` 而无需借用 `&mut Agent`。
     ///
-    /// Why `&self` (not `&mut self`): `run_turn(input).await` 借用 `&mut Agent` 整生命周期；
-    /// select! 内调 `agent.cancel(&mut self)` 与 `&mut turn_fut` borrow 冲突（E0499）。
-    /// 返回 Clone handle 让调用方跨借用边界触发取消。
-    ///
-    /// 与 `cancel(&mut self)` 共存；后者保留向后兼容（未来若 BasicLoop 加 abort 回调需要 &mut self，
-    /// 仍可走 `&mut self` 路径）。
+    /// ADR-0008 保留：agent 自转后，外部唯一能与 agent 交互的通道就剩取消与只读查询。
     pub fn cancel_handle(&self) -> ys_core::CancelToken {
         self.cancel.clone()
-    }
-
-    /// 替换 model。传 None 移除（例如 /logout）。
-    pub fn set_model(&mut self, model: Option<Box<dyn Model>>) {
-        self.model = model;
-    }
-
-    /// 清空 session 中的所有消息。
-    pub async fn clear_session(&mut self) -> Result<(), ys_session::SessionError> {
-        self.session.clear().await
-    }
-
-    /// 读取所有 session 消息。
-    pub fn session_messages(&self) -> &[Message] {
-        self.session.messages()
     }
 }
 
@@ -251,25 +272,20 @@ mod tests {
         }
     }
 
+    fn test_agent() -> Agent {
+        AgentBuilder::new().build().unwrap()
+    }
+
     #[test]
     fn test_tool_names_empty_by_default() {
-        let agent = AgentBuilder::new()
-            .model(MockModel::new("test"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
-        let names = agent.tool_names();
+        let agent = test_agent();
         // 默认 builder 不注册任何工具。
-        assert_eq!(names.len(), 0);
+        assert_eq!(agent.tool_names().len(), 0);
     }
 
     #[test]
     fn test_tool_names_returns_registered_tools() {
         let agent = AgentBuilder::new()
-            .model(MockModel::new("test"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
             .tool(MockTool("read"))
             .tool(MockTool("write"))
             .build()
@@ -282,12 +298,7 @@ mod tests {
 
     #[test]
     fn test_context_window_default() {
-        let agent = AgentBuilder::new()
-            .model(MockModel::new("test"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
+        let agent = test_agent();
         // RunLimits::default() 的 context_window = 128_000
         assert_eq!(agent.context_window(), 128_000);
     }
@@ -296,27 +307,15 @@ mod tests {
     fn test_cancel_signals_token() {
         let cancel = CancelToken::new();
         let token_clone = cancel.clone();
-        let agent = AgentBuilder::new()
-            .model(MockModel::new("test"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .cancel_token(cancel)
-            .build()
-            .unwrap();
+        let mut agent = AgentBuilder::new().cancel_token(cancel).build().unwrap();
         assert!(!token_clone.is_cancelled());
-        let mut agent = agent;
         agent.cancel();
         assert!(token_clone.is_cancelled());
     }
 
     #[test]
     fn test_cancel_handle_is_clone_and_signals() {
-        let agent = AgentBuilder::new()
-            .model(MockModel::new("test"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
+        let agent = test_agent();
 
         let handle = agent.cancel_handle();
         let handle2 = handle.clone();
@@ -331,14 +330,11 @@ mod tests {
     async fn test_cancel_handle_triggers_cancellation() {
         use ys_core::StopReason;
 
-        let agent = AgentBuilder::new()
-            .model(MockModel::new("test"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
+        let model = MockModel::new("test");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
 
-        let mut agent = agent;
+        let mut agent = test_agent();
         let handle = agent.cancel_handle();
 
         // 通过 handle 触发取消 —— 无需 &mut agent
@@ -346,7 +342,10 @@ mod tests {
         handle.cancel();
 
         let result = agent
-            .run_turn(ys_loop::AgentInput::text("go"))
+            .run_turn(
+                ys_loop::AgentInput::text("go"),
+                AgentPorts::new(Some(&model), &mut session, &mut events),
+            )
             .await
             .unwrap();
         assert_eq!(result.stop_reason, StopReason::Cancelled);

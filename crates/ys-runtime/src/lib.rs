@@ -12,8 +12,10 @@ pub use error::*;
 #[cfg(test)]
 mod tests {
     use super::prelude::*;
+    use ys_channel::{Inbox, Intent};
     use ys_event::CollectingSink;
     use ys_model::MockModel;
+    use ys_session::{MemorySession, Session};
 
     struct EchoTool;
 
@@ -38,66 +40,48 @@ mod tests {
     async fn test_agent_builder_and_run() {
         let model = MockModel::new("test");
         model.push_text("hello");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
 
-        let agent = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
+        let mut agent = AgentBuilder::new().build().unwrap();
+        let result = agent
+            .run_turn(
+                AgentInput::text("hi"),
+                AgentPorts::new(Some(&model), &mut session, &mut events),
+            )
+            .await
             .unwrap();
-
-        let mut agent = agent;
-        let result = agent.run_turn(AgentInput::text("hi")).await.unwrap();
         assert_eq!(result.stop_reason, StopReason::Completed);
     }
 
-    #[tokio::test]
-    async fn test_build_without_model() {
-        // 允许不配置 model 构建 —— agent 可以以仅命令模式启动
-        let agent = AgentBuilder::new()
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
-
-        assert!(!agent.is_configured());
+    /// 空 builder（无工具、无 model/session/events 端口）能成功构建。
+    ///
+    /// ADR-0010 后 `build` 不再要求 session/events/model —— 它们在 `run` 时经
+    /// [`AgentPorts`] 传入。本测试锁住「空 builder 构建」这一路径本身。
+    #[test]
+    fn test_empty_builder_builds_successfully() {
+        let agent = AgentBuilder::new().build().expect("空 builder 应能构建");
+        assert!(agent.tool_names().is_empty(), "默认不注册工具");
     }
 
     #[tokio::test]
     async fn test_run_without_model_fails() {
-        let mut agent = AgentBuilder::new()
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut agent = AgentBuilder::new().build().unwrap();
 
-        let result = agent.run_turn(AgentInput::text("hi")).await;
+        let result = agent
+            .run_turn(
+                AgentInput::text("hi"),
+                AgentPorts::new(None, &mut session, &mut events),
+            )
+            .await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(
             msg.contains("No model configured"),
             "error should mention no model: {msg}"
         );
-    }
-
-    #[test]
-    fn test_build_error_missing_session() {
-        let model = MockModel::new("test");
-        let result = AgentBuilder::new()
-            .model(model)
-            .events(CollectingSink::new())
-            .build();
-        assert!(matches!(result, Err(BuildError::MissingSession)));
-    }
-
-    #[test]
-    fn test_build_error_missing_events() {
-        let model = MockModel::new("test");
-        let result = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .build();
-        assert!(matches!(result, Err(BuildError::MissingEvents)));
     }
 
     #[tokio::test]
@@ -107,18 +91,21 @@ mod tests {
         model.push_tool_call("echo", serde_json::json!({}));
         model.push_tool_call("echo", serde_json::json!({}));
         model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
 
-        let agent = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
+        let mut agent = AgentBuilder::new()
             .tool(EchoTool)
             .limits(RunLimits::new(2))
             .build()
             .unwrap();
-
-        let mut agent = agent;
-        let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
+        let result = agent
+            .run_turn(
+                AgentInput::text("go"),
+                AgentPorts::new(Some(&model), &mut session, &mut events),
+            )
+            .await
+            .unwrap();
         // 两轮后应命中最大 round 数
         assert_eq!(result.stop_reason, StopReason::MaxRounds);
         assert_eq!(result.rounds, 2);
@@ -129,86 +116,84 @@ mod tests {
         let model = MockModel::new("test");
         let cancel = CancelToken::new();
         cancel.cancel(); // 运行前取消
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
 
-        let agent = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
+        let mut agent = AgentBuilder::new()
             .cancel_token(cancel.clone())
             .build()
             .unwrap();
-
-        let mut agent = agent;
-        let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
+        let result = agent
+            .run_turn(
+                AgentInput::text("go"),
+                AgentPorts::new(Some(&model), &mut session, &mut events),
+            )
+            .await
+            .unwrap();
         assert_eq!(result.stop_reason, StopReason::Cancelled);
     }
 
-    #[test]
-    fn test_builder_default() {
-        // 缺少 session/events 的构建应失败
-        let result = AgentBuilder::new().build();
-        assert!(result.is_err());
-        assert!(
-            matches!(result.err().unwrap(), BuildError::MissingSession),
-            "expected MissingSession"
-        );
-    }
-
+    /// **agent 无状态**：同一 `Agent` 实例配不同 [`AgentPorts`] 能分别跑，
+    /// 证明它不持有会话（也不持有模型）——「当前是哪个会话」由端口决定。
     #[tokio::test]
-    async fn test_agent_model_id() {
-        let agent = AgentBuilder::new()
-            .model(MockModel::new("test-model"))
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
+    async fn same_agent_instance_runs_with_different_ports() {
+        let m1 = MockModel::new("m1");
+        m1.push_text("one");
+        let m2 = MockModel::new("m2");
+        m2.push_text("two");
+
+        let mut s1 = MemorySession::new();
+        let mut e1 = CollectingSink::new();
+        let mut s2 = MemorySession::new();
+        let mut e2 = CollectingSink::new();
+
+        let mut agent = AgentBuilder::new().build().unwrap();
+
+        agent
+            .run_turn(
+                AgentInput::text("a"),
+                AgentPorts::new(Some(&m1), &mut s1, &mut e1),
+            )
+            .await
             .unwrap();
-        assert_eq!(agent.model_id(), Some("test-model"));
+        agent
+            .run_turn(
+                AgentInput::text("b"),
+                AgentPorts::new(Some(&m2), &mut s2, &mut e2),
+            )
+            .await
+            .unwrap();
+
+        // 每个会话各自拿到 user + assistant 两条，互不串。
+        assert_eq!(s1.messages().len(), 2, "会话 1 应独立记录");
+        assert_eq!(s2.messages().len(), 2, "会话 2 应独立记录");
     }
 
-    #[test]
-    fn test_agent_model_id_none() {
-        let agent = AgentBuilder::new()
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
-        assert_eq!(agent.model_id(), None);
-    }
-
+    /// `RunSummary` 语义不变：`turns` 计回合、`last_stop` 取末回合、`usage` 累计。
     #[tokio::test]
-    async fn test_agent_set_model() {
-        let mut agent = AgentBuilder::new()
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
-            .unwrap();
-        assert_eq!(agent.model_id(), None);
-
-        let model = MockModel::new("new-model");
-        agent.set_model(Some(Box::new(model)));
-        assert_eq!(agent.model_id(), Some("new-model"));
-
-        agent.set_model(None);
-        assert_eq!(agent.model_id(), None);
-    }
-
-    #[tokio::test]
-    async fn test_agent_clear_session() {
+    async fn run_summary_semantics_unchanged() {
         let model = MockModel::new("test");
-        model.push_text("hi");
+        model.push_text("r1");
+        model.push_text("r2");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
 
-        let mut agent = AgentBuilder::new()
-            .model(model)
-            .session(MemorySession::new())
-            .events(CollectingSink::new())
-            .build()
+        let mut agent = AgentBuilder::new().build().unwrap();
+        let inbox = Inbox::new();
+        inbox.push(AgentInput::text("a").message, Intent::FollowUp);
+        inbox.push(AgentInput::text("b").message, Intent::FollowUp);
+
+        let summary = agent
+            .run(
+                AgentPorts::new(Some(&model), &mut session, &mut events),
+                &inbox,
+            )
+            .await
             .unwrap();
 
-        // 运行一个 turn 以向 session 添加消息
-        agent.run_turn(AgentInput::text("hello")).await.unwrap();
-        assert!(!agent.session_messages().is_empty());
-
-        agent.clear_session().await.unwrap();
-        assert!(agent.session_messages().is_empty());
+        assert_eq!(summary.turns, 2, "两条 followUp → 两个回合");
+        assert_eq!(summary.last_stop, Some(StopReason::Completed));
+        assert_eq!(summary.last_rounds, 1);
+        assert!(summary.last_message.is_some());
     }
 }

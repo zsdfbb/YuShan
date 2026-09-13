@@ -2,17 +2,16 @@ use super::{Agent, BuildError};
 use std::path::PathBuf;
 use ys_component::RunLimits;
 use ys_core::CancelToken;
-use ys_event::EventSink;
 use ys_loop::{AgentLoop, BasicLoop};
-use ys_model::Model;
-use ys_session::Session;
 use ys_tool::{ApprovalHandler, Tool, ToolRegistry};
 
+/// Agent 的静态组合器。
+///
+/// **ADR-0010**：会话、事件出口与模型**不再**是 agent 的组成——它们归接线器，
+/// 运行时经 [`AgentPorts`](crate::AgentPorts) 传入。故 builder 不含
+/// `.session()` / `.events()` / `.model()`。
 pub struct AgentBuilder {
-    model: Option<Box<dyn Model>>,
     tools: Vec<Box<dyn Tool>>,
-    session: Option<Box<dyn Session>>,
-    events: Option<Box<dyn EventSink>>,
     loop_impl: Option<Box<dyn AgentLoop>>,
     cancel: CancelToken,
     limits: RunLimits,
@@ -25,10 +24,7 @@ pub struct AgentBuilder {
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
-            model: None,
             tools: Vec::new(),
-            session: None,
-            events: None,
             loop_impl: None,
             cancel: CancelToken::new(),
             limits: RunLimits::default(),
@@ -39,23 +35,8 @@ impl AgentBuilder {
         }
     }
 
-    pub fn model(mut self, model: impl Model + 'static) -> Self {
-        self.model = Some(Box::new(model));
-        self
-    }
-
     pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
         self.tools.push(Box::new(tool));
-        self
-    }
-
-    pub fn session(mut self, session: impl Session + 'static) -> Self {
-        self.session = Some(Box::new(session));
-        self
-    }
-
-    pub fn events(mut self, events: impl EventSink + 'static) -> Self {
-        self.events = Some(Box::new(events));
         self
     }
 
@@ -86,9 +67,6 @@ impl AgentBuilder {
     }
 
     pub fn build(self) -> Result<Agent, BuildError> {
-        let session = self.session.ok_or(BuildError::MissingSession)?;
-        let events = self.events.ok_or(BuildError::MissingEvents)?;
-
         let registry =
             ToolRegistry::build(self.tools).map_err(|e| BuildError::ToolRegistry(e.to_string()))?;
 
@@ -101,10 +79,7 @@ impl AgentBuilder {
 
         Ok(Agent::new(
             loop_impl,
-            self.model,
             registry,
-            session,
-            events,
             self.cancel,
             self.limits,
             cwd,

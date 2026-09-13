@@ -151,8 +151,9 @@ pub async fn emit(sink: &mut dyn EventSink, event: AgentEvent) -> Result<(), Eve
 以下是 `docs/design.md` 不变量 + 历次 ADR 的摘要。**新增代码违反任何一条都算设计偏离，需先改设计文档。**
 
 - **依赖方向单向**：`ys-core` ← 组件接口 ← loop/runtime ← 应用适配器
-  - **纯契约层**（`ys-core` / `ys-event` / `ys-channel` / `ys-component`）**不依赖 tokio**（ADR-0012）
-  - **执行层**（`ys-session` / `ys-loop` / `ys-runtime`）可直接依赖 tokio（工具超时、文件 IO）
+  - **`ys-core` / `ys-event` / `ys-channel` 不含 tokio**（直接与间接皆无）—— 它们只装数据与纯 trait
+  - **`ys-component` 不直接依赖 tokio**（自身代码不用 tokio API），但经 `ys-session` **间接**引入（ADR-0012）
+  - `ys-session` / `ys-loop` / `ys-runtime` 可直接依赖 tokio（文件 IO、工具超时）
 - **最小核心**：Runtime 只提供一次 Agent Turn 所需能力；文件系统、Shell、MCP、TUI、记忆、子 Agent 均为可选组件
 - **不做安全**：沙箱、隔离、权限、审批、多租户由上层项目解决；`ToolRegistry` 只按名称查找工具
 - **四者边界不可混淆**：Event 观察「发生了什么」，Hook 决定「下一步怎么处理」，Component 提供能力，Loop 决定推进规则
@@ -179,7 +180,8 @@ pub async fn emit(sink: &mut dyn EventSink, event: AgentEvent) -> Result<(), Eve
 
 | 需要了解... | 阅读... |
 |---|---|
-| 架构全貌、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
+| **架构全貌的图解**（组件关系、数据流、时序） | `docs/architecture.md` |
+| 架构规范、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
 | 术语定义（Turn、Round、StopReason、错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
 | 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle、0009 事件信道异步化、0010 actor 模型（Agent 无状态）、0011 信道设计、0012 运行时依赖边界 |
 | **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/core-channel.md` |

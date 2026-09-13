@@ -217,26 +217,164 @@ tokio::join!(agent.run(ports, &inbox), 消费者(rx))    ← -p/--json 已是这
 
 ---
 
-## 未澄清问题
+## 信道拓扑（本轮 grill 定稿）
 
-- [ ] **Q1（共享层放哪）**：turn 驱动 + 命令桥抽到哪个模块？`gap-closure/context.md:257-273` 曾定 **`ys-tui`** 为「纯渲染消费者 crate」（看归 ys-tui、开归接线器），但本轮把 `repl.rs` 放回 `apps/coding-agent`，**从未提及 `ys-tui`**——该既有决策被静默搁置，需明确存废。
-- [ ] **Q2（两个 feature 的互斥规则）**：`tui-repl` 与 `tui-ratatui` 同时开启时谁生效？`--no-default-features`（两者都关）时 Interactive 应如何？（现状是**直接报错**）
-- [ ] **Q3（`crossterm` 归属）**：REPL 也需要 `crossterm`（键盘增强协议 + 终端尺寸）。它现在挂在 `tui-ratatui` 下，需重新分配 feature。
-- [ ] **Q4（`format.rs` 归属）**：它只被 `ui/draw.rs` 用，客观是 UI 专属。REPL 需要**另写** `print_*`（banner / turn 摘要 / `/status`）。是抽公共的 `format` 还是各写各的？
-- [ ] **Q5（原型归属与判据）**：三项验证（readline 后是否恢复 cooked mode / turn 中 `select!` 能否取消 / 键盘协议在本机终端是否支持）谁做、放哪、结果记到哪？**部分通过**（尤其第 3 项不支持）时是否仍推进？
-- [ ] **Q6（`^C` 的实现位置）**：`^C` 在 turn 中由 `tokio::signal::ctrl_c()` 捕获——但 `readline` 期间 SIGINT 由谁处理？（rustyline 的 `Interrupted`）。两段之间的**边界**需明确，避免「turn 刚开始/刚结束」的窗口漏掉。
-- [ ] **Q7（动画节拍）**：spinner 用 `\r` 原地刷需要定时器。用 `tokio::time::interval` 与 `select!` 组合，还是干脆不做动画（只打印一行 `Working…` 然后等）？
-- [ ] **Q8（两套 UI 的测试策略）**：`tui-ratatui` 的 ~500 行 TestBackend 断言保留；REPL 用「`W: Write` 快照 + 纯函数」测试。二者是否需要共享测试工具？
-- [ ] **Q9（旧 ratatui 资产去留）**：`App.show_status`/`show_footer`/`working_dot`/`exit_document_lines` 等——保留不动（因为 `tui-ratatui` 还在）？确认「不删」的边界。
-- [ ] **Q10（`inquire` 与 rustyline 的终端状态交替）**：`inquire` 内部用 raw mode，rustyline 在 `readline` 期间也用 raw mode。二者交替时终端状态如何保证？（origin 只有一句「真终端正常跑」）
-- [ ] **Q11（键盘协议的异常清理）**：`PushKeyboardEnhancementFlags` 必须在所有退出路径 `Pop`——用 RAII guard？panic hook？（否则污染用户终端）
-- [ ] **Q12（`docs/architecture.md` 与 `gap-closure/context.md` 回改）**：前者仍写 TUI 是「四路 select!」、后者写「TUI 本轮不改」——**均已被推翻**，需同步。
+### 结论：**2 进 + 1 出**
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  UI 线程（REPL / ratatui 各一份）                                     │
+└───────┬──────────────────────────────┬───────────────────────────────┘
+        │                              │
+   入站 A（app 线程，回合边界）      出站（UI 消费）
+   入站 B（BasicLoop，轮边界）
+        │                              ▲
+        ▼                              │
+┌──────────────────────────────────────┴───────────────────────────────┐
+│  app / agent 线程（持 Agent + Wiring + Session）                      │
+│                                                                       │
+│  ① A: Request::{ Prompt | Command | Abort | SetModel | ... }          │
+│     loop { req = A.recv().await; match req { ... } }                  │
+│                       ↑ 这就是 agent 线程的「叫醒」                    │
+│                                                                       │
+│  ② B: Boundary::{ Steer | Abort }                                     │
+│     BasicLoop 轮边界 try_recv()                                       │
+│                                                                       │
+│  ③ 出站: Outbound::{ Event(Envelope) | View(AppView) }                │
+│     ChannelSink.emit()（有界，满则 await = 背压）                     │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### 三条硬约束（每条逼出一个机制，不是设计偏好）
+
+| 边 | 为什么必须独立 |
+|---|---|
+| **① 回合边界入站** | app 线程的「叫醒」。`recv().await` 就是它 |
+| **② 轮边界入站** | **回合跑动时 app 线程阻塞在 `agent.run()` 里，不可能 `recv` ①**；而 `Steer` 要回合**中途**被看到 → 只能由 `BasicLoop` 在轮边界 `try_recv`。合并成一条会互相抢（轮边界拿到一条 `Prompt`，它不知道怎么处理） |
+| **③ 出站** | 生产者/消费者分离 |
+
+### 关键分层：`Command` 与 `Prompt` 的区别
+
+**两者同在 ①（同一个消费者、同一个时机），但语义完全不同**：
+
+- `Prompt` → 转成 `Message` 推入 agent 的输入，**agent 不知道它从哪来**
+- `Command`（`/login` `/model` `/new`）→ **由接线器执行**。它们要 `ProviderRegistry` / `auth.json` / 换 session 文件 —— **全是产品层概念**
+
+> **不能让命令进 agent 的输入队列**，否则等于把产品层塞进 `ys-runtime`。
+> **pi 与 CodeWhale 都避开了**：pi 在 `interactive-mode.ts`（适配层）解析，CodeWhale 在 `commands::execute(cmd, app)`（TUI 侧）。
+
+### 快照必须**推送**，不能请求-响应
+
+UI 若用「发一个 GetView 请求 → 等响应」拿状态，**app 线程在 `run()` 里时无法响应** —— 中途刷新会等到整个回合结束。
+
+**所以 `View` 并入出站 ③（推送）**，不是独立信道，也不是请求-响应。
+
+### 过程中的一次过度分解（记录以免后人误读）
+
+**曾经拆到 5 条信道**（prompt / steer / abort / command / outbound），并把 `CancelToken` 也改成消息。**这是过度分解**：
+
+- 把「**谁消费**」和「**什么时机消费**」两个维度混在一起，导致**同一个消费者（app 线程）被拆成三条**
+- 合并后 `Prompt` 与 `Command` 共享 ① —— 它们**同一个消费者、同一个时机**
+
+### `CancelToken`：口味问题，不是架构问题（更正）
+
+曾论证「Abort 必须是信号，因为走信道延迟不可控」——**该论证错误**：
+
+> 协作式取消**本来就没有即时性**（ADR-0002：只在**步骤边界**生效，最坏延迟 = 单次调用耗时）。
+> `CancelToken` 与「边界信道里的一条消息」**在同一个边界被检查，延迟完全相同**。
+
+**所以两种都行**：
+
+| 做法 | 理由 |
+|---|---|
+| **保留 `CancelToken`**（倾向） | ADR-0002 已定义；"是否被取消"是**布尔状态**，不是事件；跨线程取消的正解 |
+| 改成 `Request::Abort` 消息 | UI 侧更统一（只认信道）；但要用队列模拟标志位，且要修 ADR-0002 |
+
+**折中**（若希望 UI 侧全走信道）：UI 发 `Request::Abort`，**接线器收到后置 `CancelToken`** —— UI 不碰原子，agent 侧保留原语。
+
+### 单出站 = 单消费者（已知边界）
+
+`mpsc` 是 multi-producer **single**-consumer。**现在够用**（`-p`/`--json`/TUI 互斥，一次一个消费者）。
+
+若将来要 **TUI + 日志同时**：
+
+| 做法 | 代价 |
+|---|---|
+| `broadcast` | 慢消费者**丢帧**（`Lagged`） |
+| 每消费者一条信道（扇出） | 生产者 N 次 `send`；**最慢的拖住 agent**（背压） |
+| 一个消费者再分发 | 多一跳延迟 |
+
+### 入站不需要「队列 + 日志」的结合
+
+信道与队列的能力高度重叠（下表）。**入站不需要日志语义**——因为**消费即转移**：
+
+```
+入站（待处理） ──消费 = 转移──► Session（历史，可回看、落 JSONL）
+```
+
+「可回看」由 `Session` 承担，**它才是那个「队列 + 日志」的结合体**（`Vec<Message>` + JSONL + 可回放），且已实现。
+
+| 队列（`Inbox`） | `mpsc` 对应 |
+|---|---|
+| `push(&self, msg)` | `send().await` / `try_send` |
+| `take_steering()`（轮边界非阻塞拉批） | `while let Ok(x) = rx.try_recv()` |
+| `take_followup()`（按 `QueueMode`） | `recv().await`（一条）/ `try_recv` 循环（All） |
+| `close()` | drop 全部 `Sender` |
+| 有界 + 背压 | `mpsc::channel(cap)` |
+
+**队列真正独有的只有「可回看」（peek / 游标 / 多消费者各自视图）**——而那正是 `Session` 的角色。
 
 ---
 
+## 未澄清问题
+
+### 本轮已定
+
+| # | 结论 |
+|---|---|
+| **Q1 ys-tui 存废** | **不建 `ys-tui`**。改：两个独立 UI crate（REPL / ratatui）+ 一个**协议 crate**（`AppView` / `CommandMeta` / 请求 / 出站） |
+| **Q2 feature 规则** | 两个 feature：`tui-repl`（**默认**）/ `tui-ratatui`（保留）。二者同时开启 / 都关时的行为**仍待定** |
+| **协议 crate 定位** | **通用能力平面**（agent 能做什么），不是「UI 专有」。任何 peer 可用 |
+| **线程模型** | **多线程优先，多进程不计划** |
+| **UI ↔ app 传输** | **信道**（2 进 1 出，见上） |
+| **命令执行位置** | **接线器**（不进 agent 队列） |
+| **快照传递** | **出站推送**（不是请求-响应，也不是共享 `Arc`） |
+
+### 仍待决
+
+- [ ] **协议 crate 的名字**（`ys-ui-api` / `ys-presentation` / `ys-ui-proto` / `ys-host-api` 均被提出，未定）
+- [ ] **`Inbox` 废不废**：曾倾向废掉（信道全覆盖），后又收窄为「UI↔接线器走信道、agent 内部保留 `Inbox`」。**未最终拍板**
+- [ ] **`CancelToken` 保留还是信道化**：两种都行（见上「口味问题」），**未拍板**
+- [ ] **两个 feature 同时开启 / 都关时的行为**（现状：`--no-default-features` 直接报错）
+- [ ] **`crossterm` 的 feature 归属**（REPL 也要它做键盘协议）
+- [ ] **`CommandMeta` 放哪**：两个参考都放 UI 侧（纯静态数据 + 补全用），但**会与 app 侧实现漂移**
+- [ ] **快照的更新策略**：全量推 vs 增量折叠（pi-mini 用复制状态折叠）
+- [ ] **出站多消费者**（现在不需要，但要知道边界）
+- [ ] **`format.rs` 归属**（只被 `ui/draw.rs` 用；REPL 需要另写 `print_*`）
+- [ ] **原型归属与判据**（Q5，见下文）
+- [ ] **`^C` 在 `readline`/`turn` 两段的边界**
+- [ ] **`inquire` 与 rustyline 的 raw mode 交替**
+- [ ] **键盘协议异常清理**（RAII guard / panic hook）
+- [ ] **文档回改**：`architecture.md` 的「四路 select!」与 `gap-closure/context.md` 的「TUI 本轮不改」**均已被推翻**
+
 ## 后续建议
 
-1. **先用 `prototype` 验证 Q5 的三件事**（尤其「readline 返回后是否恢复 cooked mode」——它是整个方案的地基；若不过，收益大打折扣）
-2. **再用 `arch-design`** 出方案，重点解 Q1（共享层与 `ys-tui` 存废）、Q2/Q3（feature 切分）、Q4（format 归属）
-3. **`borrow 文档` 的 9 处矛盾**（A–I）建议在进入设计前先修文档，尤其是 **I（`v1 补遗` 不存在）**——悬空引用比没有更糟
-4. **两个真 bug 可独立先修**（与架构无关）
+1. **先用 `prototype` 验证三件事**（尤其「readline 返回后是否恢复 cooked mode」——它是整个方案的地基；若不过，收益大打折扣）
+2. **再进 `arch-design`**，重点解「仍待决」里的四项结构性选择：协议 crate 名、`Inbox` 存废、`CancelToken` 去向、两 feature 的互斥规则
+3. **`borrow 文档` 的 9 处矛盾**（A–I）建议在进入设计前先修，尤其是 **I（`v1 补遗` 不存在）**——悬空引用比没有更糟
+4. **两个真 bug 可独立先修**（与架构无关）：中文退格 panic、补全 popup 从未渲染
+5. **文档回改**：`architecture.md` §TUI 的「四路 select!」与 `gap-closure/context.md` 的「TUI 本轮不改」均已被推翻
+
+### 一条前提失效的提醒
+
+本轮早先的若干论证建立在「**为跨进程做准备**」上（消息必须 serde-able、要评估 RPC 库、`Arc<Mutex>` 出不了进程所以要信道化）。
+
+**「多线程优先，多进程不计划」定下后，这些论据全部失效。**
+
+结论**未变**（仍用信道），但**理由换了**：从「跨进程就绪」变成「**线程间无共享可变状态、消费时机显式**」。
+
+**同时失效的**：
+
+- 「必须 serde-able」—— 同进程不需要序列化（**但保持 serde-able 仍无成本，可留**）
+- 「评估 RPC 库」（tarpc / kameo / jsonrpsee）—— **同进程下价值为零**，且单一 RPC 库只覆盖「一元调用」，覆盖不了「事件推送」。**详见本轮调研：抄 tarpc 的「服务定义与传输解耦」结构，不引实现**
+- 「`Inbox` 的 `Arc<Mutex>` 是跨进程障碍」—— **跨线程完全可用**，这削弱了「废掉 `Inbox`」的理由

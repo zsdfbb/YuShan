@@ -27,11 +27,17 @@ pub struct OpenAICompatibleModel {
 }
 
 impl OpenAICompatibleModel {
+    /// 用默认 client（`reqwest::Client::new()`，遵循进程级/系统代理）构造。
     pub fn new(config: OpenAICompatibleConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        Self::with_client(config, reqwest::Client::new())
+    }
+
+    /// 用调用方提供的 `reqwest::Client` 构造。
+    ///
+    /// 便于注入自定义超时、连接池或代理策略（如测试里 `.no_proxy()` 直连回环），
+    /// 从而不必改进程级 env——避免同一测试二进制内并行执行时相互污染。
+    pub fn with_client(config: OpenAICompatibleConfig, client: reqwest::Client) -> Self {
+        Self { config, client }
     }
 
     /// 发送一次 `/chat/completions` 请求。只负责传输层错误，不解读状态码——

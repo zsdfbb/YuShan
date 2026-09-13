@@ -20,6 +20,15 @@ pub struct RunSummary {
     pub usage: Usage,
     /// 最后一个回合的停止原因；一个回合都没跑时为 `None`。
     pub last_stop: Option<StopReason>,
+    /// 最后一个回合的轮数；一个回合都没跑时为 0。
+    ///
+    /// 供 TUI 的 Summary 行复用（其 `rounds` 语义）；`-p`/`--json` 不读。
+    pub last_rounds: u32,
+    /// 最后一个回合的终态消息；一个回合都没跑时为 `None`。
+    ///
+    /// 供 TUI 在「模型未产文本增量」时兜底追加 assistant 文本（块 C）：
+    /// 增量渲染优先，仅当本回合一个 `ModelTextDelta` 都没收到才回退到它。
+    pub last_message: Option<Message>,
 }
 
 pub struct Agent {
@@ -112,8 +121,16 @@ impl Agent {
                 let result = self
                     .run_one_turn(AgentInput::new(message), Some(inbox))
                     .await?;
-                summary.usage = summary.usage + result.usage;
-                summary.last_stop = Some(result.stop_reason);
+                let RunResult {
+                    stop_reason,
+                    usage,
+                    rounds,
+                    final_message,
+                } = result;
+                summary.usage = summary.usage + usage;
+                summary.last_stop = Some(stop_reason);
+                summary.last_rounds = rounds;
+                summary.last_message = final_message;
             }
         }
     }

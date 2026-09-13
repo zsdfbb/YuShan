@@ -9,6 +9,10 @@ mod state;
 mod status;
 mod view;
 
+/// 测试专用：进程级 env 互斥与恢复，供各模块测试复用。
+#[cfg(test)]
+mod test_env;
+
 #[cfg(feature = "tui-ratatui")]
 mod ui;
 
@@ -18,7 +22,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use ys_channel::{Envelope, Inbox, Intent, LifecyclePolicy};
-use ys_event::{AgentEvent, EventSink, NoopEventSink};
+use ys_event::{AgentEvent, EventSink};
 use ys_loop::AgentInput;
 use ys_model::Model;
 use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
@@ -35,7 +39,7 @@ enum Mode {
     Print(String),
     /// JSON 事件模式：逐行序列化 [`Envelope`]。
     Json(String),
-    /// 交互式 TUI（本轮不改，仍用 [`NoopEventSink`]）。
+    /// 交互式 TUI：用有界信道 [`ChannelSink`] + 增量消费事件做流式渲染（块 C）。
     Interactive,
 }
 
@@ -43,25 +47,6 @@ enum Mode {
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     mode: Mode,
-}
-
-/// 事件出口选择（与消费方式绑定）。抽成纯函数以便单测断言：
-/// `Interactive` 必须用 [`NoopEventSink`]（不消费事件），
-/// `Print`/`Json` 才用有界信道 [`ChannelSink`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SinkChoice {
-    /// 有界信道 + 并发消费（`-p` / `--json`）。
-    Channel,
-    /// 静默丢弃（交互 TUI；事件桥接不在本轮范围）。
-    Noop,
-}
-
-/// 模式 → 事件出口。这是「先定模式 → 选消费者 → 建 agent」的判据。
-fn sink_choice(mode: &Mode) -> SinkChoice {
-    match mode {
-        Mode::Print(_) | Mode::Json(_) => SinkChoice::Channel,
-        Mode::Interactive => SinkChoice::Noop,
-    }
 }
 
 /// 解析 argv（不含 argv[0]）。
@@ -402,25 +387,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 为工具构建 workspace
     let workspace = config.cwd.clone();
 
-    // 「先定模式 → 选消费者 → 建 agent」：sink 选择由模式决定。
-    let choice = sink_choice(&args.mode);
-    match (args.mode, choice) {
-        (Mode::Print(task), SinkChoice::Channel) => {
+    // 「先定模式 → 选消费者 → 建 agent」：三种模式共用有界信道 `ChannelSink`。
+    // TUI 也转为信道消费（块 C）——它必须在 turn 的 select! 里并发收事件，
+    // 否则有界信道撞满即阻塞 agent（死锁）。
+    match args.mode {
+        Mode::Print(task) => {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let mut agent = build_agent(model, system_prompt, workspace, sink)?;
             run_print_mode(&mut agent, rx, task).await?;
         }
-        (Mode::Json(task), SinkChoice::Channel) => {
+        Mode::Json(task) => {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let mut agent = build_agent(model, system_prompt, workspace, sink)?;
             run_json_mode(&mut agent, rx, task).await?;
         }
-        (Mode::Interactive, SinkChoice::Noop) => {
+        Mode::Interactive => {
             // 交互模式——仅 ratatui（tui-stdout 路径已在 c 阶段删除）。
-            // 事件出口仍为 NoopEventSink（TUI 事件桥接不在本轮范围）。
-            let mut agent = build_agent(model, system_prompt, workspace, NoopEventSink)?;
+            // 事件出口为有界信道；接收端交给 ui::run，在 turn 期间增量消费。
+            let (sink, rx) =
+                ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
+            let mut agent = build_agent(model, system_prompt, workspace, sink)?;
             let mut stats = status::TurnStats::default();
 
             #[cfg(feature = "tui-ratatui")]
@@ -431,18 +419,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &command_registry,
                     &mut stats,
                     &mut state_store,
+                    rx,
                 )
                 .await?;
             }
             #[cfg(not(feature = "tui-ratatui"))]
             {
+                let _ = rx;
                 return Err(
                     "ratatui mode required for interactive TUI; build with --features tui-ratatui"
                         .into(),
                 );
             }
         }
-        _ => unreachable!("sink_choice 与 mode 必须一一对应"),
     }
 
     Ok(())
@@ -680,16 +669,7 @@ mod tests {
         assert!(text.contains("ModelTextDelta"), "text = {text}");
     }
 
-    /// 10. **M5**：`Interactive` 模式必须用 `NoopEventSink`（不消费事件）；
-    ///     `Print`/`Json` 才用有界信道 `ChannelSink`。
-    #[test]
-    fn interactive_mode_uses_noop_sink() {
-        assert_eq!(sink_choice(&Mode::Interactive), SinkChoice::Noop);
-        assert_eq!(sink_choice(&Mode::Print("x".into())), SinkChoice::Channel);
-        assert_eq!(sink_choice(&Mode::Json("x".into())), SinkChoice::Channel);
-    }
-
-    /// 11. 容量 clamp：过小容量被抬到下限；正常容量不动。
+    /// 10. 容量 clamp：过小容量被抬到下限；正常容量不动。
     #[test]
     fn channel_capacity_is_clamped_to_floor() {
         assert_eq!(clamp_capacity(1), MIN_CHANNEL_CAPACITY);

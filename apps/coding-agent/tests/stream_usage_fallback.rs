@@ -9,7 +9,10 @@
 //! 2. 严格校验的端点若因该字段返回 400，则剥掉该字段**只重试一次**，请求成功但
 //!    本次 usage 为 0；若请求本来就没带该字段，则 400 直接失败、不重试。
 //!
-//! 本地 mock 只需回环地址，运行前需绕过代理（见各测试里注入的 `NO_PROXY`）。
+//! 本地 mock 只需回环地址，运行前需绕过代理：子进程测试经 `Command` 的
+//! per-child `.env()` 注入（不碰父进程 env）；进程内测试用 `reqwest::Client`
+//! 的 `.no_proxy()` 直连，均不改写进程级环境变量——避免同一测试二进制内
+//! 并行执行时互相污染。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -128,6 +131,12 @@ fn serve_once(
     emit_usage: bool,
     bodies: &Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
+    // 监听 socket 是非阻塞的（accept 轮询 stop 标志需要）。在 macOS/BSD 上
+    // `accept()` 返回的连接**会继承**监听 socket 的 O_NONBLOCK，导致下面的
+    // `set_read_timeout` 被忽略、`read` 在客户端字节到达前就返回 EAGAIN——
+    // mock 随即断开连接，客户端报 "connection closed before message completed"。
+    // 显式复位为阻塞模式，让 `set_read_timeout` 真正生效。
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
     // 读头部直到 \r\n\r\n
@@ -363,17 +372,13 @@ impl ModelEventSink for NullSink {
 ///    遇到 400 → 直接失败、**不重试**（只发 1 次请求）。
 #[tokio::test]
 async fn no_fallback_when_request_lacks_stream_options() {
-    // 回环无代理：reqwest 读进程级代理环境变量，先清掉。
-    unsafe {
-        std::env::remove_var("HTTP_PROXY");
-        std::env::remove_var("HTTPS_PROXY");
-        std::env::remove_var("ALL_PROXY");
-        std::env::remove_var("http_proxy");
-        std::env::remove_var("https_proxy");
-        std::env::remove_var("all_proxy");
-        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-        std::env::set_var("no_proxy", "127.0.0.1,localhost");
-    }
+    // 回环无代理：用 per-client `.no_proxy()` 绕过代理，**不改进程级 env**。
+    // 改写进程 env（set_var/remove_var）会与同 binary 内并行测试的 env 读取
+    // （含 `Command` 继承 env 时的 `environ` 读取）产生数据竞争，属必须消除的隐患。
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build no-proxy client");
 
     // 端点一律 400；本次请求不含 stream_options，故不触发回退。
     let server = MockServer::start(MockConfig {
@@ -382,14 +387,17 @@ async fn no_fallback_when_request_lacks_stream_options() {
         emit_usage: false,
     });
     // minimax 兼容层：supports_stream_usage = false。
-    let model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
-        api_base: server.api_base(),
-        api_key: "k".into(),
-        model: "m".into(),
-        max_tokens: None,
-        temperature: None,
-        compat: ProviderCompat::minimax(),
-    });
+    let model = OpenAICompatibleModel::with_client(
+        OpenAICompatibleConfig {
+            api_base: server.api_base(),
+            api_key: "k".into(),
+            model: "m".into(),
+            max_tokens: None,
+            temperature: None,
+            compat: ProviderCompat::minimax(),
+        },
+        client,
+    );
 
     let result = model.complete(ModelRequest::default(), &mut NullSink).await;
     assert!(result.is_err(), "400 应直接失败，而不是回退成功");

@@ -31,53 +31,15 @@ pub fn dim(s: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::test_env::{EnvRestore, env_lock};
     use std::env;
-    use std::sync::{Mutex, OnceLock};
 
-    /// 进程级锁，用于修改 `NO_COLOR` 环境变量的测试。
-    /// 防止并行测试竞争（Rust 默认并行运行测试）。
-    /// 通过 `crate::ansi::tests::env_lock` 跨模块共享——必须是
-    /// 单一 static，使所有测试在同一 mutex 上串行。
-    pub fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    /// 辅助：为测试作用域设置 NO_COLOR；结束时恢复。
-    /// 在 guard 存活期内持有 `env_lock()`，使并发环境变量修改
-    /// 不会与本测试竞争。
-    struct NoColorGuard {
-        previous: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl NoColorGuard {
-        fn new() -> Self {
-            let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-            let previous = env::var_os("NO_COLOR");
-            unsafe {
-                env::set_var("NO_COLOR", "1");
-            }
-            NoColorGuard { previous, _lock }
-        }
-    }
-    impl Drop for NoColorGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => unsafe {
-                    env::set_var("NO_COLOR", v);
-                },
-                None => unsafe {
-                    env::remove_var("NO_COLOR");
-                },
-            }
-        }
-    }
-
-    /// 持有 env lock 且未设置 NO_COLOR 时执行闭包。
+    /// 持有统一 env 锁且未设置 NO_COLOR 时执行闭包。
     fn with_color_enabled<F: FnOnce()>(f: F) {
-        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&["NO_COLOR"]);
         unsafe {
             env::remove_var("NO_COLOR");
         }
@@ -129,7 +91,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_no_color_env_disables_codes() {
-        let _g = NoColorGuard::new();
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&["NO_COLOR"]);
+        unsafe {
+            env::set_var("NO_COLOR", "1");
+        }
         assert_eq!(green("plain"), "plain");
         assert_eq!(yellow("plain"), "plain");
         assert_eq!(red("plain"), "plain");

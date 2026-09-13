@@ -69,6 +69,28 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{EnvRestore, env_lock};
+
+    /// `Config::from_env` 读取的 API 凭证相关环境变量。
+    const API_ENV_KEYS: &[&str] = &[
+        "YUSHAN_API_BASE",
+        "YUSHAN_API_KEY",
+        "OPENAI_API_BASE",
+        "OPENAI_API_KEY",
+    ];
+
+    /// 清空 [`API_ENV_KEYS`]，返回 Drop 时自动恢复原值的 guard。
+    /// 调用方必须先持有 [`env_lock`]。
+    fn clear_api_env() -> EnvRestore {
+        let env = EnvRestore::capture(API_ENV_KEYS);
+        // SAFETY: 调用方持有 env_lock，独占这些变量的修改与恢复。
+        unsafe {
+            for key in API_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+        }
+        env
+    }
 
     // 测试用的 dummy model
     struct DummyModel;
@@ -89,13 +111,8 @@ mod tests {
 
     #[test]
     fn test_config_from_env_no_vars() {
-        // 清空任何已存在的环境变量
-        unsafe {
-            std::env::remove_var("YUSHAN_API_BASE");
-            std::env::remove_var("YUSHAN_API_KEY");
-            std::env::remove_var("OPENAI_API_BASE");
-            std::env::remove_var("OPENAI_API_KEY");
-        }
+        let _guard = env_lock();
+        let _env = clear_api_env();
 
         let config = Config::from_env().unwrap();
         assert!(!config.is_configured());
@@ -105,12 +122,8 @@ mod tests {
 
     #[test]
     fn test_config_model_factory() {
-        unsafe {
-            std::env::remove_var("YUSHAN_API_BASE");
-            std::env::remove_var("YUSHAN_API_KEY");
-            std::env::remove_var("OPENAI_API_BASE");
-            std::env::remove_var("OPENAI_API_KEY");
-        }
+        let _guard = env_lock();
+        let _env = clear_api_env();
 
         let mut config = Config::from_env().unwrap();
         assert!(config.build_model().is_none());
@@ -136,6 +149,8 @@ mod tests {
 
     #[test]
     fn test_config_current_compat() {
+        // from_env 会读 API_ENV_KEYS，与改写这些 key 的测试共享同一把锁。
+        let _guard = env_lock();
         let mut config = Config::from_env().unwrap();
         config.provider = Some("deepseek".into());
         let compat = config.current_compat();
@@ -144,6 +159,7 @@ mod tests {
 
     #[test]
     fn test_config_current_compat_unknown() {
+        let _guard = env_lock();
         let config = Config::from_env().unwrap();
         // 未设置 provider -> "custom" -> standard
         let compat = config.current_compat();
@@ -153,6 +169,8 @@ mod tests {
 
     #[test]
     fn test_startup_recovery_from_auth() {
+        let _guard = env_lock();
+
         // 准备一个含 deepseek 凭证的临时 auth.json
         let dir = std::env::temp_dir().join("yushan_test_startup_recovery");
         let _ = std::fs::remove_dir_all(&dir);
@@ -173,12 +191,7 @@ mod tests {
         .unwrap();
 
         // 用无环境变量（未配置）的方式创建 Config
-        unsafe {
-            std::env::remove_var("YUSHAN_API_BASE");
-            std::env::remove_var("YUSHAN_API_KEY");
-            std::env::remove_var("OPENAI_API_BASE");
-            std::env::remove_var("OPENAI_API_KEY");
-        }
+        let _env = clear_api_env();
 
         let mut config = Config::from_env().unwrap();
         config.registry.set_auth_override(auth_path);

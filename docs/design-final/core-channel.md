@@ -97,6 +97,16 @@
 - review 判定为「没做完」而非「有意推迟」（计划只推迟 `/new` 命令层），遂补做接线：`-p`/`--json` 构造 `Inbox` + `push(FollowUp)` + `agent.run(&inbox)`，turn 从 1 起。
 - **验证**：`main.rs::run_via_inbox_sets_turn_from_one`；反证——改回 `run_turn` 则退回 0。
 
+### 2.9 流式本体（后续块 A）：未加 `ModelEvent::ToolCallDelta`
+
+> 本节记录第一刀之后补做的「流式本体」（流式计划块 A），归入同一份 as-built。
+
+- **设计原貌**：`design-core-channel.md`「流式粒度」曾设想 `ModelEvent` 增 `ToolCallDelta { index, id?, name?, arguments_delta }`，与 `ThinkingDelta` 并列。
+- **实际**：只加 `ThinkingDelta`；**不加 `ToolCallDelta`**。工具参数增量在适配器内部按 `index` 分组累积（`ToolCallAccumulator`，`arguments` 为 JSON 字符串片段拼接），流结束后一次性产出完整 `ContentBlock::ToolUse`。
+- **理由**：设计已定「**工具参数不冒泡**到 `AgentEvent`」——没有任何 `AgentEvent` 与之对应。若仍把 `ToolCallDelta` 做成 `ModelEvent` 变体，`Forwarder` 的 `_ => Ok(())` 兜底会静默吞掉它，它就是一个**无人消费的 dead variant**。与其留空壳，不如把组装完全关在适配器内（那里才拿得到 `index` 顺序与分片语义），职责更内聚。
+- **同批落地**：请求 `stream: true`；`parse_sse_stream` 从「返回缓冲 `Vec`」改为**边解析边回调**（可测核心 `feed_sse_bytes` 支持跨 chunk 行边界；缓冲为**字节级** `Vec<u8>`，只在字节层面切出完整行后才做 UTF-8 解码，避免多字节字符被 TCP 分片切在中间时损坏）；`TextDelta` / `ThinkingDelta` 实时冒泡（thinking 仅在 `ProviderCompat::has_reasoning_content` 为真时）；`usage` 由 `ProviderCompat::supports_stream_usage` 门控——**默认开启**（`standard()` 与 `Default` 均如此，故 env-var 配置落到 `custom` 时 token 统计正确），请求携带 `stream_options.include_usage` 并在流末包取 `usage`；若严格校验的端点因该字段返回 **HTTP 400**，适配器剥掉 `stream_options` **只重试一次**（stderr 打明确警告、本次 `usage` 退回 `Usage::default()`），故「安全」与「统计完整」兼顾；仅显式关闭者（`minimax()`，其兼容层放行行为未经验证）不带该字段、直接退回 `Usage::default()`。
+- **验证**：`ys-model-openai-compat::stream::tests::feed_sse_bytes_*`（分片/多行/`[DONE]`/非 JSON/`reasoning_content`/`data:` 无空格前缀/末包缺 `delta`）、`tests::feed_sse_bytes_preserves_multibyte_utf8_split_across_chunks`（多字节 UTF-8 被切在字符中间，断言无 U+FFFD）、`tests::streamed_text_deltas_concatenate_to_final_text_byte_for_byte`（增量拼接 == 终态，逐字节）、`tests::tool_call_deltas_assemble_into_one_tool_use`（多片 → 一个完整 `ToolUse`）、`ys-loop::basic::tests::forwarder_maps_thinking_delta_to_agent_event`。端到端本地 SSE mock：`--json` 输出 3 条 `ModelTextDelta`，`-p` 在 0.21/0.41/0.62s 分三次写出（真增量）。**usage 门控修复**：`ys-model-openai-compat::compat::tests::standard_enables_stream_usage`（`standard()`/`Default` 默认 true）、`ys-coding-agent::provider::tests::test_compat_mapping`（custom/未知 → true）；端到端 `tests/stream_usage_fallback.rs`——env-var 配置＋容忍该字段的 mock 拿回 `usage {input:11, output:7}`；对带 `stream_options` 的请求返 400 的 mock 触发一次性回退（exit 0、有警告、重试请求不含该字段、`usage` 为 0）；不带该字段却遇 400 则直接失败、只发 1 次请求。
+
 ## 3. 最终 API 清单（各 crate 公开面）
 
 ### `ys-event`（契约层，无 tokio 生产依赖）
@@ -254,7 +264,6 @@ impl Agent {
 
 | 未做项 | 状态与归属 |
 |---|---|
-| **流式本体**：`ModelEvent` 的 `ToolCallDelta` / `ThinkingDelta`、SSE 边解析边推、请求 `stream: true` | 独立后续项（设计迁移步 6）；当前 `stream: false`，每次响应只发 1 个 `ModelTextDelta`，`-p` 的多增量路径仅有单测模拟 |
 | **TUI 增量渲染** | 未做；TUI 仍 `NoopEventSink` + `run_turn`（无 turn 语义、无事件消费） |
 | **`/new` 命令层**（换 Session + 新空 Inbox，pending 丢弃） | 留迁移步 5；契约已在 `Agent::run` 文档注释标注，命令层未实现 |
 | **ADR-0010 所有权收敛**（session/events 移出 `Agent`、`CommandContext` 不再持 `&mut Agent`） | 留迁移步 5，与信道解耦 |

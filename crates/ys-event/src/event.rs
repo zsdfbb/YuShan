@@ -11,6 +11,11 @@ pub enum AgentEvent {
     ModelTextDelta {
         text: String,
     },
+    /// 模型思考内容增量（`reasoning_content`）。由 `Forwarder` 从
+    /// `ModelEvent::ThinkingDelta` 映射而来。
+    ModelThinkingDelta {
+        text: String,
+    },
     ToolCall {
         call: ToolCall,
     },

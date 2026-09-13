@@ -29,6 +29,10 @@ impl<'a> ModelEventSink for Forwarder<'a> {
                 let _ = self.sink.try_emit(AgentEvent::ModelTextDelta { text });
                 Ok(())
             }
+            ModelEvent::ThinkingDelta { text } => {
+                let _ = self.sink.try_emit(AgentEvent::ModelThinkingDelta { text });
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -463,4 +467,55 @@ async fn generate_summary(
         }
     }
     Ok(String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ys_event::{AgentEvent, CollectingSink};
+
+    /// A3：`ModelEvent::ThinkingDelta` 经 `Forwarder` 冒泡为
+    /// `AgentEvent::ModelThinkingDelta`；`TextDelta` 路径不变。
+    #[test]
+    fn forwarder_maps_thinking_delta_to_agent_event() {
+        let mut sink = CollectingSink::new();
+        {
+            let mut forwarder = Forwarder { sink: &mut sink };
+            forwarder
+                .emit(ModelEvent::ThinkingDelta { text: "hmm".into() })
+                .unwrap();
+            forwarder
+                .emit(ModelEvent::TextDelta { text: "hi".into() })
+                .unwrap();
+        }
+        assert_eq!(sink.events().len(), 2);
+        assert!(
+            matches!(&sink.events()[0], AgentEvent::ModelThinkingDelta { text } if text == "hmm")
+        );
+        assert!(matches!(&sink.events()[1], AgentEvent::ModelTextDelta { text } if text == "hi"));
+    }
+
+    /// 向后兼容：不产 `ThinkingDelta` 的 model（如 `MockModel`）行为不变，
+    /// 不会凭空产生 `ModelThinkingDelta`。
+    #[test]
+    fn forwarder_backward_compatible_without_thinking_delta() {
+        let mut sink = CollectingSink::new();
+        {
+            let mut forwarder = Forwarder { sink: &mut sink };
+            forwarder
+                .emit(ModelEvent::TextDelta { text: "a".into() })
+                .unwrap();
+            forwarder
+                .emit(ModelEvent::TextDelta { text: "b".into() })
+                .unwrap();
+        }
+        assert_eq!(sink.events().len(), 2);
+        assert!(
+            sink.events()
+                .iter()
+                .all(|e| matches!(e, AgentEvent::ModelTextDelta { .. })),
+            "events = {:?}",
+            sink.events()
+        );
+    }
 }

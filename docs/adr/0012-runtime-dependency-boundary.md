@@ -24,8 +24,11 @@ CLAUDE.md 的硬约束原话是「**`agent-core`** 不依赖 Tokio、HTTP、数�
 
 **真正的边界是：纯契约层不得依赖运行时；执行层可以。**
 
-1. **保持运行时无关**（硬约束，不得违反）：`ys-core`、`ys-event`、`ys-channel`、`ys-component`。
-   判据：这些 crate 装的是**数据、枚举、纯 trait**——任何一处引入 tokio 都属偏离。
+1. **不直接依赖运行时**（硬约束，不得违反）：`ys-core`、`ys-event`、`ys-channel`、`ys-component`。
+   判据：这些 crate **自身的代码不使用 tokio API**——它们装的是数据、枚举、纯 trait。
+   **精确化（实施期回改）**：`ys-component` 虽不直接声明 tokio，但**经 `ys-session` 间接引入**
+   （`RuntimeContext` 持有 `&mut dyn Session`，而 `ys-session` 用 `tokio::fs`）。
+   真正「直接与间接皆无 tokio」的是 `ys-core` / `ys-event` / `ys-channel` 三者。
 2. **允许依赖 tokio**：`ys-session`、`ys-loop`、`ys-runtime`、`apps/*`。
    理由：工具超时需要定时器、JSONL 需要异步文件 IO，二者都**没有运行时无关的实现**（Rust 的异步 IO/定时器本质上是 runtime 提供的）。项目当前 tokio-only，为假想的多运行时支持付费不划算。
 

@@ -1,7 +1,7 @@
 # Coding Agent TUI — 设计
 
 > **ratatui 定死**（不再讨论）；本文描述它**长什么样**与**作为独立 crate 的形态**。
-> 前置：`../tui-repl/context.md`（**已反转**：那份文档描述的是行式 REPL，其中除"作废清单"外的架构结论仍有效）
+> 前置：`../tui-repl/context.md`（**已反转**：那份文档描述的是行式 REPL。其中与 UI 库无关的架构结论 —— 协议、信道拓扑、命令分类、快照推送、`CancelToken` 移除 —— **已全部并入本文**，该文件其余部分作废待归档）
 > `../gap-closure/context.md`（产品定位）、`../tui-pi-codewhale-borrow/design.md`（借鉴对照）
 
 ## 0. 定位
@@ -114,11 +114,13 @@ turn 中：⏳ Working· · ↑1.2k ↓345 · 2 轮 · 1m23s
 | 作废 | 原因 |
 |---|---|
 | `inquire` 依赖 | 由 TUI 浮层选择器取代 |
-| `Prompter` trait + `InquirePrompter` + `FakePrompter` | 那套抽象是为 inquire 的**可测试性**而建；没有 inquire 就不需要 |
+| **`InquirePrompter`**（`builtin.rs:6`） | 包装 inquire → 由 TUI 浮层选择器取代。**但 `Prompter` trait 与 `FakePrompter` 保留**（见下注） |
 | `suspend_terminal` / `resume_terminal`（`ui/mod.rs:109-141`） | 无外部交互程序要与 alt-screen 让位 |
 | `ec5e57c` 那次修 bug 的整个机制 | 同上 |
 
-> **注**：`Prompter` 的**测试价值**（命令决策逻辑可单测）**不能一起丢**。它的替代是"TUI 内选择器"的**可测接口**——把选择器的"喂答案 + 记录"抽出来（形态待定）。
+> **注（修正一处早先说错的）**：`Prompter` trait **不是**随 inquire 一起作废 —— 它的 `select`/`text` 正是「选择器可测」的答案：
+> **TUI 浮层实现它**（新）、**`FakePrompter` 实现它**（保留，测试注入）。命令决策逻辑照样单测。
+> **死的只是 `InquirePrompter`。**
 
 ---
 
@@ -148,13 +150,100 @@ turn 中：⏳ Working· · ↑1.2k ↓345 · 2 轮 · 1m23s
 
 ### 作废
 
-- `inquire` / `Prompter` / `suspend` / `resume`（见 §3）
+- `inquire` / `InquirePrompter` / `suspend` / `resume`（见 §3）
 - **`ansi.rs`（105 行，死代码）**：生产零消费者
 - **`format.rs` 的现状**：只剩 `format_tokens`，且唯一消费者是 `ui/draw.rs`
 
 ---
 
-## 5. 作为独立 crate 的形态（**定稿：路线 B**）
+## 5. 输出与诊断的去处（解 review R2）
+
+**14 处生产 `eprintln!`** 在新拓扑下**都会冲掉 TUI 屏幕**。按**时机**三分：
+
+| 时机 | 内容 | 去处 |
+|---|---|---|
+| **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
+| **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" | **`Outbound::Output`** → transcript |
+| **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** |
+
+### 14 处逐条归属
+
+| 位置 | 内容 | 去处 |
+|---|---|---|
+| `main.rs:146` | 容量 clamp 警告 | 启动期 → **stderr** |
+| `main.rs:239-244` | `No model configured` + 提示 | 启动期（`-p`/`--json` 路径）→ **stderr** |
+| `main.rs:279` | `--stats` 背压读数 | 非 TUI 模式的设计行为 → **stderr** |
+| `provider.rs:132` | `failed to parse auth.json` | 库内部（`load_auth`，**启动期**）→ **日志** |
+| `state.rs:36` | `failed to parse state.json` | 库内部（`load`，**启动期**）→ **日志** |
+| `builtin.rs:306` | `Could not persist credentials` | 命令期间 → **`Output`** |
+| `builtin.rs:321` | `Could not build model` | 命令期间 → **`Output`** |
+| `builtin.rs:342` | `Could not persist state` | 命令期间 → **`Output`** |
+| `builtin.rs:376` | `Could not remove persisted credentials` | 命令期间 → **`Output`** |
+
+> **只有 2 处（`provider.rs` / `state.rs`）严格需要日志文件** —— 其余靠「启动期 stderr / 命令期 `Output`」就够。
+> 日志文件的价值是**通用兜底**：TUI 应用没有"历史输出"可看，诊断得有个落处。
+
+### 日志文件
+
+```
+~/.yushan/logs/yushan.log     追加写，best-effort（写失败不影响运行）
+```
+
+**机制**：v1 手写一个极小 logger（打开追加、带时间戳、忽略错误），**不引新依赖** —— 只有 2 个调用点，用 `tracing` 是杀鸡用牛刀。将来若需要分级/结构化，再换。
+
+> ⚠ **`/compact` 的 `generate_summary` 失败**也会产生一条诊断（`basic.rs`），它属"命令期间"还是"自动压缩期间"取决于触发者 —— 归入 `Output`（对显式 `/compact`）/ 日志（对自动压缩）。
+
+---
+
+## 6. 协议形状（解 review R3）
+
+```rust
+// ys-protocol
+pub enum Request {
+    Prompt(Message),                                 // → agent 的输入
+    SetModel { model: String },
+    Login { provider: String, api_key: String },
+    Logout,
+    NewSession,
+    Compact,
+    Export { path: PathBuf },
+}
+
+pub enum Boundary {
+    Steer(Message),                                  // 轮边界注入
+    Abort,                                           // 取代 CancelToken
+}
+
+pub enum Outbound<V> {
+    Event(Envelope),                                 // 事件（已封壳）
+    View(V),                                         // 快照（产品视图 V）
+    Output(String),                                  // 命令输出 → transcript
+    Quit,
+}
+```
+
+**没有 `Diagnostic` 变体** —— 命令期间的用户可见诊断走 `Output`；库内部诊断走日志文件（见 §5）。
+
+### 命令 → 能力的映射（**表在 TUI 侧**）
+
+| 命令 | TUI 做什么 | 发给 app |
+|---|---|---|
+| `/help` | 本地打印命令表 | — |
+| `/status` | 本地（`CodingView` 在 TUI 手里） | — |
+| `/copy` | 本地（最后一条回复在 transcript） | — |
+| `/quit` | 本地 | — |
+| `/model [name]` | 无参时**浮层选择** | `SetModel` |
+| `/login` | **问 provider / api_key**（`Prompter`） | `Login` |
+| `/logout` | — | `Logout` |
+| `/new` | — | `NewSession` |
+| `/compact` | — | `Compact` |
+| `/export [path]` | — | `Export`（会话文件在 app 侧） |
+
+**为何表在 TUI 侧**：命令的**用户可见行为**（提示什么、问什么）归 UI；**能力实现**归 app。漏实现是**编译错误**（`Request` 变体必须 match），不会静默漂移。
+
+---
+
+## 7. 作为独立 crate 的形态（**定稿：路线 B**）
 
 **路线 B** = 拆 crate + 分线程 + 信道 + `ys-protocol`。
 
@@ -214,7 +303,7 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 
 ---
 
-## 6. 决策汇总与未决
+## 8. 决策汇总与未决
 
 ### 结构（路线 B）
 
@@ -237,21 +326,21 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 |---|---|
 | 布局 | 三 pane 自上而下：Chat(`Min`) / Input(`1..N`) / **Status(`1`，最底)** |
 | 对话区 | assistant 正常 wrap；**工具调用压一行**，结果默认不展开 |
+| **工具结果** | v1 **不做交互式展开**；但**失败的工具显示结果首行**（成功只给 ✓）——「看不到任何结果」是真损失，而失败时最需要看 |
 | 补全 | **浮层**盖在 Chat 上；数据早已齐全（`arg_hint`） |
-| slash 命令 | **全在 TUI 内**（废弃 inquire / `Prompter` / suspend / resume） |
+| slash 命令 | **全在 TUI 内**；废弃 `inquire` 与 `InquirePrompter`，**保留 `Prompter` trait**（换 TUI 实现 + `FakePrompter`） |
 | 输入 | 多行（Shift/Alt+Enter）+ bracketed paste + 高度自适应 |
 | thinking | 默认隐藏 + `/thinking on` 开关（暗色渲染） |
-| 状态行 | `model · ↑↓tokens · 轮数 · 时长`，窄屏尾部剥 |
+| 状态行 | `model · ↑↓tokens · 轮数 · 时长`，窄屏尾部剥；**turn 中把 model 段换成 `⏳ Working·`** |
+| 输出与诊断 | 启动期 → stderr；命令期 → `Outbound::Output`；库内部 → `~/.yushan/logs/yushan.log`（见 §5） |
+| 退出 | **保留** `restore_terminal` 那套（alt-screen 仍在） |
+| `Envelope.source` | **保留**（多 agent 占位，不占成本） |
+| crate 位置 | **`crates/ys-tui-coding/`**（与 `ys-protocol` 平级；`apps/` 留给接线器） |
+| 文档收尾 | `tui-repl/context.md` 的架构结论**已并入本文**，该文件作废待归档 |
 
-### 未决
+### 未决（只剩三条）
 
-- [ ] **crate 放哪**（`crates/ys-tui-coding/` vs `apps/`）—— 倾向 `crates/`，与 `ys-protocol` 平级
-- [ ] **状态行的 turn 中形态**：`⏳ Working·` 与状态字段并存还是替换 model 段
-- [ ] **工具展开的触发方式**：按键（回车/空格）？命令？还是不展开
-- [ ] **浮层选择器的可测接口**（替代 `Prompter` 的测试价值）—— 这是**不能丢**的
-- [ ] **`CodingView` 的字段清单**（含 `ToolCallId → ToolCall` 映射，供结果回填）
-- [ ] **`ys-protocol` 的 `Source` / 多 agent 预留**：`Envelope.source` 是否迁进协议
-- [ ] **退出时打印完整对话**：alt-screen 仍在 → `restore_terminal` 那套（~60 行）**保留**
-- [ ] **两个真 bug**（中文退格 panic / 补全 popup 未渲染）与重构的先后 —— 可独立先修，但会落在将被重写的代码上
-- [ ] **`tui-repl/context.md` 的收尾**：其中「存活」的架构结论已并入本文；该文件其余部分作废，是否归档
+- [ ] **`CodingView` 的字段清单**（含 `ToolCallId → ToolCall` 映射，供工具结果回填）—— 可在写 exec-plan 时一次给出
+- [ ] **接线器 app 侧循环的形状**（review R4）—— 它是现有 `select!` 的**重写**：何时 `recv` ①（空闲才收）、如何驱动 `turn_fut`、如何把事件转成 `Outbound`、`CommandError` 怎么回给 UI。**这是设计还差的一块**
+- [ ] **两个真 bug 与重构的先后** —— 可独立先修（半小时量级），但会落在**将被重写**的 `ui/` 上；倾向「随手在重构里修掉」
 

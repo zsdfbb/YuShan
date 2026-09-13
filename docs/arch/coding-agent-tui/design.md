@@ -154,29 +154,104 @@ turn 中：⏳ Working· · ↑1.2k ↓345 · 2 轮 · 1m23s
 
 ---
 
-## 5. 作为独立 crate 的形态
+## 5. 作为独立 crate 的形态（**定稿：路线 B**）
+
+**路线 B** = 拆 crate + 分线程 + 信道 + `ys-protocol`。
 
 ```
-crates/ys-tui-coding/           ← 或 apps/ 下（待定）
-   依赖：ys-protocol（协议）+ ratatui + crossterm
-   NOT：ys-runtime（不认识 Agent）
-   暴露：run(初始快照) + 收发信道（沿用 2 进 1 出，见 tui-repl/context.md）
+ys-protocol          通用能力面：Request / Boundary / Outbound<V>    ← 所有产品共用
+ys-tui-coding        CodingView（自己定义）+ ratatui 渲染/输入/补全    ← 本文描述的 crate
+ys-tui-invest        InvestView + 自己的渲染                         ← 将来的第二个
+apps/coding-agent    接线器：构造 CodingView、实现 app 侧循环、驱动 agent
 ```
 
-**边界纪律**：UI **不新增**对 `ys-runtime` 的依赖；要说话时用协议（`ys-protocol`）。
+依赖方向（单向、无环）：
 
-**待定**：放 `crates/` 还是 `apps/`（它是产品专属的，不是通用组件）。
+```
+ys-protocol ──► ys-tui-coding ──► apps/coding-agent
+     ▲                                    │
+     └────────────────────────────────────┘
+        （app 也依赖 ys-protocol，用同一套类型）
+```
+
+### 为什么「拆 crate ⇒ 必须分线程」
+
+`ys-tui-coding::run()` **阻塞在它自己的事件循环里**，且它**不认识 `Agent`**（否则拆 crate 没意义 —— 编译器边界形同虚设）。
+
+→ **agent 不能在 `run()` 里跑，必须在另一个线程。**
+（反向也成立：保持单线程 `select!` ⇔ 保持 `ui/` 模块。）
+
+### 视图类型归**产品 TUI crate**
+
+`CodingView` 定义在 `ys-tui-coding`，**不放进 `ys-protocol`**。理由：
+
+- 它是「**UI 想显示什么**」的定义 —— UI 自己的事
+- 各产品不同（coding：provider/tokens/tools/session；投资：净值/持仓/标的）
+- `apps/coding-agent` 依赖 `ys-tui-coding` 来**构造**它（app 本就依赖该 crate 以调 `run()`）
+
+所以 `ys-protocol` 里的 `Outbound<V>` 是**泛型**的 —— 通用壳 + 产品视图。
+
+### 三条信道（`CancelToken` 已废，`Abort` 并入 ②）
+
+| 信道 | 类型 | 方向 | 谁在什么时机消费 |
+|---|---|---|---|
+| **① Request** | `ys_protocol::Request` | UI → app | app 线程 `recv().await`（回合边界） |
+| **② Boundary** | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界** `try_recv`（`Steer` + `Abort`） |
+| **③ Outbound** | `ys_protocol::Outbound<V>` | app → UI | UI 事件循环 `recv().await` |
+
+**② 必须独立于 ①**：回合跑动时 app 线程阻塞在 `agent.run()` 里，不可能 `recv` ①；而 `Steer`/`Abort` 要**中途**被看到 → 只能由 `BasicLoop` 在轮边界拉。
+
+### 边界纪律
+
+- `ys-tui-coding` **不依赖 `ys-runtime`**（不认识 `Agent`）
+- 要说话时用 `ys-protocol` 的类型 + 收发句柄
+- **这是编译器强制的**（crate 边界），不靠自觉
+
+### 待定
+
+- **crate 放哪**：`crates/` 还是 `apps/coding-agent-tui/`（它是产品专属的，不是通用组件 —— 倾向前者放 `crates/` 以便与 `ys-protocol` 平级）
+
 
 ---
 
-## 6. 未决 / 后续
+## 6. 决策汇总与未决
 
-- [ ] **状态行的 turn 中形态**：`⏳ Working·` 与状态字段并存还是替换掉 model 段
+### 结构（路线 B）
+
+| 项 | 结论 |
+|---|---|
+| UI 形态 | **拆 crate**：`ys-tui-coding`，**不依赖 `ys-runtime`** |
+| 线程 | **2 个**：UI 线程（`run()` 阻塞在自己的循环里）+ app/agent 线程 |
+| 信道 | **三条**：① Request（回合边界）/ ② Boundary（轮边界）/ ③ Outbound |
+| `ys-protocol` | **必需** —— 通用能力面：`Request` / `Boundary` / `Outbound<V>` |
+| 视图类型 | **`CodingView` 归 `ys-tui-coding`**（不进协议；各产品不同） |
+| `CancelToken` | **移除**；`Abort` 并入 ② |
+| `Envelope.turn` | 保留 |
+
+> **「拆 crate ⇒ 必须分线程」的原因**：`run()` 阻塞在自己的事件循环里且不认识 `Agent`
+> → agent 不能在 `run()` 里跑，只能在另一个线程。反向亦然（单线程 `select!` ⇔ `ui/` 模块）。
+
+### UI 细节
+
+| 项 | 结论 |
+|---|---|
+| 布局 | 三 pane 自上而下：Chat(`Min`) / Input(`1..N`) / **Status(`1`，最底)** |
+| 对话区 | assistant 正常 wrap；**工具调用压一行**，结果默认不展开 |
+| 补全 | **浮层**盖在 Chat 上；数据早已齐全（`arg_hint`） |
+| slash 命令 | **全在 TUI 内**（废弃 inquire / `Prompter` / suspend / resume） |
+| 输入 | 多行（Shift/Alt+Enter）+ bracketed paste + 高度自适应 |
+| thinking | 默认隐藏 + `/thinking on` 开关（暗色渲染） |
+| 状态行 | `model · ↑↓tokens · 轮数 · 时长`，窄屏尾部剥 |
+
+### 未决
+
+- [ ] **crate 放哪**（`crates/ys-tui-coding/` vs `apps/`）—— 倾向 `crates/`，与 `ys-protocol` 平级
+- [ ] **状态行的 turn 中形态**：`⏳ Working·` 与状态字段并存还是替换 model 段
 - [ ] **工具展开的触发方式**：按键（回车/空格）？命令？还是不展开
-- [ ] **浮层选择器的可测接口**（替代 `Prompter` 的测试价值）
-- [ ] **crate 放哪**（`crates/` vs `apps/`）
+- [ ] **浮层选择器的可测接口**（替代 `Prompter` 的测试价值）—— 这是**不能丢**的
+- [ ] **`CodingView` 的字段清单**（含 `ToolCallId → ToolCall` 映射，供结果回填）
+- [ ] **`ys-protocol` 的 `Source` / 多 agent 预留**：`Envelope.source` 是否迁进协议
 - [ ] **退出时打印完整对话**：alt-screen 仍在 → `restore_terminal` 那套（~60 行）**保留**
-- [ ] **`ys-protocol` 是否仍需要**：若 TUI 不拆 crate（回到 `ui/` 模块），`AppView` 留在 app 内即可
-- [ ] **UI 走不走独立线程 + 信道**：见 `tui-repl/context.md`「需要重定」——ratatui 下收益比行式小得多（`select!` 已交错）
-- [ ] **`envelope.turn` / `CancelToken` 移除** 的落地（已定，待实施）
-- [ ] **两个真 bug** 与上述所有改动的关系（可独立先修）
+- [ ] **两个真 bug**（中文退格 panic / 补全 popup 未渲染）与重构的先后 —— 可独立先修，但会落在将被重写的代码上
+- [ ] **`tui-repl/context.md` 的收尾**：其中「存活」的架构结论已并入本文；该文件其余部分作废，是否归档
+

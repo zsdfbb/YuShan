@@ -387,7 +387,63 @@ UI 若用「发一个 GetView 请求 → 等响应」拿状态，**app 线程在
 
 ---
 
-## rustyline 行为核实（源码级，已定）
+## UI 在 agent 干活时**能输入**（本轮定，像 Claude Code）
+
+**决定**：回合跑动期间用户仍可输入，消息入队（信道天然是队列）。
+
+### 结构
+
+```
+UI 线程：  Editor（rustyline）
+             │  create_external_printer()
+             │  loop { readline() → tx.send(Request) }      ← 一直可输入
+             ▼
+app 线程：  loop {
+               select! {
+                 ① 收 Request（Prompt/Command）      ← 空闲时才 recv（否则留在信道里当队列）
+                 ② turn_fut 完成
+                 ③ 从事件信道取事件 → printer.print(渲染)  ← 流式输出走这里
+               }
+             }
+```
+
+**注意**：app 线程的结构**与今天 `ui/mod.rs` 的 `run_turn_with_ticks` 三路 `select!` 同形**（`turn_fut` | 事件 | ticker）—— 只是"打印"从"重绘全屏"变成"交给 ExternalPrinter"。
+
+### 关键：`ExternalPrinter` 已由源码确认可行
+
+`rustyline-14.0.0/src/tty/unix.rs:1490-1513`：
+
+```rust
+pub struct ExternalPrinter {
+    writer: PipeWriter,
+    raw_mode: Arc<AtomicBool>,   // ← 与 rustyline 内部**同一个**标志
+    tty_out: RawFd,
+}
+impl ExternalPrinter {
+    fn print(&mut self, msg: String) -> Result<()> {
+        if !self.raw_mode.load(SeqCst) {
+            write_all(self.tty_out, msg)?;      // 不在 readline 中 → 直接写 stdout
+        } else {
+            self.writer.1.send(msg)?;           // 正在 readline → 经 pipe 注入
+            writer.write_all(&[b'm'])?;         //   readline 负责显示在提示符上方并重绘
+        }
+    }
+}
+```
+
+**它自带 `raw_mode` 标志，自动选路径** —— 用户没在输入就直写；正在输入就交给 readline 正确显示。
+`ExternalPrinter` 是 `Send` 的（`Arc<Mutex<File>>` + `SyncSender` + `RawFd`），**可跨线程交给 app 线程**。
+
+**附带好处**：`sync_channel(1)`（`unix.rs:1454`）容量为 1 → **打印自带背压**。
+
+### 一条推论
+
+「能输入」使 `QueueMode` **真正有用**（消息会累积），也使「信道即队列」成为**必需**：
+
+- 回合跑动中来的 `Prompt` → **停在 ① 信道里**（app 线程不 recv 它）
+- 用户连发几条 → 依次成回合，或按 `QueueMode::All` 合并
+
+
 
 **结论：`readline()` 返回时 raw mode 已被恢复为进入前的原状。** 方案的地基成立，**无需原型验证**。
 
@@ -465,19 +521,22 @@ fn disable_raw_mode(&self) -> Result<()> {
 | # | 结论 |
 |---|---|
 | **Q1 ys-tui 存废** | **不建 `ys-tui`**。改：两个独立 UI crate（REPL / ratatui）+ 一个**协议 crate**（`AppView` / `CommandMeta` / 请求 / 出站） |
-| **Q2 feature 规则** | 两个 feature：`tui-repl`（**默认**）/ `tui-ratatui`（保留）。二者同时开启 / 都关时的行为**仍待定** |
-| **协议 crate 定位** | **通用能力平面**（agent 能做什么），不是「UI 专有」。任何 peer 可用 |
+| **Q2 feature 规则** | 两个 feature：`tui-repl`（**默认**）/ `tui-ratatui`（保留）。**只能开一个** —— 同时开启用 `compile_error!` 挡住 |
+| **协议 crate 定位与命名** | **`ys-protocol`**。定位：**通用能力平面**（agent 能做什么），任何 peer（UI / 控制器 / 测试 / 另一个 agent）可用 |
 | **线程模型** | **多线程优先，多进程不计划** |
 | **UI ↔ app 传输** | **信道**（2 进 1 出，见上） |
-| **命令执行位置** | **接线器**（不进 agent 队列） |
+| **命令执行位置** | **接线器**（不进 agent 队列）；命令按「结果去哪」分四类（见上） |
 | **快照传递** | **出站推送**（不是请求-响应，也不是共享 `Arc`） |
+| **`Envelope.turn`** | **保留**（消费者不必自己维护计数即可分组） |
+| **跑动中能否输入** | **能**（像 Claude Code）—— 用 rustyline `ExternalPrinter`（已由源码确认） |
 
 ### 仍待决
 
-- [ ] **协议 crate 的名字**（`ys-ui-api` / `ys-presentation` / `ys-ui-proto` / `ys-host-api` 均被提出，未定）
-- [ ] **`Inbox` 废不废**：曾倾向废掉（信道全覆盖），后又收窄为「UI↔接线器走信道、agent 内部保留 `Inbox`」。**未最终拍板**
-- [ ] **`CancelToken` 保留还是信道化**：两种都行（见上「口味问题」），**未拍板**
-- [ ] **两个 feature 同时开启 / 都关时的行为**（现状：`--no-default-features` 直接报错）
+- [ ] **`Inbox` 废不废**（**唯一剩下的结构性分歧**）
+  - **反对保留的理由**：在「2 进 1 出」+「能输入」已定的前提下，`Inbox` 的两个角色都被信道接管 —— followUp → ① 信道（回合跑动时消息停在信道里），steering → ② 信道（直达 `BasicLoop`）。**而同线程那一段（接线器→agent）直接调 `agent.run_turn` 即可，本不需要队列。** 保留它是"同一件事两套做法且有一套没被用到"
+  - **支持保留的理由**：已写好、测过（15 个单测）、能用；废掉要 `ys-component` 加 trait（零 tokio）+ `BasicLoop` 改写 + 四处返工
+  - **权衡**：「能输入」定下后，① 信道**必须**存在且**必须**充当队列 —— 这使 `Inbox` 更显多余
+- [ ] **`CancelToken` 保留还是信道化**：两种延迟相同（协作式取消本就无即时性），是**口味问题**。保留的理由：它是**电平信号**，被**多处反复读**（loop 各步骤 + `ToolContext` 里的工具）—— 消息读一次就没了
 - [ ] **`crossterm` 的 feature 归属**（REPL 也要它做键盘协议）
 - [ ] **`CommandMeta` 放哪**：两个参考都放 UI 侧（纯静态数据 + 补全用），但**会与 app 侧实现漂移**
 - [ ] **快照的更新策略**：全量推 vs 增量折叠（pi-mini 用复制状态折叠）
@@ -486,7 +545,7 @@ fn disable_raw_mode(&self) -> Result<()> {
 - [x] ~~**原型归属与判据**~~ → **已收窄为三条集成细节**，见上「待验清单」
 - [ ] **`^C` 在 `readline`/`turn` 两段的边界**（rustyline 侧已确认：Ctrl-C → `Err(Interrupted)`；turn 侧待验）
 - [x] ~~**`inquire` 与 rustyline 的 raw mode 交替**~~ → **已由源码答掉**（两者各自 RAII 恢复）
-- [ ] **键盘协议异常清理**（RAII guard / panic hook）—— 注意 rustyline 自己的 `Guard` 是 RAII 的，我们的 `PushKeyboardEnhancementFlags` 应对齐同一模式
+- [ ] **键盘协议异常清理**（RAII guard / panic hook）—— rustyline 自己的 `Guard` 是 RAII 的，我们的 `PushKeyboardEnhancementFlags` 应对齐同一模式
 - [ ] **文档回改**：`architecture.md` 的「四路 select!」与 `gap-closure/context.md` 的「TUI 本轮不改」**均已被推翻**
 
 ## 后续建议

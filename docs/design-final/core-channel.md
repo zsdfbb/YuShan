@@ -107,8 +107,53 @@
 - **同批落地**：请求 `stream: true`；`parse_sse_stream` 从「返回缓冲 `Vec`」改为**边解析边回调**（可测核心 `feed_sse_bytes` 支持跨 chunk 行边界；缓冲为**字节级** `Vec<u8>`，只在字节层面切出完整行后才做 UTF-8 解码，避免多字节字符被 TCP 分片切在中间时损坏）；`TextDelta` / `ThinkingDelta` 实时冒泡（thinking 仅在 `ProviderCompat::has_reasoning_content` 为真时）；`usage` 由 `ProviderCompat::supports_stream_usage` 门控——**默认开启**（`standard()` 与 `Default` 均如此，故 env-var 配置落到 `custom` 时 token 统计正确），请求携带 `stream_options.include_usage` 并在流末包取 `usage`；若严格校验的端点因该字段返回 **HTTP 400**，适配器剥掉 `stream_options` **只重试一次**（stderr 打明确警告、本次 `usage` 退回 `Usage::default()`），故「安全」与「统计完整」兼顾；仅显式关闭者（`minimax()`，其兼容层放行行为未经验证）不带该字段、直接退回 `Usage::default()`。
 - **验证**：`ys-model-openai-compat::stream::tests::feed_sse_bytes_*`（分片/多行/`[DONE]`/非 JSON/`reasoning_content`/`data:` 无空格前缀/末包缺 `delta`）、`tests::feed_sse_bytes_preserves_multibyte_utf8_split_across_chunks`（多字节 UTF-8 被切在字符中间，断言无 U+FFFD）、`tests::streamed_text_deltas_concatenate_to_final_text_byte_for_byte`（增量拼接 == 终态，逐字节）、`tests::tool_call_deltas_assemble_into_one_tool_use`（多片 → 一个完整 `ToolUse`）、`ys-loop::basic::tests::forwarder_maps_thinking_delta_to_agent_event`。端到端本地 SSE mock：`--json` 输出 3 条 `ModelTextDelta`，`-p` 在 0.21/0.41/0.62s 分三次写出（真增量）。**usage 门控修复**：`ys-model-openai-compat::compat::tests::standard_enables_stream_usage`（`standard()`/`Default` 默认 true）、`ys-coding-agent::provider::tests::test_compat_mapping`（custom/未知 → true）；端到端 `tests/stream_usage_fallback.rs`——env-var 配置＋容忍该字段的 mock 拿回 `usage {input:11, output:7}`；对带 `stream_options` 的请求返 400 的 mock 触发一次性回退（exit 0、有警告、重试请求不含该字段、`usage` 为 0）；不带该字段却遇 400 则直接失败、只发 1 次请求。
 
-## 3. 最终 API 清单（各 crate 公开面）
+### 2.10 后续块 B：所有权收敛（ADR-0010）+ `/new` 命令层
 
+> 本节记录第一刀之后补做的「Actor 模型所有权收敛 + `/new` 命令层」（后续块 B），归入同一份 as-built。
+
+- **Agent 无状态**：`model` / `session` / `events` 三个字段从 `Agent` 移出，改为端口结构
+  `AgentPorts<'a> { model: Option<&'a dyn Model>, session: &'a mut dyn Session, events: &'a mut dyn EventSink }`；
+  `Agent::run(ports, inbox)` / `run_turn(input, ports)` 均经端口取用，Agent 只执行、只产事件。
+  选择「端口结构」而非「多参数」：后续再加端口（工具审批流、记忆）时**不破签名**。
+  `AgentBuilder::build()` 不再要求 session/events/model —— 空 builder（无工具、无端口）也能构建。
+- **`Wiring`（新）**：`apps/coding-agent/src/wiring.rs` 持有 model + session + inbox + events + `sessions_dir`/`session_path`。
+  `ports()` 把三样借给 `Agent::run`；`persistent()` 启动时恢复 `sessions_dir` 下**最近**的 `*.jsonl`（无则新建），
+  `ephemeral()` 用 `MemorySession`、不落盘不恢复（保持 `-p`/`--json` 行为）。
+- **`/new` = 换队列**：`Wiring::new_session()` 替换 `session`（新会话文件）+ `inbox`（pending 丢弃），旧会话文件保留不删；
+  Agent / BasicLoop / ys-channel 全程不知情。命令层 `NewCommand` 只调 `new_session`。
+- **`CommandContext` 不再持 `&mut Agent`**：改为 `&mut Wiring` + `&mut Config` + `&mut StateStore` + `&dyn Prompter`，
+  命令改配置后经端口在 `run` 时传入（ADR-0010「命令不伸手进 agent」）。
+- **`JsonlSession` 落盘路径**：`open` 惰性（不预建文件），`append`/`clear` 走 `flush_to_file`——
+  先写 `{path}.jsonl.tmp` 再 rename（原子的），防崩溃半写。
+
+### 2.11 后续块 C：TUI 增量渲染
+
+> 本节记录「TUI 接事件流做增量渲染」（后续块 C），归入同一份 as-built。
+
+- TUI（feature `tui-ratatui`）不再 `NoopEventSink` + `run_turn`，改为消费 `ChannelSink` 的 `Envelope`：
+  `run_turn_with_ticks` 里 `agent.run(wiring.ports(), &inbox)` 返回 future，与 crossterm 事件流 `select!` 并发推进，
+  `ModelTextDelta` / `ThinkingDelta` 增量追加进 `App.transcript`（`finalize_assistant_text` 在零 delta 时兜底，防丢文本）。
+- 退出时经 `suspend_terminal` 让位真实终端、打印完整对话进主屏 scrollback。
+
+### 2.12 `model` 也收进端口（超出 ADR-0010 字面）
+
+- ADR-0010 只点名 session/events 移出 `Agent`；实际把 `model` **一并**收进 `AgentPorts`。
+- **理由**：`/model`、`/login`、`/logout` 要在**不碰 Agent** 的前提下即时生效——若 model 仍留 `Agent`，
+  命令层就必须持 `&mut Agent`，与 ADR-0010「命令不伸手进 agent」直接冲突。故收敛粒度取「执行器所需的静态能力
+  （工具/限制/取消/系统提示/cwd）归 Agent，会话态（历史/当前模型/事件出口）归接线器」。
+
+### 2.13 `/new` 预建空文件（否则重启恢复不到）
+
+- **设计原貌**：`/new` = 换 `Session` + 新空 `Inbox`。
+- **问题**：`JsonlSession::open` **惰性落盘**（只在首次 `append` 时写文件）。若用户 `/new` 后**不发消息就退出**，
+  磁盘上仍只有旧文件 → 重启 `latest_session_path` 仍选旧文件 → **`/new` 等于没生效**（已实测复现：两条消息落进同一文件）。
+- **实际**：`new_session` 在 `open` 后立即 `clear()`（触发 `flush_to_file` 写空文件），使新文件**真实存在**且时间戳最新；
+  顺序调整为「**先 open + clear 成功，再替换** `session`/`session_path`/`inbox`」——失败时状态保持原样，
+  不会出现「pending 已丢、会话未换」的半新半旧。
+- **验证**：`wiring::tests::new_session_persistent_keeps_old_file_and_creates_empty_new`（新文件预建且为空）、
+  `wiring::tests::restart_after_new_without_messages_recovers_new_empty_session`（`/new` 不发消息 → 重建 Wiring → 恢复新空会话）。
+
+## 3. 最终 API 清单（各 crate 公开面）
 ### `ys-event`（契约层，无 tokio 生产依赖）
 
 | 项 | 形状 |
@@ -264,11 +309,11 @@ impl Agent {
 
 | 未做项 | 状态与归属 |
 |---|---|
-| **TUI 增量渲染** | 未做；TUI 仍 `NoopEventSink` + `run_turn`（无 turn 语义、无事件消费） |
-| **`/new` 命令层**（换 Session + 新空 Inbox，pending 丢弃） | 留迁移步 5；契约已在 `Agent::run` 文档注释标注，命令层未实现 |
-| **ADR-0010 所有权收敛**（session/events 移出 `Agent`、`CommandContext` 不再持 `&mut Agent`） | 留迁移步 5，与信道解耦 |
 | **正交优化**：`Arc<Vec<Message>>` 请求快照、`Bytes` delta、`Usage`/`StopReason: Copy`、`max_rounds`/`bash_timeout` 可配、事件落盘 | 留迁移步 6，与信道正交 |
 | **`docs/adr/*`、`docs/arch/*` 文档重命名** | 有意保留为历史记录 |
+
+> 原列于此的 **TUI 增量渲染**（块 C 已完成，见 §2.11）、**`/new` 命令层**（块 B 已完成，见 §2.10）、
+> **ADR-0010 所有权收敛**（块 B 已完成，见 §2.10）三项均已落地，移出本表。
 
 ## 7. 遗留缺口与已知问题（诚实清单）
 
@@ -293,3 +338,14 @@ CLI 形态下 `run` 是「喂一条 followUp → 跑完退出」，运行期**�
 - `Envelope` 的**实际内存尺寸未实测**：设计 §8 的 ~112 B 系估算，实现未补 `size_of::<Envelope>()` 断言。
 - `ys-session/src/jsonl.rs` 4 个硬编码 `test_jsonl_*.jsonl` 文件名未修（单进程内不互踩，仅并发 `cargo test` 进程互踩，低危，本轮仅记录）。
 - 步 2.4 的 `-p` 增量实现随步 3 commit（`061806c`）落地，提交粒度与计划步号非一一对应。
+
+### 7.6 多进程并发写同一会话文件（`JsonlSession` 既有设计，未改）
+
+- `JsonlSession` **无文件锁**，且每次 `append`/`clear` 都**整文件重写**、临时文件名固定为 `{path}.jsonl.tmp`。
+  两个进程同时写同一会话文件会互相覆盖、丢更新。默认持久化落盘（块 B 起交互式默认写 `sessions_dir/*.jsonl`）后该风险上升。
+  多进程/多实例场景需在外层加锁或改增量追加 + 唯一 tmp 名。**本轮只记录，不改。**
+
+### 7.7 TUI `/new` 后 `App.transcript` 不清（设计未规定）
+
+- `/new` 后 `AppView.message_count` 归零（快照由新 wiring 重建），但 `App.transcript` 仍保留屏幕上的旧对话行，
+  视觉上「没换成新会话」。设计未规定该行为，留待交互设计统一。**本轮只记录，不改。**

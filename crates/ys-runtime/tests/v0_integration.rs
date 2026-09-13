@@ -2,6 +2,8 @@
 //!
 //! 使用 AgentBuilder 组装完整的 Agent，
 //! 通过 Agent API 与低层 BasicLoop API 共同验证所有关键场景。
+//!
+//! ADR-0010 后：会话/事件/模型归接线器，测试中作为 [`AgentPorts`] 传入。
 
 use std::path::PathBuf;
 use ys_core::{ContentBlock, Message, Role};
@@ -9,6 +11,7 @@ use ys_event::CollectingSink;
 use ys_loop::{AgentLoop, BasicLoop};
 use ys_model::MockModel;
 use ys_runtime::prelude::*;
+use ys_session::{MemorySession, Session};
 
 // ---------------------------------------------------------------------------
 // 测试工具
@@ -53,7 +56,7 @@ impl ys_tool::Tool for FailingTool {
 fn make_ctx<'a>(
     model: &'a dyn ys_model::Model,
     registry: &'a ys_tool::ToolRegistry,
-    session: &'a mut dyn ys_session::Session,
+    session: &'a mut dyn Session,
     events: &'a mut dyn ys_event::EventSink,
     cancel: &'a CancelToken,
     limits: RunLimits,
@@ -80,16 +83,17 @@ fn make_ctx<'a>(
 async fn tc2_pure_text_reply() {
     let model = MockModel::new("test");
     model.push_text("Hello, World!");
+    let mut session = MemorySession::new();
+    let mut events = CollectingSink::new();
 
-    let agent = AgentBuilder::new()
-        .model(model)
-        .session(MemorySession::new())
-        .events(CollectingSink::new())
-        .build()
+    let mut agent = AgentBuilder::new().build().unwrap();
+    let result = agent
+        .run_turn(
+            AgentInput::text("hi"),
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        )
+        .await
         .unwrap();
-
-    let mut agent = agent;
-    let result = agent.run_turn(AgentInput::text("hi")).await.unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert!(result.final_message.is_some());
@@ -105,17 +109,17 @@ async fn tc3_single_tool_call() {
     let model = MockModel::new("test");
     model.push_tool_call("echo", serde_json::json!({"message": "test"}));
     model.push_text("done");
+    let mut session = MemorySession::new();
+    let mut events = CollectingSink::new();
 
-    let agent = AgentBuilder::new()
-        .model(model)
-        .tool(EchoTool)
-        .session(MemorySession::new())
-        .events(CollectingSink::new())
-        .build()
+    let mut agent = AgentBuilder::new().tool(EchoTool).build().unwrap();
+    let result = agent
+        .run_turn(
+            AgentInput::text("go"),
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        )
+        .await
         .unwrap();
-
-    let mut agent = agent;
-    let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert_eq!(result.rounds, 2); // 1 个工具 round + 1 个文本 round
@@ -132,17 +136,17 @@ async fn tc4_multi_round_tool_loop() {
     model.push_tool_call("echo", serde_json::json!({"message": "first"}));
     model.push_tool_call("echo", serde_json::json!({"message": "second"}));
     model.push_text("all done");
+    let mut session = MemorySession::new();
+    let mut events = CollectingSink::new();
 
-    let agent = AgentBuilder::new()
-        .model(model)
-        .tool(EchoTool)
-        .session(MemorySession::new())
-        .events(CollectingSink::new())
-        .build()
+    let mut agent = AgentBuilder::new().tool(EchoTool).build().unwrap();
+    let result = agent
+        .run_turn(
+            AgentInput::text("go"),
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        )
+        .await
         .unwrap();
-
-    let mut agent = agent;
-    let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert_eq!(result.rounds, 3); // 2 个工具 round + 1 个文本 round
@@ -158,17 +162,17 @@ async fn tc5_tool_error_fed_back_to_model() {
     model.push_tool_call("fail", serde_json::json!({}));
     // tool 错误之后，模型以文本回复（错误已作为结果回喂）
     model.push_text("I see the tool failed, continuing anyway");
+    let mut session = MemorySession::new();
+    let mut events = CollectingSink::new();
 
-    let agent = AgentBuilder::new()
-        .model(model)
-        .tool(FailingTool)
-        .session(MemorySession::new())
-        .events(CollectingSink::new())
-        .build()
+    let mut agent = AgentBuilder::new().tool(FailingTool).build().unwrap();
+    let result = agent
+        .run_turn(
+            AgentInput::text("go"),
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        )
+        .await
         .unwrap();
-
-    let mut agent = agent;
-    let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
 
     // tool 错误现在作为结果回喂，循环继续
     assert_eq!(result.stop_reason, StopReason::Completed);
@@ -313,15 +317,15 @@ async fn tc14_continuation_with_history() {
         .await
         .unwrap();
 
-    let agent = AgentBuilder::new()
-        .model(model)
-        .session(session)
-        .events(CollectingSink::new())
-        .build()
+    let mut events = CollectingSink::new();
+    let mut agent = AgentBuilder::new().build().unwrap();
+    let result = agent
+        .run_turn(
+            AgentInput::text("follow up"),
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        )
+        .await
         .unwrap();
-
-    let mut agent = agent;
-    let result = agent.run_turn(AgentInput::text("follow up")).await.unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Completed);
     assert!(result.final_message.is_some());
@@ -334,9 +338,6 @@ async fn tc14_continuation_with_history() {
 #[test]
 fn tc10_duplicate_tool_name_build_error() {
     let result = AgentBuilder::new()
-        .model(MockModel::new("test"))
-        .session(MemorySession::new())
-        .events(CollectingSink::new())
         .tool(EchoTool)
         .tool(EchoTool) // 重复名称 "echo"
         .build();
@@ -349,7 +350,6 @@ fn tc10_duplicate_tool_name_build_error() {
                 "error should mention duplicate: {msg}"
             );
         }
-        Err(other) => panic!("expected ToolRegistry error, got {other:?}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -386,20 +386,23 @@ async fn cancel_mid_loop() {
 
     let model = MockModel::new("test");
     model.push_tool_call("cancel", serde_json::json!({}));
+    let mut session = MemorySession::new();
+    let mut events = CollectingSink::new();
 
-    let agent = AgentBuilder::new()
-        .model(model)
+    let mut agent = AgentBuilder::new()
         .tool(CancellingTool {
             cancel: cancel_token.clone(),
         })
-        .session(MemorySession::new())
-        .events(CollectingSink::new())
         .cancel_token(cancel_token)
         .build()
         .unwrap();
-
-    let mut agent = agent;
-    let result = agent.run_turn(AgentInput::text("go")).await.unwrap();
+    let result = agent
+        .run_turn(
+            AgentInput::text("go"),
+            AgentPorts::new(Some(&model), &mut session, &mut events),
+        )
+        .await
+        .unwrap();
 
     // 工具执行期间已设置取消，下一个 loop 边界检测到它
     assert_eq!(result.stop_reason, StopReason::Cancelled);

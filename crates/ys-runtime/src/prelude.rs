@@ -1,4 +1,4 @@
-pub use super::{Agent, AgentBuilder, BuildError};
+pub use super::{Agent, AgentBuilder, AgentPorts, BuildError};
 pub use ys_component::{RunLimits, RuntimeContext};
 pub use ys_core::{
     CancelToken, ContentBlock, Message, Role, StopReason, ToolCall, ToolCallId, ToolResult, Usage,

@@ -13,6 +13,8 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
@@ -23,9 +25,8 @@ use ys_event::{AgentEvent, EventSink};
 
 /// 背压可观测读数（设计修订 R6）。
 ///
-/// 尚无生产调用者（仅测试读取）：当前 `--json`/`-p` 的消费循环未接指标输出。
-/// 保留为公开读数接口，待需要观测背压时接线。
-#[allow(dead_code)] // 字段仅在测试中被读取
+/// 由 [`ChannelSink::stats`] 读取，`-p`/`--json` 收尾时经 [`format_stats`]
+/// 渲染到 **stderr**（不污染 stdout 的 JSON / 文本流）。见 `--stats`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelStats {
     /// `try_send` 撞满次数（backpressure 次数）。
@@ -34,6 +35,63 @@ pub struct ChannelStats {
     pub buffered: usize,
     /// 消费者是否已消失。
     pub consumer_gone: bool,
+}
+
+/// `ChannelStats` 的共享内核：`ChannelSink` 装箱为 `Box<dyn EventSink>` 后，
+/// 调用方仍能经 [`ChannelStatsHandle`] 读取读数（Arc 共享 + 原子计数）。
+#[derive(Debug, Default)]
+struct StatsCell {
+    backpressure_waits: AtomicU64,
+    buffered: AtomicUsize,
+    consumer_gone: AtomicBool,
+}
+
+/// 背压读数的跨生命周期句柄：在 `ChannelSink` 被装箱/移交后仍可观测。
+///
+/// 构造方式：[`ChannelSink::stats_handle`]。每次 [`snapshot`](Self::snapshot)
+/// 取当前值（非缓存），故可在 turn 结束后读到终态。
+#[derive(Debug, Clone, Default)]
+pub struct ChannelStatsHandle {
+    cell: Arc<StatsCell>,
+}
+
+impl ChannelStatsHandle {
+    /// 当前读数快照。
+    pub fn snapshot(&self) -> ChannelStats {
+        ChannelStats {
+            backpressure_waits: self.cell.backpressure_waits.load(Ordering::Relaxed),
+            buffered: self.cell.buffered.load(Ordering::Relaxed),
+            consumer_gone: self.cell.consumer_gone.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// 把背压读数渲染为一行 stderr 摘要；三项全为「无事发生」时返回 `None`
+/// （正常运行时保持 stderr 干净，不刷屏）。
+///
+/// 有事发生的判据：`backpressure_waits > 0 || buffered > 0 || consumer_gone`。
+pub fn format_stats(s: &ChannelStats) -> Option<String> {
+    if s.backpressure_waits == 0 && s.buffered == 0 && !s.consumer_gone {
+        return None;
+    }
+    Some(render_stats(s))
+}
+
+/// 无条件渲染读数摘要（`--stats` 显式要求时用，哪怕全零）。
+pub fn format_stats_forced(s: &ChannelStats) -> String {
+    render_stats(s)
+}
+
+/// 渲染本体：固定前缀 + 两个计数；`consumer_gone` 时追加标记。
+fn render_stats(s: &ChannelStats) -> String {
+    let mut line = format!(
+        "[channel] backpressure waits: {}, buffered at end: {}",
+        s.backpressure_waits, s.buffered
+    );
+    if s.consumer_gone {
+        line.push_str(", consumer gone");
+    }
+    line
 }
 
 /// 有界信道的 `EventSink`：把 `AgentEvent` 包成 `Envelope` 投递。
@@ -50,9 +108,8 @@ pub struct ChannelSink {
     source: Source,
     turn: u32,
     policy: LifecyclePolicy,
-    // stats 计数
-    backpressure_waits: u64,
-    consumer_gone: bool,
+    /// 背压读数（Arc 共享，装箱后仍可经 [`ChannelStatsHandle`] 读取）。
+    stats: ChannelStatsHandle,
 }
 
 impl ChannelSink {
@@ -67,8 +124,7 @@ impl ChannelSink {
                 source: Source::agent(),
                 turn: 0,
                 policy,
-                backpressure_waits: 0,
-                consumer_gone: false,
+                stats: ChannelStatsHandle::default(),
             },
             rx,
         )
@@ -80,31 +136,67 @@ impl ChannelSink {
         Envelope::new(self.source.clone(), self.turn, event)
     }
 
+    /// overflow 变更后同步 `buffered` 读数。
+    ///
+    /// 所有 overflow 写操作都必须经下面三个 `overflow_*` 包装，保证读数不漏更新。
+    #[inline]
+    fn sync_buffered(&self) {
+        self.stats
+            .cell
+            .buffered
+            .store(self.overflow.len(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn overflow_push_back(&mut self, env: Envelope) {
+        self.overflow.push_back(env);
+        self.sync_buffered();
+    }
+
+    #[inline]
+    fn overflow_push_front(&mut self, env: Envelope) {
+        self.overflow.push_front(env);
+        self.sync_buffered();
+    }
+
+    #[inline]
+    fn overflow_pop_front(&mut self) -> Option<Envelope> {
+        let env = self.overflow.pop_front();
+        self.sync_buffered();
+        env
+    }
+
     /// 顺手冲积压：同步 `try_send` 循环，按序尽力发送。
     /// 撞满即把**整个信封**放回队首并停止（保序）；消费者消失则记标记并停止。
     fn drain_overflow_best_effort(&mut self) {
-        while let Some(env) = self.overflow.pop_front() {
+        while let Some(env) = self.overflow_pop_front() {
             match self.tx.try_send(env) {
                 Ok(()) => {}
                 Err(TrySendError::Full(env)) => {
                     // 放回队首，保序；下次再冲
-                    self.overflow.push_front(env);
+                    self.overflow_push_front(env);
                     break;
                 }
                 Err(TrySendError::Closed(env)) => {
                     // 消费者消失：保留事件（Stop 语义下不应静默丢弃），停止冲刷
-                    self.consumer_gone = true;
-                    self.overflow.push_front(env);
+                    self.mark_consumer_gone();
+                    self.overflow_push_front(env);
                     break;
                 }
             }
         }
     }
 
+    /// 标记消费者已消失（读数 + 内部一致性的唯一写点）。
+    #[inline]
+    fn mark_consumer_gone(&mut self) {
+        self.stats.cell.consumer_gone.store(true, Ordering::Relaxed);
+    }
+
     /// 按生命周期策略处置「消费者消失」。
     #[inline]
     fn on_consumer_gone(&mut self, event: AgentEvent) -> Result<(), AgentEvent> {
-        self.consumer_gone = true;
+        self.mark_consumer_gone();
         match self.policy {
             LifecyclePolicy::ContinueWithoutConsumer => Ok(()), // 丢弃，继续跑
             // StopWhenConsumerGone 及未来新增变体：交回循环 → 终止
@@ -113,14 +205,18 @@ impl ChannelSink {
         }
     }
 
-    /// 背压可观测读数。
-    #[allow(dead_code)] // 尚无生产调用者（仅测试读取），待接指标输出
+    /// 背压可观测读数（持有**具体** sink 时的便捷读取）。
+    ///
+    /// 仅测试直接调用；生产路径中 sink 已被装箱为 `dyn EventSink`，
+    /// 读数经 [`Self::stats_handle`] 的 [`ChannelStatsHandle`] 读取。
+    #[allow(dead_code)] // 生产读计数走 stats_handle()，此便捷方法目前仅测试用
     pub fn stats(&self) -> ChannelStats {
-        ChannelStats {
-            backpressure_waits: self.backpressure_waits,
-            buffered: self.overflow.len(),
-            consumer_gone: self.consumer_gone,
-        }
+        self.stats.snapshot()
+    }
+
+    /// 取跨生命周期句柄：`ChannelSink` 装箱为 `dyn EventSink` 后仍可读读数。
+    pub fn stats_handle(&self) -> ChannelStatsHandle {
+        self.stats.clone()
     }
 }
 
@@ -132,8 +228,11 @@ impl EventSink for ChannelSink {
             Err(TrySendError::Full(env)) => {
                 // 撞满 → 缓冲，**不算失败**（契约：满时内部缓冲，不得返回 Err）
                 // 存整个信封（含包装时的 turn），冲刷时原样发送
-                self.backpressure_waits += 1;
-                self.overflow.push_back(env);
+                self.stats
+                    .cell
+                    .backpressure_waits
+                    .fetch_add(1, Ordering::Relaxed);
+                self.overflow_push_back(env);
                 Ok(())
             }
             Err(TrySendError::Closed(env)) => self.on_consumer_gone(env.event), // 消费者消失
@@ -147,12 +246,12 @@ impl EventSink for ChannelSink {
         Box::pin(async move {
             // 先按序冲干 overflow —— 背压点在此；信封原样发送，不重新包装，
             // 故积压事件的 turn 保持包装时的值（不随当前回合漂移）。
-            while let Some(env) = self.overflow.pop_front() {
+            while let Some(env) = self.overflow_pop_front() {
                 if let Err(SendError(env)) = self.tx.send(env).await {
                     // 消费者消失：把事件放回队首保留（与 drain 的 Closed 分支一致，
                     // 不静默丢弃），再按 policy 返回。
-                    self.consumer_gone = true;
-                    self.overflow.push_front(env);
+                    self.mark_consumer_gone();
+                    self.overflow_push_front(env);
                     return if self.policy == LifecyclePolicy::ContinueWithoutConsumer {
                         Ok(())
                     } else {
@@ -162,9 +261,9 @@ impl EventSink for ChannelSink {
             }
             // 再发本次事件（用当前回合号包装）
             if let Err(SendError(env)) = self.tx.send(self.wrap(event)).await {
-                self.consumer_gone = true;
+                self.mark_consumer_gone();
                 // 本次事件同样保留回 overflow，不静默丢弃
-                self.overflow.push_front(env);
+                self.overflow_push_front(env);
                 return if self.policy == LifecyclePolicy::ContinueWithoutConsumer {
                     Ok(())
                 } else {
@@ -482,5 +581,86 @@ mod tests {
             0,
             "慢路径不增快路径撞满计数"
         );
+    }
+
+    /// 10. `format_stats`：三项全零 → `None`（不输出，保持 stderr 干净）。
+    #[test]
+    fn format_stats_all_zero_is_none() {
+        let s = ChannelStats {
+            backpressure_waits: 0,
+            buffered: 0,
+            consumer_gone: false,
+        };
+        assert_eq!(format_stats(&s), None);
+    }
+
+    /// 11. 有背压 → 含 `backpressure` 字样与具体数字。
+    #[test]
+    fn format_stats_reports_backpressure_with_numbers() {
+        let s = ChannelStats {
+            backpressure_waits: 3,
+            buffered: 0,
+            consumer_gone: false,
+        };
+        let line = format_stats(&s).expect("有背压时应输出");
+        assert_eq!(line, "[channel] backpressure waits: 3, buffered at end: 0");
+        assert!(line.contains("backpressure"), "line = {line}");
+        assert!(line.contains('3'), "line = {line}");
+    }
+
+    /// 12. 仅 `buffered > 0`（没撞满但仍有积压）也要输出。
+    #[test]
+    fn format_stats_reports_buffered_only() {
+        let s = ChannelStats {
+            backpressure_waits: 0,
+            buffered: 2,
+            consumer_gone: false,
+        };
+        let line = format_stats(&s).expect("有积压时应输出");
+        assert!(line.contains("buffered at end: 2"), "line = {line}");
+    }
+
+    /// 13. `consumer_gone` → 含相应字样。
+    #[test]
+    fn format_stats_reports_consumer_gone() {
+        let s = ChannelStats {
+            backpressure_waits: 0,
+            buffered: 0,
+            consumer_gone: true,
+        };
+        let line = format_stats(&s).expect("消费者消失时应输出");
+        assert!(line.contains("consumer gone"), "line = {line}");
+    }
+
+    /// 14. `format_stats_forced`：全零也输出（`--stats` 显式要求时用）。
+    #[test]
+    fn format_stats_forced_always_renders() {
+        let s = ChannelStats {
+            backpressure_waits: 0,
+            buffered: 0,
+            consumer_gone: false,
+        };
+        assert_eq!(
+            format_stats_forced(&s),
+            "[channel] backpressure waits: 0, buffered at end: 0"
+        );
+    }
+
+    /// 15. **接线关键不变量**：`ChannelSink` 装箱/移交后，句柄仍能读到终态读数。
+    #[tokio::test]
+    async fn stats_handle_observes_after_boxing() {
+        let (mut sink, _rx) = ChannelSink::new(1, LifecyclePolicy::StopWhenConsumerGone);
+        let handle = sink.stats_handle();
+        for i in 0..3 {
+            assert!(sink.try_emit(delta(&format!("e{i}"))).is_ok());
+        }
+
+        // 装箱（生产路径：`Wiring::ephemeral(model, Box::new(sink))`）并 drop。
+        let boxed: Box<dyn EventSink> = Box::new(sink);
+        drop(boxed);
+
+        let s = handle.snapshot();
+        assert_eq!(s.backpressure_waits, 2, "容量 1、投 3 个应撞满 2 次");
+        assert_eq!(s.buffered, 2, "撞满的事件仍在 overflow 中");
     }
 }

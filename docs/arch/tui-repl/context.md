@@ -263,6 +263,67 @@ tokio::join!(agent.run(ports, &inbox), 消费者(rx))    ← -p/--json 已是这
 > **不能让命令进 agent 的输入队列**，否则等于把产品层塞进 `ys-runtime`。
 > **pi 与 CodeWhale 都避开了**：pi 在 `interactive-mode.ts`（适配层）解析，CodeWhale 在 `commands::execute(cmd, app)`（TUI 侧）。
 
+### 命令按「**结果去哪**」分四类（不是一类）
+
+现有 10 个内置命令的实际归位：
+
+| 结果去哪 | 命令 | 谁处理 | 对 agent 的影响 |
+|---|---|---|---|
+| **只给用户看** | `/help` `/status` `/copy` `/export` | 接线器 | 无 |
+| **改配置** | `/login` `/logout` `/model` | 接线器 | **无消息** —— agent 回合开始时**自取** config |
+| **改 Session** | `/new`（换）、`/compact`（重写） | 接线器 | 靠**换 / 重写 Session** 影响，不是发消息 |
+| **展开成消息** | *（现有命令中无；将来的 `/skill:` / prompt template）* | 接线器**展开** → 作为普通 `Prompt` | **就是一条普通用户输入** |
+
+**pi 恰好就是这三层**（`agent-session.ts:1159+` 的 `AgentSession.prompt`）：
+
+```
+1. /xxx 命中扩展命令  → _tryExecuteExtensionCommand，执行完 return，**不进 LLM**
+2. /skill:name / 模板 → **展开成文本**，继续往下走
+3. 纯文本             → 交给 agent 队列
+```
+
+**第 2 条是关键**：展开型命令的产物是**文本**，走的是与第 3 类**完全相同的路** ——
+**所以 agent 根本不知道它来自命令**。这条让「命令」这个产品概念**完全不泄漏进 agent**。
+
+### 接线器的职责清单（由此定稿）
+
+```
+接线器（app 线程）
+  ├─ ① 收到 Request::Prompt   → 转成 Message 入队给 agent
+  ├─ ② 收到 Request::Command  → 按四类分流：
+  │     ├─ 纯展示     → 输出给 UI（Outbound::CommandOutput）
+  │     ├─ 改配置     → 改 Config（agent 自取，不发消息）
+  │     ├─ 改 Session → 换 / 重写（/compact 需 model）
+  │     └─ 展开型     → **展开成文本**，走 ①
+  └─ ③ 收到 SetModel / Abort 等 → 改配置 / 置 CancelToken
+```
+
+**② 的最后一条是根本原因**：同一个 `Command` 请求的产物有**四种去向** ——
+这正是「命令执行」必须与「agent 队列」分开的理由（若命令直接进 agent 队列，
+agent 就得同时认识这四种）。
+
+### ⚠ 一个真实后果：`/compact` 会产生双份实现
+
+**它是唯一需要 `Session` + `Model` 的命令**：生成摘要要**调模型**，结果要**重写 Session**。
+
+而 `compact_session` **现在是 `BasicLoop` 的私有函数**（`ys-loop/src/basic.rs:371`，
+`generate_summary` 在 :439），**唯一调用点是自动压缩**（`basic.rs:134`，每轮开始检查）。
+
+| | 位置 | 触发 |
+|---|---|---|
+| 自动压缩 | `BasicLoop` 内 | 上下文接近上限 |
+| `/compact` | 接线器侧 | 用户显式 |
+
+**两者逻辑相同、代码两处 → 必然漂移。** 这与 `CommandMeta`（元数据在 UI、实现在 app）
+是**同一类问题**。
+
+**解法**：把 `compact_session` 从 `BasicLoop` 提出来，成为**两处都能调的共享操作**
+（它只需 `&mut dyn Session` + `&dyn Model`，接线器手里都有）。
+
+> **顺带发现**：`/compact` 命令**当前调的是 `agent.clear_session()`** ——
+> 即**清空**而非压缩（报告 1.5 记载的问题）。`compact_session` 的能力**已实现但悬空**，
+> 命令层根本没接它。这条与上面的"共享操作"是同一个修复。
+
 ### 快照必须**推送**，不能请求-响应
 
 UI 若用「发一个 GetView 请求 → 等响应」拿状态，**app 线程在 `run()` 里时无法响应** —— 中途刷新会等到整个回合结束。

@@ -569,3 +569,64 @@ fn disable_raw_mode(&self) -> Result<()> {
 - 「必须 serde-able」—— 同进程不需要序列化（**但保持 serde-able 仍无成本，可留**）
 - 「评估 RPC 库」（tarpc / kameo / jsonrpsee）—— **同进程下价值为零**，且单一 RPC 库只覆盖「一元调用」，覆盖不了「事件推送」。**详见本轮调研：抄 tarpc 的「服务定义与传输解耦」结构，不引实现**
 - 「`Inbox` 的 `Arc<Mutex>` 是跨进程障碍」—— **跨线程完全可用**，这削弱了「废掉 `Inbox`」的理由
+
+---
+
+## ⛔ 决定反转：定死 ratatui（2026-09）
+
+> **交互界面用 ratatui，不再讨论。** 本文件以下内容**部分作废**。
+
+### 反转的原因
+
+行式 REPL 的**候选列表体验不够**：rustyline 的补全只在绑定键（Tab）触发，且
+`ConditionalEventHandler` 一个按键事件只能产出一个 `Cmd` → **无法"边打边弹下拉"**；
+候选列表的显示方式**官方不可定制**（`completion.rs:77` 的 TODO，issue #302）。
+reedline 可定制 `Menu`，但引入新库 + 重验全部行为。**为交互易用性，选 ratatui。**
+
+### 作废的内容
+
+| 作废 | 原因 |
+|---|---|
+| rustyline / reedline 的全部调研（RAII 恢复、`ExternalPrinter`、`Completer`/`Menu`） | 为行式 REPL 做的 |
+| 「删 `ui/`，改 `repl.rs`」 | 不删了 |
+| 「行式更稳定」的论据（无帧管理 / 无 raw mode / 无 alt-screen） | 前提不存在了 |
+| 「UI 跑动中能否输入」这个待决问题 | **ratatui 本来就能**（`select!` 收键鼠），现状已实现 |
+| 「两个 feature 只能开一个」 | 只剩一个 UI，feature 门控问题消失 |
+
+### 存活的内容（与 UI 库无关）
+
+| 存活 | 说明 |
+|---|---|
+| **`ys-protocol`（通用能力平面）** | agent 与外界的接口，任何 peer 可用 |
+| **命令四分类 + 接线器职责清单** | 与 UI 无关 |
+| **快照必须推送**（不是请求-响应） | ratatui 同样需要 |
+| **`Envelope.turn` 保留** | |
+| **`CancelToken` 移除**（改为 `Boundary::Abort` 消息） | 代价：工具失去"自愿检查取消"的可选能力（见下节） |
+| **UI 独立线程 + 信道（2 进 1 出）** | 分线程的理由是「agent 自己转」，与 UI 库无关 |
+| **tarpc 的「服务定义与传输解耦」结构** | |
+| **两个真 bug**（中文退格 panic、补全 popup 从未渲染） | 与架构无关，**现在更要修了**（见下） |
+
+### 需要重定（「两个 UI」前提塌了）
+
+```
+原：ys-tui-repl + ys-tui-ratatui    两个 crate
+现：只有一个 UI                     「两个 crate」不成立
+```
+
+连带三处：
+
+1. **UI 还拆不拆 crate**？（原来拆是为了"两个 UI 对称"）
+2. **`ys-protocol` 还要不要**？若 UI 不拆 crate，`AppView` 等留在 app 内即可
+3. **UI 还走不走独立线程 + 信道**？分线程的理由（agent 自己转）仍在，但代价与收益要重算
+
+### 回到真问题
+
+用户最初报告的 **5 个使用问题**仍未解决，现在要**在 ratatui 内**解：
+
+| # | 问题 | 方向 |
+|---|---|---|
+| 1 | slash 命令时退出 TUI | **条件 suspend**（只交互命令让位；`/help` `/status` 等纯文本命令不必） |
+| 2 | 无 Shift+Enter 多行 | `PushKeyboardEnhancementFlags`（已确认 crossterm 0.28 支持）+ 多行输入模型 + 渲染 |
+| 3 | thinking 显示到对话 | provider 把 think 标签内联进 `content` → 需**剥离标签**（代码从不显示 `reasoning_content`） |
+| 4 | 命令无提示 | **`CompletionState` 从未在 `draw.rs` 渲染**（数据早已齐全，只差画） |
+| — | 中文退格 panic | `events.rs:131` 的 `cursor - 1` 落在多字节字符中间 |

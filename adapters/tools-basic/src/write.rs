@@ -61,13 +61,9 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ys_core::CancelToken;
 
-    fn make_ctx() -> (CancelToken, ToolContext<'static>) {
-        let token = Box::leak(Box::new(CancelToken::new()));
-        let ctx = ToolContext::new(token, PathBuf::from("."), PathBuf::from("."));
-        let ctx: ToolContext<'static> = unsafe { std::mem::transmute(ctx) };
-        (CancelToken::new(), ctx)
+    fn make_ctx() -> ToolContext<'static> {
+        ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
     }
 
     fn test_dir() -> PathBuf {
@@ -91,7 +87,7 @@ mod tests {
         let file = dir.join("new.txt");
 
         let tool = WriteTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "new.txt", "content": "hello world" });
         let result = tool.call(input, ctx).await.unwrap();
 
@@ -112,7 +108,7 @@ mod tests {
         tokio::fs::write(&file, "old content").await.unwrap();
 
         let tool = WriteTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "overwrite.txt", "content": "new content" });
         let result = tool.call(input, ctx).await.unwrap();
 
@@ -130,7 +126,7 @@ mod tests {
         let file = dir.join("sub/nested/file.txt");
 
         let tool = WriteTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "sub/nested/file.txt", "content": "nested" });
         let result = tool.call(input, ctx).await.unwrap();
 

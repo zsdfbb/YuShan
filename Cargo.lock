@@ -192,12 +192,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dyn-clone"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
-
-[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -362,15 +356,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fuzzy-matcher"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54614a3312934d066701a80f20f15fa3b56d67ac7722b39eea5b4c9dd1d66c94"
-dependencies = [
- "thread_local",
 ]
 
 [[package]]
@@ -680,20 +665,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
 dependencies = [
  "rustversion",
-]
-
-[[package]]
-name = "inquire"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "828c7f16c60714c347523c68c11ddb7f74b512973ae8464b5b64ea8900d4c319"
-dependencies = [
- "bitflags",
- "crossterm",
- "dyn-clone",
- "fuzzy-matcher",
- "unicode-segmentation",
- "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -1412,15 +1383,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thread_local"
-version = "1.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "tinystr"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,40 +1875,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "ys-channel"
-version = "0.0.1"
-dependencies = [
- "serde",
- "serde_json",
- "ys-core",
- "ys-event",
-]
-
-[[package]]
 name = "ys-coding-agent"
 version = "0.0.1"
 dependencies = [
  "async-trait",
- "crossterm",
- "futures",
- "inquire",
- "ratatui",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
- "ys-channel",
  "ys-component",
  "ys-core",
  "ys-event",
  "ys-loop",
  "ys-model",
  "ys-model-openai-compat",
+ "ys-protocol",
  "ys-runtime",
  "ys-session",
  "ys-tool",
  "ys-tools-basic",
+ "ys-tui-coding",
 ]
 
 [[package]]
@@ -1954,10 +1902,10 @@ name = "ys-component"
 version = "0.0.1"
 dependencies = [
  "tokio",
- "ys-channel",
  "ys-core",
  "ys-event",
  "ys-model",
+ "ys-protocol",
  "ys-session",
  "ys-tool",
 ]
@@ -1991,11 +1939,11 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "ys-channel",
  "ys-component",
  "ys-core",
  "ys-event",
  "ys-model",
+ "ys-protocol",
  "ys-session",
  "ys-tool",
 ]
@@ -2032,6 +1980,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ys-protocol"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ys-core",
+ "ys-event",
+]
+
+[[package]]
 name = "ys-runtime"
 version = "0.0.1"
 dependencies = [
@@ -2039,12 +1997,12 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "ys-channel",
  "ys-component",
  "ys-core",
  "ys-event",
  "ys-loop",
  "ys-model",
+ "ys-protocol",
  "ys-session",
  "ys-tool",
 ]
@@ -2070,6 +2028,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "ys-core",
+ "ys-protocol",
 ]
 
 [[package]]
@@ -2081,7 +2040,21 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "ys-core",
+ "ys-protocol",
  "ys-tool",
+]
+
+[[package]]
+name = "ys-tui-coding"
+version = "0.0.1"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "ys-core",
+ "ys-event",
+ "ys-protocol",
 ]
 
 [[package]]

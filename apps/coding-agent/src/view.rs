@@ -1,16 +1,18 @@
-//! `AppView` —— 唯一的展示侧数据源。
+//! `CodingView` 的构造（设计 §8「视图类型归产品 TUI crate」）。
 //!
-//! `format.rs::print_*` 函数接收 `&AppView`，对 `Config` / `Agent` / `ProviderRegistry`
-//! 一无所知。当 `view_dirty = true`（`tui.rs` 在任何 command 执行或 turn 完成后设置）
-//! 时，`AppView::from_sources` 重建快照。
+//! app 线程是唯一知道 `Config` / `Agent` / `Wiring` / `ProviderRegistry` 的地方，
+//! 它把这些实时数据源**拍成一张快照**（[`CodingView`]）经
+//! [`Outbound::View`](ys_protocol::Outbound::View) 推给 UI。
+//! UI 侧不读 `Session`、不读 registry —— 数据/显示分离（设计 §4）。
 //!
-//! `tools` 与 `context_window` 由 [`AppView::from_sources`] 从
-//! `Agent::tool_names()` / `Agent::context_window()` 填充（ADR-0007）。
+//! **无网络**：可用模型列表取 registry 的**静态**表（`known_models_static`）。
+//! TUI 路径不得因重绘而发起 HTTP 请求（`/v1/models` 拉取曾是登录路径的行为，
+//! 现在登录也不再拉取 —— 见 `capabilities::login`）。
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use ys_runtime::Agent;
+use ys_tui_coding::{CodingView, ProviderEntry};
 
 use crate::config::Config;
 use crate::provider::ProviderRegistry;
@@ -18,156 +20,242 @@ use crate::state::StateStore;
 use crate::status::TurnStats;
 use crate::wiring::Wiring;
 
-/// 单个 slash command 的元数据（**依赖域占位**）。
+/// 从实时数据源构造显示快照。
 ///
-/// **当前无生产消费者**：`/help` 直接读 `builtin_help_entries()`，
-/// ratatui Tab completer 用 `ui/events.rs` 自有的 `CmdEntry`，故
-/// [`AppView::commands`] 恒为空 `Vec`。保留该类型作为后续「统一命令元数据源」
-/// 的落点，因此显式允许 dead_code。
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // 生产路径尚未接线（见上）；仅测试构造
-pub struct CommandMeta {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub arg_hint: Option<&'static str>,
-}
+/// 调用时机：view₀（启动）+ 每个 `Request` 处理完之后（`app_loop`）。
+pub fn build_view(
+    cfg: &Config,
+    agent: &Agent,
+    wiring: &Wiring,
+    registry: &ProviderRegistry,
+    state: &StateStore,
+    stats: &TurnStats,
+    session_started: Instant,
+) -> CodingView {
+    let logged_in = registry.logged_in_providers();
 
-/// 全部与展示相关的状态快照。克隆开销低（约 `10 个小字段`）。
-#[derive(Clone, Debug)]
-pub struct AppView {
-    // 身份信息
-    pub cwd: PathBuf,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub config_path: PathBuf,
-    pub logged_in_providers: Vec<String>,
-    pub total_known_providers: usize,
-    pub version: &'static str,
+    // 绑定 provider 的 model（有 auth 时）优先，否则用 config 里的当前值；
+    // 它不进静态表时也补进去，否则 `/model` 浮层里选不回当前模型。
+    let bound_model = cfg
+        .provider
+        .as_deref()
+        .and_then(|name| registry.auth_for(name))
+        .map(|entry| entry.model.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| cfg.model.clone());
 
-    // 统计
-    pub total_input_tokens: u32,
-    pub total_output_tokens: u32,
-    pub turn_count: u32,
-
-    // 会话
-    pub session_started: Instant,
-    /// 当前会话中的消息数。供未来的 "context full" 警告读取；
-    /// 当前渲染路径与 `/status` 均不消费。
-    #[allow(dead_code)]
-    pub message_count: usize,
-
-    // 能力
-    pub tools: Vec<String>,
-    pub context_window: Option<usize>,
-    pub is_first_run: bool,
-
-    // 命令
-    pub commands: Vec<CommandMeta>,
-}
-
-impl AppView {
-    /// 从实时数据源构建快照。当 `view_dirty = true` 时由 `tui.rs` 调用。
-    /// 调用方负责在重建之间保持 `stats` 与 `session_started` 一致
-    /// （通常二者都由 `tui.rs` 持有）。
-    pub fn from_sources(
-        cfg: &Config,
-        agent: &Agent,
-        wiring: &Wiring,
-        registry: &ProviderRegistry,
-        state: &StateStore,
-        stats: &TurnStats,
-        session_started: Instant,
-    ) -> Self {
-        let logged_in = registry.logged_in_providers();
-        let is_first_run = logged_in.is_empty() && !state.exists();
-        Self {
-            cwd: cfg.cwd.clone(),
-            provider: cfg.provider.clone(),
-            model: wiring.model_id().map(String::from),
-            config_path: registry.auth_path(),
-            logged_in_providers: logged_in,
-            total_known_providers: registry.providers().len(),
-            version: env!("CARGO_PKG_VERSION"),
-            total_input_tokens: stats.total_input_tokens,
-            total_output_tokens: stats.total_output_tokens,
-            turn_count: stats.turn_count,
-            session_started,
-            message_count: wiring.session_messages().len(),
-            tools: agent.tool_names(),
-            context_window: Some(agent.context_window()),
-            is_first_run,
-            commands: Vec::new(), // 暂未接线（见 CommandMeta 说明）
-        }
+    let mut available_models: Vec<String> = ProviderRegistry::known_models_static()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    if !bound_model.is_empty() && !available_models.contains(&bound_model) {
+        available_models.push(bound_model);
     }
 
-    /// 人类可读的会话时长：`Ns` / `Nm Ms` / `Nh Mm`。
-    pub fn session_duration_str(&self) -> String {
-        let secs = self.session_started.elapsed().as_secs();
-        if secs < 60 {
-            format!("{secs}s")
-        } else if secs < 3600 {
-            format!("{}m {}s", secs / 60, secs % 60)
-        } else {
-            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-        }
+    CodingView {
+        cwd: cfg.cwd.clone(),
+        provider: cfg.provider.clone(),
+        // 实际在跑的模型（接线器持有），而非 config 里的期望值。
+        model: wiring.model_id().map(String::from),
+        logged_in_providers: logged_in,
+        providers: registry
+            .providers()
+            .iter()
+            .map(|p| ProviderEntry {
+                name: p.name.clone(),
+                // 内置 base 原样透传（空串 = `custom` 这类需要 `/login` 追问 URL 的）。
+                api_base: p.api_base.clone(),
+            })
+            .collect(),
+        available_models,
+        total_input_tokens: stats.total_input_tokens,
+        total_output_tokens: stats.total_output_tokens,
+        turn_count: stats.turn_count,
+        session_started,
+        message_count: wiring.session_messages().len(),
+        tools: agent.tool_names(),
+        context_window: Some(agent.context_window()),
+        session_path: wiring.session_path().map(ToOwned::to_owned),
+        // 首次运行 = 没有任何 auth 且没有 state.json（欢迎语用）。
+        is_first_run: registry.logged_in_providers().is_empty() && !state.exists(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn make_view(started: Instant) -> AppView {
-        AppView {
-            cwd: PathBuf::from("/tmp"),
-            provider: None,
-            model: None,
-            config_path: PathBuf::from("/x.json"),
-            logged_in_providers: vec![],
-            total_known_providers: 0,
-            version: "0.0.0",
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            turn_count: 0,
-            session_started: started,
-            message_count: 0,
-            tools: vec![],
-            context_window: None,
-            is_first_run: false,
-            commands: vec![],
-        }
+    use ys_event::CollectingSink;
+    use ys_model::MockModel;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("yushan_view_{tag}_{}_{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
+    fn test_agent() -> Agent {
+        ys_runtime::AgentBuilder::new().build().unwrap()
+    }
+
+    /// 无凭证、无 state：字段取默认值，`is_first_run` 为真。
     #[test]
-    fn test_appview_default_fields() {
-        let view = make_view(Instant::now());
-        assert_eq!(view.total_input_tokens, 0);
-        assert_eq!(view.total_output_tokens, 0);
+    fn test_build_view_defaults_without_credentials() {
+        let dir = temp_dir("defaults");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.api_base = None;
+        cfg.api_key = None;
+        cfg.model = "deepseek-chat".into();
+        cfg.cwd = PathBuf::from("/tmp/proj");
+        cfg.provider = None;
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+
+        let view = build_view(
+            &cfg,
+            &agent,
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        assert_eq!(view.cwd, PathBuf::from("/tmp/proj"));
+        assert!(view.provider.is_none());
+        assert!(view.model.is_none(), "无 model → 状态行显示 (no model)");
+        assert!(view.logged_in_providers.is_empty());
+        assert_eq!(view.providers.len(), 3, "内置三个 provider");
+        assert!(view.provider_names().contains(&"deepseek".to_string()));
+        // **回归锚点**：内置 base 必须原样透传 —— `/login custom` 要靠这个空串
+        // 判定「该追问 API base URL」。把 api_base 拍成空 → 本断言变红。
+        assert!(
+            view.provider_needs_api_base_url("custom"),
+            "custom 无内置 base → /login 应追问 URL：{:?}",
+            view.providers
+        );
+        assert!(
+            !view.provider_needs_api_base_url("deepseek"),
+            "deepseek 有内置 base → /login 不该多问一句"
+        );
+        assert!(view.available_models.contains(&"deepseek-chat".to_string()));
         assert_eq!(view.turn_count, 0);
         assert_eq!(view.message_count, 0);
-        assert!(view.logged_in_providers.is_empty());
-        assert!(view.tools.is_empty());
-        assert!(view.context_window.is_none());
+        assert!(view.session_path.is_none(), "一次性会话无文件");
+        assert!(view.is_first_run);
+        assert_eq!(view.context_window, Some(agent.context_window()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 统计与工具透传：`TurnStats` 与 `Agent::tool_names` 原样进快照。
     #[test]
-    fn test_session_duration_str_sub_minute() {
-        let view = make_view(Instant::now());
-        let s = view.session_duration_str();
-        // 不足一分钟的渲染总以 "s" 结尾（如 "0s"、"12s"）。
-        assert!(s.ends_with('s'), "expected trailing 's', got {s:?}");
-        assert!(!s.contains(' '), "sub-minute form must not contain spaces");
+    fn test_build_view_passes_stats_tools_and_session_path() {
+        let dir = temp_dir("stats");
+        let mut stats = TurnStats::default();
+        stats.record(&ys_core::Usage {
+            input_tokens: 120,
+            output_tokens: 45,
+        });
+        stats.record(&ys_core::Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+        });
+
+        let cfg = Config::from_env().unwrap();
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = ys_runtime::AgentBuilder::new()
+            .tool(ys_tools_basic::ReadTool::new(PathBuf::from(".")))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+
+        let view = build_view(
+            &cfg,
+            &agent,
+            &wiring,
+            &cfg.registry,
+            &state,
+            &stats,
+            started,
+        );
+
+        assert_eq!(view.total_input_tokens, 121);
+        assert_eq!(view.total_output_tokens, 47);
+        assert_eq!(view.turn_count, 2);
+        assert_eq!(view.tools, vec!["read".to_string()]);
+        assert_eq!(view.session_started, started);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_command_meta_field_types_static() {
-        // 编译期检查：&'static str 字段形态良好。
-        let meta = CommandMeta {
-            name: "help",
-            description: "Show available commands",
-            arg_hint: None,
-        };
-        assert_eq!(meta.name, "help");
-        assert!(meta.arg_hint.is_none());
+    /// 已登录 provider 的 auth model 被补进 `available_models`（即使不在静态表）。
+    #[tokio::test]
+    async fn test_build_view_includes_bound_provider_model() {
+        use crate::provider::AuthEntry;
+
+        let dir = temp_dir("models");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.provider = Some("deepseek".into());
+        cfg.model = "some-other-model".into();
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        cfg.registry
+            .save_auth(
+                "deepseek",
+                &AuthEntry {
+                    api_base: "https://api.deepseek.com".into(),
+                    api_key: "sk-x".into(),
+                    model: "deepseek-reasoner".into(),
+                },
+            )
+            .unwrap();
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        // 持久会话：session_path 应被填进快照。
+        let wiring = Wiring::persistent(
+            Some(Box::new(MockModel::new("deepseek-reasoner"))),
+            Box::new(CollectingSink::new()),
+            dir.join("sessions"),
+        )
+        .await
+        .unwrap();
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        assert!(
+            view.available_models
+                .contains(&"deepseek-reasoner".to_string()),
+            "绑定的 auth model 应在选择器里：{:?}",
+            view.available_models
+        );
+        assert_eq!(
+            view.model.as_deref(),
+            Some("deepseek-reasoner"),
+            "快照里的 model 来自接线器（实际在跑的）"
+        );
+        assert_eq!(view.logged_in_providers, vec!["deepseek".to_string()]);
+        assert!(view.session_path.is_some(), "持久会话应有会话文件");
+        assert!(!view.is_first_run, "有 auth → 不是首次运行");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

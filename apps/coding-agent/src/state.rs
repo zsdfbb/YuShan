@@ -33,7 +33,8 @@ impl StateStore {
         };
         match std::fs::read_to_string(path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                eprintln!("Warning: failed to parse state.json: {e}");
+                // 库内部诊断 → 日志文件（设计 §5），与 auth.json 同理。
+                crate::logging::log(&format!("failed to parse state.json: {e}"));
                 AppState::default()
             }),
             Err(_) => AppState::default(),

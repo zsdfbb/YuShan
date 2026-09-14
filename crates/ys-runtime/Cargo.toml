@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 ys-core = { path = "../ys-core" }
 ys-loop = { path = "../ys-loop" }
-ys-channel = { path = "../ys-channel" }
+ys-protocol = { path = "../ys-protocol" }
 ys-component = { path = "../ys-component" }
 ys-model = { path = "../ys-model" }
 ys-tool = { path = "../ys-tool" }

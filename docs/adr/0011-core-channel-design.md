@@ -1,5 +1,11 @@
 # 0011 — 核心信道契约：三方案评审后取「最小骨架 + 两处性能移植」
 
+> **部分修订（2026-09-14）**：`ys-channel` 整 crate 已删除。
+> `Envelope` / `LifecyclePolicy` 迁入 `ys-protocol`；`Inbox` / `Intent` / `QueueMode` 随路线 B 移除，
+> 由 `ys_protocol::Request`（回合边界）+ `ys_protocol::BoundarySource`（轮边界）取代。
+> `EventSink` 的 try/await 双路径**保留不变**（本 ADR 的该决策仍有效）。
+> 见 [ADR-0013](0013-cancel-token-removal-boundary-source.md)。
+
 为「核心信道 + Actor 模型」（`ys-channel` 契约 + 自转循环 + 事件信道）做三方案并行设计（最小复杂度 / 可扩展优先 / 性能优先，详见 [`docs/arch/gap-closure/design-core-channel.md`](../arch/gap-closure/design-core-channel.md)）。
 
 **决策**：取**最小复杂度方案为骨架**，移植**性能方案的两处**——`EventSink` 的 try/await 双路径、`Inbox` 的产消模型（落法经质量分析修订为「内可变 + pending 转移进会话」）。**不采纳**可扩展方案的 `EventBus`/`Projection`/`SharedLog`/`InboundHub`/`TurnDriver`（它们服务于已被推迟的群聊/多消费者）。

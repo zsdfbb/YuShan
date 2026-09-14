@@ -7,6 +7,7 @@ use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
 use ys_event::{AgentEvent, emit};
 use ys_model::{ModelEvent, ModelEventSink, ModelRequest};
+use ys_protocol::Boundary;
 use ys_tool::{ToolContext, ToolError};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
@@ -49,8 +50,8 @@ impl AgentLoop for BasicLoop {
         let mut total_usage = Usage::default();
         let mut consecutive_errors: HashMap<String, u32> = HashMap::new();
 
-        // Step 1：入口边界 —— 检查 cancel
-        if ctx.cancel.is_cancelled() {
+        // Step 1：入口边界 —— 检查 abort（非破坏性探针）
+        if ctx.boundary.is_some_and(|b| b.is_aborted()) {
             emit(
                 ctx.events,
                 AgentEvent::RunFinished {
@@ -86,8 +87,8 @@ impl AgentLoop for BasicLoop {
 
         // 主循环
         loop {
-            // Step 3：调用 model 前检查 cancel
-            if ctx.cancel.is_cancelled() {
+            // Step 3：调用 model 前检查 abort
+            if ctx.boundary.is_some_and(|b| b.is_aborted()) {
                 emit(
                     ctx.events,
                     AgentEvent::RunFinished {
@@ -135,17 +136,46 @@ impl AgentLoop for BasicLoop {
                 }
             }
 
-            // 轮边界：拉取中途插话（steering），注入后进入本轮的 ModelRequest。
-            // 不增 rounds、不改 turn —— 它们是轮内的额外输入，不是新一轮。
-            if let Some(inbox) = ctx.inbox {
-                for msg in inbox.take_steering() {
-                    ctx.session
-                        .append(msg.clone())
-                        .await
-                        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-                    emit(ctx.events, AgentEvent::UserMessage { message: msg })
-                        .await
-                        .map_err(LoopError::Event)?;
+            // 轮边界：拉取中途插话（steering）与中止（abort），保持入队顺序。
+            // 不增 rounds、不改 turn —— Steer 是轮内的额外输入，不是新一轮。
+            // Abort 命中即以 Cancelled 收场（先于本轮的 model 调用）。
+            //
+            // 注意：这里的 `Boundary::Abort` 是**压缩窗口的防御路径**。正常时序下
+            // Abort 入队即置 `is_aborted` 标记，上面的 Step 3 探针（以及轮内的工具
+            // 轮询）总是先行命中并提前返回，本分支几乎不可达；唯一窗口是 Step 4b
+            // 上下文压缩 `await` 期间 Abort 才到达 —— 探针已过、消息刚到。保留它是
+            // 为了在压缩耗时较长时不至于漏掉一次中止（宁可晚一轮，不可丢失）。
+            if let Some(boundary) = ctx.boundary {
+                while let Some(bnd) = boundary.take() {
+                    match bnd {
+                        Boundary::Steer(msg) => {
+                            ctx.session
+                                .append(msg.clone())
+                                .await
+                                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                            emit(ctx.events, AgentEvent::UserMessage { message: msg })
+                                .await
+                                .map_err(LoopError::Event)?;
+                        }
+                        Boundary::Abort => {
+                            emit(
+                                ctx.events,
+                                AgentEvent::RunFinished {
+                                    stop_reason: StopReason::Cancelled,
+                                    usage: total_usage.clone(),
+                                    rounds,
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
+                            return Ok(RunResult {
+                                stop_reason: StopReason::Cancelled,
+                                usage: total_usage,
+                                rounds,
+                                final_message: None,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -276,7 +306,7 @@ impl AgentLoop for BasicLoop {
                 let result = match ctx.registry.get(tool_name) {
                     Some(tool) => {
                         let tool_ctx = ToolContext::new(
-                            ctx.cancel,
+                            ctx.boundary,
                             ctx.cwd.clone(),
                             ctx.workspace_root.clone(),
                         );

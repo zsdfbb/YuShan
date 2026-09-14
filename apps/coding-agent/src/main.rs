@@ -1,8 +1,39 @@
-mod ansi;
+//! 入口：模式分发（TUI / `-p` / `--json`）+ 接线器组装（设计 §7 初始化顺序）。
+//!
+//! # 线程模型（TUI 模式）
+//!
+//! ```text
+//! 主线程（**不在 runtime 上下文里**）        app 线程（tokio multi-thread worker）
+//! ─────────────────────────────────         ────────────────────────────────────
+//! ys_tui_coding::run(view₀, rx_out,          app_loop::run(agent, wiring, …)
+//!                    tx_req, tx_boundary)      loop { req = request_rx.recv() }
+//! ```
+//!
+//! `ys_tui_coding::run` 用 `Sender::blocking_send` 投请求，**必须在非 async
+//! 线程调用** —— 故 `main` 是普通 `fn`：先建 runtime（异步初始化 `Wiring`），
+//! `rt.spawn(app_loop)`，再在**当前线程**跑阻塞的 UI 循环。UI 退出 → `tx_req`
+//! 被 drop → app 线程 `recv()` 得 `None` → 自然收摊。
+//!
+//! 初始化顺序（含 R7 的阻塞提前返回）：
+//!
+//! ```text
+//! 1. 建 ChannelSink（policy 已定）+ 建 Agent（挂工具与系统提示）
+//! 2. 【阻塞】model + Wiring 构造   ← 可能失败并提前返回（turn 恒 0 也无所谓）
+//! 3. 构造 view₀
+//! 4. 建三条信道 request / boundary / outbound
+//! 5. spawn app 线程 + 当前线程跑 UI
+//! ```
+//!
+//! 注意 **Agent 先于 Wiring 建**（`run_interactive` 的实际顺序）：二者互不依赖，
+//! 而 `view₀` 要同时借用它们，故都放在 view₀ 之前。承重的不变量是「`begin_turn`
+//! 只可能在 `rt.spawn` 之后发生」（`view₀` 因此必然看到 turn 恒 0），与这两者
+//! 的先后无关。
+
+mod app_loop;
+mod capabilities;
 mod channel;
-mod commands;
 mod config;
-mod format;
+mod logging;
 mod prompt;
 mod provider;
 mod state;
@@ -14,21 +45,19 @@ mod wiring;
 #[cfg(test)]
 mod test_env;
 
-#[cfg(feature = "tui-ratatui")]
-mod ui;
-
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use ys_channel::{Envelope, Intent, LifecyclePolicy};
 use ys_event::AgentEvent;
-use ys_loop::AgentInput;
-use ys_model::Model;
+use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
+use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, Request};
 use ys_runtime::{Agent, AgentBuilder, BuildError};
 use ys_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
+use ys_tui_coding::CodingView;
 
 use channel::{ChannelSink, ChannelStatsHandle};
 use wiring::Wiring;
@@ -40,7 +69,7 @@ enum Mode {
     Print(String),
     /// JSON 事件模式：逐行序列化 [`Envelope`]。
     Json(String),
-    /// 交互式 TUI：用有界信道 [`ChannelSink`] + 增量消费事件做流式渲染（块 C）。
+    /// 交互式 TUI：真正的 UI 在 `ys-tui-coding`（独立 crate），本 crate 只接线。
     Interactive,
 }
 
@@ -125,6 +154,15 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 /// 故 clamp 到 16 并在 stderr 警告一次（env 覆盖路径）。
 const MIN_CHANNEL_CAPACITY: usize = 16;
 
+/// Outbound（app → UI）信道容量。UI 每个 poll 周期排空一次，积压量很小。
+const OUTBOUND_CAPACITY: usize = 1024;
+/// Request（UI → app）信道容量。UI 用 `blocking_send`，容量给足避免误阻塞。
+const REQUEST_CAPACITY: usize = 64;
+/// Boundary（UI → `BasicLoop`）信道容量。回合结束后的残留由 app 侧清空。
+const BOUNDARY_CAPACITY: usize = 64;
+/// UI 退出后，给 app 线程收摊的宽限时长（超时即连 runtime 一起丢弃）。
+const APP_THREAD_GRACE: Duration = Duration::from_secs(1);
+
 /// 把请求容量 clamp 到 [`MIN_CHANNEL_CAPACITY`]。
 ///
 /// 注意：死锁已由「自由函数总走慢路径」结构性修复，clamp **不是**正确性补丁，
@@ -205,8 +243,7 @@ where
 /// 组装 agent（无状态执行器）。
 ///
 /// ADR-0010：会话、事件出口与模型不再进入 agent —— 它们归 [`Wiring`]，
-/// 运行时经端口传入。sink 由调用方按模式选定 —— 这是「先定模式 → 选消费者 →
-/// 建 agent」的落点。
+/// 运行时经端口传入。
 fn build_agent(system_prompt: String, workspace: PathBuf) -> Result<Agent, BuildError> {
     AgentBuilder::new()
         .tool(ReadTool::new(workspace.clone()))
@@ -232,6 +269,8 @@ fn sessions_dir() -> PathBuf {
 }
 
 /// print / json 模式的前置检查：无 model 时给出可操作提示并退出。
+///
+/// **启动期诊断 → stderr**（设计 §5）：此刻 TUI 还没起屏，stderr 是正确去处。
 fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> {
     if wiring.is_configured() {
         return Ok(());
@@ -243,6 +282,21 @@ fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> 
     eprintln!("  YUSHAN_MODEL     — Model name (optional, default: deepseek-chat)");
     eprintln!("Or run in interactive mode and use /login to configure.");
     std::process::exit(1);
+}
+
+/// `-p` / `--json` 的驱动：跑**一个** turn。
+///
+/// `Inbox` / `Agent::run` 已删（T1）：单次运行就是一次 `run_turn`，`begin_turn(1)`
+/// 让 `Envelope.turn` 从 1 起（不再有逐回合递增的多回合循环）。
+/// `boundary` 传 `None` —— 一次性模式没有中途插话/中止的 UI 入口。
+async fn run_single_turn(
+    agent: &mut Agent,
+    wiring: &mut Wiring,
+    input: AgentInput,
+) -> Result<RunResult, LoopError> {
+    let ports = wiring.ports();
+    ports.events.begin_turn(1);
+    agent.run_turn(input, ports).await
 }
 
 /// `-p` 模式的事件消费：只把 [`AgentEvent::ModelTextDelta`] 的文本增量写入 `w`
@@ -294,15 +348,9 @@ async fn run_print_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
-    // 走自转接口 `Agent::run`（而非 `run_turn`）：它每回合调 `begin_turn(n)`，
-    // 使 `Envelope.turn` 从 1 起递增。一次用户输入 = 一个 followUp 回合。
-    // Inbox 为克隆句柄（内为 Arc），与 wiring 持有的是同一底层队列。
-    let inbox = wiring.inbox();
-    inbox.push(AgentInput::text(task.as_str()).message, Intent::FollowUp);
-
-    // 消费与 run 必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
+    // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
     let (run_result, consume_result) = tokio::join!(
-        agent.run(wiring.ports(), &inbox),
+        run_single_turn(agent, wiring, AgentInput::text(task.as_str())),
         consume_print_events(rx, io::stdout()),
     );
 
@@ -330,12 +378,8 @@ async fn run_json_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
-    // 同 `-p`：走 `Agent::run` 以获得逐回合的 `turn`（从 1 起递增）。
-    let inbox = wiring.inbox();
-    inbox.push(AgentInput::text(task.as_str()).message, Intent::FollowUp);
-
     let (run_result, consume_result) = tokio::join!(
-        agent.run(wiring.ports(), &inbox),
+        run_single_turn(agent, wiring, AgentInput::text(task.as_str())),
         consume_events(rx, io::stdout(), write_json_envelope),
     );
 
@@ -345,15 +389,88 @@ async fn run_json_mode(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// TUI 模式的全部组装（设计 §7 初始化顺序 1–5）。
+///
+/// **必须在非 async 线程上调用末尾的 UI 循环** —— 故这里只做「异步初始化 +
+/// spawn app 线程 + 跑 UI」这三件事，`rt` 由调用方持有。
+#[allow(clippy::too_many_arguments)]
+fn run_interactive(
+    rt: tokio::runtime::Runtime,
+    config: config::Config,
+    state_store: state::StateStore,
+    system_prompt: String,
+    workspace: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
+    let (sink, sink_rx) =
+        ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
+
+    // 1（续）. agent（挂工具与系统提示；session/model/events 经端口传入）。
+    let agent = build_agent(system_prompt, workspace)?;
+
+    // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
+    let model = config.build_model();
+    let wiring = rt.block_on(Wiring::persistent(model, Box::new(sink), sessions_dir()))?;
+
+    let stats = status::TurnStats::default();
+    let session_started = Instant::now();
+
+    // 3. view₀ —— 在把 config 移交给 app 线程之前构造。
+    let view0 = view::build_view(
+        &config,
+        &agent,
+        &wiring,
+        &config.registry,
+        &state_store,
+        &stats,
+        session_started,
+    );
+
+    // 4. 三条信道：① Request（回合边界）/ ② Boundary（轮边界）/ ③ Outbound（app → UI）。
+    let (request_tx, request_rx) = mpsc::channel::<Request>(REQUEST_CAPACITY);
+    let (boundary_tx, boundary_rx) = mpsc::channel::<Boundary>(BOUNDARY_CAPACITY);
+    let (out_tx, out_rx) = mpsc::channel::<Outbound<CodingView>>(OUTBOUND_CAPACITY);
+
+    // 5. app 线程（tokio worker）跑循环；当前线程跑**阻塞**的 UI 循环。
+    //    app 循环唯一的失败是「UI 侧收摊」，不该惊动用户 —— 落日志即可。
+    rt.spawn(async move {
+        if let Err(e) = app_loop::run(
+            agent,
+            wiring,
+            config,
+            state_store,
+            stats,
+            session_started,
+            request_rx,
+            boundary_rx,
+            out_tx,
+            sink_rx,
+        )
+        .await
+        {
+            logging::log(&format!("app loop exited with error: {e}"));
+        }
+    });
+
+    // 不在 runtime 上下文里 → `blocking_send` 不会 panic。
+    let tui_result = ys_tui_coding::run(view0, out_rx, request_tx, boundary_tx);
+
+    // UI 退出已把 `request_tx` / `boundary_tx` drop → app 线程 `recv()` 得 `None`。
+    // 给一段宽限让它收摊（回合跑在半途时最多等这么久），超时连 runtime 一起丢。
+    rt.shutdown_timeout(APP_THREAD_GRACE);
+
+    tui_result?;
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = config::Config::from_env()?;
 
     // 从 auth.json 加载已保存的凭证
     config.registry.load_auth();
 
     // 从 state.json 加载已保存的会话状态
-    let mut state_store = state::StateStore::new();
+    let state_store = state::StateStore::new();
     let saved_state = state_store.load();
 
     // 启动恢复：若环境变量未提供完整凭证，
@@ -411,46 +528,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
     });
 
-    // 构建 command registry
-    let command_registry = commands::build_registry();
-
     // 模式必须在建 agent 之前确定：它决定事件消费者与 sink 的选择。
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_args(&argv)?;
 
-    // 构建 system prompt
+    // 构建 system prompt 与工具 workspace
     let cwd = config.cwd.clone();
     let system_prompt = prompt::build_system_prompt(&cwd);
-
-    // 构建 model（可选——agent 可在无 API 凭证时启动）
-    let model: Option<OpenAICompatibleModel> = if config.is_configured() {
-        let compat = config.current_compat();
-        Some(OpenAICompatibleModel::new(OpenAICompatibleConfig {
-            api_base: config.api_base.clone().unwrap(),
-            api_key: config.api_key.clone().unwrap(),
-            model: config.model.clone(),
-            max_tokens: Some(4096),
-            temperature: Some(0.7),
-            compat,
-        }))
-    } else {
-        None
-    };
-
-    // 为工具构建 workspace
     let workspace = config.cwd.clone();
 
-    // model 装箱为 trait object，供接线器持有（ADR-0010：模型归接线器）。
-    let model: Option<Box<dyn Model>> = model.map(|m| Box::new(m) as Box<dyn Model>);
+    // 手工建 runtime（而非 `#[tokio::main]`）：TUI 模式的 UI 循环**必须在
+    // 没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
-    // 「先定模式 → 选消费者 → 建 agent」：三种模式共用有界信道 `ChannelSink`。
-    // TUI 也转为信道消费（块 C）——它必须在 turn 的 select! 里并发收事件，
-    // 否则有界信道撞满即阻塞 agent（死锁）。
-    let Args {
-        mode,
-        stats: with_stats,
-    } = args;
-    match mode {
+    match args.mode {
         Mode::Print(task) => {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
@@ -458,49 +551,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stats_handle = sink.stats_handle();
             let mut agent = build_agent(system_prompt, workspace)?;
             // `-p` 是一次性会话：MemorySession，不落盘、不恢复（行为与改动前一致）。
-            let mut wiring = Wiring::ephemeral(model, Box::new(sink));
-            run_print_mode(&mut agent, &mut wiring, rx, task, &stats_handle, with_stats).await?;
+            let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
+            rt.block_on(run_print_mode(
+                &mut agent,
+                &mut wiring,
+                rx,
+                task,
+                &stats_handle,
+                args.stats,
+            ))?;
         }
         Mode::Json(task) => {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
             let mut agent = build_agent(system_prompt, workspace)?;
-            let mut wiring = Wiring::ephemeral(model, Box::new(sink));
-            run_json_mode(&mut agent, &mut wiring, rx, task, &stats_handle, with_stats).await?;
+            let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
+            rt.block_on(run_json_mode(
+                &mut agent,
+                &mut wiring,
+                rx,
+                task,
+                &stats_handle,
+                args.stats,
+            ))?;
         }
         Mode::Interactive => {
-            // 交互模式——仅 ratatui（tui-stdout 路径已在 c 阶段删除）。
-            // 事件出口为有界信道；接收端交给 ui::run，在 turn 期间增量消费。
-            let (sink, rx) =
-                ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
-            let mut agent = build_agent(system_prompt, workspace)?;
-            // 交互式会话持久化到 `~/.yushan/sessions/{id}.jsonl`，启动恢复最近一个。
-            let mut wiring = Wiring::persistent(model, Box::new(sink), sessions_dir()).await?;
-            let mut stats = status::TurnStats::default();
-
-            #[cfg(feature = "tui-ratatui")]
-            {
-                ui::run(
-                    &mut agent,
-                    &mut wiring,
-                    &mut config,
-                    &command_registry,
-                    &mut stats,
-                    &mut state_store,
-                    rx,
-                )
-                .await?;
-            }
-            #[cfg(not(feature = "tui-ratatui"))]
-            {
-                // 取可变借用即算「用到 mut」，同时避免未用变量告警。
-                let _ = (&mut agent, &mut wiring, &mut stats, &mut state_store, rx);
-                return Err(
-                    "ratatui mode required for interactive TUI; build with --features tui-ratatui"
-                        .into(),
-                );
-            }
+            run_interactive(rt, config, state_store, system_prompt, workspace)?;
         }
     }
 
@@ -512,8 +589,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use ys_channel::Source;
     use ys_core::{ContentBlock, Message, Role, StopReason, ToolCall, ToolCallId, Usage};
+    use ys_model::MockModel;
+    use ys_protocol::Source;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -742,42 +820,23 @@ mod tests {
     ///    旧实现下 run_turn 内的自由函数先走同步快路径，不 yield；
     ///    终局事件被缓冲进 overflow 后无人冲刷 → consume 永不返回 → join 挂起。
     ///    修复后（自由函数总走慢路径）应在超时内完成且收到 RunFinished。
+    ///
+    ///    驱动走**生产路径** [`run_single_turn`]（`begin_turn(1)` + `run_turn`）。
     #[tokio::test]
     async fn run_turn_and_consume_do_not_deadlock_at_small_capacity() {
-        use std::path::PathBuf;
-
-        use ys_component::{RunLimits, RuntimeContext};
-        use ys_core::CancelToken;
-        use ys_loop::{AgentLoop, BasicLoop};
-        use ys_model::MockModel;
-        use ys_session::MemorySession;
-        use ys_tool::ToolRegistry;
-
         let model = MockModel::new("m");
         model.push_text("hello world");
 
-        let (mut sink, rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
-        let registry = ToolRegistry::build(vec![]).unwrap();
-        let mut session = MemorySession::new();
-        let cancel = CancelToken::new();
-        let limits = RunLimits::new(5);
-        let mut ctx = RuntimeContext::new(
-            &model,
-            &registry,
-            &mut session,
-            &mut sink,
-            &cancel,
-            limits,
-            PathBuf::from("."),
-            PathBuf::from("."),
-            None,
-            None,
-        );
+        let (sink, rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
+        let mut agent = build_agent(String::new(), PathBuf::from(".")).unwrap();
+        let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         let mut out: Vec<u8> = Vec::new();
         let joined = tokio::time::timeout(Duration::from_secs(5), async {
-            let run = BasicLoop.run_turn(AgentInput::text("hi"), &mut ctx);
-            tokio::join!(run, consume_events(rx, &mut out, write_json_envelope))
+            tokio::join!(
+                run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi")),
+                consume_events(rx, &mut out, write_json_envelope),
+            )
         })
         .await;
 
@@ -872,15 +931,12 @@ mod tests {
         drop(tx);
     }
 
-    /// 12. **迁移步 4 回归**：`-p`/`--json` 走 `Agent::run(&inbox)`（而非 `run_turn`），
-    ///     `begin_turn(1)` 被驱动 → 信道上所有 `Envelope.turn` 从 **1** 起（不再恒为 0）。
+    /// 13. **一次性模式的回合号**：`-p`/`--json` 走 [`run_single_turn`]
+    ///     （`begin_turn(1)` + `run_turn`），信道上所有 `Envelope.turn` 从 **1** 起。
     ///
-    ///     修复前：`run_print_mode`/`run_json_mode` 调 `run_turn`，`begin_turn` 从不触发，
-    ///     `ChannelSink.turn` 保持初值 0 → 断言失败。
+    ///     `Inbox`/`Agent::run` 已删：不再有逐回合递增，一次运行恒为 turn 1。
     #[tokio::test]
-    async fn run_via_inbox_sets_turn_from_one() {
-        use ys_model::MockModel;
-
+    async fn run_single_turn_sets_turn_from_one() {
         let model = MockModel::new("m");
         model.push_text("hello");
 
@@ -891,16 +947,12 @@ mod tests {
         let mut agent = build_agent(String::new(), PathBuf::from(".")).unwrap();
         let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
-        // 与 `-p`/`--json` 相同的构造：一次用户输入作为 followUp 入队。
-        let inbox = wiring.inbox();
-        inbox.push(AgentInput::text("hi").message, Intent::FollowUp);
-
         let mut out: Vec<u8> = Vec::new();
         let (run_result, consume_result) = tokio::join!(
-            agent.run(wiring.ports(), &inbox),
+            run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi")),
             consume_events(rx, &mut out, write_json_envelope),
         );
-        run_result.expect("run 应成功");
+        run_result.expect("run_turn 应成功");
         consume_result.expect("consume 应成功");
 
         let text = String::from_utf8(out).unwrap();

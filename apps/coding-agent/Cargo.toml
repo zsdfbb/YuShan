@@ -3,10 +3,9 @@ name = "ys-coding-agent"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = ["tui-ratatui"]
-tui-ratatui = ["dep:ratatui", "dep:crossterm", "dep:futures"]
-# tui-stdout 已移除（c 阶段）
+# 无 [features]：TUI 已抽成独立 crate `ys-tui-coding`（设计 §8 路线 B），
+# 本 crate 只剩接线器一条形态，故 ratatui/crossterm/futures 可选依赖与
+# `tui-ratatui` feature 一并移除（`tui-stdout` 更早删除）。
 
 [dependencies]
 ys-core = { path = "../../crates/ys-core" }
@@ -17,7 +16,9 @@ ys-event = { path = "../../crates/ys-event" }
 ys-component = { path = "../../crates/ys-component" }
 ys-loop = { path = "../../crates/ys-loop" }
 ys-runtime = { path = "../../crates/ys-runtime" }
-ys-channel = { path = "../../crates/ys-channel" }
+ys-protocol = { path = "../../crates/ys-protocol" }
+# 产品层 TUI：与 ys-protocol 平级；本 crate 依赖它来**构造 CodingView** 并跑 `run()`。
+ys-tui-coding = { path = "../../crates/ys-tui-coding" }
 ys-model-openai-compat = { path = "../../adapters/model-openai-compatible" }
 ys-tools-basic = { path = "../../adapters/tools-basic" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "sync", "time"] }
@@ -25,13 +26,5 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
-thiserror = "2"
-inquire = "0.8"
-# rustyline 已移除（c 阶段——ratatui 模式通过 crossterm events 处理输入）
-
-# 仅 ratatui 模式使用（可选依赖）
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true, features = ["event-stream"] }
-futures = { version = "0.3", optional = true }
 
 [dev-dependencies]

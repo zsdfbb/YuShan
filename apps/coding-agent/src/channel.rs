@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 
-use ys_channel::{Envelope, LifecyclePolicy, Source};
 use ys_core::EventError;
 use ys_event::{AgentEvent, EventSink};
+use ys_protocol::{Envelope, LifecyclePolicy, Source};
 
 /// 背压可观测读数（设计修订 R6）。
 ///

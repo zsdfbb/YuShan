@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 
 use super::RunLimits;
-use ys_channel::Inbox;
-use ys_core::CancelToken;
 use ys_event::EventSink;
 use ys_model::Model;
+use ys_protocol::BoundarySource;
 use ys_session::Session;
 use ys_tool::{ApprovalHandler, ToolRegistry};
 
@@ -14,14 +13,15 @@ pub struct RuntimeContext<'a> {
     pub registry: &'a ToolRegistry,
     pub session: &'a mut dyn Session,
     pub events: &'a mut dyn EventSink,
-    pub cancel: &'a CancelToken,
     pub limits: RunLimits,
     pub cwd: PathBuf,
     pub workspace_root: PathBuf,
     pub approval: Option<&'a dyn ApprovalHandler>,
     pub system_prompt: Option<String>,
-    /// 轮边界可查的掌舵队列（None = 行为与今日逐字节一致）。
-    pub inbox: Option<&'a Inbox>,
+    /// 轮边界控制源（steering + abort 的唯一入口）。
+    ///
+    /// `None` = 无边界控制，行为与不挂载时逐字节一致（既无插话也无取消）。
+    pub boundary: Option<&'a dyn BoundarySource>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -31,7 +31,6 @@ impl<'a> RuntimeContext<'a> {
         registry: &'a ToolRegistry,
         session: &'a mut dyn Session,
         events: &'a mut dyn EventSink,
-        cancel: &'a CancelToken,
         limits: RunLimits,
         cwd: PathBuf,
         workspace_root: PathBuf,
@@ -43,19 +42,18 @@ impl<'a> RuntimeContext<'a> {
             registry,
             session,
             events,
-            cancel,
             limits,
             cwd,
             workspace_root,
             approval,
             system_prompt,
-            inbox: None,
+            boundary: None,
         }
     }
 
-    /// 链式挂载掌舵队列（轮边界 steering 来源）。`None` 时行为不变。
-    pub fn with_inbox(mut self, inbox: &'a Inbox) -> Self {
-        self.inbox = Some(inbox);
+    /// 链式挂载轮边界控制源。`None` 时行为不变。
+    pub fn with_boundary(mut self, boundary: &'a dyn BoundarySource) -> Self {
+        self.boundary = Some(boundary);
         self
     }
 }

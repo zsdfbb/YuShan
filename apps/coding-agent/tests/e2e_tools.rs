@@ -71,7 +71,7 @@ async fn e2e_four_tools_calculator() {
         std::time::Duration::from_secs(120),
         agent.run_turn(
             input,
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(Some(&model), &mut session, &mut events, None),
         ),
     )
     .await

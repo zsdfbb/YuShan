@@ -32,7 +32,7 @@ pub trait Tool: Send + Sync {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use ys_core::CancelToken;
+    use ys_protocol::{Boundary, QueueBoundarySource};
 
     struct DummyTool {
         spec: ToolSpec,
@@ -92,12 +92,21 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_context_cancel() {
-        let token = CancelToken::new();
-        let ctx = ToolContext::new(&token, PathBuf::from("."), PathBuf::from("."));
-        assert!(!ctx.cancel.is_cancelled());
-        token.cancel();
-        assert!(ctx.cancel.is_cancelled());
+    fn test_tool_context_exposes_boundary_abort_probe() {
+        let boundary = QueueBoundarySource::new();
+        let ctx = ToolContext::new(Some(&boundary), PathBuf::from("."), PathBuf::from("."));
+        assert!(!ctx.boundary.expect("boundary 已挂载").is_aborted());
+        boundary.push(Boundary::Abort);
+        assert!(
+            ctx.boundary.expect("boundary 已挂载").is_aborted(),
+            "Abort 入队后工具应能经 boundary 探针看到"
+        );
+    }
+
+    #[test]
+    fn test_tool_context_without_boundary() {
+        let ctx = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."));
+        assert!(ctx.boundary.is_none(), "无边界控制时 boundary 为 None");
     }
 
     #[test]

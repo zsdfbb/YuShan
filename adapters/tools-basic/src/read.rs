@@ -106,15 +106,9 @@ impl Tool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ys_core::CancelToken;
 
-    fn make_ctx() -> (CancelToken, ToolContext<'static>) {
-        // 泄漏这些 tokens，使其存续时间足以满足 ToolContext<'static>
-        let token = Box::leak(Box::new(CancelToken::new()));
-        let ctx = ToolContext::new(token, PathBuf::from("."), PathBuf::from("."));
-        // SAFETY: 我们泄漏了 CancelToken，保证该引用在 'static 期间有效
-        let ctx: ToolContext<'static> = unsafe { std::mem::transmute(ctx) };
-        (CancelToken::new(), ctx)
+    fn make_ctx() -> ToolContext<'static> {
+        ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
     }
 
     fn test_dir() -> PathBuf {
@@ -141,7 +135,7 @@ mod tests {
             .unwrap();
 
         let tool = ReadTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "test.txt" });
         let result = tool.call(input, ctx).await.unwrap();
 
@@ -161,7 +155,7 @@ mod tests {
         tokio::fs::write(&file, "a\nb\nc\nd\ne\n").await.unwrap();
 
         let tool = ReadTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "offset.txt", "offset": 2, "limit": 2 });
         let result = tool.call(input, ctx).await.unwrap();
 
@@ -178,7 +172,7 @@ mod tests {
     async fn test_read_nonexistent_file() {
         let dir = test_dir();
         let tool = ReadTool::new(dir);
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "no_such_file.txt" });
         let result = tool.call(input, ctx).await;
 
@@ -194,7 +188,7 @@ mod tests {
         tokio::fs::write(&file, &content).await.unwrap();
 
         let tool = ReadTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({ "path": "many.txt", "limit": 3 });
         let result = tool.call(input, ctx).await.unwrap();
 

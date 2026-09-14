@@ -1,5 +1,4 @@
 use ys_component::{RunLimits, RuntimeContext};
-use ys_core::CancelToken;
 use ys_core::{ContentBlock, Message, Role, ToolCallId};
 use ys_event::CollectingSink;
 use ys_loop::{AgentInput, AgentLoop, BasicLoop};
@@ -66,11 +65,9 @@ async fn test_read_write_edit_roundtrip() {
     let tmp = std::env::temp_dir().join("yushan_test");
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let cancel = CancelToken::new();
-
-    // 写入文件
+    // 写入文件（工具不带轮边界源：`None` = 无插话/取消）
     let write_tool = WriteTool::new(tmp.clone());
-    let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
+    let ctx = ToolContext::new(None, tmp.clone(), tmp.clone());
     let result = write_tool
         .call(
             serde_json::json!({ "path": "test.txt", "content": "hello world" }),
@@ -82,7 +79,7 @@ async fn test_read_write_edit_roundtrip() {
 
     // 读回
     let read_tool = ReadTool::new(tmp.clone());
-    let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
+    let ctx = ToolContext::new(None, tmp.clone(), tmp.clone());
     let result = read_tool
         .call(serde_json::json!({ "path": "test.txt" }), ctx)
         .await
@@ -91,7 +88,7 @@ async fn test_read_write_edit_roundtrip() {
 
     // 编辑它
     let edit_tool = EditTool::new(tmp.clone());
-    let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
+    let ctx = ToolContext::new(None, tmp.clone(), tmp.clone());
     let result = edit_tool
         .call(
             serde_json::json!({
@@ -105,7 +102,7 @@ async fn test_read_write_edit_roundtrip() {
     assert!(!result.is_error);
 
     // 再次读取以验证
-    let ctx = ToolContext::new(&cancel, tmp.clone(), tmp.clone());
+    let ctx = ToolContext::new(None, tmp.clone(), tmp.clone());
     let result = read_tool
         .call(serde_json::json!({ "path": "test.txt" }), ctx)
         .await
@@ -125,7 +122,6 @@ async fn test_full_agent_turn_with_mock_model() {
     let model = MockCodingModel;
     let mut session = MemorySession::new();
     let mut events = CollectingSink::new();
-    let cancel = CancelToken::new();
     let registry = ys_tool::ToolRegistry::build(vec![
         Box::new(ReadTool::new(tmp.clone())),
         Box::new(WriteTool::new(tmp.clone())),
@@ -140,7 +136,6 @@ async fn test_full_agent_turn_with_mock_model() {
             &registry,
             &mut session,
             &mut events,
-            &cancel,
             limits,
             tmp.clone(),
             tmp.clone(),

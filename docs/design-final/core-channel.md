@@ -14,6 +14,26 @@
 >
 > 一句话结论：**「事件出口 + 消息模型自转」这条主链已通**——`--json` / `-p` 生产路径实测输出正确、`turn` 从 1 起、死锁已结构性消除；实现期在设计的承重处发现并修掉 2 个真 bug（overflow 丢 turn、自由函数短路冲刷致死锁）。
 
+---
+
+> ⚠ **部分已过时（2026-09-14）** —— 本文件描述的是「核心信道 + Actor 模型」**第一刀**的 as-built。
+> 随后的「coding agent TUI 路线 B」重构删掉了本文件里的若干承重件，**最新形态见
+> [`coding-agent-tui.md`](./coding-agent-tui.md)**：
+>
+> | 本文件描述 | 现状 |
+> |---|---|
+> | `crates/ys-channel`（整 crate） | **已删除**；`Envelope` / `Source` / `LifecyclePolicy` 迁入 `crates/ys-protocol` |
+> | `Inbox` / `Intent` / `QueueMode`（§3 的 `ys-channel` 小节） | **已移除**；由 `ys_protocol::Request`（回合边界）+ `BoundarySource`（轮边界）取代 |
+> | `CancelToken` / `Agent::cancel()` / `cancel_handle()`（§2.7 相关） | **已移除**；由 `Boundary::Abort` 取代（取消是队列里的一条消息，不是跨线程原子） |
+> | `Agent::run(inbox)` / `RunSummary`（§3 `ys-runtime`） | **已删除**；多回合 / followUp 语义上移到 `apps/coding-agent/src/app_loop.rs`（见 ADR-0010 附注） |
+> | `RuntimeContext.inbox`（§3 `ys-component`） | 改为 `RuntimeContext.boundary: Option<&dyn BoundarySource>` + `with_boundary()` |
+> | `ToolContext.cancel: &CancelToken` | 改为 `ToolContext.boundary: Option<&dyn BoundarySource>` |
+>
+> **仍然有效的部分**：`EventSink` 的 try/await 双路径与 `emit` 总走慢路径（§2.2）、`try_emit` 的
+> `Err` 语义（§2.3）、`Source` 手写 serde（§2.4）、`Slow path 背压 / Fast path 不背压`（§2.5）、
+> `ChannelSink` 的 overflow 保 turn 与背压读数（§2.1 / 接线层）—— 这些一字未改。
+> 逐条变更见文末 **§8「2026-09-14 变更」**。
+
 ## 1. 交付概览（对照计划逐项）
 
 状态口径：**完成** = 与计划一致；**偏离** = 做了但形状/落点与计划不同；**补做** = 计划未含、实施期发现必须补。
@@ -349,3 +369,44 @@ CLI 形态下 `run` 是「喂一条 followUp → 跑完退出」，运行期**�
 
 - `/new` 后 `AppView.message_count` 归零（快照由新 wiring 重建），但 `App.transcript` 仍保留屏幕上的旧对话行，
   视觉上「没换成新会话」。设计未规定该行为，留待交互设计统一。**本轮只记录，不改。**
+
+## 8. 2026-09-14 变更（路线 B 重构的连带影响）
+
+> 上游：`docs/arch/coding-agent-tui/design.md`（路线 B）+ `review.md` R1–R7；
+> as-built：`docs/design-final/coding-agent-tui.md`。
+> 本节只记录**对本文件所述内容的改动**，不重复新形态的完整描述。
+
+### 8.1 删除
+
+| 删除项 | 原落点 | 取代者 |
+|---|---|---|
+| `crates/ys-channel`（整 crate） | §3「`ys-channel`（新契约 crate）」 | 拆分：`Envelope` / `Source` / `LifecyclePolicy` → `ys-protocol`；`Inbox` / `Intent` / `QueueMode` → 删除 |
+| `Inbox` / `Intent` / `QueueMode` | §3 `ys-channel` 小节 | `ys_protocol::Request`（UI→app 回合边界）+ `Boundary::Steer`（UI→loop 轮边界） |
+| `CancelToken`（`ys-core/src/cancel.rs`） | §2.7 相关的取消语义 | `ys_protocol::Boundary::Abort` + `BoundarySource::is_aborted()` |
+| `Agent::cancel()` / `Agent::cancel_handle()` | ADR-0007 / 0008 接口 | 同上（ADR-0008 相应结论被 ADR-0013 修订） |
+| `Agent::run(inbox)` / `RunSummary` | §3 `ys-runtime` | `app_loop::run` 的多回合循环（见 ADR-0010 附注） |
+| `RuntimeContext.inbox` + `with_inbox()` | §3 `ys-component` | `RuntimeContext.boundary: Option<&'a dyn BoundarySource>` + `with_boundary()` |
+| `apps/coding-agent/src/ui/`（1684 行）、`ansi.rs`、`commands/`、`inquire` 依赖、`tui-ratatui` feature | 产品层 | `crates/ys-tui-coding`（独立 crate）+ `capabilities.rs` + `ys-tui-coding` 的浮层选择器 |
+
+### 8.2 迁移与改写
+
+- **`Envelope` / `Source` / `LifecyclePolicy` 迁入 `ys-protocol`**（纯数据，类型零改动）。
+  `ys-protocol` 零 tokio（生产与 dev 依赖皆无），仍满足 `ys-core`/`ys-event` 一级的契约层约束。
+- **`EventSink` / `ChannelSink` 一字未改**：try/await 双路径、`emit` 总走慢路径、overflow 存
+  `Envelope`（turn 冻结）、背压读数 —— §2.1 / §2.2 / §2.3 全部继续成立，只是 `Envelope` 的 `use`
+  从 `ys-channel` 变 `ys-protocol`。`ChannelSink` 仍写自己的事件信道，app 侧多跑一个转发循环
+  转成 `Outbound::Event`。
+- **`ys-runtime/tests/actor_run.rs` 删除**（测 `Agent::run` 自转）：多回合 / followUp 语义不在
+  `ys-runtime` 了，等价覆盖落在 `apps/coding-agent/src/app_loop.rs`（2 条）与
+  `crates/ys-runtime/tests/run_turn_boundary.rs`（5 条，`run_turn` + `BoundarySource`）。
+- **`-p` / `--json` 不再经 `Inbox` + `Agent::run`**：直接 `run_turn` + `begin_turn(1)`，
+  一次运行恒为 turn 1（原 §2.8 的「turn 从 1 起」不变量保留，承载方式改为显式 `begin_turn(1)`）。
+- **`ys-component` / `ys-loop` / `ys-runtime` / `adapters/tools-basic` 新增 `ys-protocol` 依赖**
+  （替换原 `ys-channel`）。
+
+### 8.3 仍然有效的结论（勿误删）
+
+§2.2 死锁勘误（自由函数总走慢路径）、§2.3 `try_emit` 的 `Err` 仅表示消费者消失、
+§2.4 `Source` 手写 serde、§2.5 同步/异步路径的背压取舍、§2.6 `#[non_exhaustive]` 的 wildcard、
+§2.13 `/new` 预建空文件、§7.6 多进程写同一会话文件的既有风险、§7.7 `/new` 后 transcript 不清
+—— **均未变**。

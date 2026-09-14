@@ -75,3 +75,18 @@ tool_names / context_window / cancel / cancel_handle
 - **两个产品形态共用**：交互式（`StopWhenConsumerGone`）与后台长任务（`ContinueWithoutConsumer`）共用同一套所有权结构，只是生命周期策略不同。
 - **`AgentBuilder` 仍存在**（启动时静态组合），但其字段需随之调整——**具体形态待设计**。
 - **Q13 部分关闭**：本 ADR 回答"所有权归谁"；"具体 API 形状"仍开放。
+
+## 附注（2026-09-14）：actor 循环上移到 app 侧
+
+**本 ADR 的结论不变**——`Agent` 仍是「只持执行能力、不持会话」的无状态执行器。**换的只是 actor
+循环的承载者**：
+
+- `Agent::run(inbox)` 与 `RunSummary` **已删除**。多回合 / followUp 的驱动语义上移到
+  `apps/coding-agent/src/app_loop.rs`（`app_loop::run` 持 `Wiring` + `Agent`，逐条 `recv` `Request`、
+  调 `run_turn`、转发事件）。
+- 原因：路线 B（拆 crate + 分线程 + 三信道，见 `docs/design-final/coding-agent-tui.md`）让
+  **回合边界在 app 侧**（`Request::Prompt` 到达即跑一回合），`Inbox` 连同其 two-vec / `Intent` /
+  `QueueMode` 一并删除（见 ADR-0013）。
+- `-p` / `--json` 不再经 `Agent::run`：直接 `run_turn` + `begin_turn(1)`，一次运行恒为 turn 1。
+- 因此「Agent 自己转」这一措辞在本 ADR 的语境下收窄为「**app 侧循环驱动 `Agent` 逐回合执行**」；
+  `Agent` 自身的无状态性（不持 session / events / model，经 `AgentPorts` 传入）**一字未改**。

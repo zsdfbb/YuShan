@@ -30,6 +30,10 @@ pub struct ApiModel {
 }
 
 /// 从 API 拉取 models 的结果，区分错误类型。
+///
+/// **当前无生产消费者**（见 [`ProviderRegistry::fetch_models`] 的说明）：
+/// 保留这段能力与它的单测，是为了将来 `/model --refresh` 之类的显式刷新入口。
+#[allow(dead_code)]
 pub enum FetchModelsResult {
     Success(Vec<ApiModel>),
     /// 401 —— 提示用户重新登录
@@ -41,6 +45,7 @@ pub enum FetchModelsResult {
 /// GET /v1/models 的响应。
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
+    #[allow(dead_code)] // 仅经 serde 反序列化，生产路径不直接读
     data: Vec<ApiModel>,
 }
 
@@ -50,6 +55,9 @@ type AuthStore = HashMap<String, AuthEntry>;
 pub struct ProviderRegistry {
     providers: Vec<ProviderInfo>,
     auth_store: AuthStore,
+    /// `/v1/models` 拉取结果缓存（按 api_base 键）。TUI 路径不拉取 —— 见
+    /// [`ProviderRegistry::fetch_models`]。
+    #[allow(dead_code)]
     model_cache: HashMap<String, Vec<ApiModel>>,
     /// auth 文件路径的覆盖项（测试用）。
     auth_override: Option<PathBuf>,
@@ -129,7 +137,9 @@ impl ProviderRegistry {
         };
         match serde_json::from_str::<AuthStore>(&data) {
             Ok(store) => self.auth_store = store,
-            Err(e) => eprintln!("Warning: failed to parse auth.json: {e}"),
+            // 库内部诊断 → 日志文件（设计 §5）：启动期 TUI 可能已起屏，
+            // stderr 会冲掉整屏，而这里没有「历史输出」可看。
+            Err(e) => crate::logging::log(&format!("failed to parse auth.json: {e}")),
         }
     }
 
@@ -182,6 +192,12 @@ impl ProviderRegistry {
     }
 
     /// 从 provider 的 /v1/models endpoint 拉取 models。
+    ///
+    /// **TUI 路径不调用**（设计 §4「`available_models` 用静态列表」）：起屏之后
+    /// 一次重绘都不该发 HTTP 请求，`/login` 也不再顺带拉取 —— `CodingView` 的
+    /// 模型选择器由 [`ProviderRegistry::known_models_static`] 供货。
+    /// 能力本身与单测保留，供将来的显式刷新入口（如 `/model --refresh`）。
+    #[allow(dead_code)]
     pub async fn fetch_models(api_base: &str, api_key: &str) -> FetchModelsResult {
         let url = build_models_url(api_base);
         let client = match reqwest::Client::builder()
@@ -217,6 +233,9 @@ impl ProviderRegistry {
 
     /// 返回可用 models，优先用 cache，否则从 API 拉取。
     /// 出错时回退到静态已知 models。
+    ///
+    /// 同 [`Self::fetch_models`]：TUI 路径不调用。
+    #[allow(dead_code)]
     pub async fn available_models(&mut self, api_base: &str, api_key: &str) -> Vec<ApiModel> {
         if let Some(cached) = self.model_cache.get(api_base) {
             return cached.clone();
@@ -256,6 +275,7 @@ impl ProviderRegistry {
 /// 构建 /v1/models endpoint 的 URL。
 /// 若 base 已以 "/v1" 或 "/v1/" 结尾，则追加 "/models"。
 /// 否则追加 "/v1/models"。
+#[allow(dead_code)] // 仅被 fetch_models 使用（TUI 路径不拉取 models）
 pub fn build_models_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/v1") {

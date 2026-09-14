@@ -1,8 +1,14 @@
 # ADR-0008: Agent::cancel_handle — Ctrl-C / Esc 中断 turn
 
+> **已作废（2026-09-14）**：`CancelToken` 与 `Agent::cancel_handle()` 已随路线 B 一并移除——
+> 取消不再是跨线程原子，而是 `Boundary` 信道上的一条有序消息（`Boundary::Abort`）。
+> 见 [ADR-0013](0013-cancel-token-removal-boundary-source.md) 与
+> [`docs/design-final/coding-agent-tui.md`](../design-final/coding-agent-tui.md)。
+> 本文件仅作历史留档。
+
 ## 状态
 
-提议（2026-09-10）
+提议（2026-09-10）→ **已被 ADR-0013 取代（2026-09-14）**
 
 ## 上下文
 

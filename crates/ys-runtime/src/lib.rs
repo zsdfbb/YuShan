@@ -12,7 +12,6 @@ pub use error::*;
 #[cfg(test)]
 mod tests {
     use super::prelude::*;
-    use ys_channel::{Inbox, Intent};
     use ys_event::CollectingSink;
     use ys_model::MockModel;
     use ys_session::{MemorySession, Session};
@@ -47,7 +46,7 @@ mod tests {
         let result = agent
             .run_turn(
                 AgentInput::text("hi"),
-                AgentPorts::new(Some(&model), &mut session, &mut events),
+                AgentPorts::new(Some(&model), &mut session, &mut events, None),
             )
             .await
             .unwrap();
@@ -56,8 +55,8 @@ mod tests {
 
     /// 空 builder（无工具、无 model/session/events 端口）能成功构建。
     ///
-    /// ADR-0010 后 `build` 不再要求 session/events/model —— 它们在 `run` 时经
-    /// [`AgentPorts`] 传入。本测试锁住「空 builder 构建」这一路径本身。
+    /// ADR-0010 后 `build` 不再要求 session/events/model —— 它们在 `run_turn`
+    /// 时经 [`AgentPorts`] 传入。本测试锁住「空 builder 构建」这一路径本身。
     #[test]
     fn test_empty_builder_builds_successfully() {
         let agent = AgentBuilder::new().build().expect("空 builder 应能构建");
@@ -73,7 +72,7 @@ mod tests {
         let result = agent
             .run_turn(
                 AgentInput::text("hi"),
-                AgentPorts::new(None, &mut session, &mut events),
+                AgentPorts::new(None, &mut session, &mut events, None),
             )
             .await;
         assert!(result.is_err());
@@ -102,7 +101,7 @@ mod tests {
         let result = agent
             .run_turn(
                 AgentInput::text("go"),
-                AgentPorts::new(Some(&model), &mut session, &mut events),
+                AgentPorts::new(Some(&model), &mut session, &mut events, None),
             )
             .await
             .unwrap();
@@ -111,22 +110,23 @@ mod tests {
         assert_eq!(result.rounds, 2);
     }
 
+    /// 入口即中止：预置 `Abort` → `run_turn` 返回 `Cancelled`。
+    ///
+    /// 取代旧的 `test_agent_cancel_token`（`CancelToken` 已废）。
     #[tokio::test]
-    async fn test_agent_cancel_token() {
+    async fn test_abort_boundary_cancels_turn() {
         let model = MockModel::new("test");
-        let cancel = CancelToken::new();
-        cancel.cancel(); // 运行前取消
         let mut session = MemorySession::new();
         let mut events = CollectingSink::new();
 
-        let mut agent = AgentBuilder::new()
-            .cancel_token(cancel.clone())
-            .build()
-            .unwrap();
+        let boundary = QueueBoundarySource::new();
+        boundary.push(Boundary::Abort); // 运行前已中止
+
+        let mut agent = AgentBuilder::new().build().unwrap();
         let result = agent
             .run_turn(
                 AgentInput::text("go"),
-                AgentPorts::new(Some(&model), &mut session, &mut events),
+                AgentPorts::new(Some(&model), &mut session, &mut events, Some(&boundary)),
             )
             .await
             .unwrap();
@@ -152,14 +152,14 @@ mod tests {
         agent
             .run_turn(
                 AgentInput::text("a"),
-                AgentPorts::new(Some(&m1), &mut s1, &mut e1),
+                AgentPorts::new(Some(&m1), &mut s1, &mut e1, None),
             )
             .await
             .unwrap();
         agent
             .run_turn(
                 AgentInput::text("b"),
-                AgentPorts::new(Some(&m2), &mut s2, &mut e2),
+                AgentPorts::new(Some(&m2), &mut s2, &mut e2, None),
             )
             .await
             .unwrap();
@@ -167,33 +167,5 @@ mod tests {
         // 每个会话各自拿到 user + assistant 两条，互不串。
         assert_eq!(s1.messages().len(), 2, "会话 1 应独立记录");
         assert_eq!(s2.messages().len(), 2, "会话 2 应独立记录");
-    }
-
-    /// `RunSummary` 语义不变：`turns` 计回合、`last_stop` 取末回合、`usage` 累计。
-    #[tokio::test]
-    async fn run_summary_semantics_unchanged() {
-        let model = MockModel::new("test");
-        model.push_text("r1");
-        model.push_text("r2");
-        let mut session = MemorySession::new();
-        let mut events = CollectingSink::new();
-
-        let mut agent = AgentBuilder::new().build().unwrap();
-        let inbox = Inbox::new();
-        inbox.push(AgentInput::text("a").message, Intent::FollowUp);
-        inbox.push(AgentInput::text("b").message, Intent::FollowUp);
-
-        let summary = agent
-            .run(
-                AgentPorts::new(Some(&model), &mut session, &mut events),
-                &inbox,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(summary.turns, 2, "两条 followUp → 两个回合");
-        assert_eq!(summary.last_stop, Some(StopReason::Completed));
-        assert_eq!(summary.last_rounds, 1);
-        assert!(summary.last_message.is_some());
     }
 }

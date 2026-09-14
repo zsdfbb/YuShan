@@ -42,7 +42,7 @@ fn is_cjk(ch: char) -> bool {
 
 /// 估算 session 中全部消息的总 token 数
 pub fn estimate_session_tokens(messages: &[Message]) -> usize {
-    messages.iter().map(|m| estimate_tokens(m)).sum()
+    messages.iter().map(estimate_tokens).sum()
 }
 
 #[cfg(test)]

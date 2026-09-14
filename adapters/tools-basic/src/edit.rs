@@ -260,13 +260,9 @@ fn find_match_fuzzy(content: &str, old_text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ys_core::CancelToken;
 
-    fn make_ctx() -> (CancelToken, ToolContext<'static>) {
-        let token = Box::leak(Box::new(CancelToken::new()));
-        let ctx = ToolContext::new(token, PathBuf::from("."), PathBuf::from("."));
-        let ctx: ToolContext<'static> = unsafe { std::mem::transmute(ctx) };
-        (CancelToken::new(), ctx)
+    fn make_ctx() -> ToolContext<'static> {
+        ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
     }
 
     fn test_dir() -> PathBuf {
@@ -298,7 +294,7 @@ mod tests {
         std::fs::write(&file, "hello world").unwrap();
 
         let tool = EditTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({
             "path": "exact.txt",
             "edits": [{ "oldText": "world", "newText": "rust" }]
@@ -321,7 +317,7 @@ mod tests {
         std::fs::write(&file, "aaa bbb ccc").unwrap();
 
         let tool = EditTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({
             "path": "batch.txt",
             "edits": [
@@ -346,7 +342,7 @@ mod tests {
         std::fs::write(&file, "foo bar").unwrap();
 
         let tool = EditTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({
             "path": "legacy.txt",
             "oldText": "foo",
@@ -369,7 +365,7 @@ mod tests {
         std::fs::write(&file, "hello").unwrap();
 
         let tool = EditTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({
             "path": "notfound.txt",
             "edits": [{ "oldText": "xyz", "newText": "abc" }]
@@ -388,7 +384,7 @@ mod tests {
         std::fs::write(&file, "aaa aaa aaa").unwrap();
 
         let tool = EditTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({
             "path": "multi.txt",
             "edits": [{ "oldText": "aaa", "newText": "bbb" }]
@@ -407,7 +403,7 @@ mod tests {
         std::fs::write(&file, "hello\r\nworld\r\n").unwrap();
 
         let tool = EditTool::new(dir.clone());
-        let (_cancel, ctx) = make_ctx();
+        let ctx = make_ctx();
         let input = json!({
             "path": "crlf.txt",
             "edits": [{ "oldText": "hello", "newText": "hi" }]

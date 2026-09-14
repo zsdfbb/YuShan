@@ -1,16 +1,18 @@
-//! 接线器（ADR-0010）：持有**会话 + 队列 + 模型 + 事件出口**。
+//! 接线器（ADR-0010）：持有**会话 + 模型 + 事件出口**。
 //!
 //! Agent 已降为无状态执行器；「当前是哪个会话」「当前用哪个模型」都归这里。
-//! 调用点经 [`Wiring::ports`] 把这三样借给 `Agent::run`。
+//! 调用点经 [`Wiring::ports`] 把这三样借给 `Agent::run_turn`。
 //!
-//! **`/new` = 换队列**：替换 `session` + `inbox` 两个句柄——新会话文件 + 新空
-//! `Inbox`（pending 丢弃），旧会话文件保留。Agent / BasicLoop / ys-channel
-//! 全程不知情（设计 §3「`/new` 的语义」）。
+//! **`/new` = 换会话**：替换 `session` 句柄 —— 新会话文件（旧文件保留）。
+//! Agent / BasicLoop 全程不知情。
+//!
+//! **不再有 `Inbox`**（T1 起删除）：未处理输入的唯一持有者是 UI 的输入框，
+//! app 线程每收到一条 [`Request::Prompt`](ys_protocol::Request::Prompt) 就跑
+//! 一个回合 —— 队列与历史的历史性合并已成过去（设计 §8 三条信道）。
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ys_channel::Inbox;
 use ys_event::EventSink;
 use ys_model::Model;
 use ys_runtime::AgentPorts;
@@ -28,7 +30,6 @@ use ys_session::Message;
 pub struct Wiring {
     model: Option<Box<dyn Model>>,
     session: Box<dyn Session>,
-    inbox: Inbox,
     events: Box<dyn EventSink>,
     /// 会话落盘目录；`None` = 一次性会话。
     sessions_dir: Option<PathBuf>,
@@ -42,7 +43,6 @@ impl Wiring {
         Self {
             model,
             session: Box::new(MemorySession::new()),
-            inbox: Inbox::new(),
             events,
             sessions_dir: None,
             session_path: None,
@@ -67,23 +67,21 @@ impl Wiring {
         Ok(Self {
             model,
             session: Box::new(session),
-            inbox: Inbox::new(),
             events,
             sessions_dir: Some(sessions_dir),
             session_path: Some(path),
         })
     }
 
-    /// **`/new`**：换新会话 + 新空 `Inbox`（pending 丢弃）；旧会话文件保留（不删）。
+    /// **`/new`**：换新会话；旧会话文件保留（不删）。
     ///
     /// 持久形态下 **先建好新会话并立即落盘**（空文件）：
     /// - `JsonlSession::open` 不预建文件，只在**首次追加**时落盘。若只 `open`
     ///   不落盘，用户 `/new` 后不发消息就退出，磁盘上仍只有旧文件，
     ///   重启时 [`latest_session_path`] 仍选中旧文件 —— `/new` 等于没生效。
     ///   故 `open` 后立即 `clear()` 触发一次落盘，使新文件名时间戳最新且真实存在。
-    /// - 顺序上**先 open + clear、成功后才替换** `session` / `session_path` /
-    ///   `inbox`：任一步失败时状态保持原样，不会出现「pending 已丢、会话未换」
-    ///   的半新半旧。
+    /// - 顺序上**先 open + clear、成功后才替换** `session` / `session_path`：
+    ///   任一步失败时状态保持原样，不会出现「会话未换却已丢历史」的半新半旧。
     ///
     /// 返回新会话文件路径（一次性会话返回 `None`）。
     pub async fn new_session(&mut self) -> Result<Option<PathBuf>, SessionError> {
@@ -95,13 +93,11 @@ impl Wiring {
                 session.clear().await?;
                 self.session = Box::new(session);
                 self.session_path = Some(path.clone());
-                self.inbox = Inbox::new(); // pending 丢弃（设计 §3：未处理输入失去语境）
                 Ok(Some(path))
             }
             None => {
                 self.session = Box::new(MemorySession::new());
                 self.session_path = None;
-                self.inbox = Inbox::new();
                 Ok(None)
             }
         }
@@ -112,26 +108,24 @@ impl Wiring {
         self.session.clear().await
     }
 
-    /// 借用端口给 `Agent::run` / `run_turn`。
+    /// 借用端口给 `Agent::run_turn`。
+    ///
+    /// 轮边界源**不在这里**：它由 `app_loop` 每回合新建、经 [`AgentPorts::new`]
+    /// 就地传入（`Abort` 的标志位必须随回合作废）。
     pub fn ports(&mut self) -> AgentPorts<'_> {
-        AgentPorts {
-            model: self.model.as_deref(),
-            session: self.session.as_mut(),
-            events: self.events.as_mut(),
-        }
-    }
-
-    /// 当前 inbox 的克隆句柄（`Inbox` 内为 `Arc`，克隆共享同一底层队列）。
-    pub fn inbox(&self) -> Inbox {
-        self.inbox.clone()
+        AgentPorts::new(
+            self.model.as_deref(),
+            self.session.as_mut(),
+            self.events.as_mut(),
+            None,
+        )
     }
 
     pub fn is_configured(&self) -> bool {
         self.model.is_some()
     }
 
-    /// 当前模型标识（供 `AppView` 快照；无 TUI 构建下不被读取）。
-    #[cfg_attr(not(feature = "tui-ratatui"), allow(dead_code))]
+    /// 当前模型标识（构造 `CodingView` 快照用）。
     pub fn model_id(&self) -> Option<&str> {
         self.model.as_deref().map(|m| m.model_id())
     }
@@ -141,17 +135,14 @@ impl Wiring {
         self.model = model;
     }
 
-    /// 当前会话消息（供 `AppView` 快照；无 TUI 构建下不被读取）。
-    #[cfg_attr(not(feature = "tui-ratatui"), allow(dead_code))]
+    /// 当前会话消息（构造 `CodingView` 快照用）。
     pub fn session_messages(&self) -> &[Message] {
         self.session.messages()
     }
 
     /// 当前会话文件路径（一次性会话为 `None`）。
     ///
-    /// 生产路径当前不读（`/new` 用 `new_session` 的返回值），保留为公开只读
-    /// 查询：`/status`、测试与后续「会话列表」需要它。
-    #[allow(dead_code)]
+    /// 消费者：`CodingView.session_path` 与 `/export` 的默认落点。
     pub fn session_path(&self) -> Option<&Path> {
         self.session_path.as_deref()
     }
@@ -178,7 +169,8 @@ fn latest_session_path(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ys_channel::Intent;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use ys_core::{ContentBlock, Role};
     use ys_event::CollectingSink;
 
@@ -189,29 +181,30 @@ mod tests {
         }
     }
 
+    /// 临时目录名含**进程内原子序号 + `process::id()`**（并行安全）。
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("yushan_wiring_{name}_{}", std::process::id()));
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("yushan_wiring_{name}_{}_{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// `/new`（一次性）：inbox 里的 pending 被丢弃、消息历史清空。
+    /// `/new`（一次性）：历史清空、无会话文件。
     #[tokio::test]
-    async fn new_session_ephemeral_discards_pending() {
+    async fn new_session_ephemeral_clears_history() {
         let mut w = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
         w.ports().session.append(text_message("old")).await.unwrap();
-        w.inbox().push(text_message("pending"), Intent::FollowUp);
-        assert!(!w.inbox().is_empty());
 
         let path = w.new_session().await.unwrap();
 
         assert!(path.is_none(), "一次性会话无文件");
-        assert!(w.inbox().is_empty(), "pending 应被丢弃");
         assert!(w.session_messages().is_empty(), "历史应清空");
     }
 
-    /// `/new`（持久）：旧文件保留且非空；新文件生成且为空；新 inbox 为空。
+    /// `/new`（持久）：旧文件保留且非空；新文件生成且为空。
     #[tokio::test]
     async fn new_session_persistent_keeps_old_file_and_creates_empty_new() {
         let dir = temp_dir("new_session");
@@ -226,7 +219,6 @@ mod tests {
             .unwrap();
         let old_path = w.session_path().unwrap().to_path_buf();
         assert!(old_path.exists());
-        w.inbox().push(text_message("pending"), Intent::FollowUp);
 
         let new_path = w.new_session().await.unwrap().expect("持久会话应返回路径");
 
@@ -244,7 +236,6 @@ mod tests {
             "预建的新文件应为空"
         );
         assert!(w.session_messages().is_empty(), "新会话历史为空");
-        assert!(w.inbox().is_empty(), "新 inbox 为空（pending 丢弃）");
 
         w.ports()
             .session
@@ -354,6 +345,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `/compact`：消息清空，但会话文件仍在（同一个文件）。
+    #[tokio::test]
+    async fn clear_session_empties_history_but_keeps_file() {
+        let dir = temp_dir("clear");
+        let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        w.ports()
+            .session
+            .append(text_message("gone"))
+            .await
+            .unwrap();
+        let path = w.session_path().unwrap().to_path_buf();
+
+        w.clear_session().await.unwrap();
+
+        assert!(w.session_messages().is_empty());
+        assert_eq!(w.session_path(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 覆盖：`set_model` 后 `model_id()` 精确值、`is_configured()` 两态。
     #[test]
     fn set_model_updates_model_id_and_is_configured() {
@@ -368,5 +380,15 @@ mod tests {
         w.set_model(None);
         assert!(!w.is_configured(), "移除 model 后未配置");
         assert_eq!(w.model_id(), None);
+    }
+
+    /// `ports()` 不携带边界源（边界由 `app_loop` 每回合新建）。
+    #[test]
+    fn ports_carry_no_boundary_source() {
+        let mut w = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        assert!(
+            w.ports().boundary.is_none(),
+            "接线器不持有边界源 —— 它随回合生灭"
+        );
     }
 }

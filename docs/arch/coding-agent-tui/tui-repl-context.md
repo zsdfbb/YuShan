@@ -1,5 +1,8 @@
 # 行式 REPL（rustyline）— 架构上下文
 
+> **已作废（2026-09-14）**：本文件描述的行式 REPL 方案已被反转，架构结论已并入 docs/arch/coding-agent-tui/design.md 与 docs/design-final/coding-agent-tui.md。仅作历史留档。
+
+
 > 目标：**新增行式 REPL 作为交互入口，与现有 ratatui TUI 并存（各为一个 feature），REPL 为默认。**
 > 产出本文后进入 `arch-design`。
 >

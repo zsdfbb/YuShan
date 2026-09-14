@@ -11,7 +11,7 @@ ys-model = { path = "../ys-model" }
 ys-tool = { path = "../ys-tool" }
 ys-session = { path = "../ys-session" }
 ys-event = { path = "../ys-event" }
-ys-channel = { path = "../ys-channel" }
+ys-protocol = { path = "../ys-protocol" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -1,6 +1,5 @@
 //! ys-core: 共享词汇与原语
 
-mod cancel;
 mod error;
 mod id;
 mod message;
@@ -8,7 +7,6 @@ mod stop;
 mod tool;
 mod usage;
 
-pub use cancel::*;
 pub use error::*;
 pub use id::*;
 pub use message::*;
@@ -43,14 +41,6 @@ mod tests {
         let json = serde_json::to_string(&call).unwrap();
         let back: ToolCall = serde_json::from_str(&json).unwrap();
         assert_eq!(call, back);
-    }
-
-    #[test]
-    fn test_cancel_token() {
-        let token = CancelToken::new();
-        assert!(!token.is_cancelled());
-        token.cancel();
-        assert!(token.is_cancelled());
     }
 
     #[test]

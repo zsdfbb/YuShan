@@ -6,6 +6,7 @@
 //! ADR-0010 后：会话/事件/模型归接线器，测试中作为 [`AgentPorts`] 传入。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use ys_core::{ContentBlock, Message, Role};
 use ys_event::CollectingSink;
 use ys_loop::{AgentLoop, BasicLoop};
@@ -52,13 +53,12 @@ impl ys_tool::Tool for FailingTool {
     }
 }
 
-/// 用默认 cwd/workspace 创建 RuntimeContext 的辅助函数
+/// 用默认 cwd/workspace 创建 RuntimeContext 的辅助函数（不挂边界源）
 fn make_ctx<'a>(
     model: &'a dyn ys_model::Model,
     registry: &'a ys_tool::ToolRegistry,
     session: &'a mut dyn Session,
     events: &'a mut dyn ys_event::EventSink,
-    cancel: &'a CancelToken,
     limits: RunLimits,
 ) -> RuntimeContext<'a> {
     RuntimeContext::new(
@@ -66,7 +66,6 @@ fn make_ctx<'a>(
         registry,
         session,
         events,
-        cancel,
         limits,
         PathBuf::from("."),
         PathBuf::from("."),
@@ -90,7 +89,7 @@ async fn tc2_pure_text_reply() {
     let result = agent
         .run_turn(
             AgentInput::text("hi"),
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(Some(&model), &mut session, &mut events, None),
         )
         .await
         .unwrap();
@@ -116,7 +115,7 @@ async fn tc3_single_tool_call() {
     let result = agent
         .run_turn(
             AgentInput::text("go"),
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(Some(&model), &mut session, &mut events, None),
         )
         .await
         .unwrap();
@@ -143,7 +142,7 @@ async fn tc4_multi_round_tool_loop() {
     let result = agent
         .run_turn(
             AgentInput::text("go"),
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(Some(&model), &mut session, &mut events, None),
         )
         .await
         .unwrap();
@@ -169,7 +168,7 @@ async fn tc5_tool_error_fed_back_to_model() {
     let result = agent
         .run_turn(
             AgentInput::text("go"),
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(Some(&model), &mut session, &mut events, None),
         )
         .await
         .unwrap();
@@ -191,19 +190,11 @@ async fn tc8_incremental_concat_matches_final() {
 
     let mut session = MemorySession::new();
     let mut events = CollectingSink::new();
-    let cancel = CancelToken::new();
     let registry = ToolRegistry::build(vec![Box::new(EchoTool)]).unwrap();
     let limits = RunLimits::new(5);
 
     let result = {
-        let mut ctx = make_ctx(
-            &model,
-            &registry,
-            &mut session,
-            &mut events,
-            &cancel,
-            limits,
-        );
+        let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
         BasicLoop
             .run_turn(AgentInput::text("go"), &mut ctx)
             .await
@@ -259,19 +250,11 @@ async fn tc9_terminal_event_invariant() {
 
     let mut session = MemorySession::new();
     let mut events = CollectingSink::new();
-    let cancel = CancelToken::new();
     let registry = ToolRegistry::build(vec![]).unwrap();
     let limits = RunLimits::new(5);
 
     {
-        let mut ctx = make_ctx(
-            &model,
-            &registry,
-            &mut session,
-            &mut events,
-            &cancel,
-            limits,
-        );
+        let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
         let _ = BasicLoop.run_turn(AgentInput::text("go"), &mut ctx).await;
     }
 
@@ -322,7 +305,7 @@ async fn tc14_continuation_with_history() {
     let result = agent
         .run_turn(
             AgentInput::text("follow up"),
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(Some(&model), &mut session, &mut events, None),
         )
         .await
         .unwrap();
@@ -355,26 +338,26 @@ fn tc10_duplicate_tool_name_build_error() {
 }
 
 // ---------------------------------------------------------------------------
-// 取消：经工具执行在循环中途取消
+// 中止：经工具执行在循环中途推入 Abort
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cancel_mid_loop() {
-    struct CancellingTool {
-        cancel: CancelToken,
+async fn abort_mid_loop() {
+    struct AbortingTool {
+        boundary: Arc<QueueBoundarySource>,
     }
 
     #[async_trait::async_trait]
-    impl ys_tool::Tool for CancellingTool {
+    impl ys_tool::Tool for AbortingTool {
         fn spec(&self) -> ToolSpec {
-            ToolSpec::new("cancel", "cancels the run", serde_json::json!({}))
+            ToolSpec::new("abort", "aborts the run", serde_json::json!({}))
         }
         async fn call(
             &self,
             _input: serde_json::Value,
             _ctx: ToolContext<'_>,
         ) -> Result<ToolResult, ToolError> {
-            self.cancel.cancel();
+            self.boundary.push(Boundary::Abort);
             Ok(ToolResult {
                 content: "cancelled".into(),
                 is_error: false,
@@ -382,28 +365,32 @@ async fn cancel_mid_loop() {
         }
     }
 
-    let cancel_token = CancelToken::new();
+    let boundary = Arc::new(QueueBoundarySource::new());
 
     let model = MockModel::new("test");
-    model.push_tool_call("cancel", serde_json::json!({}));
+    model.push_tool_call("abort", serde_json::json!({}));
     let mut session = MemorySession::new();
     let mut events = CollectingSink::new();
 
     let mut agent = AgentBuilder::new()
-        .tool(CancellingTool {
-            cancel: cancel_token.clone(),
+        .tool(AbortingTool {
+            boundary: boundary.clone(),
         })
-        .cancel_token(cancel_token)
         .build()
         .unwrap();
     let result = agent
         .run_turn(
             AgentInput::text("go"),
-            AgentPorts::new(Some(&model), &mut session, &mut events),
+            AgentPorts::new(
+                Some(&model),
+                &mut session,
+                &mut events,
+                Some(boundary.as_ref()),
+            ),
         )
         .await
         .unwrap();
 
-    // 工具执行期间已设置取消，下一个 loop 边界检测到它
+    // 工具执行期间已推入中止，下一个 loop 边界检测到它
     assert_eq!(result.stop_reason, StopReason::Cancelled);
 }

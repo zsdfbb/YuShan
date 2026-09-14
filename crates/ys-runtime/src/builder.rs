@@ -1,7 +1,6 @@
 use super::{Agent, BuildError};
 use std::path::PathBuf;
 use ys_component::RunLimits;
-use ys_core::CancelToken;
 use ys_loop::{AgentLoop, BasicLoop};
 use ys_tool::{ApprovalHandler, Tool, ToolRegistry};
 
@@ -9,11 +8,11 @@ use ys_tool::{ApprovalHandler, Tool, ToolRegistry};
 ///
 /// **ADR-0010**：会话、事件出口与模型**不再**是 agent 的组成——它们归接线器，
 /// 运行时经 [`AgentPorts`](crate::AgentPorts) 传入。故 builder 不含
-/// `.session()` / `.events()` / `.model()`。
+/// `.session()` / `.events()` / `.model()`；轮边界控制源亦经端口传入，
+/// 故也不含 `.cancel_token()`（`CancelToken` 已废，由 `Boundary::Abort` 取代）。
 pub struct AgentBuilder {
     tools: Vec<Box<dyn Tool>>,
     loop_impl: Option<Box<dyn AgentLoop>>,
-    cancel: CancelToken,
     limits: RunLimits,
     cwd: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
@@ -26,7 +25,6 @@ impl AgentBuilder {
         Self {
             tools: Vec::new(),
             loop_impl: None,
-            cancel: CancelToken::new(),
             limits: RunLimits::default(),
             cwd: None,
             workspace_root: None,
@@ -37,11 +35,6 @@ impl AgentBuilder {
 
     pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
         self.tools.push(Box::new(tool));
-        self
-    }
-
-    pub fn cancel_token(mut self, cancel: CancelToken) -> Self {
-        self.cancel = cancel;
         self
     }
 
@@ -80,7 +73,6 @@ impl AgentBuilder {
         Ok(Agent::new(
             loop_impl,
             registry,
-            self.cancel,
             self.limits,
             cwd,
             workspace_root,

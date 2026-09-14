@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 用工具片段和动态 guideline 构建 system prompt。
 pub fn build_system_prompt(cwd: &Path) -> String {
@@ -154,17 +154,6 @@ fn find_custom_prompt(cwd: &Path) -> Option<String> {
     None
 }
 
-/// 渲染 cwd，将 $HOME 前缀替换为 `~/`。若 cwd 在 $HOME 之外则回退为绝对路径。
-pub fn format_cwd_tilde(cwd: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home_path = PathBuf::from(home);
-        if let Ok(rel) = cwd.strip_prefix(&home_path) {
-            return format!("~/{}", rel.display());
-        }
-    }
-    cwd.display().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,53 +184,5 @@ mod tests {
         assert_eq!(prompt, "Custom system prompt");
 
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn test_format_cwd_tilde_inside_home() {
-        let _guard = env_lock();
-        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
-        unsafe {
-            std::env::set_var("HOME", "/test/home");
-            std::env::remove_var("USERPROFILE");
-        }
-        let cwd = PathBuf::from("/test/home/foo");
-        assert_eq!(format_cwd_tilde(&cwd), "~/foo");
-    }
-
-    #[test]
-    fn test_format_cwd_tilde_at_home() {
-        let _guard = env_lock();
-        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
-        unsafe {
-            std::env::set_var("HOME", "/test/home");
-            std::env::remove_var("USERPROFILE");
-        }
-        let cwd = PathBuf::from("/test/home");
-        assert_eq!(format_cwd_tilde(&cwd), "~/");
-    }
-
-    #[test]
-    fn test_format_cwd_tilde_outside_home() {
-        let _guard = env_lock();
-        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
-        unsafe {
-            std::env::set_var("HOME", "/test/home");
-            std::env::remove_var("USERPROFILE");
-        }
-        let cwd = PathBuf::from("/tmp");
-        assert_eq!(format_cwd_tilde(&cwd), "/tmp");
-    }
-
-    #[test]
-    fn test_format_cwd_tilde_no_home() {
-        let _guard = env_lock();
-        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
-        unsafe {
-            std::env::remove_var("HOME");
-            std::env::remove_var("USERPROFILE");
-        }
-        let cwd = PathBuf::from("/tmp");
-        assert_eq!(format_cwd_tilde(&cwd), "/tmp");
     }
 }

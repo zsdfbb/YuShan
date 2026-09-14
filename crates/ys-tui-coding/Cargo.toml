@@ -1,0 +1,23 @@
+[package]
+name = "ys-tui-coding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 无 [features] —— 默认全开（本 crate 只有一种形态）。
+#
+# 硬约束：**不得依赖 ys-runtime**（不认识 `Agent`）。依赖方向由 crate 边界强制：
+#   ys-protocol ──► ys-tui-coding ──► apps/coding-agent
+[dependencies]
+ys-protocol = { path = "../ys-protocol" }
+ys-core = { path = "../ys-core" }
+ys-event = { path = "../ys-event" }
+serde_json = "1"
+# `unstable-rendered-line-info` 提供 `Paragraph::line_count(width)` —— 按 **wrap 后**
+# 的视觉行数计算滚动上限（设计 §4「对话区 wrap 修正」）。这是 ratatui 内部
+# WordWrapper 的同一实现，故与渲染结果严格一致（自写折行无法保证 CJK 列宽对齐）。
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+# UI 线程本身不跑 async；tokio 只提供 mpsc 类型（与 app 线程的信道契约）。
+tokio = { version = "1", default-features = false, features = ["sync"] }

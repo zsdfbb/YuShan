@@ -324,7 +324,7 @@ session-jsonl = ["dep:ys-session-jsonl"]
 session-sqlite = ["dep:ys-session-sqlite"]
 ```
 
-**运行时依赖边界（ADR-0012）**：不宜对 tokio 做 feature 门控。实际边界是——**纯契约层**（`ys-core`/`ys-event`/`ys-channel`/`ys-component`）保持运行时无关；**执行层**（`ys-session`/`ys-loop`/`ys-runtime`）可直接依赖 tokio。上表 `runtime-tokio` 一项**不实施**。
+**运行时依赖边界（ADR-0012）**：不宜对 tokio 做 feature 门控。实际边界是——**纯契约层**（`ys-core`/`ys-event`/`ys-protocol`/`ys-component`）保持运行时无关；**执行层**（`ys-session`/`ys-loop`/`ys-runtime`）可直接依赖 tokio。上表 `runtime-tokio` 一项**不实施**。
 
 ## 8. 动态插件
 

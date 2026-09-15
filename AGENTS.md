@@ -221,7 +221,8 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 | **架构全貌的图解**（组件关系、数据流、时序） | `docs/architecture.md` |
 | 架构规范、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
 | 术语定义（Turn、Round、StopReason、错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
-| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`） |
+| **给新需求归类**（该用 Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
+| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`）、0014 只做 follow-up（**不建 hook 系统**，有意推迟） |
 | **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）+ `docs/design-final/core-channel.md`（核心信道第一刀，部分已被上文取代，见其 §8） |
 | coding agent TUI 的设计推导与质量分析 | `docs/arch/coding-agent-tui/{design,review}.md`；已作废的前身 `docs/arch/coding-agent-tui/tui-repl-context.md` |
 | 核心信道的设计推导与质量分析 | `docs/arch/gap-closure/{context,design-core-channel,review}.md` |

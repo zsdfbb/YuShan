@@ -287,6 +287,10 @@ Loop：按什么规则推进
 
 静态插件直接注册 Rust Hook，动态插件通过 ABI 注册 Hook Adapter。第一版只支持启动时注册，不支持 Agent 运行期间热插拔或热卸载。
 
+> **状态（2026-09-15）**：Hook 系统**有意推迟** —— 见 [ADR-0014](../adr/0014-follow-up-without-hook-system.md)。
+> 当前只实现 `app_loop` 层的 **follow-up（追问）**（设计见 `docs/design-plans/2026-09-15-follow-up.md`），
+> 不建通用 hook。本节规范保持有效，待第二个真实消费者出现再落地。
+
 ## 7. 静态组合
 
 ```rust

@@ -6,9 +6,6 @@ use tokio::process::Command;
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
-const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 50 * 1024;
-
 /// 挂载了 `boundary` 时的中止轮询间隔 —— 命令中止的感知延迟上界。
 const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -20,44 +17,6 @@ impl BashTool {
     pub fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
-}
-
-/// 尾截断输出：保留末尾的 MAX_LINES / MAX_BYTES
-fn tail_truncate(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    let total_lines = lines.len();
-
-    if total_lines <= MAX_LINES {
-        // 检查字节上限
-        if output.len() <= MAX_BYTES {
-            return output.to_string();
-        }
-    }
-
-    // 找出多少尾行能放入 MAX_BYTES
-    let mut byte_count = 0usize;
-    let mut start = total_lines;
-
-    for i in (0..total_lines).rev() {
-        let line_len = lines[i].len() + 1; // +1 计入换行符
-        if byte_count + line_len > MAX_BYTES {
-            break;
-        }
-        byte_count += line_len;
-        start = i;
-    }
-
-    // 同时遵守 MAX_LINES 上限
-    let min_start = total_lines.saturating_sub(MAX_LINES);
-    start = start.max(min_start);
-
-    let shown = &lines[start..];
-    let mut result = shown.join("\n");
-    let skipped = start;
-    if skipped > 0 {
-        result.insert_str(0, &format!("[Truncated {skipped} lines.]\n\n"));
-    }
-    result
 }
 
 /// 把子进程输出组装成工具结果：stdout + stderr 合并、超限尾截断、非零退码标错。
@@ -76,19 +35,32 @@ fn render_result(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> ToolRe
         combined.push_str(&stderr);
     }
 
+    // 尾截断由 `ys_tool::truncate` 统一实现；「丢弃了多少行」的通知由本工具前插。
+    // `total_lines - shown_lines` 即被丢弃的行数（= 原实现里的 `skipped`）。
+    let truncated = ys_tool::tail(&combined, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
+    let mut content = truncated.content;
+    if truncated.shown_lines < truncated.total_lines {
+        content.insert_str(
+            0,
+            &format!(
+                "[Truncated {} lines.]\n\n",
+                truncated.total_lines - truncated.shown_lines
+            ),
+        );
+    }
+
     // 检查退出码（被信号杀死时 code 为 None，不视作「非零退码」）
     if let Some(code) = exit_code {
         if code != 0 {
-            let truncated = tail_truncate(&combined);
             return ToolResult {
-                content: format!("{truncated}\n\nCommand exited with code {code}"),
+                content: format!("{content}\n\nCommand exited with code {code}"),
                 is_error: true,
             };
         }
     }
 
     ToolResult {
-        content: tail_truncate(&combined),
+        content,
         is_error: false,
     }
 }
@@ -138,7 +110,10 @@ impl Tool for BashTool {
             .arg(command)
             .current_dir(&self.workspace)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // 超时/中止后 `Child` 在 `wait_with_output` 的 future 被 drop 时随之 drop，
+            // 若无此设置子进程会继续跑到自然结束。
+            .kill_on_drop(true);
 
         // Unix 上使用进程组
         #[cfg(unix)]
@@ -266,6 +241,21 @@ mod tests {
         ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
     }
 
+    /// 临时目录名含**进程内原子序号 + `process::id()`**（并行安全的既有样板，见 `read.rs`）。
+    fn test_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agent_tools_basic_bash_test_{id}_{}_{seq}",
+            std::process::id()
+        ))
+    }
+
     #[tokio::test]
     async fn test_bash_echo() {
         let tool = BashTool::new(PathBuf::from("."));
@@ -298,6 +288,56 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    /// N3（不泄漏）：超时后**直接子进程必须已被杀死**，不得继续执行后续命令。
+    ///
+    /// 原理：`cmd.kill_on_drop(true)` 在 `wait_with_output()` 的 future 被 timeout drop 时
+    /// 连带 drop `Child`，从而 SIGKILL 直接子进程 `sh`；`sh` 死于 1s，来不及在 2s 执行
+    /// `touch`。故 3s 后 sentinel 必须不存在。
+    ///
+    /// ⚠️ 本用例只用「`sh` 亲自执行 `touch`」的形式 —— `kill_on_drop` 只杀直接子进程，
+    /// `sh -c '(… ) & wait'` 之类**孙进程**仍会存活（已登记的后续项 P2-2，不在此编码）。
+    ///
+    /// 变异：删掉 `.kill_on_drop(true)` → `sh` 活过 2s 并 `touch` → sentinel 存在 → 红。
+    #[tokio::test]
+    async fn test_bash_timeout_does_not_leak_child_process() {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let sentinel = dir.join("leaked.txt");
+
+        let tool = BashTool::new(dir.clone());
+        let ctx = make_ctx();
+        let input = json!({
+            "command": format!("sleep 2; touch {}", sentinel.display()),
+            "timeout": 1
+        });
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.call(input, ctx))
+            .await
+            .expect("call 应在 ~1s 内返回；超过 10s 视为挂起（死锁必须表现为失败）");
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("超时必须返回 Err");
+        assert!(
+            matches!(err, ToolError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时应按 timeout 收敛（1s），实际耗时 {elapsed:?}"
+        );
+
+        // 等过命令里 `sleep 2` 的时点：若子进程没被杀死，此刻 sentinel 已被 touch 出来。
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !sentinel.exists(),
+            "超时后子进程仍存活并执行了 touch（kill_on_drop 未生效）：{}",
+            sentinel.display()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -411,19 +451,63 @@ mod tests {
         );
     }
 
+    /// 未超限：`truncate::tail` 原样返回（含尾随换行），无需通知。
     #[test]
     fn test_tail_truncate_short() {
         let input = "line1\nline2\nline3\n";
-        let result = tail_truncate(input);
-        assert_eq!(result, input);
+        let result = ys_tool::tail(input, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
+        assert_eq!(result.content, input);
+        assert_eq!(result.shown_lines, result.total_lines);
     }
 
+    /// 超限：保留末尾（含最后一行），且确有行被丢弃 —— 后者等价于「调用方会拼出
+    /// `[Truncated N lines.]` 通知」（文案由调用方拼，不在本模块）。
     #[test]
     fn test_tail_truncate_long() {
         let lines: Vec<String> = (1..=3000).map(|i| format!("line{i}")).collect();
         let input = lines.join("\n");
-        let result = tail_truncate(&input);
-        assert!(result.contains("Truncated"));
-        assert!(result.contains("line3000"));
+        let result = ys_tool::tail(&input, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
+        assert!(result.shown_lines < result.total_lines);
+        assert!(result.content.contains("line3000"));
+    }
+
+    /// 走**完整 `call` 路径**，钉住 `[Truncated N lines.]` 的字面文案与**具体 N**。
+    ///
+    /// 关键构造：输入必须让**字节闸**（51200）而非行数闸（2000）成为约束 ——
+    /// 3000 行 × 40 字节 = 123000 字节，行数（3000）并未超过行数上限（2000），
+    /// 故 `shown_lines` 完全由 `tail` 的字节规则（单行成本 `len() + 1`，含换行）决定：
+    /// `51200 / 41 = 1248` 行可留 ⇒ 丢弃 `3000 - 1248 = 1752` 行。
+    ///
+    /// 变异：`crates/ys-tool/src/truncate.rs::tail` 里 `lines[i].len() + 1` 改成 `len()`
+    /// → `51200 / 40 = 1280` 行可留 ⇒ N 变 1720 → 本测试的 `1752` 断言变红。
+    #[tokio::test]
+    async fn test_bash_truncation_notice_reports_exact_line_count() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = make_ctx();
+        // 输出 3000 行、每行恰好 40 个 'x'（纯 ASCII，字节数 = 字符数）。
+        let input = json!({
+            "command":
+                "awk 'BEGIN { s=\"\"; for (i=0;i<40;i++) s=s \"x\"; for (i=0;i<3000;i++) print s }'"
+        });
+
+        let result = tool.call(input, ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.starts_with("[Truncated 1752 lines.]\n\n"),
+            "通知文案（含丢弃行数）必须精确；实际开头：{:?}",
+            result.content.chars().take(80).collect::<String>()
+        );
+        // 通知 2 行（正文 + 空行）+ 保留的 1248 行。
+        assert_eq!(
+            result.content.lines().count(),
+            2 + 1248,
+            "通知后应恰好保留 1248 行正文"
+        );
+        // 尾截断的语义：保留的是**末尾**。
+        assert!(
+            result.content.lines().skip(2).all(|l| l == "x".repeat(40)),
+            "保留正文应全为 40 字节行"
+        );
     }
 }

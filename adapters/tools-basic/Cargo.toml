@@ -6,10 +6,9 @@ edition.workspace = true
 [dependencies]
 ys-core = { path = "../../crates/ys-core" }
 ys-tool = { path = "../../crates/ys-tool" }
+# `exec::run_bounded` 的签名需显式命名 `BoundarySource`（设计风险 5）
+ys-protocol = { path = "../../crates/ys-protocol" }
 serde_json = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "io-util", "fs", "process", "signal", "macros"] }
 unicode-normalization = "0.1"
-
-[dev-dependencies]
-ys-protocol = { path = "../../crates/ys-protocol" }

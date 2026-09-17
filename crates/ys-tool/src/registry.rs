@@ -17,19 +17,23 @@ impl std::fmt::Debug for ToolRegistry {
 
 impl ToolRegistry {
     /// 从一组 tool 构建 registry，并检查是否是重名
+    ///
+    /// `specs` 严格按**输入 `tools` 的顺序**收集 —— 不能由 `HashMap` 的迭代顺序决定，
+    /// 否则顺序逐进程抖动（哈希随机种子），由它派生的提示词清单会让 prompt cache 前缀失效。
     pub fn build(tools: Vec<Box<dyn Tool>>) -> Result<Self, ToolError> {
         let mut map = HashMap::new();
+        let mut specs = Vec::with_capacity(tools.len());
         for tool in tools {
             let spec = tool.spec();
-            if map.contains_key(&spec.name) {
+            let name = spec.name.clone();
+            if map.contains_key(&name) {
                 return Err(ToolError::InvalidInput(format!(
-                    "duplicate tool name: {}",
-                    spec.name
+                    "duplicate tool name: {name}"
                 )));
             }
-            map.insert(spec.name, tool);
+            map.insert(name, tool);
+            specs.push(spec);
         }
-        let specs: Vec<ToolSpec> = map.values().map(|t| t.spec()).collect();
         Ok(Self { tools: map, specs })
     }
 
@@ -98,5 +102,42 @@ mod tests {
     fn test_names_empty_registry() {
         let registry = ToolRegistry::build(vec![]).unwrap();
         assert!(registry.names().is_empty());
+    }
+
+    /// 按给定顺序构建 8 个**不同名**工具的 registry。
+    fn build_ordered(order: &[&'static str; 8]) -> ToolRegistry {
+        let tools: Vec<Box<dyn Tool>> = order
+            .iter()
+            .copied()
+            .map(|n| Box::new(MockTool(n)) as Box<dyn Tool>)
+            .collect();
+        ToolRegistry::build(tools).unwrap()
+    }
+
+    #[test]
+    fn test_specs_and_names_follow_input_order() {
+        // N2 保序：`specs()` 必须严格按**输入顺序**，不能由 HashMap 迭代顺序决定
+        //（哈希随机种子 ⇒ 顺序逐进程抖动 ⇒ 派生提示词清单让 prompt cache 前缀失效）。
+        let order: [&'static str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let registry = build_ordered(&order);
+
+        let spec_names: Vec<&str> = registry.specs().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(spec_names, order.to_vec(), "specs() 必须与输入同序");
+        assert_eq!(registry.names(), order.to_vec(), "names() 必须与输入同序");
+        assert_eq!(registry.len(), 8);
+
+        // 变异：把 `build()` 改回「specs 由 map.values() 收集」→ 顺序随机，
+        // 本测试以 1 - 1/8! = 40319/40320 的概率变红（漏检概率 ≈ 1/40320）。
+    }
+
+    #[test]
+    fn test_specs_follow_input_order_reversed() {
+        // 换一个输入顺序再验一次：钉住的是「跟随输入」，而不是「恰好等于某个固定序列」。
+        let order: [&'static str; 8] = ["h", "g", "f", "e", "d", "c", "b", "a"];
+        let registry = build_ordered(&order);
+
+        assert_eq!(registry.names(), order.to_vec());
+
+        // 变异：同 `test_specs_and_names_follow_input_order`（map.values()）→ 红。
     }
 }

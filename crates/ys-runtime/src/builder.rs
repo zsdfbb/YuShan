@@ -38,6 +38,16 @@ impl AgentBuilder {
         self
     }
 
+    /// 批量追加工具（**按传入顺序**注册，即 `specs()` / 将来 prompt 清单的顺序）。
+    ///
+    /// 与 [`Self::tool`] 同义，只是省去逐条链式；装配方（如 coding-agent 的
+    /// `toolset`）通常一次性建好有序工具表再来这里挂上。重复名称仍在
+    /// `build()` 时由 `ToolRegistry` 报错，不在此处提前校验。
+    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
     pub fn limits(mut self, limits: RunLimits) -> Self {
         self.limits = limits;
         self

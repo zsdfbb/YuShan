@@ -17,12 +17,16 @@
 //! 初始化顺序（含 R7 的阻塞提前返回）：
 //!
 //! ```text
+//! 0. 装工具表（toolset 探测一次）→ 降级提示打 stderr → 由工具表派生 system prompt
 //! 1. 建 ChannelSink（policy 已定）+ 建 Agent（挂工具与系统提示）
 //! 2. 【阻塞】model + Wiring 构造   ← 可能失败并提前返回（turn 恒 0 也无所谓）
 //! 3. 构造 view₀
 //! 4. 建三条信道 request / boundary / outbound
 //! 5. spawn app 线程 + 当前线程跑 UI
 //! ```
+//!
+//! 第 0 步在**建 runtime 之前**：工具表既进 agent，也派生提示词清单 —— 同一份表，
+//! 顺序自然一致（设计 §1.2 启动期 / §1.5 提示词来源）。
 //!
 //! 注意 **Agent 先于 Wiring 建**（`run_interactive` 的实际顺序）：二者互不依赖，
 //! 而 `view₀` 要同时借用它们，故都放在 view₀ 之前。承重的不变量是「`begin_turn`
@@ -38,6 +42,7 @@ mod prompt;
 mod provider;
 mod state;
 mod status;
+mod toolset;
 mod view;
 mod wiring;
 
@@ -56,7 +61,7 @@ use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
 use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, Request};
 use ys_runtime::{Agent, AgentBuilder, BuildError};
-use ys_tools_basic::{BashTool, EditTool, ReadTool, WriteTool};
+use ys_tool::Tool;
 use ys_tui_coding::CodingView;
 
 use channel::{ChannelSink, ChannelStatsHandle};
@@ -244,12 +249,17 @@ where
 ///
 /// ADR-0010：会话、事件出口与模型不再进入 agent —— 它们归 [`Wiring`]，
 /// 运行时经端口传入。
-fn build_agent(system_prompt: String, workspace: PathBuf) -> Result<Agent, BuildError> {
+///
+/// **工具表由调用方装配后传入**（[`toolset::build_tools`] 唯一装配：探测一次 +
+/// 固定顺序）：同一份表既进 `ToolRegistry`，也派生系统提示词的工具清单 ——
+/// 二者因此不可能漂移（设计 §1.5）。
+fn build_agent(
+    system_prompt: String,
+    workspace: PathBuf,
+    tools: Vec<Box<dyn Tool>>,
+) -> Result<Agent, BuildError> {
     AgentBuilder::new()
-        .tool(ReadTool::new(workspace.clone()))
-        .tool(WriteTool::new(workspace.clone()))
-        .tool(EditTool::new(workspace.clone()))
-        .tool(BashTool::new(workspace.clone()))
+        .tools(tools)
         .system_prompt(system_prompt)
         .working_dir(workspace.clone(), workspace)
         .approval(ys_tool::AutoApprove)
@@ -400,13 +410,14 @@ fn run_interactive(
     state_store: state::StateStore,
     system_prompt: String,
     workspace: PathBuf,
+    tools: Vec<Box<dyn Tool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
         ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
 
     // 1（续）. agent（挂工具与系统提示；session/model/events 经端口传入）。
-    let agent = build_agent(system_prompt, workspace)?;
+    let agent = build_agent(system_prompt, workspace, tools)?;
 
     // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
     let model = config.build_model();
@@ -532,10 +543,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_args(&argv)?;
 
-    // 构建 system prompt 与工具 workspace
+    // 构建工具表与 system prompt。
+    //
+    // 顺序即设计 §1.2「启动期」：**先探测装工具**（`toolset` 是唯一装配接缝，
+    // 探测只做一次），降级提示此刻打（TUI 未起屏 → stderr 是正确去处，见
+    // 「输出与诊断三分」）；**再由工具表派生提示词的工具清单** —— 同一份表，
+    // 清单顺序 == 注册顺序，不可能漂移。
     let cwd = config.cwd.clone();
-    let system_prompt = prompt::build_system_prompt(&cwd);
-    let workspace = config.cwd.clone();
+    let workspace = cwd.clone();
+    let (tools, hint) = toolset::build_tools(&workspace);
+    if let Some(hint) = hint {
+        eprintln!("{hint}");
+    }
+    let specs = tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
+    let system_prompt = prompt::build_system_prompt(&cwd, &specs);
 
     // 手工建 runtime（而非 `#[tokio::main]`）：TUI 模式的 UI 循环**必须在
     // 没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
@@ -549,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
             let stats_handle = sink.stats_handle();
-            let mut agent = build_agent(system_prompt, workspace)?;
+            let mut agent = build_agent(system_prompt, workspace, tools)?;
             // `-p` 是一次性会话：MemorySession，不落盘、不恢复（行为与改动前一致）。
             let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
             rt.block_on(run_print_mode(
@@ -565,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
-            let mut agent = build_agent(system_prompt, workspace)?;
+            let mut agent = build_agent(system_prompt, workspace, tools)?;
             let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
             rt.block_on(run_json_mode(
                 &mut agent,
@@ -577,7 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))?;
         }
         Mode::Interactive => {
-            run_interactive(rt, config, state_store, system_prompt, workspace)?;
+            run_interactive(rt, config, state_store, system_prompt, workspace, tools)?;
         }
     }
 
@@ -828,7 +849,7 @@ mod tests {
         model.push_text("hello world");
 
         let (sink, rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
-        let mut agent = build_agent(String::new(), PathBuf::from(".")).unwrap();
+        let mut agent = build_agent(String::new(), PathBuf::from("."), Vec::new()).unwrap();
         let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         let mut out: Vec<u8> = Vec::new();
@@ -944,7 +965,7 @@ mod tests {
             DEFAULT_CHANNEL_CAPACITY,
             LifecyclePolicy::StopWhenConsumerGone,
         );
-        let mut agent = build_agent(String::new(), PathBuf::from(".")).unwrap();
+        let mut agent = build_agent(String::new(), PathBuf::from("."), Vec::new()).unwrap();
         let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         let mut out: Vec<u8> = Vec::new();

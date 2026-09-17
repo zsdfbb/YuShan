@@ -5,12 +5,14 @@ mod context;
 mod error;
 mod registry;
 mod spec;
+mod truncate;
 
 pub use approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 pub use context::*;
 pub use error::*;
 pub use registry::*;
 pub use spec::*;
+pub use truncate::*;
 
 // 为方便起见从 ys-core 再导出
 pub use ys_core::{ToolCallId, ToolResult};

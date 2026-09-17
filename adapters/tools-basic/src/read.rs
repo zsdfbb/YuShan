@@ -3,9 +3,6 @@ use std::path::PathBuf;
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
-const MAX_LINES: usize = 2000;
-const MAX_BYTES: usize = 50 * 1024;
-
 pub struct ReadTool {
     workspace: PathBuf,
 }
@@ -63,27 +60,23 @@ impl Tool for ReadTool {
             .unwrap_or(total_lines);
 
         let selected = &lines[start..end];
-        let mut output_lines: Vec<String> = Vec::new();
-        let mut total_bytes = 0usize;
+        // 先渲染成最终形态（`{行号:>6}\t{内容}`），再交给 `ys_tool::truncate::head_lines` ——
+        // 字节预算按**渲染后**的字节数计（不含换行），与原循环逐字节一致。
+        //
+        // `head_lines` 至多取 `MAX_LINES` 行，故先把待格式化的区间裁到 `MAX_LINES`：
+        // 否则无 `limit` 的大文件会先物化全文件行数的 `String`（2M 行 → ~8× 回退）。
+        // `selected[..cap]` 保留前缀，`enumerate()` 的下标 `i` 不变，行号一致。
+        let cap = selected.len().min(ys_tool::MAX_LINES);
+        let formatted: Vec<String> = selected[..cap]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{:>6}\t{line}", start + i + 1))
+            .collect();
 
-        for (i, line) in selected.iter().enumerate() {
-            let line_num = start + i + 1;
-            let formatted = format!("{line_num:>6}\t{line}");
-            let line_bytes = formatted.len();
+        let truncated = ys_tool::head_lines(&formatted, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
 
-            if total_bytes + line_bytes > MAX_BYTES && !output_lines.is_empty() {
-                break;
-            }
-            total_bytes += line_bytes;
-            output_lines.push(formatted);
-
-            if output_lines.len() >= MAX_LINES {
-                break;
-            }
-        }
-
-        let mut output = output_lines.join("\n");
-        let shown_end = start + output_lines.len();
+        let mut output = truncated.content;
+        let shown_end = start + truncated.shown_lines;
 
         if shown_end < total_lines {
             let next_offset = shown_end + 1;
@@ -196,6 +189,94 @@ mod tests {
         assert!(result.content.contains("offset="));
         assert!(result.content.contains("line1"));
         assert!(result.content.contains("line3"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 钉住续读通知的**完整形态与具体数字**（既有 `test_read_truncation_hint` 只
+    /// `contains("offset=")`，太弱）：10 行文件取前 3 行 ⇒ `1-3`、总数 `10`、`offset=4`。
+    ///
+    /// 变异：`next_offset = shown_end + 1` 改成 `shown_end` → `offset=3` → 红。
+    /// 变异：`start + 1` 改成 `start` → 起始行变 `0` → 红。
+    /// （`shown_end` 漏加 `start` 的变异由下面的子区间用例精确捕获。）
+    #[tokio::test]
+    async fn test_read_hint_reports_exact_bounds_and_numbers() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file = dir.join("exact.txt");
+        let content: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        tokio::fs::write(&file, &content).await.unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let ctx = make_ctx();
+        let input = json!({ "path": "exact.txt", "limit": 3 });
+        let result = tool.call(input, ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result
+                .content
+                .ends_with("\n\n[Showing lines 1-3 of 10. Use offset=4 to continue.]"),
+            "通知形态与数字必须逐字精确；实际结尾：{:?}",
+            result
+                .content
+                .chars()
+                .rev()
+                .take(60)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
+        // 渲染形态：行号右对齐 6 宽 + 制表符（内容 3 行 + 空行 + 通知 1 行）。
+        assert!(result.content.starts_with("     1\tline1\n"));
+        assert!(result.content.contains("\n     3\tline3"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// P1 陷阱回归网：`offset`/`limit` 取**子区间**且**未触顶**时，只要文件还有后续行，
+    /// 就**仍须**追加续读通知（判定依据是「文件剩余行」而非「本次选取是否被截断」）。
+    ///
+    /// 这里 offset=5 / limit=2 ⇒ 选中 `line5..line6`，`head_lines` 未丢弃任何行
+    /// （`shown_lines == total_lines`），但文件还剩 `7..10` ⇒ 通知必须是 `5-6 … offset=7`。
+    ///
+    /// 变异：把守卫 `shown_end < total_lines` 改成 `truncated.shown_lines <
+    /// truncated.total_lines`（「本次选取被截断」）→ 此处不再追加通知 → 红。
+    /// 变异：`shown_end = start + truncated.shown_lines` 改成 `truncated.shown_lines`
+    /// → 通知变成 `1-2 … offset=3` → 红。
+    #[tokio::test]
+    async fn test_read_subrange_without_truncation_still_hints() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file = dir.join("subrange.txt");
+        let content: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        tokio::fs::write(&file, &content).await.unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let ctx = make_ctx();
+        let input = json!({ "path": "subrange.txt", "offset": 5, "limit": 2 });
+        let result = tool.call(input, ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("line5"));
+        assert!(result.content.contains("line6"));
+        assert!(!result.content.contains("line7"));
+        assert!(
+            result
+                .content
+                .ends_with("\n\n[Showing lines 5-6 of 10. Use offset=7 to continue.]"),
+            "子区间未触顶但文件有剩余行时仍须通知；实际结尾：{:?}",
+            result
+                .content
+                .chars()
+                .rev()
+                .take(60)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

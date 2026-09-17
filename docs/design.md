@@ -428,6 +428,9 @@ flowchart TB
 
 第二阶段可增加 `grep`、`find`、`ls` 和 `git`。工具仍实现通用 `Tool` 接口，Runtime 不感知 Coding 语义。
 
+> **状态（2026-09-17）**：`grep` / `find` / `ls` **已实现**（外挂 `rg`/`fd` → 降级 POSIX `grep`/`find`，绝不下载）；
+> 见 `docs/design-final/search-tools.md` 与 ADR-0015。`git` 工具仍未做。
+
 ### 项目上下文与 Coding Prompt
 
 `CodingContextProvider` 负责按需发现当前工作目录、项目根目录、`AGENTS.md`、`CLAUDE.md`、`README.md`、`Cargo.toml`、`package.json`、Git 状态和用户显式提供的文件。

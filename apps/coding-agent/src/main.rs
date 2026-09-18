@@ -17,7 +17,8 @@
 //! 初始化顺序（含 R7 的阻塞提前返回）：
 //!
 //! ```text
-//! 0. 装工具表（toolset 探测一次）→ 降级提示打 stderr → 由工具表派生 system prompt
+//! 0. from_env 建 web 配置 → 启动期清理（仅 Primary 档）
+//!    → 装工具表（toolset 探测一次）→ 降级提示打 stderr → 由工具表派生 system prompt
 //! 1. 建 ChannelSink（policy 已定）+ 建 Agent（挂工具与系统提示）
 //! 2. 【阻塞】model + Wiring 构造   ← 可能失败并提前返回（turn 恒 0 也无所谓）
 //! 3. 构造 view₀
@@ -62,6 +63,7 @@ use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
 use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, Request};
 use ys_runtime::{Agent, AgentBuilder, BuildError};
 use ys_tool::Tool;
+use ys_tools_web::WebConfig;
 use ys_tui_coding::CodingView;
 
 use channel::{ChannelSink, ChannelStatsHandle};
@@ -266,16 +268,89 @@ fn build_agent(
         .build()
 }
 
-/// 会话落盘目录：`$YUSHAN_SESSIONS_DIR` 覆盖，否则 `~/.yushan/sessions`。
+/// 抓取落盘文件的保留时长：超过即被启动期清理（**只对 Primary 档**生效）。
+///
+/// `tools-web` 未把它导出为 pub 常量（设计 §1.8 的常量清单里只有散文），故在此
+/// 定义为**调用方的策略值**：7 天 —— 足够跨会话 `grep` 回看，又不会无限堆积。
+const FETCHED_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// 启动期清理抓取落盘目录 —— **只对可清理档生效**，best-effort、静默。
+///
+/// # 为什么必须由 `main` 显式调
+///
+/// 设计 §1.1 硬约束：[`toolset::build_tools`] 与 [`WebConfig::from_env`] **无副作用到
+/// 「清理」为止**。若把清理塞进其中任何一处，`toolset` 的**测试**（它们会调
+/// `build_tools`）就会删掉用户真实的 `~/.yushan/fetched` —— 测试越界改用户数据。
+///
+/// # 只对 `Primary` 档
+///
+/// 用户用 `YUSHAN_FETCHED_DIR` 显式指定的目录（`Override` 档）**只写不删** ——
+/// 用户既然点名了目录，清理就是越界。[`FetchedDir::is_cleanable`] 在**类型上**
+/// 给出这条保证，不靠自觉。
+///
+/// 失败静默（照 `logging.rs` 的 best-effort 风格）：清理是**附带动作**，
+/// 它永远不该成为一次启动失败的原因。
+///
+/// # 为什么 `max_age` 是参数而不是直接读常量
+///
+/// 常量 [`FETCHED_MAX_AGE`]（7 天）是**调用方策略**，生产路径照常传它。把它做成
+/// 参数**只为可测**：测试要造「已超龄」的文件，若阈值写死 7 天就只能靠改 mtime
+/// 到 8 天前 —— 能测，但测的是「7 天这个数」。参数化后可直接传 `Duration::ZERO`
+/// 或小阈值，从而把被测对象收敛到「**是否清理**」（guard 语义），与本函数无关的
+/// 保留时长解耦。行为不变：`main` 传的仍是 [`FETCHED_MAX_AGE`]。
+///
+/// [`FetchedDir::is_cleanable`]: ys_tools_web::FetchedDir::is_cleanable
+fn sweep_fetched(web: &WebConfig, max_age: Duration) {
+    let fetched = web.fetched();
+    if !fetched.is_cleanable() {
+        return;
+    }
+    let Some(dir) = fetched.path() else {
+        return;
+    };
+    let _ = ys_tools_web::sweep(dir, max_age);
+}
+
+/// 会话落盘目录 —— **自己的降级绝不产生相对路径**。
+///
+/// # 四档（优先级从高到低）
+///
+/// 1. `$YUSHAN_SESSIONS_DIR`（非空）—— 显式覆盖（测试 / 用户指定）。
+/// 2. `<HOME>/.yushan/sessions` —— 主目录档。
+/// 3. `<USERPROFILE>/.yushan/sessions` —— 同档的 Windows 变量名。
+/// 4. `<temp_dir>/yushan-sessions-<pid>` —— 无主目录时的降级。
+///
+/// # 为什么第 4 档不能是 `.yushan/sessions`
+///
+/// 相对路径会解析到 **CWD**，而 coding agent 的 CWD **就是用户仓库** —— 会话文件
+/// 会落进用户的 git 工作区（`.gitignore` 里有 `tmp/` 时连 `git status` 都看不见，
+/// 比看得见的污染更危险）。故降级用 `temp_dir()`，与 `tools-web` 的落盘目录降级
+/// 同思路。
+///
+/// 注意：第 1 档**逐字返回**用户给的值（可能是相对路径）—— 那是显式配置，
+/// 责任在配置方；本函数只保证**自己的降级**不产生相对路径。第 2/3 档同样带
+/// 绝对性闸门（`HOME=""` / 相对取值会拼出相对路径）。
 fn sessions_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("YUSHAN_SESSIONS_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    home.map(|h| PathBuf::from(h).join(".yushan").join("sessions"))
-        .unwrap_or_else(|| PathBuf::from(".yushan/sessions"))
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        if home.is_absolute() {
+            return home.join(".yushan").join("sessions");
+        }
+    }
+    // `TMPDIR` 被设成相对路径时 `temp_dir()` 会**原样返回**它 —— 那时需要一个
+    // 恒为绝对的兜底（本项目只支持 Linux/macOS）。
+    let base = std::env::temp_dir();
+    let base = if base.is_absolute() {
+        base
+    } else {
+        PathBuf::from("/tmp")
+    };
+    base.join(format!("yushan-sessions-{}", std::process::id()))
 }
 
 /// print / json 模式的前置检查：无 model 时给出可操作提示并退出。
@@ -551,7 +626,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 清单顺序 == 注册顺序，不可能漂移。
     let cwd = config.cwd.clone();
     let workspace = cwd.clone();
-    let (tools, hint) = toolset::build_tools(&workspace);
+    // web 配置与模型配置**无关**（工具拿不到 `Model` 的正面利用）：`from_env()` 只读
+    // env 一次并冻结，**无副作用到「清理」为止**。
+    let web = WebConfig::from_env();
+    // 清理在此**显式**发生（不在 `build_tools` / `from_env` 里）：只对 Primary 档，
+    // 且必须在把 `web` move 进 `build_tools` 之前完成。
+    sweep_fetched(&web, FETCHED_MAX_AGE);
+    let (tools, hint) = toolset::build_tools(&workspace, web);
     if let Some(hint) = hint {
         eprintln!("{hint}");
     }
@@ -608,11 +689,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
 
     use ys_core::{ContentBlock, Message, Role, StopReason, ToolCall, ToolCallId, Usage};
     use ys_model::MockModel;
     use ys_protocol::Source;
+    use ys_tools_web::FetchedDir;
+
+    use crate::test_env::{EnvRestore, env_lock};
+
+    /// 进程内唯一临时目录（**原子序号 + `process::id()`**，与 `toolset.rs` 同规）：
+    /// `SystemTime::as_nanos()` 在 macOS 只到微秒级，并行测试会撞名互删。
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("yushan_sweep_{tag}_{}_{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 在 `dir` 下写一个**超龄**（mtime = 8 天前）且名字**符合落盘命名形状**
+    /// （`<slug>-<16hex>.md`）的文件，返回其路径。
+    ///
+    /// 名字直接调 `ys_tools_web::fetched_file_name`（落盘文件名的**唯一定义**），
+    /// 不手抄形状 —— 否则 `sweep` 认不出它，测试会「因为文件本来就不会被删」而假绿。
+    /// mtime 用 `File::set_modified`（Rust 1.75+ 稳定）显式拨到 8 天前，不依赖
+    /// 文件系统时间戳精度或写入耗时，从而**确定性**地满足 `mtime < now - max_age`。
+    fn write_aged_fetched(dir: &Path, final_url: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(ys_tools_web::fetched_file_name(final_url));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+        path
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -992,5 +1106,133 @@ mod tests {
             turns.iter().all(|&t| t == 1),
             "所有信封的 turn 应从 1 开始；turns = {turns:?}"
         );
+    }
+
+    /// 14. **`sessions_dir` 回归（S11b）**：无 `HOME` / `USERPROFILE` 且
+    ///     `YUSHAN_SESSIONS_DIR` 未设时，降级路径**必须是绝对路径**。
+    ///
+    ///     改前的 bug：回退到 `PathBuf::from(".yushan/sessions")` —— **相对路径**，
+    ///     会解析到 CWD，而 coding agent 的 CWD **就是用户仓库** → 会话文件落进
+    ///     用户的 git 工作区（`.gitignore` 有 `tmp/` 时连 `git status` 都看不见）。
+    ///
+    ///     ⚠️ 必须同时摘掉 `HOME` **与** `USERPROFILE`：任一个存在都会走主目录档，
+    ///     那档本身就含 `.yushan/sessions`（但那是**绝对**路径，是合法结果），
+    ///     从而让本用例的「不含相对形态」断言失去意义。
+    ///
+    ///     变异：把回退改回 `PathBuf::from(".yushan/sessions")` → 本用例变红
+    ///     （`is_absolute()` 与「不含 `.yushan/sessions`」两条同时失败）。
+    #[test]
+    fn sessions_dir_fallback_is_absolute_when_home_missing() {
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&["HOME", "USERPROFILE", "YUSHAN_SESSIONS_DIR"]);
+        // SAFETY: 调用方持有 env_lock，独占这几个 key 的修改。
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
+            std::env::remove_var("YUSHAN_SESSIONS_DIR");
+        }
+
+        let dir = sessions_dir();
+        assert!(
+            dir.is_absolute(),
+            "无主目录时的降级必须是绝对路径（相对路径会落进用户仓库）；got = {}",
+            dir.display()
+        );
+        assert!(
+            !dir.to_string_lossy().contains(".yushan/sessions"),
+            "降级不得退化成相对形态 .yushan/sessions；got = {}",
+            dir.display()
+        );
+        assert!(
+            dir.to_string_lossy().contains("yushan-sessions-"),
+            "降级应是 <temp_dir>/yushan-sessions-<pid>；got = {}",
+            dir.display()
+        );
+
+        // 主目录存在时仍走主目录档（绝对路径）——确认改动没有把正常路径也换掉。
+        // SAFETY: 同上，仍持锁。
+        unsafe {
+            std::env::set_var("HOME", "/tmp/yushan-home-probe");
+        }
+        let with_home = sessions_dir();
+        assert_eq!(
+            with_home,
+            PathBuf::from("/tmp/yushan-home-probe/.yushan/sessions"),
+            "有 HOME 时应走主目录档"
+        );
+    }
+
+    /// 15. **`sweep_fetched` 的档位 guard**：只清 `Primary`，`Override` 档**只写不删**。
+    ///
+    ///     两个临时目录扮演两档，各放一个**超龄且命名形状正确**的文件：
+    ///     - `Override` → 文件**必须仍在**（用户点名的目录，清理即越界）；
+    ///     - `Primary`  → 文件**必须被删**。
+    ///
+    ///     第二条是第一条的**对照**：它证明这个探针**能**删（命名形状、mtime、
+    ///     目录参数都对得上），否则「Override 文件仍在」可能只是因为**什么都没删**，
+    ///     变成一条恒真的空断言。
+    ///
+    ///     变异：删掉 `sweep_fetched` 里 `if !fetched.is_cleanable() { return; }`
+    ///     这段 guard → `Override` 文件被删 → 本用例第一条断言变红。
+    #[test]
+    fn sweep_fetched_only_cleans_primary_tier() {
+        let name_src = "https://example.com/aged-article";
+
+        // ---- 档 3：Override（用户显式指定）→ 只写不删 ----
+        let override_dir = unique_tmp_dir("override");
+        let override_file = write_aged_fetched(&override_dir, name_src);
+        let override_web = WebConfig::offline(FetchedDir::Override(override_dir.clone()));
+        // max_age 传 7 天（== 生产常量）：文件 mtime 是 8 天前，确实超龄。
+        sweep_fetched(&override_web, FETCHED_MAX_AGE);
+        assert!(
+            override_file.exists(),
+            "Override 档（$YUSHAN_FETCHED_DIR）只写不删 —— 用户点名的目录不得被清理；got = {}",
+            override_file.display()
+        );
+
+        // ---- 档 2：Primary（应用目录）→ 清理生效 ----
+        let primary_dir = unique_tmp_dir("primary");
+        let primary_file = write_aged_fetched(&primary_dir, name_src);
+        let primary_web = WebConfig::offline(FetchedDir::Primary(primary_dir.clone()));
+        sweep_fetched(&primary_web, FETCHED_MAX_AGE);
+        assert!(
+            !primary_file.exists(),
+            "Primary 档的超龄落盘文件应被清理（否则上一条断言是空断言）"
+        );
+
+        let _ = std::fs::remove_dir_all(&override_dir);
+        let _ = std::fs::remove_dir_all(&primary_dir);
+    }
+
+    /// 15b. **「未超龄」不删**：同一 `Primary` 档、同一命名形状，mtime = 现在 +
+    ///      `max_age` = 7 天 → 文件必须**仍在**。
+    ///
+    ///      这是 15 的**阈值对照**：15 只证明「超龄会被删」，若实现把阈值判据写反
+    ///      （`mtime >= cutoff` 写成恒真/恒假的另一侧），15 仍可能绿。本用例把
+    ///      `mtime > cutoff` 这一侧钉住。
+    ///
+    ///      变异：`store.rs::sweep` 的 `if mtime >= cutoff { continue; }` 改成
+    ///      `if mtime <= cutoff { continue; }` → 本用例变红（刚写的文件被删）。
+    #[test]
+    fn sweep_fetched_keeps_recent_files() {
+        let primary_dir = unique_tmp_dir("recent");
+        let fresh_file = write_aged_fetched(&primary_dir, "https://example.com/fresh-article");
+        // 把 mtime 拨回「刚刚」——在 7 天阈值内。
+        std::fs::File::options()
+            .write(true)
+            .open(&fresh_file)
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+
+        let web = WebConfig::offline(FetchedDir::Primary(primary_dir.clone()));
+        sweep_fetched(&web, FETCHED_MAX_AGE);
+        assert!(
+            fresh_file.exists(),
+            "未超龄（7 天内）的落盘文件不得被清理；got = {}",
+            fresh_file.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&primary_dir);
     }
 }

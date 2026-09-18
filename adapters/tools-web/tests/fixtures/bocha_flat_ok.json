@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"_type\":\"SearchResponse\",\"queryContext\":{\"originalQuery\":\"rust error handling\"},\"webPages\":{\"webSearchUrl\":\"https://www.bing.com/search?q=rust+error+handling\",\"totalEstimatedMatches\":2,\"value\":[{\"name\":\"Error Handling - The Rust Programming Language\",\"url\":\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\",\"snippet\":\"Rust groups errors into two major categories: recoverable and unrecoverable errors.\",\"siteName\":\"doc.rust-lang.org\"},{\"name\":\"Rust 错误处理实践\",\"url\":\"https://blog.example.org/rust-errors-in-practice\",\"snippet\":\"anyhow 与 thiserror 的取舍。\",\"siteName\":\"blog.example.org\"}]}}\n"
+}

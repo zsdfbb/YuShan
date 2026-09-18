@@ -2,7 +2,7 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-**当前状态**：`cargo test --workspace` 全绿 —— **513 passed**（1 个 e2e 需真实凭证，`#[ignore]`）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find）。
+**当前状态**：`cargo test --workspace` 全绿 —— **636 passed**（1 个 e2e 需真实凭证，`#[ignore]`）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）。
 
 ## 目录结构
 
@@ -21,7 +21,8 @@ YuShan/
 │   └── ys-runtime                 # AgentBuilder + Agent（无状态）+ AgentPorts + prelude
 ├── adapters/                      # 可选适配器
 │   ├── model-openai-compatible    # OpenAI 兼容后端（流式 SSE + compat 差异）
-│   └── tools-basic                # BashTool / ReadTool / WriteTool / EditTool / GrepTool / FindTool / LsTool + exec（外部二进制探测与有界子进程）
+│   ├── tools-basic                # BashTool / ReadTool / WriteTool / EditTool / GrepTool / FindTool / LsTool + exec（外部二进制探测与有界子进程）
+│   └── tools-web                  # WebSearchTool / WebFetchTool（**有网络**）+ net/guard/convert/store/backends；`tools-basic` 保持无网络由 crate 边界强制
 ├── apps/                          # 产品层应用
 │   └── coding-agent               # YuShan Coding Agent（bin crate，接线器）
 │       ├── src/
@@ -59,14 +60,14 @@ YuShan/
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（513 passed）
+- `cargo test --workspace` — 全量测试（636 passed）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr
 - `cargo test -p ys-coding-agent e2e -- --ignored --nocapture` — 端到端（需 `YUSHAN_API_BASE` + `YUSHAN_API_KEY`）
 
-环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）。
+环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）；`YUSHAN_SEARCH_SEARXNG_URL` / `YUSHAN_SEARCH_TAVILY_KEY` / `YUSHAN_SEARCH_BOCHA_KEY` / `YUSHAN_SEARCH_FIRECRAWL_KEY`（搜索后端，**四家均需配置**才进链）；`YUSHAN_FETCHED_DIR`（webfetch 落盘目录覆盖，须为**绝对路径**，测试用）。
 
 ## 核心模型（理解本项目的关键）
 
@@ -224,9 +225,10 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 | 架构规范、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
 | 术语定义（Turn、Round、StopReason、错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
 | **给新需求归类**（该用 Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
-| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`）、0014 只做 follow-up（**不建 hook 系统**，有意推迟）、0015 搜索工具外挂 `rg`/`fd`（降级 `grep`/`find`，不内建 `ignore` crate） |
+| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`）、0014 只做 follow-up（**不建 hook 系统**，有意推迟）、0015 搜索工具外挂 `rg`/`fd`（降级 `grep`/`find`，不内建 `ignore` crate）、0016 web 工具（落盘+指针 / 后端链用表非 trait / 引入 `htmd` / SSRF 反转；**修订（2026-09-18）**：Firecrawl 由 keyless 改为需 key，零配置链为空） |
 | **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）+ `docs/design-final/core-channel.md`（核心信道第一刀，部分已被上文取代，见其 §8） |
 | 搜索工具的 as-built | `docs/design-final/search-tools.md` |
+| web 工具的 as-built | `docs/design-final/tools-web.md` |
 | coding agent TUI 的设计推导与质量分析 | `docs/arch/coding-agent-tui/{design,review}.md`；已作废的前身 `docs/arch/coding-agent-tui/tui-repl-context.md` |
 | 核心信道的设计推导与质量分析 | `docs/arch/gap-closure/{context,design-core-channel,review}.md` |
 | 各 crate 的 API 和实现细节 | 对应 crate 的 `src/lib.rs` |

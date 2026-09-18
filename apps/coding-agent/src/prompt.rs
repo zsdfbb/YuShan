@@ -69,6 +69,13 @@ fn tool_snippet(name: &str) -> &'static str {
         }
         "find" => "Search for files by glob pattern",
         "ls" => "List directory contents",
+        // 与 `WebSearchTool` / `WebFetchTool` 的 `spec().name` 逐字一致（装配端名字是契约）。
+        "websearch" => {
+            "Search the web (tries the configured backends in a fixed order, stops at the first one that answers)"
+        }
+        "webfetch" => {
+            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep)"
+        }
         _ => "Custom tool",
     }
 }
@@ -105,6 +112,19 @@ fn tool_guidelines(tools: &[&str]) -> String {
     if tools.contains(&"ls") {
         guidelines
             .push("Use ls to list directories instead of running ls through bash".to_string());
+    }
+    if tools.contains(&"websearch") {
+        guidelines.push(
+            "Use websearch for information outside the repository (API docs, error meanings)"
+                .to_string(),
+        );
+    }
+    if tools.contains(&"webfetch") {
+        guidelines.push(
+            "Use webfetch to save a URL's content to a local file and get back only its head — \
+             read that path (read offset=) or grep it for more, and do not refetch the same URL"
+                .to_string(),
+        );
     }
 
     guidelines.push("Be concise in your responses".to_string());
@@ -209,6 +229,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// **确定性** `WebConfig`（测试不得用 `from_env()`：结果随机器 env 漂移）。
+    ///
+    /// 本用例只关心工具**名字**，web 侧配不配无关 —— 但装配接缝要求传一个值，
+    /// 且 `offline` 不建任何真实用户目录（`Temp` 档）。
+    fn offline_web() -> ys_tools_web::WebConfig {
+        ys_tools_web::WebConfig::offline(ys_tools_web::FetchedDir::Temp(unique_dir("web")))
     }
 
     /// 抽出 `Available tools:` 段的行（形状 `- {name}: {snippet}`），保持出现顺序。
@@ -335,12 +363,12 @@ mod tests {
         let _env = no_global_prompt();
         let dir = unique_dir("drift");
 
-        let (tools, _hint) = crate::toolset::build_tools(&dir);
+        let (tools, _hint) = crate::toolset::build_tools(&dir, offline_web());
         let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
 
         // 先确认取到的是真实工具表（空表会让下面的循环平凡通过）。
         let actual: Vec<&str> = names.iter().map(String::as_str).collect();
-        assert_eq!(actual, EXPECTED_ORDER, "应取到装配端的真实 7 元工具表");
+        assert_eq!(actual, EXPECTED_ORDER, "应取到装配端的真实 9 元工具表");
 
         for name in &names {
             let snippet = tool_snippet(name);
@@ -355,22 +383,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `grep` / `find` / `ls` 的 snippet **逐字**钉死（T11 review 点名的无守卫项）。
+    /// `grep` / `find` / `ls` / `websearch` / `webfetch` 的 snippet **逐字**钉死
+    /// （T11 review 点名的无守卫项 + T13 新增的 web 两条）。
     ///
     /// 非兜底断言（上一用例）只能证明「有专属文案」，证不了「文案说对了」；
-    /// 这三条是模型真正读到的检索/列目录指引，故用字面量锁文本。
+    /// 这几条是模型真正读到的检索 / 列目录 / 联网指引，故用字面量锁文本。
     ///
-    /// 变异：把 `"grep"` 分支的文案改成别的（哪怕仍非兜底）→ 本用例变红。
+    /// 文案里的关键语义（websearch 的「固定顺序试后端、首答即停」；webfetch 的
+    /// 「落盘 + 只回头部 + 用 `read offset=` 续读」）都是**模型行为的输入**，
+    /// 改文案等于改行为 —— 必须过一次显式评审，故此守卫用逐字断言。
+    ///
+    /// 变异：把任一分支的文案改成别的（哪怕仍非兜底）→ 本用例变红。
     #[test]
-    fn search_and_list_snippets_are_verbatim() {
+    fn search_list_and_web_snippets_are_verbatim() {
         assert_eq!(
             tool_snippet("grep"),
             "Search file contents for a pattern (respects .gitignore when ripgrep is available)"
         );
         assert_eq!(tool_snippet("find"), "Search for files by glob pattern");
         assert_eq!(tool_snippet("ls"), "List directory contents");
+        assert_eq!(
+            tool_snippet("websearch"),
+            "Search the web (tries the configured backends in a fixed order, stops at the first one that answers)"
+        );
+        assert_eq!(
+            tool_snippet("webfetch"),
+            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep)"
+        );
         // 兜底分支本身也要在（外部工具靠它列出而不报错）。
         assert_eq!(tool_snippet("__no_such_tool__"), "Custom tool");
+    }
+
+    /// web 两条 guideline 在工具**在场**时出现、**缺席**时不出现（照 `grep`/`find` 的
+    /// 「有工具才提示」风格）。
+    ///
+    /// 反向断言（缺席时不得出现）是关键：少了它，一个「无条件把所有 guideline 都塞进去」
+    /// 的实现也能过 —— 而那会让模型看到用不了的工具建议。
+    ///
+    /// 变异：把两条 guideline 的 `if tools.contains(&"websearch")` / `webfetch` 守卫
+    /// 删掉（无条件加）→ 反向断言变红。
+    #[test]
+    fn web_guidelines_appear_only_when_tools_present() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_web = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("websearch"), spec("webfetch")],
+        );
+        assert!(
+            with_web.contains("- Use websearch for information outside the repository"),
+            "有 websearch 时应给「查仓库外信息」的指引；prompt = {with_web}"
+        );
+        assert!(
+            with_web.contains("- Use webfetch to save a URL's content to a local file"),
+            "有 webfetch 时应给「落盘 + 读回路径」的指引；prompt = {with_web}"
+        );
+        assert!(
+            with_web.contains("do not refetch the same URL"),
+            "webfetch 指引应含「别重复抓同一 URL」；prompt = {with_web}"
+        );
+
+        let without_web = build_system_prompt(Path::new("/tmp"), &[spec("read")]);
+        assert!(
+            !without_web.contains("Use websearch"),
+            "无 websearch 时不得出现其指引；prompt = {without_web}"
+        );
+        assert!(
+            !without_web.contains("Use webfetch"),
+            "无 webfetch 时不得出现其指引；prompt = {without_web}"
+        );
     }
 
     #[test]

@@ -15,10 +15,11 @@ pub use ls::LsTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 
-/// `grep` / `find` / `ls` 共用的常量、路径归一与 notice 拼接。
+/// `grep` / `find` / `ls` 共用的常量与路径归一。
 ///
-/// 三个工具的后端不同（`rg`/`grep`、`fd`/`find`、纯 Rust），但**上限口径、显示路径口径与
-/// 通知形态必须一致**，故收拢在此，避免三处各写一份而漂移。
+/// 三个工具的后端不同（`rg`/`grep`、`fd`/`find`、纯 Rust），但**上限口径与显示路径口径
+/// 必须一致**，故收拢在此，避免三处各写一份而漂移。notice 的**形态**（`relativize` 之外的
+/// 那一半）早已上提到 `ys_tool::append_notices`（第 3 个消费者出现后，`pub(crate)` 跨不了 crate）。
 pub(crate) mod search {
     use std::path::Path;
     use std::time::Duration;
@@ -69,21 +70,6 @@ pub(crate) mod search {
             }
         }
         raw.trim_start_matches("./").to_string()
-    }
-
-    /// 把 notice 拼成 `\n\n[… . …]` 附在正文后；正文为空时 notice 独占内容（不留下前导空行）。
-    ///
-    /// 上限一律**显式报出**，不得静默（设计 §1.4）—— 是否报由调用方判定，形态由这里统一。
-    pub fn append_notices(content: &mut String, notices: &[String]) {
-        if notices.is_empty() {
-            return;
-        }
-        if !content.is_empty() {
-            content.push_str("\n\n");
-        }
-        content.push('[');
-        content.push_str(&notices.join(". "));
-        content.push(']');
     }
 }
 

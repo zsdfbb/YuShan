@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"query\":\"yushan-zzq9-no-such-page-7f3a\",\"follow_up_questions\":null,\"answer\":null,\"images\":[],\"results\":[],\"response_time\":0.41,\"request_id\":\"00000000-0000-4000-8000-000000000000\"}"
+}

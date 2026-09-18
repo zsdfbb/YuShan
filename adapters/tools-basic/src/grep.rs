@@ -36,10 +36,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use ys_core::ToolResult;
-use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
+use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 
 use crate::exec::{Bounded, SearchBackends, Stop, run_bounded};
-use crate::search::{BYTE_CAP, DEADLINE, EXCLUDED_DIRS, append_notices, relativize};
+use crate::search::{BYTE_CAP, DEADLINE, EXCLUDED_DIRS, relativize};
 
 /// 一次调用返回的命中**条数**上限（与 `byte_cap` / `head` 是三个不同单位的上限）。
 const DEFAULT_LIMIT: usize = 100;
@@ -949,6 +949,49 @@ mod tests {
                 .content
                 .contains("2 matches limit reached. Use limit=4 for more"),
             "截断必须显式报出；实际：{}",
+            brief(&result.content)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **两条 notice 并存**时的拼接形态（S10：输出逐字节不变的另一半证力）。
+    ///
+    /// 既有 notice 用例全是单条，`append_notices` 内部的 `notices.join(". ")` 不参与
+    /// → **分隔符不可观测**（变异成全绿）。本用例同时触发 `limit` 截断与长行截断，
+    /// 让真实路径产出两条 notice，钉住 `[a. b]`（`.` + 空格）。
+    ///
+    /// 变异：`append_notices` 的 `join(". ")` → `join("; ")` → 本用例的尾部断言变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_grep_two_notices_joined_by_dot_space() {
+        let dir = test_dir("grep_two_notices");
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("src/a.rs").to_string_lossy().into_owned();
+        // 长于 `GREP_MAX_LINE_CHARS`(500) 的命中行 → 触发「超长行被截」notice。
+        let long = "a".repeat(ys_tool::GREP_MAX_LINE_CHARS + 100);
+        let body: String = (1..=2)
+            .map(|i| format!("printf '%s\\n' '{}'\n", rg_match_jsonl(&abs, i, &long)))
+            .collect();
+        let rg = fake_bin(&dir, "rg", &body);
+
+        // limit=1 且有 2 条命中 → 触发 `limit` notice；两条 notice 同时出现。
+        let result = call(&rg_tool(&rg, &dir), json!({ "pattern": "a", "limit": 1 })).await;
+
+        assert!(!result.is_error, "{}", brief(&result.content));
+        let tail = result
+            .content
+            .rsplit_once("\n\n[")
+            .map(|(_, rest)| rest)
+            .expect("正文后应附 `\\n\\n[… . …]`");
+        assert_eq!(
+            tail,
+            format!(
+                "1 matches limit reached. Use limit=2 for more. \
+                 Some lines truncated to {} chars. Use the read tool to see full lines]",
+                ys_tool::GREP_MAX_LINE_CHARS
+            ),
+            "两条 notice 必须用 `. ` 连接；实际：{}",
             brief(&result.content)
         );
 

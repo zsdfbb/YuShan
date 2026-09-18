@@ -412,7 +412,7 @@ flowchart TB
 | --- | --- |
 | Model、Tool、Session 接口 | Coding Prompt 和默认配置 |
 | BasicLoop、Event、Hook | 项目上下文发现 |
-| Registry 和插件加载 | read、write、edit、bash |
+| Registry 和插件加载 | 9 个默认工具（见下「默认工具」） |
 | 通用消息和运行状态 | CLI、TUI 和 coding session |
 
 第一版优先使用 `BasicLoop + Coding Tools + Coding Hooks + Coding Prompt`。只有在需要自动验证、失败修复、特殊压缩或任务阶段管理时，才增加独立的 `CodingLoop`。
@@ -425,11 +425,22 @@ flowchart TB
 | `write` | 创建文件或完整覆盖内容 |
 | `edit` | 对已有文件执行精确修改 |
 | `bash` | 执行命令并返回标准输出、错误和退出码 |
+| `grep` | 按内容搜索：优先外挂 `rg`，缺失时降级 POSIX `grep` |
+| `find` | 按路径 / 名字搜索：优先外挂 `fd`，缺失时降级 POSIX `find` |
+| `ls` | 列目录（纯 `read_dir`，不起子进程） |
+| `websearch` | 联网搜索：走确定的后端链（一张 `const TABLE`，不建 trait） |
+| `webfetch` | 抓网页 → Markdown → 落盘 + 文件头 + 指针，返回绝对路径供 `read` / `grep` 续读 |
 
-第二阶段可增加 `grep`、`find`、`ls` 和 `git`。工具仍实现通用 `Tool` 接口，Runtime 不感知 Coding 语义。
+**注册顺序即契约**：`read` → `write` → `edit` → `bash` → `grep` → `find` → `ls` → `websearch` → `webfetch`（共 **9 个**），
+与 `apps/coding-agent/src/toolset.rs::EXPECTED_ORDER` 同源 —— 顺序决定 `ToolRegistry::specs()` 与系统提示词里工具清单的顺序，**勿重排**。
+工具仍实现通用 `Tool` 接口，Runtime 不感知 Coding 语义。
 
 > **状态（2026-09-17）**：`grep` / `find` / `ls` **已实现**（外挂 `rg`/`fd` → 降级 POSIX `grep`/`find`，绝不下载）；
 > 见 `docs/design-final/search-tools.md` 与 ADR-0015。`git` 工具仍未做。
+>
+> **状态（2026-09-18）**：`websearch` / `webfetch` **已实现**，落在新 crate `adapters/tools-web`
+> （**本仓库第一个带网络**的工具适配器；`tools-basic` 保持无网络，由 crate 边界强制）；
+> 见 `docs/design-final/tools-web.md` 与 ADR-0016。至此默认工具共 **9 个**。
 
 ### 项目上下文与 Coding Prompt
 

@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"code\":200,\"log_id\":\"0000000000000000\",\"msg\":null,\"data\":{\"_type\":\"SearchResponse\",\"queryContext\":{\"originalQuery\":\"yushan-zzq9-no-such-page-7f3a\"},\"webPages\":{\"totalEstimatedMatches\":0,\"value\":[]}}}"
+}

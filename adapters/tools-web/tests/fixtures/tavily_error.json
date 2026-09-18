@@ -1,0 +1,7 @@
+{
+  "status": 401,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"detail\":{\"error\":\"Unauthorized: missing or invalid API key.\"}}"
+}

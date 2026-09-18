@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"query\":\"rust error handling\",\"follow_up_questions\":null,\"answer\":null,\"images\":[],\"results\":[{\"title\":\"Error Handling - The Rust Programming Language\",\"url\":\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\",\"content\":\"Rust groups errors into two major categories: recoverable and unrecoverable errors.\",\"score\":0.97,\"raw_content\":null},{\"title\":\"anyhow - Rust\",\"url\":\"https://docs.rs/anyhow/latest/anyhow/\",\"content\":\"Flexible concrete Error type built on std::error::Error.\",\"score\":0.91,\"raw_content\":null}],\"response_time\":1.24,\"request_id\":\"00000000-0000-4000-8000-000000000000\"}"
+}

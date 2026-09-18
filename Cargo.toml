@@ -13,6 +13,7 @@ members = [
     "crates/ys-tui-coding",
     "adapters/model-openai-compatible",
     "adapters/tools-basic",
+    "adapters/tools-web",
     "apps/coding-agent",
 ]
 

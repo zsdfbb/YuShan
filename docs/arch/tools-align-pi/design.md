@@ -269,14 +269,25 @@ pub fn parse_<provider>(body: &serde_json::Value) -> Vec<SearchHit>;  // 每 pro
 - 降级路径与原生路径**行为不等价**（`.gitignore` vs 6 个硬编码目录；ERE vs Rust regex；`glob` 含 `/` 不支持）—— 同一提问在不同机器出不同质量的答案，**这是本设计最大的体验裂缝**，靠启动期一行提示 + 输出尾部 `[degraded]` 标注缓解，**不能消除**。
 - 工具数 4 → 9，每轮多 5 行工具描述（≈40–80 token/轮），是**净负外部性**。
 - `spec.description` 仍进 `ModelRequest.tools`（面向 API、需完整）；**prompt 里的清单另用 snippet 短表**（§1.5）。两处都要为 9 个工具写准 —— 写砸了模型变笨。
-- **安全（明确范围外，但必须留痕）**：① `webfetch` **不防 SSRF** —— `http://127.0.0.1:8080/admin`、云元数据 `169.254.169.254` 全可达（本项目「不做安全」，但这是最大的悬空项）；② 抓回的网页内容进上下文，**构成提示注入面**；缓解：输出带 `[fetched from <url>]` 归因标注。
+- **安全**：① **SSRF** —— 原结论「不做」，**据调研修正**：Vibe-Trading 用约 **35 行**即做到「scheme 白名单 + 拒 URL 内凭据 + 拒 `localhost`/`.local` + IP 段判定（私有/回环/链路本地/保留/非全局）」，性价比足够，**应做**（见 `web-research.md` §3.4）；② **提示注入** —— 抓回的网页会进上下文；建议采纳 Vibe-Trading 的「**只标注、不改内容**」（约 40 行正则，往结果里加警告元数据），与本项目「Event 只观察」的精神一致。
 
 ---
 
 ## 4. 未决 / 待验证
 
-- [ ] **默认搜索 provider 未定**：A/C 推 **Brave**（单一 GET + 单 header + `web.results[].{title,url,description}`，Bing API 已于 2025-08 退役）；B 推 Tavily（**自认未核实 API 形状**）。用户选了「可配置、默认一家」但未指定 —— **实现前需定**（考虑国内可用性）。
-- [ ] **HTML→Markdown crate 需 prototype 验证两件事**：① 能否**跳过 boilerplate 标签**；② 能否**写入字节计数的 `Write` 适配器**（转换期截断的前提）。候选 `html2text`（无 DOM、流式解析）vs `htmd`（turndown 语义、skip-tags）。**注意**：HTML 解析器需要**完整输入**，只有**输出**是流的 → 内存下界 = 输入的 5 MiB cap（本文早前「流式」的表述不准确，以本条为准）。
+### 切片二 · 已定（2026-09-17，详见 [`web-research.md`](./web-research.md)）
+
+- **`webfetch` 本地抓取** —— 不外包第三方 reader 服务（自主、稳定）。
+- **`websearch` 免 key + provider API 并存** —— 先试免 key（抓取式元搜索），再落到配置的 provider（如 Tavily）。
+
+### 切片二 · 仍未决
+
+- [ ] **HTML→Markdown crate**（因「本地抓」而成立）：候选 **`htmd`**（CodeWhale 在踩过 readability+html5ever **双栈编译冲突**后最终选它）。需 prototype 验证两件事：能否**跳 boilerplate 标签**、能否**写入字节计数的 `Write` 适配器**（转换期截断的前提）。注意 HTML 解析器需**完整输入**，只有输出是流的 → 内存下界 = 输入 cap。
+- [ ] **「免 key 搜索」在 Rust 无 `ddgs` 等价物** → 现实做法是**自抓 HTML**（CodeWhale 的免 key provider 即如此，其 `scrape.rs` 约 528 行），**必须按脆弱件对待**：做成**一个 backend**、失败即顺延，并能告知"当前走免 key 抓取"。
+- [ ] **provider 清单与默认值**：国内已验证可用的有 博查/秘塔/百度/火山（CodeWhale）与阿里云 IQS（Vibe-Trading）；是否让 **provider 原生搜索**优先（CodeWhale 已证明 Kimi/智谱可行）—— 待定。
+
+### 切片一遗留
+
 - [ ] `rg --json` 的 `context` 事件是否随 `-C N` 发出（C 用它替代 Pi 的「回读文件」方案）—— 实现第一步验证；不成立则退回回读文件（设计已隔离成纯函数）。
 - [ ] 降级 grep 在 macOS **BSD grep** 无 `--include`/`--exclude-dir` 时的兜底（需手写 glob 或客户端过滤）。
 - [ ] 需在真实 Linux + macOS 各验一遍降级路径（GNU vs BSD grep 差异）。

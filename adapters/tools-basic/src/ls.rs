@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use ys_core::ToolResult;
-use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
-
-use crate::search::append_notices;
+use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 
 /// 一次调用返回的条目数上限（可被 `limit` 覆盖）。
 const DEFAULT_LIMIT: usize = 500;

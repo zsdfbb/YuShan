@@ -42,7 +42,8 @@ apps/coding-agent/src/prompt.rs      build_system_prompt(cwd, &[ToolSpec])，清
 
 1. `find.rs`：以 `/` 开头的 glob（`/src/*.rs`）经 `fd --full-path` 仍静默返回空（罕见路径）。
 2. `bash` 的 `kill_on_drop` 只杀直接子进程；无 boundary 超时路径对 `sh -c` 的**孙进程**不覆盖。
-3. 切片二（`websearch`/`webfetch`）**未启动** —— 两个未决项：默认搜索 provider、`HTML→Markdown` crate 需 prototype 验证。
+3. ~~切片二（`websearch`/`webfetch`）未启动~~ —— **已完成**（2026-09-18）：as-built 见 **`docs/design-final/tools-web.md`**，
+   决策见 **ADR-0016**；两个未决项已定：搜索后端链用一张 `const TABLE` + 两个 `match`（不建 trait），`HTML→Markdown` 引入 `htmd`。
 4. 变异测试靠手工注入（`cargo-mutants` 未安装）。
 
 ## 测试资产

@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"code\":200,\"log_id\":\"0000000000000000\",\"msg\":null,\"data\":{\"_type\":\"SearchResponse\",\"queryContext\":{\"originalQuery\":\"rust error handling\"},\"webPages\":{\"webSearchUrl\":\"https://www.bing.com/search?q=rust+error+handling\",\"totalEstimatedMatches\":2,\"value\":[{\"id\":\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\",\"name\":\"Error Handling - The Rust Programming Language\",\"url\":\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\",\"displayUrl\":\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\",\"snippet\":\"Rust groups errors into two major categories: recoverable and unrecoverable errors.\",\"summary\":\"Rust 的错误处理分为可恢复与不可恢复两类。（只有 summary:true 时才有）\",\"siteName\":\"doc.rust-lang.org\",\"siteIcon\":\"https://example.com/favicon.ico\",\"datePublished\":\"2024-01-01T00:00:00+08:00\",\"dateLastCrawled\":\"2024-06-01T00:00:00+08:00\",\"language\":\"en\",\"isFamilyFriendly\":true},{\"name\":\"Rust 错误处理实践\",\"url\":\"https://blog.example.org/rust-errors-in-practice\",\"snippet\":\"anyhow 与 thiserror 的取舍。\",\"siteName\":\"blog.example.org\"}]}}}"
+}

@@ -1,0 +1,27 @@
+[package]
+name = "ys-tools-web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ys-core = { path = "../../crates/ys-core" }
+ys-tool = { path = "../../crates/ys-tool" }
+ys-protocol = { path = "../../crates/ys-protocol" }
+serde_json = "1"
+async-trait = "0.1"
+# `net`/`io-util`/`sync`/`rt-multi-thread` 是给**测试基建**的（`tests/common/mod.rs`
+# 及将来的集成测试可能需要 tokio 的 socket / 多线程 runtime）；本 crate 的生产代码
+# 只用 `rt`/`time`/`macros`/`fs`。
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "fs", "net", "io-util", "sync"] }
+# ⚠️ 绝不加 `rustls-tls`：进程里已有一套 TLS 栈（reqwest 默认的 native-tls），
+# 双 TLS 栈会带来根证书来源不一致与体积膨胀（设计明确禁止）。
+reqwest = { version = "0.12", features = ["json"] }
+# ⚠️ `htmd` 的依赖树必须无 `regex`（ADR-0015 硬否决线）：`fast_html2md` 因此被否。
+htmd = "0.5"
+
+[dev-dependencies]
+# 跨工具契约（`tests/tools.rs`）：`webfetch` 返回的**绝对路径**必须能被 `read` 直接打开，
+# 且 `offset` 与文件行号 1:1 对齐。这条是 ADR-0016 点名的**隐性依赖** —— 给 `read` 加
+# 「workspace 根包含检查」会让 webfetch 静默失效，只有一条真跑 `ReadTool` 的测试能挡住。
+# 依赖方向仍是单向（`tools-basic` 不认识 `tools-web`），只是**测试**需要两者同时在手。
+ys-tools-basic = { path = "../tools-basic" }

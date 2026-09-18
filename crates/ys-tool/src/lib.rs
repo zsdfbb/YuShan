@@ -3,6 +3,7 @@
 mod approval;
 mod context;
 mod error;
+mod notice;
 mod registry;
 mod spec;
 mod truncate;
@@ -10,6 +11,7 @@ mod truncate;
 pub use approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
 pub use context::*;
 pub use error::*;
+pub use notice::*;
 pub use registry::*;
 pub use spec::*;
 pub use truncate::*;

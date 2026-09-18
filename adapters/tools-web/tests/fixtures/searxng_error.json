@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "text/html; charset=utf-8"
+  },
+  "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>rust error handling - searxng</title>\n</head>\n<body>\n  <form id=\"search\" method=\"POST\" action=\"/search\">\n    <input name=\"q\" type=\"text\" value=\"rust error handling\">\n    <button type=\"submit\">search</button>\n  </form>\n  <section id=\"results\">\n    <article class=\"result\">\n      <a href=\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\">Error Handling - The Rust Programming Language</a>\n      <p class=\"content\">Rust groups errors into two major categories: recoverable and unrecoverable errors.</p>\n    </article>\n  </section>\n</body>\n</html>\n"
+}

@@ -21,6 +21,9 @@ ys-protocol = { path = "../../crates/ys-protocol" }
 ys-tui-coding = { path = "../../crates/ys-tui-coding" }
 ys-model-openai-compat = { path = "../../adapters/model-openai-compatible" }
 ys-tools-basic = { path = "../../adapters/tools-basic" }
+# 带网络的工具适配器（`websearch` / `webfetch`）：与 `tools-basic` **刻意分开**，
+# 使「只要本机能力」的装配在类型上拿不到网络（见 tools-web crate 文档）。
+ys-tools-web = { path = "../../adapters/tools-web" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "sync", "time"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

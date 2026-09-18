@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"success\":true,\"data\":{\"web\":[{\"url\":\"https://www.firecrawl.dev/\",\"title\":\"Firecrawl - The Web Data API for AI\",\"description\":\"The web crawling, scraping, and search API for AI.\",\"position\":1},{\"url\":\"https://docs.firecrawl.dev/features/search\",\"title\":\"Search | Firecrawl\",\"description\":\"Search the web and get clean, structured content from every result in a single API call.\",\"position\":2}]},\"creditsUsed\":2}"
+}

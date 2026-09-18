@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use ys_core::ToolResult;
-use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
+use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 
 use crate::exec::{Bounded, SearchBackends, Stop, run_bounded};
-use crate::search::{BYTE_CAP, DEADLINE, EXCLUDED_DIRS, append_notices, relativize};
+use crate::search::{BYTE_CAP, DEADLINE, EXCLUDED_DIRS, relativize};
 
 /// 一次调用返回的**结果条数**上限。
 const DEFAULT_LIMIT: usize = 1000;

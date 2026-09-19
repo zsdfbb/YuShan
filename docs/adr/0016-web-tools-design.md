@@ -7,6 +7,9 @@
 ## Status
 
 accepted（2026-09-17）· **修订（2026-09-18）**：Firecrawl 由「keyless」改为**需 key**（见「决策 2」与「Consequences」的修订记录）。
+· **修订（2026-09-19）**：**「Claude Code 式总结当前做不到」这条被重开** —— 其实现路径理由（注入 `Arc<dyn Model>` +
+重排装配顺序）被证伪，**由 [ADR-0018](0018-webfetch-summarize.md) 落地**（可选 `prompt` + 摘要 + 指针）。
+本 ADR 其余决定**全部不变**。
 
 ## 背景
 
@@ -78,9 +81,14 @@ accepted（2026-09-17）· **修订（2026-09-18）**：Firecrawl 由「keyless�
 ## Considered Options
 
 - **`webfetch` 直接截断回喂**。**否决** —— 内容**永久丢失**（模型看不到被截掉的部分，也无法续读）。
-- **Claude Code 式「带 `prompt`、小模型总结后只回答案」**。**当前做不到**：`Tool::call` 拿不到 `Model`；
+- **Claude Code 式「带 `prompt`、小模型总结后只回答案」**。**当时判为做不到**：`Tool::call` 拿不到 `Model`；
   要做需注入 `Arc<dyn Model>` + 重排装配顺序（`build_tools` 早于模型构建）。落盘方案用**零改造**拿到了
   「上下文有界」这个主要收益，且额外得到「内容不丢 + 可 grep」。
+  > ⚠️ **修订（2026-09-19）**：本条的**结论被重开**，因为所依赖的两条实现路径理由均被证伪 ——
+  > ① 不必 `Arc`，每回合**借用** `&dyn Summarizer` 即可（且工具跨回合持有模型与 ADR-0010 冲突）；
+  > ② 「重排装配顺序」**只对构造器注入成立**；走 `ToolContext` 时 `RuntimeContext` 每回合已带 `model`，问题不存在。
+  > 已由 **[ADR-0018](0018-webfetch-summarize.md)** 落地。**但落盘 + 指针保留**，且正是 0018「摘要 + 指针并存」的基础 ——
+  > 本条不改写为「错了」，而是「当时的约束是真的，现在松了」。
 - **`fast_html2md`（lol_html 流式，峰值内存 1/25）**。**否决** —— 拉 `regex`。且 5 MiB 下载 cap 下，
   `htmd` 的 ~2.5MB 峰值可接受，「流式转换」的收益不成立（我们本来就要持有完整 Markdown 才能落盘）。
 - **给后端建 `SearchBackend` trait**。**否决** —— 逐条核对，4 家只差 method / URL / 鉴权头 / 请求体 /

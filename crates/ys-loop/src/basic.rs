@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::{AgentInput, AgentLoop, LoopError, RunResult};
+use super::{AgentInput, AgentLoop, LoopError, ModelSummarizer, NoopModelEventSink, RunResult};
 use async_trait::async_trait;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
@@ -305,11 +305,15 @@ impl AgentLoop for BasicLoop {
                 // 在 registry 中查找并带超时执行（T11b）与错误恢复（T11c）
                 let result = match ctx.registry.get(tool_name) {
                     Some(tool) => {
+                        // 唯一的摘要适配器接线点：`ctx.model` / `ctx.registry` / `ctx.boundary`
+                        // 全是不可变借用，可共存；`summarizer` 必须先于 `tool_ctx` 声明。
+                        let summarizer = ModelSummarizer { model: ctx.model };
                         let tool_ctx = ToolContext::new(
                             ctx.boundary,
                             ctx.cwd.clone(),
                             ctx.workspace_root.clone(),
-                        );
+                        )
+                        .with_summarizer(&summarizer);
                         let timeout_secs = ctx.limits.bash_timeout.unwrap_or(300);
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
@@ -470,13 +474,7 @@ async fn generate_summary(
     model: &dyn ys_model::Model,
     messages: &[Message],
 ) -> Result<String, ys_model::ModelError> {
-    struct NoopModelEventSink;
-    impl ModelEventSink for NoopModelEventSink {
-        fn emit(&mut self, _event: ModelEvent) -> Result<(), ys_core::EventError> {
-            Ok(())
-        }
-    }
-
+    // sink 与 `summarize::ModelSummarizer` 共用同一份（R9：同 crate 内不该有两份相同 impl）。
     let mut sink = NoopModelEventSink;
     let request = ModelRequest {
         messages: messages.to_vec(),

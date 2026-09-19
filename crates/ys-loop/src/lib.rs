@@ -4,12 +4,14 @@ mod basic;
 mod error;
 mod input;
 mod result;
+mod summarize;
 pub mod token;
 
 pub use basic::*;
 pub use error::*;
 pub use input::*;
 pub use result::*;
+pub use summarize::*;
 
 use ys_component::RuntimeContext;
 
@@ -161,6 +163,91 @@ mod tests {
             .any(|e| matches!(e, AgentEvent::ToolResult { .. }));
         assert!(has_tool_call);
         assert!(has_tool_result);
+    }
+
+    // U3-P1：**唯一生产接线点**的探针工具。
+    //
+    // 为什么需要它：`tools-web` 的 W4 用例是**直接注入假 `Summarizer`** 构造
+    // `ToolContext` 的，结构性绕过了 `basic.rs` 里 `.with_summarizer(&summarizer)`
+    // 那一行 —— 把整段接线删掉，全仓测试依然全绿。本探针把「接线本身」变成被测对象：
+    // 它由真实的 `BasicLoop::run_turn` 驱动，只记录拿到的 `ToolContext` 长什么样。
+    //
+    // ⚠️ 这里配 `MockModel` 是**允许**的：设计 R8 的禁令只针对「让 `ModelSummarizer`
+    // 接 `MockModel`」（那会吃掉主循环的响应队列）。探针工具**不调 `complete`**，
+    // 不消费模型队列。
+    struct ProbeTool {
+        /// 记录工具被调用时 `ToolContext.summarizer` 是否为 `Some`。
+        saw_summarizer: Arc<AtomicBool>,
+        /// 记录工具被调用时 `ToolContext.boundary` 是否为 `Some`。
+        saw_boundary: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ProbeTool {
+        fn spec(&self) -> ys_tool::ToolSpec {
+            ys_tool::ToolSpec::new(
+                "probe",
+                "records what the loop wired into ToolContext",
+                serde_json::json!({}),
+            )
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            ctx: ToolContext<'_>,
+        ) -> Result<ys_tool::ToolResult, ys_tool::ToolError> {
+            self.saw_summarizer
+                .store(ctx.summarizer.is_some(), Ordering::SeqCst);
+            self.saw_boundary
+                .store(ctx.boundary.is_some(), Ordering::SeqCst);
+            Ok(ys_tool::ToolResult {
+                content: "probed".into(),
+                is_error: false,
+            })
+        }
+    }
+
+    // U3-P1：`BasicLoop::run_turn` 必须给工具挂上 `ModelSummarizer`
+    //
+    // 通路是真实的两轮循环（tool_call → 文本），与 `test_tool_call_loop` 同构，
+    // 唯一差别是工具换成探针。变异自检：删掉 `basic.rs` 的 `.with_summarizer(...)`
+    // ⇒ 本用例必须变红。
+    #[tokio::test]
+    async fn test_loop_wires_summarizer_into_tool_context() {
+        let model = MockModel::new("m");
+        model.push_tool_call("probe", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let saw_summarizer = Arc::new(AtomicBool::new(false));
+        let saw_boundary = Arc::new(AtomicBool::new(false));
+        let registry = ToolRegistry::build(vec![Box::new(ProbeTool {
+            saw_summarizer: saw_summarizer.clone(),
+            saw_boundary: saw_boundary.clone(),
+        })])
+        .unwrap();
+        let limits = RunLimits::new(5);
+        let boundary = Arc::new(QueueBoundarySource::new());
+
+        let result = {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
+                .with_boundary(boundary.as_ref());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        assert!(
+            saw_summarizer.load(Ordering::SeqCst),
+            "BasicLoop 必须经 `with_summarizer` 把 ModelSummarizer 挂进 ToolContext；\
+             为 false 说明唯一的摘要接线点断了（或整段被删）"
+        );
+        assert!(
+            saw_boundary.load(Ordering::SeqCst),
+            "ToolContext 应带上本回合的 boundary（工具靠它实现取消轮询）"
+        );
     }
 
     // TC6：入口即中止（Abort 取代 CancelToken）

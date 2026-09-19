@@ -6,6 +6,7 @@ mod error;
 mod notice;
 mod registry;
 mod spec;
+mod summarizer;
 mod truncate;
 
 pub use approval::{ApprovalDecision, ApprovalHandler, AutoApprove};
@@ -14,6 +15,7 @@ pub use error::*;
 pub use notice::*;
 pub use registry::*;
 pub use spec::*;
+pub use summarizer::*;
 pub use truncate::*;
 
 // 为方便起见从 ys-core 再导出

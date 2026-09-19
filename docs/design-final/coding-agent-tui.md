@@ -270,7 +270,9 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 `Outbound::Output`。**本模块绝不 print**（TUI 起屏后 stderr/stdout 会冲掉整屏）。
 `new_session` / `compact` 是 `async`（碰 `Session`），`export` 是**同步**（见 §8）。
 
-> **占位语义**（与旧行为一致）：`/compact` 仍是 `clear_session`（真压缩 TBD）；`/copy` 无剪贴板；
+> **降级语义**：`/compact` **已接真压缩**（`capabilities::compact` → `ys_loop::plan` + `execute`：
+> 摘要成一条 checkpoint、尾部原样保留）；四条路径里**三条失败（无 model / 无事可压 / 摘要失败）
+> 都不碰 session 一个字节**，各给一行明确提示 —— 靠「什么都不做」而非「清空」降级。`/copy` 无剪贴板；
 > `/export` 无参时落点由 app 决定 = 会话文件自身（**带自拷贝护栏**：`fs::copy` 对「源 == 目标」
 > 会先截断目标 —— 那是清空会话而非导出）。
 
@@ -364,7 +366,8 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 ## 10. 已知缺口（诚实清单）
 
-- `/compact` 仍是 `clear_session` 占位（真压缩 TBD，与旧行为一致）。
+- `/compact` **已接真压缩**（`ys_loop::plan` + `execute`）：摘要成一条 checkpoint、尾部保留；
+  无 model / 无事可压 / 摘要失败三条路径**都不动 session**，只给一行提示。（此条原为「占位」缺口，已闭合。）
 - `/copy` 无剪贴板集成（v1 把内容写进 transcript，手动选中）。
 - `/new` 后 `App.transcript` 不清（旧对话行仍在屏上；`CodingView.message_count` 已归零）—— 与
   `core-channel.md` §7.7 记录的同一行为，本版未改。

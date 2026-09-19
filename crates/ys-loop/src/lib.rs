@@ -1,15 +1,19 @@
 //! Agent 执行循环与编排逻辑。
 
 mod basic;
+mod compact;
 mod error;
 mod input;
 mod result;
+mod summarize;
 pub mod token;
 
 pub use basic::*;
+pub use compact::*;
 pub use error::*;
 pub use input::*;
 pub use result::*;
+pub use summarize::*;
 
 use ys_component::RuntimeContext;
 
@@ -161,6 +165,91 @@ mod tests {
             .any(|e| matches!(e, AgentEvent::ToolResult { .. }));
         assert!(has_tool_call);
         assert!(has_tool_result);
+    }
+
+    // U3-P1：**唯一生产接线点**的探针工具。
+    //
+    // 为什么需要它：`tools-web` 的 W4 用例是**直接注入假 `Summarizer`** 构造
+    // `ToolContext` 的，结构性绕过了 `basic.rs` 里 `.with_summarizer(&summarizer)`
+    // 那一行 —— 把整段接线删掉，全仓测试依然全绿。本探针把「接线本身」变成被测对象：
+    // 它由真实的 `BasicLoop::run_turn` 驱动，只记录拿到的 `ToolContext` 长什么样。
+    //
+    // ⚠️ 这里配 `MockModel` 是**允许**的：设计 R8 的禁令只针对「让 `ModelSummarizer`
+    // 接 `MockModel`」（那会吃掉主循环的响应队列）。探针工具**不调 `complete`**，
+    // 不消费模型队列。
+    struct ProbeTool {
+        /// 记录工具被调用时 `ToolContext.summarizer` 是否为 `Some`。
+        saw_summarizer: Arc<AtomicBool>,
+        /// 记录工具被调用时 `ToolContext.boundary` 是否为 `Some`。
+        saw_boundary: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ProbeTool {
+        fn spec(&self) -> ys_tool::ToolSpec {
+            ys_tool::ToolSpec::new(
+                "probe",
+                "records what the loop wired into ToolContext",
+                serde_json::json!({}),
+            )
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            ctx: ToolContext<'_>,
+        ) -> Result<ys_tool::ToolResult, ys_tool::ToolError> {
+            self.saw_summarizer
+                .store(ctx.summarizer.is_some(), Ordering::SeqCst);
+            self.saw_boundary
+                .store(ctx.boundary.is_some(), Ordering::SeqCst);
+            Ok(ys_tool::ToolResult {
+                content: "probed".into(),
+                is_error: false,
+            })
+        }
+    }
+
+    // U3-P1：`BasicLoop::run_turn` 必须给工具挂上 `ModelSummarizer`
+    //
+    // 通路是真实的两轮循环（tool_call → 文本），与 `test_tool_call_loop` 同构，
+    // 唯一差别是工具换成探针。变异自检：删掉 `basic.rs` 的 `.with_summarizer(...)`
+    // ⇒ 本用例必须变红。
+    #[tokio::test]
+    async fn test_loop_wires_summarizer_into_tool_context() {
+        let model = MockModel::new("m");
+        model.push_tool_call("probe", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let saw_summarizer = Arc::new(AtomicBool::new(false));
+        let saw_boundary = Arc::new(AtomicBool::new(false));
+        let registry = ToolRegistry::build(vec![Box::new(ProbeTool {
+            saw_summarizer: saw_summarizer.clone(),
+            saw_boundary: saw_boundary.clone(),
+        })])
+        .unwrap();
+        let limits = RunLimits::new(5);
+        let boundary = Arc::new(QueueBoundarySource::new());
+
+        let result = {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
+                .with_boundary(boundary.as_ref());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        assert!(
+            saw_summarizer.load(Ordering::SeqCst),
+            "BasicLoop 必须经 `with_summarizer` 把 ModelSummarizer 挂进 ToolContext；\
+             为 false 说明唯一的摘要接线点断了（或整段被删）"
+        );
+        assert!(
+            saw_boundary.load(Ordering::SeqCst),
+            "ToolContext 应带上本回合的 boundary（工具靠它实现取消轮询）"
+        );
     }
 
     // TC6：入口即中止（Abort 取代 CancelToken）
@@ -470,6 +559,19 @@ mod tests {
         msg.content
             .iter()
             .any(|b| matches!(b, ContentBlock::Text { text: t } if t == text))
+    }
+
+    /// 含压缩摘要标记（`[Context Summary]`）的消息（子串匹配 —— 摘要是拼接出来的长文本）。
+    fn summary_messages(session: &MemorySession) -> Vec<&Message> {
+        session
+            .messages()
+            .iter()
+            .filter(|m| {
+                m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("[Context Summary]"))
+                })
+            })
+            .collect()
     }
 
     // Task 16-1：轮边界注入的 steering 出现在**下一轮**的 ModelRequest 里
@@ -853,6 +955,172 @@ mod tests {
                 .iter()
                 .any(|m| content_has_text(m, "steer!")),
             "排队在 Abort 之前的 Steer 不得被丢弃"
+        );
+    }
+
+    // ============ ADR-0017：Step 4b 自动压缩的接线（片 1） ============
+
+    /// 预置 6 条各 ~100 token 的消息 + 本轮用户消息 = 601 token；
+    /// window = 1000 ⇒ `trigger_at = 101`、`keep_budget = 100` ⇒ 必然触发压缩。
+    async fn seed_compaction_session(session: &mut MemorySession) {
+        for i in 0..6 {
+            session
+                .append(Message {
+                    role: if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    content: vec![ContentBlock::Text {
+                        text: "x".repeat(400),
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    fn small_window_limits() -> RunLimits {
+        let mut limits = RunLimits::new(5);
+        limits.context_window = 1000;
+        limits
+    }
+
+    /// 自动压缩成功：`ContextCompacted` **排在 `RunFinished` 之前**，会话含摘要而非被清空。
+    ///
+    /// mock 的响应顺序即调用顺序：第 1 条被**摘要调用**消费，第 2 条是主对话。
+    #[tokio::test]
+    async fn test_auto_compaction_emits_context_compacted_before_run_finished() {
+        let model = MockModel::new("m");
+        model.push_text("摘要正文"); // 第 1 次 complete：摘要调用
+        model.push_text("done"); // 第 2 次 complete：主对话
+        let mut session = MemorySession::new();
+        seed_compaction_session(&mut session).await;
+        let mut events = CollectingSink::new();
+        let registry = ToolRegistry::build(vec![]).unwrap();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                small_window_limits(),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+        assert_eq!(result.stop_reason, StopReason::Completed);
+
+        let evts = events.events();
+        let compacted_at = evts
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ContextCompacted { .. }))
+            .expect("小窗口下必须发出 ContextCompacted");
+        let finished_at = evts
+            .iter()
+            .position(|e| matches!(e, AgentEvent::RunFinished { .. }))
+            .expect("必须有终局事件");
+        assert!(
+            compacted_at < finished_at,
+            "ContextCompacted 必须排在 RunFinished 之前：{evts:?}"
+        );
+
+        // 事件里的数字必须自洽：before = 6 条预置 + 本轮用户消息（"go" ≈ 0 token）
+        match &evts[compacted_at] {
+            AgentEvent::ContextCompacted {
+                estimated_tokens_before,
+                estimated_tokens_after,
+                summarized,
+                kept,
+            } => {
+                assert_eq!(*estimated_tokens_before, 600, "前置：6 × 100 token");
+                assert!(
+                    estimated_tokens_after < estimated_tokens_before,
+                    "压缩后必须变小：{estimated_tokens_before} → {estimated_tokens_after}"
+                );
+                // 尾扫留得下最后两条（"go" 0 token + 一条 100 token 的），其余 5 条进摘要段
+                assert_eq!(*summarized, 5);
+                assert_eq!(*kept, 2);
+            }
+            other => panic!("unreachable: {other:?}"),
+        }
+
+        // 会话**含摘要**而非被清空（旧实现失败时会退化成一行占位符）
+        assert_eq!(
+            summary_messages(&session).len(),
+            1,
+            "压缩后必须恰好留下 1 条摘要：{:?}",
+            session.messages()
+        );
+        assert_eq!(
+            session.messages().len(),
+            4,
+            "摘要 1 条 + 保留段 2 条 + 本轮的 assistant 回复（run_turn 随后 append）"
+        );
+    }
+
+    /// 自动压缩失败（B-3）：发 `ContextCompactionFailed`、**session 逐字节不动**、本轮照常继续。
+    ///
+    /// mock 顺序：第 1 条错误响应被摘要调用吃掉，第 2 条供主对话使用 ——
+    /// 若失败路径吞掉了 session 或改写了它，下面的断言立刻变红。
+    #[tokio::test]
+    async fn test_auto_compaction_failure_leaves_session_untouched() {
+        let model = MockModel::new("m");
+        model.push_error("provider 挂了"); // 第 1 次 complete：摘要调用失败
+        model.push_text("done"); // 第 2 次 complete：主对话照常
+        let mut session = MemorySession::new();
+        seed_compaction_session(&mut session).await;
+        let mut events = CollectingSink::new();
+        let registry = ToolRegistry::build(vec![]).unwrap();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                small_window_limits(),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Completed,
+            "压缩失败不中止本轮"
+        );
+
+        let evts = events.events();
+        assert!(
+            evts.iter().any(|e| matches!(
+                e,
+                AgentEvent::ContextCompactionFailed { reason } if reason.contains("provider 挂了")
+            )),
+            "失败必须可见：{evts:?}"
+        );
+        assert!(
+            !evts
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextCompacted { .. })),
+            "失败不得发成功事件"
+        );
+
+        // session 逐字节未变：6 条预置 + 本轮用户消息 + 本轮的 assistant 回复，
+        // 且**没有**任何摘要 / 占位符。
+        assert_eq!(
+            session.messages().len(),
+            8,
+            "失败时 session 一个字节都不动（6 预置 + 用户消息 + 本轮回复）"
+        );
+        assert!(
+            summary_messages(&session).is_empty(),
+            "失败时不得写入占位符或空摘要：{:?}",
+            session.messages()
         );
     }
 }

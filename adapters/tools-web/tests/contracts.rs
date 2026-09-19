@@ -99,11 +99,12 @@ fn web_tool_names_are_the_release_contract() {
 ///
 /// `description` **直接进 `ModelRequest.tools`**，是模型行为的输入 —— 改文案等于改行为。
 /// 这里只锁**关键短语**（不锁整段）：文案微调（换词、断行）不该红，但**语义漂移**
-/// （链变随机、落盘被拿掉）必须红。
+/// （链变随机、落盘被拿掉、摘要能力被静默删掉）必须红。
 ///
 /// 变异：
 /// ① `search.rs` 的 description 把 "fixed order" 换成 "a randomized order" → 本用例红；
-/// ② `fetch.rs` 的 description 删掉「saved / path」那两句（暗指「不再落盘」）→ 本用例红。
+/// ② `fetch.rs` 的 description 删掉「saved / path」那两句（暗指「不再落盘」）→ 本用例红；
+/// ③ `fetch.rs` 的 description 删掉 `prompt` / `summary` 那段（可选摘要静默消失）→ 本用例红。
 #[test]
 fn descriptions_pin_chain_and_save_semantics() {
     let search_desc = WebSearchTool::new(offline_cfg()).spec().description;
@@ -127,6 +128,55 @@ fn descriptions_pin_chain_and_save_semantics() {
         fetch_desc.contains("path"),
         "webfetch 的 description 须给出**路径**（指针）以便续读：{fetch_desc}"
     );
+
+    // webfetch：**可选 `prompt`（摘要）**—— 这是「多付一次模型调用」这个代价的**唯一**出口：
+    // description 是模型判断「要不要为这次抓取多花一轮」的全部依据，缺了它模型不知道
+    // 有这个能力（功能等于不存在），或者用了却不知道它更慢。
+    assert!(
+        fetch_desc.contains("prompt"),
+        "webfetch 的 description 须说明**可选 prompt**（否则模型不知道有摘要能力）：{fetch_desc}"
+    );
+    assert!(
+        fetch_desc.contains("summary"),
+        "webfetch 的 description 须说明 prompt 会给出 **summary**（而不是别的效果）：{fetch_desc}"
+    );
+}
+
+/// **契约：`prompt` 是可选参数**（设计 §2.4 / N11）—— schema 里必须**有**它，
+/// 但 `required` 里**不许**有它。
+///
+/// 两半缺一不可：漏掉 schema 会让模型**根本传不出** `prompt`（能力静默消失）；
+/// 误进 `required` 则把「可选」变成「必填」，于是**每一次**抓取都多花一轮模型调用
+/// （设计 §7 风险 4：模型很会把「可选」用成「必选」）。
+///
+/// 变异：删掉 `properties.prompt` → 红；把 `"prompt"` 塞进 `required` → 红。
+#[test]
+fn webfetch_schema_exposes_an_optional_prompt() {
+    let spec = WebFetchTool::new(offline_cfg()).spec();
+    let params = &spec.parameters;
+
+    let props = params["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("`properties` 必须是对象：{params}"));
+    assert!(props.contains_key("url"), "{params}");
+    assert!(
+        props.contains_key("prompt"),
+        "schema 必须**暴露**可选 prompt（否则模型传不出来）：{params}"
+    );
+    assert_eq!(
+        props["prompt"]["type"], "string",
+        "prompt 是字符串（摘要是自然语言的提问）：{params}"
+    );
+
+    let required = params["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`required` 必须是数组：{params}"));
+    assert_eq!(
+        required.len(),
+        1,
+        "`prompt` 是**可选**的，不得进 required（否则每次抓取都要多花一轮模型调用）：{required:?}"
+    );
+    assert_eq!(required[0], "url", "{required:?}");
 }
 
 /// **契约：本 crate 的 8 个源文件都不得出现打印宏**（设计 §1.1 硬约束）。

@@ -131,6 +131,17 @@ impl Agent {
     pub fn context_window(&self) -> usize {
         self.limits.context_window
     }
+
+    /// 设置 model 的 context window 大小（运行期刷新）。
+    ///
+    /// **为什么需要**：`/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍。
+    /// 只在 `build_agent` 解析的话，用户 `/login` 到 1M 模型后仍按旧窗口压缩 ——
+    /// 这正是「1M 模型在 11 万 token 就被压缩」这个 bug 的另一半。
+    ///
+    /// ADR-0007：本 API 由 ADR-0017 覆盖。
+    pub fn set_context_window(&mut self, window: usize) {
+        self.limits.context_window = window;
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +201,16 @@ mod tests {
         let agent = test_agent();
         // RunLimits::default() 的 context_window = 128_000
         assert_eq!(agent.context_window(), 128_000);
+    }
+
+    #[test]
+    fn test_set_context_window_overrides_default() {
+        let mut agent = test_agent();
+        agent.set_context_window(1_000_000);
+        assert_eq!(agent.context_window(), 1_000_000);
+        // 再改一次也应生效（运行期可反复刷新）。
+        agent.set_context_window(32_000);
+        assert_eq!(agent.context_window(), 32_000);
     }
 
     /// 入口即中止：预置 `Abort` → `run_turn` 返回 `Cancelled`。

@@ -99,6 +99,16 @@ pub async fn run(
         match req {
             Request::Prompt(message) => {
                 turns += 1;
+                // **每回合刷新 context window**（唯一调用点，结构上不可能漏）。
+                //
+                // `/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍
+                // （128k ↔ 1M）：只在 `build_agent` 解析的话，用户 `/login` 到 1M
+                // 模型后仍按旧窗口压缩 —— 这正是「1M 模型在 11 万 token 就被压缩」
+                // 的后半截根因。
+                //
+                // 放在回合**开头**（而非 login/set_model 各加一处）：命令的实现散在
+                // `capabilities`，而窗口由 `config` 派生 —— 一处读取、不可能漂移。
+                agent.set_context_window(config.context_window());
                 let outcome = {
                     let ports = wiring.ports();
                     ports.events.begin_turn(turns);
@@ -171,7 +181,10 @@ pub async fn run(
             }
 
             Request::Compact => {
-                lines = capabilities::compact(&mut wiring).await;
+                // 窗口与策略都取自 `config` —— 与 agent 每回合用的那份同源
+                // （`/compact` 是用户显式触发的压缩，不等自动触发阈值）。
+                let policy = config.compact_policy();
+                lines = capabilities::compact(&mut wiring, &policy, config.context_window()).await;
             }
 
             Request::Export { path } => {
@@ -293,16 +306,36 @@ mod tests {
         persistent: bool,
         prefilled: Vec<Boundary>,
     ) -> Harness {
+        spawn_app_loop_with(model, persistent, prefilled, |_, _| {}).await
+    }
+
+    /// 同上，但允许在起循环前改写 `Config`（第二个参数是临时目录，可往里写
+    /// `config.json`）—— 供「窗口每回合刷新」用：把某个 model 的 context window
+    /// 压小，自动压缩这条**唯一可观测**的路径才会被触发。
+    async fn spawn_app_loop_with(
+        model: Box<dyn Model>,
+        persistent: bool,
+        prefilled: Vec<Boundary>,
+        tweak: impl FnOnce(&mut Config, &PathBuf),
+    ) -> Harness {
         let tmp = TempDir::new("harness");
         let (sink, sink_rx) =
             ChannelSink::new(64, ys_protocol::LifecyclePolicy::StopWhenConsumerGone);
         let agent = ys_runtime::AgentBuilder::new().build().unwrap();
 
-        let mut config = Config::from_env().unwrap();
+        // `Config::from_env` 会 `getenv` 凭证 key，而 `config.rs` 的用例正在
+        // `env_lock` 下 `set_var` / `remove_var` —— 只读也须串行。
+        // 锁**只圈住这次 `getenv`**，不跨下方的 `.await`：`MutexGuard` 非 `Send`，
+        // 跨 await 会让整个 future 失去 `Send`（且本就无故长持全局锁）。
+        let mut config = {
+            let _guard = crate::test_env::env_lock();
+            Config::from_env().unwrap()
+        };
         config.registry.set_auth_override(tmp.join("auth.json"));
         config.api_base = None;
         config.api_key = None;
         config.provider = None;
+        tweak(&mut config, &tmp.0);
 
         let mut state_store = StateStore::new();
         state_store.set_override(tmp.join("state.json"));
@@ -848,6 +881,138 @@ mod tests {
             .expect("app 循环任务不应 panic");
         assert!(joined.is_ok(), "正常收摊应为 Ok：{joined:?}");
         drop(tmp);
+    }
+
+    /// **窗口必须每回合刷新**（U6b）：`/login`、`/model` 能在运行中换 provider /
+    /// model，窗口差可达 16 倍（128k ↔ 1M）。
+    ///
+    /// 观测手段是**自动压缩** —— 它是 `context_window` 唯一的可观测后果。本用例把
+    /// model 的窗口经临时 `config.json` 压到 8000（触发点 `trigger_at(8000) = 2880`）：
+    /// 会话养到 ≈7000 估算 token 后，第 2 个回合**必须**发 `ContextCompacted`。
+    ///
+    /// 变异：删掉 `Request::Prompt` 臂开头的 `agent.set_context_window(...)` →
+    /// agent 停在 `RunLimits::default()` 的 128_000（触发点 108_800）→ 7000 远不触发
+    /// → 本用例变红。
+    #[tokio::test]
+    async fn prompt_refreshes_context_window_each_turn() {
+        let model = MockModel::new("mock");
+        model.push_text("a".repeat(28_000)); // 回合 1 的回复：≈7000 token 的历史
+        model.push_text("SUMMARY"); // 回合 2：压缩的摘要调用
+        model.push_text("done"); // 回合 2：正式回复
+
+        let mut h = spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
+            let path = tmp.join("config.json");
+            std::fs::write(&path, r#"{"context_window": {"harness-model": 8000}}"#).unwrap();
+            config.model = "harness-model".into();
+            config.load_user_config(&path);
+        })
+        .await;
+
+        // 回合 1：Step 4b 时 session 还只有本轮 user 消息（估算 0 token）⇒ 不压缩。
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            !events_of(&msgs)
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. })),
+            "第 1 回合的 session 还太小，不该压缩：{msgs:?}"
+        );
+
+        // 回合 2：窗口若已按 config 刷新为 8000 ⇒ 7000 > 2880 ⇒ 必须压缩。
+        // （仍是默认 128_000 则触发点是 108_800，本回合不会压缩 → 断言变红。）
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            events_of(&msgs)
+                .iter()
+                .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. })),
+            "回合开头必须按 config 刷新窗口（8000）→ 触发自动压缩：{msgs:?}"
+        );
+    }
+
+    /// 出站序列里出现了自动压缩吗 —— `context_window` 唯一的可观测后果。
+    fn has_compaction(msgs: &[Outbound<CodingView>]) -> bool {
+        events_of(msgs)
+            .iter()
+            .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. }))
+    }
+
+    /// **窗口必须每回合重算，而不是只在第一回合设一次**（U6b 的核心场景）。
+    ///
+    /// [`prompt_refreshes_context_window_each_turn`] 借「自动压缩是否触发」观测窗口
+    /// 刷新，但那条用例里窗口是**常量**（8000）—— 「每回合重算」与「只在第一回合设
+    /// 一次」产生的可观测结果**完全相同**，故它证明不了「每回合」。
+    ///
+    /// 本用例补上设计意图的核心场景：**运行中换到窗口差 16 倍的另一个 model**
+    /// （`/model` / `/login` 的真实路径）。回合 1 用 128_000（触发点 108_800），
+    /// ≈7000 token 的历史不动它；`SetModel` 换到 8000（触发点 2880）后，回合 2
+    /// **必须**压缩。若窗口只在第一回合设过一次（或压根没设），回合 2 仍按
+    /// 128_000 判定 → 不压缩 → 断言变红。
+    ///
+    /// 断言**刻意双向**：回合 1 的宽窗口下**不**压缩，回合 2 换窄窗口后**必须**压缩
+    /// —— 只断言后半截的话，一个「永远压缩」的实现也能蒙混过关。
+    ///
+    /// 变异：删掉 `Request::Prompt` 臂开头的 `agent.set_context_window(...)` →
+    /// agent 停在 `RunLimits::default()` 的 128_000 → 回合 2 不压缩 → 本用例变红。
+    ///
+    /// 换 model 会走 `capabilities::set_model` 里的 `config.build_model()` 重建后端，
+    /// 故在 `tweak` 里装一个**脚本化的 model factory**（真实路径上是 OpenAI 兼容
+    /// 适配器）—— 否则重建失败会把接线器的 model 置空，回合 2 直接 `ConfigError`，
+    /// 那样即便实现正确也拿不到压缩事件（假红）。
+    #[tokio::test]
+    async fn context_window_is_recomputed_after_model_switch() {
+        let model = MockModel::new("mock");
+        model.push_text("a".repeat(28_000)); // 回合 1 的回复：≈7000 token 的历史
+
+        let mut h = spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
+            let path = tmp.join("config.json");
+            std::fs::write(
+                &path,
+                r#"{"context_window": {"harness-wide": 128000, "harness-narrow": 8000}}"#,
+            )
+            .unwrap();
+            config.model = "harness-wide".into();
+            config.load_user_config(&path);
+            // 换 model 时 `build_model()` 重建的后端：给回合 2 备好「摘要 + 正式回复」。
+            config.set_model_factory(|_| {
+                let m = MockModel::new("mock-narrow");
+                m.push_text("SUMMARY");
+                m.push_text("done");
+                Some(Box::new(m))
+            });
+        })
+        .await;
+
+        // 回合 1：窗口 128_000，会话里只有本轮 user 消息 ⇒ 不压缩。
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            !has_compaction(&msgs),
+            "回合 1 的窗口是 128_000，≈0 token 的会话不该压缩：{msgs:?}"
+        );
+
+        // 运行中换到窗口小 16 倍的 model —— 设计意图里的核心场景。
+        h.requests
+            .send(Request::SetModel {
+                model: "harness-narrow".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        // 回合 2：窗口若**每回合**重算 ⇒ 8000（触发点 2880）⇒ 7000 > 2880 ⇒ 必须压缩。
+        // 若窗口只在回合 1 设过一次，这里仍是 128_000（触发点 108_800）⇒ 不压缩 → 变红。
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            has_compaction(&msgs),
+            "换 model 后回合 2 必须按新窗口（8000）重算 → 触发自动压缩：{msgs:?}"
+        );
     }
 
     /// **空闲期丢弃残留边界消息**：循环开跑前就躺在边界信道里的 `Abort` 不得把

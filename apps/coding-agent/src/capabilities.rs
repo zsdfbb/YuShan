@@ -191,11 +191,59 @@ pub async fn new_session(wiring: &mut Wiring) -> Vec<String> {
     }
 }
 
-/// `/compact`：MVP 占位 —— 清空会话（与旧行为一致）。
-pub async fn compact(wiring: &mut Wiring) -> Vec<String> {
-    match wiring.clear_session().await {
-        Ok(()) => vec!["Compacting... Session cleared (full compaction TBD).".to_string()],
-        Err(e) => vec![format!("Failed to compact session: {e}")],
+/// `/compact`：真压缩 —— 把手里的旧消息摘要成一条 checkpoint，尾部原样保留。
+///
+/// # 为什么不是「清空会话」
+///
+/// 改前是 MVP 占位：无脑 `wiring.clear_session()`。那等于**静默失忆** —— 用户以为
+/// 上下文被压缩了，实际几十万 token 的历史被丢掉且不可挽回（会话文件也被截断）。
+/// 现在四条路径里**三条失败**（无 model / 无事可压 / 摘要失败）**都不碰 session
+/// 一个字节**，且各自给出一行明确提示 —— 靠「什么都不做」而不是「清空」来实现降级。
+///
+/// # 参数
+///
+/// `policy` 与 `window` 由 app 侧从 `config` 取（与 agent 读的是同一份配置）：
+/// 手动 `/compact` **不等自动触发阈值** —— 用户点了就压。窗口参与的是
+/// 「保留多少」（`policy.keep_budget(window)`），不是「是否触发」。
+pub async fn compact(
+    wiring: &mut Wiring,
+    policy: &ys_component::CompactPolicy,
+    window: usize,
+) -> Vec<String> {
+    // model 与会话必须**同时**借出：`Wiring::ports` 是唯一的同时借出口
+    // （分开借会被借用检查器拦下 —— model 的不可变借用压着 session 的可变借用）。
+    let ports = wiring.ports();
+    let Some(model) = ports.model else {
+        // 无 model ⇒ 明确提示并收手。**绝不**退回 `clear_session`：
+        // 那会把「压不了」变成「历史没了」。
+        return vec!["Cannot compact: no model configured. Use /login.".to_string()];
+    };
+
+    // `plan()` 是纯同步函数、**不碰 model**：消息太少（`len < 2`）或结构上无法
+    // 同时保证「摘要段非空 + 保留段非空」时返回 `None`。
+    let messages = ports.session.messages();
+    let Some(plan) = ys_loop::plan(messages, policy, window) else {
+        return vec!["Nothing to compact.".to_string()];
+    };
+
+    match ys_loop::execute(messages, &plan, model, policy).await {
+        Ok(outcome) => {
+            let before = outcome.estimated_tokens_before;
+            let after = outcome.estimated_tokens_after;
+            let summarized = outcome.summarized;
+            let kept = outcome.kept;
+            // 写回由**调用方**做（`execute` 不持有 session，评审 R3）——
+            // 这正是「失败不丢历史」的结构保证。
+            if let Err(e) = ports.session.replace_all(outcome.messages).await {
+                return vec![format!("Compaction failed: {e}")];
+            }
+            vec![format!(
+                "Compacted: ~{before} → ~{after} tokens ({summarized} summarized, {kept} kept)."
+            )]
+        }
+        // B-3：`execute` 失败时它自己什么都没改 —— 这里**只**返回提示，
+        // 不得「顺手」把会话清掉。
+        Err(e) => vec![format!("Compaction failed: {e}")],
     }
 }
 
@@ -246,8 +294,48 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use ys_core::{ContentBlock, Message, Role};
     use ys_event::CollectingSink;
-    use ys_model::{Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+    use ys_model::{MockModel, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+
+    /// 一条 `tokens` 量级的文本消息（估算器是「字节 / 4」，用整数倍长度让切分
+    /// 边界可精确断言）。`tag` 用于区分消息 —— 断言「谁被摘要掉、谁被留下」。
+    fn tagged_message(role: Role, tag: &str, tokens: usize) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: format!("{tag}{}", "a".repeat(tokens * 4)),
+            }],
+        }
+    }
+
+    /// 往当前会话灌 `n` 条各 `tokens` 量级的消息（User / Assistant 交替）。
+    async fn seed(wiring: &mut Wiring, n: usize, tokens: usize) {
+        for i in 0..n {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            wiring
+                .ports()
+                .session
+                .append(tagged_message(role, &format!("m{i}"), tokens))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// 拼出一条消息里的全部文本块。
+    fn text_of(msg: &Message) -> String {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     /// 测试目录名：**进程内原子序号 + `process::id()`**（并行安全，血液教训）。
     fn temp_dir(tag: &str) -> PathBuf {
@@ -281,6 +369,11 @@ mod tests {
 
     /// 指向临时 auth.json 的 Config（默认 provider 目录保持不变）。
     fn test_config() -> (Config, PathBuf) {
+        // `from_env` 的 `getenv` 必须与 `config.rs` 里在 `env_lock` 下改写这些
+        // key 的用例串行（getenv/setenv 跨线程并发即数据竞争）。本函数是同步的，
+        // guard 随返回自然释放，恰好覆盖到 `from_env` 这一次读。
+        let _guard = crate::test_env::env_lock();
+
         let dir = temp_dir("auth");
         let mut config = Config::from_env().unwrap();
         config.registry.set_auth_override(dir.join("auth.json"));
@@ -604,27 +697,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `/compact`：清空当前会话（文件仍在，内容为空）。
+    /// `/compact`（真压缩）：会话**变小且含摘要**，**而非变空**。
+    ///
+    /// 改前是占位 `clear_session()` —— 历史被静默丢弃、会话文件被截断。
+    ///
+    /// 窗口 3000 ⇒ 保留预算 300 token；6 条各 100 token ⇒ 尾扫留 3 条、摘掉 3 条
+    /// ⇒ 结果 3 条保留 + 1 条摘要 = 4 条（少于 6 条）。
+    ///
+    /// 变异：退回 `wiring.clear_session()` → 会话为空 ⇒ 本用例第一条断言变红。
     #[tokio::test]
-    async fn test_compact_clears_session() {
-        let dir = temp_dir("compact");
+    async fn test_compact_summarizes_session_instead_of_clearing_it() {
+        let dir = temp_dir("compact_summarize");
+        let model = MockModel::new("mock");
+        model.push_text("HANDOFF SUMMARY");
+        let mut wiring = Wiring::persistent(
+            Some(Box::new(model)),
+            Box::new(CollectingSink::new()),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+        seed(&mut wiring, 6, 100).await;
+        let before = wiring.session_messages().to_vec();
+        assert_eq!(before.len(), 6);
+
+        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+
+        let after = wiring.session_messages();
+        assert!(
+            !after.is_empty(),
+            "压缩**不是**清空：会话必须仍有消息（退回 clear_session 即变红）"
+        );
+        assert!(
+            after.len() < before.len(),
+            "压缩后条数必须变少：{} → {}",
+            before.len(),
+            after.len()
+        );
+        assert!(
+            ys_loop::token::estimate_session_tokens(after)
+                < ys_loop::token::estimate_session_tokens(&before),
+            "压缩后估算 token 必须更小"
+        );
+        assert!(
+            after.iter().any(|m| text_of(m).contains("HANDOFF SUMMARY")),
+            "会话里应含摘要文本：{after:?}"
+        );
+        assert!(
+            after.iter().any(|m| text_of(m).starts_with("m5")),
+            "尾部保留段必须逐字还在：{after:?}"
+        );
+        assert!(
+            !after.iter().any(|m| text_of(m).starts_with("m0")),
+            "被摘要掉的首条不应再逐字出现（摘要取代了它）"
+        );
+
+        // 汇报走返回值（`Outbound::Output`）—— 本模块绝不 print。
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].starts_with("Compacted:"), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **无 model 时 `/compact` 什么都不做**，只给一行明确提示。
+    ///
+    /// ⚠️ 这是本刀风险最高的点：若在 `model == None` 时退回 `clear_session()`，
+    /// 「压不了」就变成「历史没了」—— 静默数据丢失。
+    ///
+    /// 变异：把无 model 分支改成 `wiring.clear_session()` → 会话被清空 ⇒ 变红。
+    #[tokio::test]
+    async fn test_compact_without_model_keeps_session_intact() {
+        let dir = temp_dir("compact_no_model");
         let mut wiring = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
-        wiring
-            .ports()
-            .session
-            .append(ys_core::Message {
-                role: ys_core::Role::User,
-                content: vec![ys_core::ContentBlock::Text { text: "hi".into() }],
-            })
-            .await
-            .unwrap();
+        seed(&mut wiring, 6, 100).await;
+        let before = wiring.session_messages().to_vec();
 
-        let out = compact(&mut wiring).await;
+        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
 
-        assert!(wiring.session_messages().is_empty());
-        assert!(out[0].contains("Session cleared"), "{out:?}");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("no model configured"), "{out:?}");
+        assert!(
+            out[0].contains("/login"),
+            "提示必须可操作（指向 /login）：{out:?}"
+        );
+        assert_eq!(
+            wiring.session_messages(),
+            before.as_slice(),
+            "无 model 时必须逐条不变 —— 绝不退回 clear_session"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **摘要失败 ⇒ session 一个字节都不动**（B-3 在 `/compact` 路径上的落地）：
+    /// 报错、且内存消息与磁盘文件逐字节不变。
+    ///
+    /// 变异：失败臂改成 `clear_session()` → 会话为空、文件被截断 ⇒ 变红。
+    #[tokio::test]
+    async fn test_compact_failure_leaves_session_byte_identical() {
+        let dir = temp_dir("compact_failure");
+        let model = MockModel::new("mock");
+        model.push_error("provider 挂了");
+        let mut wiring = Wiring::persistent(
+            Some(Box::new(model)),
+            Box::new(CollectingSink::new()),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+        seed(&mut wiring, 6, 100).await;
+        let before = wiring.session_messages().to_vec();
+        let path = wiring.session_path().unwrap().to_path_buf();
+        let file_before = std::fs::read(&path).unwrap();
+
+        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("Compaction failed"), "{out:?}");
+        assert!(out[0].contains("provider 挂了"), "原因应可读：{out:?}");
+        assert_eq!(
+            wiring.session_messages(),
+            before.as_slice(),
+            "失败时内存消息必须逐条不变"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            file_before,
+            "失败时会话文件必须逐字节不变"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 消息太少（`len < 2`）→ `Nothing to compact.`，且**不调用 model**
+    /// （`MockModel` 空队列被调用即 panic，正好把这条耦合钉成可执行断言）。
+    #[tokio::test]
+    async fn test_compact_with_too_few_messages_says_nothing_to_compact() {
+        let dir = temp_dir("compact_too_few");
+        let model = MockModel::new("mock"); // 队列为空：被调用即 panic
+        let mut wiring = Wiring::persistent(
+            Some(Box::new(model)),
+            Box::new(CollectingSink::new()),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+        seed(&mut wiring, 1, 100).await;
+        let before = wiring.session_messages().to_vec();
+
+        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+
+        assert_eq!(out, vec!["Nothing to compact.".to_string()], "{out:?}");
+        assert_eq!(wiring.session_messages(), before.as_slice());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -24,6 +24,23 @@ pub trait Session: Send {
     async fn clear(&mut self) -> Result<(), SessionError> {
         Ok(())
     }
+
+    /// 整体替换 session 内容。
+    ///
+    /// ⚠️ **默认实现非原子** —— 它是 `clear()` + 逐条 `append()`，中途失败会留下被截断的 session。
+    /// 要求原子性的实现**必须覆写**本方法（见 `JsonlSession`）。
+    ///
+    /// 另外，对「`append` 每次全量重写整个文件」的实现（如 `JsonlSession`），默认实现会把整体替换
+    /// 退化成 **O(n²)**：`clear()` 一次全量写，其后 N 次 `append()` 又各写一遍整个文件 ——
+    /// 而整体替换恰恰出现在会话最大时（压缩场景），代价最高。覆写为「赋值一次 + 单次落盘」
+    /// 可把它降到一次写。
+    async fn replace_all(&mut self, messages: Vec<Message>) -> Result<(), SessionError> {
+        self.clear().await?;
+        for m in messages {
+            self.append(m).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Session 错误类型
@@ -36,6 +53,7 @@ pub enum SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use ys_core::{ContentBlock, Role};
 
     #[tokio::test]
@@ -124,5 +142,103 @@ mod tests {
 
         session.clear().await.unwrap();
         assert!(session.messages().is_empty());
+    }
+
+    /// 计数替身：记录 `clear` / `append` 的调用次数，**有意不覆写 `replace_all`**，
+    /// 用来验证 trait 默认实现确实是 `clear()×1 + append()×N`。
+    #[derive(Default)]
+    struct CallCounts {
+        clear: usize,
+        append: usize,
+    }
+
+    struct CountingSession {
+        messages: Vec<Message>,
+        counts: Arc<Mutex<CallCounts>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for CountingSession {
+        fn messages(&self) -> &[Message] {
+            &self.messages
+        }
+
+        async fn append(&mut self, message: Message) -> Result<(), SessionError> {
+            self.counts.lock().unwrap().append += 1;
+            self.messages.push(message);
+            Ok(())
+        }
+
+        async fn clear(&mut self) -> Result<(), SessionError> {
+            self.counts.lock().unwrap().clear += 1;
+            self.messages.clear();
+            Ok(())
+        }
+    }
+
+    fn text_msg(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_replace_all_is_clear_plus_n_appends() {
+        let counts = Arc::new(Mutex::new(CallCounts::default()));
+        let mut session = CountingSession {
+            messages: Vec::new(),
+            counts: Arc::clone(&counts),
+        };
+        // 先垫一条陈旧消息，确认 replace_all 会先清空
+        session.append(text_msg("stale")).await.unwrap();
+        {
+            let mut c = counts.lock().unwrap();
+            c.clear = 0;
+            c.append = 0;
+        }
+
+        session
+            .replace_all(vec![text_msg("a"), text_msg("b"), text_msg("c")])
+            .await
+            .unwrap();
+
+        let c = counts.lock().unwrap();
+        assert_eq!(c.clear, 1, "默认实现应当恰好 clear 一次");
+        assert_eq!(c.append, 3, "默认实现应当逐条 append，共 3 次");
+        assert_eq!(
+            session.messages(),
+            [text_msg("a"), text_msg("b"), text_msg("c")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_replace_all_empty_vec() {
+        let counts = Arc::new(Mutex::new(CallCounts::default()));
+        let mut session = CountingSession {
+            messages: Vec::new(),
+            counts: Arc::clone(&counts),
+        };
+        session.append(text_msg("stale")).await.unwrap();
+
+        session.replace_all(Vec::new()).await.unwrap();
+
+        let c = counts.lock().unwrap();
+        assert_eq!(c.clear, 1, "replace_all 仍会 clear 一次");
+        assert_eq!(c.append, 1, "仅垫数据那次 append，空 Vec 不再 append");
+        assert!(session.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_memory_session_replace_all_uses_default_impl() {
+        let mut session = MemorySession::new();
+        session.append(text_msg("old")).await.unwrap();
+
+        session
+            .replace_all(vec![text_msg("new1"), text_msg("new2")])
+            .await
+            .unwrap();
+
+        assert_eq!(session.messages(), [text_msg("new1"), text_msg("new2")]);
     }
 }

@@ -272,6 +272,49 @@ impl ProviderRegistry {
     }
 }
 
+/// 内置的 model → context window（token）表。
+///
+/// **解析键是 `model`，不是 `provider`**：`ProviderInfo` 每个 provider 只有一个
+/// `default_model`，而同一 provider 下可以切多个模型（DeepSeek 至少
+/// `deepseek-chat` / `deepseek-reasoner`）；且窗口本就是**模型**的属性。
+///
+/// 来源：厂商公开的模型规格。**值会过时** —— 这正是必须保留
+/// `~/.yushan/config.json` 覆盖入口的原因（`Config::context_window` ② 级）。
+///
+/// 未收录的模型（含刻意留空的 MiniMax-Text-01，见下）一律返回 `None`，
+/// 由调用方回退默认值。
+///
+/// | model | window | 依据 |
+/// |---|---|---|
+/// | `deepseek-chat` | 128K | DeepSeek 官方 API 文档（V3.1 起两个模型同为 128K） |
+/// | `deepseek-reasoner` | 128K | 同上 |
+/// | `MiniMax-M3` | 1M | MiniMax 官方 API 文档模型表 |
+/// | `MiniMax-M2.7` | 204,800 | 同上 |
+///
+/// **刻意未收录**：`MiniMax-Text-01`（本仓库 minimax provider 的 default_model）。
+/// 官方口径是「训练 1M / 推理可达 4M」，两条数字差 4 倍，**API 实际放行哪个无法确证**，
+/// 故不填 —— 宁可回退 128_000（偏保守：提前压缩），也不编造一个可能让上下文溢出的值。
+/// 用该模型的用户请写 `~/.yushan/config.json` 覆盖。
+///
+/// 另外收录 M3 / M2.7 还有一个工程理由：DeepSeek 两个模型都是 128K，
+/// 恰好等于兜底默认值，若表里全是 128K，「② 内置表」这一级就**测不出来**。
+const KNOWN_MODEL_WINDOWS: &[(&str, usize)] = &[
+    ("deepseek-chat", 128_000),
+    ("deepseek-reasoner", 128_000),
+    ("MiniMax-M3", 1_000_000),
+    ("MiniMax-M2.7", 204_800),
+];
+
+/// 查内置表。未知 model 返回 `None`（调用方回退默认值）。
+///
+/// 生产调用点：`Config::context_window` 的 ② 级（`config.rs`）。
+pub fn builtin_context_window(model: &str) -> Option<usize> {
+    KNOWN_MODEL_WINDOWS
+        .iter()
+        .find(|(name, _)| *name == model)
+        .map(|(_, window)| *window)
+}
+
 /// 构建 /v1/models endpoint 的 URL。
 /// 若 base 已以 "/v1" 或 "/v1/" 结尾，则追加 "/models"。
 /// 否则追加 "/v1/models"。
@@ -417,6 +460,28 @@ mod tests {
         assert_eq!(models[1].owned_by.as_deref(), Some("deepseek"));
         assert_eq!(models[2].id, "MiniMax-Text-01");
         assert_eq!(models[2].owned_by.as_deref(), Some("minimax"));
+    }
+
+    #[test]
+    fn test_builtin_context_window_known() {
+        assert_eq!(builtin_context_window("deepseek-chat"), Some(128_000));
+        assert_eq!(builtin_context_window("deepseek-reasoner"), Some(128_000));
+        assert_eq!(builtin_context_window("MiniMax-M3"), Some(1_000_000));
+        assert_eq!(builtin_context_window("MiniMax-M2.7"), Some(204_800));
+    }
+
+    /// 未知 model → `None`（由调用方回退默认值）。
+    ///
+    /// 明列 `MiniMax-Text-01`：它是本仓库 minimax provider 的 default_model，
+    /// 但官方「训练 1M / 推理 4M」两条口径矛盾，**刻意不收录**（见表注释）。
+    #[test]
+    fn test_builtin_context_window_unknown_is_none() {
+        assert_eq!(builtin_context_window("MiniMax-Text-01"), None);
+        assert_eq!(builtin_context_window("my-1m-model"), None);
+        assert_eq!(builtin_context_window(""), None);
+        // 精确匹配：不做大小写折叠 / 前缀匹配
+        assert_eq!(builtin_context_window("DeepSeek-Chat"), None);
+        assert_eq!(builtin_context_window("deepseek-chat-v3"), None);
     }
 
     #[test]

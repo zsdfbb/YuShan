@@ -146,6 +146,27 @@ impl App {
                 self.transcript.push(TranscriptLine::Error(error));
                 self.finish_turn();
             }
+            AgentEvent::ContextCompacted {
+                estimated_tokens_before,
+                estimated_tokens_after,
+                summarized,
+                kept,
+            } => {
+                // `~` 前缀是有意的：这两个数是启发式**估算**，不是 provider 真实
+                // usage，文案不得暗示精确（见 `ys-event` 的 `ContextCompacted` 文档）。
+                self.transcript.push(TranscriptLine::System(format!(
+                    "context compacted: ~{estimated_tokens_before} → ~{estimated_tokens_after} tokens ({summarized} summarized, {kept} kept)"
+                )));
+                self.follow = true;
+            }
+            AgentEvent::ContextCompactionFailed { reason } => {
+                // 压缩失败不终止回合（session 未改动，本轮照常继续）——
+                // 故这里只推一条 Error 行，**不调** `finish_turn`。
+                self.transcript.push(TranscriptLine::Error(format!(
+                    "context compaction failed: {reason}"
+                )));
+                self.follow = true;
+            }
             _ => {} // AgentEvent 是 #[non_exhaustive]
         }
     }
@@ -607,6 +628,55 @@ mod tests {
             a.transcript
         );
         assert!(matches!(a.transcript.last(), Some(TranscriptLine::User(s)) if s == "next"));
+    }
+
+    /// 压缩成功：推一条 `System` 行，文案带 `~` 估算前缀与四个计数。
+    ///
+    /// 变异：把 `apply_event` 里的 `ContextCompacted` 臂改回 `_ => {}` → 本测试变红。
+    #[test]
+    fn test_context_compacted_pushes_system_line() {
+        let mut a = app();
+        a.apply_event(env(AgentEvent::ContextCompacted {
+            estimated_tokens_before: 12_000,
+            estimated_tokens_after: 3_500,
+            summarized: 20,
+            kept: 4,
+        }));
+        assert_eq!(a.transcript.len(), 1);
+        match &a.transcript[0] {
+            TranscriptLine::System(s) => {
+                assert_eq!(
+                    s,
+                    "context compacted: ~12000 → ~3500 tokens (20 summarized, 4 kept)"
+                );
+                assert!(s.contains('~'), "估算值必须带 ~ 前缀，不得暗示精确：{s}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+        assert!(a.follow, "新内容到达 → 回到贴底");
+    }
+
+    /// 压缩失败：推一条 `Error` 行，且**不结束回合**（session 未改动，本轮继续）。
+    ///
+    /// 变异：把 `apply_event` 里的 `ContextCompactionFailed` 臂改回 `_ => {}` → 本测试变红。
+    #[test]
+    fn test_context_compaction_failed_pushes_error_line_and_keeps_turn() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        a.apply_event(env(AgentEvent::ContextCompactionFailed {
+            reason: "provider 挂了".into(),
+        }));
+
+        assert!(
+            matches!(
+                a.transcript.last(),
+                Some(TranscriptLine::Error(e)) if e == "context compaction failed: provider 挂了"
+            ),
+            "transcript={:?}",
+            a.transcript
+        );
+        assert!(a.is_turning, "压缩失败不终止回合");
+        assert!(a.turn_started_at.is_some());
     }
 
     #[test]

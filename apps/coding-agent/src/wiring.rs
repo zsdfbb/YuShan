@@ -103,11 +103,6 @@ impl Wiring {
         }
     }
 
-    /// 清空当前会话的消息（`/compact` 的 MVP 语义）。
-    pub async fn clear_session(&mut self) -> Result<(), SessionError> {
-        self.session.clear().await
-    }
-
     /// 借用端口给 `Agent::run_turn`。
     ///
     /// 轮边界源**不在这里**：它由 `app_loop` 每回合新建、经 [`AgentPorts::new`]
@@ -345,9 +340,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `/compact`：消息清空，但会话文件仍在（同一个文件）。
+    /// `Session::clear`：消息清空，但会话文件仍在（同一个文件）。
+    ///
+    /// 说明：`Wiring` **不再**暴露 `clear_session`（U6b 起 `/compact` 走真压缩）。
+    /// 保留本用例是为了钉住底层 `clear` 的语义 —— 它是 `/new` 与压缩写回共同的依赖。
     #[tokio::test]
-    async fn clear_session_empties_history_but_keeps_file() {
+    async fn session_clear_empties_history_but_keeps_file() {
         let dir = temp_dir("clear");
         let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
             .await
@@ -359,7 +357,7 @@ mod tests {
             .unwrap();
         let path = w.session_path().unwrap().to_path_buf();
 
-        w.clear_session().await.unwrap();
+        w.ports().session.clear().await.unwrap();
 
         assert!(w.session_messages().is_empty());
         assert_eq!(w.session_path(), Some(path.as_path()));

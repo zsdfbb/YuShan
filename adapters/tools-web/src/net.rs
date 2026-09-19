@@ -284,7 +284,15 @@ async fn read_response(req: RequestBuilder, cap: usize) -> Result<Fetched, Fetch
 ///
 /// 独立成一个 future（而非在 chunk 循环里 `is_aborted()`）是为了**挂起也能中止**：
 /// 对端迟迟不发第一个字节时，chunk 循环根本没机会轮询。
-async fn wait_aborted(b: Option<&dyn BoundarySource>) {
+///
+/// # 为什么是 `pub(crate)`
+///
+/// `fetch.rs` 的**摘要**调用（`summarize_bounded`，60s 预算）要复用同一个「挂起也能中止」
+/// 的形状：`select! { biased; wait_aborted, timeout }`。`Model::complete` 没有取消句柄 ——
+/// `select!` 命中即 **drop future**（in-flight 请求被丢、连接关闭），于是 Ctrl+C 的感知延迟
+/// 从「整段摘要」（典型 ~18s）压到 ≤ [`ABORT_POLL_INTERVAL`]。这是与 `fetch_capped` **同一份**
+/// 实现、同一个轮询间隔 —— 不复制第二份，免得两处的中止延迟悄悄漂移。
+pub(crate) async fn wait_aborted(b: Option<&dyn BoundarySource>) {
     let Some(src) = b else {
         std::future::pending::<()>().await;
         return;

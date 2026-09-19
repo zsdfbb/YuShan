@@ -59,7 +59,8 @@ pub use crate::backends::{
 };
 pub use crate::convert::{SKIP_TAGS, html_to_markdown};
 pub use crate::fetch::{
-    ContentKind, FETCH_BUDGET, FETCH_MAX_BYTES, WebFetchTool, classify_content, decode_body,
+    ContentKind, FETCH_BUDGET, FETCH_MAX_BYTES, SUMMARIZE_BUDGET, WebFetchTool, classify_content,
+    decode_body,
 };
 pub use crate::guard::{vet_url, vet_url_with};
 pub use crate::net::{

@@ -10,7 +10,7 @@
 
 ## 基线
 
-- **基线 ref**: `<Phase 3 开始时由 scripts/baseline.sh 填写>`
+- **基线 ref**: `09a50a69206dd1da63f9c78b3d7ad1d407e8d0b0`（备份分支 `sw-backup/webfetch-summarize` 存原 HEAD `c2aa299`）
 - 用途: review 执行 `git diff <基线 ref> -- <files>` 取字节级证据（含 `??` 新文件）
 
 ## 任务清单
@@ -100,7 +100,15 @@
 
 | 单元 | 含任务 | 涉及文件 | 依赖 | 波次 | review 档 |
 |------|--------|---------|------|------|-----------|
-| （Phase 3 回填） | | | | | |
+| U1 | T1, T2 | `crates/ys-tool/src/summarizer.rs`, `crates/ys-tool/src/context.rs`, `crates/ys-tool/src/lib.rs` | 无 | W0 | deep |
+| U2 | T7, T8 | `apps/coding-agent/src/prompt.rs` | 无 | W0 | shallow |
+| U3 | T3, T4 | `crates/ys-loop/src/summarize.rs`, `crates/ys-loop/src/lib.rs`, `crates/ys-loop/src/basic.rs` | U1 | W1 | deep |
+| U4 | T5, T6 | `adapters/tools-web/src/fetch.rs`, `adapters/tools-web/src/net.rs`, `adapters/tools-web/tests/tools.rs`, `adapters/tools-web/tests/contracts.rs` | U1 | W1 | deep |
+| U5 | T9 | 无（只跑命令） | U1–U4 | W2 | shallow |
+
+> **合并依据**：R4（impl 与其配对 test 同单元）⇒ T1+T2 / T3+T4 / T5+T6 / T7+T8 各成一体。
+> **同波文件集互不相交**已逐对核对（W0 的 ys-tool 三文件 vs `prompt.rs`；W1 的 ys-loop 三文件 vs tools-web 四文件）。
+> **review 档依据**：U1/U3/U4 触及对外契约（新公开 trait / 生产接线点 / 工具 schema 与 description）= 模型行为输入，故 deep；U2 仅文案、U5 仅跑命令，故 shallow。
 
 ## 验证清单
 - [ ] **所有 (impl, test) 配对均已 completed**（Phase 3 review 放行条件）

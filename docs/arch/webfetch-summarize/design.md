@@ -107,14 +107,21 @@ url → vet_url → fetch_capped → 分派/解码/htmd → file_content → 落
     └─ prompt 有
          ── 复用上面那个 head（**不再调第二次** head()，见 review R6）──
          select! { biased;
-             () = net::wait_aborted(ctx.boundary) => Err("cancelled"),       ← D6
-             r  = timeout(60s, ctx.summarizer.summarize(&cap.content, prompt)) => r,  ← D4
+             () = net::wait_aborted(ctx.boundary) => Outcome::Aborted,        ← D6：真取消
+             r  = timeout(60s, ctx.summarizer.summarize(&cap.content, prompt)) => match r {  ← D4
+                 Ok(Ok(text)) => Outcome::Ok(text),   Ok(Err(why)) => Outcome::Failed(why),
+                 Err(_) => Outcome::Failed("timed out after 60s"),
+             },
          }
-         ├─ Ok(text)  → content = "## Summary of <url> (untrusted…)\n\n{text}"
-         │              notice  = [既有 capped/无CT/解码 三条] + [覆盖行号 + 指针]
-         └─ Err(why)  → content = head.content（**与无 prompt 逐字节同源**）
-                        notice  = [Summary failed: {why} — showing the page head instead] + [既有三条] + [saved_notice]
-         两条腿 is_error = false（ADR-0001）
+         ├─ Ok(text)      → content = "## Summary of <url> (untrusted…)\n\n{text}"
+         │                  notice  = [既有 capped/无CT/解码 三条] + [字节覆盖率 + 指针]
+         ├─ Skipped(why)  → content = head.content（**与无 prompt 逐字节同源**）
+         │                  notice  = [Summary skipped: {why} — showing the page head instead] + [既有三条] + [saved_notice]
+         ├─ Failed(why)   → content = head.content（**与无 prompt 逐字节同源**）
+         │                  notice  = [Summary failed: {why} — showing the page head instead] + [既有三条] + [saved_notice]
+         └─ Aborted       → content = "Fetch aborted by user during summarization."（**提前返回**：
+                            不挂 notice、不给指针、不回灌头部）——「调用前探针命中」与「调用中被打断」**合流**在此
+         四条腿 is_error 全为 false（ADR-0001）
 ```
 
 **喂的是 `file_content`（含 2 行警示头）而非纯正文** —— 这样 `cap.shown_lines / total_lines` 与 `read(path, offset=N+1)` **同一坐标空间**，与 `fetch.rs` 模块文档死守的「偏移必须对得上」是同一条不变量。
@@ -207,16 +214,29 @@ let tool_ctx = ToolContext::new(ctx.boundary, ctx.cwd.clone(), ctx.workspace_roo
 // adapters/tools-web/src/fetch.rs
 pub const SUMMARIZE_BUDGET: Duration = Duration::from_secs(60);
 
+/// 摘要路径的**四条腿** —— 让它们在**代码层面**分得开，测试才能分别钉住（见 §2.4 B1/B2/D）。
+enum Outcome {
+    Ok(String),        // 摘要成功
+    Skipped(String),   // R4 退化保护命中（**我们主动没调**）
+    Failed(String),    // **调了但挂了**（无 summarizer / 超时 / 供应商报错）
+    Aborted,           // **用户主动中止**（前置探针命中 **或** 调用中被 `select!` 打断）
+}
+
 /// 有界摘要：`biased` 中止优先（与 net.rs:225 的 fetch_capped 同款）。
 /// `Model::complete` 无取消句柄 —— `select!` 命中即 **drop future**（in-flight 请求被丢、连接关闭）。
+///
+/// **直接产出 `Outcome`**（不是 `Result<String, String>`）：取消腿（`Aborted`）与失败腿
+/// （`Failed`）在**类型上**就分得开 —— 这正是不让它退化成 `Err("cancelled")` 的理由。
 async fn summarize_bounded(
     s: &dyn Summarizer, content: &str, prompt: &str, b: Option<&dyn BoundarySource>,
-) -> Result<String, String> {
+) -> Outcome {
     tokio::select! {
         biased;
-        () = crate::net::wait_aborted(b) => Err("cancelled".into()),
-        r = tokio::time::timeout(SUMMARIZE_BUDGET, s.summarize(content, prompt)) => {
-            r.unwrap_or_else(|_| Err(format!("timed out after {}s", SUMMARIZE_BUDGET.as_secs())))
+        () = crate::net::wait_aborted(b) => Outcome::Aborted,                  // ← D6：真取消
+        r = tokio::time::timeout(SUMMARIZE_BUDGET, s.summarize(content, prompt)) => match r {
+            Ok(Ok(text)) => Outcome::Ok(text),
+            Ok(Err(why)) => Outcome::Failed(why),
+            Err(_) => Outcome::Failed(format!("timed out after {}s", SUMMARIZE_BUDGET.as_secs())),
         }
     }
 }
@@ -227,31 +247,23 @@ async fn summarize_bounded(
 ```rust
 let prompt = input["prompt"].as_str().map(str::trim).filter(|p| !p.is_empty());  // E2：空/全空白 ⇒ None
 if let Some(prompt) = prompt {
-    // R7：取消**不**走「摘要失败」那条腿 —— 照 fetch.rs:271-276 的 FetchError::Aborted 形状，
-    // **短消息、不回落头部**。理由：abort 后本回合会被轮边界结束，≤50KB 头部只会白写一次 session。
-    if ctx.boundary.is_some_and(|b| b.is_aborted()) {
-        return Ok(ToolResult {
-            content: "Fetch aborted by user during summarization.".into(),
-            is_error: false,
-        });
-    }
-    // R4 退化保护：`head` 是**面向行**的显示截断器。正文若不含换行（minified JSON/JS、单行纯文本），
-    // 它会在头 3 行（警示行 / Source / 空行）内就停住 ⇒ 摘要输入里**一个正文字节都没有**。
-    // 此时不发调用：宁可不总结，也不要给一个「覆盖 0% 却看起来权威」的摘要。
-    // 三分：**skipped 与 failed 刻意分开** —— 前者是「我们主动没调」，后者是「调了但挂了」。
-    // 合并会让退化保护伪装成一次故障，也让模型的归因错位（它没做错什么，是内容形态不适合）。
-    enum Outcome { Ok(String), Skipped(String), Failed(String) }
-
-    let outcome = if head_is_header_only(&head) {
+    let outcome = if ctx.boundary.is_some_and(|b| b.is_aborted()) {
+        // R7 取消的**前置探针**：命中 ⇒ 与「调用中被 `select!` 打断」**合流**在 `Outcome::Aborted`。
+        // 照 fetch.rs:271-276 的 FetchError::Aborted 形状：**短消息、不回落头部**。
+        // 理由：abort 后本回合会被轮边界结束，≤50KB 头部只会白写一次 session。
+        Outcome::Aborted
+    } else if head_is_header_only(&head) {
+        // R4 退化保护：`head` 是**面向行**的显示截断器。正文若不含换行（minified JSON/JS、单行纯文本），
+        // 它会在头 3 行（警示行 / Source / 空行）内就停住 ⇒ 摘要输入里**一个正文字节都没有**。
+        // 此时不发调用：宁可不总结，也不要给一个「覆盖 0% 却看起来权威」的摘要。
+        // 四分：**skipped 与 failed 刻意分开** —— 前者是「我们主动没调」，后者是「调了但挂了」。
+        // 合并会让退化保护伪装成一次故障，也让模型的归因错位（它没做错什么，是内容形态不适合）。
         Outcome::Skipped("the page body has no line breaks".into())    // R4 退化保护
     } else {
         // 复用上面算好的 `head`，**不要**再调一次 head() —— 同参同函数 ⇒ 结果恒等，
         // 两次调用只是「第二个真值」（见 review R6）。
         match ctx.summarizer {
-            Some(s) => match summarize_bounded(s, &head.content, prompt, ctx.boundary).await {
-                Ok(text) => Outcome::Ok(text),
-                Err(why) => Outcome::Failed(why),
-            },
+            Some(s) => summarize_bounded(s, &head.content, prompt, ctx.boundary).await,
             None => Outcome::Failed("no summarizer is configured".into()),
         }
     };
@@ -272,6 +284,12 @@ if let Some(prompt) = prompt {
             head.content,
             format!("Summary failed: {why} — showing the page head instead"),
         ),
+        // R7：两条取消路径的**合流点** —— **提前返回**，不挂 notice、不给指针、不回灌头部
+        // （与抓取期 `Err(FetchError::Aborted)` 的处置逐字同形）。
+        Outcome::Aborted => return Ok(ToolResult {
+            content: "Fetch aborted by user during summarization.".into(),
+            is_error: false,
+        }),
     };
     // ……既有三条 notice（capped / 无 CT / 解码有损）+ notice，走 append_notices
     return Ok(ToolResult { content, is_error: false });
@@ -326,6 +344,13 @@ Fetch aborted by user during summarization.
 ```
 
 无 notice、无正文、`is_error: false`。理由见 §2.3 的注释。
+
+> **两条取消路径合流在 `Outcome::Aborted`**：**调用前的 `is_aborted()` 探针**与**调用中被
+> `select!` 打断**走的是**同一条**腿 —— 同一句文案、同一种处置（提前返回、不给正文、
+> 不回落头部）。命中时机不同（抓取完成后 / 调用进行中），但「用户主动中止」这件事在**代码层面**
+> 也只有一个落点，测试才能只钉一处而不必跟着时机分裂成两套断言。
+> ⚠️ 抓取期（`fetch_capped` 先跑、共用同一个 `BoundarySource`）的取消是**另一句**文案
+> （`Fetch aborted by user.`），处置相同 —— 它属于抓取那一段，不在本设计范围内。
 
 ---
 
@@ -432,7 +457,7 @@ Fetch aborted by user during summarization.
 |---|---|---|---|---|
 | **R7** | 取消语义 | **取消走独立分支：短消息、不回落头部** | 同 crate 既有处置就是「短消息 + 不塞正文」（`net.rs:225` → `fetch.rs:271-276`）。且 abort 后本回合会被轮边界结束 ⇒ ≤50KB 头部只会**白写一次 session** 并在轮内被重发。一致性 + 不浪费。 | §2.3 前置探针 + §2.4 D |
 | **R3** | 非 HTML 正文是否分档封顶 | **不分档** | 分档要加第二个常量 + 一个 `match`，而收益仅是「非 HTML 的闸更小」。真正的危害（摘要几乎读不到东西）由 **R4 的字节覆盖率**直接消解——诚实报 0.7% 比默默调小闸更有效。今天只有 HTML 形态有实测，**ADR-0014 判据：第二个档没有独立证据**。 | §2.4 A（字节读数） |
-| **R4** | 退化保护（单行正文） | **覆盖率改「字节」+ 加结构性退化保护 + `skipped` 与 `failed` 分开** | ① 行读数在单行正文上是**假的**（报 75% 而正文 0%）⇒ 必须改字节。② **结构性**判据：正文一个字节都没进摘要输入时（`head.hit.is_some() && shown_lines <= 3`）**不发调用**，直接回落 —— 判据是「正文贡献 0 字节」，**不是魔数百分比**。③ 三分 `Ok`/`Skipped`/`Failed`：合并会让「形态不适合」伪装成故障、模型归因错位，且测试无法分别钉住。 | §2.3 `head_is_header_only` + `enum Outcome` + §2.4 A/B1/B2 |
+| **R4** | 退化保护（单行正文） | **覆盖率改「字节」+ 加结构性退化保护 + `skipped` 与 `failed` 分开** | ① 行读数在单行正文上是**假的**（报 75% 而正文 0%）⇒ 必须改字节。② **结构性**判据：正文一个字节都没进摘要输入时（`head.hit.is_some() && shown_lines <= 3`）**不发调用**，直接回落 —— 判据是「正文贡献 0 字节」，**不是魔数百分比**。③ `Ok`/`Skipped`/`Failed` 三条腿刻意分开（第四条取消腿 `Aborted` 见 **R7**）：合并会让「形态不适合」伪装成故障、模型归因错位，且测试无法分别钉住。 | §2.3 `head_is_header_only` + `enum Outcome` + §2.4 A/B1/B2 |
 | **R8** 测试 | 注入策略 | **带 prompt 的用例一律注入独立假 `Summarizer`；绝不让 `ModelSummarizer` 接 `MockModel`** | `MockModel` 忽略请求并按 FIFO 消费（`mock.rs:65-68`）⇒ 真接上去会**吃掉主循环的响应**：队列有余量 ⇒ 静默错位；耗尽 ⇒ `remove(0)` panic。这必须写死成纪律。 | §5 测试清单 + as-built |
 | **R8** 测试 | 请求形状断言 | **新建「记录型 `Model`」测试基建**，放 `ys-loop` 的 `#[cfg(test)]` | `MockModel` 的形参是 `_request`、且只有 `push_*`（`mock.rs:33,41,49`）—— **断言不了** `tools.is_empty()` / `system` / `max_tokens`。清单第 8 条依赖它，必须补进文件清单。 | §2.1 文件清单 + §5 |
 | **R8** 测试 | 给 `MockModel` 加计数 / 队列耗尽返 `Err` | **不做，记为独立 backlog 项** | 它**不能**防住「统计错位」（那只由注入策略防住），只能把 panic 变成 Err。改动落在 `ys-model`、影响全仓测试替身 —— 与本切片无关（W5 精神：不扩范围）。 | backlog |

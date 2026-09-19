@@ -73,8 +73,9 @@ fn tool_snippet(name: &str) -> &'static str {
         "websearch" => {
             "Search the web (tries the configured backends in a fixed order, stops at the first one that answers)"
         }
+        // 末尾一句是**可选** `prompt` 参数的唯一线索：按意图取摘要而非整页原文。
         "webfetch" => {
-            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep)"
+            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
         }
         _ => "Custom tool",
     }
@@ -120,9 +121,13 @@ fn tool_guidelines(tools: &[&str]) -> String {
         );
     }
     if tools.contains(&"webfetch") {
+        // 末尾刻意写明**代价**（多一次模型调用、更慢），这是「按需使用」的唯一闸门：
+        // 模型有「更努力」的倾向，措辞若只说好处，可选参数会被当成每次抓取都该带。
         guidelines.push(
             "Use webfetch to save a URL's content to a local file and get back only its head — \
-             read that path (read offset=) or grep it for more, and do not refetch the same URL"
+             read that path (read offset=) or grep it for more, and do not refetch the same URL. \
+             Pass prompt only when you need an answer rather than the page (e.g. \"how is the auth \
+             header built?\"): it costs one extra model call and is slower"
                 .to_string(),
         );
     }
@@ -392,6 +397,7 @@ mod tests {
     /// 文案里的关键语义（websearch 的「固定顺序试后端、首答即停」；webfetch 的
     /// 「落盘 + 只回头部 + 用 `read offset=` 续读」）都是**模型行为的输入**，
     /// 改文案等于改行为 —— 必须过一次显式评审，故此守卫用逐字断言。
+    /// （可选 `prompt` 取摘要的线索同理，见 `web_guidelines_*` 用例。）
     ///
     /// 变异：把任一分支的文案改成别的（哪怕仍非兜底）→ 本用例变红。
     #[test]
@@ -408,7 +414,7 @@ mod tests {
         );
         assert_eq!(
             tool_snippet("webfetch"),
-            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep)"
+            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
         );
         // 兜底分支本身也要在（外部工具靠它列出而不报错）。
         assert_eq!(tool_snippet("__no_such_tool__"), "Custom tool");
@@ -442,6 +448,12 @@ mod tests {
         assert!(
             with_web.contains("do not refetch the same URL"),
             "webfetch 指引应含「别重复抓同一 URL」；prompt = {with_web}"
+        );
+        // 可选 `prompt` 的**代价**必须告知模型：这是「按需用」而非「每次都用」的唯一闸门。
+        // 只断言「代价已告知」，不断言具体措辞 —— 措辞可调，代价不可省。
+        assert!(
+            with_web.contains("costs one extra model call"),
+            "webfetch 指引应告知带 prompt 的代价（多一次模型调用）；prompt = {with_web}"
         );
 
         let without_web = build_system_prompt(Path::new("/tmp"), &[spec("read")]);

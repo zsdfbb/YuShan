@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::{AgentInput, AgentLoop, LoopError, RunResult};
+use super::{AgentInput, AgentLoop, LoopError, ModelSummarizer, RunResult};
+use crate::compact;
 use async_trait::async_trait;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
@@ -11,9 +12,6 @@ use ys_protocol::Boundary;
 use ys_tool::{ToolContext, ToolError};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
-
-/// 压缩上下文时为 summary 预留的 token 预算
-const COMPACT_KEEP_TOKENS: usize = 20_000;
 
 pub struct BasicLoop;
 
@@ -127,12 +125,57 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 4b：上下文压缩检查（T11e）
+            // Step 4b：上下文压缩检查（T11e）—— 算法本体在 `crate::compact`（ADR-0017 决策 1）。
+            //
+            // ⚠️ **承重耦合（ADR-0017 决策 1）**：`plan()` 是**纯同步**函数、不碰 model，
+            // 且下面的早退必须留在 Step 6 的 `ctx.model.complete` **之前**（Step 4b 本就在
+            // 其前，改动时别把它挪到 model 调用之后）。`apps/coding-agent/src/app_loop.rs`
+            // 的既有测试 `every_request_variant_is_handled` 会走到这里，它安全**只因为**
+            // 会话太小 ⇒ 不满足触发阈值 / `plan()` 返回 `None` ⇒ `MockModel` 的响应队列
+            // 不被消费（空队列 `remove(0)` 会 panic）。
             {
+                let policy = &ctx.limits.compaction;
+                let window = ctx.limits.context_window;
                 let messages = ctx.session.messages();
-                let total_tokens = crate::token::estimate_session_tokens(messages);
-                if total_tokens > ctx.limits.context_window.saturating_sub(16384) {
-                    compact_session(ctx).await?;
+                let estimated = crate::token::estimate_session_tokens(messages);
+
+                if estimated > policy.trigger_at(window) {
+                    if let Some(plan) = compact::plan(messages, policy, window) {
+                        match compact::execute(messages, &plan, ctx.model, policy).await {
+                            Ok(outcome) => {
+                                // 写回由**调用方**做（`execute` 不持有 session，评审 R3）。
+                                ctx.session
+                                    .replace_all(outcome.messages)
+                                    .await
+                                    .map_err(|_| {
+                                        LoopError::Event(ys_core::EventError::SendFailed)
+                                    })?;
+                                emit(
+                                    ctx.events,
+                                    AgentEvent::ContextCompacted {
+                                        estimated_tokens_before: outcome.estimated_tokens_before,
+                                        estimated_tokens_after: outcome.estimated_tokens_after,
+                                        summarized: outcome.summarized,
+                                        kept: outcome.kept,
+                                    },
+                                )
+                                .await
+                                .map_err(LoopError::Event)?;
+                            }
+                            Err(e) => {
+                                // B-3：失败 ⇒ **session 一个字节都不动**，本轮照常继续。
+                                // 旧实现会 `clear()` + 写一行占位符 —— 那是静默失忆，不是降级。
+                                emit(
+                                    ctx.events,
+                                    AgentEvent::ContextCompactionFailed {
+                                        reason: e.to_string(),
+                                    },
+                                )
+                                .await
+                                .map_err(LoopError::Event)?;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -305,11 +348,15 @@ impl AgentLoop for BasicLoop {
                 // 在 registry 中查找并带超时执行（T11b）与错误恢复（T11c）
                 let result = match ctx.registry.get(tool_name) {
                     Some(tool) => {
+                        // 唯一的摘要适配器接线点：`ctx.model` / `ctx.registry` / `ctx.boundary`
+                        // 全是不可变借用，可共存；`summarizer` 必须先于 `tool_ctx` 声明。
+                        let summarizer = ModelSummarizer { model: ctx.model };
                         let tool_ctx = ToolContext::new(
                             ctx.boundary,
                             ctx.cwd.clone(),
                             ctx.workspace_root.clone(),
-                        );
+                        )
+                        .with_summarizer(&summarizer);
                         let timeout_secs = ctx.limits.bash_timeout.unwrap_or(300);
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
@@ -395,108 +442,6 @@ impl AgentLoop for BasicLoop {
                 .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
         }
     }
-}
-
-/// 当 context window 接近上限时，通过总结旧消息来压缩 session。
-async fn compact_session(ctx: &mut RuntimeContext<'_>) -> Result<(), LoopError> {
-    let messages: Vec<Message> = ctx.session.messages().to_vec();
-
-    // 计算保留点：从最新消息往回扫，保留约 COMPACT_KEEP_TOKENS 个 token
-    let mut keep_from = messages.len();
-    let mut kept_tokens = 0usize;
-    for msg in messages.iter().rev() {
-        let msg_tokens = crate::token::estimate_tokens(msg);
-        if kept_tokens + msg_tokens > COMPACT_KEEP_TOKENS {
-            break;
-        }
-        kept_tokens += msg_tokens;
-        keep_from -= 1;
-    }
-
-    // keep_from 为 0 或 1 时无需压缩
-    if keep_from <= 1 {
-        return Ok(());
-    }
-
-    let to_summarize = &messages[..keep_from];
-    let to_keep = &messages[keep_from..];
-
-    // 使用模型生成 summary
-    let summary = generate_summary(ctx.model, to_summarize).await;
-
-    // 重建 session：summary 消息 + 保留的消息
-    ctx.session
-        .clear()
-        .await
-        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-
-    // 以 system context 形式写入 summary
-    let summary_text = match summary {
-        Ok(text) => format!("[Context Summary]\n{text}\n[/Context Summary]"),
-        Err(_) => "[Context Summary]\n[Compression failed — proceeding with truncated history]\n[/Context Summary]".into(),
-    };
-    ctx.session
-        .append(Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text { text: summary_text }],
-        })
-        .await
-        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-
-    // 保留一条合成的 assistant 确认消息
-    ctx.session
-        .append(Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: "I have the context summary. Continuing.".into(),
-            }],
-        })
-        .await
-        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-
-    // 重新追加保留的消息
-    for msg in to_keep {
-        ctx.session
-            .append(msg.clone())
-            .await
-            .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-    }
-
-    Ok(())
-}
-
-/// 使用模型生成旧消息的 summary。
-async fn generate_summary(
-    model: &dyn ys_model::Model,
-    messages: &[Message],
-) -> Result<String, ys_model::ModelError> {
-    struct NoopModelEventSink;
-    impl ModelEventSink for NoopModelEventSink {
-        fn emit(&mut self, _event: ModelEvent) -> Result<(), ys_core::EventError> {
-            Ok(())
-        }
-    }
-
-    let mut sink = NoopModelEventSink;
-    let request = ModelRequest {
-        messages: messages.to_vec(),
-        tools: vec![],
-        system: Some(
-            "You are a conversation summarizer. Summarize the following conversation \
-             concisely, preserving key decisions, facts, and context."
-                .into(),
-        ),
-        max_tokens: Some(1024),
-        ..Default::default()
-    };
-    let response = model.complete(request, &mut sink).await?;
-    // 从响应中提取文本
-    for block in &response.message.content {
-        if let ContentBlock::Text { text } = block {
-            return Ok(text.clone());
-        }
-    }
-    Ok(String::new())
 }
 
 #[cfg(test)]

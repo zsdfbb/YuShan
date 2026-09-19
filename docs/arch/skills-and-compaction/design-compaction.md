@@ -159,7 +159,10 @@ keep_budget(w) = clamp(w × keep_ratio, w × keep_min_ratio, w × keep_max_ratio
 >
 > **这把「结构化摘要」从 D3 的延后项提进了第一刀** —— 它不再是「换一句话」，而是一段有明确结构的 prompt。
 >
-> **落法**：`CompactPolicy.summary_system_prompt` 保留为**覆盖口子**，默认值为上述结构化 prompt（常量）。**不做** pi 的 `UPDATE_SUMMARIZATION_PROMPT` 增量合并（另一件事，仍延后）。
+> ✅ **实现期修订（2026-09-19，见 [`design-final/compaction.md`](../../design-final/compaction.md)）**：**落地的是「骨架取 pi、规则取 Codewhale」的合并版**。节骨架即本节 pi 的固定 Markdown 节，**另追加 `## Files` 一节**（共七节）；规则取 Codewhale 的两条原文 —— *"exact file paths, commands, and error text"*（逐字引用）与 *"Summarize the task, not the checkpoint machinery"*（不描述压缩机器）。
+> **中间曾短暂落过「逐字 Codewhale 的 `COMPACT_PROMPT`」**（bullet 式 handoff 指令）：内容要求全部满足，但**没有结构** —— 接手模型拿到的是一坨 bullet，无从预期「哪段在哪」。改成固定节骨架后，接手模型才有**可预期的解析结构**，不必自己猜摘要的组织方式。
+> **为什么加 `## Files` 一节**（对应本节 §「追加文件清单」的 `<read-files>` / `<modified-files>` 原形）：它把「已读/已改的精确路径 + 为什么重要」收成**独立一节**，是**避免重复劳动与误覆盖文件的唯一直接入口** —— 接手模型最危险的动作是「凭印象重读/重写一个其实已经改过的文件」，只有列出路径，接手方才可能直接续写而非从头再来。故这一节承重，`test_summary_prompt_pins_structure_and_rules` 钉住它不得在「美化」时被合并或删除。
+> **落法**：`CompactPolicy.summary_system_prompt` 仍是**覆盖口子**，默认值为上述合并 prompt（常量）。**不做** pi 的 `UPDATE_SUMMARIZATION_PROMPT` 增量合并（另一件事，仍延后）。
 > **不做** `summary_max_tokens` 字段 —— 见「评审处置 R2」。
 
 ### KV cache 成本（2026-09-19 增补）

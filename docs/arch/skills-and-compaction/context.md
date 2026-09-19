@@ -24,10 +24,27 @@
 | **D2** | **发现路径 = `~/.yushan/skills/`（用户级）+ `.yushan/skills/`（项目级）** | 不扫 `~/.claude/skills`。**JackCC 的 57 个 skill 靠用户自行软链进 `~/.yushan/skills`**，代码不内置对 Claude Code 目录约定的依赖 |
 | **D3** | **压缩 = 加固既有实现**，不重写算法 | 补可见性（事件）、补测试、阈值提到 `RunLimits`、`/compact` 接真压缩。**不动**估算器对账 / 摘要策略重写 / `Session` 重写 API（均延后） |
 | **D4** | **推进顺序 = 先压缩加固，再做 skills** | 两个需求**分成两份独立设计**，不混在同一个 `arch-design` 里 |
-| **D5** | **`context_window` 配置 = 内置 provider 表 + `~/.yushan/config.json` 覆盖（单值全局默认）** | ① `ProviderInfo`（`provider.rs:9-14`）新增 `context_window` 字段，已知 provider 开箱即用；② 新增 `~/.yushan/config.json`（**用户写、app 只读**）可覆盖；③ 解析顺序：**`config.json` > 内置表（当前 provider）> `RunLimits::default()`（128_000）**；④ **单值，不按 model 区分** |
-| **D6** | **阈值与保留量全比例化** | 触发 = `context_window × trigger_ratio`；压缩后保留 = `context_window × keep_ratio`（替换硬编码的 `16384` / `20_000`） |
+| **D5** | ~~`context_window` 配置 = 内置 provider 表 + `config.json`（单值全局）~~ → **已被 D12 修订为按 `model` 解析** | 原案：① `ProviderInfo` 新增 `context_window`；② 新增 `~/.yushan/config.json`（用户写、app 只读）；③ 解析顺序 `config.json` > 内置表 > 默认；④ **单值全局**。**解析键已由 D12 从 `provider` 改为 `model`**；「用户写、app 只读」「失败落日志」「绝不阻断启动」等其余条款不变 |
+| **D6** | ~~阈值与保留量全比例化~~ → **已被 D10 修订** | 原案「触发 = `window × trigger_ratio`；保留 = `window × keep_ratio`」的**形态**保留，**数值被 D10 替换** |
 | **D7** | **第一刀范围 = A 骨架 + C 的三项 bug 修复** | 调研推翻了 D3 的部分前提：其中「`keep_from == len`」「空摘要静默丢历史」「压缩失败=静默失忆」是** bug 而非增强**，本轮一并修。`TokenLedger` / 溢出恢复 / 结构化摘要仍延后 |
 | **D8** | **keep 段先只设 floor，不设 ceiling** | keep 是**每轮重付**的 token（1M 下 156k/轮），但工作集大小是任务属性而非模型属性 ⇒ 先用第一刀新加的事件收数据再调 |
+| **D9** | **KV cache 成本纳入设计**（2026-09-19 增补） | 三处漏：**K-1 摘要调用必然 100% 缓存未命中**（换 system/清 tools ⇒ 最大单次输入全价重发）；**K-2 `Usage` 无缓存字段 ⇒ 完全盲**；K-3 压缩必然击穿缓存（不可消除，只能减小 keep）。**主项是「每轮背着大上下文」，缓存命中是 4 倍杠杆 ⇒ 第一优先级是保证命中，不是调 keep** |
+| **D10** | **数值定稿：触发 = 窗口 × 85%；保留 = 窗口的 1%~10%（带）** | 修订 D6 的数值。**「128k 逐位等价」护栏正式放弃**（旧值是从 pi 抄的、无测量依据）。`trigger = 0.85w` 与 `keep ≤ 0.10w` 使 `trigger > keep` 恒成立 ⇒ **D-1 小窗口退化由构造消除**。依据：pi/Codewhale/Claude Code 三家触发落在 80%~92%、保留独立收敛到「约 10% 窗口」；KV cache 量化显示保留 50% 窗口比 1% 贵 1.66x。**与三家的唯一分歧：按窗口比例 vs 固定 20k** |
+| **D11** | ~~摘要内容策略：只描述最主要的；引用类信息不必穷尽保留~~ → **已被 D13 推翻** | 原案「引用类信息可回头再找」被推翻，理由：**「改过哪些文件」是重复劳动 / 覆盖文件的唯一直接入口**，且 Codex/pi/Codewhale 三家独立收敛到「结构化骨架 + 显式保留精确引用」 |
+
+### 评审驱动的新决策（`arch-validate`，2026-09-19）
+
+| # | 决策 | 依据 |
+|---|---|---|
+| **D12** | **窗口解析粒度改为按 `model`**（修订 D5） | 评审 R5：`ProviderInfo` 每 provider 只有**一个** `default_model`（`provider.rs:9-15`），但 DeepSeek 至少两个（`deepseek-chat`/`deepseek-reasoner`）⇒ 同 provider 内切模型窗口不变；且全局覆盖会跨 provider 误用。窗口是**模型**的属性，不是 provider 的 |
+| **D13** | **摘要采用 pi / Codewhale 的形状：结构化骨架 + 显式保留精确文件路径/命令/错误文本 + `<read-files>`/`<modified-files>` 清单**（推翻 D11） | 三家（Codex/pi/Codewhale）独立收敛；重读文件的 token 成本远高于在摘要里留几个路径。**「结构化摘要」因此从 D3 延后项进入第一刀** |
+| **D14** | **`ys-model::ModelRequest` 加 `tool_choice`**（摘要调用传 `"none"`） | 评审 R1：K-1「复用 tools 以命中缓存」必须有抑制工具调用的手段，否则摘要可能被当工具调用 → 空摘要 → B-2。Codewhale 同处明确传 `tool_choice: "none"`。**触及核心 crate 公开 API，须 ADR 补记** |
+| **D15** | **触发点减去输出预留**：`trigger_at = min(w × 0.85, w − output_reserve − 1024)` | 评审 R4：窗口需容纳模型输出（`max_tokens = 4096`）；8K 窗口下 `6800 + 4096 > 8192` ⇒ 溢出，而溢出恢复已延后。Codewhale 同形状 |
+| **D16** | **压缩期本轮只加超时**（按 B-3 处理：超时即失败、session 不动）；**中断显式延后** | 评审 R6：`-p`/`--json` 下 `boundary = None`，一次 30s+ 的摘要调用无刹车。加中断要引入 app 层信号管线，成本高于本轮收益 |
+| **D17** | **`CompactPolicy` 不设 `summary_max_tokens`** | 评审 R2：adapter 是 `config.max_tokens.or(request.max_tokens)`（`lib.rs:415`），app 写死 4096（`main.rs:610`）⇒ 请求里的值被静默覆盖。**本仓库已立此原则**（`summarize.rs:37-38`「设值会被静默覆盖，那是句假话，故不设」）。**不留死旋钮** |
+| **D18** | **删掉合成的 assistant ack 消息**（`I have the context summary. Continuing.`），交替**由构造保证** | 评审 R7 升级：它是**伪造的模型输出**（写进 JSONL、重启重放、`/export` 带出、下次压缩再摘要一遍）；且它**根本没解决交替**（只把失败位置从 `kept[0]=User` 挪到 `kept[0]=Assistant`）。pi / Codewhale **都不加**合成 assistant 消息。构造保证：`kept[0]` 是 User 则摘要**并入**它，否则摘要独立成条。**`Role::User` 保留**（改角色另议） |
+| **D19** | **`keep_ratio = 0.10`（带上沿）** | ① 带内成本差仅约 10%（1M 下 1% vs 10%：430K vs 475K eq/轮），对比 50% 档的 1.66x 可忽略；② 三家收敛点就是 ~10%；③ **先保真后调低比先有损后调高安全**。硬边界 `[1%, 10%]` 仍保证落带内 |
+| **D20** | **实施拆两片**：片 1 = 配置 + 可见性 + 正确性；片 2 = 成本 + 摘要质量；第二刀 = `TokenLedger` | `tool_choice` 动的是 `ys-model` **公开 API**，值得单独评审；片 2 依赖片 1 的事件数据。**第二刀须赶在 D1（skills）之前** |
 
 > **D7/D8 的设计已产出**：→ [`design-compaction.md`](./design-compaction.md) + [`../../adr/0017-compaction-hardening.md`](../../adr/0017-compaction-hardening.md)
 

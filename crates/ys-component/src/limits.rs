@@ -1,3 +1,5 @@
+use super::CompactPolicy;
+
 /// 一次 run 的执行限制
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -8,6 +10,8 @@ pub struct RunLimits {
     pub bash_timeout: Option<u64>,
     /// model context window 大小（以 token 计）
     pub context_window: usize,
+    /// context 压缩策略（阈值与保留预算；算法在 `ys-loop`）
+    pub compaction: CompactPolicy,
 }
 
 impl RunLimits {
@@ -25,6 +29,7 @@ impl Default for RunLimits {
             max_rounds: 10,
             bash_timeout: None,
             context_window: 128_000,
+            compaction: CompactPolicy::default(),
         }
     }
 }

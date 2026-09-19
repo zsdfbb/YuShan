@@ -31,4 +31,28 @@ pub enum AgentEvent {
     RunFailed {
         error: String,
     },
+    /// 一次自动压缩完成。
+    ///
+    /// **只发终局、不发「开始」** —— `Started` 会引入悬挂状态：压缩中途被
+    /// `Abort` 时终止事件永不发出，transcript 会永远挂着「Compacting…」。
+    ///
+    /// 字段名里的 `estimated_` 前缀是**有意的**：这两个数来自启发式估算器
+    /// （`ys-loop` 的 `token.rs`：ASCII 字节 / 4 + CJK 每字 1.5），
+    /// 不是 provider 回报的真实 `usage`，命名不得简写成 `tokens_before/after`。
+    ///
+    /// 非终局事件：不影响 `-p` / `--json` 的消费循环退出条件。
+    ContextCompacted {
+        /// 压缩前的**估算** token 数（启发式，非 provider 真实 usage）
+        estimated_tokens_before: usize,
+        /// 压缩后的**估算** token 数
+        estimated_tokens_after: usize,
+        /// 被摘要掉的消息条数
+        summarized: usize,
+        /// 原样保留的消息条数
+        kept: usize,
+    },
+    /// 一次压缩失败（session 未被修改）。
+    ContextCompactionFailed {
+        reason: String,
+    },
 }

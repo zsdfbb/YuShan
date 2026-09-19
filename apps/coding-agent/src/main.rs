@@ -255,17 +255,49 @@ where
 /// **工具表由调用方装配后传入**（[`toolset::build_tools`] 唯一装配：探测一次 +
 /// 固定顺序）：同一份表既进 `ToolRegistry`，也派生系统提示词的工具清单 ——
 /// 二者因此不可能漂移（设计 §1.5）。
+///
+/// **`limits` 必须由调用方传入**（U6b 接线）：此前本函数从不调 `.limits()`，
+/// `AgentBuilder` 落回 `RunLimits::default()` ⇒ `context_window` 恒为 128_000 ——
+/// 这正是「1M 模型在 11 万 token 就被压缩」的根因。传给 `build_agent` 的
+/// `context_window` 只是**启动时初值**：TUI 模式下 `app_loop` 每回合按当前 model
+/// 重算（`/login` / `/model` 能在运行中换到 16 倍窗口的模型）。
 fn build_agent(
     system_prompt: String,
     workspace: PathBuf,
     tools: Vec<Box<dyn Tool>>,
+    limits: ys_component::RunLimits,
 ) -> Result<Agent, BuildError> {
     AgentBuilder::new()
         .tools(tools)
         .system_prompt(system_prompt)
         .working_dir(workspace.clone(), workspace)
         .approval(ys_tool::AutoApprove)
+        .limits(limits)
         .build()
+}
+
+/// 从 [`Config`] 解析出这次运行的执行限制。
+///
+/// # 为什么抽成独立函数
+///
+/// **只为可测**：这段装配若留在 `main()` 里，测试够不着 —— `main()` 会真读环境变量、
+/// 真起 runtime、真进 TUI。而它恰恰是本刀（U6b）修复的**接线**那一步：
+/// [`build_agent`] 已能正确应用传入的 `limits`（有单测钉住），但「取 `config` 的值
+/// 再传进去」若被误写成 `RunLimits::default()`，**全部测试依旧全绿**，
+/// 而回归的正是「1M 模型在 11 万 token 就被压缩」这个 bug。抽出来后可被单测直接调用。
+///
+/// # 依赖顺序
+///
+/// 调用方必须在 **provider/model 恢复之后**调用：`context_window()` 按 `config.model`
+/// 查表（`config.json` 覆盖 > 内置表 > 默认 128_000），恢复逻辑会改写 `config.model`。
+///
+/// `RunLimits` 是 `#[non_exhaustive]`：跨 crate **不能**用结构体字面量，
+/// 只能 `default()` + 字段赋值。
+fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
+    let mut limits = ys_component::RunLimits::default();
+    limits.context_window = config.context_window();
+    limits.compaction = config.compact_policy();
+    limits
 }
 
 /// 抓取落盘文件的保留时长：超过即被启动期清理（**只对 Primary 档**生效）。
@@ -478,6 +510,9 @@ async fn run_json_mode(
 ///
 /// **必须在非 async 线程上调用末尾的 UI 循环** —— 故这里只做「异步初始化 +
 /// spawn app 线程 + 跑 UI」这三件事，`rt` 由调用方持有。
+///
+/// `limits` 是**启动时初值**（`main` 按 provider 恢复后的 model 算好）：挂到 agent
+/// 上之后由 `app_loop` 每回合覆盖 `context_window`。
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     rt: tokio::runtime::Runtime,
@@ -486,13 +521,14 @@ fn run_interactive(
     system_prompt: String,
     workspace: PathBuf,
     tools: Vec<Box<dyn Tool>>,
+    limits: ys_component::RunLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
         ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
 
     // 1（续）. agent（挂工具与系统提示；session/model/events 经端口传入）。
-    let agent = build_agent(system_prompt, workspace, tools)?;
+    let agent = build_agent(system_prompt, workspace, tools, limits)?;
 
     // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
     let model = config.build_model();
@@ -555,6 +591,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 从 auth.json 加载已保存的凭证
     config.registry.load_auth();
 
+    // 读 `~/.yushan/config.json` 的用户覆盖（context_window / compaction 比例）。
+    //
+    // 路径由调用方解析（`Config::default_user_config_path`）后显式传入 —— 取不到
+    // 路径（无 `HOME` / `USERPROFILE`）就跳过，`load_user_config` 对「文件不存在」
+    // 本就静默（用户没写配置文件是常态，不是故障）。
+    if let Some(path) = config::Config::default_user_config_path() {
+        config.load_user_config(&path);
+    }
+
     // 从 state.json 加载已保存的会话状态
     let state_store = state::StateStore::new();
     let saved_state = state_store.load();
@@ -596,6 +641,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // 窗口配置接线（U6b）—— 必须在 **provider 恢复之后**：`context_window()` 按
+    // `config.model` 查表，恢复逻辑会改写它。
+    //
+    // 装配本身在 [`resolve_limits`]（抽出去只为可测，见该函数）；这里算的是
+    // **启动时初值**：`-p`/`--json` 单次运行内不会换 provider，一次定死即可；
+    // TUI 模式的窗口由 `app_loop` 每回合按当前 model 重算（见该文件）。
+    let limits = resolve_limits(&config);
 
     // 注册 model factory（适配器特有的构建逻辑）
     config.set_model_factory(|cfg| {
@@ -651,7 +704,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
             let stats_handle = sink.stats_handle();
-            let mut agent = build_agent(system_prompt, workspace, tools)?;
+            let mut agent = build_agent(system_prompt, workspace, tools, limits)?;
             // `-p` 是一次性会话：MemorySession，不落盘、不恢复（行为与改动前一致）。
             let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
             rt.block_on(run_print_mode(
@@ -667,7 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
-            let mut agent = build_agent(system_prompt, workspace, tools)?;
+            let mut agent = build_agent(system_prompt, workspace, tools, limits)?;
             let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
             rt.block_on(run_json_mode(
                 &mut agent,
@@ -679,7 +732,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))?;
         }
         Mode::Interactive => {
-            run_interactive(rt, config, state_store, system_prompt, workspace, tools)?;
+            run_interactive(
+                rt,
+                config,
+                state_store,
+                system_prompt,
+                workspace,
+                tools,
+                limits,
+            )?;
         }
     }
 
@@ -730,6 +791,11 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// 测试用默认 limits —— `build_agent` 现在必须显式收一个（U6b 接线）。
+    fn default_limits() -> ys_component::RunLimits {
+        ys_component::RunLimits::default()
     }
 
     fn env(event: AgentEvent) -> Envelope {
@@ -963,7 +1029,13 @@ mod tests {
         model.push_text("hello world");
 
         let (sink, rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
-        let mut agent = build_agent(String::new(), PathBuf::from("."), Vec::new()).unwrap();
+        let mut agent = build_agent(
+            String::new(),
+            PathBuf::from("."),
+            Vec::new(),
+            default_limits(),
+        )
+        .unwrap();
         let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         let mut out: Vec<u8> = Vec::new();
@@ -1079,7 +1151,13 @@ mod tests {
             DEFAULT_CHANNEL_CAPACITY,
             LifecyclePolicy::StopWhenConsumerGone,
         );
-        let mut agent = build_agent(String::new(), PathBuf::from("."), Vec::new()).unwrap();
+        let mut agent = build_agent(
+            String::new(),
+            PathBuf::from("."),
+            Vec::new(),
+            default_limits(),
+        )
+        .unwrap();
         let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         let mut out: Vec<u8> = Vec::new();
@@ -1234,5 +1312,99 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&primary_dir);
+    }
+
+    /// 16. **`build_agent` 必须把 `limits` 真的挂到 agent 上**（U6b 根因回归）。
+    ///
+    ///     改前 `build_agent` 从不调 `.limits()` ⇒ `AgentBuilder` 落回
+    ///     `RunLimits::default()` ⇒ `context_window` 恒为 128_000 —— 这就是
+    ///     「1M 模型在 11 万 token 就被压缩」的根因（压缩阈值按错误的窗口算）。
+    ///
+    ///     变异：删掉 `build_agent` 里的 `.limits(limits)` → 断言变红
+    ///     （`128_000 != 1_000_000`）。
+    #[test]
+    fn build_agent_applies_context_window_from_limits() {
+        let mut limits = ys_component::RunLimits::default();
+        limits.context_window = 1_000_000;
+        limits.compaction.trigger_ratio = 0.5;
+
+        let agent = build_agent(String::new(), PathBuf::from("."), Vec::new(), limits)
+            .expect("空工具表也应能构建");
+
+        assert_eq!(
+            agent.context_window(),
+            1_000_000,
+            "传入的 limits.context_window 必须生效，否则压缩按错误的窗口触发"
+        );
+        // 反证：这个值确实不同于「落回默认」的结果（不是恒真断言）
+        assert_ne!(
+            agent.context_window(),
+            ys_component::RunLimits::default().context_window,
+            "若仍等于默认窗口，说明 .limits() 没生效"
+        );
+    }
+
+    /// **`resolve_limits` 必须真的从 `Config` 取值**（U6b 装配回归）。
+    ///
+    /// [`build_agent_applies_context_window_from_limits`] 钉住的是「**传入的 limits**
+    /// 会生效」；但「**从 config 取出来再传进去**」那一步原先在 `main()` 里，
+    /// 测试够不着 —— 若有人把它误写成 `RunLimits::default()`，那条测试照样全绿，
+    /// 而本刀修的 bug（1M 模型按 128k 压缩）会**悄悄复活**。本用例直接调
+    /// [`resolve_limits`]，把装配这一步钉住。
+    ///
+    /// 断言**刻意选与默认值不同的数**：窗口 `262_144 ≠ 128_000`、触发比例
+    /// `0.5 ≠ 0.85`（`CompactPolicy::default`）。若取默认值，两个值都能区分开，
+    /// 断言不会恒真。
+    ///
+    /// 变异：把 `resolve_limits` 改成直接 `return RunLimits::default()` →
+    /// 本用例变红（`context_window` 落回 128_000、`trigger_ratio` 落回 0.85）。
+    #[test]
+    fn resolve_limits_reads_window_and_policy_from_config() {
+        // `Config::from_env` 会 `getenv` 四个凭证 key，而 `config.rs` 的用例正在
+        // `env_lock` 下对这些 key 做 `set_var` / `remove_var` —— 二者跨线程并发即
+        // 数据竞争（`set_var` 在 edition 2024 因此是 `unsafe`）。**只读也要持锁**，
+        // 把本用例与那些改写串行化。
+        let _guard = crate::test_env::env_lock();
+
+        let dir = unique_tmp_dir("resolve_limits");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "context_window": { "resolve-limits-model": 262144 },
+                "compaction": { "trigger_ratio": 0.5, "keep_ratio": 0.25 }
+            }"#,
+        )
+        .unwrap();
+
+        // `model` 随即被覆盖，环境里的 `YUSHAN_MODEL` 影响不到本用例的断言；
+        // 但 `from_env` 的 `getenv` 仍须与改写的测试串行（见函数开头的锁）。
+        let mut config = config::Config::from_env().unwrap();
+        config.model = "resolve-limits-model".into();
+        config.load_user_config(&path);
+
+        let limits = resolve_limits(&config);
+
+        assert_eq!(
+            limits.context_window, 262_144,
+            "context_window 必须来自 config（config.json 的按 model 覆盖）"
+        );
+        assert_ne!(
+            limits.context_window,
+            ys_component::RunLimits::default().context_window,
+            "若等于默认 128_000，说明装配没引用 config"
+        );
+        assert_eq!(
+            limits.compaction.trigger_ratio, 0.5,
+            "compact_policy 必须来自 config"
+        );
+        assert_eq!(limits.compaction.keep_ratio, 0.25, "逐字段独立覆盖");
+        assert_ne!(
+            limits.compaction.trigger_ratio,
+            ys_component::CompactPolicy::default().trigger_ratio,
+            "若等于默认 0.85，说明装配没引用 config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

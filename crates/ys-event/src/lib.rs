@@ -135,4 +135,63 @@ mod tests {
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, back);
     }
+
+    // 压缩事件：加法式新增，序列化 / 反序列化roundtrip 必须稳定
+    // （`--json` 模式逐行打印 `Envelope`，字段名即对外契约）。
+    #[test]
+    fn test_agent_event_compaction_serde_roundtrip() {
+        let compacted = AgentEvent::ContextCompacted {
+            estimated_tokens_before: 12_000,
+            estimated_tokens_after: 3_500,
+            summarized: 18,
+            kept: 4,
+        };
+        let json = serde_json::to_string(&compacted).unwrap();
+        assert!(
+            json.contains("estimated_tokens_before"),
+            "字段名里的 estimated_ 前缀是有意的，不得简写成 tokens_before：{json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(compacted, back);
+
+        let failed = AgentEvent::ContextCompactionFailed {
+            reason: "summarizer returned empty".into(),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(failed, back);
+    }
+
+    // 两个压缩变体都是**非终局**事件 —— 消费循环（`-p` / `--json`）的退出条件
+    // 只认 `RunFinished` / `RunFailed`，故压缩事件必须能落到兜底分支、不产生输出。
+    #[test]
+    fn test_compaction_events_destructure_as_non_terminal() {
+        let compacted = AgentEvent::ContextCompacted {
+            estimated_tokens_before: 100,
+            estimated_tokens_after: 40,
+            summarized: 3,
+            kept: 1,
+        };
+        match compacted {
+            AgentEvent::ContextCompacted {
+                estimated_tokens_before,
+                estimated_tokens_after,
+                summarized,
+                kept,
+            } => {
+                assert_eq!(estimated_tokens_before, 100);
+                assert_eq!(estimated_tokens_after, 40);
+                assert_eq!(summarized, 3);
+                assert_eq!(kept, 1);
+            }
+            other => panic!("期望 ContextCompacted，实得 {other:?}"),
+        }
+
+        let failed = AgentEvent::ContextCompactionFailed {
+            reason: "boom".into(),
+        };
+        assert!(
+            matches!(&failed, AgentEvent::ContextCompactionFailed { reason } if reason == "boom")
+        );
+    }
 }

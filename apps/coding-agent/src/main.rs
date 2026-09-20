@@ -41,6 +41,7 @@ mod config;
 mod logging;
 mod prompt;
 mod provider;
+mod skills;
 mod state;
 mod status;
 mod toolset;
@@ -298,6 +299,84 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     limits.context_window = config.context_window();
     limits.compaction = config.compact_policy();
     limits
+}
+
+/// 每轮**固定开销**的 token 估算：system prompt + 工具表的 JSON spec。
+///
+/// 压缩触发（`ys-loop`）此前只算 session 消息，这两项是盲区；skill 目录入场后
+/// 缺口从 ~1.1k 涨到 ~9.6k（设计 §选择理由 E）。量一次、交给 `RunLimits`。
+///
+/// **估算器不引额外依赖**：复用 `ys_loop::token`（全仓唯一的估算实现）。
+/// `serde_json::to_string` 失败（不可能：`ToolSpec` 是可序列化的纯数据）时按
+/// 空串计 —— 宁可低估，也不要让启动失败。
+fn fixed_prompt_tokens(system_prompt: &str, specs: &[ys_tool::ToolSpec]) -> usize {
+    ys_loop::token::estimate_text_tokens(system_prompt)
+        + ys_loop::token::estimate_text_tokens(&serde_json::to_string(specs).unwrap_or_default())
+}
+
+/// R5：固定开销已经**不小于**压缩触发点 ⇒ 压缩即便触发也帮不上（消息已到底），
+/// 或永不触发而溢出。给一条可操作的启动期提示（调大窗口 / 减少 skill）。
+///
+/// **只诊断、不改变行为**：触发条件与 `trigger_at` 的语义都不动（设计 §选择理由 E
+/// 明确「扣减发生在比较的输入端」，`trigger_at` 原样保留）。
+fn fixed_cost_note(limits: &ys_component::RunLimits) -> Option<String> {
+    let trigger = limits.compaction.trigger_at(limits.context_window);
+    if limits.fixed_prompt_tokens < trigger {
+        return None;
+    }
+    Some(format!(
+        "[yushan] 每轮固定开销（system prompt + 工具表）≈ {} token，已达压缩触发点 {} token \
+         （context_window = {}）—— 压缩无从下手，长会话会直接撞窗口。请调大 context_window、\
+         或给部分 skill 标 `disable-model-invocation` 以减少 skill 目录。",
+        limits.fixed_prompt_tokens, trigger, limits.context_window
+    ))
+}
+
+/// 自定义 prompt（`.yushan/SYSTEM.md`）命中时的**代价说明**。
+///
+/// `build_system_prompt` 的短路是既有契约（用户全权接管提示词，逐字保留），代价是
+/// skill 目录段**不会**注入 ⇒ 模型无法自主发现 skill。但不该**静默**：`/skill-name`
+/// 的确定性路线仍可用（设计 §F「自定义 prompt 短路」行）。
+fn custom_prompt_note(cwd: &std::path::Path, skill_count: usize) -> Option<String> {
+    if skill_count == 0 || !prompt::has_custom_prompt(cwd) {
+        return None;
+    }
+    Some(format!(
+        "[yushan] 检测到自定义 SYSTEM.md —— 已发现 {skill_count} 个 skill，但 skill 目录\
+         **未**注入系统提示（自定义提示词逐字生效），模型无法自主发现它们；`/skill-name` \
+         仍可用（不依赖系统提示）。"
+    ))
+}
+
+/// 汇总启动期提示为**一条**（多行），**绝不互相覆盖**。
+///
+/// 四类来源彼此独立（缺 `rg`/`fd`、skill 遮蔽、自定义 prompt、窗口装不下固定开销），
+/// 合并成一条是因为三者**去处相同**：TUI 模式下它是 `Outbound::Output` 的第一条
+/// （排在对话之前），`-p` / `--json` 下是 stderr 的若干行（**绝不能**混进 stdout）。
+///
+/// 与 `toolset::merge_hints`（私有、两源）同规：空集返回 `None`，否则 `"\n"` 连接。
+fn startup_hints(
+    tool_hint: Option<String>,
+    skill_diags: &[String],
+    custom_prompt: Option<String>,
+    fixed_cost: Option<String>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(tool_hint);
+    parts.extend(skill_diags.iter().cloned());
+    parts.extend(custom_prompt);
+    parts.extend(fixed_cost);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// `-p` / `--json` 的 task 展开：与 TUI 的 `Request::Prompt` 走**同一套**逻辑
+/// （`skills::expand_invocation`），三模式行为一致（设计 §关键数据流）。
+fn expand_task(task: String, skill_entries: &[skills::SkillEntry]) -> String {
+    skills::expand_invocation(&task, skill_entries).unwrap_or(task)
 }
 
 /// 抓取落盘文件的保留时长：超过即被启动期清理（**只对 Primary 档**生效）。
@@ -627,6 +706,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.load_user_config(&path);
     }
 
+    // 启动期扫描 skill（**紧跟用户配置**，设计 §关键数据流）：根顺序 = 优先级
+    // （project 在前），由 `default_skill_roots` 唯一给出。诊断**不由本模块打印** ——
+    // 它与 `toolset` 的降级提示合并成一条，走既有的启动期提示通道。
+    let skill_roots = config::Config::default_skill_roots(&config.cwd);
+    let skill_diags = config.load_skills(&skill_roots);
+
+    // 目录归一（去重 project > user + 按 command 升序 + 预算收束）一次，供
+    // 系统提示段与 `/` 浮层共用；`omitted` 写回 config（`build_view` 的取数口）。
+    let catalogue = skills::catalogue(config.skills.clone(), skills::Budget::default());
+    config.skills_omitted = catalogue.omitted;
+
     // 从 state.json 加载已保存的会话状态
     let state_store = state::StateStore::new();
     let saved_state = state_store.load();
@@ -675,7 +765,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 装配本身在 [`resolve_limits`]（抽出去只为可测，见该函数）；这里算的是
     // **启动时初值**：`-p`/`--json` 单次运行内不会换 provider，一次定死即可；
     // TUI 模式的窗口由 `app_loop` 每回合按当前 model 重算（见该文件）。
-    let limits = resolve_limits(&config);
+    //
+    // `mut` 是因为 `fixed_prompt_tokens` 只能在 system prompt 派生出来**之后**量
+    // （见下方 §压缩耦合修正）—— 本值不影响 `context_window` / `compaction`。
+    let mut limits = resolve_limits(&config);
 
     // 注册 model factory（适配器特有的构建逻辑）
     config.set_model_factory(|cfg| {
@@ -714,7 +807,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sweep_fetched(&web, FETCHED_MAX_AGE);
     let (tools, hint) = toolset::build_tools(&workspace, web);
     let specs = tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
-    let system_prompt = prompt::build_system_prompt(&cwd, &specs);
+    let system_prompt = prompt::build_system_prompt(&cwd, &specs, &catalogue);
+
+    // **压缩耦合修正**（设计 §选择理由 E）：压缩触发只看 session 消息，system prompt
+    // 与工具表这**每轮固定开销**此前完全在盲区（skill 目录入场后 ~9.6k）。此处量一次
+    // 交给 `BasicLoop`，由它加在比较的**输入端**（`trigger_at` 的语义原样不动）。
+    limits.fixed_prompt_tokens = fixed_prompt_tokens(&system_prompt, &specs);
+
+    // **启动期提示合并成一条**（多行、绝不互相覆盖）：工具降级 + skill 诊断
+    // （遮蔽 / 非法值）+ 自定义 prompt 的代价说明 + R5 的窗口警告。
+    // 去处由模式决定：TUI → `Outbound::Output`（transcript）；`-p` / `--json` → stderr。
+    let hint = startup_hints(
+        hint,
+        &skill_diags,
+        custom_prompt_note(&cwd, config.skills.len()),
+        fixed_cost_note(&limits),
+    );
 
     // 手工建 runtime（而非 `#[tokio::main]`）：TUI 模式的 UI 循环**必须在
     // 没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
@@ -728,6 +836,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(hint) = &hint {
                 eprintln!("{hint}");
             }
+            // 与 TUI 的 `Request::Prompt` **同一套**展开：`-p "/git-status"` 也生效。
+            let task = expand_task(task, &config.skills);
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
@@ -749,6 +859,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(hint) = &hint {
                 eprintln!("{hint}");
             }
+            let task = expand_task(task, &config.skills);
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
@@ -1438,6 +1549,172 @@ mod tests {
             limits.compaction.trigger_ratio,
             ys_component::CompactPolicy::default().trigger_ratio,
             "若等于默认 0.85，说明装配没引用 config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── skills 启动装配（T13） ─────────────────────
+
+    /// **`fixed_prompt_tokens` 由 system prompt 与工具表派生**（设计 §选择理由 E）：
+    /// 必须 > 0（工具表的 JSON spec 本身就占 token），且随 prompt 增长。
+    ///
+    /// 变异：把它写死成 `RunLimits::default()` 的 0（= 本刀修的那个盲区复活）⇒
+    /// 第一条断言变红。
+    #[test]
+    fn fixed_prompt_tokens_derives_from_prompt_and_tool_specs() {
+        let specs = vec![ys_tool::ToolSpec::new(
+            "read",
+            "Read file contents",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        let short = fixed_prompt_tokens("hi", &specs);
+        let long = fixed_prompt_tokens(&"x".repeat(4096), &specs);
+        assert!(short > 0, "工具表 spec 本身即固定开销");
+        assert!(
+            long > short,
+            "prompt 变长 ⇒ 固定开销必须变长（{short} → {long}）"
+        );
+
+        // 边界：空 prompt + 空工具表 ⇒ 0（估算器对空串给 0，`[]` 也只有 2 字节）
+        assert_eq!(fixed_prompt_tokens("", &[]), 0);
+        assert_eq!(fixed_prompt_tokens("abcdefgh", &[]), 2);
+    }
+
+    /// **R5**：固定开销 ≥ 压缩触发点 ⇒ 必须有明确提示；差一个 token 就不提示。
+    ///
+    /// 两条对照（`fixed = trigger - 1` 与大窗口 + 9.6k 固定开销）是为了让「有提示」
+    /// 不成为恒真断言 —— 一个永远返回 `Some` 的实现过不了后两条。
+    ///
+    /// 变异：把判据写成 `<`（方向倒转）⇒ 第一条断言变红。
+    #[test]
+    fn fixed_cost_note_fires_when_trigger_point_is_out_of_reach() {
+        let mut limits = ys_component::RunLimits::default();
+        limits.context_window = 8_000;
+        let trigger = limits.compaction.trigger_at(8_000);
+        assert!(trigger > 0, "测试前提：触发点非零（P1 不变量给的兜底）");
+
+        limits.fixed_prompt_tokens = trigger;
+        let note = fixed_cost_note(&limits).expect("固定开销 = 触发点 ⇒ 必须提示");
+        assert!(note.contains(&trigger.to_string()), "提示应给出触发点：{note}");
+        assert!(note.contains("context_window"), "提示应可操作：{note}");
+
+        // 差一个 token ⇒ 仍装得下 ⇒ 不提示。
+        limits.fixed_prompt_tokens = trigger - 1;
+        assert!(
+            fixed_cost_note(&limits).is_none(),
+            "未达触发点不该打扰用户"
+        );
+
+        // 真实量级的对照：128k 窗口装得下 ~9.6k 的 skill 目录。
+        let mut wide = ys_component::RunLimits::default();
+        wide.fixed_prompt_tokens = 9_600;
+        assert!(
+            fixed_cost_note(&wide).is_none(),
+            "128k 窗口下 skill 目录（~9.6k）远不到触发点"
+        );
+    }
+
+    /// 启动期提示**合并成一条、绝不互相覆盖**（照 `toolset::merge_hints` 的立场：
+    /// 四类来源彼此独立，丢任何一条用户就少了可操作信息）。
+    ///
+    /// 变异：把实现改成「后取者覆盖先取者」（只留一条）⇒ 各 `contains` 断言变红。
+    #[test]
+    fn startup_hints_merge_all_sources() {
+        let merged = startup_hints(
+            Some("tool-hint".into()),
+            &["skill-diag-a".to_string(), "skill-diag-b".to_string()],
+            Some("custom-note".into()),
+            Some("fixed-note".into()),
+        )
+        .expect("四源皆有 ⇒ 一条提示");
+
+        for part in [
+            "tool-hint",
+            "skill-diag-a",
+            "skill-diag-b",
+            "custom-note",
+            "fixed-note",
+        ] {
+            assert!(merged.contains(part), "合并后不得丢掉 `{part}`：{merged}");
+        }
+        assert!(merged.starts_with("tool-hint"), "工具降级在最前：{merged}");
+        assert!(merged.ends_with("fixed-note"), "R5 在最后：{merged}");
+        assert_eq!(merged.lines().count(), 5, "一行一事：{merged}");
+
+        // 全空 ⇒ None（不留空行）。
+        assert!(startup_hints(None, &[], None, None).is_none());
+
+        // **只有 skill 诊断**也要出（工具侧没有不能把 skill 侧吞掉）。
+        assert_eq!(
+            startup_hints(None, &["x".into()], None, None).as_deref(),
+            Some("x")
+        );
+    }
+
+    /// 自定义 prompt 提示：**两个条件同时成立**才出（有自定义 SYSTEM.md 且发现了 skill）。
+    ///
+    /// 变异：去掉 `skill_count == 0` 的守卫 ⇒ 第二条断言变红（没 skill 还提示 skill
+    /// 不可见，是纯粹的噪音）。
+    #[test]
+    fn custom_prompt_note_requires_both_conditions() {
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
+        // SAFETY: 调用方持有 env_lock，独占这两个 key 的修改与恢复。
+        unsafe {
+            std::env::set_var("HOME", "/nonexistent-yushan-note-home");
+            std::env::remove_var("USERPROFILE");
+        }
+
+        let dir = unique_tmp_dir("custom_note");
+        assert!(
+            custom_prompt_note(&dir, 3).is_none(),
+            "无自定义 prompt ⇒ 无提示"
+        );
+
+        let system_dir = dir.join(".yushan");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        std::fs::write(system_dir.join("SYSTEM.md"), "Custom").unwrap();
+
+        assert!(
+            custom_prompt_note(&dir, 0).is_none(),
+            "一个 skill 都没有 ⇒ 无提示（避免噪音）"
+        );
+        let note = custom_prompt_note(&dir, 3).expect("两者皆有 ⇒ 提示");
+        assert!(note.contains('3'), "提示应给出 skill 数：{note}");
+        assert!(note.contains("/skill-name"), "提示应指出确定性路线仍可用：{note}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`-p` / `--json` 的 task 也展开**（三模式行为一致）：命中已知 skill 时 task
+    /// 被重写成带正文的信封；普通 task **逐字节不变**。
+    ///
+    /// 变异：把 `expand_task` 改成恒等（忘了接）⇒ 第一条断言变红。
+    #[test]
+    fn print_task_skill_invocation_is_expanded_like_the_tui_path() {
+        let dir = unique_tmp_dir("expand_task");
+        let skill_dir = dir.join("git-status");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: git-status\ndescription: 状态\n---\n正文第一行\n",
+        )
+        .unwrap();
+        let (entries, diags) = crate::skills::scan(&[dir.clone()]);
+        assert_eq!(entries.len(), 1, "测试前提：{diags:?}");
+
+        let expanded = expand_task("/git-status 现在改了什么".to_string(), &entries);
+        assert!(expanded.contains("<skill name=\"git-status\""), "{expanded}");
+        assert!(expanded.contains("正文第一行"), "{expanded}");
+        assert!(expanded.contains("现在改了什么"), "参数原样保留：{expanded}");
+
+        let plain = "修一下这个 bug".to_string();
+        assert_eq!(
+            expand_task(plain.clone(), &entries),
+            plain,
+            "非 skill 的 task 必须逐字节不变"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

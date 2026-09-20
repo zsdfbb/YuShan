@@ -2,6 +2,8 @@ use std::path::Path;
 
 use ys_tool::ToolSpec;
 
+use crate::skills::Catalogue;
+
 /// 用工具片段和动态 guideline 构建 system prompt。
 ///
 /// # 工具清单从 `tools` 派生
@@ -10,7 +12,20 @@ use ys_tool::ToolSpec;
 /// （`toolset::build_tools` → `ToolRegistry`，见
 /// `docs/design-plans/2026-09-16-search-tools.md` B1）保证，本函数不排序、
 /// 不查自己的名录：`tools` 里有什么就列什么。这样提示词与注册表**不可能漂移**。
-pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec]) -> String {
+///
+/// # skill 目录段（纯追加，设计 §选择理由 F）
+///
+/// 段落在**整条提示的最末尾**（`Current working directory: …` 之后），故
+/// **空 `catalogue` 的输出是任何非空 `catalogue` 输出的逐字节前缀** ——
+/// 这是「同一台机器上先后两次启动的提示前缀稳定」的可测形式（严格前缀不变量）。
+///
+/// 门控（照 pi）：仅当工具表里**有 `read`**（skill 正文靠它加载）且目录非空时追加。
+/// 空目录时**什么都不追加**（不留空行）。
+///
+/// 命中自定义 prompt（`.yushan/SYSTEM.md` / `~/.yushan/SYSTEM.md`）时整体短路返回，
+/// **不追加** skill 段 —— 既有契约逐字保留（用户全权接管提示词）；代价（模型无法
+/// 自主发现 skill）由 `main` 的启动期提示交代，见 [`has_custom_prompt`]。
+pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogue) -> String {
     // 1. 检查是否有自定义 prompt 文件
     if let Some(custom) = find_custom_prompt(cwd) {
         return custom;
@@ -52,7 +67,48 @@ Guidelines:
     }
 
     prompt.push_str(&format!("\n\nCurrent working directory: {}", cwd.display()));
+
+    // 4. 追加 skill 目录段 —— **必须留在最末尾**（见函数文档的严格前缀不变量）。
+    //    门控：有 `read`（skill 正文靠它加载）且目录非空；否则**一字不加**。
+    if tools.iter().any(|t| t.name == "read") && !catalogue.lines.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&skill_section(&catalogue.lines));
+    }
+
     prompt
+}
+
+/// 是否命中自定义 prompt（`.yushan/SYSTEM.md` 项目级，或 `~/.yushan/SYSTEM.md`
+/// 用户级）—— 供 `main` 的启动期提示用。
+///
+/// 薄包装 [`find_custom_prompt`]：只回答「有没有」，**不把它改 pub**（该函数返回
+/// 内容，暴露出去会诱使调用方绕过 [`build_system_prompt`] 的短路语义）。
+pub fn has_custom_prompt(cwd: &Path) -> bool {
+    find_custom_prompt(cwd).is_some()
+}
+
+/// 渲染 `<available_skills>` 段。
+///
+/// 前言里的三句话都是**承重**的（设计 §CC 兼容性 偏离 3 / R7）：
+///
+/// 1. **用 `read` 打开 `location`** —— 零工具路线（ADR-0019 决策 1）的唯一触发线索；
+///    实测模型在给出绝对路径时会首跳即 `read`（R1 已验证）。
+/// 2. **相对路径按 skill 自己所在目录解析** —— 实测多条正文按相对路径交叉引用兄弟
+///    skill（如 `../design-interface/SKILL.md`），按 CWD 解析必然找不到。
+/// 3. **能力边界声明**（无 subagent / plan mode）—— 正文里约 20 处 Claude 专有工具名
+///    在本 runtime 静默失效；不做符号映射（那是把上游知识写死），改为声明边界。
+fn skill_section(lines: &str) -> String {
+    format!(
+        "<available_skills>\n\
+         The following skills are available. Each entry is `- <command>: <description> (location: <absolute path>)`.\n\
+         To use a skill, open its `location` with the read tool and follow the instructions in that file.\n\
+         Relative paths inside a skill body (e.g. `references/...`, or a sibling skill) resolve \
+         relative to that skill's own directory, not the current working directory.\n\
+         This runtime has no subagents and no plan mode — ignore instructions that ask for them.\n\
+         \n\
+         {lines}\n\
+         </available_skills>"
+    )
 }
 
 /// 工具的一句话描述，按 **name** 查表。
@@ -223,6 +279,28 @@ mod tests {
         ToolSpec::new(name, "（本函数不读这个字段）", serde_json::json!({}))
     }
 
+    /// **空** catalogue（= 没有 skill，或预算把整表收起）—— 严格前缀不变量的左端。
+    fn no_skills() -> crate::skills::Catalogue {
+        crate::skills::catalogue(Vec::new(), crate::skills::Budget::default())
+    }
+
+    /// 含一个 skill 的 catalogue（合成条目，不落盘）。
+    fn one_skill(command: &str, description: &str) -> crate::skills::Catalogue {
+        use crate::skills::{Scope, SkillEntry};
+        crate::skills::catalogue(
+            vec![SkillEntry {
+                command: command.to_string(),
+                label: command.to_string(),
+                description: description.to_string(),
+                path: PathBuf::from(format!("/skills/{command}/SKILL.md")),
+                scope: Scope::User,
+                model_visible: true,
+                user_invocable: true,
+            }],
+            crate::skills::Budget::default(),
+        )
+    }
+
     /// 进程内唯一临时目录：**原子序号 + `process::id()`**（项目硬约定）。
     ///
     /// `SystemTime::as_nanos()` 在 macOS 只到微秒级，并行测试会撞名互删（血的教训）。
@@ -296,7 +374,7 @@ mod tests {
         let _env = no_global_prompt();
 
         let specs = vec![spec("read"), spec("write"), spec("edit"), spec("bash")];
-        let prompt = build_system_prompt(Path::new("/tmp"), &specs);
+        let prompt = build_system_prompt(Path::new("/tmp"), &specs, &no_skills());
 
         // 清单**逐字**按传入顺序渲染（保序由装配端保证，此处只锁定渲染形状）。
         let expected = "Available tools:\n\
@@ -329,7 +407,7 @@ mod tests {
         let reversed: Vec<&str> = EXPECTED_ORDER.iter().rev().copied().collect();
         for order in [EXPECTED_ORDER.to_vec(), reversed] {
             let specs: Vec<ToolSpec> = order.iter().map(|name| spec(name)).collect();
-            let prompt = build_system_prompt(Path::new("/tmp"), &specs);
+            let prompt = build_system_prompt(Path::new("/tmp"), &specs, &no_skills());
 
             assert_eq!(
                 listed_tool_names(&prompt),
@@ -436,6 +514,7 @@ mod tests {
         let with_web = build_system_prompt(
             Path::new("/tmp"),
             &[spec("read"), spec("websearch"), spec("webfetch")],
+            &no_skills(),
         );
         assert!(
             with_web.contains("- Use websearch for information outside the repository"),
@@ -456,7 +535,7 @@ mod tests {
             "webfetch 指引应告知带 prompt 的代价（多一次模型调用）；prompt = {with_web}"
         );
 
-        let without_web = build_system_prompt(Path::new("/tmp"), &[spec("read")]);
+        let without_web = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
         assert!(
             !without_web.contains("Use websearch"),
             "无 websearch 时不得出现其指引；prompt = {without_web}"
@@ -479,9 +558,153 @@ mod tests {
         std::fs::write(system_dir.join("SYSTEM.md"), "Custom system prompt").unwrap();
 
         let specs = vec![spec("read"), spec("bash")];
-        let prompt = build_system_prompt(&tmp, &specs);
+        let prompt = build_system_prompt(&tmp, &specs, &no_skills());
         assert_eq!(prompt, "Custom system prompt");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─────────────────────────── skill 目录段（M2） ───────────────────────────
+
+    /// **严格前缀不变量**（本设计可测的核心性质）：空 catalogue 的输出必须是任何
+    /// 非空 catalogue 输出的**逐字节前缀** —— 它是「同一台机器上先后两次启动，
+    /// 提示前缀稳定」的形式化（前缀稳定 ⇒ 二次启动的 KV cache 命中大部分）。
+    ///
+    /// 变异：把 skill 段插到 `Guidelines:` **之前**（或任何非末尾位置）⇒ 非空输出
+    /// 在中段多出内容，`starts_with` 立刻变红。
+    #[test]
+    fn skills_section_is_appended_at_the_tail_keeping_strict_prefix() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("skills_prefix");
+
+        let specs = vec![spec("read"), spec("bash")];
+        let bare = build_system_prompt(&dir, &specs, &no_skills());
+        let with_skills = build_system_prompt(&dir, &specs, &one_skill("git-status", "查看仓库状态"));
+
+        assert!(
+            with_skills.starts_with(&bare),
+            "空 catalogue 的输出必须是含 skill 输出的逐字节前缀；\nbare = {bare}\nwith = {with_skills}"
+        );
+        assert_ne!(bare, with_skills, "含 skill 时必须真的多出内容");
+        // 段确实在**最末尾**：提取出来的后缀就是整段。
+        let tail = &with_skills[bare.len()..];
+        assert!(
+            tail.starts_with("\n\n<available_skills>") && tail.ends_with("</available_skills>"),
+            "追加的段落形状不对：{tail}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 段的**内容契约**（设计 §CC 兼容性 偏离 3 / R7）：三句承重前言逐项在位。
+    ///
+    /// 变异：删掉「相对路径按 skill 目录解析」那句 ⇒ 下文断言变红（实测多条 skill
+    /// 正文按相对路径交叉引用兄弟 skill，缺了这句必然找不到）。
+    #[test]
+    fn skills_section_content_contract() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("skills_content");
+
+        let prompt = build_system_prompt(
+            &dir,
+            &[spec("read")],
+            &one_skill("arch-design", "多方案架构设计"),
+        );
+
+        // 条目逐字来自 `Catalogue.lines`（含 location —— 零工具路线的唯一线索）。
+        assert!(
+            prompt.contains("- arch-design: 多方案架构设计 (location: /skills/arch-design/SKILL.md)"),
+            "skill 行应逐字来自 catalogue.lines；prompt = {prompt}"
+        );
+        assert!(prompt.contains("with the read tool"), "须指出用 read 打开");
+        assert!(
+            prompt.contains("relative to that skill's own directory"),
+            "须说明正文里的相对路径按 skill 自身目录解析"
+        );
+        assert!(
+            prompt.contains("no subagents") && prompt.contains("no plan mode"),
+            "须声明能力边界（正文里的 Claude 专有工具名在本 runtime 失效）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **门控**：无 `read` 工具（skill 正文加载不了）或目录为空时**一字不加**。
+    ///
+    /// 后半条尤其承重：空目录若留下一个空行，前缀不变量的「逐字节」也就破了。
+    ///
+    /// 变异：删掉 `!catalogue.lines.is_empty()` ⇒ 后半条断言变红（多出 `\n\n`）。
+    #[test]
+    fn skills_section_is_gated_on_read_tool_and_non_empty_lines() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("skills_gate");
+
+        // ① 没有 `read` ⇒ 即便有目录也不追加。
+        let without_read =
+            build_system_prompt(&dir, &[spec("bash")], &one_skill("git-status", "状态"));
+        assert!(
+            !without_read.contains("<available_skills>"),
+            "无 read 工具时不该注入 skill 目录；prompt = {without_read}"
+        );
+
+        // ② 有 `read` 但目录为空 ⇒ 输出与「完全不加 skill 段」逐字相同（无多余空行）。
+        let empty = build_system_prompt(&dir, &[spec("read")], &no_skills());
+        assert!(
+            empty.ends_with(&format!("Current working directory: {}", dir.display())),
+            "空目录时不得留下空行或空段；prompt = {empty:?}"
+        );
+        assert!(!empty.contains("available_skills"), "prompt = {empty:?}");
+
+        // ③ 有 `read` 且有目录 ⇒ 追加。
+        let with = build_system_prompt(&dir, &[spec("read")], &one_skill("git-status", "状态"));
+        assert!(with.contains("<available_skills>"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `has_custom_prompt` 的真/假两态（供 `main` 的启动期提示判定）。
+    #[test]
+    fn has_custom_prompt_reports_both_states() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("has_custom");
+
+        assert!(!has_custom_prompt(&dir), "无 SYSTEM.md ⇒ false");
+
+        let system_dir = dir.join(".yushan");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        std::fs::write(system_dir.join("SYSTEM.md"), "Custom").unwrap();
+        assert!(has_custom_prompt(&dir), "有 .yushan/SYSTEM.md ⇒ true");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自定义 prompt 短路**优先于** skill 注入：即便目录非空，也逐字返回该文件。
+    ///
+    /// 变异：把 skill 追加挪到 `find_custom_prompt` 短路**之前** ⇒ 本用例变红
+    /// （用户全权接管的契约被破坏）。
+    #[test]
+    fn custom_prompt_short_circuit_ignores_non_empty_catalogue() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("custom_skills");
+        let system_dir = dir.join(".yushan");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        std::fs::write(system_dir.join("SYSTEM.md"), "Custom system prompt").unwrap();
+
+        let prompt = build_system_prompt(
+            &dir,
+            &[spec("read")],
+            &one_skill("git-status", "查看仓库状态"),
+        );
+        assert_eq!(
+            prompt, "Custom system prompt",
+            "自定义 prompt 命中时不得追加 skill 段（既有契约逐字保留）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

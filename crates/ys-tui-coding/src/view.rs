@@ -24,6 +24,20 @@ pub struct ProviderEntry {
     pub api_base: String,
 }
 
+/// 一个已知 skill（`/` 补全浮层的候选 + `/status` 可列举项）。
+///
+/// `command` 是**目录名**（也就是 `/` 后要敲的那个词），`label` 是 frontmatter
+/// 里的 `name`（**仅用于显示**，与 `command` 可以不同）。UI 不解析 skill 目录 ——
+/// 它只消费 app 侧扫描好的这份快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillEntry {
+    /// 目录名 —— `/` 命令名。
+    pub command: String,
+    /// frontmatter `name`（仅显示）。
+    pub label: String,
+    pub description: String,
+}
+
 /// coding agent 的显示快照。
 #[derive(Clone, Debug)]
 pub struct CodingView {
@@ -44,6 +58,10 @@ pub struct CodingView {
     /// 会话历史条数（含 pending）。
     pub message_count: usize,
     pub tools: Vec<String>,
+    /// 已知 skill（供 `/` 补全浮层列举；同时供 `/status` 显示条数）。
+    pub skills: Vec<SkillEntry>,
+    /// 因整表字节预算被收起的 skill 条数（`/status` 可见；默认预算下恒为 0）。
+    pub skills_omitted: usize,
     pub context_window: Option<usize>,
     pub session_path: Option<PathBuf>,
     /// 首次运行（无 `auth.json` 凭证）—— 用于欢迎语。
@@ -65,6 +83,8 @@ impl Default for CodingView {
             session_started: Instant::now(),
             message_count: 0,
             tools: Vec::new(),
+            skills: Vec::new(),
+            skills_omitted: 0,
             context_window: None,
             session_path: None,
             is_first_run: true,
@@ -127,6 +147,23 @@ impl CodingView {
             session_started: Instant::now(),
             message_count: 0,
             tools: vec!["read".into(), "write".into()],
+            // 两条 skill：`command` 与 `label` 故意不同 —— 覆盖「补全用目录名、
+            // 显示用 frontmatter name」两条路径。
+            skills: vec![
+                SkillEntry {
+                    command: "commit".into(),
+                    label: "Git Commit".into(),
+                    description: "生成一条提交信息".into(),
+                },
+                SkillEntry {
+                    command: "review".into(),
+                    label: "Code Review".into(),
+                    description: "审查当前改动".into(),
+                },
+            ],
+            // 非零值：`/status` 里「有 skill 被预算收起」那一行能被测试走到
+            // （默认预算下真实运行恒为 0）。
+            skills_omitted: 3,
             context_window: Some(65_536),
             session_path: None,
             is_first_run: false,
@@ -195,5 +232,42 @@ mod tests {
         let v = CodingView::default();
         assert!(!v.provider_needs_api_base_url("custom"));
         assert!(v.provider_names().is_empty());
+    }
+
+    /// `Default` 的中性值：没有 skill，也没有被收起的 skill。
+    #[test]
+    fn test_default_view_has_no_skills() {
+        let v = CodingView::default();
+        assert!(v.skills.is_empty(), "Default 无 skill");
+        assert_eq!(v.skills_omitted, 0, "默认预算下无收起");
+    }
+
+    /// `for_test` 字段齐全：两条 skill 的 `command`/`label` 分属两个词表，
+    /// 且 `skills_omitted` 非零（让 `/status` 的「已收起 N 条」那行有数据可测）。
+    #[test]
+    fn test_for_test_view_carries_skills() {
+        let v = CodingView::for_test();
+        assert_eq!(v.skills.len(), 2, "两条构造 skill");
+        assert_eq!(v.skills[0].command, "commit");
+        assert_eq!(v.skills[0].label, "Git Commit", "label ≠ command");
+        assert_eq!(v.skills[1].command, "review");
+        assert_eq!(v.skills_omitted, 3, "非零：覆盖「已收起」显示路径");
+    }
+
+    /// `SkillEntry` 可比较（`/` 补全去重与测试断言都靠它）。
+    #[test]
+    fn test_skill_entry_equality() {
+        let a = SkillEntry {
+            command: "commit".into(),
+            label: "Git Commit".into(),
+            description: "d".into(),
+        };
+        assert_eq!(a.clone(), a);
+        let b = SkillEntry {
+            command: "commit".into(),
+            label: "Committing".into(),
+            description: "d".into(),
+        };
+        assert_ne!(a, b, "label 不同即不等");
     }
 }

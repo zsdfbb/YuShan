@@ -2,7 +2,7 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-**当前状态**：`cargo test --workspace` 全绿 —— **731 passed**（1 个 e2e 需真实凭证，`#[ignore]`）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）。
+**当前状态**：`cargo test --workspace` 全绿 —— **809 passed / 0 failed / 7 ignored**（7 条 `#[ignore]` = 4 条 `tools-web` 的人工采集 + 2 条 coding-agent e2e（`e2e_tools` / `e2e_skills`，需真实凭证）+ 1 条 doc-test）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）、**skills 支持**（`SKILL.md` 启动期扫描 + 自写 frontmatter 解析，零新依赖；`<available_skills>` 常驻系统提示 + `/skill-name` 展开；**零新工具 / 零新协议变体**；顺带修正压缩触发对固定开销的盲区，as-built 见 `docs/design-final/skills.md`）。
 
 ## 目录结构
 
@@ -34,8 +34,9 @@ YuShan/
 │       │   ├── logging.rs         # 极简日志文件 ~/.yushan/logs/yushan.log（库内部诊断的落处）
 │       │   ├── config.rs          # Config + ProviderRegistry 持有 + model factory
 │       │   ├── provider.rs        # ProviderRegistry：provider 目录、auth.json、/v1/models、ProviderCompat
-│       │   ├── prompt.rs          # 系统提示词构建
-│       │   ├── view.rs            # CodingView 显示快照构建（唯一显示数据源）
+│       │   ├── prompt.rs          # 系统提示词构建（末尾追加 <available_skills> 段 + has_custom_prompt）
+│       │   ├── skills.rs          # skill 领域逻辑（唯一新模块）：扫描 / frontmatter 子集解析 / catalogue 归一 / load_body / expand_invocation / escape_xml；纯数据、不 print
+│       │   ├── view.rs            # CodingView 显示快照构建（唯一显示数据源）；在此过滤 user_invocable:false
 │       │   ├── state.rs           # state.json（last_active_provider / model）
 │       │   ├── status.rs          # TurnStats 累计
 │       │   ├── toolset.rs         # 唯一装配接缝：探测 rg/fd 一次 + 建工具表 + 降级提示
@@ -44,6 +45,8 @@ YuShan/
 │           ├── integration.rs         # 工具层集成（MockModel，无网络）
 │           ├── degraded_search.rs     # CLI 降级路径（受限 PATH → stderr 有提示 + stdout 为空）
 │           ├── stream_usage_fallback.rs # 流式 usage 门控与 400 回退
+│           ├── skills_cli.rs          # skill 诊断的 CLI 去向（-p/--json → stderr；stdout 纯净）
+│           ├── e2e_skills.rs          # R8 对账：真实 usage 差 vs 静态估算（#[ignore]，未校准）
 │           └── e2e_tools.rs           # 真实 API 端到端（#[ignore]）
 ├── docs/
 │   ├── design.md              # 总体设计（原则、crate 划分、核心 trait、Hook/Event 边界、路线图、测试矩阵）
@@ -60,14 +63,17 @@ YuShan/
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（731 passed）
+- `cargo test --workspace` — 全量测试（809 passed / 7 ignored）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr
 - `cargo test -p ys-coding-agent e2e -- --ignored --nocapture` — 端到端（需 `YUSHAN_API_BASE` + `YUSHAN_API_KEY`）
+- `cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture` — **R8 对账**（skill 目录段的真实 input token 成本；`#[ignore]`，**尚未校准**，需同上凭证）
 
 环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）；`YUSHAN_SEARCH_SEARXNG_URL` / `YUSHAN_SEARCH_TAVILY_KEY` / `YUSHAN_SEARCH_BOCHA_KEY` / `YUSHAN_SEARCH_FIRECRAWL_KEY`（搜索后端，**四家均需配置**才进链）；`YUSHAN_FETCHED_DIR`（webfetch 落盘目录覆盖，须为**绝对路径**，测试用）。
+
+**skills 没有任何环境变量**（D2′：不开路径配置项）—— 扫描根恒为 `[<cwd>/.yushan/skills, <home>/.yushan/skills]`，由 `Config::default_skill_roots` 唯一给出，**顺序即优先级**（`roots[0]` = 项目级）。
 
 ## 核心模型（理解本项目的关键）
 
@@ -176,10 +182,11 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 | `wiring` | **接线器**：持有 `model` + `session` + `events`，`ports()` 产出 `AgentPorts`（boundary 由 app 循环每回合传入）；`/new` / `set_model` / `session_messages` |
 | `channel` | `ChannelSink`：有界 mpsc + overflow 缓冲 + `begin_turn` + 背压统计（`format_stats`） |
 | `logging` | 极简日志文件 `~/.yushan/logs/yushan.log`（库内部诊断 + app 循环异常，best-effort、不引依赖） |
-| `config` | Config 结构体，持有 ProviderRegistry + model factory，管理运行时配置 |
+| `config` | Config 结构体，持有 ProviderRegistry + model factory，管理运行时配置；`default_skill_roots`（`[project, user]`，**顺序即语义**）/ `load_skills` / `skills` + `skills_omitted` |
 | `provider` | ProviderRegistry：内置 provider 目录、auth.json 持久化（`~/.yushan/`）、**启动期**并发 GET /v1/models 填缓存（`refresh_models` → `models_for_provider` / `provider_for_model`）、ProviderCompat 映射 |
-| `prompt` | 系统提示词构建 |
-| `view` | `build_view` → `CodingView` 显示快照（provider/model/tokens/turn_count/session/cwd/tools/available_models…），唯一显示数据源；`available_models` = 所有已登录 provider 的模型并集 + 当前在跑的模型 |
+| `prompt` | 系统提示词构建；末尾追加 `<available_skills>`（门控：有 `read` 且目录非空），自定义 `SYSTEM.md` 短路时不注入（`has_custom_prompt` 供启动期提示） |
+| `skills` | **skill 领域逻辑**（唯一新模块）：扫描（显式 roots，位置判 scope）/ frontmatter 子集解析（自写、零依赖）/ `catalogue` 归一（project > user 整条替换 + 按 `command` 升序 + 字节预算安全阀）/ `load_body`（有界读、剥 frontmatter、不缓存）/ `expand_invocation` / `escape_xml`；**纯数据、不 print、不读 env** |
+| `view` | `build_view` → `CodingView` 显示快照（provider/model/tokens/turn_count/session/cwd/tools/skills/available_models…），唯一显示数据源；`available_models` = 所有已登录 provider 的模型并集 + 当前在跑的模型；skill 只透传三个显示字段并**在此过滤 `user_invocable: false`** |
 | `state` | state.json（last_active_provider / model） |
 | `status` | `TurnStats` 累计 |
 
@@ -198,6 +205,7 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 - 数据/显示分离：`build_view` 是唯一显示数据源快照；`App`（`ys-tui-coding`）管 UI 交互状态
 - **`/login` 的 api_base 不再交互填**：协议只带 provider + api_key，api_base 从 provider 内置值解析，回退 `YUSHAN_API_BASE`；`custom` provider 需靠环境变量（见 `docs/design-final/coding-agent-tui.md` §8 M3）
 - **`/model` 无参浮层的候选在启动期备齐**：`run_interactive` 在**起屏之前**对每个已登录 provider 并发拉 `/v1/models`（5s 超时，失败静默回退静态表）—— 起屏后一次重绘都不发 HTTP（设计 M4）。候选是**所有已登录 provider** 的并集 + 当前在跑的模型；选中别家的模型时 `capabilities::set_model` 会**连端点一起切**（`provider_for_model` 定归属，见 M9）
+- **`/skill-name`（skill 通路）**：TUI **只认名、不读盘**（`commands::parse_with_skills` 未命中内置表才查 `view.skills`，命中即发**原文** `Request::Prompt`）；正文在 **app 侧** `app_loop::expand_skill_invocation` 读盘并展开成 `<skill name="…" location="…">正文</skill>`（**回合启动路径不分叉**，`-p`/`--json` 走 `main::expand_task` 的同一套）。**硬序：内置命令 > skill**（三处各钉一次：`parse`、补全、事件层）。**零新工具**（正文由既有 `read` 加载）、**零新协议变体**
 
 ## 硬性约束
 
@@ -243,6 +251,7 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 | **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）+ `docs/design-final/core-channel.md`（核心信道第一刀，部分已被上文取代，见其 §8） |
 | 搜索工具的 as-built | `docs/design-final/search-tools.md` |
 | web 工具的 as-built | `docs/design-final/tools-web.md` |
+| **skills 的 as-built**（含与设计的 12 条偏差） | `docs/design-final/skills.md`；设计 `docs/arch/skills/design.md`、决策 `docs/adr/0019-skills.md`、计划 `docs/design-plans/2026-09-21-skills.md` |
 | coding agent TUI 的设计推导与质量分析 | `docs/arch/coding-agent-tui/{design,review}.md`；已作废的前身 `docs/arch/coding-agent-tui/tui-repl-context.md` |
 | 核心信道的设计推导与质量分析 | `docs/arch/gap-closure/{context,design-core-channel,review}.md` |
 | 各 crate 的 API 和实现细节 | 对应 crate 的 `src/lib.rs` |

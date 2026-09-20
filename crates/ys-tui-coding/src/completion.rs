@@ -1,12 +1,20 @@
 //! 补全浮层 —— Tab 触发、↑↓ 选择、Tab/Enter 填入、Esc 关闭（设计 §2.4）。
 //!
-//! **条目直接从命令表派生**（[`crate::commands::all_commands`]）：浮层里
-//! 看得见的命令与 `parse` 认识的命令是同一张表，结构上不可能漂移。
+//! **候选有两段来源，与 [`crate::commands::parse_with_skills`] 同源、同硬序**：
+//!
+//! ```text
+//! 内置命令表（all_commands，顺序即表序）  →  在前
+//! CodingView.skills（按 command 升序）   →  在后
+//! ```
+//!
+//! 「内置 > skill」在补全面也成立：`command` 与内置命令同名的 skill **不进候选**
+//! （否则浮层会出现两行一模一样的 `/status`，而敲下去走的必然是内置那条）。
 //!
 //! 浮层本身「盖在 Chat 上、不参与布局高度计算」的渲染在 `draw.rs`
 //! （[`crate::draw`]），本模块只负责**候选集与选中态**这类纯逻辑。
 
 use crate::commands::{CommandSpec, all_commands, spec_line};
+use crate::view::SkillEntry;
 
 /// 一个补全候选项。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,30 +69,89 @@ pub fn item_for(spec: &CommandSpec) -> CompletionItem {
     }
 }
 
-/// 全部候选条目（= 全部命令），顺序与 [`all_commands`] 一致。
+/// 一条 skill → 一个候选项。
+///
+/// 显示 `<command>  — <description>`：**这里列 description 是有意的** ——
+/// 浮层是「挑一条来用」的面，描述正是挑的依据（`/help` 那个面才只列名字，
+/// 见 [`crate::commands::help_text_with_skills`]）。宽度由浮层的
+/// `truncate_to_width` + `COMPLETION_MAX_WIDTH` 兜住。
+pub fn skill_item_for(skill: &SkillEntry) -> CompletionItem {
+    CompletionItem {
+        display: format!("/{}  — {}", skill.command, skill.description),
+        // 尾随空格：接着敲参数（与内置命令同形）
+        replacement: format!("/{} ", skill.command),
+    }
+}
+
+/// skill 段的候选项：按 `command` **升序**，且**排除与内置命令同名的**。
+///
+/// `bare` 是**不含前导 `/`** 的前缀（`""` = 全部）。
+fn skill_items(skills: &[SkillEntry], bare: &str) -> Vec<CompletionItem> {
+    let mut picked: Vec<&SkillEntry> = skills
+        .iter()
+        .filter(|s| s.command.starts_with(bare))
+        // 内置命令 > skill：同名的 skill 进不了浮层（它敲下去也永远走不到）
+        .filter(|s| !all_commands().iter().any(|c| c.name == s.command))
+        .collect();
+    picked.sort_by(|a, b| a.command.cmp(&b.command));
+    picked.into_iter().map(skill_item_for).collect()
+}
+
+/// 全部候选条目（= 全部内置命令），顺序与 [`all_commands`] 一致。
+///
+/// **不含 skill** —— 等价于 [`entries_with_skills`]`(&[])`。
 pub fn entries() -> Vec<CompletionItem> {
-    all_commands().iter().map(item_for).collect()
+    entries_with_skills(&[])
+}
+
+/// 全部候选条目：**内置命令（在前）+ skill（在后，按 `command` 升序）**。
+pub fn entries_with_skills(skills: &[SkillEntry]) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = all_commands().iter().map(item_for).collect();
+    items.extend(skill_items(skills, ""));
+    items
 }
 
 /// 按前缀过滤（`prefix` 是**含前导 `/`** 的第一个词，如 `"/mo"`）。
 ///
-/// `"/"` → 全部；`"/zzz"` → 空。
+/// `"/"` → 全部；`"/zzz"` → 空。**不含 skill** —— 等价于
+/// [`matches_with_skills`]`(prefix, &[])`。
+///
+/// 保留的薄包装：生产路径（`events.rs` 的 Tab 与 `draw.rs`）已统一走 `_with_skills`
+/// 变体，本函数只剩既有测试在用 —— 但它与 [`entries`] / [`open`] 同为一组，
+/// 是「无 skill 的调用形式」，**不删**。
+#[allow(dead_code)]
 pub fn matches(prefix: &str) -> Vec<CompletionItem> {
+    matches_with_skills(prefix, &[])
+}
+
+/// 按前缀过滤内置命令 + skill（顺序同 [`entries_with_skills`]）。
+pub fn matches_with_skills(prefix: &str, skills: &[SkillEntry]) -> Vec<CompletionItem> {
     let bare = prefix.strip_prefix('/').unwrap_or(prefix);
-    all_commands()
+    let mut items: Vec<CompletionItem> = all_commands()
         .iter()
         .filter(|spec| spec.name.starts_with(bare))
         .map(item_for)
-        .collect()
+        .collect();
+    items.extend(skill_items(skills, bare));
+    items
 }
 
 /// 尝试打开浮层：输入必须 `/` 开头且至少命中一条命令，否则 `None`（Tab 无效）。
+///
+/// **不含 skill** —— 等价于 [`open_with_skills`]`(input, &[])`。保留的薄包装：
+/// 生产路径（`events.rs` 的 Tab）已走 `open_with_skills`，本函数只剩既有测试在用。
+#[allow(dead_code)]
 pub fn open(input: &str) -> Option<CompletionState> {
+    open_with_skills(input, &[])
+}
+
+/// 同 [`open`]，但候选里带上 skill（设计与 [`crate::commands::parse_with_skills`] 同源）。
+pub fn open_with_skills(input: &str, skills: &[SkillEntry]) -> Option<CompletionState> {
     if !input.starts_with('/') {
         return None;
     }
     let token = input.split_whitespace().next().unwrap_or("");
-    let items = matches(token);
+    let items = matches_with_skills(token, skills);
     if items.is_empty() {
         return None;
     }
@@ -214,5 +281,127 @@ mod tests {
         state.move_down();
         assert_eq!(state.selected, 0);
         assert!(state.current().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // skill 候选（与 `parse_with_skills` 同源、同硬序）
+    // -----------------------------------------------------------------------
+
+    fn skill(command: &str, description: &str) -> SkillEntry {
+        SkillEntry {
+            command: command.into(),
+            label: command.into(),
+            description: description.into(),
+        }
+    }
+
+    /// 内置在前、skill 在后，且 skill 段按 `command` **升序**（与传入顺序无关）。
+    ///
+    /// 变异：把 skill 段 `extend` 到内置之前 ⇒ 本测试变红。
+    #[test]
+    fn test_entries_with_skills_orders_builtin_first_then_sorted_skills() {
+        let skills = [skill("zeta", "z"), skill("alpha", "a"), skill("mid", "m")];
+        let items = entries_with_skills(&skills);
+        let builtin_len = all_commands().len();
+        assert_eq!(items.len(), builtin_len + 3);
+
+        for (i, spec) in all_commands().iter().enumerate() {
+            assert_eq!(
+                items[i].replacement,
+                format!("/{} ", spec.name),
+                "内置段保持表序"
+            );
+        }
+        let skill_section: Vec<&str> = items[builtin_len..]
+            .iter()
+            .map(|i| i.replacement.as_str())
+            .collect();
+        assert_eq!(
+            skill_section,
+            vec!["/alpha ", "/mid ", "/zeta "],
+            "skill 段按 command 升序"
+        );
+
+        let one = entries_with_skills(&[skill("alpha", "甲")]);
+        assert_eq!(one[builtin_len].display, "/alpha  — 甲");
+        assert_eq!(one[builtin_len].replacement, "/alpha ");
+    }
+
+    /// 与内置命令同名的 skill **不进候选**（「内置命令 > skill」在补全面同样成立）。
+    ///
+    /// 变异：去掉 `skill_items` 里的同名过滤 ⇒ 浮层出现两行 `/status`，本测试变红。
+    #[test]
+    fn test_skill_shadowed_by_builtin_is_not_offered() {
+        let skills = [skill("status", "想遮蔽 /status"), skill("zeta", "z")];
+        let items = entries_with_skills(&skills);
+        assert_eq!(items.len(), all_commands().len() + 1, "同名 skill 被吃掉");
+        assert_eq!(
+            items.iter().filter(|i| i.replacement == "/status ").count(),
+            1
+        );
+        assert!(items.iter().any(|i| i.replacement == "/zeta "));
+    }
+
+    /// `matches_with_skills` 两段都按前缀过滤。
+    #[test]
+    fn test_matches_with_skills_filters_both_sections() {
+        let skills = [skill("commit", "提交"), skill("compact-notes", "笔记")];
+        let got: Vec<String> = matches_with_skills("/co", &skills)
+            .into_iter()
+            .map(|i| i.replacement)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["/copy ", "/compact ", "/commit ", "/compact-notes "],
+            "内置（表序）在前，skill（升序）在后"
+        );
+
+        let only: Vec<String> = matches_with_skills("/commit", &skills)
+            .into_iter()
+            .map(|i| i.replacement)
+            .collect();
+        assert_eq!(only, vec!["/commit "], "只有 skill 命中时也返回");
+        assert!(matches_with_skills("/zzz", &skills).is_empty());
+    }
+
+    /// `open_with_skills`：skill 命中也能开浮层；无命中仍 `None`（Tab 无效）。
+    #[test]
+    fn test_open_with_skills_hits_and_misses() {
+        let skills = [skill("git-status", "看仓库状态")];
+        assert!(
+            open_with_skills("hello", &skills).is_none(),
+            "非 / 开头不补全"
+        );
+        assert!(
+            open_with_skills("/zzz", &skills).is_none(),
+            "无命中不开浮层"
+        );
+
+        let state = open_with_skills("/git", &skills).expect("skill 命中即开浮层");
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].replacement, "/git-status ");
+        assert_eq!(state.items[0].display, "/git-status  — 看仓库状态");
+        assert_eq!(state.selected, 0);
+
+        assert!(
+            open_with_skills("/git-status x", &skills).is_some(),
+            "只看第一个词"
+        );
+    }
+
+    /// 薄包装的正确性：`entries` / `matches` / `open` ≡ 各自的 `_with_skills(.., &[])`。
+    #[test]
+    fn test_legacy_wrappers_equal_empty_skills_variants() {
+        assert_eq!(entries(), entries_with_skills(&[]));
+        for prefix in ["/", "/m", "/mo", "/zzz", "mo"] {
+            assert_eq!(
+                matches(prefix),
+                matches_with_skills(prefix, &[]),
+                "前缀 `{prefix}`"
+            );
+        }
+        for input in ["/", "/mo", "/model ", "/zzz", "hello", ""] {
+            assert_eq!(open(input), open_with_skills(input, &[]), "输入 `{input}`");
+        }
     }
 }

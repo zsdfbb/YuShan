@@ -43,6 +43,7 @@
 use std::time::Instant;
 
 use tokio::sync::mpsc;
+use ys_core::{ContentBlock, Message, Role};
 use ys_loop::AgentInput;
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
@@ -98,6 +99,12 @@ pub async fn run(
 
         match req {
             Request::Prompt(message) => {
+                // **`/skill-name` 展开**（唯一的 skill 接线点，设计 §选择理由 B）：
+                // 复用 `Request::Prompt` 而**不加协议变体** —— 展开型命令与纯文本输入
+                // 走**同一条**回合启动路径（下面的 `turns += 1` / `set_context_window` /
+                // `run_turn` 一字未动）。位置必须在 `turns += 1` 之前：展开后的正文才是
+                // 本回合真正的输入。
+                let message = expand_skill_invocation(message, &config.skills);
                 turns += 1;
                 // **每回合刷新 context window**（唯一调用点，结构上不可能漏）。
                 //
@@ -208,6 +215,48 @@ pub async fn run(
             session_started,
         );
         send(&out_tx, Outbound::View(view)).await?;
+    }
+}
+
+/// 展开 `/skill-name <args>`：命中已知 skill 时把消息**重写**为带正文的信封
+/// （`<skill name="…" location="…">正文</skill>`），否则**原样返回**。
+///
+/// # 为什么是「重写整条消息」而不是追加
+///
+/// 设计 §选择理由 B：TUI **不读盘**、也不持 frontmatter 逻辑，它只「认名」并发一条
+/// 原文的 `Request::Prompt("/name args")`；正文由 app 侧在这里读盘注入。形态与
+/// Claude Code 注入的 user 消息一致（设计 §CC 兼容性 采纳表）。
+///
+/// # 三个「不」
+///
+/// - 首块**不是 `Text`**（例如带图/多块消息）⇒ 不展开（只认纯文本首块的 `/` 命名空间）。
+/// - 未知命令 / `user-invocable: false` / 正文读不出来 ⇒ `expand_invocation` 返回
+///   `None` ⇒ 原样返回（宁可发一条普通消息，也不塞半截指令）。
+/// - **不缓存**正文：skill 目录可写（agent 会往里写文件），缓存会给出陈旧指令。
+fn expand_skill_invocation(message: Message, skills: &[crate::skills::SkillEntry]) -> Message {
+    let Some(text) = first_text(&message) else {
+        return message;
+    };
+    match crate::skills::expand_invocation(&text, skills) {
+        Some(expanded) => {
+            logging::log(&format!(
+                "skill invocation expanded ({} bytes) for this turn",
+                expanded.len()
+            ));
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: expanded }],
+            }
+        }
+        None => message,
+    }
+}
+
+/// 首块是 `Text` 则取其文本（owned，避免与「移动 `message`」冲突）。
+fn first_text(message: &Message) -> Option<String> {
+    match message.content.first() {
+        Some(ContentBlock::Text { text }) => Some(text.clone()),
+        _ => None,
     }
 }
 
@@ -1060,5 +1109,139 @@ mod tests {
             vec![StopReason::Completed],
             "残留的 Abort 不该影响本回合：{msgs:?}"
         );
+    }
+
+    // ─────────────────── `/skill-name` 展开（T12，唯一接线点） ───────────────────
+
+    /// **命中 `/<已知 skill>` ⇒ 正文进上下文**：Agent 侧第 1 轮的 `ModelRequest` 里
+    /// 那条 user 消息必须含 SKILL.md 正文（`<skill …>` 信封形态），且**不含
+    /// frontmatter**（`load_body` 已剥）；参数原样保留在尾部。
+    ///
+    /// 这条同时钉住**位置**：展开发生在 `turns += 1` / `run_turn` **之前** ——
+    /// 若挪到 `run_turn` 之后（或压根没接），首轮请求里就只有原文 `/git-status …`。
+    #[tokio::test]
+    async fn prompt_with_known_skill_is_expanded_into_the_turn_input() {
+        let (model, mut probe) = probe_model(ProbePlan::ToolCallThenFinal);
+        let mut h =
+            spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
+                let root = tmp.join("skills");
+                let dir = root.join("git-status");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("SKILL.md"),
+                    "---\nname: git-status\ndescription: 仓库状态\n---\n正文第一行\n正文第二行\n",
+                )
+                .unwrap();
+                config.load_skills(&[root]);
+                assert_eq!(config.skills.len(), 1, "测试前提：恰好扫到一条 skill");
+            })
+            .await;
+
+        h.requests
+            .send(prompt("/git-status 现在改了什么"))
+            .await
+            .unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let requests = probe.requests();
+        assert!(!requests.is_empty(), "应至少有一次 model 调用");
+        let first = &requests[0];
+        assert!(
+            has_text(first, "<skill name=\"git-status\""),
+            "首轮请求必须已带上 skill 信封：{first:?}"
+        );
+        assert!(has_text(first, "正文第一行"), "{first:?}");
+        assert!(has_text(first, "正文第二行"), "{first:?}");
+        assert!(
+            has_text(first, "现在改了什么"),
+            "`/name` 之后的参数必须原样保留在尾部：{first:?}"
+        );
+        assert!(
+            !has_text(first, "description:"),
+            "正文已剥掉 frontmatter（`load_body` 的契约）：{first:?}"
+        );
+    }
+
+    /// **负例逐字节不变**：非 skill 文本、未知命令、`/` 不在首位、无 skill 配置、
+    /// 首块不是文本 —— 五种情形下消息**一字不改**。
+    ///
+    /// 变异：把 `expand_skill_invocation` 的 `None => message` 改成无条件重写
+    /// （例如给原文套一层信封）⇒ 本用例逐条变红。
+    #[test]
+    fn non_skill_text_is_passed_through_verbatim() {
+        use crate::skills::{Scope, SkillEntry};
+
+        let root = temp_dir_for("expand");
+        let dir = root.join("git-status");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\ndescription: 状态\n---\n正文\n",
+        )
+        .unwrap();
+        let (skills, _) = crate::skills::scan(&[root.clone()]);
+        assert_eq!(skills.len(), 1);
+
+        for text in [
+            "普通消息",
+            "看看 /git-status 怎么用",   // `/` 不在首位
+            "/unknown-skill 参数",       // 不命中
+            "git-status",                // 无前导 `/`
+            "/",                         // 光一个斜杠
+        ] {
+            let msg = user_message(text);
+            assert_eq!(
+                expand_skill_invocation(msg.clone(), &skills),
+                msg,
+                "非 skill 调用必须逐字节不变：{text:?}"
+            );
+        }
+
+        // 有 skill 表但**没有任何 skill**（启动期扫描为空）⇒ 同样不变。
+        let msg = user_message("/git-status");
+        assert_eq!(expand_skill_invocation(msg.clone(), &[]), msg);
+
+        // 首块不是 `Text` ⇒ 不展开（只认纯文本首块的 `/` 命名空间）。
+        let tool_first = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_call_id: ToolCallId("c1".into()),
+                content: "/git-status".into(),
+                is_error: false,
+            }],
+        };
+        assert_eq!(expand_skill_invocation(tool_first.clone(), &skills), tool_first);
+
+        // `user-invocable: false` 的 skill：`/` 不认（`expand_invocation` 的契约）。
+        let model_only = SkillEntry {
+            command: "model-only".into(),
+            label: "model-only".into(),
+            description: "只给模型".into(),
+            path: root.join("model-only/SKILL.md"),
+            scope: Scope::User,
+            model_visible: true,
+            user_invocable: false,
+        };
+        let msg = user_message("/model-only");
+        assert_eq!(expand_skill_invocation(msg.clone(), &[model_only]), msg);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 临时目录（含进程内原子序号 + pid；调用方负责删除）。
+    fn temp_dir_for(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "yushan_app_loop_skill_{tag}_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

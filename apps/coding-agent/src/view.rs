@@ -90,6 +90,32 @@ pub fn build_view(
         session_started,
         message_count: wiring.session_messages().len(),
         tools: agent.tool_names(),
+        // skill 候选：**只透传三个显示字段**（`command` / `label` / `description`）。
+        // 路径与正文是 app 侧的事（`/skill-name` 的正文由 app 读盘后进 transcript），
+        // TUI 不读盘 —— 数据/显示分离。
+        //
+        // **准入过滤发生在这里**：`config.skills` 保留全部条目（含 `user_invocable:
+        // false` 的「只给模型」skill —— `expand_invocation` 自己会判），但**下发给
+        // TUI 的只有可被用户调用的那些**。设计契约：`user-invocable: false` ⇒ 只给
+        // 模型、不给用户敲，不得出现在 `/` 补全、`/help`、`/status`。
+        //
+        // 为什么过滤落在 app 侧：`ys_tui_coding::SkillEntry` 刻意只有三个显示字段，
+        // 不携带 `user_invocable`（数据/显示分离，UI 不做准入决策）。若不过滤，不可
+        // 调用的 skill 会出现在候选里，用户敲下它时 `expand_invocation` 拒绝展开，
+        // 整条消息**原样发回模型** —— 静默降级。
+        skills: cfg
+            .skills
+            .iter()
+            .filter(|s| s.user_invocable)
+            .map(|s| ys_tui_coding::SkillEntry {
+                command: s.command.clone(),
+                label: s.label.clone(),
+                description: s.description.clone(),
+            })
+            .collect(),
+        // R3 的可见性出口：预算安全阀把一部分 skill 从**模型**目录里收起时，
+        // 用户仍要在 `/status` 看得见（默认预算下恒为 0）。
+        skills_omitted: cfg.skills_omitted,
         context_window: Some(agent.context_window()),
         session_path: wiring.session_path().map(ToOwned::to_owned),
         // 首次运行 = 没有任何 auth 且没有 state.json（欢迎语用）。
@@ -402,6 +428,151 @@ mod tests {
             !view.available_models.contains(&"deepseek-chat".to_string()),
             "有目录时不得再掺静态条目：{:?}",
             view.available_models
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **skill 透传（T11）**：`cfg.skills` → `CodingView.skills`（顺序与内容一致），
+    /// `cfg.skills_omitted` 原样进 `skills_omitted`；且**路径不外泄**（TUI 只拿三个
+    /// 显示字段，正文由 app 侧读盘）。
+    ///
+    /// 变异：把映射写成 `skills: Vec::new()`（忘了接）⇒ 前两条断言变红。
+    #[test]
+    fn test_build_view_passes_skills_and_omitted_count() {
+        use crate::skills::{Scope, SkillEntry};
+
+        let dir = temp_dir("skills");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.cwd = PathBuf::from("/tmp/proj");
+        // 刻意**逆序**喂入：透传必须保序（顺序归 `catalogue` 管，`build_view` 不重排）。
+        cfg.skills = vec![
+            SkillEntry {
+                command: "zeta".into(),
+                label: "Z 标签".into(),
+                description: "Z 描述".into(),
+                path: PathBuf::from("/secret/zeta/SKILL.md"),
+                scope: Scope::User,
+                model_visible: true,
+                user_invocable: true,
+            },
+            SkillEntry {
+                command: "alpha".into(),
+                label: "A 标签".into(),
+                description: "A 描述".into(),
+                path: PathBuf::from("/secret/alpha/SKILL.md"),
+                scope: Scope::Project,
+                model_visible: false,
+                user_invocable: true,
+            },
+        ];
+        cfg.skills_omitted = 3;
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        let carried: Vec<(String, String, String)> = view
+            .skills
+            .iter()
+            .map(|s| (s.command.clone(), s.label.clone(), s.description.clone()))
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                ("zeta".to_string(), "Z 标签".to_string(), "Z 描述".to_string()),
+                ("alpha".to_string(), "A 标签".to_string(), "A 描述".to_string()),
+            ],
+            "skill 的 command/label/description 必须逐条透传且保序"
+        );
+        // `model_visible: false` 的条目**仍进浮层候选**（只给用户敲、不给模型读）——
+        // 是否可见由 `Catalogue.lines` 决定，与列表无关。
+        assert!(view.skills.iter().any(|s| s.command == "alpha"));
+        assert_eq!(view.skills_omitted, 3, "预算收起的计数必须透传（/status 要显示）");
+        // 路径不外泄：TUI 拿到的类型里根本没有这个字段。
+        assert!(
+            !format!("{:?}", view.skills).contains("SKILL.md"),
+            "路径不得进入 UI 侧数据：{:?}",
+            view.skills
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **准入契约**：`user_invocable: false` 的 skill **不得**进 `CodingView.skills`。
+    ///
+    /// 设计契约：`user-invocable: false` ⇒ 只给模型、不给用户敲（不出现在 `/` 补全、
+    /// `/help`、`/status`）。`config.skills` 仍保留全部条目（`expand_invocation` 自己
+    /// 会判），过滤只影响下发给 TUI 的快照。
+    ///
+    /// 变异：去掉 `build_view` 里的 `.filter(|s| s.user_invocable)` ⇒ 本用例变红
+    /// （`model-only` 会漏进候选；用户敲下它时 `expand_invocation` 拒绝展开，
+    /// 整条消息原样发回模型 —— 静默降级）。
+    #[test]
+    fn test_build_view_filters_out_non_user_invocable_skills() {
+        use crate::skills::{Scope, SkillEntry};
+
+        let dir = temp_dir("skills_invocable");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.cwd = PathBuf::from("/tmp/proj");
+        cfg.skills = vec![
+            SkillEntry {
+                command: "user-facing".into(),
+                label: "可调用".into(),
+                description: "用户能敲".into(),
+                path: PathBuf::from("/secret/user/SKILL.md"),
+                scope: Scope::User,
+                model_visible: false,
+                user_invocable: true,
+            },
+            SkillEntry {
+                command: "model-only".into(),
+                label: "只给模型".into(),
+                description: "用户不可敲".into(),
+                path: PathBuf::from("/secret/model/SKILL.md"),
+                scope: Scope::Project,
+                model_visible: true,
+                user_invocable: false,
+            },
+        ];
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        let commands: Vec<&str> = view.skills.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(
+            commands,
+            vec!["user-facing"],
+            "只有 user_invocable 的 skill 能进 TUI 候选：{:?}",
+            view.skills
+        );
+        // 过滤只发生在快照上：`config.skills` 自己**不动**（`expand_invocation`
+        // 依赖它拿到 model-only 的正文）。
+        assert_eq!(
+            cfg.skills.len(),
+            2,
+            "config.skills 必须保留全部条目（不过滤）"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

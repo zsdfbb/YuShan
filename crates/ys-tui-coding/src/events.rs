@@ -5,7 +5,8 @@
 //!
 //! # 命令分发（T10）
 //!
-//! Enter 时把输入交给 [`crate::commands::parse`]，按 [`crate::commands::Action`] 分派：
+//! Enter 时把输入交给 [`crate::commands::parse_with_skills`]（内置命令 + skill 名），
+//! 按 [`crate::commands::Action`] 分派：
 //! 本地动作当场执行（写 transcript），`Request` 投给 app 线程。**唯一例外是
 //! [`Action::Prompt`]** —— 它要开一块模态浮层，而画屏得握 `Terminal`，故这里只把
 //! 意图记进 [`App::pending_prompt`]，由 `run.rs` 的事件循环取走并跑模态循环
@@ -126,9 +127,10 @@ pub fn handle_key(
             app.scroll_offset = 0;
             app.follow = true;
         }
-        // Tab：输入 `/` 开头时按前缀开补全浮层（无命中 / 不以 `/` 开头 = no-op）
+        // Tab：输入 `/` 开头时按前缀开补全浮层（无命中 / 不以 `/` 开头 = no-op）。
+        // 候选含 skill（与 `submit` 的解析同源，见模块文档）。
         KeyCode::Tab => {
-            if let Some(state) = completion::open(&app.input.text) {
+            if let Some(state) = completion::open_with_skills(&app.input.text, &app.view.skills) {
                 app.completion = Some(state);
             }
         }
@@ -193,14 +195,16 @@ fn scroll(app: &mut App, width: u16, height: u16, delta: isize) {
     app.follow = next == 0;
 }
 
-/// 提交输入：命令分发（[`commands::parse`]）或普通消息。
+/// 提交输入：命令分发（[`commands::parse_with_skills`]，含 skill 名）或普通消息。
 fn submit(app: &mut App, requests: &Sender<Request>, boundaries: &Sender<Boundary>) {
     let text = app.input.take();
     app.completion = None;
     if text.trim().is_empty() {
         return;
     }
-    dispatch(app, requests, boundaries, commands::parse(&text));
+    // 先把 `Action` 算出来（只读借 `app.view.skills`）再 dispatch（可变借 `app`）
+    let action = commands::parse_with_skills(&text, &app.view.skills);
+    dispatch(app, requests, boundaries, action);
 }
 
 /// 分派一个**已解析**的 [`Action`]。
@@ -253,7 +257,7 @@ mod tests {
     use super::*;
     use crate::draw::input_height;
     use crate::transcript::TranscriptLine;
-    use crate::view::CodingView;
+    use crate::view::{CodingView, SkillEntry};
     use tokio::sync::mpsc;
     use ys_core::{ContentBlock, Role};
 
@@ -1037,5 +1041,75 @@ mod tests {
         );
         assert!(!a.is_turning);
         assert!(ch.next_request().is_none(), "未知命令绝不发给模型");
+    }
+
+    // -----------------------------------------------------------------------
+    // skill 通路（`/skill-name` → 原文直发 app，展开归 app 侧）
+    // -----------------------------------------------------------------------
+
+    /// 命中 skill ⇒ **原文（含参数）**作为 `Request::Prompt` 发出，回显的也是原文。
+    ///
+    /// 变异：`submit` 改回 `commands::parse(&text)`（不传 skills）⇒ 本测试变红
+    /// （会退化成「未知命令」本地提示，一个请求都不发）。
+    #[test]
+    fn test_skill_name_submits_original_text_as_prompt() {
+        let ch = channels();
+        let mut a = app(); // `for_test` 视图带 commit / review 两条 skill
+        a.input.insert_str("/commit 帮我写一条");
+        key(&mut a, &ch, KeyCode::Enter);
+
+        match ch.next_request().expect("skill 命中应发 Prompt") {
+            Request::Prompt(msg) => assert!(
+                matches!(&msg.content[0], ContentBlock::Text { text } if text == "/commit 帮我写一条"),
+                "{msg:?}"
+            ),
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+        assert!(a.is_turning, "skill 调用是一个回合");
+        assert!(
+            matches!(&a.transcript[0], TranscriptLine::User(s) if s == "/commit 帮我写一条"),
+            "transcript 回显原文（展开在 app 侧）：{:?}",
+            a.transcript
+        );
+    }
+
+    /// **内置命令 > skill 穿过整个事件层**：视图里塞一条同名 skill，`/status` 仍走本地。
+    ///
+    /// 变异：把 skill 判定提到内置表之前 ⇒ 本测试变红（`/status` 会被当 skill 发出去）。
+    #[test]
+    fn test_builtin_still_wins_when_view_has_same_named_skill() {
+        let ch = channels();
+        let mut a = app();
+        a.view.skills.push(SkillEntry {
+            command: "status".into(),
+            label: "Fake Status".into(),
+            description: "想遮蔽 /status".into(),
+        });
+        a.input.insert_str("/status");
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert!(ch.next_request().is_none(), "内置命令不得被 skill 顶掉");
+        assert!(!a.is_turning);
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s.contains("provider")),
+            "{:?}",
+            a.transcript
+        );
+    }
+
+    /// Tab 补全的候选含 skill（生产接线是 `open_with_skills`）。
+    ///
+    /// 变异：把 Tab 分支改回 `completion::open(..)` ⇒ 浮层开不出来 → 本测试变红。
+    #[test]
+    fn test_tab_completion_includes_skills() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/comm"); // 内置表里没有 /comm* —— 只有 skill `commit` 命中
+        key(&mut a, &ch, KeyCode::Tab);
+
+        let state = a.completion.as_ref().expect("skill 命中即开浮层");
+        assert_eq!(state.items.len(), 1, "{:?}", state.items);
+        assert_eq!(state.items[0].replacement, "/commit ");
+        assert!(ch.next_request().is_none(), "开浮层不发请求");
     }
 }

@@ -431,37 +431,60 @@ impl<B: Backend + Write> ModalHost<'_, B> {
 ///
 /// 照搬旧 `ui/mod.rs:142-174` 的 pi 语义（逐行 2K 清行，无残影、无 padding 行）。
 ///
+/// **不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到
+/// 进入 alt-screen 时的位置 —— 也就是本 app 自己那段启动输出（stderr 的降级提示、
+/// 模型拉取提示）的**下一行**。回放从那里往下写即可。曾经在这里 `MoveTo(0, 0)`
+/// 是错的：那是**视口绝对第 0 行**，会把屏幕顶部（往往是与本 app 无关的上一条
+/// 命令输出）整片啃掉，并把启动提示的首行盖掉。
+///
 /// **best-effort**：恢复路径上的每一步都不得 `?` 提前返回 —— 否则
 /// `disable_raw_mode()` 会被跳过，终端留在 raw mode。这里吞掉 IO 错误，
 /// 保证「无论如何都退出 raw mode / 恢复主屏」。
 fn restore_terminal<B: Backend + Write>(terminal: &mut Terminal<B>, app: &App) {
-    use crossterm::cursor::MoveTo;
-
     let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = (cols as usize).clamp(10, 400);
     let lines = draw::transcript_plain_lines(app, width);
 
     let mut out = std::io::stdout();
-    let _ = execute!(
-        out,
-        EnableLineWrap,
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    );
-    let _ = execute!(out, PopKeyboardEnhancementFlags);
-    let _ = execute!(out, MoveTo(0, 0));
-
-    for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            let _ = write!(out, "\r\n");
-        }
-        let _ = write!(out, "\r\x1b[2K{line}\x1b[0m");
-    }
-    let _ = write!(out, "\r\n");
+    let _ = write!(out, "{}", exit_payload(&lines));
     let _ = out.flush();
 
     let _ = disable_raw_mode();
     let _ = terminal.show_cursor();
+}
+
+/// 退出时写给终端的**全部字节** —— 抽成纯函数，好让「不得绝对定位」这条能被单测钉住。
+///
+/// `restore_terminal` 除本函数的产物外**不再写任何东西**，所以单测直接盯着这里，
+/// 就能覆盖「回放落点」这条不变量：任何人往里加 `MoveTo(0, 0)` 都会被测试拦下。
+///
+/// 前段是终端状态恢复（换行 / 退出 alt-screen / 关括号粘贴 / 弹键盘增强）；
+/// 后段是回放 —— 逐行 `\r\x1b[2K{line}\x1b[0m`、行间 `\r\n`、末尾一个 `\r\n`，
+/// **不含任何光标定位转义**：落点是进入 alt-screen 时保存、`?1049l` 恢复的那个位置。
+fn exit_payload(lines: &[String]) -> String {
+    // 前段：终端状态恢复。crossterm 的命令是 `impl Command`（写字节）而非 `Display`，
+    // 故先 `queue!` 进一个缓冲区再拼进字符串。
+    let mut restore: Vec<u8> = Vec::new();
+    let _ = crossterm::queue!(
+        restore,
+        EnableLineWrap,
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    );
+    let mut out = String::from_utf8_lossy(&restore).into_owned();
+
+    // 后段：回放。**不含任何光标定位转义** —— 落点由 `?1049l` 恢复。
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\r\n");
+        }
+        out.push_str("\r\x1b[2K");
+        out.push_str(line);
+        out.push_str("\x1b[0m");
+    }
+    out.push_str("\r\n");
+    out
 }
 
 /// 模态选择器里 ↑↓ 的落点（回卷；空列表原地不动）。
@@ -502,5 +525,51 @@ mod tests {
     fn test_modal_move_single_option_stays() {
         assert_eq!(modal_move(0, 1, true), 0);
         assert_eq!(modal_move(0, 1, false), 0);
+    }
+
+    /// 退出回放：逐行 `\r\x1b[2K` 清行 + 行间 `\r\n` + 末尾一个 `\r\n`，
+    /// 且**不含任何光标定位** —— 落点靠 `?1049l` 恢复的光标位置。
+    ///
+    /// 变异：在 `exit_payload` 里加回 `MoveTo(0, 0)`（`\x1b[1;1H`）→ 本用例变红
+    /// （那会把回放挪到视口第 0 行，啃掉屏幕上与本 app 无关的内容）。
+    #[test]
+    fn exit_payload_replays_without_absolute_positioning() {
+        let seq = exit_payload(&["first".to_string(), "second".to_string()]);
+
+        // 前段是状态恢复，后段是回放（逐行 2K 清行、行间 \r\n、末尾一个 \r\n）。
+        assert!(
+            seq.ends_with("\r\x1b[2Kfirst\x1b[0m\r\n\r\x1b[2Ksecond\x1b[0m\r\n"),
+            "回放段格式不对：{seq:?}"
+        );
+        // **不变量**：整段里不得出现任何以 `H` 结尾的 CSI（光标绝对定位），
+        // 否则回放会落在视口顶部而非 app 自己输出的下一行。
+        assert!(
+            !seq.contains("\x1b[1;1H"),
+            "回放不得绝对定位到视口顶部：{seq:?}"
+        );
+        assert!(
+            !seq.contains("H"),
+            "退出载荷里不应有任何光标定位 CSI（以 H 结尾）：{seq:?}"
+        );
+    }
+
+    /// 空行列表也要吐一个 `\r\n`（不能把光标留在原行上）。
+    #[test]
+    fn exit_payload_with_no_lines_still_breaks_the_line() {
+        assert!(exit_payload(&[]).ends_with("\r\n"));
+    }
+
+    /// 状态恢复命令确实在载荷前段（`?1049l` 退出 alt-screen 是回放贴合光标的前提）。
+    #[test]
+    fn exit_payload_starts_with_terminal_restore() {
+        let seq = exit_payload(&["x".to_string()]);
+        assert!(
+            seq.contains("\x1b[?1049l"),
+            "必须先退出 alt-screen 再回放：{seq:?}"
+        );
+        assert!(
+            seq.find("\x1b[?1049l").unwrap() < seq.find("\r\x1b[2K").unwrap(),
+            "退出 alt-screen 必须排在回放之前：{seq:?}"
+        );
     }
 }

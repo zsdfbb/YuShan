@@ -31,9 +31,8 @@ pub struct ApiModel {
 
 /// 从 API 拉取 models 的结果，区分错误类型。
 ///
-/// **当前无生产消费者**（见 [`ProviderRegistry::fetch_models`] 的说明）：
-/// 保留这段能力与它的单测，是为了将来 `/model --refresh` 之类的显式刷新入口。
-#[allow(dead_code)]
+/// 生产消费者：[`ProviderRegistry::refresh_models`]（启动期对每个已登录 provider
+/// 拉一次）。失败一律**静默** —— 不写缓存，`/model` 的候选回退静态表。
 pub enum FetchModelsResult {
     Success(Vec<ApiModel>),
     /// 401 —— 提示用户重新登录
@@ -45,7 +44,6 @@ pub enum FetchModelsResult {
 /// GET /v1/models 的响应。
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
-    #[allow(dead_code)] // 仅经 serde 反序列化，生产路径不直接读
     data: Vec<ApiModel>,
 }
 
@@ -55,9 +53,10 @@ type AuthStore = HashMap<String, AuthEntry>;
 pub struct ProviderRegistry {
     providers: Vec<ProviderInfo>,
     auth_store: AuthStore,
-    /// `/v1/models` 拉取结果缓存（按 api_base 键）。TUI 路径不拉取 —— 见
-    /// [`ProviderRegistry::fetch_models`]。
-    #[allow(dead_code)]
+    /// `/v1/models` 拉取结果缓存（按 api_base 键）。
+    ///
+    /// 启动期由 [`ProviderRegistry::refresh_models`] 填充；此后 `view::build_view`
+    /// 每回合从它读候选模型 —— **渲染路径一次 HTTP 都不发**（设计 M4）。
     model_cache: HashMap<String, Vec<ApiModel>>,
     /// auth 文件路径的覆盖项（测试用）。
     auth_override: Option<PathBuf>,
@@ -115,6 +114,20 @@ impl ProviderRegistry {
     #[cfg(test)]
     pub(crate) fn set_auth_override(&mut self, path: PathBuf) {
         self.auth_override = Some(path);
+    }
+
+    /// 测试用：直接塞一份「启动期拉到的目录」，免去起本地 HTTP 服务。
+    #[cfg(test)]
+    pub(crate) fn seed_cached_models(&mut self, base: &str, ids: &[&str]) {
+        self.model_cache.insert(
+            base.to_string(),
+            ids.iter()
+                .map(|id| ApiModel {
+                    id: (*id).into(),
+                    owned_by: None,
+                })
+                .collect(),
+        );
     }
 
     /// 返回 auth.json 文件的路径。
@@ -193,11 +206,10 @@ impl ProviderRegistry {
 
     /// 从 provider 的 /v1/models endpoint 拉取 models。
     ///
-    /// **TUI 路径不调用**（设计 §4「`available_models` 用静态列表」）：起屏之后
-    /// 一次重绘都不该发 HTTP 请求，`/login` 也不再顺带拉取 —— `CodingView` 的
-    /// 模型选择器由 [`ProviderRegistry::known_models_static`] 供货。
-    /// 能力本身与单测保留，供将来的显式刷新入口（如 `/model --refresh`）。
-    #[allow(dead_code)]
+    /// **只在启动期调用**（[`ProviderRegistry::refresh_models`]，TUI 起屏**之前**的
+    /// 阻塞步骤）：起屏之后一次重绘都不该发 HTTP 请求，故拉到的目录缓存进
+    /// [`ProviderRegistry::model_cache`]，由 [`ProviderRegistry::models_for_provider`]
+    /// 读给 `/model` 浮层。
     pub async fn fetch_models(api_base: &str, api_key: &str) -> FetchModelsResult {
         let url = build_models_url(api_base);
         let client = match reqwest::Client::builder()
@@ -231,26 +243,104 @@ impl ProviderRegistry {
         }
     }
 
-    /// 返回可用 models，优先用 cache，否则从 API 拉取。
-    /// 出错时回退到静态已知 models。
+    /// 启动期：对**每个已登录 provider** 拉一次 `/v1/models`，成功即写进
+    /// [`Self::model_cache`]（键为 api_base）。
     ///
-    /// 同 [`Self::fetch_models`]：TUI 路径不调用。
-    #[allow(dead_code)]
-    pub async fn available_models(&mut self, api_base: &str, api_key: &str) -> Vec<ApiModel> {
-        if let Some(cached) = self.model_cache.get(api_base) {
-            return cached.clone();
+    /// 唯一生产调用点：`main.rs::run_interactive` —— **TUI 起屏之前**的阻塞步骤
+    /// （`rt.block_on`）。之所以在启动期拉、而不是打开 `/model` 浮层时拉：起屏后
+    /// 一次重绘都不该发 HTTP（设计 M4）。此后 `build_view` 只读缓存。
+    ///
+    /// 各 provider **并发**拉（`JoinSet`），故总耗时 ≈ 单次超时（5s），不随
+    /// provider 数线性增长。**失败一律静默**（超时 / DNS / 401 → 不写缓存）：
+    /// [`Self::models_for_provider`] 会因此回退静态表 —— 网络问题绝不该让
+    /// `/model` 的候选变空，更不该让启动失败。
+    pub async fn refresh_models(&mut self) {
+        let targets: Vec<(String, String)> = self
+            .providers
+            .iter()
+            .filter_map(|p| {
+                self.auth_store
+                    .get(&p.name)
+                    .map(|e| (e.api_base.clone(), e.api_key.clone()))
+            })
+            .filter(|(base, _)| !base.is_empty())
+            .collect();
+
+        let mut set = tokio::task::JoinSet::new();
+        for (base, key) in targets {
+            set.spawn(async move {
+                let result = Self::fetch_models(&base, &key).await;
+                (base, result)
+            });
         }
 
-        match Self::fetch_models(api_base, api_key).await {
-            FetchModelsResult::Success(models) => {
-                self.model_cache
-                    .insert(api_base.to_string(), models.clone());
-                models
-            }
-            FetchModelsResult::AuthError(_) | FetchModelsResult::NetworkError(_) => {
-                Self::known_models_static()
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((base, FetchModelsResult::Success(models))) => {
+                    // 空目录视同失败：不写缓存 ⇒ `models_for_provider` 回退静态表
+                    // （写进去反而会让候选整体变空）。
+                    if !models.is_empty() {
+                        self.model_cache.insert(base, models);
+                    }
+                }
+                // 对用户静默（`/model` 照常有静态回退），但**落日志** —— 否则
+                // 「候选怎么只有静态那几条」会成为一个无从排查的现象。
+                Ok((base, FetchModelsResult::AuthError(e))) => {
+                    crate::logging::log(&format!("model refresh {base}: auth error: {e}"));
+                }
+                Ok((base, FetchModelsResult::NetworkError(e))) => {
+                    crate::logging::log(&format!("model refresh {base}: network error: {e}"));
+                }
+                Err(e) => crate::logging::log(&format!("model refresh task failed: {e}")),
             }
         }
+    }
+
+    /// 该 provider 的候选模型 id：优先启动期拉到的目录，缺失则回退静态表中
+    /// **属于它的**条目（[`Self::known_models_static`] 的 `owned_by` 即 provider 名）。
+    ///
+    /// 唯一消费者：`view::build_view`（`/model` 浮层的候选）。
+    pub fn models_for_provider(&self, name: &str) -> Vec<String> {
+        let base = self
+            .auth_store
+            .get(name)
+            .map(|e| e.api_base.as_str())
+            .or_else(|| self.find_provider(name).map(|p| p.api_base.as_str()));
+        if let Some(models) = base.and_then(|base| self.model_cache.get(base)) {
+            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+        Self::known_models_static()
+            .into_iter()
+            .filter(|m| m.owned_by.as_deref() == Some(name))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    /// 哪个 provider 提供该 model —— 跨 provider 选模型时据此切端点
+    /// （`capabilities::set_model`）。
+    ///
+    /// 先查启动期拉到的目录（api_base → provider 反查），再回退静态表的 `owned_by`。
+    /// 都查不到返回 `None`（调用方**保持当前 provider 不变** —— 手敲的自定义模型名
+    /// 不该把端点带跑）。
+    pub fn provider_for_model(&self, model: &str) -> Option<String> {
+        for (base, models) in &self.model_cache {
+            if models.iter().any(|m| m.id == model)
+                && let Some(p) = self.providers.iter().find(|p| {
+                    self.auth_store
+                        .get(&p.name)
+                        .is_some_and(|e| &e.api_base == base)
+                })
+            {
+                return Some(p.name.clone());
+            }
+        }
+        Self::known_models_static()
+            .into_iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.owned_by)
     }
 
     /// API 不可达时硬编码的回退 models。
@@ -318,7 +408,6 @@ pub fn builtin_context_window(model: &str) -> Option<usize> {
 /// 构建 /v1/models endpoint 的 URL。
 /// 若 base 已以 "/v1" 或 "/v1/" 结尾，则追加 "/models"。
 /// 否则追加 "/v1/models"。
-#[allow(dead_code)] // 仅被 fetch_models 使用（TUI 路径不拉取 models）
 pub fn build_models_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/v1") {
@@ -526,5 +615,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `models_for_provider`：**优先启动期拉到的目录**，缺失才回退静态表 ——
+    /// 且回退只给**该 provider 的**条目（不再把 deepseek 的名字塞给 minimax）。
+    ///
+    /// 变异：把 cache 分支删掉 → 第二条断言变红（拿到的仍是静态的 deepseek-chat）。
+    #[test]
+    fn test_models_for_provider_prefers_fetched_catalog_over_static() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        // 未拉取 → 静态表中属于 deepseek 的那两条；minimax 的名字不得混进来。
+        assert_eq!(
+            reg.models_for_provider("deepseek"),
+            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
+        );
+        assert!(
+            !reg.models_for_provider("deepseek")
+                .contains(&"MiniMax-Text-01".to_string()),
+            "静态回退必须按 owned_by 过滤，不得跨 provider"
+        );
+
+        // 拉到了目录 → 用目录（静态表不再参与）
+        reg.seed_cached_models("https://api.deepseek.com", &["deepseek-v4"]);
+        assert_eq!(
+            reg.models_for_provider("deepseek"),
+            vec!["deepseek-v4".to_string()]
+        );
+
+        // 空目录视同没拉到 → 回退静态表（`refresh_models` 不写空目录，这里直接构造）
+        reg.seed_cached_models("https://api.deepseek.com", &[]);
+        assert_eq!(
+            reg.models_for_provider("deepseek"),
+            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
+        );
+    }
+
+    /// `provider_for_model`：目录（经 auth 条目把 base 绑回 provider）优先，
+    /// 回退静态表的 `owned_by`；两处都没有 → `None`（调用方保持当前 provider）。
+    #[test]
+    fn test_provider_for_model_resolves_catalog_then_static() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        // 静态表兜底
+        assert_eq!(
+            reg.provider_for_model("deepseek-chat").as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            reg.provider_for_model("MiniMax-Text-01").as_deref(),
+            Some("minimax")
+        );
+        assert_eq!(reg.provider_for_model("gpt-4o"), None, "两处都没有 → None");
+
+        // 目录优先：新模型名只存在于拉到的目录里
+        reg.auth_store.insert(
+            "minimax".into(),
+            AuthEntry {
+                api_base: "https://api.minimax.chat/v1".into(),
+                api_key: "sk-mm".into(),
+                model: "MiniMax-Text-01".into(),
+            },
+        );
+        reg.seed_cached_models("https://api.minimax.chat/v1", &["MiniMax-M3"]);
+        assert_eq!(
+            reg.provider_for_model("MiniMax-M3").as_deref(),
+            Some("minimax"),
+            "目录里的新模型应能反查到 provider"
+        );
     }
 }

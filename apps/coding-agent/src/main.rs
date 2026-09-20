@@ -516,7 +516,7 @@ async fn run_json_mode(
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     rt: tokio::runtime::Runtime,
-    config: config::Config,
+    mut config: config::Config,
     state_store: state::StateStore,
     system_prompt: String,
     workspace: PathBuf,
@@ -533,6 +533,17 @@ fn run_interactive(
     // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
     let model = config.build_model();
     let wiring = rt.block_on(Wiring::persistent(model, Box::new(sink), sessions_dir()))?;
+
+    // 2b.【阻塞】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
+    //
+    // 必须在**起屏之前**（此后一次重绘都不该发 HTTP，设计 M4）；5s 超时且并发，
+    // 失败静默回退静态表。此刻 TUI 未起 → stderr 是正确去处（输出三分，设计 §5）：
+    // 网络慢时这行提示解释了这几秒的停顿。
+    let pending = config.registry.logged_in_providers().len();
+    if pending > 0 {
+        eprintln!("Fetching models for {pending} logged-in provider(s)…");
+        rt.block_on(config.registry.refresh_models());
+    }
 
     let stats = status::TurnStats::default();
     let session_started = Instant::now();

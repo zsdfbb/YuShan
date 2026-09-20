@@ -145,16 +145,38 @@ pub fn logout(config: &mut Config, wiring: &mut Wiring, state: &StateStore) -> V
 /// `/model <name>`：切模型并重建（经 factory）。带参数的那条路径 —— 无参的
 /// 「浮层选一个」在 TUI 里，选完照样发 [`Request::SetModel`]。
 ///
+/// **跨 provider 选模型**：`/model` 浮层的候选是**所有已登录 provider** 的并集，
+/// 选中别家的模型时必须连端点一起切 —— 只改 `config.model` 会把 A 家的模型名发到
+/// B 家的 base（换来一个 400）。归属由 [`ProviderRegistry::provider_for_model`]
+/// 定位（启动期拉到的目录，回退静态表）；目录里都没有的手敲名字**保持当前
+/// provider 不变**。
+///
 /// [`Request::SetModel`]: ys_protocol::Request::SetModel
+/// [`ProviderRegistry::provider_for_model`]: crate::provider::ProviderRegistry::provider_for_model
 pub fn set_model(
     config: &mut Config,
     wiring: &mut Wiring,
     state: &StateStore,
     model: &str,
 ) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Some(owner) = config.registry.provider_for_model(model)
+        && config.provider.as_deref() != Some(owner.as_str())
+        && let Some(entry) = config.registry.auth_for(&owner).cloned()
+    {
+        let from = config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string());
+        config.api_base = Some(entry.api_base);
+        config.api_key = Some(entry.api_key);
+        config.provider = Some(owner.clone());
+        out.push(format!("Provider switched: {from} → {owner}"));
+    }
+
     config.model = model.to_string();
 
-    let mut out = Vec::new();
     if let Err(e) = state.save(&AppState {
         last_active_provider: config.provider.clone(),
         last_active_model: Some(model.to_string()),
@@ -954,5 +976,93 @@ mod tests {
         let wiring = test_wiring();
         let out = export(&wiring, None);
         assert!(out[0].contains("nothing to export"), "{out:?}");
+    }
+
+    /// **跨 provider 选模型**：`/model` 浮层的候选是**所有已登录 provider** 的并集，
+    /// 选中别家的模型必须连端点一起切 —— 只改 `config.model` 会把 A 家的模型名发到
+    /// B 家的 base（换来一个 400）。
+    ///
+    /// 变异：去掉 `set_model` 开头的 `provider_for_model` 分支 → 下面
+    /// `provider` / `api_base` / `api_key` 三条断言同时变红。
+    #[test]
+    fn test_set_model_switches_provider_when_model_belongs_to_another() {
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-ds".into());
+        config.provider = Some("deepseek".into());
+        config
+            .registry
+            .save_auth(
+                "minimax",
+                &AuthEntry {
+                    api_base: "https://api.minimax.chat/v1".into(),
+                    api_key: "sk-mm".into(),
+                    model: "MiniMax-Text-01".into(),
+                },
+            )
+            .unwrap();
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(&mut config, &mut wiring, &state, "MiniMax-Text-01");
+
+        assert_eq!(config.provider.as_deref(), Some("minimax"), "{out:?}");
+        assert_eq!(
+            config.api_base.as_deref(),
+            Some("https://api.minimax.chat/v1"),
+            "端点必须跟着切，否则模型名会发到别家 base"
+        );
+        assert_eq!(config.api_key.as_deref(), Some("sk-mm"));
+        assert_eq!(config.model, "MiniMax-Text-01");
+        assert!(
+            out.iter()
+                .any(|l| l.contains("Provider switched: deepseek → minimax")),
+            "切换应告知用户：{out:?}"
+        );
+        assert_eq!(
+            state.load().last_active_provider.as_deref(),
+            Some("minimax"),
+            "state 记的也应是新 provider"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// 归属查不到的模型名（手敲的自定义名）→ **保持当前 provider 不变**，
+    /// 不把端点带跑。
+    ///
+    /// 变异：把 `provider_for_model` 的 `None` 臂也当成「切 provider」→ 变红。
+    #[test]
+    fn test_set_model_unknown_model_keeps_current_provider() {
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-ds".into());
+        config.provider = Some("deepseek".into());
+        config
+            .registry
+            .save_auth(
+                "minimax",
+                &AuthEntry {
+                    api_base: "https://api.minimax.chat/v1".into(),
+                    api_key: "sk-mm".into(),
+                    model: "MiniMax-Text-01".into(),
+                },
+            )
+            .unwrap();
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(&mut config, &mut wiring, &state, "my-local-model");
+
+        assert_eq!(config.provider.as_deref(), Some("deepseek"), "{out:?}");
+        assert_eq!(config.api_base.as_deref(), Some("https://api.deepseek.com"));
+        assert!(
+            !out.iter().any(|l| l.contains("Provider switched")),
+            "未知名不该切 provider：{out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

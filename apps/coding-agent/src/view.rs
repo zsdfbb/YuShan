@@ -34,22 +34,38 @@ pub fn build_view(
 ) -> CodingView {
     let logged_in = registry.logged_in_providers();
 
-    // 绑定 provider 的 model（有 auth 时）优先，否则用 config 里的当前值；
-    // 它不进静态表时也补进去，否则 `/model` 浮层里选不回当前模型。
-    let bound_model = cfg
-        .provider
-        .as_deref()
-        .and_then(|name| registry.auth_for(name))
-        .map(|entry| entry.model.clone())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| cfg.model.clone());
+    // `/model` 无参浮层的候选 = **所有已登录 provider** 的模型并集。
+    //
+    // 每个 provider 的条目：优先启动期拉到的 `/v1/models` 目录（`refresh_models`
+    // 写入的缓存），缺失则回退静态表中属于它的部分（`known_models_static` 的
+    // `owned_by` 即 provider 名）。**未登录任何 provider** 时退回静态全表 —— 那时
+    // 列出的模型本就点不动（无凭证），保留只为 `/model` 仍可浏览。
+    let mut available_models: Vec<String> = Vec::new();
+    if logged_in.is_empty() {
+        available_models = ProviderRegistry::known_models_static()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+    } else {
+        for name in &logged_in {
+            for id in registry.models_for_provider(name) {
+                if !available_models.contains(&id) {
+                    available_models.push(id);
+                }
+            }
+        }
+    }
 
-    let mut available_models: Vec<String> = ProviderRegistry::known_models_static()
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
-    if !bound_model.is_empty() && !available_models.contains(&bound_model) {
-        available_models.push(bound_model);
+    // **当前在跑的模型必须在候选里**，否则切走就选不回来。
+    //
+    // 取据是「**接线器实际持有的 model**」+ `config.model`，而**不是** auth entry
+    // 里的 `model` —— 后者是 `/login` 当时的快照，`/model X` 只改 config/wiring、
+    // 从不回头改 auth entry（拿它当「当前模型」会把正在跑的那个漏掉）。
+    let running = wiring.model_id().map(String::from);
+    for m in [running, Some(cfg.model.clone())].into_iter().flatten() {
+        if !m.is_empty() && !available_models.contains(&m) {
+            available_models.push(m);
+        }
     }
 
     CodingView {
@@ -255,6 +271,138 @@ mod tests {
         assert_eq!(view.logged_in_providers, vec!["deepseek".to_string()]);
         assert!(view.session_path.is_some(), "持久会话应有会话文件");
         assert!(!view.is_first_run, "有 auth → 不是首次运行");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **回归**：当前**正在跑**的模型必须始终在候选里。
+    ///
+    /// 场景：minimax 登录时 auth entry 的 model 是 `MiniMax-Text-01`，用户
+    /// `/model MiniMax-M3` 切过去 —— `/model X` 只改 config/wiring，**从不回头改
+    /// auth entry**。若「要不要补进候选」的判据取自 auth entry 的 model（改前的
+    /// 写法），补进去的就是登录时的旧值，正在跑的 MiniMax-M3 反而选不回来。
+    ///
+    /// 变异：把 `build_view` 里补当前模型那段改回读 `auth_for(provider).model`
+    /// → 本用例变红（列表里只有 MiniMax-Text-01）。
+    #[tokio::test]
+    async fn test_build_view_always_includes_the_running_model() {
+        use crate::provider::AuthEntry;
+
+        let dir = temp_dir("running_model");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.provider = Some("minimax".into());
+        cfg.model = "MiniMax-M3".into(); // 用户刚 /model 切到的
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        cfg.registry
+            .save_auth(
+                "minimax",
+                &AuthEntry {
+                    api_base: "https://api.minimax.chat/v1".into(),
+                    api_key: "sk-x".into(),
+                    model: "MiniMax-Text-01".into(), // 登录时的旧值
+                },
+            )
+            .unwrap();
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::persistent(
+            Some(Box::new(MockModel::new("MiniMax-M3"))),
+            Box::new(CollectingSink::new()),
+            dir.join("sessions"),
+        )
+        .await
+        .unwrap();
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        assert!(
+            view.available_models.contains(&"MiniMax-M3".to_string()),
+            "正在跑的模型必须在候选里：{:?}",
+            view.available_models
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **回归（用户报的「候选不全」）**：启动期拉到的目录覆盖**所有已登录
+    /// provider**，而不只是当前那一个。
+    ///
+    /// 变异：把 `build_view` 的填充循环改成只看 `cfg.provider` 一个 → 未绑定的
+    /// 那个 provider 的模型消失，本用例变红。
+    #[tokio::test]
+    async fn test_build_view_unions_models_of_all_logged_in_providers() {
+        use crate::provider::AuthEntry;
+
+        let dir = temp_dir("union");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.provider = Some("deepseek".into());
+        cfg.model = "deepseek-v4".into();
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        for (name, base, model) in [
+            ("deepseek", "https://api.deepseek.com", "deepseek-v4"),
+            ("minimax", "https://api.minimax.chat/v1", "MiniMax-M3"),
+        ] {
+            cfg.registry
+                .save_auth(
+                    name,
+                    &AuthEntry {
+                        api_base: base.into(),
+                        api_key: format!("sk-{name}"),
+                        model: model.into(),
+                    },
+                )
+                .unwrap();
+        }
+        // 启动期拉到的两个目录（真实路径是 `refresh_models` 写缓存）。
+        cfg.registry
+            .seed_cached_models("https://api.deepseek.com", &["deepseek-v4"]);
+        cfg.registry.seed_cached_models(
+            "https://api.minimax.chat/v1",
+            &["MiniMax-M3", "MiniMax-M2.7"],
+        );
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::persistent(
+            Some(Box::new(MockModel::new("deepseek-v4"))),
+            Box::new(CollectingSink::new()),
+            dir.join("sessions"),
+        )
+        .await
+        .unwrap();
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        for expected in ["deepseek-v4", "MiniMax-M3", "MiniMax-M2.7"] {
+            assert!(
+                view.available_models.contains(&expected.to_string()),
+                "候选里缺 `{expected}`（应含所有已登录 provider 的目录）：{:?}",
+                view.available_models
+            );
+        }
+        // 未拉到时才回退静态表；这里两个 provider 都拉到了，故不该混进静态条目。
+        assert!(
+            !view.available_models.contains(&"deepseek-chat".to_string()),
+            "有目录时不得再掺静态条目：{:?}",
+            view.available_models
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

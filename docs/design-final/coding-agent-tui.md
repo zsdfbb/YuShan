@@ -322,7 +322,8 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M1 | **`resolve_prompt` 纯函数**：模态命令的决策逻辑（问什么、按什么顺序、取消怎么办）与渲染分离 | `ys-tui-coding/src/prompter.rs` |
 | M2 | **`TuiPrompter` 用嵌套事件循环**把问答画成模态浮层（不切屏、不 suspend/resume） | `ys-tui-coding/src/run.rs` |
 | M3 | **`/login` 的 api_base 解析**：TUI 在所选 provider **没有内置 base** 时（`custom` 这类）**追加一问 URL**，随 `Request::Login { api_base: Option<String> }` 交给 app；app 侧按 ① 用户显式 URL → ② provider 内置 base → ③ 回退 `config.api_base`（`YUSHAN_API_BASE`）→ ④ 都没有则**明确提示**要设环境变量（不静默失败、不写空 base 的 auth）。**协议因此比 design §6 多一个 `api_base` 字段**（初版实现漏了它，导致 `custom` 的交互式 URL 失效——已修） | `ys-tui-coding::prompter::resolve_prompt` + `capabilities::login` |
-| M4 | **`/model` 无参的模型列表来自 `CodingView.available_models`**，由**静态** registry 表填充（`ProviderRegistry::known_models_static()`）；**TUI 路径不发 `/v1/models` 请求**（重绘不得触发 HTTP） | `apps/coding-agent/src/view.rs` |
+| M4 | **`/model` 无参的模型列表来自 `CodingView.available_models`** —— 由**启动期拉取**的目录填充：`ProviderRegistry::refresh_models` 在 TUI 起屏**之前**（`run_interactive` 的阻塞步骤）对**每个已登录 provider 并发**拉一次 `/v1/models`（`JoinSet`，5s 超时），失败静默回退静态表（`known_models_static` 按 `owned_by` 过滤到该 provider）。候选 = **所有已登录 provider** 的并集（去重）+ 当前正在跑的模型。**渲染路径一次 HTTP 都不发**（重绘不得触发 HTTP）—— 故拉取只在启动期做，此后每回合 `build_view` 只读缓存 | `apps/coding-agent/src/{provider,view,main}.rs` |
+| M9 | **跨 provider 选模型**：候选是多个 provider 的并集，故 `capabilities::set_model` 用 `ProviderRegistry::provider_for_model` 定位模型归属；归属与当前 provider 不同则**连端点一起切**（api_base / api_key / provider，取自该 provider 的 auth 条目）。目录里都没有的手敲名字**保持当前 provider 不变** —— 只改 `config.model` 会把 A 家的模型名发到 B 家的 base | `apps/coding-agent/src/capabilities.rs` |
 | M5 | **`Action::Abort` 目前是保留变体**：`parse()` 不产出它；Ctrl+C / Esc 在 `handle_key` 里直接投 `Boundary::Abort`。留作将来 `/abort` | `ys-tui-coding/src/commands.rs` |
 | M6 | **`app_loop` 的回合失败只落日志、不刷 transcript**：`BasicLoop` 返回错误前已发 `RunFailed`（UI 已看到 Error 行） | `app_loop::run` |
 | M7 | **`/new` 后 `session_started` 重置**（状态行时长据此归零） | `app_loop::run` |

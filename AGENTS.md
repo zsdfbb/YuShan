@@ -2,7 +2,7 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-**当前状态**：`cargo test --workspace` 全绿 —— **728 passed**（1 个 e2e 需真实凭证，`#[ignore]`）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）。
+**当前状态**：`cargo test --workspace` 全绿 —— **731 passed**（1 个 e2e 需真实凭证，`#[ignore]`）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）。
 
 ## 目录结构
 
@@ -60,7 +60,7 @@ YuShan/
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（728 passed）
+- `cargo test --workspace` — 全量测试（731 passed）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
@@ -148,10 +148,23 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 | 时机 | 内容 | 去处 |
 |---|---|---|
 | **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
+| **启动期 · 降级提示** | `toolset` 的降级提示（搜索后端 / web 侧） | **TUI 模式 → `Outbound::Output`（transcript）**；`-p`/`--json` → **stderr** |
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log`（`src/logging.rs`，手写极简 logger，追加写、`[unix秒]` 前缀、best-effort、不引依赖） |
 
 **`capabilities.rs` 绝不 print** —— 命令期间的失败也走 `Output`。
+
+**为什么降级提示在 TUI 模式下改走 transcript**：起屏**之前**写 stderr 的行会留在终端主屏缓冲区里，
+alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式回到屏幕上（看起来像 app 又打了一遍启动
+横幅）。故 TUI 模式在 `spawn` 之前把它投成 `Outbound::Output`（信道第一条，稳排对话之前）；
+`-p`/`--json` 无 TUI，仍走 stderr（且**绝不能**混进 stdout 的逐行 `Envelope`）。
+
+**`Fetching models for N logged-in provider(s)…` 拉完即擦除**（`\r\x1b[2K`）—— 它只为解释启动期
+那几秒，不留在屏上。
+
+**退出回放不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到进入 alt-screen 时的
+位置（= app 自己输出的下一行），回放从那里往下写。**不得** `MoveTo(0,0)` —— 那是视口绝对第 0 行，
+会啃掉屏幕顶部与本 app 无关的内容。
 
 ## coding-agent 模块说明
 

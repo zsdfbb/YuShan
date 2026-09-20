@@ -522,6 +522,7 @@ fn run_interactive(
     workspace: PathBuf,
     tools: Vec<Box<dyn Tool>>,
     limits: ys_component::RunLimits,
+    startup_hint: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
@@ -537,12 +538,15 @@ fn run_interactive(
     // 2b.【阻塞】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
     //
     // 必须在**起屏之前**（此后一次重绘都不该发 HTTP，设计 M4）；5s 超时且并发，
-    // 失败静默回退静态表。此刻 TUI 未起 → stderr 是正确去处（输出三分，设计 §5）：
-    // 网络慢时这行提示解释了这几秒的停顿。
+    // 失败静默回退静态表。提示**拉完即擦除** —— 它只为解释「这几秒在等什么」，
+    // 不该像降级提示那样留在屏幕上。
     let pending = config.registry.logged_in_providers().len();
     if pending > 0 {
-        eprintln!("Fetching models for {pending} logged-in provider(s)…");
+        eprint!("Fetching models for {pending} logged-in provider(s)…");
+        let _ = io::stderr().flush();
         rt.block_on(config.registry.refresh_models());
+        eprint!("\r\x1b[2K");
+        let _ = io::stderr().flush();
     }
 
     let stats = status::TurnStats::default();
@@ -563,6 +567,18 @@ fn run_interactive(
     let (request_tx, request_rx) = mpsc::channel::<Request>(REQUEST_CAPACITY);
     let (boundary_tx, boundary_rx) = mpsc::channel::<Boundary>(BOUNDARY_CAPACITY);
     let (out_tx, out_rx) = mpsc::channel::<Outbound<CodingView>>(OUTBOUND_CAPACITY);
+
+    // 4b. 启动期降级提示 → transcript（**不是 stderr**）。
+    //
+    // 起屏前写 stderr 的行会留在主屏缓冲区里，退出 alt-screen 后又回到屏幕上，
+    // 成为残渣（设计 §5 的「命令期间 → `Outbound::Output`」在启动期的延伸）。
+    // 在 spawn 之前投递 ⇒ 它是信道里的第一条，稳稳排在对话之前。
+    // 容量 1024 且信道全新 ⇒ `try_send` 不可能失败；真失败也只落日志，不 panic。
+    if let Some(hint) = startup_hint
+        && let Err(e) = out_tx.try_send(Outbound::Output(hint))
+    {
+        logging::log(&format!("failed to enqueue startup hint: {e}"));
+    }
 
     // 5. app 线程（tokio worker）跑循环；当前线程跑**阻塞**的 UI 循环。
     //    app 循环唯一的失败是「UI 侧收摊」，不该惊动用户 —— 落日志即可。
@@ -697,9 +713,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 且必须在把 `web` move 进 `build_tools` 之前完成。
     sweep_fetched(&web, FETCHED_MAX_AGE);
     let (tools, hint) = toolset::build_tools(&workspace, web);
-    if let Some(hint) = hint {
-        eprintln!("{hint}");
-    }
     let specs = tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
     let system_prompt = prompt::build_system_prompt(&cwd, &specs);
 
@@ -711,6 +724,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.mode {
         Mode::Print(task) => {
+            // 无 TUI → 启动期降级提示照旧走 stderr（设计 §5 输出三分）。
+            if let Some(hint) = &hint {
+                eprintln!("{hint}");
+            }
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
@@ -728,6 +745,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))?;
         }
         Mode::Json(task) => {
+            // 同 `-p`：无 TUI → stderr（**绝不能**混进 stdout 的逐行 Envelope）。
+            if let Some(hint) = &hint {
+                eprintln!("{hint}");
+            }
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
@@ -743,6 +764,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))?;
         }
         Mode::Interactive => {
+            // TUI 模式下提示**不进 stderr**，改走 transcript（`Outbound::Output`）——
+            // 起屏前写 stderr 的行会落在主屏上，退出 alt-screen 后成为残渣。
             run_interactive(
                 rt,
                 config,
@@ -751,6 +774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 workspace,
                 tools,
                 limits,
+                hint,
             )?;
         }
     }

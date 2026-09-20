@@ -230,6 +230,12 @@ turn 中把 model 段换成 `⏳ Working·`（300ms 节拍前进，宽字符占�
 alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinking **总是**打印（退出后没有 `/thinking`
 开关可用了）。
 
+> **回放不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到**进入 alt-screen 时**
+> 的位置 —— 也就是本 app 自己那段启动输出的下一行。回放从那里往下写即可。**不得** `MoveTo(0, 0)`：
+> 那是**视口绝对第 0 行**，会把屏幕顶部（往往是与本 app 无关的上一条命令输出）整片啃掉。
+> 该不变量由 `run.rs` 的 `exit_payload_replays_without_absolute_positioning` 钉住 ——
+> `restore_terminal` 除 `exit_payload()` 的产物外不写任何东西，故测试盯住那个纯函数即可覆盖。
+
 ---
 
 ## 6. 命令划分：TUI 侧表 vs app 侧能力
@@ -283,8 +289,18 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | 时机 | 内容 | 去处 |
 |---|---|---|
 | **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
+| **启动期 · 降级提示** | `toolset` 的降级提示（搜索后端 / web 侧） | **TUI 模式 → `Outbound::Output`（transcript）**；`-p`/`--json` → **stderr**（见下） |
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
+
+> **降级提示在 TUI 模式下为什么不走 stderr**：起屏**之前**写到 stderr 的行会留在终端的主屏
+> 缓冲区里；TUI 用 alt-screen 盖住它们，退出时主屏还原 —— 于是它们又回到屏幕上，成为**退出后的
+> 残渣**（与「对话回放到 scrollback」叠加，看起来像 app 又打了一遍启动横幅）。故 TUI 模式改投
+> `Outbound::Output`（在 `spawn` 之前投递 ⇒ 信道第一条，稳排对话之前）。`-p`/`--json` 没有 TUI，
+> stderr 仍是对的去处 —— 且**绝不能**混进 stdout 的逐行 `Envelope`（`tests/degraded_search.rs` 钉住）。
+>
+> **`Fetching models for N logged-in provider(s)…` 拉完即擦除**（`\r\x1b[2K`）：它只为解释启动期
+> 这几秒的停顿，不该像降级提示那样留在屏上。
 
 **日志文件**（`apps/coding-agent/src/logging.rs`）：手写极简 logger —— 追加写、行首 `[unix秒]` 前缀、
 **best-effort**（目录创建 / 打开 / 写入任何 IO 错误一律静默忽略，返回值 `()`，不 panic、不传播）。

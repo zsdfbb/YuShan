@@ -136,10 +136,25 @@ impl AgentLoop for BasicLoop {
             {
                 let policy = &ctx.limits.compaction;
                 let window = ctx.limits.context_window;
+                // 每回合固定开销（system prompt + 工具表）：每次请求都要重发，会话里
+                // 数不到，但真实占着窗口。判定必须把它算进去（U1），否则压缩系统性晚触发。
+                let fixed = ctx.limits.fixed_prompt_tokens;
                 let messages = ctx.session.messages();
                 let estimated = crate::token::estimate_session_tokens(messages);
+                let trigger = policy.trigger_at(window);
 
-                if estimated > policy.trigger_at(window) {
+                // ⚠️ R5 边界：`fixed >= trigger` ⇒ **直接跳过压缩**。
+                //
+                // 固定开销永远压不掉（压缩只缩会话消息），故此时硬压会同时踩两个坑：
+                //   ① 每轮空转 —— 消息已被 `plan()` 的 B-1 压到底（保留段非空），
+                //      但 `estimated + fixed` 恒在阈值之上 ⇒ 每轮都压、每轮都不解渴；
+                //   ② 小窗口下更糟 —— 压到最简后请求照样溢出，白烧一次摘要调用。
+                //
+                // 位置约束（承重，ADR-0017 决策 1）：本早退与下面的 `plan()` 都必须留在
+                // Step 6 的 `ctx.model.complete` **之前**。`apps/coding-agent/src/app_loop.rs`
+                // 的 `every_request_variant_is_handled` 会走到这里，它安全**只因为**
+                // 不触发 model 调用（`MockModel` 空队列 `remove(0)` 会 panic）。
+                if fixed < trigger && estimated + fixed > trigger {
                     if let Some(plan) = compact::plan(messages, policy, window) {
                         match compact::execute(messages, &plan, ctx.model, policy).await {
                             Ok(outcome) => {
@@ -447,7 +462,13 @@ impl AgentLoop for BasicLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ys_event::{AgentEvent, CollectingSink};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use ys_component::RunLimits;
+    use ys_event::{AgentEvent, CollectingSink, EventSink};
+    use ys_model::{MockModel, Model, ModelError, ModelResponse};
+    use ys_session::{MemorySession, Session};
+    use ys_tool::ToolRegistry;
 
     /// A3：`ModelEvent::ThinkingDelta` 经 `Forwarder` 冒泡为
     /// `AgentEvent::ModelThinkingDelta`；`TextDelta` 路径不变。
@@ -492,5 +513,263 @@ mod tests {
             "events = {:?}",
             sink.events()
         );
+    }
+
+    // ==================== U1：压缩触发必须计入固定开销 ====================
+    //
+    // 背景：Step 4b 的判定只数 session 消息（`estimate_session_tokens`），看不见每次
+    // 请求都要重发的 system prompt 与工具表。9 工具时缺口约 1.1k（可忽略）；skills 上线
+    // 后 skill 目录常驻 ~9.6k ⇒ **压缩系统性晚触发**。`RunLimits::fixed_prompt_tokens`
+    // 就是这块固定开销的入口，默认 0（⇒ 老行为逐字节不变）。
+
+    fn make_ctx<'a>(
+        model: &'a dyn Model,
+        registry: &'a ToolRegistry,
+        session: &'a mut dyn Session,
+        events: &'a mut dyn EventSink,
+        limits: RunLimits,
+    ) -> RuntimeContext<'a> {
+        RuntimeContext::new(
+            model,
+            registry,
+            session,
+            events,
+            limits,
+            PathBuf::from("."),
+            PathBuf::from("."),
+            None,
+            None,
+        )
+    }
+
+    /// `window = 1000` + 默认策略 ⇒ `trigger_at = 101`（`keep_budget = 100`）。
+    fn limits_with_window(window: usize, fixed: usize) -> RunLimits {
+        let mut limits = RunLimits::new(5);
+        limits.context_window = window;
+        limits.fixed_prompt_tokens = fixed;
+        limits
+    }
+
+    /// 预置 6 条各 10 token 的交替消息（估算合计 60）。
+    /// 本轮用户消息 "go" ≈ 0 token ⇒ 判定时的 `estimated` = 60，**不达**触发点 101。
+    async fn seed_small_session(session: &mut MemorySession) {
+        for i in 0..6 {
+            session
+                .append(Message {
+                    role: if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    content: vec![ContentBlock::Text {
+                        text: "x".repeat(40),
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// 预置 6 条各 100 token 的消息（估算合计 600，远超触发点 101）。
+    async fn seed_large_session(session: &mut MemorySession) {
+        for i in 0..6 {
+            session
+                .append(Message {
+                    role: if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    content: vec![ContentBlock::Text {
+                        text: "x".repeat(400),
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    fn has_compacted(events: &CollectingSink) -> bool {
+        events
+            .events()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextCompacted { .. }))
+    }
+
+    /// 会话里是否留下压缩摘要（`[Context Summary]` 标记）。
+    fn has_summary(session: &MemorySession) -> bool {
+        session.messages().iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("[Context Summary]")),
+            )
+        })
+    }
+
+    /// U1-1：**触发点被固定开销推前** —— 同样的消息量，`fixed > 0` 触发、`fixed = 0` 不触发。
+    ///
+    /// 会话估算 60 token、`window = 1000 ⇒ trigger_at = 101`：
+    /// - `fixed = 0`  ⇒ 60 ≤ 101 ⇒ **不压**：`MockModel` 只被消费 1 条（主对话）；
+    /// - `fixed = 50` ⇒ 110 > 101 ⇒ **压**：第 1 条响应被摘要调用吃掉，第 2 条才是主对话。
+    ///
+    /// 走的是**真实 `BasicLoop::run_turn`**（Step 4b），不是重算一遍算术 ——
+    /// `MockModel` 的响应队列按调用顺序被消费，压缩与否由此**直接可见**。
+    ///
+    /// 变异自检（已实测）：把 `basic.rs` 的 `estimated + fixed` 改回 `estimated`
+    /// ⇒ 分支 B 不触发压缩、只消费 1 条响应、不发 `ContextCompacted` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn fixed_prompt_tokens_shifts_compaction_trigger() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+
+        // 分支 A：fixed = 0 ⇒ 60 ≤ 101 ⇒ 不压缩。
+        let model = MockModel::new("m");
+        model.push_text("done"); // 唯一一次调用：主对话
+        let mut session = MemorySession::new();
+        seed_small_session(&mut session).await;
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !has_compacted(&events),
+            "fixed = 0 时 60 ≤ 101 ⇒ 不得压缩：{:?}",
+            events.events()
+        );
+        assert!(!has_summary(&session), "未压缩则不得写入摘要");
+
+        // 分支 B：fixed = 50 ⇒ 60 + 50 = 110 > 101 ⇒ 触发压缩。
+        let model = MockModel::new("m");
+        model.push_text("SUMMARY"); // 第 1 次调用：摘要
+        model.push_text("done"); // 第 2 次调用：主对话
+        let mut session = MemorySession::new();
+        seed_small_session(&mut session).await;
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 50),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert!(
+            has_compacted(&events),
+            "fixed = 50 时 110 > 101 ⇒ 必须压缩：{:?}",
+            events.events()
+        );
+        assert!(has_summary(&session), "压缩后会话里应留下摘要");
+    }
+
+    /// 每次都计数、恒返回纯文本的 model —— 用来断言「模型一共被调用了几次」。
+    /// （比 `MockModel` 的空队列 `remove(0)` panic 给出更直白的失败信号。）
+    struct CountingModel {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for CountingModel {
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                stop_reason: None,
+            })
+        }
+    }
+
+    /// U1-2（R5 边界）：`fixed >= trigger_at(window)` ⇒ **不进入压缩**（不空转、不 panic）。
+    ///
+    /// 固定开销永远压不掉：硬压的话每轮空转（消息已被 `plan()` 的 B-1 压到底，但
+    /// `estimated + fixed` 恒在阈值之上），小窗口下更会「压了还溢出」白烧一次摘要调用。
+    ///
+    /// 会话养到 600 token —— 只要走到 `plan()` 就一定压得动（`len ≥ 2`、两段非空、
+    /// 保留段首条是 Assistant 文本），**唯一**拦下它的是 R5 早退。断言模型只被调用
+    /// **1 次**：若压缩发生则是 2 次（摘要 + 主对话），且次数可证早退仍在 Step 6 的
+    /// `model.complete` **之前**。
+    ///
+    /// 变异自检（已实测）：删掉 `fixed < trigger` 这个条件（只留 `estimated + fixed > trigger`）
+    /// ⇒ 模型被调用 2 次、发 `ContextCompacted` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn fixed_prompt_tokens_at_or_above_trigger_skips_compaction() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let window = 1000;
+        let trigger = RunLimits::default().compaction.trigger_at(window);
+        assert_eq!(
+            trigger, 101,
+            "前置：默认策略下 window = 1000 的触发点是 101"
+        );
+
+        // 边界两侧：`fixed == trigger`（下界）+ 远超触发点的两个点。
+        for fixed in [trigger, trigger + 1, 10_000] {
+            let model = CountingModel {
+                calls: Mutex::new(0),
+            };
+            let mut session = MemorySession::new();
+            seed_large_session(&mut session).await;
+            let mut events = CollectingSink::new();
+            let result = {
+                let mut ctx = make_ctx(
+                    &model,
+                    &registry,
+                    &mut session,
+                    &mut events,
+                    limits_with_window(window, fixed),
+                );
+                BasicLoop
+                    .run_turn(AgentInput::text("go"), &mut ctx)
+                    .await
+                    .unwrap()
+            };
+
+            assert_eq!(
+                result.stop_reason,
+                StopReason::Completed,
+                "fixed = {fixed}：本轮照常收场"
+            );
+            assert_eq!(
+                *model.calls.lock().unwrap(),
+                1,
+                "fixed = {fixed} ≥ trigger = {trigger} ⇒ 必须跳过压缩（只该有主对话那一次调用）"
+            );
+            assert!(
+                !has_compacted(&events),
+                "fixed = {fixed} ⇒ 不得发 ContextCompacted：{:?}",
+                events.events()
+            );
+            assert!(!has_summary(&session), "fixed = {fixed} ⇒ 不得写入摘要");
+            // 会话逐字节未动：6 条预置 + 本轮用户消息 + 本轮 assistant 回复。
+            assert_eq!(
+                session.messages().len(),
+                8,
+                "fixed = {fixed}：压缩被跳过 ⇒ 会话形状不变"
+            );
+        }
     }
 }

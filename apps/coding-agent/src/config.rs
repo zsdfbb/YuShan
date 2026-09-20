@@ -56,6 +56,17 @@ pub struct Config {
     pub cwd: PathBuf,
     pub provider: Option<String>,
     pub registry: ProviderRegistry,
+    /// 启动期扫描到的 skill（**已去重、已按 `command` 升序**）。
+    ///
+    /// 由 [`Config::load_skills`] 写入。三处消费者：系统提示的目录段（`main` 经
+    /// [`Config::load_skills`] 的返回值之外的 `skills::catalogue`）、`/` 浮层的候选
+    /// （`view::build_view` 只取 `command`/`label`/`description`，**路径不外泄**）、
+    /// `Request::Prompt` 的 `/skill-name` 展开（`app_loop`）。
+    ///
+    /// ⚠️ **绝不写进 `state.json`** —— 那是 `StateStore::save()` 会**覆盖**的文件。
+    pub skills: Vec<crate::skills::SkillEntry>,
+    /// 因整表字节预算被收起的 skill 条数（`Catalogue.omitted`，R3 的可见性出口）。
+    pub skills_omitted: usize,
     /// 从 `~/.yushan/config.json` 读到的覆盖项（用户写、app 只读）。
     ///
     /// 由 [`Config::load_user_config`] 写入，经 [`Config::context_window`] /
@@ -84,6 +95,8 @@ impl Config {
             cwd,
             provider: None,
             registry: ProviderRegistry::new(),
+            skills: Vec::new(),
+            skills_omitted: 0,
             user_config: UserConfig::default(),
             model_factory: None,
         })
@@ -157,6 +170,59 @@ impl Config {
     pub fn default_user_config_path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
         Some(PathBuf::from(home).join(".yushan").join("config.json"))
+    }
+
+    /// skill 扫描根：`[<cwd>/.yushan/skills, <home>/.yushan/skills]`。
+    ///
+    /// # 顺序即语义（**不是**风格问题）
+    ///
+    /// [`crate::skills::scan`] 靠**位置**判定 `scope`：`roots[0]` ⇒ `Scope::Project`、
+    /// `roots[1..]` ⇒ `Scope::User`，而同名（命令名 = 目录名）时 **project 胜**（整条
+    /// 替换）。故**项目级必须在前** —— 顺序错了就是静默的语义错误（项目本地覆盖失效，
+    /// 用户级反而遮蔽项目级）。本函数是该顺序在生产侧的**唯一来源**。
+    ///
+    /// 无 `HOME` / `USERPROFILE` 时只返回项目那一条（照
+    /// [`Config::default_user_config_path`] 的读法）。**不扫 `.claude/skills`**
+    /// （设计 D2；JackCC 靠软链进 `~/.yushan/skills`）。
+    ///
+    /// # 去重（`cwd == $HOME` 时）
+    ///
+    /// 从 home 目录启动时两条根算出来是**同一路径**。若照发两条，[`crate::skills::scan`]
+    /// 会把每个 skill 收两遍（一条 `Project`、一条 `User`，`path` 相同），于是
+    /// `shadow_diagnostics` 对**每个** skill 产一条**假的**「project 级遮蔽 user 级」
+    /// 诊断 —— 几十行纯噪音恰好淹没 R4（「一个仓库能静默换掉你的 `/git-status`」）依赖
+    /// 的那个信号，启动期 IO 也翻倍。故两条路径相等时只返回一条。
+    ///
+    /// ⚠️ 注意：**不得**为此改 [`crate::skills::scan`] 的 scope-by-position 契约 ——
+    /// 去重只发生在「同一路径」这一退化情形，三条以上的根顺序语义原样保留。
+    pub fn default_skill_roots(cwd: &std::path::Path) -> Vec<PathBuf> {
+        let project = cwd.join(".yushan").join("skills");
+        let mut roots = vec![project.clone()];
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            let user = PathBuf::from(home).join(".yushan").join("skills");
+            if user != project {
+                roots.push(user);
+            }
+        }
+        roots
+    }
+
+    /// 扫描 skill 根：条目落 `self.skills`、预算收束计数落 `self.skills_omitted`，
+    /// **诊断作为返回值**交给调用方打印（本函数**绝不 print** —— 与
+    /// `capabilities.rs` / `toolset.rs` 同规）。
+    ///
+    /// 入参走[`Config::default_skill_roots`]给出的显式路径（`scan` **不读 env**）。
+    /// 空目录 / 目录不存在 ⇒ 零条目、零诊断（静默，不是故障）。
+    ///
+    /// **不写盘**：`skills` 是纯内存快照，绝不进 `~/.yushan/state.json`
+    /// （那是 app 会 `save()` 覆盖的文件）。
+    pub fn load_skills(&mut self, roots: &[PathBuf]) -> Vec<String> {
+        let (entries, diags) = crate::skills::scan(roots);
+        let catalogue =
+            crate::skills::catalogue(entries, crate::skills::Budget::default());
+        self.skills_omitted = catalogue.omitted;
+        self.skills = catalogue.entries;
+        diags
     }
 
     /// 设置 model factory。适配器类型确定后在 main.rs 中调用一次。
@@ -238,6 +304,8 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             provider: None,
             registry: ProviderRegistry::new(),
+            skills: Vec::new(),
+            skills_omitted: 0,
             user_config: UserConfig::default(),
             model_factory: None,
         }
@@ -699,5 +767,165 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── skills 装配（M4） ─────────────────────────
+
+    /// 在 `root/<command>/SKILL.md` 落一份 skill。
+    fn write_skill(root: &std::path::Path, command: &str, content: &str) {
+        let dir = root.join(command);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    }
+
+    /// `from_env` 起步时**零 skill**（扫描是启动期显式的一步，不是构造副作用）；
+    /// 空目录 / 不存在的根 ⇒ 零 skill、零诊断，且**其余字段不动**。
+    ///
+    /// 变异：把 `from_env` 改成顺带扫描真实 `~/.yushan/skills` ⇒ 第一组断言在开发机
+    /// 上有 skill 时变红（且启动期会变成隐式 IO）。
+    #[test]
+    fn skills_start_empty_and_empty_roots_are_silent() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+
+        let mut config = Config::from_env().unwrap();
+        assert!(config.skills.is_empty(), "构造时不该有 skill");
+        assert_eq!(config.skills_omitted, 0);
+
+        let dir = temp_dir("skills_empty");
+        let missing = dir.join("no_such_root");
+        let model_before = config.model.clone();
+
+        let diags = config.load_skills(&[missing, dir.clone()]);
+        assert!(diags.is_empty(), "空根不产诊断：{diags:?}");
+        assert!(config.skills.is_empty());
+        assert_eq!(config.skills_omitted, 0);
+        assert_eq!(config.model, model_before, "load_skills 不得碰别的字段");
+        assert_eq!(config.cwd, std::env::current_dir().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `load_skills` 按 roots 顺序取条目，**同名时 project 胜**（`roots[0]` = project）——
+    /// 这是 [`crate::skills::scan`] 的 scope-by-position 契约在装配路径上的端到端钉法。
+    ///
+    /// ⚠️ 本用例**显式传 roots**（`[project, user]`），故它守的是 `scan` 的「位置即
+    /// scope」契约，**不是** [`Config::default_skill_roots`] 的顺序 —— 反转后者**不会**
+    /// 让本用例变红（它根本没调那个函数）。生产侧顺序的真正守卫是
+    /// [`default_skill_roots_are_project_first_and_never_claude`]。
+    ///
+    /// 变异：把本用例里传的 roots 对调（user 在前）⇒ 本用例变红（胜者变成用户级正文）。
+    #[test]
+    fn load_skills_respects_root_order_project_wins() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+
+        let project = temp_dir("skills_proj");
+        let user = temp_dir("skills_user");
+        write_skill(
+            &project,
+            "git-status",
+            "---\nname: 项目版\ndescription: 项目级描述\n---\n项目正文\n",
+        );
+        write_skill(
+            &user,
+            "git-status",
+            "---\nname: 用户版\ndescription: 用户级描述\n---\n用户正文\n",
+        );
+
+        let mut config = Config::from_env().unwrap();
+        // **project 在前** —— 与 `default_skill_roots` 同序。
+        let diags = config.load_skills(&[project.clone(), user.clone()]);
+
+        assert_eq!(config.skills.len(), 1, "同名只留一条");
+        assert_eq!(config.skills[0].description, "项目级描述");
+        assert_eq!(config.skills[0].path, project.join("git-status/SKILL.md"));
+        assert_eq!(diags.len(), 1, "遮蔽恰好一条诊断：{diags:?}");
+
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// **`default_skill_roots` 的顺序是语义**：第一条**必须**是 `<cwd>/.yushan/skills`
+    /// （`scan` 靠位置判 project），第二条才是 `~/.yushan/skills`；且**不扫 `.claude`**。
+    ///
+    /// 变异：两条对调 ⇒ `roots[0]` 断言变红 —— 那会让用户级静默遮蔽项目级
+    /// （与 ADR-0019 决策 6 相反），是**提示词缓存与同名遮蔽语义的真值**。
+    #[test]
+    fn default_skill_roots_are_project_first_and_never_claude() {
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
+        // SAFETY: 调用方持有 env_lock，独占这两个 key 的修改与恢复。
+        unsafe {
+            std::env::set_var("HOME", "/tmp/yushan-skills-home-probe");
+            std::env::remove_var("USERPROFILE");
+        }
+
+        let cwd = std::path::Path::new("/work/proj");
+        let roots = Config::default_skill_roots(cwd);
+        assert_eq!(roots.len(), 2, "有 HOME 时两条根：{roots:?}");
+        assert_eq!(
+            roots[0],
+            PathBuf::from("/work/proj/.yushan/skills"),
+            "第一条必须是项目级（`scan` 靠位置判 project）"
+        );
+        assert_eq!(
+            roots[1],
+            PathBuf::from("/tmp/yushan-skills-home-probe/.yushan/skills"),
+            "第二条才是用户级"
+        );
+        assert!(
+            roots.iter().all(|r| !r.to_string_lossy().contains(".claude")),
+            "不扫 `.claude/skills`（设计 D2）：{roots:?}"
+        );
+
+        // 无 HOME / USERPROFILE ⇒ 只剩项目那一条（不得凭空造出相对路径根）。
+        // SAFETY: 同上，仍持锁。
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(
+            Config::default_skill_roots(cwd),
+            vec![PathBuf::from("/work/proj/.yushan/skills")]
+        );
+    }
+
+    /// **`cwd == $HOME` 时去重**：两条根是同一路径 ⇒ 只返回项目那一条。
+    ///
+    /// 不去重的话 `scan` 会把每个 skill 收两遍（一条 `Project`、一条 `User`，`path`
+    /// 相同），`shadow_diagnostics` 便给每个 skill 产一条**假的**「project 级遮蔽
+    /// user 级」诊断 —— 实测 56 条语料 ⇒ 56 行噪音，淹没 R4 依赖的真信号，启动期
+    /// IO 还翻倍。
+    ///
+    /// 变异：去掉 `default_skill_roots` 里的 `if user != project` 判据 ⇒ 本用例
+    /// 第一条断言变红（返回两条同路径的根）。
+    #[test]
+    fn default_skill_roots_dedup_when_cwd_is_home() {
+        let _guard = env_lock();
+        let home = "/tmp/yushan-skills-home-dedup";
+        let _env = EnvRestore::capture(&["HOME", "USERPROFILE"]);
+        // SAFETY: 调用方持有 env_lock，独占这两个 key 的修改与恢复。
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::remove_var("USERPROFILE");
+        }
+
+        // cwd == $HOME ⇒ 两条根同一路径，去重成一条。
+        let roots = Config::default_skill_roots(std::path::Path::new(home));
+        assert_eq!(
+            roots,
+            vec![PathBuf::from(format!("{home}/.yushan/skills"))],
+            "cwd == HOME 时只应有一条根（去重）：{roots:?}"
+        );
+
+        // cwd != $HOME ⇒ 仍是两条，且 project 在前（顺序语义不变）。
+        let roots = Config::default_skill_roots(std::path::Path::new("/work/proj"));
+        assert_eq!(roots.len(), 2, "cwd != HOME 时两条根：{roots:?}");
+        assert_eq!(
+            roots[0],
+            PathBuf::from("/work/proj/.yushan/skills"),
+            "project 仍必须在第一条"
+        );
+        assert_eq!(roots[1], PathBuf::from(format!("{home}/.yushan/skills")));
     }
 }

@@ -22,7 +22,7 @@ use ys_protocol::Request;
 
 use crate::app::App;
 use crate::transcript::TranscriptLine;
-use crate::view::CodingView;
+use crate::view::{CodingView, SkillEntry};
 
 /// 模态选择器一次显示的选项条数（超出后在窗口内滚动）。
 pub const PROMPT_PAGE_SIZE: usize = 8;
@@ -156,7 +156,22 @@ pub enum PromptKind {
 /// - 非 `/` 开头 → [`Action::Request`]`(`[`Request::Prompt`]`)`（普通消息）
 /// - 未知 `/xxx` → 本地提示（[`Action::Local`]`(`[`LocalAction::Hint`]`)`）
 /// - 见 [`all_commands`] 的逐条映射
+///
+/// **不认识 skill** —— 等价于 [`parse_with_skills`]`(input, &[])`。需要认 skill
+/// 名的调用点（TUI 的 `submit`）走 [`parse_with_skills`]。
 pub fn parse(input: &str) -> Action {
+    parse_with_skills(input, &[])
+}
+
+/// 同 [`parse`]，但额外认识 skill 名（`/git-status <args>`）。
+///
+/// **硬序：内置命令 > skill** —— 先走内置表，**未命中**才查 skill。判定只写在兜底
+/// 分支里，故「装一条名为 `status` 的 skill 就能让 `/status` 失效」在结构上不可能。
+///
+/// 命中 skill ⇒ [`Action::Request`]`(`[`Request::Prompt`]`(原文))` —— **原文、零展开**：
+/// TUI 不读盘、不碰 frontmatter，把 SKILL.md 正文塞进上下文是 app 侧
+/// （`skills::expand_invocation`）的事（设计 §关键数据流 路线 2）。
+pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
     let text = input.trim();
     if text.is_empty() {
         return Action::None;
@@ -210,8 +225,25 @@ pub fn parse(input: &str) -> Action {
                 Some(PathBuf::from(arg()))
             },
         }),
-        _ => Action::Local(LocalAction::Hint(unknown_hint(text))),
+        _ => skill_fallback(text, name, skills),
     }
+}
+
+/// 内置表**未命中**时的兜底：首 token 命中一条 skill ⇒ 原文直发；否则既有未知命令提示。
+///
+/// `command` 是**目录名**（= `/` 后要敲的那个词），与内置命令名同处一个命名空间。
+/// 精确相等才命中（`/git-status` 不会因为存在 skill `git` 而误命中）。
+///
+/// **不判 `user_invocable`**：`CodingView.skills` 是**已过滤的快照** —— 准入
+/// （`user-invocable: false` 的条目只给模型、不给用户敲）发生在 **app 侧
+/// `view::build_view`**，不可被用户调用的 skill 根本不会进这份快照。TUI 侧只
+/// 消费已过滤的结果，`SkillEntry` 也刻意不携带 `user_invocable`（数据/显示分离，
+/// UI 不做准入决策）。
+fn skill_fallback(text: &str, name: &str, skills: &[SkillEntry]) -> Action {
+    if skills.iter().any(|s| s.command == name) {
+        return Action::Request(Request::Prompt(prompt_message(text)));
+    }
+    Action::Local(LocalAction::Hint(unknown_hint(text)))
 }
 
 /// 普通输入 → 一条用户消息。
@@ -227,12 +259,37 @@ pub fn unknown_hint(input: &str) -> String {
     format!("未知命令：{input}\n{}", help_text())
 }
 
-/// `/help` 的正文 —— 与补全浮层同源（同一张 [`all_commands`]）。
+/// `/help` 的正文 —— 与补全浮层同源（同一张 [`all_commands`]）。**不含 skill**：
+/// 薄包装 [`help_text_with_skills`]`(&[])`。
 pub fn help_text() -> String {
     let mut out = String::from("可用命令：\n");
     for spec in all_commands() {
         out.push_str("  ");
         out.push_str(&spec_line(spec));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+/// `/help` 的正文（**含 skill 段**）—— 内置命令表之后追加一段 skill 名清单。
+///
+/// **只列 `/<command>`，不列 description**（也不列 `label`）：真实语料的 description
+/// 是 CJK 密集的长句（实测 56 条合计 ~18 KB），列进 `/help` 会把命令索引变成正文
+/// 倾倒。补全浮层（[`crate::completion`]）是**另一个面** —— 那里列 description 是
+/// 为了帮用户挑，而这里只需要「有哪些」。
+pub fn help_text_with_skills(skills: &[SkillEntry]) -> String {
+    let mut out = help_text();
+    if skills.is_empty() {
+        return out;
+    }
+    let mut commands: Vec<&str> = skills.iter().map(|s| s.command.as_str()).collect();
+    commands.sort_unstable();
+    commands.dedup();
+
+    out.push_str("\n\n可用 skill：\n");
+    for command in commands {
+        out.push_str("  /");
+        out.push_str(command);
         out.push('\n');
     }
     out.trim_end().to_string()
@@ -286,6 +343,15 @@ pub fn status_text(view: &CodingView) -> String {
     } else {
         view.tools.join(", ")
     };
+    // skill 条数；被整表字节预算收起的条数一并显示（R3：模型看不到的那部分，
+    // 用户要在 `/status` 看得见）。
+    let skills = if view.skills.is_empty() {
+        dash()
+    } else if view.skills_omitted == 0 {
+        view.skills.len().to_string()
+    } else {
+        format!("{} ({} omitted)", view.skills.len(), view.skills_omitted)
+    };
     let ctx = view
         .context_window
         .map(|c| c.to_string())
@@ -310,6 +376,7 @@ pub fn status_text(view: &CodingView) -> String {
         format!("context    {ctx}"),
         format!("session    {session}"),
         format!("tools      {tools}"),
+        format!("skills     {skills}"),
         format!("cwd        {}", view.cwd.display()),
     ]
     .join("\n")
@@ -334,7 +401,11 @@ pub fn copy_text(app: &App) -> String {
 pub fn apply_local(app: &mut App, action: LocalAction) {
     let text = match action {
         LocalAction::Help(target) => match target {
-            None => help_text(),
+            // 全表用**带 skill 段**的版本：skill 是 `/` 命名空间的一部分，
+            // `/` 浮层里看得见、`/help` 里也必须看得见。
+            None => help_text_with_skills(&app.view.skills),
+            // `/help <name>` 只认内置命令（skill 的详情在它的 SKILL.md 里，
+            // `/help` 不替它做正文倾倒 —— 见 [`help_text_with_skills`]）。
             Some(name) => command_help_text(&name),
         },
         LocalAction::Status => status_text(&app.view),
@@ -714,5 +785,200 @@ mod tests {
         assert!(
             matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s == "自定义提示")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // skill 通路（`/skill-name`）—— TUI 只「认名」，零展开
+    // -----------------------------------------------------------------------
+
+    fn skill(command: &str, description: &str) -> SkillEntry {
+        SkillEntry {
+            command: command.into(),
+            label: command.into(),
+            description: description.into(),
+        }
+    }
+
+    /// **内置命令 > skill** 是硬序：存在同名 skill 也不得改变内置命令的去向。
+    ///
+    /// 变异：把 skill 判定提到内置 `match` **之前** ⇒ 本测试变红。
+    #[test]
+    fn test_builtin_command_wins_over_same_named_skill() {
+        let skills = [
+            skill("status", "一条想遮蔽 /status 的 skill"),
+            skill("model", "一条想遮蔽 /model 的 skill"),
+            skill("quit", "一条想遮蔽 /quit 的 skill"),
+        ];
+        assert_eq!(
+            parse_with_skills("/status", &skills),
+            Action::Local(LocalAction::Status),
+            "同名 skill 不得遮蔽内置命令"
+        );
+        assert_eq!(
+            parse_with_skills("/model", &skills),
+            Action::Prompt(PromptKind::PickModel)
+        );
+        assert_eq!(parse_with_skills("/quit", &skills), Action::Quit);
+    }
+
+    /// 命中 skill ⇒ **原文（含参数）**直发 app，TUI 零展开。
+    ///
+    /// 变异：把 `text.to_string()` 换成只发 `/{name}`（丢掉参数）⇒ 本测试变红。
+    #[test]
+    fn test_skill_hit_forwards_original_text_with_args() {
+        let skills = [skill("git-status", "看仓库状态")];
+        assert_eq!(
+            parse_with_skills("/git-status 看看提交", &skills),
+            Action::Request(Request::Prompt(prompt_message("/git-status 看看提交"))),
+            "原文（含参数）原样发给 app"
+        );
+        assert_eq!(
+            parse_with_skills("  /git-status   ", &skills),
+            Action::Request(Request::Prompt(prompt_message("/git-status"))),
+            "首尾空白按既有规则 trim，其余原样"
+        );
+    }
+
+    /// 命中判据是**首 token 精确相等**：存在 skill `git` 不代表 `/git-status` 可用。
+    ///
+    /// 变异：把 `s.command == name` 改成 `name.starts_with(&s.command)` ⇒ 本测试变红。
+    #[test]
+    fn test_skill_match_is_exact_not_prefix() {
+        let skills = [skill("git", "前缀不算命中")];
+        assert!(
+            matches!(
+                parse_with_skills("/git-status", &skills),
+                Action::Local(LocalAction::Hint(_))
+            ),
+            "前缀相同的另一条命令不得被认成 skill"
+        );
+        assert_eq!(
+            parse_with_skills("/git log", &skills),
+            Action::Request(Request::Prompt(prompt_message("/git log")))
+        );
+    }
+
+    /// 未命中任何 skill ⇒ 仍是既有未知命令提示（回归）。
+    #[test]
+    fn test_unknown_command_still_hints_when_skills_present() {
+        let skills = [skill("git-status", "看仓库状态")];
+        match parse_with_skills("/zzz", &skills) {
+            Action::Local(LocalAction::Hint(text)) => {
+                assert!(text.contains("未知命令：/zzz"), "{text}");
+                for spec in all_commands() {
+                    assert!(
+                        text.contains(&format!("/{}", spec.name)),
+                        "提示里缺 /{}：{text}",
+                        spec.name
+                    );
+                }
+            }
+            other => panic!("未命中应本地提示，得到 {other:?}"),
+        }
+    }
+
+    /// 薄包装的正确性：`parse` ≡ `parse_with_skills(.., &[])`。
+    #[test]
+    fn test_parse_is_thin_wrapper_over_parse_with_skills() {
+        for input in [
+            "",
+            "   ",
+            "/",
+            "hello",
+            "/status",
+            "/help model",
+            "/thinking maybe",
+            "/model",
+            "/model gpt-4o",
+            "/export a.jsonl",
+            "/nope",
+            "/git-status x",
+        ] {
+            assert_eq!(
+                parse(input),
+                parse_with_skills(input, &[]),
+                "输入 `{input}` 的两条路径必须逐字相同"
+            );
+        }
+    }
+
+    /// `/help` 列出 skill 名，**只列 `/<command>`**（不列 description、不列 label）。
+    #[test]
+    fn test_help_text_lists_skill_names_without_descriptions() {
+        let skills = [
+            SkillEntry {
+                command: "git-status".into(),
+                label: "Git Status".into(),
+                description: "一条很长很长的描述，绝不该出现在 /help 里".into(),
+            },
+            skill("arch-design", "另一条描述"),
+        ];
+        let text = help_text_with_skills(&skills);
+        assert!(text.contains("可用 skill："), "{text}");
+        assert!(text.contains("/git-status"), "{text}");
+        assert!(text.contains("/arch-design"), "{text}");
+        assert!(
+            !text.contains("一条很长很长的描述"),
+            "不得倾倒 description：{text}"
+        );
+        assert!(!text.contains("另一条描述"), "不得倾倒 description：{text}");
+        assert!(!text.contains("Git Status"), "label 也不列：{text}");
+
+        // 内置命令表仍然完整，且整段排在 skill 段**之前**
+        for spec in all_commands() {
+            assert!(
+                text.contains(&format!("/{}", spec.name)),
+                "缺 /{}：{text}",
+                spec.name
+            );
+        }
+        assert!(
+            text.find("/export").expect("内置表在")
+                < text.find("/arch-design").expect("skill 段在"),
+            "内置命令必须在前：{text}"
+        );
+        // 空切片 = 既有正文（薄包装）
+        assert_eq!(help_text_with_skills(&[]), help_text());
+    }
+
+    /// `/help` 的**生产路径**（`apply_local` → `Help(None)`）也带上 skill 段 ——
+    /// 否则 `/` 浮层里看得见、`/help` 里看不见（两处显示面不一致）。
+    #[test]
+    fn test_apply_local_help_lists_skills_from_view() {
+        let mut a = app(); // `for_test` 视图带 commit / review 两条 skill
+        apply_local(&mut a, LocalAction::Help(None));
+        let Some(TranscriptLine::System(text)) = a.transcript.last() else {
+            panic!("应 push 一条 System：{:?}", a.transcript);
+        };
+        assert!(text.contains("/commit"), "{text}");
+        assert!(text.contains("/review"), "{text}");
+        assert!(
+            !text.contains("生成一条提交信息"),
+            "不列 description：{text}"
+        );
+        assert!(text.contains("/model"), "内置表照旧：{text}");
+    }
+
+    /// `/status` 显示 skill 条数，以及被整表预算收起的条数（R3）。
+    #[test]
+    fn test_status_text_reports_skill_count_and_omitted() {
+        let line = |v: &CodingView| {
+            status_text(v)
+                .lines()
+                .find(|l| l.starts_with("skills"))
+                .expect("`/status` 应有 skills 行")
+                .to_string()
+        };
+
+        let mut view = CodingView::for_test();
+        view.skills = vec![skill("a", "d"), skill("b", "d")];
+        view.skills_omitted = 3;
+        assert_eq!(line(&view), "skills     2 (3 omitted)");
+
+        view.skills_omitted = 0;
+        assert_eq!(line(&view), "skills     2", "无收起时只报条数");
+
+        view.skills.clear();
+        assert_eq!(line(&view), "skills     -", "无 skill 与其余空字段同形");
     }
 }

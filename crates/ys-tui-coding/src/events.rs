@@ -966,6 +966,23 @@ mod tests {
         assert!(ch.next_request().is_none());
     }
 
+    /// `/skills` 无参 → **记下意图交给 run.rs**（开选择器），此刻不发任何请求。
+    /// 选中后是**回填输入框**而非发 `Request` —— 故这条路径上永远不该有请求。
+    #[test]
+    fn test_skills_defers_to_modal_prompt_without_request() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/skills");
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(
+            a.pending_prompt,
+            Some(crate::commands::PromptKind::PickSkill)
+        );
+        assert!(ch.next_request().is_none(), "浮层结果出来前不发请求");
+        assert!(a.input.text.is_empty());
+    }
+
     /// `/logout` `/new` `/compact` `/export` 直发对应变体。
     /// `/export` 无参必须发 `path: None`（**默认落点由 app 侧决定**，
     /// TUI 不替 app 猜路径）。

@@ -247,7 +247,8 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 ```text
 输入 ──parse()──► Action ──┬─► Local(LocalAction)   TUI 自己处理（写 transcript）
                            ├─► Request(Request)     → app 线程（信道 ①）
-                           ├─► Prompt(PromptKind)    → 模态浮层 → resolve_prompt → Request
+                           ├─► Prompt(PromptKind)    → 模态浮层 ┬─ Request      → app 线程
+                           │                                    └─ 回填输入框    （不发送）
                            ├─► Abort                 → 轮边界（信道 ②）
                            └─► Quit                  退出 UI
 ```
@@ -256,6 +257,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 |---|---|---|
 | `/help [command]` | 本地打印命令表（有参只给该条） | — |
 | `/status` | 本地（`CodingView` 在 TUI 手里） | — |
+| `/skills` | **浮层选择**（列全部 skill + description，按 `command` 升序、含**内置遮蔽过滤**）；选中**回填输入框** `/<command> `（尾随空格），由用户补参数后自行回车 | — |
 | `/copy` | 本地（最后一条 assistant 回复写进 transcript，**无剪贴板依赖**） | — |
 | `/quit` | 本地 | — |
 | `/thinking [on\|off]` | 本地开关 **（不在 design §6 表里，实现新增，见 §8）** | — |
@@ -325,7 +327,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D3 | app 循环伪代码把 `boundary_rx` 直接交给 `BasicLoop`（§7） | app 侧在 `select!` 里把 `boundary_rx` 收到的 `Boundary` **push 进每回合新建的 `QueueBoundarySource`** | ① app 循环在回合中已经 `select!` 着 `boundary_rx`，顺手泵进源即可；② 一次性源避免 `Abort` 标记跨回合污染（§4）。另加空闲期排空残留 |
 | D4 | app 循环伪代码在回合末**不排空**事件信道（§7） | 回合结束后 `while let Ok(env) = sink_rx.try_recv()` 排空 | `select!` 分支选择是随机的，可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件还躺在信道里；不排空会晚一整回合转发（`is_turning` 不复位、turn 摘要不显示） |
 | D5 | `CodingView` 字段清单「含 `ToolCallId → ToolCall` 映射，供工具结果回填」（§9 未决） | **视图不含映射**；结果回填靠 **UI 侧** `App` 自己的 `tool_index`（transcript 下标） | 视图只承载「状态行 / `/status`」要显示的东西；回填是渲染关注点，归 UI |
-| D6 | 命令表只有 §6 的 9 条 | 表里有 **11 条**，多出 `/thinking` 与 `/copy`（后者 §6 表里写「本地」但表头只有 9 行） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项 |
+| D6 | 命令表只有 §6 的 9 条 | 表里有 **12 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）与 **`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4 |
 | D7 | 初始化顺序编号为 1.信道 2.sink 3.阻塞 Wiring 4.Agent 5.view₀ 6.spawn（§7） | 实际 1+2.channel/sink → **4.Agent** → **3.阻塞 Wiring** → 5.view₀ → 6.spawn | Agent 构建不阻塞、不依赖 Wiring；先建 Agent 后建 Wiring 不破坏 R7 的承重结论（**阻塞早退发生在 spawn 之前**，`begin_turn` 只在 agent 真跑时发生） |
 | D8 | `ys-protocol` 里的 `Envelope` / `LifecyclePolicy`「迁往 ys-protocol」（review R1 建议） | 已迁；`ys-channel` 整 crate 删除 | 见 `core-channel.md` §8 |
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
@@ -344,6 +346,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M6 | **`app_loop` 的回合失败只落日志、不刷 transcript**：`BasicLoop` 返回错误前已发 `RunFailed`（UI 已看到 Error 行） | `app_loop::run` |
 | M7 | **`/new` 后 `session_started` 重置**（状态行时长据此归零） | `app_loop::run` |
 | M8 | **`export` 为同步 `std::fs::copy`**：会话是本地小文件；把一个非 `Sync` 的 `&Wiring` 借进 app 循环的 future 跨 `await` 会让整个循环不再 `Send`、无法 `spawn` | `capabilities::export` |
+| M10 | **`/skills` 命令（skills 特性落地后补）**：TUI 浮层列全部 skill（`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的**——与 `/` 浮层同一条规则），选中后**回填输入框** `/<command> `（尾随空格）而**不发 `Request`**：skill 常带参数（`/git-status --short`），用户补完再回车；`-p` / `--json` 无 TUI，不涉及此路。为此 `resolve_prompt` 的返回类型由 `Result<Request, _>` 改为 **`Result<PromptOutcome, _>`**（`PromptOutcome::Request` \| `PromptOutcome::Prefill(String)`），`run_prompt` 据此分支「发送」或「回填输入框」。选项文本与 `/` 补全**共用** `completion::skill_label` —— `Prompter::select` 只回传**显示串**，反解回 `command` 靠的就是这条格式（**故它是承重的**） | `ys-tui-coding/src/{commands,prompter,run,completion}.rs` |
 
 ---
 
@@ -364,7 +367,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | 落点 | 条数 | 覆盖 |
 |---|---|---|
 | `crates/ys-protocol` | 28 | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
-| `crates/ys-tui-coding` | 166 | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter` |
+| `crates/ys-tui-coding` | 200（**当前值**；路线 B 当时为 166，其后 skills 特性与本表下方的 `/skills` 陆续补入） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消） |
 | `crates/ys-runtime/tests/run_turn_boundary.rs` | 5 | `run_turn` + `AgentPorts` 带 `BoundarySource` 的轮边界语义（跨 crate，不反向依赖 app） |
 | `apps/coding-agent/src/app_loop.rs` | 2 | Prompt → 事件（turn 从 1）→ View；`NewSession` → Output + 刷新快照；**残留 `Abort` 被空闲期丢弃**（变异测试钉住） |
 | `apps/coding-agent/src/capabilities.rs` | 13 | `/login`（成功 / 未知 provider / custom 无 base / 回退）、`/logout`、`/model`（成功 / 缺凭证置空）、`/new`、`/compact`、`/export`（含**自拷贝护栏**变异测试） |
@@ -378,6 +381,8 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 - 去掉 `/export` 的 `is_same_file` 护栏 → `fs::copy` 自拷贝截断会话文件 → `export_without_path_does_not_truncate_session_file` 变红。
 - `/model` 无参改成直发 `SetModel` → `test_bare_model_never_sends_set_model_directly` 与命令映射表测试同时变红。
 - `/help <cmd>` 改回无条件打全表 → `test_help_with_command_shows_only_that_command` 变红。
+- `/skills` 选中改回「直接发 `Request::Prompt`」→ `test_pick_skill_prefills_slash_command_with_trailing_space` 变红（它断言的是 `PromptOutcome::Prefill`）。
+- `/skills` 候选取消 `selectable_skills` 的内置遮蔽过滤 → `test_pick_skill_excludes_skill_shadowed_by_builtin_command` 变红。
 
 ---
 

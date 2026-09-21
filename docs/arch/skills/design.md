@@ -276,7 +276,7 @@ if estimated + ctx.limits.fixed_prompt_tokens > policy.trigger_at(window) {
 - [ ] **R5 小窗口下 `fixed_prompt_tokens` 可能 ≥ `trigger_at(window)`** ⇒ 压缩触发但帮不上（消息已到底）、或永不触发而溢出。**需在实现时处理**：`fixed ≥ trigger_at` 时跳过压缩并在启动期给一条明确提示（「窗口装不下固定开销，请调大 `context_window` 或减少 skill」）。这是 E 的新边界，**必须补测试**。
 - [ ] **R6 压缩会把刚注入的 skill 正文摘要掉**（E5）：正文进 session ⇒ 会被摘要。长任务里模型可能凭印象行事。**不引入「skill 正文免疫压缩」这种新机制**（会破坏压缩的单一阈值语义）。缓解：名字常驻系统提示 ⇒ 模型可重新 `read`。
 - [ ] **R7 正文里 ~20 个 Claude 专有工具名静默失效**（`Agent` 16~17 个）：**不做符号映射**（映射表是把上游知识写死在代码里，上游一改就撒谎）。改为在目录前言里加一句**能力边界声明**（「本 runtime 无 subagent / plan mode」），逐字断言。
-- [ ] **R8 token 估算器未与真实 `Usage` 对账**：落地后**必须**用真实 `Usage.input_tokens` 差（有/无 skill 段）校准一次，据此回看 `Budget.total_bytes` 与压缩阈值。**不要用静态字节估算替代真实 usage。**
+- [x] **R8 token 估算器与真实 `Usage` 对账 —— ✅ 已完成（2026-09-21）**。真实凭证（MiniMax-M3）跑 `e2e_skills.rs`：真实增量 **1,265** token vs 静态估算 **1,796** ⇒ **真实/估算 = 0.704（估算高估 ~42%）**。回看结论：`Budget.total_bytes = 32 KB` **无需调整**（56 条语料 21,601 B，余量 ~10 KB）；`fixed_prompt_tokens` 用估算器算 ⇒ 触发点被**保守地推前**（安全方向），**不改**。实测细节见 [`../../design-final/skills.md`](../../design-final/skills.md) §R8 对账结果。
 
 ### `prototype` 验证结果（R1，2026-09-20 —— 已完成）
 

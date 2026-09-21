@@ -18,7 +18,7 @@ coding agent 支持 **skills**：启动期扫描 `SKILL.md`（自写 frontmatter
 |---|---|---|
 | `apps/coding-agent/src/skills.rs` | **M1 领域逻辑**（全部）：`scan` / frontmatter 子集解析 / `catalogue` / `load_body` / `expand_invocation` / `escape_xml`。纯数据、**不 print**、不读 env | ✅ 新建（~1750 行，含 34 条测试） |
 | `apps/coding-agent/tests/skills_cli.rs` | T14：skill 诊断在 `-p` / `--json` 下的**去向**（子进程、无凭证） | ✅ 新建（3 条） |
-| `apps/coding-agent/tests/e2e_skills.rs` | T15：R8 对账 —— 真实 `Usage.input_tokens` 差 vs 静态估算 | ✅ 新建（`#[ignore]`，**未校准**） |
+| `apps/coding-agent/tests/e2e_skills.rs` | T15：R8 对账 —— 真实 `Usage.input_tokens` 差 vs 静态估算 | ✅ 新建（`#[ignore]`，**已校准**：真实/估算 = 0.704，见下） |
 | `apps/coding-agent/src/main.rs` | 启动期装配（扫描 / 归一 / 提示合并 / `fixed_prompt_tokens`）；`-p` / `--json` 的 `expand_task` | 改 |
 | `apps/coding-agent/src/prompt.rs` | `build_system_prompt(…, &Catalogue)` 末尾追加 `<available_skills>`；`has_custom_prompt` | 改 |
 | `apps/coding-agent/src/config.rs` | `Config.skills` / `skills_omitted`；`default_skill_roots` / `load_skills` | 改 |
@@ -233,13 +233,40 @@ pub fn expand_invocation(text: &str, skills: &[SkillEntry]) -> Option<String>;
 > 保留短路 + 一行提示；正文不缓存、每次激活重读；`fixed_prompt_tokens` 默认 0 且加在**比较的输入端**、
 > `CompactPolicy::trigger_at` 原样不动；R5（`fixed ≥ trigger`）跳过压缩 + 启动期提示。
 
+## R8 对账结果（2026-09-21 实测，已校准）
+
+用真实凭证（`~/.yushan/auth.json` 的 minimax + `state.json` 的 `MiniMax-M3`）跑
+`cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture`：
+
+| 指标 | 值 |
+|---|---|
+| 段规模（12 条 fixture） | 4,542 B（含 `<available_skills>` wrapper）/ 3,208 chars |
+| 真实 `input_tokens`（无段 / 有段） | 520 / 1,785 |
+| **真实增量** | **1,265 token** |
+| 静态估算（`estimate_text_tokens`，同一段文本） | 1,796 token |
+| **真实 / 估算** | **0.704** |
+
+**结论与影响**：
+
+1. **估算器高估约 42%**（真实仅为估算的 0.70 倍）。设计原文假设「CJK ≈ 1 token/字节」过于悲观 ——
+   真实 BPE 下 CJK 更接近 **0.7 token/字节**。这条与 `docs/design-final/compaction.md` 的
+   「估算器未与真实 `Usage` 对账」互相印证，**本次给出了第一个量化比值**。
+2. **`Budget.total_bytes = 32 KB` 无需调整**：56 条语料的 `lines` 实测 21,601 B ⇒ 安全阀仍不触发，
+   余量约 10 KB。**结论：默认值保留。**
+3. **压缩阈值方向是保守的**：`fixed_prompt_tokens` 用 `estimate_text_tokens` 算（高估 42%）
+   ⇒ 触发点被**推前**、压缩比实际需要更早发生。这是**安全方向**（宁可早压，不至于顶出窗口），
+   代价是比必要更频繁地压缩。**不改**：把估算器换成真实 usage 需要 provider 先回报（首轮不可知），
+   而估算器的保守性恰是既有设计所依赖的性质。
+4. **56 条语料的每轮固定成本推算**：`lines` 21,601 B × 0.395 tok/B（本次样本比）≈ **~6.0k 真实 token**
+   （设计文档原估 ~9.6k，同为高估方向）。
+
+> 本测量为**单模型单次**（MiniMax-M3，12 条 fixture）。换模型/换语料需重跑 —— `e2e_skills.rs`
+> 保留为 `#[ignore]`，随时可复测；它仍是**测量**而非判定门槛。
+
 ## 已知未决 / 遗留
 
-1. **R8 未校准** —— `tests/e2e_skills.rs` 是 `#[ignore]`，**没有凭证、从未跑过**。
-   token 估算器（`ys-loop/src/token.rs`）与真实 `Usage.input_tokens` **尚未对账**；
-   `Budget.total_bytes = 32 KB` 与压缩阈值的取值**仍只有静态估算支撑**。
-   文件里已如实打印「未校准」并有显式断言 —— 不是「通过了」，是「没测」。
-   `YUSHAN_API_BASE` + `YUSHAN_API_KEY` 齐备时须跑一次并把比值记回本文。
+1. ~~**R8 未校准**~~ —— **已校准（2026-09-21）**，见上一节。剩余局限：只测了 MiniMax-M3 与
+   12 条 fixture 的单次样本；比值 0.704 的普适性未经多模型交叉验证。
 2. **`/help <name>` 不认 skill** —— `/help`（无参）已追加 skill 段（`help_text_with_skills`，
    只列 `/<command>`、**不列 description**），但 `/help <skill>` 走 `command_help_text`，
    **只认内置命令表** ⇒ 对 skill 名给「未知命令」提示。设计 §M3 只要求「`/help` 追加 skill 段」，
@@ -282,6 +309,7 @@ pub fn expand_invocation(text: &str, skills: &[SkillEntry]) -> Option<String>;
   `--json` 下 **stdout 逐行纯 JSON 且为空**；无 skills 目录 / 空目录时**零诊断且两次 stderr 逐字节相同**。
 - `apps/coding-agent/tests/e2e_skills.rs`：**1 条 `#[ignore]`** —— R8 对账（真实 `usage` 差 vs
   `estimate_text_tokens`，比值打印给人看；provider 不回报 usage 时**只打印「未校准」**、不做断言）。
+  **已于 2026-09-21 用真实凭证跑通并回写比值**（见上文「R8 对账结果」）。
 - `apps/coding-agent/src/{main,prompt,config,view,app_loop}.rs`：启动提示四源合并 / R5 提示触发的
   两侧边界 / 自定义 prompt 提示的两个必要条件 / `-p` task 展开 / **严格前缀不变量** /
   skill 段内容契约（三句承重前言）/ 门控（无 `read` 或空目录 ⇒ 一字不加）/ `default_skill_roots`

@@ -18,6 +18,7 @@ use std::sync::{Mutex, MutexGuard};
 use ys_protocol::Request;
 
 use crate::commands::{PROMPT_PAGE_SIZE, PromptKind};
+use crate::completion::{selectable_skills, skill_label};
 use crate::view::CodingView;
 
 /// 一次问答的失败原因。
@@ -61,6 +62,19 @@ pub trait Prompter: Send + Sync {
     fn text(&self, prompt: &str, help: Option<&str>) -> Result<String, PromptError>;
 }
 
+/// [`resolve_prompt`] 的结局 —— 模态问答收尾的两种去向。
+///
+/// 大多数命令问完就发一条 [`Request`]；`/skills` 是例外：选中一条 skill 只把
+/// `/<command> ` **回填到输入框**，由用户补参数后自行提交（见
+/// [`PromptKind::PickSkill`]）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum PromptOutcome {
+    /// 产出一条待发的请求。
+    Request(Request),
+    /// 回填输入框的文本（**不发送**）—— 与 Tab 补全的 `replacement` 同形（尾随空格）。
+    Prefill(String),
+}
+
 /// 把「需要模态浮层的命令」跑成一条 [`Request`] —— **纯决策逻辑，可单测**。
 ///
 /// `/login` 的问答序列：选 provider → 问 api_key →（**仅当**该 provider 没有
@@ -73,7 +87,7 @@ pub fn resolve_prompt(
     kind: PromptKind,
     prompter: &dyn Prompter,
     view: &CodingView,
-) -> Result<Request, PromptError> {
+) -> Result<PromptOutcome, PromptError> {
     match kind {
         PromptKind::Login => {
             let provider =
@@ -97,11 +111,11 @@ pub fn resolve_prompt(
             } else {
                 None
             };
-            Ok(Request::Login {
+            Ok(PromptOutcome::Request(Request::Login {
                 provider,
                 api_key,
                 api_base,
-            })
+            }))
         }
         PromptKind::PickModel => {
             let model = prompter.select(
@@ -112,7 +126,25 @@ pub fn resolve_prompt(
             if model.trim().is_empty() {
                 return Err(PromptError::Cancelled);
             }
-            Ok(Request::SetModel { model })
+            Ok(PromptOutcome::Request(Request::SetModel { model }))
+        }
+        // 选 skill → 回填 `/<command> `（**不发 Request**）。
+        //
+        // `Prompter::select` 只回传**显示串**，故要用同一个 [`skill_label`]
+        // 反解回 `command` —— 这正是那条格式由本 crate 独占的原因（补全面与
+        // 选择器共用它，两边不会各写一份）。
+        PromptKind::PickSkill => {
+            let selectable = selectable_skills(&view.skills);
+            let options: Vec<String> = selectable.iter().map(|s| skill_label(s)).collect();
+            let picked = prompter.select("Select skill", options, PROMPT_PAGE_SIZE)?;
+            // 选中的串必来自上面的候选（`select` 的契约：回传 `options` 里的一项），
+            // 且**在候选集里反解**（不是 `view.skills`）—— 被内置命令遮蔽的 skill
+            // 不该经这条路被回填进去。找不到 ⇒ 视图在问答期间变了这类不可能情形：
+            // 当作取消，什么都不改。
+            let Some(skill) = selectable.into_iter().find(|s| skill_label(s) == picked) else {
+                return Err(PromptError::Cancelled);
+            };
+            Ok(PromptOutcome::Prefill(format!("/{} ", skill.command)))
         }
     }
 }
@@ -189,7 +221,7 @@ impl Prompter for FakePrompter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view::ProviderEntry;
+    use crate::view::{ProviderEntry, SkillEntry};
 
     fn provider(name: &str, api_base: &str) -> ProviderEntry {
         ProviderEntry {
@@ -261,14 +293,14 @@ mod tests {
         let view = view_with(&["deepseek", "openai"], &[]);
         let p = FakePrompter::with_answers(vec![Ok("openai".into()), Ok("sk-secret".into())]);
 
-        let req = resolve_prompt(PromptKind::Login, &p, &view).expect("应产出 Request");
+        let outcome = resolve_prompt(PromptKind::Login, &p, &view).expect("应产出 Request");
         assert_eq!(
-            req,
-            Request::Login {
+            outcome,
+            PromptOutcome::Request(Request::Login {
                 provider: "openai".into(),
                 api_key: "sk-secret".into(),
                 api_base: None,
-            }
+            })
         );
         assert_eq!(
             p.calls(),
@@ -294,14 +326,14 @@ mod tests {
             Ok("https://my-llm.example.com/v1".into()),
         ]);
 
-        let req = resolve_prompt(PromptKind::Login, &p, &view).expect("应产出 Request");
+        let outcome = resolve_prompt(PromptKind::Login, &p, &view).expect("应产出 Request");
         assert_eq!(
-            req,
-            Request::Login {
+            outcome,
+            PromptOutcome::Request(Request::Login {
                 provider: "custom".into(),
                 api_key: "sk-secret".into(),
                 api_base: Some("https://my-llm.example.com/v1".into()),
-            }
+            })
         );
         assert_eq!(
             p.calls(),
@@ -325,14 +357,14 @@ mod tests {
             Ok("https://unused.example.com".into()),
         ]);
 
-        let req = resolve_prompt(PromptKind::Login, &p, &view).expect("应产出 Request");
+        let outcome = resolve_prompt(PromptKind::Login, &p, &view).expect("应产出 Request");
         assert_eq!(
-            req,
-            Request::Login {
+            outcome,
+            PromptOutcome::Request(Request::Login {
                 provider: "deepseek".into(),
                 api_key: "sk-secret".into(),
                 api_base: None,
-            }
+            })
         );
         assert_eq!(p.calls().len(), 2, "deepseek 不该被问 URL：{:?}", p.calls());
         assert_eq!(
@@ -427,12 +459,12 @@ mod tests {
         let view = view_with(&["deepseek"], &["deepseek-chat", "gpt-4o"]);
         let p = FakePrompter::with_answers(vec![Ok("gpt-4o".into())]);
 
-        let req = resolve_prompt(PromptKind::PickModel, &p, &view).expect("应产出 Request");
+        let outcome = resolve_prompt(PromptKind::PickModel, &p, &view).expect("应产出 Request");
         assert_eq!(
-            req,
-            Request::SetModel {
+            outcome,
+            PromptOutcome::Request(Request::SetModel {
                 model: "gpt-4o".into()
-            }
+            })
         );
         assert_eq!(
             p.calls(),
@@ -457,6 +489,78 @@ mod tests {
         let p = FakePrompter::with_answers(vec![]);
         assert_eq!(
             resolve_prompt(PromptKind::PickModel, &p, &view),
+            Err(PromptError::Cancelled)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // /skills 无参 → 浮层；选中**回填输入框**（不发 Request）
+    // -----------------------------------------------------------------------
+
+    /// 选中一条 skill ⇒ `Prefill("/<command> ")` —— **尾随空格**是承重的：
+    /// 用户接着敲参数，不必自己补一个空格（与补全 `replacement` 同形）。
+    ///
+    /// 断言用的是**显示串**（`FakePrompter` 只认这个），故本测试同时钉住
+    /// 「选项文本 = `skill_label`」与「反解回 command」两端 —— 变异：把
+    /// `skill_label` 改成不列 description、或把 `command` 与 `label` 弄反 → 红。
+    #[test]
+    fn test_pick_skill_prefills_slash_command_with_trailing_space() {
+        let view = CodingView::for_test();
+        let p = FakePrompter::ok(["/commit  — 生成一条提交信息"]);
+
+        let outcome = resolve_prompt(PromptKind::PickSkill, &p, &view).expect("应产出回填");
+        assert_eq!(outcome, PromptOutcome::Prefill("/commit ".into()));
+        assert_eq!(
+            p.calls(),
+            vec![
+                "select:Select skill[/commit  — 生成一条提交信息,/review  — 审查当前改动]"
+                    .to_string()
+            ],
+            "选项 = `/command  — description`，按 command 升序"
+        );
+    }
+
+    /// **被内置命令遮蔽的 skill 不进候选**（内置 > skill，它敲下去也永远走不到）——
+    /// 与 `/` 补全浮层同一条规则（共用 [`selectable_skills`]）。
+    ///
+    /// 变异：去掉 `selectable_skills` 里那条 filter（或让它与 `parse` 的硬序不一致）
+    /// → 本测试的 `calls()` 断言变红。
+    #[test]
+    fn test_pick_skill_excludes_skill_shadowed_by_builtin_command() {
+        let view = CodingView {
+            skills: vec![
+                SkillEntry {
+                    command: "commit".into(),
+                    label: "Git Commit".into(),
+                    description: "生成一条提交信息".into(),
+                },
+                // 与内置命令同名 ⇒ 用户敲 `/status` 永远走内置，这条不可达。
+                SkillEntry {
+                    command: "status".into(),
+                    label: "Shadow".into(),
+                    description: "一条想遮蔽 /status 的 skill".into(),
+                },
+            ],
+            ..CodingView::for_test()
+        };
+        let p = FakePrompter::ok(["/commit  — 生成一条提交信息"]);
+
+        let outcome = resolve_prompt(PromptKind::PickSkill, &p, &view).expect("应产出回填");
+        assert_eq!(outcome, PromptOutcome::Prefill("/commit ".into()));
+        let calls = p.calls();
+        assert!(
+            calls[0].contains("/commit") && !calls[0].contains("/status"),
+            "被遮蔽的 skill 不该进候选：{calls:?}"
+        );
+    }
+
+    /// 取消 ⇒ 什么都不做（不产出回填、不产生 `Request`）。
+    #[test]
+    fn test_pick_skill_cancelled_produces_nothing() {
+        let view = CodingView::for_test();
+        let p = FakePrompter::with_answers(vec![]);
+        assert_eq!(
+            resolve_prompt(PromptKind::PickSkill, &p, &view),
             Err(PromptError::Cancelled)
         );
     }

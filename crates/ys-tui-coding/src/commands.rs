@@ -42,7 +42,7 @@ pub struct CommandSpec {
 ///
 /// 补全浮层（`completion.rs`）、`/help`（[`help_text`]）与解析（[`parse`]）三者
 /// 都从这一张表派生，故「浮层里看得到、敲下去却不认识」在结构上不可能发生。
-static COMMANDS: [CommandSpec; 11] = [
+static COMMANDS: [CommandSpec; 12] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -51,6 +51,11 @@ static COMMANDS: [CommandSpec; 11] = [
     CommandSpec {
         name: "status",
         description: "显示当前配置与状态",
+        arg_hint: None,
+    },
+    CommandSpec {
+        name: "skills",
+        description: "查看并选择一个 skill",
         arg_hint: None,
     },
     CommandSpec {
@@ -149,6 +154,13 @@ pub enum PromptKind {
     Login,
     /// 选模型 → `Request::SetModel`。
     PickModel,
+    /// 选 skill → **回填输入框**（`/<command> `），**不发 `Request`**。
+    ///
+    /// 与 [`PickModel`](Self::PickModel) 的区别是有意的：skill 常常带参数
+    /// （`/git-status --short`），选中只把命令名填进输入框，用户补完参数再回车；
+    /// 且 `-p` / `--json` 无 TUI，不涉及此路。落地在
+    /// [`crate::prompter::PromptOutcome::Prefill`]。
+    PickSkill,
 }
 
 /// 解析一次提交的输入。
@@ -194,6 +206,9 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
             Some(arg())
         })),
         "status" => Action::Local(LocalAction::Status),
+        // 开选择器列全部 skill（带 description）。**选中不直发** —— 回填输入框，
+        // 用户补参数后自行回车（见 `PromptKind::PickSkill`）。
+        "skills" => Action::Prompt(PromptKind::PickSkill),
         "copy" => Action::Local(LocalAction::Copy),
         "quit" => Action::Quit,
         "thinking" => match args.first().copied() {
@@ -446,6 +461,7 @@ mod tests {
                 Action::Local(L::Help(Some("model".into()))),
             ),
             ("/status", Action::Local(L::Status)),
+            ("/skills", Action::Prompt(PromptKind::PickSkill)),
             ("/copy", Action::Local(L::Copy)),
             ("/quit", Action::Quit),
             ("/thinking", Action::Local(L::Thinking(None))),
@@ -508,8 +524,14 @@ mod tests {
         for input in ["/login", "/model"] {
             match parse(input) {
                 Action::Prompt(kind) => produced.push(
-                    crate::prompter::resolve_prompt(kind, &fake, &view)
-                        .unwrap_or_else(|e| panic!("`{input}` 应能产出 Request：{e}")),
+                    match crate::prompter::resolve_prompt(kind, &fake, &view)
+                        .unwrap_or_else(|e| panic!("`{input}` 应能产出 Request：{e}"))
+                    {
+                        crate::prompter::PromptOutcome::Request(r) => r,
+                        // 回填型命令（`/skills`）不在这份输入清单里；真加进来就说明
+                        // 这条断言该改成「回填」而非「产出 Request」。
+                        other => panic!("`{input}` 应产出 Request，得到 {other:?}"),
+                    },
                 ),
                 other => panic!("`{input}` 应走模态浮层，得到 {other:?}"),
             }
@@ -590,8 +612,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "copy", "quit", "thinking", "model", "login", "logout", "new",
-                "compact", "export",
+                "help", "status", "skills", "copy", "quit", "thinking", "model", "login", "logout",
+                "new", "compact", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );

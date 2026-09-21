@@ -49,7 +49,7 @@ use ys_protocol::{Boundary, Outbound, Request};
 use crate::app::App;
 use crate::commands::PromptKind;
 use crate::input::InputBuffer;
-use crate::prompter::{PromptError, Prompter, resolve_prompt};
+use crate::prompter::{PromptError, PromptOutcome, Prompter, resolve_prompt};
 use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
 use crate::{draw, events};
@@ -212,7 +212,7 @@ fn event_loop<B: Backend + Write + Send>(
 // 模态浮层（`Prompter` 的 TUI 实现）
 // ---------------------------------------------------------------------------
 
-/// 跑一条 `Action::Prompt` 命令：模态问答 → 一条 [`Request`]。
+/// 跑一条 `Action::Prompt` 命令：模态问答 → 一条 [`Request`]（或回填输入框）。
 ///
 /// **取消不改任何状态** —— `Err(Cancelled)` 直接吞掉，transcript / 输入框 /
 /// 模型配置都不动（半截登录比什么都不做更糟）。
@@ -237,11 +237,15 @@ fn run_prompt<B: Backend + Write + Send>(
     };
 
     match outcome {
-        Ok(req) => {
+        Ok(PromptOutcome::Request(req)) => {
             if requests.blocking_send(req).is_err() {
                 app.should_quit = true;
             }
         }
+        // `/skills` 选中：**只回填输入框，不发送** —— 把光标留在末尾，用户补参数
+        // 后自行回车（与 `Tab` 补全接受一项后的处置一致）。此时输入框必空
+        // （`submit` 已 `take()`，光标归零），故 `insert_str` 即「从头写入」。
+        Ok(PromptOutcome::Prefill(text)) => app.input.insert_str(&text),
         Err(PromptError::Cancelled) => {}
         Err(PromptError::Other(msg)) => {
             app.transcript

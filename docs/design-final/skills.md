@@ -263,6 +263,27 @@ pub fn expand_invocation(text: &str, skills: &[SkillEntry]) -> Option<String>;
 > 本测量为**单模型单次**（MiniMax-M3，12 条 fixture）。换模型/换语料需重跑 —— `e2e_skills.rs`
 > 保留为 `#[ignore]`，随时可复测；它仍是**测量**而非判定门槛。
 
+## 后续追加：`/skills` 命令（2026-09-22）
+
+skills 落地后补的第四个**用户可见面**（此前三个：`/help` 只列名字、`/status` 只给条数、
+`/` 浮层一放即走且需按 Tab 才开、且是**前缀过滤**的，不能用来浏览全部）。
+
+- **形态**：`/skills` → `PromptKind::PickSkill` → TUI 模态浮层列全部 skill
+  （`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的** —— 与 `/` 浮层
+  共用 `completion::selectable_skills`）。
+- **选中不发送**：**回填输入框** `/<command> `（尾随空格），用户补参数后自行回车。
+  skill 常带参数（`/git-status --short`），选中即发会把参数路堵死；这也是 `Tab` 补全的既有语义。
+- **数据仍是启动期快照**（`CodingView.skills`），**不重扫磁盘** —— 中途新增的 `SKILL.md`
+  要重启才可见（与其余三个面一致）。**不显示 path / scope**（`ys_tui_coding::SkillEntry`
+  刻意只有三个显示字段），故「这条是谁盖了谁」看不见。
+- **零协议改动**：不新增 `Request` 变体（仍 7 个）、不新增工具（仍 9 个）。唯一接口改动在
+  `ys-tui-coding` 内部 —— `resolve_prompt` 返回类型由 `Result<Request, _>` 变为
+  `Result<PromptOutcome, _>`（`Request` | `Prefill(String)`）。
+- **已知形态限制（实测）**：真实语料的 description 是 CJK 长句，选择器宽度被
+  `MODAL_MAX_WIDTH` 夹住 ⇒ 每条只显示描述的前一截（与 `/` 补全面同一取舍）。**`/`
+  浮层仍是按前缀过滤的那个面**（且要按 Tab 才开），两个面互补而非替代。
+- as-built 细节见 [`./coding-agent-tui.md`](./coding-agent-tui.md) §6 表 / §8.2 M10。
+
 ## 已知未决 / 遗留
 
 1. ~~**R8 未校准**~~ —— **已校准（2026-09-21）**，见上一节。剩余局限：只测了 MiniMax-M3 与
@@ -270,7 +291,8 @@ pub fn expand_invocation(text: &str, skills: &[SkillEntry]) -> Option<String>;
 2. **`/help <name>` 不认 skill** —— `/help`（无参）已追加 skill 段（`help_text_with_skills`，
    只列 `/<command>`、**不列 description**），但 `/help <skill>` 走 `command_help_text`，
    **只认内置命令表** ⇒ 对 skill 名给「未知命令」提示。设计 §M3 只要求「`/help` 追加 skill 段」，
-   故不算偏离，但这是用户会撞上的行为缺口。
+   故不算偏离，但这是用户会撞上的行为缺口。**部分缓解**：`/skills`（见上「后续追加」）提供了
+   「带 description 浏览全部」的面，但按名查详情（`/help <skill>`）仍未接。
 3. **诊断未按 `(command, key)` 去重** —— 同一条 `SKILL.md` 形态错误若在两条 root 上同时出现
    （两条同名 skill 各有一个非法 `description`），`scan_root` 会各产一条措辞相同的诊断。
    今天的形态（两条 root、同名时遮蔽诊断已收敛）下不会明显放大，但去重逻辑不存在。

@@ -230,6 +230,7 @@ pub enum Outbound<V> {
 |---|---|---|
 | `/help` | 本地打印命令表 | — |
 | `/status` | 本地（`CodingView` 在 TUI 手里） | — |
+| `/skills` | **浮层选择**（列全部 skill + description）；选中**回填输入框** `/<command> `，**不发送** | — |
 | `/copy` | 本地（最后一条回复在 transcript） | — |
 | `/quit` | 本地 | — |
 | `/model [name]` | 无参时**浮层选择** | `SetModel` |

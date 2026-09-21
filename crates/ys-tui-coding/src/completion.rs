@@ -69,32 +69,50 @@ pub fn item_for(spec: &CommandSpec) -> CompletionItem {
     }
 }
 
-/// 一条 skill → 一个候选项。
+/// skill 在「挑一条来用」的面上的显示文本：`<command>  — <description>`。
 ///
-/// 显示 `<command>  — <description>`：**这里列 description 是有意的** ——
-/// 浮层是「挑一条来用」的面，描述正是挑的依据（`/help` 那个面才只列名字，
-/// 见 [`crate::commands::help_text_with_skills`]）。宽度由浮层的
-/// `truncate_to_width` + `COMPLETION_MAX_WIDTH` 兜住。
+/// **这里列 description 是有意的** —— 两个面都是「挑一条来用」，描述正是挑的依据
+/// （`/help` 那个面才只列名字，见 [`crate::commands::help_text_with_skills`]）。
+/// 宽度由各自的浮层兜住：补全面是 `truncate_to_width` + `COMPLETION_MAX_WIDTH`，
+/// 选择器是 `truncate_to_width` + `MODAL_MAX_WIDTH`（真实语料的 description 是
+/// CJK 长句，两边都会被截断 —— 这是有意的「一屏一条」取舍，不是缺陷）。
+///
+/// 补全浮层与 `/skills` 选择器（[`crate::prompter::resolve_prompt`]）**共用**本函数 ——
+/// 两个面列的是同一批 skill、同一套措辞，不会漂移。选择器还要靠它**反解**回
+/// `command`（`Prompter::select` 只回传显示串），故这条格式是**承重的**。
+pub fn skill_label(skill: &SkillEntry) -> String {
+    format!("/{}  — {}", skill.command, skill.description)
+}
+
+/// 一条 skill → 一个候选项。
 pub fn skill_item_for(skill: &SkillEntry) -> CompletionItem {
     CompletionItem {
-        display: format!("/{}  — {}", skill.command, skill.description),
+        display: skill_label(skill),
         // 尾随空格：接着敲参数（与内置命令同形）
         replacement: format!("/{} ", skill.command),
     }
 }
 
-/// skill 段的候选项：按 `command` **升序**，且**排除与内置命令同名的**。
+/// 可被用户调用、且**未被内置命令遮蔽**的 skill，按 `command` 升序。
 ///
-/// `bare` 是**不含前导 `/`** 的前缀（`""` = 全部）。
-fn skill_items(skills: &[SkillEntry], bare: &str) -> Vec<CompletionItem> {
+/// 内置命令 > skill：同名的 skill 敲下去也永远走不到（`parse_with_skills` 先查内置表），
+/// 故不进任何候选面。`/` 浮层与 `/skills` 选择器**共用**本函数 —— 两个面列同一批。
+pub fn selectable_skills(skills: &[SkillEntry]) -> Vec<&SkillEntry> {
     let mut picked: Vec<&SkillEntry> = skills
         .iter()
-        .filter(|s| s.command.starts_with(bare))
-        // 内置命令 > skill：同名的 skill 进不了浮层（它敲下去也永远走不到）
         .filter(|s| !all_commands().iter().any(|c| c.name == s.command))
         .collect();
     picked.sort_by(|a, b| a.command.cmp(&b.command));
-    picked.into_iter().map(skill_item_for).collect()
+    picked
+}
+
+/// skill 段的候选项（`bare` 是**不含前导 `/`** 的前缀，`""` = 全部）。
+fn skill_items(skills: &[SkillEntry], bare: &str) -> Vec<CompletionItem> {
+    selectable_skills(skills)
+        .into_iter()
+        .filter(|s| s.command.starts_with(bare))
+        .map(skill_item_for)
+        .collect()
 }
 
 /// 全部候选条目（= 全部内置命令），顺序与 [`all_commands`] 一致。

@@ -2,7 +2,7 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-**当前状态**：`cargo test --workspace` 全绿 —— **809 passed / 0 failed / 7 ignored**（7 条 `#[ignore]` = 4 条 `tools-web` 的人工采集 + 2 条 coding-agent e2e（`e2e_tools` / `e2e_skills`，需真实凭证）+ 1 条 doc-test）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）、**skills 支持**（`SKILL.md` 启动期扫描 + 自写 frontmatter 解析，零新依赖；`<available_skills>` 常驻系统提示 + `/skill-name` 展开；**零新工具 / 零新协议变体**；顺带修正压缩触发对固定开销的盲区，as-built 见 `docs/design-final/skills.md`）。
+**当前状态**：`cargo test --workspace` 全绿 —— **813 passed / 0 failed / 7 ignored**（7 条 `#[ignore]` = 4 条 `tools-web` 的人工采集 + 2 条 coding-agent e2e（`e2e_tools` / `e2e_skills`，需真实凭证）+ 1 条 doc-test）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）、**skills 支持**（`SKILL.md` 启动期扫描 + 自写 frontmatter 解析，零新依赖；`<available_skills>` 常驻系统提示 + `/skill-name` 展开；**零新工具 / 零新协议变体**；顺带修正压缩触发对固定开销的盲区，as-built 见 `docs/design-final/skills.md`）、**`/skills` 选择器**（列全部 skill + description，选中**回填输入框**、不发请求；TUI 内部新增 `PromptOutcome`）。
 
 ## 目录结构
 
@@ -63,7 +63,7 @@ YuShan/
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（809 passed / 7 ignored）
+- `cargo test --workspace` — 全量测试（813 passed / 7 ignored）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
@@ -206,6 +206,7 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 - **`/login` 的 api_base 不再交互填**：协议只带 provider + api_key，api_base 从 provider 内置值解析，回退 `YUSHAN_API_BASE`；`custom` provider 需靠环境变量（见 `docs/design-final/coding-agent-tui.md` §8 M3）
 - **`/model` 无参浮层的候选在启动期备齐**：`run_interactive` 在**起屏之前**对每个已登录 provider 并发拉 `/v1/models`（5s 超时，失败静默回退静态表）—— 起屏后一次重绘都不发 HTTP（设计 M4）。候选是**所有已登录 provider** 的并集 + 当前在跑的模型；选中别家的模型时 `capabilities::set_model` 会**连端点一起切**（`provider_for_model` 定归属，见 M9）
 - **`/skill-name`（skill 通路）**：TUI **只认名、不读盘**（`commands::parse_with_skills` 未命中内置表才查 `view.skills`，命中即发**原文** `Request::Prompt`）；正文在 **app 侧** `app_loop::expand_skill_invocation` 读盘并展开成 `<skill name="…" location="…">正文</skill>`（**回合启动路径不分叉**，`-p`/`--json` 走 `main::expand_task` 的同一套）。**硬序：内置命令 > skill**（三处各钉一次：`parse`、补全、事件层）。**零新工具**（正文由既有 `read` 加载）、**零新协议变体**
+- **`/skills`（skill 浏览/选择）**：`PromptKind::PickSkill` → TUI 浮层列全部 skill（`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的** —— 与 `/` 浮层共用 `completion::selectable_skills`）。选中**回填输入框** `/<command> `（尾随空格）、**不发 `Request`**，用户补参数后自行回车 —— 落地在 `resolve_prompt` 的新返回类型 `PromptOutcome::{Request, Prefill}`。数据是**启动期快照**（不重扫盘），**不含 path / scope**。
 
 ## 硬性约束
 

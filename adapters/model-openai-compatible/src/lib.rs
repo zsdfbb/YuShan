@@ -10,7 +10,9 @@ use request::*;
 use response::*;
 use stream::{StreamEvent, parse_sse_stream};
 use ys_core::{ContentBlock, Message, Role, ToolCallId, Usage};
-use ys_model::{Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse};
+use ys_model::{
+    FinishReason, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
+};
 
 pub struct OpenAICompatibleConfig {
     pub api_base: String,
@@ -288,8 +290,26 @@ impl<'s> StreamAccumulator<'s> {
             // 端点不支持该选项时始终收不到 → 退回 `Usage::default()`（token 统计为 0），
             // 这是保守兼容的已知代价，不 panic。
             usage: self.usage.unwrap_or_default(),
-            stop_reason: self.finish_reason,
+            finish_reason: normalize_finish_reason(self.finish_reason),
         })
+    }
+}
+
+/// provider 的 finish_reason 方言 → [`FinishReason`]。
+///
+/// 分工：**方言归适配器，词汇归 `ys-model`** —— 因此 `ys-loop` 永远不必认识
+/// 任何 provider 的字符串。别名（`end_turn` / `max_tokens` / `tool_use`）是
+/// 零成本的保险，覆盖 Anthropic 系词汇。
+fn normalize_finish_reason(raw: Option<String>) -> FinishReason {
+    match raw.as_deref() {
+        Some("stop") | Some("end_turn") => FinishReason::Stop,
+        Some("tool_calls") | Some("tool_use") => FinishReason::ToolCalls,
+        Some("length") | Some("max_tokens") => FinishReason::Length,
+        Some("content_filter") => FinishReason::ContentFilter,
+        // 未识别的方言与「provider 压根没给」都落到 Other —— 语义是「没结论」，
+        // 绝不猜成 Stop（那会让下游把未知当正常收尾）。
+        Some(other) => FinishReason::Other(other.to_string()),
+        None => FinishReason::Other(String::new()),
     }
 }
 
@@ -552,7 +572,7 @@ mod tests {
 
         assert_eq!(joined, "Hello, world");
         assert_eq!(joined, final_text, "增量拼接必须与终态文本逐字节相等");
-        assert_eq!(response.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(response.finish_reason, FinishReason::Stop);
     }
 
     /// 工具参数增量：同一 `index` 的 id/name/arguments 分多片下发，
@@ -741,5 +761,75 @@ mod tests {
         assert_eq!(response.usage, Usage::default());
         assert_eq!(response.usage.input_tokens, 0);
         assert_eq!(response.usage.output_tokens, 0);
+    }
+
+    /// 映射表：**全部已知方言**逐条覆盖，含 Anthropic 系别名与未知值的兜底。
+    ///
+    /// 用参数化表而非散装 `assert`，是为了让「新增一种方言」时只需加一行。
+    #[test]
+    fn normalize_finish_reason_maps_every_known_dialect() {
+        let cases: Vec<(Option<&str>, FinishReason)> = vec![
+            // OpenAI 系
+            (Some("stop"), FinishReason::Stop),
+            (Some("tool_calls"), FinishReason::ToolCalls),
+            (Some("length"), FinishReason::Length),
+            (Some("content_filter"), FinishReason::ContentFilter),
+            // Anthropic 系别名（零成本保险）
+            (Some("end_turn"), FinishReason::Stop),
+            (Some("max_tokens"), FinishReason::Length),
+            (Some("tool_use"), FinishReason::ToolCalls),
+            // 未知方言 / provider 未给：一律 Other，**不得**猜成 Stop
+            (
+                Some("some_future_thing"),
+                FinishReason::Other("some_future_thing".into()),
+            ),
+            (None, FinishReason::Other(String::new())),
+        ];
+
+        for (raw, expected) in cases {
+            let got = normalize_finish_reason(raw.map(str::to_string));
+            assert_eq!(got, expected, "raw = {raw:?}");
+        }
+    }
+
+    /// **下游截断保护的判据来源**：只有 `length` / `max_tokens` 算截断；
+    /// `stop` / `None` / 未知值都**不是** —— 未知绝不能伪装成正常收尾。
+    #[test]
+    fn normalize_finish_reason_truncation_flag() {
+        assert!(normalize_finish_reason(Some("length".into())).is_truncated());
+        assert!(normalize_finish_reason(Some("max_tokens".into())).is_truncated());
+
+        assert!(!normalize_finish_reason(Some("stop".into())).is_truncated());
+        assert!(!normalize_finish_reason(None).is_truncated());
+        assert!(
+            !normalize_finish_reason(Some("some_future_thing".into())).is_truncated(),
+            "未知方言不得被判为截断"
+        );
+    }
+
+    /// 端到端（合成 SSE）：provider 给 `finish_reason: "length"` 时，
+    /// 收敛出的 `ModelResponse.finish_reason` 必须已归一化且 `is_truncated()`。
+    /// 这条守着 `finish()` 的接线，而不仅是映射函数本身。
+    #[test]
+    fn streamed_length_finish_reason_is_normalized_to_truncated() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive(
+            &mut buf,
+            &mut acc,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut off\"}}]}\n",
+        );
+        drive(
+            &mut buf,
+            &mut acc,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n",
+        );
+        drive(&mut buf, &mut acc, b"data: [DONE]\n");
+
+        let response = acc.finish().unwrap();
+        assert_eq!(response.finish_reason, FinishReason::Length);
+        assert!(response.finish_reason.is_truncated());
     }
 }

@@ -13,6 +13,12 @@ use ys_tool::{ToolContext, ToolError};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
+/// 被截断的那批工具调用的统一回喂话术。必须**模型可读、能自愈**：
+/// 点明「没执行、别以为成功了」，并给出可行的下一步。
+const TRUNCATED_TOOL_NOTICE: &str = "tool call was NOT executed: the model response was truncated \
+     (output token limit reached). Re-issue this call with a smaller payload, or split it into \
+     several calls.";
+
 pub struct BasicLoop;
 
 /// Forwarder 桥接 ModelEvent → AgentEvent，转发到 EventSink。
@@ -300,6 +306,95 @@ impl AgentLoop for BasicLoop {
                 })
                 .collect();
 
+            // Step 8b：截断保护（ADR-0020）—— 被截断的那一批工具**一个都不执行**。
+            //
+            // 模型被输出预算掐断时，工具块的参数很可能是残缺的（适配器只看 name 非空就出块），
+            // 执行它等于拿半个 payload 去写文件。故整批作废、合成 is_error 结果回喂，
+            // 让模型下一轮自己改小步。
+            if response.finish_reason.is_truncated() {
+                emit(
+                    ctx.events,
+                    AgentEvent::ResponseTruncated {
+                        dropped_tool_calls: tool_calls.len(),
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
+
+                if tool_calls.is_empty() {
+                    // 纯文本被截断：诚实收场，**不得**伪装成 Completed（那是静默的谎）。
+                    let final_msg = if text_content.is_empty() {
+                        None
+                    } else {
+                        Some(assistant_message)
+                    };
+                    emit(
+                        ctx.events,
+                        AgentEvent::RunFinished {
+                            stop_reason: StopReason::Truncated,
+                            usage: total_usage.clone(),
+                            rounds,
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                    return Ok(RunResult {
+                        stop_reason: StopReason::Truncated,
+                        usage: total_usage,
+                        rounds,
+                        final_message: final_msg,
+                    });
+                }
+
+                // 有工具调用：整批作废。每个 tool_use 都必须拿到一条结果
+                // （ADR-0001 配对完整性 —— 否则下一轮请求会被真实 provider 直接拒收）。
+                //
+                // 注意：此处**不做审批检查** —— 不执行就不该弹审批。
+                let mut dropped: Vec<ContentBlock> = Vec::with_capacity(tool_calls.len());
+                for (tool_call_id, tool_name, tool_args) in &tool_calls {
+                    emit(
+                        ctx.events,
+                        AgentEvent::ToolCall {
+                            call: ys_core::ToolCall {
+                                id: tool_call_id.clone(),
+                                name: tool_name.clone(),
+                                arguments: tool_args.clone(),
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+
+                    let content = TRUNCATED_TOOL_NOTICE.to_string();
+                    emit(
+                        ctx.events,
+                        AgentEvent::ToolResult {
+                            id: tool_call_id.clone(),
+                            result: CoreToolResult {
+                                content: content.clone(),
+                                is_error: true,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+
+                    dropped.push(ContentBlock::ToolResult {
+                        tool_call_id: tool_call_id.clone(),
+                        content,
+                        is_error: true,
+                    });
+                }
+                ctx.session
+                    .append(Message {
+                        role: Role::User,
+                        content: dropped,
+                    })
+                    .await
+                    .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                continue;
+            }
+
             if tool_calls.is_empty() {
                 // 无 tool call -> 完成
                 let final_msg = if text_content.is_empty() {
@@ -463,12 +558,14 @@ impl AgentLoop for BasicLoop {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use ys_component::RunLimits;
     use ys_event::{AgentEvent, CollectingSink, EventSink};
-    use ys_model::{MockModel, Model, ModelError, ModelResponse};
+    use ys_model::{FinishReason, MockModel, Model, ModelError, ModelResponse};
     use ys_session::{MemorySession, Session};
-    use ys_tool::ToolRegistry;
+    use ys_tool::{Tool, ToolContext, ToolRegistry, ToolSpec};
 
     /// A3：`ModelEvent::ThinkingDelta` 经 `Forwarder` 冒泡为
     /// `AgentEvent::ModelThinkingDelta`；`TextDelta` 路径不变。
@@ -699,7 +796,7 @@ mod tests {
                     }],
                 },
                 usage: Usage::default(),
-                stop_reason: None,
+                finish_reason: FinishReason::Stop,
             })
         }
     }
@@ -771,5 +868,495 @@ mod tests {
                 "fixed = {fixed}：压缩被跳过 ⇒ 会话形状不变"
             );
         }
+    }
+
+    // ==================== N1-N4：截断保护（ADR-0020） ====================
+    //
+    // 背景：provider 输出预算耗尽时给 `finish_reason: "length"`，工具块的参数很可能是
+    // 残缺的（适配器只看 name 非空就出块）。旧循环把这批工具**照常执行** ⇒ 半个 payload
+    // 去写文件且返回 success；纯文本截断则直接判 `Completed` + ✓（静默的谎）。
+    // 新分支（Step 8b）整批作废、合成 is_error 回喂，让模型下一轮改小步。
+
+    /// 间谍工具：只数被调用了几次，`call` 里 `fetch_add(1)` 后返回成功结果。
+    ///
+    /// 「计数」是最直白的证据 —— 比「结果内容长什么样」更难被巧合糊弄过去。
+    ///
+    /// **名字可配**（每个名字各自一份计数器）：只有让被作废的那批工具名**真的注册进
+    /// registry**，计数才说明问题。若用例里 model 返回的名字没注册，guard 失效后循环会走
+    /// Step 9 的「registry 未命中」路径 —— 照样合成 id 一一对应的 `is_error` 结果、装进同
+    /// 一条 `Role::User` 消息 —— 于是断言全被那条错误路径满足，计数更是恒为 0 的**空断言**。
+    struct SpyTool {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SpyTool {
+        /// 返回 (名为 `spy` 的工具, 计数器)。测试持有计数器即可断言调用次数。
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            Self::new_named("spy")
+        }
+
+        /// 返回 (指定名字的工具, 计数器) —— 名字不同则计数器**互不相干**。
+        fn new_named(name: &str) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    name: name.to_string(),
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SpyTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.name.as_str(), "counts invocations", serde_json::json!({}))
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreToolResult {
+                content: "spy ok".into(),
+                is_error: false,
+            })
+        }
+    }
+
+    /// 会话里所有 `ToolResult` block（按出现顺序）。
+    fn tool_results_in(session: &MemorySession) -> Vec<&ContentBlock> {
+        session
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .collect()
+    }
+
+    /// 消息里是否含**恰好等于** `text` 的文本块（子串会把 "done" 误命中别处）。
+    fn content_has_text(msg: &Message, text: &str) -> bool {
+        msg.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text: t } if t == text))
+    }
+
+    /// N1：**被截断的那批工具一个都不执行**，整批作废并回喂 is_error。
+    ///
+    /// 场景：`push_truncated_tool_call("spy")`（`finish_reason = Length`）→ `push_text("done")`。
+    /// 断言链：
+    ///  - SpyTool 计数 **== 0**（没被执行 —— 本改动的全部意义）；
+    ///  - 会话里有一条 `is_error` 且内容含 "truncated" 的 `ToolResult`（模型看得见「没执行」）；
+    ///  - 事件流里有 `ResponseTruncated { dropped_tool_calls: 1 }`；
+    ///  - 模型**被调了第二次**：证据是 `push_text("done")` 那条响应的文本出现在会话里
+    ///    （第二轮的产出）。若少了 `continue`，队列里那条响应永远不会被消费。
+    ///
+    /// 变异自检（已实测）：删掉 `response.finish_reason.is_truncated()` 这个 `if`
+    /// ⇒ spy 被真执行、计数变 1 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn truncated_tool_calls_are_not_executed() {
+        let (spy, calls) = SpyTool::new();
+        let registry = ToolRegistry::build(vec![Box::new(spy)]).unwrap();
+        let model = MockModel::new("m");
+        model.push_truncated_tool_call("spy", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "被截断的工具**一个都不得执行**（否则拿半个 payload 就去写文件）"
+        );
+
+        // 事件：必须有一条 ResponseTruncated，且 dropped_tool_calls = 1
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ResponseTruncated { dropped_tool_calls: 1 })),
+            "必须发出 ResponseTruncated{{dropped_tool_calls: 1}}：{:?}",
+            events.events()
+        );
+
+        // 会话：每个被作废的 tool_use 都拿到一条 is_error 结果，话术含 "truncated"
+        let results = tool_results_in(&session);
+        assert_eq!(results.len(), 1, "配对完整性：1 个 tool_use ⇒ 1 条结果");
+        match results[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(*is_error, "作废的结果必须是 is_error（别让模型以为成功了）");
+                assert!(
+                    content.contains("truncated"),
+                    "回喂话术必须点明「被截断」，实际 = {content:?}"
+                );
+            }
+            other => panic!("unreachable: {other:?}"),
+        }
+
+        // 模型被调了第二次：第二轮那条 "done" 出现在会话里（在结果消息之后）
+        assert_eq!(result.stop_reason, StopReason::Completed, "第二轮照常收场");
+        assert_eq!(result.rounds, 2, "第 1 轮作废 → 第 2 轮拿回控制权");
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|m| m.role == Role::Assistant && content_has_text(m, "done")),
+            "第二轮的模型输出必须落地（证明 continue 让循环再调了一次 model）：{:?}",
+            session.messages()
+        );
+    }
+
+    /// N2：纯文本被截断 ⇒ 回合以 `StopReason::Truncated` **诚实**收场（不是 `Completed`）。
+    ///
+    /// 变异自检（已实测）：把分支里两处 `StopReason::Truncated` 改回 `Completed`
+    /// ⇒ `result.stop_reason` 与 `RunFinished.stop_reason` 两条断言同时变红；
+    /// 把 `ResponseTruncated` 的 emit 挪到 `RunFinished` **之后** ⇒ 顺序断言变红。
+    #[tokio::test]
+    async fn truncated_text_ends_turn_as_truncated() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = MockModel::new("m");
+        model.push_truncated_text("half an answer");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Truncated,
+            "被截断的纯文本**不得**伪装成 Completed"
+        );
+        assert_eq!(result.rounds, 1);
+        // 截断的文本仍作为 final_message 交出去（半句答案总比没有好，但不能标成完成）
+        assert!(
+            result
+                .final_message
+                .as_ref()
+                .is_some_and(|m| content_has_text(m, "half an answer")),
+            "被截断的文本应仍带出，实际 = {:?}",
+            result.final_message
+        );
+
+        let terminal: Vec<_> = events
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. }
+                )
+            })
+            .collect();
+        assert_eq!(terminal.len(), 1, "终局事件不变量：恰好一个");
+        assert!(
+            matches!(
+                terminal[0],
+                AgentEvent::RunFinished {
+                    stop_reason: StopReason::Truncated,
+                    ..
+                }
+            ),
+            "终局事件必须是 RunFinished{{Truncated}}，实际 = {:?}",
+            terminal[0]
+        );
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ResponseTruncated { dropped_tool_calls: 0 })),
+            "纯文本截断也要发 ResponseTruncated（dropped = 0）：{:?}",
+            events.events()
+        );
+
+        // 顺序不变量：截断通知是**非终局**事件，必须先于**终局**事件 RunFinished。
+        // `terminal.len() == 1` 已钉住 RunFinished 只有一条，故 `position` 唯一。
+        let truncated_at = events
+            .events()
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ResponseTruncated { .. }))
+            .expect("截断时必须发出 ResponseTruncated");
+        let finished_at = events
+            .events()
+            .iter()
+            .position(|e| matches!(e, AgentEvent::RunFinished { .. }))
+            .expect("回合终局必须发出 RunFinished");
+        assert!(
+            truncated_at < finished_at,
+            "顺序不变量：ResponseTruncated（下标 {truncated_at}）必须先于 RunFinished\
+             （下标 {finished_at}）—— 先告知「被截断了」，再收场：{:?}",
+            events.events()
+        );
+    }
+
+    /// N3（回归护栏）：**未**截断的 tool call 照常执行 —— 保护既有行为不被新分支误伤。
+    ///
+    /// 变异自检（已实测）：让 guard 恒真（把 `is_truncated()` 的判别写死成 `true`）
+    /// ⇒ spy 计数变 0、`stop_reason` 不再是 `Completed`、且凭空多出 `ResponseTruncated`
+    /// ⇒ 本用例三处断言全部变红。
+    #[tokio::test]
+    async fn non_truncated_tool_calls_still_execute() {
+        let (spy, calls) = SpyTool::new();
+        let registry = ToolRegistry::build(vec![Box::new(spy)]).unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("spy", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "正常收尾的 tool call 必须照常执行（计数应为 1）"
+        );
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ResponseTruncated { .. })),
+            "未截断 ⇒ 不得发出 ResponseTruncated：{:?}",
+            events.events()
+        );
+    }
+
+    /// 单条响应里含**两个** tool_use 的截断模型。
+    ///
+    /// `MockModel::push_truncated_tool_call` 一次只出一个 tool_use（每次 `push` 是**一个
+    /// 独立响应** ⇒ 分两轮），覆盖不到「**同一条**被截断的响应里挂着多个工具块」——
+    /// 而那正是真实 provider 的形状，也是配对完整性最容易写错的地方（只给
+    /// `tool_calls[0]` 合成结果时，MockModel 版本会**漏检**，用例变假绿）。
+    ///
+    /// 两个工具名（`spy-a` / `spy-b`）**必须是 registry 里真注册过的** —— 见 `SpyTool` 注释。
+    struct TwoTruncatedCallsModel {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for TwoTruncatedCallsModel {
+        fn model_id(&self) -> &str {
+            "two-truncated-calls"
+        }
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let idx = {
+                let mut calls = self.calls.lock().unwrap();
+                let idx = *calls;
+                *calls += 1;
+                idx
+            };
+            if idx == 0 {
+                // 第 1 轮：**一条**被截断的响应，里面挂着两个工具块
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![
+                            ContentBlock::ToolUse {
+                                id: ys_core::ToolCallId("tc-a".into()),
+                                name: "spy-a".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                            ContentBlock::ToolUse {
+                                id: ys_core::ToolCallId("tc-b".into()),
+                                name: "spy-b".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                        ],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Length,
+                })
+            } else {
+                // 第 2 轮：作废回喂后模型改小步，正常收尾
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                })
+            }
+        }
+    }
+
+    /// N4：**配对完整性**（ADR-0001）—— 整批作废时每个 `ToolUse` 都必须拿到一条
+    /// `ToolResult`，否则下一轮请求会被真实 provider 直接拒收（400）。
+    ///
+    /// 场景：**同一条**被截断的响应里两个不同名的 tool_use（`spy-a` / `spy-b`，**两个都真
+    /// 注册进 registry**）→ 第 2 轮 `"done"`。
+    /// 断言：
+    ///  - 两个 spy 的计数**都 == 0**（真被作废，而非「名字没注册所以找不到」）；
+    ///  - 回喂的那条 `Role::User` 消息里 `ToolResult` 数量 == 2，且 `tool_call_id` 集合与
+    ///    assistant 消息里两个 `ToolUse` 的 `id` 集合**完全一致**；
+    ///  - 两条结果全 `is_error`；
+    ///  - 事件流里有**恰好一条** `ResponseTruncated { dropped_tool_calls: 2 }` ——
+    ///    值必须是 2，钉住「**整批**作废」而非「只丢坏的」。
+    ///
+    /// 变异自检（已实测）：把 Step 8b 的 guard 恒假（`is_truncated()` 判别写死成 `false`）
+    /// ⇒ 两个 spy 被**真执行**、计数变 1 ⇒ 计数断言变红，且 `ResponseTruncated` 事件断言同时变红。
+    /// （旧版本用未注册的 `a`/`b` 名：guard 失效后走「registry 未命中」路径照样合成
+    /// is_error 结果，计数恒 0 ⇒ 用例假绿、对该特性零判别力。见 `SpyTool` 注释。）
+    #[tokio::test]
+    async fn truncated_tool_calls_satisfy_pairing_invariant() {
+        // 两个工具名都真注册：否则本用例对截断保护零判别力（见函数注释）。
+        let (spy_a, calls_a) = SpyTool::new_named("spy-a");
+        let (spy_b, calls_b) = SpyTool::new_named("spy-b");
+        let registry = ToolRegistry::build(vec![Box::new(spy_a), Box::new(spy_b)]).unwrap();
+        let model = TwoTruncatedCallsModel {
+            calls: Mutex::new(0),
+        };
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            calls_a.load(Ordering::SeqCst),
+            0,
+            "整批作废 ⇒ spy-a 不得被执行（计数 1 说明 guard 失效、真去执行了半个 payload）"
+        );
+        assert_eq!(
+            calls_b.load(Ordering::SeqCst),
+            0,
+            "整批作废 ⇒ spy-b 不得被执行（计数 1 说明 guard 失效、真去执行了半个 payload）"
+        );
+
+        // 事件：恰好一条 ResponseTruncated，且 dropped_tool_calls **恰好是 2**（整批作废）
+        let truncated_events: Vec<_> = events
+            .events()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ResponseTruncated { .. }))
+            .collect();
+        assert_eq!(
+            truncated_events.len(),
+            1,
+            "截断保护必须发出**恰好一条** ResponseTruncated：{:?}",
+            events.events()
+        );
+        assert!(
+            matches!(
+                truncated_events[0],
+                AgentEvent::ResponseTruncated {
+                    dropped_tool_calls: 2
+                }
+            ),
+            "dropped_tool_calls 必须恰好是 2（整批作废，不是只丢坏的）：{:?}",
+            truncated_events[0]
+        );
+
+        // assistant 那批被作废的 tool_use 的 id 集合
+        let use_ids: std::collections::BTreeSet<String> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(use_ids.len(), 2, "前置：一条响应里两个 tool_use");
+
+        // 回喂的那条 user 消息里的结果 id 集合
+        let paired = session
+            .messages()
+            .iter()
+            .find(|m| {
+                m.role == Role::User
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            })
+            .expect("截断批次必须把工具结果回喂进会话");
+        let result_blocks: Vec<&ContentBlock> = paired
+            .content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            .collect();
+        assert_eq!(
+            result_blocks.len(),
+            2,
+            "配对完整性：2 个 tool_use ⇒ 必须合成 2 条结果，实际 = {result_blocks:?}"
+        );
+
+        let result_ids: std::collections::BTreeSet<String> = result_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_call_id, .. } => Some(tool_call_id.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            result_ids, use_ids,
+            "结果的 tool_call_id 集合必须与 tool_use 的 id 集合**完全一致**（ADR-0001）"
+        );
+        assert!(
+            result_blocks
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
+            "作废的结果必须全是 is_error：{result_blocks:?}"
+        );
     }
 }

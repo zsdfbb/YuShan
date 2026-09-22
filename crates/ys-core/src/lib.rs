@@ -69,11 +69,22 @@ mod tests {
             StopReason::Completed,
             StopReason::MaxRounds,
             StopReason::Cancelled,
+            StopReason::Truncated,
         ];
         for r in reasons {
             let json = serde_json::to_string(&r).unwrap();
             let back: StopReason = serde_json::from_str(&json).unwrap();
             assert_eq!(r, back);
         }
+    }
+
+    // `Truncated` 是加法式新增变体，但它会出现在 `RunFinished.stop_reason` 里，
+    // 经 `--json` 模式逐行打印 —— 序列化出的字符串是**对外契约**，必须钉死。
+    #[test]
+    fn test_stop_reason_truncated_serde_roundtrip() {
+        let json = serde_json::to_string(&StopReason::Truncated).unwrap();
+        assert_eq!(json, "\"Truncated\"", "序列化字符串是对外契约，不得改名");
+        let back: StopReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, StopReason::Truncated);
     }
 }

@@ -2,7 +2,7 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-**当前状态**：`cargo test --workspace` 全绿 —— **813 passed / 0 failed / 7 ignored**（7 条 `#[ignore]` = 4 条 `tools-web` 的人工采集 + 2 条 coding-agent e2e（`e2e_tools` / `e2e_skills`，需真实凭证）+ 1 条 doc-test）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）、**skills 支持**（`SKILL.md` 启动期扫描 + 自写 frontmatter 解析，零新依赖；`<available_skills>` 常驻系统提示 + `/skill-name` 展开；**零新工具 / 零新协议变体**；顺带修正压缩触发对固定开销的盲区，as-built 见 `docs/design-final/skills.md`）、**`/skills` 选择器**（列全部 skill + description，选中**回填输入框**、不发请求；TUI 内部新增 `PromptOutcome`）。
+**当前状态**：`cargo test --workspace` 全绿 —— **832 passed / 0 failed / 7 ignored**（7 条 `#[ignore]` = 4 条 `tools-web` 的人工采集 + 2 条 coding-agent e2e（`e2e_tools` / `e2e_skills`，需真实凭证）+ 1 条 doc-test）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）、**skills 支持**（`SKILL.md` 启动期扫描 + 自写 frontmatter 解析，零新依赖；`<available_skills>` 常驻系统提示 + `/skill-name` 展开；**零新工具 / 零新协议变体**；顺带修正压缩触发对固定开销的盲区，as-built 见 `docs/design-final/skills.md`）、**`/skills` 选择器**（列全部 skill + description，选中**回填输入框**、不发请求；TUI 内部新增 `PromptOutcome`）、**截断保护**（模型输出被 `finish_reason = length` 截断时**整批工具作废、一个都不执行**并回喂错误结果；纯文本截断以新增的第四种终止原因 `StopReason::Truncated` 收场；`ModelResponse` 字段改名并归一化为 `FinishReason`；新非终局事件 `ResponseTruncated`；as-built 见 `docs/design-final/truncation-guard.md`、决策见 `docs/adr/0020`）。
 
 ## 目录结构
 
@@ -46,6 +46,7 @@ YuShan/
 │           ├── degraded_search.rs     # CLI 降级路径（受限 PATH → stderr 有提示 + stdout 为空）
 │           ├── stream_usage_fallback.rs # 流式 usage 门控与 400 回退
 │           ├── skills_cli.rs          # skill 诊断的 CLI 去向（-p/--json → stderr；stdout 纯净）
+│           ├── truncation_guard.rs    # 截断保护端到端：被截断的那批工具调用一个都不执行（回环 SSE）
 │           ├── e2e_skills.rs          # R8 对账：真实 usage 差 vs 静态估算（#[ignore]，未校准）
 │           └── e2e_tools.rs           # 真实 API 端到端（#[ignore]）
 ├── docs/
@@ -63,7 +64,7 @@ YuShan/
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（813 passed / 7 ignored）
+- `cargo test --workspace` — 全量测试（832 passed / 7 ignored）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
@@ -248,11 +249,13 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 | 架构规范、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
 | 术语定义（Turn、Round、StopReason、错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
 | **给新需求归类**（该用 Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
-| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`）、0014 只做 follow-up（**不建 hook 系统**，有意推迟）、0015 搜索工具外挂 `rg`/`fd`（降级 `grep`/`find`，不内建 `ignore` crate）、0016 web 工具（落盘+指针 / 后端链用表非 trait / 引入 `htmd` / SSRF 反转；**修订（2026-09-18）**：Firecrawl 由 keyless 改为需 key，零配置链为空） |
+| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`）、0014 只做 follow-up（**不建 hook 系统**，有意推迟）、0015 搜索工具外挂 `rg`/`fd`（降级 `grep`/`find`，不内建 `ignore` crate）、0016 web 工具（落盘+指针 / 后端链用表非 trait / 引入 `htmd` / SSRF 反转；**修订（2026-09-18）**：Firecrawl 由 keyless 改为需 key，零配置链为空）、0017 压缩加固（算法搬家 `ys-loop::compact` / 阈值比例化 / 窗口三级配置 / 失败不再静默失忆）、0018 `webfetch` 总结能力（可选 `prompt` / 窄能力 trait 注入模型 / 内容封顶同头部）、0019 skills（零新工具 / 展开型命令 / 压缩耦合修正）、0020 截断保护（`finish_reason` 归一化 / 被截断工具批作废 / 新增终止原因 `Truncated`） |
 | **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）+ `docs/design-final/core-channel.md`（核心信道第一刀，部分已被上文取代，见其 §8） |
 | 搜索工具的 as-built | `docs/design-final/search-tools.md` |
 | web 工具的 as-built | `docs/design-final/tools-web.md` |
+| 上下文压缩的 as-built | `docs/design-final/compaction.md`；决策 `docs/adr/0017-compaction-hardening.md`、设计 `docs/arch/skills-and-compaction/design-compaction.md` |
 | **skills 的 as-built**（含与设计的 12 条偏差） | `docs/design-final/skills.md`；设计 `docs/arch/skills/design.md`、决策 `docs/adr/0019-skills.md`、计划 `docs/design-plans/2026-09-21-skills.md` |
+| **截断保护的 as-built**（含与设计的 6 条偏差） | `docs/design-final/truncation-guard.md`；决策 `docs/adr/0020-truncation-guard.md`、报告 `docs/reports/2026-09-22-truncation-guard-report.md` |
 | coding agent TUI 的设计推导与质量分析 | `docs/arch/coding-agent-tui/{design,review}.md`；已作废的前身 `docs/arch/coding-agent-tui/tui-repl-context.md` |
 | 核心信道的设计推导与质量分析 | `docs/arch/gap-closure/{context,design-core-channel,review}.md` |
 | 各 crate 的 API 和实现细节 | 对应 crate 的 `src/lib.rs` |

@@ -535,6 +535,7 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
         StopReason::Completed => "✓",
         StopReason::MaxRounds => "⚠",
         StopReason::Cancelled => "✗",
+        StopReason::Truncated => "✂",
         _ => "?",
     }
 }
@@ -790,6 +791,7 @@ mod tests {
             (StopReason::Completed, "✓"),
             (StopReason::MaxRounds, "⚠"),
             (StopReason::Cancelled, "✗"),
+            (StopReason::Truncated, "✂"),
         ] {
             let mut app = app_with(CodingView::for_test());
             app.transcript.push(TranscriptLine::Summary {

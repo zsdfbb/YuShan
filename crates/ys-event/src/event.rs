@@ -55,4 +55,13 @@ pub enum AgentEvent {
     ContextCompactionFailed {
         reason: String,
     },
+    /// 模型输出被截断（provider finish_reason = length/max_tokens）。
+    ///
+    /// **非终局**：终局事件仍只有 `RunFinished` / `RunFailed`。
+    /// 有工具调用时该批**全部不执行**，循环继续；无工具调用时回合以
+    /// `StopReason::Truncated` 收场。
+    ResponseTruncated {
+        /// 被作废、**未执行**的工具调用数（0 = 纯文本被截断）。
+        dropped_tool_calls: usize,
+    },
 }

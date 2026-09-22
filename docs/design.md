@@ -215,6 +215,7 @@ pub trait AgentLoop: Send + Sync {
 工具返回错误结果（含请求了未注册的工具）→ 作为错误 ToolResult 回喂模型，计入轮数
 ToolError（工具无法产出可回喂的结果）   → 终止回合，返回 LoopError
 达到最大轮数                            → 正常结束，StopReason = MaxRounds
+模型输出被截断（含被作废的工具批）      → 正常结束，StopReason = Truncated
 取消（步骤边界检查）                    → 正常结束，StopReason = Cancelled
 EventSink 发送失败                      → 终止回合（观察者不阻断属于后续 Hook 阶段的语义）
 ```
@@ -519,7 +520,7 @@ let agent = AgentBuilder::new()
 | 模块  | 重点测试 |
 | --- | --- |
 | `ys-core` | 消息、Tool Call、事件和序列化 |
-| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致 |
+| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致、截断保护 |
 | `Registry` | 注册、查找、重复名称和缺失组件 |
 | `Session` | 追加消息、保存恢复、空会话和损坏数据 |
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |

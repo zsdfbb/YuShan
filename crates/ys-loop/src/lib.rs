@@ -37,7 +37,9 @@ mod tests {
     use ys_component::{RunLimits, RuntimeContext};
     use ys_core::*;
     use ys_event::{AgentEvent, CollectingSink, FailingSink};
-    use ys_model::{MockModel, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+    use ys_model::{
+        FinishReason, MockModel, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse,
+    };
     use ys_protocol::{Boundary, BoundarySource, QueueBoundarySource};
     use ys_session::{MemorySession, Session};
     use ys_tool::{Tool, ToolContext, ToolRegistry};
@@ -516,7 +518,7 @@ mod tests {
                         }],
                     },
                     usage: Usage::default(),
-                    stop_reason: None,
+                    finish_reason: FinishReason::Stop,
                 })
             } else {
                 Ok(ModelResponse {
@@ -527,7 +529,7 @@ mod tests {
                         }],
                     },
                     usage: Usage::default(),
-                    stop_reason: None,
+                    finish_reason: FinishReason::Stop,
                 })
             }
         }
@@ -762,7 +764,7 @@ mod tests {
                     }],
                 },
                 usage: Usage::default(),
-                stop_reason: None,
+                finish_reason: FinishReason::Stop,
             })
         }
     }
@@ -793,7 +795,7 @@ mod tests {
                     }],
                 },
                 usage: Usage::default(),
-                stop_reason: None,
+                finish_reason: FinishReason::Stop,
             })
         }
     }

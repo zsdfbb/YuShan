@@ -13,7 +13,9 @@
 use std::sync::Mutex;
 
 use ys_event::CollectingSink;
-use ys_model::{MockModel, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+use ys_model::{
+    FinishReason, MockModel, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse,
+};
 use ys_runtime::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ impl Model for SteeringProbeModel {
                     }],
                 },
                 usage: Usage::default(),
-                stop_reason: None,
+                finish_reason: FinishReason::Stop,
             })
         } else {
             Ok(ModelResponse {
@@ -119,7 +121,7 @@ impl Model for SteeringProbeModel {
                     }],
                 },
                 usage: Usage::default(),
-                stop_reason: None,
+                finish_reason: FinishReason::Stop,
             })
         }
     }

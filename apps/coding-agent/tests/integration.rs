@@ -5,7 +5,7 @@ use ys_component::{RunLimits, RuntimeContext};
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId};
 use ys_event::{AgentEvent, CollectingSink};
 use ys_loop::{AgentInput, AgentLoop, BasicLoop};
-use ys_model::{Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+use ys_model::{FinishReason, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
 use ys_session::MemorySession;
 use ys_tool::{Tool, ToolContext};
 use ys_tools_basic::exec::SearchBackends;
@@ -60,7 +60,7 @@ impl Model for MockCodingModel {
                     }],
                 },
                 usage: Default::default(),
-                stop_reason: Some("stop".into()),
+                finish_reason: FinishReason::Stop,
             })
         } else {
             // 返回一个 read tool call
@@ -74,7 +74,7 @@ impl Model for MockCodingModel {
                     }],
                 },
                 usage: Default::default(),
-                stop_reason: Some("tool_calls".into()),
+                finish_reason: FinishReason::ToolCalls,
             })
         }
     }
@@ -114,7 +114,7 @@ impl Model for MockGrepModel {
                     }],
                 },
                 usage: Default::default(),
-                stop_reason: Some("stop".into()),
+                finish_reason: FinishReason::Stop,
             })
         } else {
             Ok(ModelResponse {
@@ -127,7 +127,7 @@ impl Model for MockGrepModel {
                     }],
                 },
                 usage: Default::default(),
-                stop_reason: Some("tool_calls".into()),
+                finish_reason: FinishReason::ToolCalls,
             })
         }
     }

@@ -167,6 +167,20 @@ impl App {
                 )));
                 self.follow = true;
             }
+            AgentEvent::ResponseTruncated { dropped_tool_calls } => {
+                // 非终局事件：有工具调用时循环会**继续**（那批工具被作废、未执行），
+                // 故这里只推一行警告、**不调** `finish_turn`。
+                let msg = if dropped_tool_calls == 0 {
+                    "model response was truncated (output limit reached)".to_string()
+                } else {
+                    format!(
+                        "model response was truncated (output limit reached): \
+                         {dropped_tool_calls} tool call(s) were NOT executed"
+                    )
+                };
+                self.transcript.push(TranscriptLine::System(msg));
+                self.follow = true;
+            }
             _ => {} // AgentEvent 是 #[non_exhaustive]
         }
     }
@@ -677,6 +691,58 @@ mod tests {
         );
         assert!(a.is_turning, "压缩失败不终止回合");
         assert!(a.turn_started_at.is_some());
+    }
+
+    /// 截断且有工具调用被作废：推一条 `System` 警告行，且**不结束回合**
+    /// （非终局事件 —— 循环会带着「工具未执行」这一事实继续下一轮）。
+    ///
+    /// 变异：① 把 `apply_event` 里的 `ResponseTruncated` 臂改回 `_ => {}` →
+    /// 前两条断言变红；② 在臂里补上 `finish_turn()` → `is_turning` 断言变红。
+    #[test]
+    fn test_response_truncated_with_dropped_tool_calls_keeps_turn() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        assert!(a.is_turning, "前置：回合进行中");
+
+        a.apply_event(env(AgentEvent::ResponseTruncated {
+            dropped_tool_calls: 2,
+        }));
+
+        match a.transcript.last() {
+            Some(TranscriptLine::System(s)) => {
+                assert!(s.contains("2 tool call(s)"), "要报出被作废的工具数：{s}");
+                assert!(s.contains("NOT executed"), "要明说那批工具没执行：{s}");
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+        // **非终局**：回合可能还在继续，不得复位 turn 态
+        assert!(a.is_turning, "ResponseTruncated 不得调 finish_turn");
+        assert!(a.turn_started_at.is_some());
+    }
+
+    /// 纯文本被截断（0 个工具调用）：文案同样警告，但**不**提工具调用。
+    ///
+    /// 变异：把 `dropped_tool_calls == 0` 的分支去掉（统一走带工具数的文案）→
+    /// `!s.contains("tool call(s)")` 断言变红。
+    #[test]
+    fn test_response_truncated_without_tool_calls_omits_tool_wording() {
+        let mut a = app();
+        a.apply_event(env(AgentEvent::ResponseTruncated {
+            dropped_tool_calls: 0,
+        }));
+
+        assert_eq!(a.transcript.len(), 1);
+        match &a.transcript[0] {
+            TranscriptLine::System(s) => {
+                assert!(s.contains("truncated"), "要报出截断这一事实：{s}");
+                assert!(
+                    !s.contains("tool call(s)"),
+                    "纯文本截断不该提工具调用：{s}"
+                );
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+        assert!(a.follow, "新内容到达 → 回到贴底");
     }
 
     #[test]

@@ -333,7 +333,7 @@ async fn generate_summary(
 mod tests {
     use super::*;
     use ys_core::Usage;
-    use ys_model::{MockModel, ModelError, ModelEventSink, ModelResponse};
+    use ys_model::{FinishReason, MockModel, ModelError, ModelEventSink, ModelResponse};
 
     /// 400 字节 ASCII ≈ 100 token（估算器：字节 / 4）。
     /// 用「字符数 = token 数 × 4」把预算算成整数，切分边界才可精确断言。
@@ -963,7 +963,7 @@ mod tests {
                         }],
                     },
                     usage: Usage::default(),
-                    stop_reason: None,
+                    finish_reason: FinishReason::Stop,
                 })
             }
         }

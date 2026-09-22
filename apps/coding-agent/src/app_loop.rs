@@ -282,7 +282,8 @@ mod tests {
     use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId, Usage};
     use ys_event::AgentEvent;
     use ys_model::{
-        MockModel, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
+        FinishReason, MockModel, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest,
+        ModelResponse,
     };
 
     use crate::channel::ChannelSink;
@@ -607,7 +608,7 @@ mod tests {
                 content: vec![ContentBlock::Text { text: text.into() }],
             },
             usage: Usage::default(),
-            stop_reason: None,
+            finish_reason: FinishReason::Stop,
         }
     }
 
@@ -654,7 +655,7 @@ mod tests {
                         }],
                     },
                     usage: Usage::default(),
-                    stop_reason: None,
+                    finish_reason: FinishReason::Stop,
                 })
             }
         }

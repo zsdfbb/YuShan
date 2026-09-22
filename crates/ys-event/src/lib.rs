@@ -194,4 +194,43 @@ mod tests {
             matches!(&failed, AgentEvent::ContextCompactionFailed { reason } if reason == "boom")
         );
     }
+
+    // 截断事件：加法式新增，序列化 / 反序列化 roundtrip 必须稳定
+    // （`--json` 模式逐行打印 `Envelope`，字段名即对外契约）。
+    #[test]
+    fn test_agent_event_truncated_serde_roundtrip() {
+        let truncated = AgentEvent::ResponseTruncated {
+            dropped_tool_calls: 2,
+        };
+        let json = serde_json::to_string(&truncated).unwrap();
+        assert!(
+            json.contains("dropped_tool_calls"),
+            "字段名是对外契约，不得改名：{json}"
+        );
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(truncated, back);
+
+        // 纯文本被截断 = 0 个工具调用被作废
+        let text_only = AgentEvent::ResponseTruncated {
+            dropped_tool_calls: 0,
+        };
+        let json = serde_json::to_string(&text_only).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(text_only, back);
+    }
+
+    // `ResponseTruncated` 是**非终局**事件 —— 消费循环（`-p` / `--json`）的退出条件
+    // 只认 `RunFinished` / `RunFailed`，故截断事件必须能落到兜底分支、不产生输出。
+    #[test]
+    fn test_truncated_event_destructures_as_non_terminal() {
+        let truncated = AgentEvent::ResponseTruncated {
+            dropped_tool_calls: 3,
+        };
+        match truncated {
+            AgentEvent::ResponseTruncated { dropped_tool_calls } => {
+                assert_eq!(dropped_tool_calls, 3);
+            }
+            other => panic!("期望 ResponseTruncated，实得 {other:?}"),
+        }
+    }
 }

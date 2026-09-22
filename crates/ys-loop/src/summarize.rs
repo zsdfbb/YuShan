@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use ys_core::Usage;
-    use ys_model::{ModelError, ModelResponse};
+    use ys_model::{FinishReason, ModelError, ModelResponse};
     use ys_tool::Summarizer;
 
     /// 记录**最后一次** `ModelRequest` 的 `Model` 替身 —— 供断言请求形状。
@@ -180,7 +180,7 @@ mod tests {
                     content,
                 },
                 usage: Usage::default(),
-                stop_reason: None,
+                finish_reason: FinishReason::Stop,
             })
         }
     }

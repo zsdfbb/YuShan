@@ -203,6 +203,13 @@ struct ContextFile {
     content: String,
 }
 
+/// 加载项目上下文文件（`<project_context>` 段）。
+///
+/// # 搜索名单：`AGENTS.override.md` / `AGENTS.md` / `YUSHAN.md`
+///
+/// 从 `cwd` **逐级向上**遍历，每一级按上述顺序各试一次；命中的**全收**（不是首个命中即停），
+/// 最后 `reverse` 成「祖先目录从远到近」。另有一份全局上下文 `~/.yushan/AGENTS.md`，
+/// 排在所有逐级命中之前。
 fn load_project_context(cwd: &Path) -> Vec<ContextFile> {
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -216,10 +223,10 @@ fn load_project_context(cwd: &Path) -> Vec<ContextFile> {
         );
     }
 
-    // 从 cwd 逐级向父目录遍历
+    // 从 cwd 逐级向父目录遍历。**`CLAUDE.md` 刻意不在名单里**（见函数文档）。
     let mut current = cwd.to_path_buf();
     loop {
-        for name in &["AGENTS.override.md", "AGENTS.md", "YUSHAN.md", "CLAUDE.md"] {
+        for name in &["AGENTS.override.md", "AGENTS.md", "YUSHAN.md"] {
             try_load(&current.join(name), &mut files, &mut seen);
         }
         let parent = current.parent();
@@ -661,6 +668,41 @@ mod tests {
         // ③ 有 `read` 且有目录 ⇒ 追加。
         let with = build_system_prompt(&dir, &[spec("read")], &one_skill("git-status", "状态"));
         assert!(with.contains("<available_skills>"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **搜索名单是封闭的**：名单里的名字会加载，名单外的不会 —— 无论叫什么。
+    ///
+    /// 断言按 basename 判定（而非文件数或内容计数），故不依赖运行环境：祖先目录或全局
+    /// 上下文若另有文件，只会多出名字，不影响这里的 `contains` / `!contains`。
+    ///
+    /// 变异 1：往搜索列表里多加一个名字 → 对应的 `!contains` 断言变红。
+    /// 变异 2：从搜索列表里删掉 `"YUSHAN.md"` → `contains` 断言变红。
+    #[test]
+    fn project_context_search_list_is_closed() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("ctx_list");
+
+        // 名单内的三个之两个 + 两个名单外的高频上下文文件名。
+        for name in ["AGENTS.md", "YUSHAN.md", "CLAUDE.md", "README.md"] {
+            std::fs::write(dir.join(name), format!("{name}-content")).unwrap();
+        }
+
+        let names: Vec<String> = load_project_context(&dir)
+            .iter()
+            .filter_map(|f| f.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        assert!(names.contains(&"AGENTS.md".to_string()), "{names:?}");
+        assert!(names.contains(&"YUSHAN.md".to_string()), "{names:?}");
+        for outside in ["CLAUDE.md", "README.md"] {
+            assert!(
+                !names.contains(&outside.to_string()),
+                "名单外的名字不得加载：{outside} ∈ {names:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

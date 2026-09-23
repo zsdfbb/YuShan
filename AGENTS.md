@@ -2,69 +2,16 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-**当前状态**：`cargo test --workspace` 全绿 —— **832 passed / 0 failed / 7 ignored**（7 条 `#[ignore]` = 4 条 `tools-web` 的人工采集 + 2 条 coding-agent e2e（`e2e_tools` / `e2e_skills`，需真实凭证）+ 1 条 doc-test）；`cargo clippy --all-targets` 零 warning。已完成：路线 B 重构（拆 crate + 分线程 + 三信道 + `ys-protocol`）、`CancelToken`/`Inbox` 移除（改 `BoundarySource`）、TUI 独立成 `ys-tui-coding`、有界事件信道、流式响应、`/new` 换会话、JSONL 会话落盘、coding agent 工具面扩展（grep/find/ls，外挂 rg/fd 并降级 grep/find；websearch/webfetch，带网络、新 crate `tools-web`，工具共 9 个）、`/model` 候选改为**启动期拉取所有已登录 provider 的 `/v1/models`**（失败回退静态表）、**skills 支持**（`SKILL.md` 启动期扫描 + 自写 frontmatter 解析，零新依赖；`<available_skills>` 常驻系统提示 + `/skill-name` 展开；**零新工具 / 零新协议变体**；顺带修正压缩触发对固定开销的盲区，as-built 见 `docs/design-final/skills.md`）、**`/skills` 选择器**（列全部 skill + description，选中**回填输入框**、不发请求；TUI 内部新增 `PromptOutcome`）、**截断保护**（模型输出被 `finish_reason = length` 截断时**整批工具作废、一个都不执行**并回喂错误结果；纯文本截断以新增的第四种终止原因 `StopReason::Truncated` 收场；`ModelResponse` 字段改名并归一化为 `FinishReason`；新非终局事件 `ResponseTruncated`；as-built 见 `docs/design-final/truncation-guard.md`、决策见 `docs/adr/0020`）。
-
-## 目录结构
-
-```
-YuShan/
-├── crates/                        # 核心库
-│   ├── ys-core                    # 共享原语：Message / Role / ContentBlock / Usage / StopReason / ToolCall / EventError，零外部依赖
-│   ├── ys-event                   # AgentEvent + EventSink（try/await 双路径）+ Noop/Collecting/Failing
-│   ├── ys-protocol                # 能力平面（协议）：Request / Boundary / Outbound<V> / BoundarySource / Envelope / Source / LifecyclePolicy，**零 tokio**
-│   ├── ys-tui-coding              # coding agent 的 TUI（独立 crate）：CodingView + 三 pane 渲染 / 输入 / 补全 / 浮层选择器，**不依赖 ys-runtime**
-│   ├── ys-model                   # Model trait（complete）+ ModelEvent/ModelEventSink + MockModel
-│   ├── ys-tool                    # Tool trait + ToolRegistry + 审批处理 + truncate（截断的唯一实现）
-│   ├── ys-session                 # Session trait + JsonlSession（原子写）/ MemorySession
-│   ├── ys-component               # RuntimeContext 容器（含 boundary: Option<&dyn BoundarySource>）+ RunLimits
-│   ├── ys-loop                    # AgentLoop trait + BasicLoop（含轮边界 steering / Abort）
-│   └── ys-runtime                 # AgentBuilder + Agent（无状态）+ AgentPorts + prelude
-├── adapters/                      # 可选适配器
-│   ├── model-openai-compatible    # OpenAI 兼容后端（流式 SSE + compat 差异）
-│   ├── tools-basic                # BashTool / ReadTool / WriteTool / EditTool / GrepTool / FindTool / LsTool + exec（外部二进制探测与有界子进程）
-│   └── tools-web                  # WebSearchTool / WebFetchTool（**有网络**）+ net/guard/convert/store/backends；`tools-basic` 保持无网络由 crate 边界强制
-├── apps/                          # 产品层应用
-│   └── coding-agent               # YuShan Coding Agent（bin crate，接线器）
-│       ├── src/
-│       │   ├── main.rs            # 入口：模式分发（TUI / -p / --json）、启动组装（设计 §7 初始化顺序）
-│       │   ├── app_loop.rs        # app 侧循环：回合边界 recv Request、跑 turn、转发事件（actor 循环承载者）
-│       │   ├── capabilities.rs    # 命令的**能力实现**（login/logout/set_model/new_session/compact/export），返回 Vec<String> → Outbound::Output
-│       │   ├── wiring.rs          # 接线器：持有 model + session + events（/new 换的就是它）；ports() 产出 AgentPorts
-│       │   ├── channel.rs         # ChannelSink：有界 mpsc + overflow + 背压统计
-│       │   ├── logging.rs         # 极简日志文件 ~/.yushan/logs/yushan.log（库内部诊断的落处）
-│       │   ├── config.rs          # Config + ProviderRegistry 持有 + model factory
-│       │   ├── provider.rs        # ProviderRegistry：provider 目录、auth.json、/v1/models、ProviderCompat
-│       │   ├── prompt.rs          # 系统提示词构建（末尾追加 <available_skills> 段 + has_custom_prompt）
-│       │   ├── skills.rs          # skill 领域逻辑（唯一新模块）：扫描 / frontmatter 子集解析 / catalogue 归一 / load_body / expand_invocation / escape_xml；纯数据、不 print
-│       │   ├── view.rs            # CodingView 显示快照构建（唯一显示数据源）；在此过滤 user_invocable:false
-│       │   ├── state.rs           # state.json（last_active_provider / model）
-│       │   ├── status.rs          # TurnStats 累计
-│       │   ├── toolset.rs         # 唯一装配接缝：探测 rg/fd 一次 + 建工具表 + 降级提示
-│       │   └── test_env.rs        # #[cfg(test)] 统一 env 锁（测试隔离）
-│       └── tests/
-│           ├── integration.rs         # 工具层集成（MockModel，无网络）
-│           ├── degraded_search.rs     # CLI 降级路径（受限 PATH → stderr 有提示 + stdout 为空）
-│           ├── stream_usage_fallback.rs # 流式 usage 门控与 400 回退
-│           ├── skills_cli.rs          # skill 诊断的 CLI 去向（-p/--json → stderr；stdout 纯净）
-│           ├── truncation_guard.rs    # 截断保护端到端：被截断的那批工具调用一个都不执行（回环 SSE）
-│           ├── e2e_skills.rs          # R8 对账：真实 usage 差 vs 静态估算（#[ignore]，未校准）
-│           └── e2e_tools.rs           # 真实 API 端到端（#[ignore]）
-├── docs/
-│   ├── design.md              # 总体设计（原则、crate 划分、核心 trait、Hook/Event 边界、路线图、测试矩阵）
-│   ├── CONTEXT.md             # 领域术语表（Turn / Round / StopReason / 错误结果 vs 基础设施失败…）
-│   ├── adr/                   # 架构决策记录
-│   ├── arch/                  # 架构分析（context / design / review）
-│   ├── design-plans/          # 设计方案（completed/ 为已归档）
-│   ├── exec-plans/            # 执行计划（completed/ 为已归档）
-│   ├── design-final/          # as-built 最终设计（实现后回写）
-│   └── reports/               # 分析报告
-└── CLAUDE.md -> AGENTS.md
-```
+> **本文件按渐进式披露组织**：只放**每一轮都需要**的东西 —— 定位 / 常用命令 / 硬性约束 / 工作约定 / 去哪找。
+> 架构、模块职责、数据流、命令分工等**细节一律在 `docs/`**（见文末「去哪找什么」）。
+>
+> **往这里加内容前先问一句：它每一轮都需要吗？** 不是 ⇒ 写进 `docs/`，这里只留一行指针。
+> 判据与先例见 `docs/arch/skills/design.md`（skill 的渐进式披露）与 `docs/CONTEXT.md`。
 
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（832 passed / 7 ignored）
+- `cargo test --workspace` — 全量测试（833 passed / 7 ignored）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
@@ -76,146 +23,13 @@ YuShan/
 
 **skills 没有任何环境变量**（D2′：不开路径配置项）—— 扫描根恒为 `[<cwd>/.yushan/skills, <home>/.yushan/skills]`，由 `Config::default_skill_roots` 唯一给出，**顺序即优先级**（`roots[0]` = 项目级）。
 
-## 核心模型（理解本项目的关键）
-
-### Agent 是无状态执行器（ADR-0010，结论不变）
-
-`Agent` **不持有**会话、事件出口或模型。这三者由接线器持有，每次运行时经端口传入：
-
-```rust
-pub struct AgentPorts<'a> {
-    pub model:    Option<&'a dyn Model>,        // None = 未配置，run_turn 返回 ConfigError
-    pub session:  &'a mut dyn Session,           // 归接线器；/new 换的就是它
-    pub events:   &'a mut dyn EventSink,         // 归接线器
-    pub boundary: Option<&'a dyn BoundarySource>,// 轮边界控制（Steer/Abort），每回合新建
-}
-
-pub async fn run_turn(&mut self, input: AgentInput, ports: AgentPorts<'_>) -> Result<RunResult, LoopError>;
-```
-
-`Agent` 保留的字段只有执行能力：`loop_impl / registry / limits / cwd / workspace_root / approval / system_prompt`。
-
-> **附注（2026-09-14）**：`Agent::run(inbox)` 与 `RunSummary` **已删除**。**actor 循环**（多回合 /
-> followUp 的驱动）**上移到 `apps/coding-agent/src/app_loop.rs`**（见 ADR-0010 附注、ADR-0013）。
-> `Agent` 仍是「只持执行能力、不持会话」的无状态执行器 —— 结论不变，只是承载者换了。
-> `-p` / `--json` 不再经 `Agent::run`：直接 `run_turn` + `begin_turn(1)`，一次运行恒为 turn 1。
-
-### 三信道 + 两线程（路线 B）
-
-`ys-tui-coding` **不认识 `Agent`**（不依赖 `ys-runtime`，编译器强制），故 agent 必须在另一个线程：
-
-| 信道 | 类型 | 方向 | 消费时机 |
-|---|---|---|---|
-| ① Request | `ys_protocol::Request` | UI → app | app 线程 `recv().await`（**回合边界**） |
-| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`Steer` 插话 / `Abort` 取消） |
-| ③ Outbound | `ys_protocol::Outbound<V>` | app → UI | UI 事件循环（**单一出站写者**） |
-
-- **UI 线程**跑 `ys_tui_coding::run`（**同步阻塞**，用 `blocking_send`，必须在非 async 线程）
-- **app 线程**跑 `app_loop::run`（async，`rt.spawn`）；UI 退出 → drop 发送端 → app 线程 `recv()` 得 `None` → 正常收摊
-- **② 必须独立于 ①**：回合跑动时 app 线程阻塞在 `run_turn()` 里，不可能 `recv` ①，而插话/取消要**中途**被看到
-
-### `BoundarySource` 与 Abort 语义（取代 `CancelToken` 与 `Inbox`）
-
-```rust
-// ys-protocol，零 tokio
-pub trait BoundarySource: Send + Sync {
-    fn take(&self) -> Option<Boundary>;   // 轮边界：非阻塞、保序
-    fn is_aborted(&self) -> bool;          // 非破坏性探针（模型调用前 / 工具轮询）
-}
-```
-
-- **取消不再是跨线程原子**，而是队列里的一条消息（`Boundary::Abort`）—— 与插话（`Steer`）**共享同一条有序通道**
-- `QueueBoundarySource`（`Mutex<Inner{queue, aborted}>`）是唯一实现；两方法都是 `&self`（内可变），生产者可在 agent 运行期间 `push`
-- `Abort` 入队**即置位** `is_aborted`（探针立即可见），但**照常入队**（保序，`take` 仍会交还）；标记不随 `take` 清除
-- **每回合必须新建 `BoundarySource`**：标记永久置位，复用会让「上一回合的取消」立刻取消之后每个回合；app 循环还须在空闲期丢弃残留边界消息
-- `ToolContext.cancel: &CancelToken` → `ToolContext.boundary: Option<&dyn BoundarySource>`；`BashTool` 100ms 轮询 `is_aborted()`，命中则杀**进程组**（`sh -c "kill -9 -{pid}"`，不引 libc）
-- `/new` 仍是**换整个 `Wiring`**（新 Session，旧文件保留）；会话落盘 `~/.yushan/sessions/{unix秒}_{纳秒}.jsonl`，启动恢复最近一个，`/new` 时**立即落盘空文件**（否则重启恢复不到新会话）
-
-### 事件信道
-
-`Envelope { source, turn, event }`（现居 `ys-protocol`）—— 不传裸事件，`source` 为多 agent 协作预留。
-
-**`EventSink` 是 try/await 双路径**：
-
-```rust
-fn try_emit(&mut self, event: AgentEvent) -> Result<(), AgentEvent>;  // 同步快路径
-fn emit<'a>(&'a mut self, event: AgentEvent) -> Pin<Box<dyn Future<...> + Send + 'a>>;  // 异步慢路径
-fn begin_turn(&mut self, _turn: u32) {}                              // 默认 no-op
-pub async fn emit(sink: &mut dyn EventSink, event: AgentEvent) -> Result<(), EventError>;  // 循环内唯一出口
-```
-
-- **同步快路径的唯一消费者是 `Forwarder`**（实现同步的 `ModelEventSink`，不能 await）
-- 循环内的自由函数 `emit()` **总是走异步路径** —— 若让它先试快路径，满时 `try_emit` 缓冲后返回 `Ok`，冲刷永不发生，终局事件会滞留、背压失效（这是修过的死锁）
-- **`try_emit` 的 `Err` 仅表示「消费者已消失」**；信道满时实现**必须内部缓冲**，不得返回 `Err`
-
-### 输出与诊断三分
-
-TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 review R2）：
-
-| 时机 | 内容 | 去处 |
-|---|---|---|
-| **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
-| **启动期 · 降级提示** | `toolset` 的降级提示（搜索后端 / web 侧） | **TUI 模式 → `Outbound::Output`（transcript）**；`-p`/`--json` → **stderr** |
-| **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
-| **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log`（`src/logging.rs`，手写极简 logger，追加写、`[unix秒]` 前缀、best-effort、不引依赖） |
-
-**`capabilities.rs` 绝不 print** —— 命令期间的失败也走 `Output`。
-
-**为什么降级提示在 TUI 模式下改走 transcript**：起屏**之前**写 stderr 的行会留在终端主屏缓冲区里，
-alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式回到屏幕上（看起来像 app 又打了一遍启动
-横幅）。故 TUI 模式在 `spawn` 之前把它投成 `Outbound::Output`（信道第一条，稳排对话之前）；
-`-p`/`--json` 无 TUI，仍走 stderr（且**绝不能**混进 stdout 的逐行 `Envelope`）。
-
-**`Fetching models for N logged-in provider(s)…` 拉完即擦除**（`\r\x1b[2K`）—— 它只为解释启动期
-那几秒，不留在屏上。
-
-**退出回放不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到进入 alt-screen 时的
-位置（= app 自己输出的下一行），回放从那里往下写。**不得** `MoveTo(0,0)` —— 那是视口绝对第 0 行，
-会啃掉屏幕顶部与本 app 无关的内容。
-
-## coding-agent 模块说明
-
-| 模块 | 职责 |
-|------|------|
-| `main` | 入口：模式分发（TUI / `-p` / `--json`）、参数解析、启动组装（三信道 → sink → wiring → agent → view₀ → spawn） |
-| `app_loop` | **app 侧循环**（actor 循环的承载者）：回合边界 `recv` `Request`、跑 `run_turn`、转发事件为 `Outbound`；空闲期丢弃残留边界消息 |
-| `capabilities` | 命令的**能力实现**（`login` / `logout` / `set_model` / `new_session` / `compact` / `export`），各返回 `Vec<String>` → `Outbound::Output`；**绝不 print** |
-| `wiring` | **接线器**：持有 `model` + `session` + `events`，`ports()` 产出 `AgentPorts`（boundary 由 app 循环每回合传入）；`/new` / `set_model` / `session_messages` |
-| `channel` | `ChannelSink`：有界 mpsc + overflow 缓冲 + `begin_turn` + 背压统计（`format_stats`） |
-| `logging` | 极简日志文件 `~/.yushan/logs/yushan.log`（库内部诊断 + app 循环异常，best-effort、不引依赖） |
-| `config` | Config 结构体，持有 ProviderRegistry + model factory，管理运行时配置；`default_skill_roots`（`[project, user]`，**顺序即语义**）/ `load_skills` / `skills` + `skills_omitted` |
-| `provider` | ProviderRegistry：内置 provider 目录、auth.json 持久化（`~/.yushan/`）、**启动期**并发 GET /v1/models 填缓存（`refresh_models` → `models_for_provider` / `provider_for_model`）、ProviderCompat 映射 |
-| `prompt` | 系统提示词构建；末尾追加 `<available_skills>`（门控：有 `read` 且目录非空），自定义 `SYSTEM.md` 短路时不注入（`has_custom_prompt` 供启动期提示） |
-| `skills` | **skill 领域逻辑**（唯一新模块）：扫描（显式 roots，位置判 scope）/ frontmatter 子集解析（自写、零依赖）/ `catalogue` 归一（project > user 整条替换 + 按 `command` 升序 + 字节预算安全阀）/ `load_body`（有界读、剥 frontmatter、不缓存）/ `expand_invocation` / `escape_xml`；**纯数据、不 print、不读 env** |
-| `view` | `build_view` → `CodingView` 显示快照（provider/model/tokens/turn_count/session/cwd/tools/skills/available_models…），唯一显示数据源；`available_models` = 所有已登录 provider 的模型并集 + 当前在跑的模型；skill 只透传三个显示字段并**在此过滤 `user_invocable: false`** |
-| `state` | state.json（last_active_provider / model） |
-| `status` | `TurnStats` 累计 |
-
-命令的**用户可见行为**（命令表、提示、浮层）在 `ys-tui-coding/src/commands.rs`（TUI 侧表）；
-**能力实现**在 app 侧 `capabilities.rs`。二者唯一契约是 `Request` —— 漏实现是**编译错误**。
-
-关键设计：
-
-- **协议在 `ys-protocol`**：`Request` / `Boundary` / `Outbound<V>` / `BoundarySource` / `Envelope` / `Source` / `LifecyclePolicy`
-- **`CodingView` 归 `ys-tui-coding`**（各产品视图不同，不进协议）；`Outbound<V>` 泛型化
-- **`Prompter` trait 保留**（`ys-tui-coding`）：TUI 实现 `TuiPrompter` 画模态浮层，测试注入 `FakePrompter`；决策逻辑抽在纯函数 `resolve_prompt` 里
-- 凭证持久化到 `~/.yushan/auth.json`（0o600），启动时自动恢复
-- **三种入口互斥**：TUI（默认）/ `-p` / `--json`；`-p`/`--json` 用 `Wiring::ephemeral`（MemorySession 不落盘）
-- **`-p`/`--json` 的消费必须与 turn 并发**（`tokio::join!`）—— 有界信道若无并发消费者，第一次撞满即死锁
-- **消费循环以终局事件（`RunFinished`/`RunFailed`）为终止条件**，不是等信道关闭（sender 在 agent 侧，等关闭必死锁）
-- 数据/显示分离：`build_view` 是唯一显示数据源快照；`App`（`ys-tui-coding`）管 UI 交互状态
-- **`/login` 的 api_base 不再交互填**：协议只带 provider + api_key，api_base 从 provider 内置值解析，回退 `YUSHAN_API_BASE`；`custom` provider 需靠环境变量（见 `docs/design-final/coding-agent-tui.md` §8 M3）
-- **`/model` 无参浮层的候选在启动期备齐**：`run_interactive` 在**起屏之前**对每个已登录 provider 并发拉 `/v1/models`（5s 超时，失败静默回退静态表）—— 起屏后一次重绘都不发 HTTP（设计 M4）。候选是**所有已登录 provider** 的并集 + 当前在跑的模型；选中别家的模型时 `capabilities::set_model` 会**连端点一起切**（`provider_for_model` 定归属，见 M9）
-- **`/skill-name`（skill 通路）**：TUI **只认名、不读盘**（`commands::parse_with_skills` 未命中内置表才查 `view.skills`，命中即发**原文** `Request::Prompt`）；正文在 **app 侧** `app_loop::expand_skill_invocation` 读盘并展开成 `<skill name="…" location="…">正文</skill>`（**回合启动路径不分叉**，`-p`/`--json` 走 `main::expand_task` 的同一套）。**硬序：内置命令 > skill**（三处各钉一次：`parse`、补全、事件层）。**零新工具**（正文由既有 `read` 加载）、**零新协议变体**
-- **`/skills`（skill 浏览/选择）**：`PromptKind::PickSkill` → TUI 浮层列全部 skill（`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的** —— 与 `/` 浮层共用 `completion::selectable_skills`）。选中**回填输入框** `/<command> `（尾随空格）、**不发 `Request`**，用户补参数后自行回车 —— 落地在 `resolve_prompt` 的新返回类型 `PromptOutcome::{Request, Prefill}`。数据是**启动期快照**（不重扫盘），**不含 path / scope**。
-
 ## 硬性约束
 
 以下是 `docs/design.md` 不变量 + 历次 ADR 的摘要。**新增代码违反任何一条都算设计偏离，需先改设计文档。**
 
 - **依赖方向单向**：`ys-core` ← 组件接口 ← loop/runtime ← 应用适配器
   - **`ys-core` / `ys-event` / `ys-protocol` 不含 tokio**（直接与间接皆无）—— 它们只装数据与纯 trait
-  - **`ys-tui-coding` 不依赖 `ys-runtime`**（不认识 `Agent`）—— **编译器强制**（crate 边界），不靠自觉
+  - **`ys-tui-coding` 不依赖 `ys-runtime`**（不认识 `Agent`）—— **编译器强制**（crate 边界），不靠自觉。**UI 线程必须无 runtime 上下文**（它用 `blocking_send`，在 async 上下文会 panic）—— 这条编译器管不住。
   - **`ys-component` 不直接依赖 tokio**（自身代码不用 tokio API），但经 `ys-session` **间接**引入（ADR-0012）
   - `ys-session` / `ys-loop` / `ys-runtime` 可直接依赖 tokio（文件 IO、工具超时）
 - **最小核心**：Runtime 只提供一次 Agent Turn 所需能力；文件系统、Shell、MCP、TUI、记忆、子 Agent 均为可选组件
@@ -225,9 +39,14 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 - **不跨动态库边界传递 Rust trait object、Tokio 类型或跨库所有权对象**
   - 推论：**`ModelEventSink` 必须保持同步 `fn`**（async trait 跨动态库边界困难）—— 这是 try/await 双路径存在的首要理由
 - **Agent 无状态**（ADR-0010）：不持有 session / events / model；会话、配置、历史归接线器。**actor 循环已上移到 `app_loop`**（ADR-0010 附注）
-- **取消即消息**（ADR-0013）：`CancelToken` / `Agent::cancel()` 已删；`Boundary::Abort` + `BoundarySource` 取代 `Inbox` / `Intent` / `QueueMode`
-- **信道契约**（ADR-0009 / 0011 / 0013）：有界、容量可配；`try_emit` 的 `Err` 仅表示消费者消失；满时内部缓冲
+- **取消即消息**（ADR-0013）：`CancelToken` / `Agent::cancel()` 已删；`Boundary::Abort` + `BoundarySource` 取代 `Inbox` / `Intent` / `QueueMode`。
+  **每回合必须新建 `BoundarySource`** —— `Abort` 的标记**永久置位**，复用会让「上一回合的取消」立刻取消之后每个回合。
+- **信道契约**（ADR-0009 / 0011 / 0013）：有界、容量可配；`try_emit` 的 `Err` 仅表示消费者消失；信道满时实现**必须内部缓冲**，不得返回 `Err`。
+  - **循环内的自由函数 `emit()` 总是走异步路径** —— 让它先试同步快路径，满时 `try_emit` 会把事件缓冲进 overflow 并返回 `Ok`，此后**冲刷永不发生** ⇒ 终局事件滞留、背压失效。
+  - **`-p` / `--json` 的消费必须与 turn 并发**（`tokio::join!`）—— 有界信道若无并发消费者，第一次撞满即死锁。
+  - **消费循环以终局事件（`RunFinished` / `RunFailed`）为终止条件**，不是等信道关闭 —— sender 在 agent 侧，等关闭必死锁。
 - **事件只观察，Hook 才控制流程**：`AgentEvent` 不可用于改变执行路径
+- **`capabilities.rs` 绝不 print**：命令期间的一切输出走 `Outbound::Output` → transcript（输出按**时机**三分，见 `docs/architecture.md` §13）
 
 ## 工作约定
 
@@ -246,23 +65,16 @@ alt-screen 退出后被还原 —— 于是它们以**退出后的残渣**形式
 - **流式/字节路径注意 UTF-8 边界**：TCP 分片可能切在多字节字符中间；缓冲必须是**字节级**，只在完整行上解码
 - `tmp/` 已被 `.gitignore` 忽略，勿将正式内容放入
 
-## 参考资料
+## 去哪找什么
 
-| 需要了解... | 阅读... |
+| 需要了解… | 读… |
 |---|---|
-| **架构全貌的图解**（组件关系、数据流、时序） | `docs/architecture.md` |
+| **架构全貌** | **`docs/architecture.md`**（14 节：分层与依赖 / 三信道与两线程 / 组件关系 / 一次 run 的时序 / 出站·入站数据流 / 事件信道两条路径 / 流式 / 生命周期 / 三种入口 / `/new` 换 Wiring / 会话落盘 / **输出与诊断三分** / `ys-tui-coding` 形态与命令分工 / 测试分层） |
 | 架构规范、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
-| 术语定义（Turn、Round、StopReason、错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
-| **给新需求归类**（该用 Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
-| 架构决策的 why | `docs/adr/`：0001 工具失败双通道、0002 协作取消（2026-09-14 部分修订）、0003 Session::append 异步、0004 v0 分层骨架、0007 Agent 公开 API、0008 cancel_handle（**已作废**）、0009 事件信道异步化、0010 actor 模型（Agent 无状态，含 2026-09-14 附注）、0011 信道设计（2026-09-14 部分修订）、0012 运行时依赖边界、0013 取消即消息（`CancelToken` 移除 / `BoundarySource` 取代 `Inbox`）、0014 只做 follow-up（**不建 hook 系统**，有意推迟）、0015 搜索工具外挂 `rg`/`fd`（降级 `grep`/`find`，不内建 `ignore` crate）、0016 web 工具（落盘+指针 / 后端链用表非 trait / 引入 `htmd` / SSRF 反转；**修订（2026-09-18）**：Firecrawl 由 keyless 改为需 key，零配置链为空）、0017 压缩加固（算法搬家 `ys-loop::compact` / 阈值比例化 / 窗口三级配置 / 失败不再静默失忆）、0018 `webfetch` 总结能力（可选 `prompt` / 窄能力 trait 注入模型 / 内容封顶同头部）、0019 skills（零新工具 / 展开型命令 / 压缩耦合修正）、0020 截断保护（`finish_reason` 归一化 / 被截断工具批作废 / 新增终止原因 `Truncated`） |
-| **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）+ `docs/design-final/core-channel.md`（核心信道第一刀，部分已被上文取代，见其 §8） |
-| 搜索工具的 as-built | `docs/design-final/search-tools.md` |
-| web 工具的 as-built | `docs/design-final/tools-web.md` |
-| 上下文压缩的 as-built | `docs/design-final/compaction.md`；决策 `docs/adr/0017-compaction-hardening.md`、设计 `docs/arch/skills-and-compaction/design-compaction.md` |
-| **skills 的 as-built**（含与设计的 12 条偏差） | `docs/design-final/skills.md`；设计 `docs/arch/skills/design.md`、决策 `docs/adr/0019-skills.md`、计划 `docs/design-plans/2026-09-21-skills.md` |
-| **截断保护的 as-built**（含与设计的 6 条偏差） | `docs/design-final/truncation-guard.md`；决策 `docs/adr/0020-truncation-guard.md`、报告 `docs/reports/2026-09-22-truncation-guard-report.md` |
-| coding agent TUI 的设计推导与质量分析 | `docs/arch/coding-agent-tui/{design,review}.md`；已作废的前身 `docs/arch/coding-agent-tui/tui-repl-context.md` |
-| 核心信道的设计推导与质量分析 | `docs/arch/gap-closure/{context,design-core-channel,review}.md` |
-| 各 crate 的 API 和实现细节 | 对应 crate 的 `src/lib.rs` |
-| coding-agent 产品层设计 | `apps/coding-agent/src/{main,app_loop,capabilities,wiring,channel}.rs` + `crates/ys-tui-coding/src/` + `docs/arch/` |
-| /login & /model 行为设计 | `docs/arch/commands/login-model-behavior/` |
+| 术语（Turn / Round / StopReason / 错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
+| **给新需求归类**（Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
+| 某个决策的 why | `docs/adr/` —— **文件名即摘要**（如 `0021-plugin-seam-without-hook-system.md`） |
+| **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）；其余 as-built：`search-tools` / `tools-web` / `compaction` / `skills` / `truncation-guard` |
+| 某个 crate / 文件干什么 | 对应 crate 的 `src/lib.rs`（模块头 `//!` 注释）；目录与分层见 `docs/architecture.md` §1、组件关系见 §3 |
+| `/login` & `/model` 的行为设计 | `docs/arch/commands/login-model-behavior/` |
+| 把项目约定送到模型面前的通道与成本 | `docs/arch/prompt-delivery/notes.md` |

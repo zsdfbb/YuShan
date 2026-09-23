@@ -80,6 +80,7 @@ pub struct ToolPlugin {
 - **`design.md` §6 保持推迟状态**（`:291-293` 的状态注继续有效）。
 - **插件缝的上限被明确写死**：**「不改 `ys-*` 核心 crate，但改 `apps/coding-agent` 的 `Cargo.toml` + 一行登记」**。零改动装配需要运行期工具面 ⇒ 每轮 9,000 token —— 那是**产品决策**，不该由插件机制替用户做。这个边界写进文档，避免后人误以为「已经支持插件了」。
 - **加一个工具的连锁点从 6 处降到 1 处**，且 snippet/guidelines 不再散落在 `prompt.rs` 的两张手抄表里（`EXPECTED_ORDER` 与 `vec!` 的「改一处必须改两处」随之消失）。测试侧保留一份**独立硬编码**的名字序列，维持装配端/测试端两份真值的交叉校验。
+- **补记（2026-09-23，`/arch-validate` → `design.md` §5.2）**：决策 3 的 `ToolPlugin` / `ToolPrompt` 需要**两条独立的序** —— `ToolPlugin.order` 定**工具**序（`read, write, edit, …`），`ToolPrompt.order` 定 **guideline** 序（`edit, write, read, …`）。两者今天确实不同（`toolset.rs:40-50` vs `prompt.rs:143-189`）。并成一条 = 一次全局前缀漂移，会毁掉「P1 搬完家指纹测试仍绿」这个唯一机械证明。
 - **`fixed_prompt_tokens` 账本自动正确** —— 插件只要走「工具 + snippet + guideline」这条既有通路，`main.rs` 的计算自动把它算进去。
 - **已知缺口（明确接受）**：todo 会被压缩摘要掉（与 `docs/design-final/skills.md` 的 R6 同型）；本轮不做「todo 免疫压缩」（那需要给 session 加保留标记，是新的核心契约）。
 - **本轮顺带订正两处既有失真**（与本决策正交，建议单独修）：

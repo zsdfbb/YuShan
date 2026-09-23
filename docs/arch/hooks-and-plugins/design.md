@@ -3,6 +3,10 @@
 > 产出：`/arch-design`（2026-09-23）。输入：[`context.md`](./context.md)（arch-explore）。
 > 证据均带 `文件:行号`，对应本工作区 `master`（`02a3b55`）。**本文所有 token 数字均为本机实测**（测量方法见 §4.2）。
 > 决策记录：[ADR-0021](../../adr/0021-plugin-seam-without-hook-system.md)。
+>
+> ⚠️ **2026-09-23 修订**（`/arch-validate` → [`review.md`](./review.md)）：§5.1 / §5.2 / §6 P0·P1 / §7.2·§7.3 已按质量分析重写。
+> 最重要的一处：**guideline 序 ≠ 工具序**（`prompt.rs:143-189` 的 `if` 块序 vs `toolset.rs:40-50`），
+> 原 §6 P1 步骤 3 按字面实现会**静默重排** ⇒ 见 §5.2「两条独立的序」。
 
 ---
 
@@ -120,14 +124,15 @@
 
 | 模块 | 归属 | 职责 | 改动 |
 |---|---|---|---|
-| `ToolPlugin` / `ToolPrompt` | **`ys-tool`**（新模块 `plugin.rs`） | 纯数据：`order: u16` + `tools: Vec<Box<dyn Tool>>` + `prompts: Vec<ToolPrompt>` | 新增 ~40 行 |
+| `ToolPlugin` / `ToolPrompt` | **`ys-tool`**（新模块 `plugin.rs`） | 纯数据：`order: u16` + `tools: Vec<Box<dyn Tool>>` + `prompts: Vec<ToolPrompt>`（`ToolPrompt` **另有自己的 `order`** —— 两条序互不相同，见 §5.2） | 新增 ~50 行 |
 | `toolset` | `apps/coding-agent` | `build_toolset(workspace, web, plugins)`；内置 9 元**逐字不变**，扩展块按 `order` 追加；`EXPECTED_ORDER` / `assert_eq!(len,9)` 降为**派生量** | 改（净减） |
 | `prompt` | `apps/coding-agent` | `tool_snippet` / `tool_guidelines` **两张手抄表删除**，改查 `ToolPlugin` 声明 | 改（净减） |
 | `plugins/todo` | **新 crate** | `TodoTool`（无状态）+ `pub fn plugin() -> ToolPlugin`；只依赖 `ys-tool` | 新增 ~200 行 |
 | `CodingView` | `ys-tui-coding` | 新增 `todos: Vec<TodoItem>`（先例：`skills` 字段） | 改 |
 | `view.rs` | `apps/coding-agent` | `latest_todos()`：反向扫 `session_messages()` 取最后一条 `ToolUse{name:"todo"}` 的 `arguments.todos` | 改 ~15 行 |
 | `draw.rs` | `ys-tui-coding` | 固定高度 todo 面板（≤5 行 + `… N more` 折叠，照 pi） | 改 |
-| `ys-core` / `ys-event` / `ys-protocol` / `ys-loop` / `ys-runtime` | 核心 | **零改动** | **0** |
+| `ys-core` / `ys-event` / `ys-protocol` / `ys-runtime` | 核心 | **零改动** | **0** |
+| `ys-component`（`RuntimeContext`）/ `ys-loop`（`basic.rs`） | 核心 | **P1.5**（§6）：加一个**可选**端口 + `None` 时就地回落。不挂载时逐字节不变 | +~10 行 |
 
 > **`ToolPlugin` 放 `ys-tool` 而非新 crate**：第三方本就必须依赖 `ys-tool` 才能实现 `Tool`；放这里**零新 crate**，且 `ToolSpec.description` 已是 prompt 面向的文本，prompt 数据进 `ys-tool` 不新增语义类别。
 
@@ -142,8 +147,8 @@ use crate::Tool;
 /// 存在的理由：把「加一个工具」的 6 处连锁点（EXPECTED_ORDER / vec! 字面量 /
 /// 3 处 assert_eq!(len,N) / tool_snippet / tool_guidelines）收敛成**一处声明**。
 pub struct ToolPlugin {
-    /// 装配位次（升序折表）。**必须是编译期常量** ——
-    /// 顺序一变，prompt 前缀字节就变，所有用户的缓存全废（§4.3）。
+    /// **工具位次**（升序折表），决定 `tools()` 与 tools JSON 的顺序。
+    /// **必须是编译期常量** —— 顺序一变，prompt 前缀字节就变，所有用户的缓存全废（§4.3）。
     /// 不得来自 env / 登录态 / 探测结果。
     pub order: u16,
     pub tools: Vec<Box<dyn Tool>>,
@@ -153,14 +158,27 @@ pub struct ToolPlugin {
 /// 工具对 system prompt 的文本贡献。
 pub struct ToolPrompt {
     pub tool: String,
+    /// **guideline 位次** —— 与 [`ToolPlugin::order`] **是两条独立的序**。
+    ///
+    /// 今天两者确实不同：**工具**序是 `read, write, edit, …`（`toolset.rs:40-50`），
+    /// 而 **guideline** 序是 `edit, write, read, …`（`prompt.rs:143-189` 的 `if` 块顺序）。
+    /// 把两者并成一条 = 一次**全局前缀漂移**，而 P1 的全部价值在于「搬完家指纹测试仍绿」
+    /// （§6 P0）—— 那是对「搬家忠实」的**唯一机械证明**，不该在 P1 里主动丢掉。
+    /// ⇒ 显式表达两条序。**将来若做一次显式的前缀迁移，可在此合并成一条。**
+    pub order: u16,
     /// `- {tool}: {snippet}` 的 snippet 部分。
     /// **必须独立于 `spec().description`** —— 今天两者文本不同（prompt.rs:117-138），
     /// 复用会改前缀字节、废掉既有缓存基线。
     pub snippet: String,
     /// guideline 行（`- ` 前缀由渲染端加）。空 = 该工具无 guideline。
+    /// **可多行一组** —— `edit` 今天就是 3 条一组（`prompt.rs:143-153`）。
     pub guidelines: Vec<String>,
 }
 ```
+
+> ⚠️ **全局尾部两条 guideline 不进 `ToolPlugin`**：`"Be concise in your responses"` /
+> `"Show file paths clearly when working with files"`（`prompt.rs:191-192`）**不属于任何工具**，
+> 仍由 `build_system_prompt` 在拼完所有插件的 guideline 之后**逐字追加**。它们本就与工具表无关。
 
 ```rust
 // apps/coding-agent/src/toolset.rs —— 唯一装配接缝
@@ -279,31 +297,85 @@ ys-tui-coding ──► ys-core / ys-event / ys-protocol   ← 依赖集合**一
 
 ### P0（前置，必做）：prefix 指纹测试
 
-**今天 `prompt.rs` 没有任何测试锁「9 工具产出的前缀总字节」。** 现有守卫只锁*形状*（`tool_list_is_derived_from_specs_order_verbatim`）与*部分文案*（`search_list_and_web_snippets_are_verbatim`）。把 snippet/guidelines 表搬进 `ToolPlugin` 时，**一处空格、一次 `trim` 都会改变所有用户的前缀 ⇒ 缓存全废 ⇒ 每轮多付 ~9,000 token，而 832 条测试依然全绿。**
+**今天 `prompt.rs` 没有任何测试锁「9 工具产出的前缀总字节」。** 现有守卫只锁*形状*（`tool_list_is_derived_from_specs_order_verbatim`）与*部分文案*（`search_list_and_web_snippets_are_verbatim`）。把 snippet/guidelines 表搬进 `ToolPlugin` 时，**一处空格、一次 `trim`、一次顺序重排都会改变所有用户的前缀 ⇒ 缓存全废 ⇒ 每轮多付 ~9,000 token，而 832 条测试依然全绿。**
+
+**它同时是 P1 的唯一验收信号**：P1 是纯搬家；若搬完**指纹仍绿**，就机械地证明了搬家忠实。一旦 P1 主动改了字节（例如把 guideline 序并进工具序），这个信号就没了 —— **这是 §5.2 坚持两条独立序的理由。**
 
 ```rust
-/// 工具面的**字节级**回归锚点。变异：改动任一 snippet / 工具顺序 / spec 文案 ⇒ 立刻变红。
+/// 每轮固定前缀的**字节级**锚点。变异：改动任一 snippet / 顺序 / spec 文案 ⇒ 立刻变红。
 #[test]
-fn tool_prefix_bytes_are_frozen() {
+fn prefix_bytes_are_frozen() {
+    // ⚠️ 必须隔离 HOME：`build_system_prompt` 会读 HOME/USERPROFILE 找
+    //   ~/.yushan/{AGENTS,SYSTEM}.md（prompt.rs:218/266），且从 cwd 逐级向上找 AGENTS.md
+    //   （prompt.rs:227-237）。不隔离 ⇒ 锚点随开发机而变：轻则「红得莫名其妙」，
+    //   重则「绿灯，但锁的不是用户真前缀」。
+    let _guard = env_lock();
+    let _env = no_global_prompt();          // 复用 prompt.rs:366 的既有手法
+
     let ts = build_toolset(&tmp, offline_web(), plugins());
     let specs: Vec<_> = ts.tools.iter().map(|t| t.spec()).collect();
     let json = serde_json::to_string(&specs).unwrap();
     assert_eq!(sha256(&json), PREFIX_TOOLS_SHA256);          // 6,517 B 那份
-    assert_eq!(sha256(&build_system_prompt(&tmp, &specs, &empty_catalogue())), PREFIX_PROMPT_SHA256);
+
+    // 锚**两个** system prompt。skill 段只在 catalogue 非空时追加（prompt.rs:73），
+    // 故空 catalogue 覆盖不到它 —— 而非空才是多数用户的实际形态。
+    //（`one_skill_catalogue()` 即现成的 `one_skill(..)`，prompt.rs:295。）
+    assert_eq!(
+        sha256(&build_system_prompt(&tmp, &specs, &empty_catalogue())),
+        PREFIX_PROMPT_SHA256
+    );
+    assert_eq!(
+        sha256(&build_system_prompt(&tmp, &specs, &one_skill_catalogue())),
+        PREFIX_PROMPT_SKILLS_SHA256
+    );
 }
 ```
+
+**锚点常量的生成时点**（流程，同样承重）：正确姿势是「**先量 9 工具锚点 ⇒ 冻结 ⇒ 再加第 10 个工具 ⇒ 重新量**」（这是一次预期的、显式的前缀漂移）。危险在「重新量」—— 把失败测试的实际值抄进常量，**正是真实前缀漂移被洗白的唯一窗口**。
+⇒ 锚点从**重构前的干净 checkout** 生成（独立 worktree / `git stash`），**不是**从重构后的树里「跑红 → 抄值」。
 
 **这条测试不是可选项，是重构的前置条件** —— 先把它钉在今天的字节上，再做搬家。
 
 ### P1：装配缝（零行为变化，可独立发布）
 
-1. `ys-tool` 新增 `plugin.rs`（`ToolPlugin` / `ToolPrompt`）。
+1. `ys-tool` 新增 `plugin.rs`（`ToolPlugin` / `ToolPrompt`，见 §5.2 —— **两条独立的序**）。
 2. `toolset::build_toolset` 取代 `build_tools`；内置 9 元 `vec!` **一字不动**，改为 `builtin_plugins()` 的 9 条声明。
-3. `prompt.rs` 的两张手抄表删除，改查 `ToolPlugin`。
-4. `EXPECTED_ORDER` 降为派生量；**但测试侧保留一份独立硬编码的名字序列**（不引用 `plugins()`），维持「装配端 vs 测试端两份独立真值」的交叉校验。
-5. 测试：打乱传入顺序 ⇒ 输出序不变（变异：不排序 ⇒ 红）；扩展在场时前 9 个名字仍是原序（变异：扩展插到前面 ⇒ 红）；跨插件重名工具 fail-fast。
+3. `prompt.rs` 删除两张手抄表：
+   - `tool_snippet` → 查 `ToolPlugin.prompts[].snippet`（按 `tool` 名匹配）；
+   - `tool_guidelines` → 收集全部 `ToolPrompt.guidelines`，**按 `ToolPrompt.order` 升序**展开（**不是**按工具 order）；
+   - **全局尾部两条**（`"Be concise…"` / `"Show file paths clearly…"`，`prompt.rs:191-192`）**留在 `build_system_prompt`**，逐字追加在所有插件 guideline 之后。
 
-**验收**：`cargo test --workspace` 全绿；**无任何 `ys-*` 核心 crate 被改动**；`plugins()` 只含内置 9 个时，产物与今天逐字节相同（由 P0 的指纹测试保证）。
+   ⚠️ **这一步是 P1 唯一会出错的地方**：若按**工具 order** 展开 guideline，顺序会变成 `read, write, edit, …`，而今天是 `edit` 组在最前 ⇒ **字节全变**。P0 会抓到，但要在动手之前就知道。
+4. `EXPECTED_ORDER` 降为派生量；**测试侧保留一份独立硬编码的名字序列**（不引用 `plugins()`）。
+   ⚠️ 补一句原设计漏掉的：`prompt.rs` 的测试**今天也**引用 `crate::toolset::EXPECTED_ORDER`（`prompt.rs:279`）—— 两侧本就是同源。降为派生量时，**独立字面量必须落在测试侧、且 prompt 侧也改用它**，否则「装配端 vs 测试端两份真值」的交叉校验名存实亡。
+5. 测试：打乱传入顺序 ⇒ 输出序不变（变异：不排序 ⇒ 红）；扩展在场时前 9 个名字仍是原序（变异：扩展插到前面 ⇒ 红）；跨插件重名工具 fail-fast —— **错误信息须点名来源**（形如 `tool "todo" declared by plugin #3 and plugin #7`），否则第三方拿到 `duplicate tool name: todo`（`registry.rs:30`）不知道是谁撞了谁。
+
+**验收**：`cargo test --workspace` 全绿；**无任何 `ys-*` 核心 crate 被改动**；**P0 的指纹测试保持绿** —— 这是「搬家忠实」的机械证明，也是「零行为变化」承诺的可测形式。
+
+### P1.5：补可达性（`summarizer` 上 `RuntimeContext`）
+
+**与 P1 正交、可并行**；来自 `notes.md` ④ 修法 1，但**形状要改一处**。
+
+```rust
+// crates/ys-component/src/context.rs —— 加一个可选字段（该类型是 #[non_exhaustive]，加法式）
+pub struct RuntimeContext<'a> { /* …既有… */ pub summarizer: Option<&'a dyn Summarizer> }
+```
+
+**不改 `AgentPorts` 签名、不 `pub ModelSummarizer`**：`BasicLoop` 在 `None` 时**就地回落**到今天的构造：
+
+```rust
+let fallback;
+let summarizer: &dyn Summarizer = match ctx.summarizer {
+    Some(s) => s,
+    None => { fallback = ModelSummarizer { model: ctx.model }; &fallback }
+};
+```
+
+**为什么不能照抄 `approval` 的位置**（`notes.md:111` 原文说「机械替换，零语义变化」—— **低估了这道缝**）：`approval` 在 **build 期**由 `AgentBuilder` 持有（`builder.rs:62`），`RuntimeContext.approval` 只是它的借用（`agent.rs:109`）；而 `ModelSummarizer { model: ctx.model }`（`basic.rs:463`）需要 **per-turn** 的 `&dyn Model`（`AgentPorts.model`，`agent.rs:21`）。「照抄」会把 `ModelSummarizer` 逼上 `pub`（现为 `pub(crate)`，`summarize.rs:53`）**并改 `AgentPorts`**。可选覆盖的形状同时满足两件事：缝**可达**，且不挂载时**逐字节不变**（与 `boundary` 同手法，`context.rs:23`）。
+
+**验收**：不挂载时行为逐字节不变（既有 833 条测试全绿即证）；挂载假 `Summarizer` 后，`ToolContext.summarizer` 拿到的是它而非 `ModelSummarizer`。
+
+**边界（写下来，本轮不做）**：compaction 的摘要**不走这条缝** —— `compact.rs:295` 的 `generate_summary` 用自己的 `policy.summary_system_prompt`，与 `ys_tool::Summarizer` 是两回事（已核 `compact.rs:33`）。⇒ 同进程将有**两套摘要**，本轮**有意分离**（提示词与用途不同）；是否统一归 ADR-0017 决策 10 的「片 2」。
 
 ### P2：todo 作为第一个真实消费者
 
@@ -340,13 +412,15 @@ fn tool_prefix_bytes_are_frozen() {
 
 **显示缝同理未开**：第三方工具若要不塌成一行，仍需有人给 `CodingView` 加字段 + 写 `draw.rs`。这是「数据/显示分离」原则的直接后果 —— 在本仓，**显示是一等产品决策，不是插件的权利**。这与 pi 的设计哲学**恰好相反**，是有意的。
 
-### 7.2 真正的风险：重构会静默改写缓存前缀
+### 7.2 真正的风险：重构会**静默**改写缓存前缀
 
-见 §6 P0。**缓解手段只有 prefix 指纹测试**。这是本方案最大的单点风险。
+见 §6 P0。**缓解手段只有 prefix 指纹测试** —— 且它有两个已知盲区，均已覆盖：默认锚点是空 catalogue，覆盖不到 skill 段（P0 补第二个锚点）；测试若不隔离 `HOME`，锚点随机器而变、失去意义（P0 显式隔离）。
+
+**最具体的风险面已定位（`/arch-validate`）**：P1 步骤 3 若按**工具 order** 展开 guideline，会静默重排成 `read, write, edit, …`（今天是 `edit` 组在最前，`prompt.rs:143-189`）。这不是假想 —— 它是「照字面实现 §6 P1」的**默认结果**。⇒ §5.2 用两条独立的序表达既成事实。
 
 ### 7.3 其他
 
-- **`EXPECTED_ORDER` 降为派生量会削弱一层交叉校验** —— 补偿：测试侧保留独立硬编码序列（§6 P1 第 4 条）。
+- **`EXPECTED_ORDER` 降为派生量会削弱一层交叉校验** —— 补偿：**独立字面量落在测试侧**，且 `prompt.rs` 的测试也改用它（它今天引用的是 `toolset::EXPECTED_ORDER`，`prompt.rs:279`，两侧本就是同源）。见 §6 P1 第 4 条。
 - **单工具 spec 的 400 B 预算会被绕过** —— 必须留显式豁免通道，否则约束要么被整体删除、要么挡住正当的长 description。
 - **`Fixed_prompt_tokens` 的账本自动正确**：插件只要走「工具 + snippet + guideline」这条既有通路，`main.rs` 的 `fixed_prompt_tokens` 计算自动把它算进去 —— 这是本设计最省事的一点。
 - **todo 状态会被压缩摘要掉**（与 `docs/design-final/skills.md` 的 R6 同型）。本轮不做「todo 免疫压缩」机制（那需要给 session 加保留标记，是新的核心契约）。缓解：最后一条 todo 调用仍在 `arguments` 里，模型可重读。

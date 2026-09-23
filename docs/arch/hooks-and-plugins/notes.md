@@ -161,7 +161,7 @@ pub struct Plugin {
 | 4 | **P1.5：`AgentBuilder::agent_loop`** | 立即 —— 修文档背离 | 本文 ④ |
 | 5 | **P2b：follow-up 第二触发器**（回合 `Completed` + 有未完成项 ⇒ 追问） | 待 follow-up 本身实现后 | 本文 ① |
 | 6 | **`Plugin` 泛化**（统一装配面） | 第 2 个缝的消费者出现 | 本文 ④ 修法 3 |
-| 7 | **ADR-0022：控制流分类**（传输 / 决策 / 分层，不统一） | 可立即写（结论已稳定） | 本文 ③ |
+| 7 | **ADR-0023：控制流分类**（传输 / 决策 / 分层，不统一） | 可立即写（结论已稳定） | 本文 ③ |
 | 8 | **「开新路」准入规则**补进 `docs/extension-points.md` | 可立即写 | 本文 ③ |
 | 9 | design.md 加 **P2b**；ADR-0021 Consequences 补一句「确保完成是 follow-up 的第二触发条件，**不是 hook 的第二消费者**」 | 可立即写 | 本文 ① |
 | 10 | **修 `load_project_context` 软链重复加载**（`CLAUDE.md -> AGENTS.md`，27.8KB 加载两遍 ≈18k est token） | 独立 issue —— **收益远大于任何插件缝优化** | design.md §8 |

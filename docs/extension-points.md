@@ -53,8 +53,9 @@ Loop       按什么规则推进
 | 调其他进程发消息 | **Event**（系统发）/ **Tool**（模型发） | 看**谁决定** |
 | LSP 查询 | **Tool** | 长驻进程 → 更适合做成 **adapter crate** |
 | LSP 改完自动查诊断 | **工具内部** | 形似 hook，但 `EditTool` 是我们的 → 工具自己做 |
+| **写代码时提示项目约定**（如注释规范） | **工具内部**（`edit`/`write` 的 `spec().description`） | 紧随动作之前、且命中缓存。⚠️ **别做成「每轮注入」** —— 尾部内容永不命中缓存，比常驻贵 10×。见 [`arch/prompt-delivery/notes.md`](./arch/prompt-delivery/notes.md) |
 
-> **六个用例，零个需要 Hook 系统。**
+> **七个用例，零个需要 Hook 系统。**
 
 ## 命名警告（血泪）
 

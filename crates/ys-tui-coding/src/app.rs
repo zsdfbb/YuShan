@@ -204,7 +204,7 @@ impl App {
         self.working_dot = (self.working_dot + 1) % WORKING_DOTS;
     }
 
-    /// Working 文案：`Working` + 1..=3 个点（与状态行共用）。
+    /// Working 文案：`Working` + 1..=3 个点（状态行用）。
     pub fn working_text(&self) -> String {
         format!("Working{}", ".".repeat(1 + self.working_dot as usize))
     }

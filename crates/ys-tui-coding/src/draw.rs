@@ -132,34 +132,28 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(" Input ");
     let inner = block.inner(area);
 
-    let (text, style) = if app.is_turning {
-        (app.working_text(), Style::default().fg(Color::Yellow))
-    } else {
-        (app.input.text.clone(), Style::default())
-    };
-    frame.render_widget(Paragraph::new(text).block(block).style(style), area);
+    // turn 进行中也照常渲染输入缓冲与光标：`Working` 心跳只由状态行承担。
+    frame.render_widget(Paragraph::new(app.input.text.clone()).block(block), area);
 
-    if !app.is_turning {
-        // 光标：**行号**取 char 语义的 `cursor_row_col`（`\n` 计数），
-        // **列**按**显示宽度**算（不能按字节、也不能按 char 数 —— 中文占 2 列）。
-        let (logical_row, _col_chars) = app.input.cursor_row_col();
-        let last_row = app
-            .input
-            .text_before_cursor()
-            .rsplit('\n')
-            .next()
-            .unwrap_or("");
-        let inner_w = inner.width.max(1) as usize;
-        let disp_col = display_width(last_row);
-        // 软换行：本行显示宽度超过 inner_w 时，光标落到被折出的下一视觉行
-        let row = logical_row + disp_col / inner_w;
-        let col = disp_col % inner_w;
-        if row < inner.height as usize && col < inner_w {
-            frame.set_cursor_position(ratatui::layout::Position::new(
-                inner.x + col as u16,
-                inner.y + row as u16,
-            ));
-        }
+    // 光标：**行号**取 char 语义的 `cursor_row_col`（`\n` 计数），
+    // **列**按**显示宽度**算（不能按字节、也不能按 char 数 —— 中文占 2 列）。
+    let (logical_row, _col_chars) = app.input.cursor_row_col();
+    let last_row = app
+        .input
+        .text_before_cursor()
+        .rsplit('\n')
+        .next()
+        .unwrap_or("");
+    let inner_w = inner.width.max(1) as usize;
+    let disp_col = display_width(last_row);
+    // 软换行：本行显示宽度超过 inner_w 时，光标落到被折出的下一视觉行
+    let row = logical_row + disp_col / inner_w;
+    let col = disp_col % inner_w;
+    if row < inner.height as usize && col < inner_w {
+        frame.set_cursor_position(ratatui::layout::Position::new(
+            inner.x + col as u16,
+            inner.y + row as u16,
+        ));
     }
 }
 
@@ -845,14 +839,21 @@ mod tests {
         assert!(shown.contains("⌁"), "带 ⌁ 前缀：{shown}");
     }
 
+    /// turn 中：输入区照常显示输入缓冲与光标，`Working` 心跳只在状态行出现一次。
     #[test]
-    fn test_turn_renders_working_in_input_and_status() {
+    fn test_turn_shows_input_text_and_working_only_in_status() {
         let mut app = app_with(CodingView::for_test());
+        app.input.insert_str("queued message");
         app.is_turning = true;
         app.working_dot = 1; // Working..
         let rows = rows_of(&mut app, 120, 40);
-        let joined = rows.join("\n");
-        assert!(joined.contains("Working.."), "{joined}");
+        // 内容仍是 1 行 → 布局与既有推导一致：输入区 36..39，状态行 39
+        let input_pane = rows[36..39].join("\n");
+        assert!(input_pane.contains("queued message"), "{input_pane}");
+        assert!(
+            !input_pane.contains("Working"),
+            "输入区不再重复 Working：{input_pane}"
+        );
         // 状态行（最底）也把 model 段换成 Working（⏳ 是宽字符，占两格）
         assert!(
             rows[39].contains("Working.."),
@@ -864,6 +865,11 @@ mod tests {
             !rows[39].contains("deepseek-chat"),
             "turn 中 model 段被替换：{}",
             rows[39]
+        );
+        assert_eq!(
+            rows.join("\n").matches("Working..").count(),
+            1,
+            "Working 全屏只出现一次（状态行）"
         );
     }
 
@@ -1096,16 +1102,15 @@ mod tests {
         );
     }
 
-    /// turn 中不显示光标（输入区显示 Working）。
+    /// turn 中光标照常显示：输入区定位与 idle 同一套（CJK 按显示宽度算列）。
     #[test]
-    fn test_no_input_cursor_while_turning() {
+    fn test_input_cursor_visible_while_turning() {
         let mut app = app_with(CodingView::for_test());
         app.input.insert_str("中文");
         app.is_turning = true;
-        // 未调用 set_cursor_position → 后端光标停在原点
         assert_eq!(
             cursor_pos(&mut app, 120, 40),
-            ratatui::layout::Position::new(0, 0)
+            ratatui::layout::Position::new(5, 37)
         );
     }
 

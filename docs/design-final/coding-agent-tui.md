@@ -220,6 +220,8 @@ turn 中把 model 段换成 `⏳ Working·`（300ms 节拍前进，宽字符占�
 
 **输入区**：多行（`Shift/Alt+Enter` 换行、`Enter` 提交）；启用 bracketed paste（`Event::Paste` 原样
 `insert_str`，不被当多次提交）；启用 `PushKeyboardEnhancementFlags`。
+turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` 排队到下一回合）；
+**`Working` 心跳只出现在状态行**。
 `InputBuffer.cursor` 是 **char 索引**，退格走字节边界求区间再 `replace_range` —— 修掉了旧
 `ui/events.rs:131` 的 `cursor - 1` 落在多字节字符中间导致的**中文退格 panic**。
 

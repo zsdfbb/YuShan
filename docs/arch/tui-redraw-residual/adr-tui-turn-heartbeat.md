@@ -14,6 +14,7 @@
 
 1. **形态**：保持 blocking `dispatch_input`；`run_turn_with_ticks` 增 `&mut Terminal<B>`、`&mut EventStream`、`&mut App` 参数，内层 `select!(biased; turn_fut | events | 300ms 动画节拍)`，入场先 `terminal.draw` 一帧。**不引入**外层 Idle/Turning 状态机与输入队列。
 2. **渲染模型（pi 对齐）**：渲染跟随状态变化（入场 / 事件 / turn 完成），无全局定时器；turn 期间仅一个 "Working…" 动画节拍（300ms，`working_dot` 步进）提供视觉心跳，turn 结束即停。不做逐 token 流式（用户选定最小刷新粒度）。
+   > **修订（2026-10-02）**：输入区不再渲染 `Working…` —— turn 进行中照常显示输入缓冲与光标（键入立即可见，不再是「turn 后可见」）；300ms 节拍只驱动状态行的 `⏳ Working·`。
 3. **取消**：删除内层 `ctrl_c` arm；Esc/Ctrl-C/Ctrl-D 经 `handle_event`（events.rs 已路由到 `cancel_token.cancel()`）触发，BasicLoop 在 round 边界返回 `Ok(stop_reason: Cancelled)`，不 drop future。
 4. **退出（用户选定 pi 风格）**：`restore_terminal(terminal, app)` 在 `LeaveAlternateScreen` 后 `MoveTo(0,0)`，按 transcript 逐行 `\r\x1b[2K` 清行 + 重打完整对话进主屏 scrollback（复用 `line_to_text`，去样式/光标标记、按 width 硬 wrap、无 padding 行）。**不做** `terminal.clear()` 清空方案。
 5. **单键退出**：`should_quit` 检查移到 `dispatch_input` 之后。

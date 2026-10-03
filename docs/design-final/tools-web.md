@@ -74,10 +74,12 @@ Cargo.toml（workspace）/ apps/coding-agent/Cargo.toml
 Tavily → Bocha → Firecrawl → Searxng
 ```
 
-**四家全部需 key**（Firecrawl 已从初稿的「keyless」**订正为需 key**，见 ADR-0016 修订记录）：
+**Tavily / Bocha / Firecrawl 需 key**（Firecrawl 已从初稿的「keyless」**订正为需 key**，见 ADR-0016 修订记录）：
 官方 API 要求 `Authorization: Bearer`，无 key 回 401「The API key was not provided」。未配 key 的行在**构造期**剔除
 ⇒ **零配置用户的链为空** ⇒ `degraded_hint` 那句「未配置任何搜索后端」**可达**（初稿的 keyless 会让它不可达，
-Firecrawl 一家撑起一条用户从没选过的链）。SearXNG 的「凭证」是实例地址（`YUSHAN_SEARCH_SEARXNG_URL`），
+Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生态通用名 `TAVILY_API_KEY` 作**回退**，命名空间名
+`YUSHAN_SEARCH_TAVILY_KEY` 优先 —— 故「零配置」指这些键**全部**未设（shell 里为别的 Tavily 工具配过的通用 key
+会让 Tavily 进链，这正是别名想要的效果）。SearXNG 的「凭证」是实例地址（`YUSHAN_SEARCH_SEARXNG_URL`），
 它排末位的理由是**元搜索**：自己再转发给上游引擎，多一跳、质量取决于实例配置与上游限流，**我们无法评估**。
 
 **降级只认错误/限额，空结果停链**（设计 §1.2 的核心区分）：一次尝试 `Ok(hits)` —— **有结果与空结果都停**，

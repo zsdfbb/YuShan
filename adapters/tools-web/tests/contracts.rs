@@ -22,8 +22,9 @@
 
 use ys_tool::Tool;
 use ys_tools_web::{
-    ENV_BOCHA_KEY, ENV_FETCHED_DIR, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY, FetchedDir,
-    WebConfig, WebFetchTool, WebSearchTool,
+    ENV_BOCHA_KEY, ENV_FETCHED_DIR, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
+    ENV_TAVILY_KEY_ALIAS, FetchedDir, Kind, WebConfig, WebFetchTool, WebSearchTool,
+    resolve_backends,
 };
 
 /// 确定性配置：无 HTTP 栈、无后端、不落盘。
@@ -53,6 +54,10 @@ fn env_var_names_are_a_frozen_release_contract() {
         "Tavily key 的 env 名是发布契约，改名 = 破坏兼容"
     );
     assert_eq!(
+        ENV_TAVILY_KEY_ALIAS, "TAVILY_API_KEY",
+        "Tavily 通用别名同样是发布契约：改名 = 已按通用名配好的用户静默失效"
+    );
+    assert_eq!(
         ENV_BOCHA_KEY, "YUSHAN_SEARCH_BOCHA_KEY",
         "Bocha key 的 env 名是发布契约，改名 = 破坏兼容"
     );
@@ -63,6 +68,42 @@ fn env_var_names_are_a_frozen_release_contract() {
     assert_eq!(
         ENV_FETCHED_DIR, "YUSHAN_FETCHED_DIR",
         "落盘目录覆盖的 env 名是发布契约，改名 = 破坏兼容（且测试隔离会静默失效）"
+    );
+}
+
+/// **契约：Tavily 的通用名是回退，不是替代** —— 只配 `TAVILY_API_KEY` 也能进链；
+/// 两个都配时 [`ENV_TAVILY_KEY`]（项目命名空间）优先；两个都不配仍被剔除。
+///
+/// 用 `resolve_backends` 的**注入式 env 闭包**确定性构造链，不改进程 env。
+///
+/// 变异：把 `TAVILY_KEY_ENVS` 的顺序反过来 → 「项目名优先」那条红；把包含
+/// `ENV_TAVILY_KEY_ALIAS` 从表里去掉 → 第一条红；把 `keyless` 打开 → 第三条红。
+#[test]
+fn tavily_generic_env_is_a_fallback_and_project_name_wins() {
+    let chain = |env: &[(&str, &str)]| {
+        let map: std::collections::HashMap<&str, &str> = env.iter().copied().collect();
+        resolve_backends(|k| map.get(k).map(|v| v.to_string()))
+    };
+
+    let only_generic = chain(&[(ENV_TAVILY_KEY_ALIAS, "tvly-generic")]);
+    assert_eq!(only_generic.len(), 1, "{only_generic:?}");
+    assert_eq!(only_generic[0].kind, Kind::Tavily);
+    assert_eq!(only_generic[0].key.as_deref(), Some("tvly-generic"));
+
+    let both = chain(&[
+        (ENV_TAVILY_KEY, "tvly-project"),
+        (ENV_TAVILY_KEY_ALIAS, "tvly-generic"),
+    ]);
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert_eq!(
+        both[0].key.as_deref(),
+        Some("tvly-project"),
+        "项目命名空间必须压过通用名"
+    );
+
+    assert!(
+        chain(&[]).is_empty(),
+        "两个名字都没配 ⇒ Tavily 按无 key 剔除（别名不得变成「无 key 也进链」）"
     );
 }
 

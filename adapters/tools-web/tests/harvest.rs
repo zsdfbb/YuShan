@@ -46,8 +46,8 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value};
 use ys_tools_web::{
-    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY, Kind, build_client,
-    kind_slug, parse, plan, resolve_backends,
+    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
+    ENV_TAVILY_KEY_ALIAS, Kind, build_client, kind_slug, parse, plan, resolve_backends,
 };
 
 /// 单次请求的超时。比产品里的预算宽（这是人跑的，宁可等也不愿意少采一份）。
@@ -60,13 +60,24 @@ const EMPTY_QUERY: &str = "yushan-zzq9-no-such-page-7f3a4c1e";
 
 /// 取一个必需 env；缺失或为空即**红**（harvest 不做「静默跳过」）。
 fn require_env(name: &str) -> String {
-    match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => panic!(
-            "未设置 {name}（或为空）。harvest 是人工采集工具，先 export 再跑；\
-             见 tests/fixtures/README.md 第四节"
-        ),
+    require_env_any(&[name])
+}
+
+/// 同 [`require_env`]，但接受**多个候选名**（返回第一个非空的）——
+/// Tavily 的项目命名空间名与生态通用名都认。
+fn require_env_any(names: &[&str]) -> String {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
     }
+    panic!(
+        "未设置 {}（或为空）。harvest 是人工采集工具，先 export 再跑；\
+         见 tests/fixtures/README.md 第四节",
+        names.join(" / ")
+    )
 }
 
 /// 从**产品那份 `TABLE`** 取这一家的端点（`plan` 用的就是它）—— 这里**刻意不硬编码地址**。
@@ -252,7 +263,7 @@ async fn harvest_empty(client: &Client, backend: &Backend, secrets: &[&str]) {
 #[tokio::test]
 #[ignore = "人工采集：需真实 key + 真实网络，不进 CI"]
 async fn harvest_tavily() {
-    let key = require_env(ENV_TAVILY_KEY);
+    let key = require_env_any(&[ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS]);
     let backend = backend_of(Kind::Tavily, Some(key.clone()));
     let client = client();
 

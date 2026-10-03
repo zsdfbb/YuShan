@@ -9,6 +9,8 @@
 accepted（2026-09-17）· **修订（2026-09-18）**：Firecrawl 由「keyless」改为**需 key**（见「决策 2」与「Consequences」的修订记录）。
 · **修订（2026-09-19）**：**「Claude Code 式总结当前做不到」这条被重开** —— 其实现路径理由（注入 `Arc<dyn Model>` +
 重排装配顺序）被证伪，**由 [ADR-0018](0018-webfetch-summarize.md) 落地**（可选 `prompt` + 摘要 + 指针）。
+· **修订（2026-10-03）**：Tavily 的密钥 env 追加接受**生态通用名** `TAVILY_API_KEY` 作**回退**
+（`YUSHAN_SEARCH_TAVILY_KEY` 优先）—— 「零配置 ⇒ 链为空」相应变成「这些键**全部**未设」。
 本 ADR 其余决定**全部不变**。
 
 ## 背景

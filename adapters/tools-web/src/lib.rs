@@ -80,6 +80,11 @@ pub use reqwest::Url;
 pub const ENV_SEARXNG_URL: &str = "YUSHAN_SEARCH_SEARXNG_URL";
 /// Tavily API key。
 pub const ENV_TAVILY_KEY: &str = "YUSHAN_SEARCH_TAVILY_KEY";
+/// Tavily 的**生态通用** API key 环境变量名（官方 SDK 与多数 Tavily 工具用它）。
+///
+/// 作为 [`ENV_TAVILY_KEY`] 的**回退**读取：已为别的 Tavily 工具配过 key 的用户
+/// 不必再复制一份到本项目命名空间。两者都设时 [`ENV_TAVILY_KEY`] 优先。
+pub const ENV_TAVILY_KEY_ALIAS: &str = "TAVILY_API_KEY";
 /// Bocha（博查）API key。
 pub const ENV_BOCHA_KEY: &str = "YUSHAN_SEARCH_BOCHA_KEY";
 /// Firecrawl API key —— **必需**（官方 API 文档要求 `Authorization: Bearer`，无 key 回 401
@@ -258,7 +263,8 @@ impl WebConfig {
         if self.backends.is_empty() {
             issues.push(format!(
                 "未配置任何搜索后端：websearch 不可用。请设置 {ENV_SEARXNG_URL}，\
-                 或 {ENV_TAVILY_KEY} / {ENV_BOCHA_KEY} / {ENV_FIRECRAWL_KEY} 之一"
+                 或 {ENV_TAVILY_KEY}（或通用名 {ENV_TAVILY_KEY_ALIAS}）/ {ENV_BOCHA_KEY} / \
+                 {ENV_FIRECRAWL_KEY} 之一"
             ));
         }
         if let Some(note) = &self.fetched_note {
@@ -421,6 +427,7 @@ mod tests {
     const BACKEND_KEYS: &[&str] = &[
         ENV_SEARXNG_URL,
         ENV_TAVILY_KEY,
+        ENV_TAVILY_KEY_ALIAS,
         ENV_BOCHA_KEY,
         ENV_FIRECRAWL_KEY,
     ];

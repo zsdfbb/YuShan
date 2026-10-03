@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | [`TABLE`] 的**顺序** | [`resolve_backends`] | 链序：`已配 key 的 provider（tavily → bocha → firecrawl）→ searxng` |
 //! | `Row.endpoint` / `endpoint_env` | [`resolve_backends`] + [`plan`] | 请求地址（SearXNG 的地址天然是用户配置） |
-//! | `Row.key_env` / `keyless` | [`resolve_backends`] | 未配 key 的行在**构造期**就被剔除 |
+//! | `Row.key_envs` / `keyless` | [`resolve_backends`] | 未配 key 的行在**构造期**就被剔除 |
 //!
 //! # `plan` 为什么多一个 `&Client` 参数（与设计 §1.3 的签名有出入）
 //!
@@ -36,7 +36,10 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::{Client, RequestBuilder, Url};
 use serde_json::{Value, json};
 
-use crate::{Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY, Kind};
+use crate::{
+    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
+    ENV_TAVILY_KEY_ALIAS, Kind,
+};
 
 // ---------- 常量：端点与上限 ----------
 
@@ -46,6 +49,12 @@ const TAVILY_ROOT: &str = "https://api.tavily.com";
 const BOCHA_ROOT: &str = "https://api.bochaai.com";
 /// Firecrawl 服务根（`plan` 追加 `/v2/search`）。
 const FIRECRAWL_ROOT: &str = "https://api.firecrawl.dev";
+
+/// Tavily 密钥的**接受名**，顺序即优先级：项目命名空间在前，生态通用名兜底。
+///
+/// 项目级名在前，是为了让「特意为本项目配的 key」压过 shell 里为别的 Tavily 工具
+/// 配的通用 key —— 同一台机器上两者常常指向不同的额度或套餐。
+const TAVILY_KEY_ENVS: &[&str] = &[ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS];
 
 /// `limit` 的**契约上限**（设计 §4「搜索 `limit` 默认 10（clamp 1..=20）」）。
 ///
@@ -72,8 +81,13 @@ struct Row {
     /// 端点由哪个 env 提供 —— **只有 SearXNG 有**（自建实例地址天然是用户配置）。
     /// 该 env 缺席 ⇒ 这一行从链上剔除。
     endpoint_env: Option<&'static str>,
-    /// 密钥所在的 env；`None` = 这家永不读密钥。
-    key_env: Option<&'static str>,
+    /// 密钥所在的 env 名，**按优先级排列**：前一个未设或为空时读下一个。
+    ///
+    /// 为什么是列表而不是单个名字：生态里同一个服务常有**通用名**
+    /// （Tavily 官方 SDK 读 `TAVILY_API_KEY`）。让表自己声明「接受哪些名字、谁优先」，
+    /// 解析规则就仍留在**唯一真值**里，不散到调用方的闭包。
+    /// **空切片** = 这家永不读密钥。
+    key_envs: &'static [&'static str],
     /// **没有密钥时是否仍留在链上**。
     ///
     /// - `false`（tavily / bocha / firecrawl）：没配 key = 用户没打算用这一家 → **构造期**剔除；
@@ -125,21 +139,21 @@ const TABLE: &[Row] = &[
         kind: Kind::Tavily,
         endpoint: TAVILY_ROOT,
         endpoint_env: None,
-        key_env: Some(ENV_TAVILY_KEY),
+        key_envs: TAVILY_KEY_ENVS,
         keyless: false,
     },
     Row {
         kind: Kind::Bocha,
         endpoint: BOCHA_ROOT,
         endpoint_env: None,
-        key_env: Some(ENV_BOCHA_KEY),
+        key_envs: &[ENV_BOCHA_KEY],
         keyless: false,
     },
     Row {
         kind: Kind::Firecrawl,
         endpoint: FIRECRAWL_ROOT,
         endpoint_env: None,
-        key_env: Some(ENV_FIRECRAWL_KEY),
+        key_envs: &[ENV_FIRECRAWL_KEY],
         // 官方 API 要求 `Authorization: Bearer`（无 key 回 401 "The API key was not provided"）
         // ⇒ 与 tavily / bocha 同组：没配 key 就在构造期剔除（见 `Row::keyless` 那段血泪）。
         keyless: false,
@@ -148,7 +162,7 @@ const TABLE: &[Row] = &[
         kind: Kind::Searxng,
         endpoint: "",
         endpoint_env: Some(ENV_SEARXNG_URL),
-        key_env: None,
+        key_envs: &[],
         // searxng 不需要密钥；它的「凭证」是实例地址，缺席时上面那条 endpoint 分支就剔了它。
         keyless: true,
     },
@@ -197,9 +211,9 @@ pub fn resolve_backends(env: impl Fn(&str) -> Option<String>) -> Vec<Backend> {
             None => row.endpoint.to_string(),
         };
 
-        // ② 密钥：`None`（key_env 缺席）= 这家不读密钥。
-        let key = row.key_env.and_then(|k| non_empty(env(k)));
-        if row.key_env.is_some() && key.is_none() && !row.keyless {
+        // ② 密钥：空切片 = 这家不读密钥；否则取**第一个非空**的名字。
+        let key = row.key_envs.iter().find_map(|k| non_empty(env(k)));
+        if !row.key_envs.is_empty() && key.is_none() && !row.keyless {
             continue;
         }
 
@@ -286,22 +300,26 @@ fn request_url(b: &Backend) -> String {
 /// **手工构造的 `Backend`**（测试、将来的其它装配路径）。给出可执行的文案而不是 panic。
 fn require_key(b: &Backend) -> Result<&str, String> {
     b.key.as_deref().ok_or_else(|| {
-        format!(
-            "{} 需要 API key（{} 未配置或为空）",
-            kind_slug(b.kind),
-            key_env_of(b.kind).unwrap_or("<无>")
-        )
+        let names = key_envs_of(b.kind);
+        let names = if names.is_empty() {
+            "<无>".to_string()
+        } else {
+            names.join(" / ")
+        };
+        format!("{} 需要 API key（{names} 未配置或为空）", kind_slug(b.kind))
     })
 }
 
-/// 这家读哪个 env 取密钥；`None` = 不读（**只有 SearXNG** —— 它的凭证是实例地址）。
+/// 这家读哪些 env 取密钥（有序接受名）；**空切片** = 不读
+/// （**只有 SearXNG** —— 它的凭证是实例地址）。
 ///
 /// 与 [`TABLE`] 同源：`plan` 的错误文案要能**告诉用户改哪个变量**，而那是表的事实。
-fn key_env_of(kind: Kind) -> Option<&'static str> {
+fn key_envs_of(kind: Kind) -> &'static [&'static str] {
     TABLE
         .iter()
         .find(|row| row.kind == kind)
-        .and_then(|row| row.key_env)
+        .map(|row| row.key_envs)
+        .unwrap_or(&[])
 }
 
 /// `limit` 的 clamp（见 [`MIN_LIMIT`] / [`MAX_LIMIT`]）。

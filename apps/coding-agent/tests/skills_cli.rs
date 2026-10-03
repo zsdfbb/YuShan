@@ -125,6 +125,8 @@ fn isolate(cmd: &mut Command, roots: &Roots) {
         // ④ web 侧
         .env_remove("YUSHAN_SEARCH_SEARXNG_URL")
         .env_remove("YUSHAN_SEARCH_TAVILY_KEY")
+        // Tavily 的生态通用名：产品会作为回退读取，不清则随开发机 shell 漂移。
+        .env_remove("TAVILY_API_KEY")
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("YUSHAN_FETCHED_DIR");

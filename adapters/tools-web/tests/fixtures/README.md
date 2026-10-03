@@ -70,7 +70,7 @@
 
 ```bash
 # 一条命令跑全部（缺哪个 env 就红哪一条，红的文案告诉你要 export 什么）
-export YUSHAN_SEARCH_TAVILY_KEY=tvly-…
+export YUSHAN_SEARCH_TAVILY_KEY=tvly-…    # 亦可 export TAVILY_API_KEY（通用名，作为回退）
 export YUSHAN_SEARCH_BOCHA_KEY=sk-…
 export YUSHAN_SEARCH_FIRECRAWL_KEY=fc-…                 # 必需（ADR-0016 修订：它不免 key）
 export YUSHAN_SEARCH_SEARXNG_URL=http://127.0.0.1:8888   # 自建实例；公共实例也行

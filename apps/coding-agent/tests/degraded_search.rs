@@ -75,12 +75,12 @@ fn run_guarded(path_dir: &Path, home: &Path) -> Output {
 ///
 /// ① **模型侧**（`API_BASE` / `API_KEY` / `MODEL` / `SESSIONS_DIR` / `CHANNEL_CAPACITY`）——
 ///    父进程若配了凭证，子进程就不会走到「无模型配置」的早退（本文件的两个早退断言失效）。
-/// ② **web 侧**（四个 `YUSHAN_SEARCH_*` + `YUSHAN_FETCHED_DIR`）—— 这四个后端键决定
+/// ② **web 侧**（四个 `YUSHAN_SEARCH_*` + Tavily 通用名 `TAVILY_API_KEY` + `YUSHAN_FETCHED_DIR`）—— 这些后端键决定
 ///    `WebConfig::from_env` 解析出的链是否为空，进而决定
 ///    [`ys_tools_web::WebConfig::degraded_hint`] **有没有**「未配置任何搜索后端」那句；
 ///    `YUSHAN_FETCHED_DIR` 决定落盘目录的**档位**（`Override` vs `Primary`）与是否附带
 ///    一条降级说明。开发机 shell 里配过 Tavily key 时，web 侧提示会**整个消失** ——
-///    任何关于它的断言都会时红时绿。故这五个键必须一并在 per-child 上清掉。
+///    任何关于它的断言都会时红时绿。故这些键（含通用别名）必须一并在 per-child 上清掉。
 ///
 /// 键名逐字取自 `adapters/tools-web/src/lib.rs` 顶部的 `ENV_*` 常量（**不猜**）。
 fn isolate(cmd: &mut Command, home: &Path) {
@@ -95,6 +95,8 @@ fn isolate(cmd: &mut Command, home: &Path) {
         // ② web 侧：不清则「未配置任何搜索后端」那句随开发机 env 有无而漂移。
         .env_remove("YUSHAN_SEARCH_SEARXNG_URL")
         .env_remove("YUSHAN_SEARCH_TAVILY_KEY")
+        // Tavily 的生态通用名：产品会作为回退读取，不清则开发机 shell 里配过它就漂移。
+        .env_remove("TAVILY_API_KEY")
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("YUSHAN_FETCHED_DIR");

@@ -65,8 +65,9 @@ use ys_tool::{Summarizer, Tool, ToolContext, ToolError};
 use ys_tools_basic::ReadTool;
 use ys_tools_web::{
     Backend, ChainOutcome, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
-    FETCH_MAX_BYTES, FetchedDir, Kind, MIN_SLICE, Url, WebConfig, WebFetchTool, WebSearchTool,
-    fetched_file_name, resolve_backends, run_chain, slice_for, vet_url,
+    ENV_TAVILY_KEY_ALIAS, FETCH_MAX_BYTES, FetchedDir, Kind, MIN_SLICE, Url, WebConfig,
+    WebFetchTool, WebSearchTool, fetched_file_name, resolve_backends, run_chain, slice_for,
+    vet_url,
 };
 
 /// 落盘文件第 1 行 —— **字面量**（不是从 crate 里 import 常量）：它是给模型/人看的契约，
@@ -244,10 +245,12 @@ impl Drop for EnvRestore {
     }
 }
 
-/// 搜索链的四个 env 键（与 `backends::resolve_backends` 消费的那组同源）。
+/// 搜索链消费的全部 env 键（与 `backends::resolve_backends` 消费的那组同源）——
+/// 含 Tavily 的**通用别名**，否则开发机 shell 配了 `TAVILY_API_KEY` 时链的形状会漂移。
 const SEARCH_ENV_KEYS: &[&str] = &[
     ENV_SEARXNG_URL,
     ENV_TAVILY_KEY,
+    ENV_TAVILY_KEY_ALIAS,
     ENV_BOCHA_KEY,
     ENV_FIRECRAWL_KEY,
 ];
@@ -906,6 +909,7 @@ async fn test_websearch_accepts_a_loopback_backend_address_from_env() {
         // `_lock` 析构（声明逆序），恢复时仍持锁。
         unsafe {
             std::env::remove_var(ENV_TAVILY_KEY);
+            std::env::remove_var(ENV_TAVILY_KEY_ALIAS);
             std::env::remove_var(ENV_BOCHA_KEY);
             std::env::remove_var(ENV_FIRECRAWL_KEY);
             std::env::set_var(ENV_SEARXNG_URL, &endpoint);

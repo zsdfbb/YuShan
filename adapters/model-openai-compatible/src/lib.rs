@@ -3,9 +3,12 @@ pub mod request;
 pub mod response;
 pub mod stream;
 
+mod inline_thinking;
+
 use std::collections::BTreeMap;
 
 use compat::ProviderCompat;
+use inline_thinking::{Segment, SegmentKind};
 use request::*;
 use response::*;
 use stream::{StreamEvent, parse_sse_stream};
@@ -186,6 +189,8 @@ struct StreamAccumulator<'s> {
     has_reasoning_content: bool,
     text: String,
     reasoning: String,
+    /// 剥离 `content` 内联思考标签；内联思考只经事件出口，不写 `reasoning`。
+    filter: inline_thinking::InlineThinkingFilter,
     tool_calls: BTreeMap<u32, ToolCallAccumulator>,
     finish_reason: Option<String>,
     /// 流中出现的最后一个非空 usage（OpenAI 系在末包附带）。
@@ -200,6 +205,7 @@ impl<'s> StreamAccumulator<'s> {
             has_reasoning_content,
             text: String::new(),
             reasoning: String::new(),
+            filter: inline_thinking::InlineThinkingFilter::new(),
             tool_calls: BTreeMap::new(),
             finish_reason: None,
             usage: None,
@@ -218,11 +224,23 @@ impl<'s> StreamAccumulator<'s> {
                 usage,
             } => {
                 if let Some(content) = content {
+                    // 保留空 delta 守卫：否则快路径会发出空 `TextDelta`，
+                    // TUI 会落一条空 Assistant 行。
                     if !content.is_empty() {
-                        // 关键不变量：此处累积的 text 将原样成为最终
-                        // `ContentBlock::Text`，与逐片 emit 的增量逐字节相等。
-                        self.text.push_str(&content);
-                        let _ = self.sink.emit(ModelEvent::TextDelta { text: content });
+                        match self.filter.passthrough(&content) {
+                            Some(SegmentKind::Text) => {
+                                self.text.push_str(&content);
+                                let _ = self.sink.emit(ModelEvent::TextDelta { text: content });
+                            }
+                            Some(SegmentKind::Thinking) => {
+                                let _ = self.sink.emit(ModelEvent::ThinkingDelta { text: content });
+                            }
+                            None => {
+                                for seg in self.filter.feed(&content) {
+                                    self.emit_segment(seg);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -262,11 +280,32 @@ impl<'s> StreamAccumulator<'s> {
         Ok(())
     }
 
+    /// 把过滤器产出的段落到「累积 `text` + emit 事件」两点。
+    /// Text 段同时写 `self.text`（终态 `ContentBlock::Text` 的来源）；
+    /// Thinking 段只 emit，不写 `self.reasoning`。
+    fn emit_segment(&mut self, seg: Segment) {
+        match seg {
+            Segment::Text(t) => {
+                self.text.push_str(&t);
+                let _ = self.sink.emit(ModelEvent::TextDelta { text: t });
+            }
+            Segment::Thinking(t) => {
+                let _ = self.sink.emit(ModelEvent::ThinkingDelta { text: t });
+            }
+        }
+    }
+
     /// 流结束后收敛为 [`ModelResponse`]。
-    fn finish(self) -> Result<ModelResponse, ModelError> {
+    fn finish(mut self) -> Result<ModelResponse, ModelError> {
         if let Some(message) = self.error {
             // 流式解析失败不做非流式回退——直接以 Provider 错误上抛。
             return Err(ModelError::Provider(format!("SSE stream error: {message}")));
+        }
+
+        // 冲刷跨片扣留：思考态残留 → Thinking（未闭合思考不外泄）、
+        // 正文态假前缀 → Text（不丢字）。须在错误检查之后、构造 content_blocks 之前。
+        for seg in self.filter.flush() {
+            self.emit_segment(seg);
         }
 
         let mut content_blocks = Vec::new();
@@ -526,6 +565,66 @@ mod tests {
         stream::feed_sse_bytes(buffer, bytes, &mut |ev| acc.handle(ev)).unwrap();
     }
 
+    /// 喂一个 `delta.content` 的 SSE 行。
+    fn drive_content(buffer: &mut Vec<u8>, acc: &mut StreamAccumulator<'_>, content: &str) {
+        let line = format!(
+            "data: {}\n",
+            serde_json::json!({"choices":[{"index":0,"delta":{"content":content}}]})
+        );
+        drive(buffer, acc, line.as_bytes());
+    }
+
+    /// 喂一个 `delta.reasoning_content` 的 SSE 行。
+    fn drive_reasoning(buffer: &mut Vec<u8>, acc: &mut StreamAccumulator<'_>, reasoning: &str) {
+        let line = format!(
+            "data: {}\n",
+            serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":reasoning}}]})
+        );
+        drive(buffer, acc, line.as_bytes());
+    }
+
+    /// 喂正常收尾（finish_reason=stop + [DONE]）。
+    fn drive_stop(buffer: &mut Vec<u8>, acc: &mut StreamAccumulator<'_>) {
+        drive(
+            buffer,
+            acc,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+        );
+        drive(buffer, acc, b"data: [DONE]\n");
+    }
+
+    fn text_deltas(sink: &RecordingModelSink) -> String {
+        sink.events
+            .iter()
+            .filter_map(|ev| match ev {
+                ModelEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn thinking_deltas(sink: &RecordingModelSink) -> String {
+        sink.events
+            .iter()
+            .filter_map(|ev| match ev {
+                ModelEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn final_text(response: &ModelResponse) -> String {
+        response
+            .message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// 关键不变量（design §12「增量拼接与终态消息一致」）：
     /// 逐片 emit 的 `TextDelta` 拼接结果，与最终 `ModelResponse` 里
     /// `ContentBlock::Text` 的文本**逐字节相等**。含跨 chunk 的行边界。
@@ -643,6 +742,157 @@ mod tests {
         drive(&mut buf, &mut acc, LINE);
         let _ = acc.finish().unwrap();
         assert!(sink.events.is_empty(), "compat 关闭时 reasoning 必须被忽略");
+    }
+
+    /// 内联思考跨片流：`<think>…</think>` 被切成任意片段时，
+    /// TextDelta 不含思考、`ContentBlock::Text` == TextDelta 拼接、
+    /// ThinkingDelta 拼接 == 思考原文，且思考不进最终文本。
+    #[test]
+    fn inline_thinking_tags_split_across_content_chunks() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        for chunk in ["pre<thi", "nk>sec", "ret</thi", "nk>post"] {
+            drive_content(&mut buf, &mut acc, chunk);
+        }
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "prepost");
+        assert_eq!(final_text(&response), "prepost");
+        assert_eq!(thinking_deltas(&sink), "secret");
+        for ev in &sink.events {
+            if let ModelEvent::TextDelta { text } = ev {
+                assert!(!text.contains("secret"), "TextDelta 泄漏思考：{text:?}");
+            }
+        }
+    }
+
+    /// 内联思考与 `reasoning_content` 并存时互不串扰：
+    /// 两个来源都进 ThinkingDelta，正文各自独立。
+    #[test]
+    fn inline_thinking_coexists_with_reasoning_content() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, true);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(&mut buf, &mut acc, "<think>T</think>V");
+        drive_reasoning(&mut buf, &mut acc, "R");
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "V");
+        assert_eq!(final_text(&response), "V");
+        assert_eq!(thinking_deltas(&sink), "TR");
+    }
+
+    /// 无标签流仍只发 TextDelta（守 `thinking_delta_only_emitted_when_compat_enabled`）。
+    #[test]
+    fn plain_content_stream_emits_only_text_deltas() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(&mut buf, &mut acc, "hello ");
+        drive_content(&mut buf, &mut acc, "world");
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "hello world");
+        assert_eq!(final_text(&response), "hello world");
+        assert!(
+            sink.events
+                .iter()
+                .all(|ev| matches!(ev, ModelEvent::TextDelta { .. })),
+            "events = {:?}",
+            sink.events
+        );
+    }
+
+    /// 未闭合内联思考在 `feed` 阶段即已作为 Thinking 发出，`flush` 无产出。
+    /// （本用例不覆盖 `finish` 的 flush 接线——那由下方两条半截标签用例守。）
+    #[test]
+    fn unclosed_inline_thinking_emitted_during_feed() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(&mut buf, &mut acc, "answer<think>partial");
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "answer");
+        assert_eq!(final_text(&response), "answer");
+        assert_eq!(thinking_deltas(&sink), "partial");
+    }
+
+    /// `finish` 的 flush：正文态流末半截开标签（`<thi`）须释放为 Text，不丢字。
+    /// 删掉 `finish` 里的 flush 循环后本用例必须变红。
+    #[test]
+    fn finish_flush_releases_trailing_partial_open_tag() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(&mut buf, &mut acc, "answer<thi");
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "answer<thi");
+        assert_eq!(final_text(&response), "answer<thi");
+        assert_eq!(thinking_deltas(&sink), "");
+    }
+
+    /// `finish` 的 flush：思考态流末半截闭标签（`</thi`）须释放为 Thinking，
+    /// 且不进入正文。删掉 `finish` 里的 flush 循环后本用例必须变红。
+    #[test]
+    fn finish_flush_releases_partial_close_tag_in_thinking() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(&mut buf, &mut acc, "answer<think>abc</thi");
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "answer");
+        assert_eq!(final_text(&response), "answer");
+        assert_eq!(thinking_deltas(&sink), "abc</thi");
+    }
+
+    /// 空 `content` delta 不得发出空 `TextDelta`（既有守卫的出口验证）。
+    #[test]
+    fn empty_content_delta_emits_no_event() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(&mut buf, &mut acc, "");
+        drive_stop(&mut buf, &mut acc);
+        let _ = acc.finish().unwrap();
+
+        assert!(sink.events.is_empty(), "events = {:?}", sink.events);
+    }
+
+    /// 三对标签经适配器出口均剥离：`<thinking>` / `<reasoning>` 同样生效。
+    #[test]
+    fn all_tag_pairs_are_stripped_from_content() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        drive_content(
+            &mut buf,
+            &mut acc,
+            "<thinking>t</thinking>a<reasoning>r</reasoning>b",
+        );
+        drive_stop(&mut buf, &mut acc);
+        let response = acc.finish().unwrap();
+
+        assert_eq!(text_deltas(&sink), "ab");
+        assert_eq!(thinking_deltas(&sink), "tr");
+        assert_eq!(final_text(&response), "ab");
     }
 
     /// 流式请求必须携带 `stream: true`。

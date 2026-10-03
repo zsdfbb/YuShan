@@ -19,7 +19,7 @@
 - `cargo test -p ys-coding-agent e2e -- --ignored --nocapture` — 端到端（需 `YUSHAN_API_BASE` + `YUSHAN_API_KEY`）
 - `cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture` — **R8 对账**（skill 目录段的真实 input token 成本；`#[ignore]`，**尚未校准**，需同上凭证）
 
-环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）；`YUSHAN_SEARCH_SEARXNG_URL` / `YUSHAN_SEARCH_TAVILY_KEY` / `YUSHAN_SEARCH_BOCHA_KEY` / `YUSHAN_SEARCH_FIRECRAWL_KEY`（搜索后端，**四家均需配置**才进链）；`YUSHAN_FETCHED_DIR`（webfetch 落盘目录覆盖，须为**绝对路径**，测试用）。
+环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）；`YUSHAN_SEARCH_SEARXNG_URL` / `YUSHAN_SEARCH_TAVILY_KEY`（Tavily 亦认生态通用名 `TAVILY_API_KEY`，命名空间名优先）/ `YUSHAN_SEARCH_BOCHA_KEY` / `YUSHAN_SEARCH_FIRECRAWL_KEY`（搜索后端，**各自配置才进链**）；`YUSHAN_FETCHED_DIR`（webfetch 落盘目录覆盖，须为**绝对路径**，测试用）。
 
 **skills 没有任何环境变量**（D2′：不开路径配置项）—— 扫描根恒为 `[<cwd>/.yushan/skills, <home>/.yushan/skills]`，由 `Config::default_skill_roots` 唯一给出，**顺序即优先级**（`roots[0]` = 项目级）。
 

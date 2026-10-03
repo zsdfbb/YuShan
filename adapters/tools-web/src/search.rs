@@ -57,8 +57,8 @@ use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 use crate::backends::{kind_slug, parse, plan};
 use crate::net::{FetchError, fetch_capped};
 use crate::{
-    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY, Kind, SearchHit,
-    WebConfig,
+    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
+    ENV_TAVILY_KEY_ALIAS, Kind, SearchHit, WebConfig,
 };
 
 /// 整条链的**总预算**（设计 §1.7）。4 家各 60s = 最坏 4 分钟，而 `-p` / `--json`
@@ -144,8 +144,8 @@ impl Tool for WebSearchTool {
         if self.cfg.backends().is_empty() {
             return Ok(error_result(format!(
                 "Web search is unavailable: no search backend is configured. Set {ENV_SEARXNG_URL} \
-                 to a SearXNG instance address, or one of {ENV_TAVILY_KEY} / {ENV_BOCHA_KEY} / \
-                 {ENV_FIRECRAWL_KEY} to an API key."
+                 to a SearXNG instance address, or one of {ENV_TAVILY_KEY} (or the generic \
+                 {ENV_TAVILY_KEY_ALIAS}) / {ENV_BOCHA_KEY} / {ENV_FIRECRAWL_KEY} to an API key."
             )));
         }
 

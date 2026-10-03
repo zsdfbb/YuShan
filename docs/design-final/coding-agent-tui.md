@@ -214,6 +214,7 @@ impl QueueBoundarySource {
 `summarize_tool_args`（`SUMMARY_KEYS = [path, file_path, command, pattern, query, url]`）从结构化参数抽取，
 **摘要规则属产品知识，故在 TUI crate 而非协议**。失败的工具显示结果首行，成功的只给 ✓。
 thinking 默认隐藏，`/thinking on` 后以暗色渲染。
+provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoning>` 标签里时，由适配器剥离并转成同样的 Thinking 行（见 `docs/adr/0025-hide-inline-thinking-tags.md`）。
 
 **状态行**：`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**（时长 → 轮数 → tokens → model）；
 turn 中把 model 段换成 `⏳ Working·`（300ms 节拍前进，宽字符占两格）。四档宽度各有测试。
@@ -229,8 +230,7 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 `End` 回聊天底部（早于 `Home` 绑定，故不做对称）。补全浮层打开时上下归浮层。
 
 **退出**：无条件恢复终端 —— 把完整对话按当前宽度 wrap 后逐行写回**主屏 scrollback**，再离开
-alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinking **总是**打印（退出后没有 `/thinking`
-开关可用了）。
+alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinking 遵守 `thinking_visible`（默认隐藏，`/thinking on` 后退出可见）。
 
 > **回放不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到**进入 alt-screen 时**
 > 的位置 —— 也就是本 app 自己那段启动输出的下一行。回放从那里往下写即可。**不得** `MoveTo(0, 0)`：

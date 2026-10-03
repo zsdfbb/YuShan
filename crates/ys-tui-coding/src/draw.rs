@@ -410,7 +410,7 @@ fn build_text(app: &App, width: usize) -> Text<'static> {
 }
 
 /// `build_text` 的完整形态：显式传入 thinking 可见性
-/// （退出打印时**总是**打印思考内容）。
+/// （TUI 与退出回放共用同一个开关值）。
 fn build_text_with(app: &App, width: usize, thinking_visible: bool) -> Text<'static> {
     if app.transcript.is_empty() {
         return Text::from(vec![Line::from(Span::styled(
@@ -537,10 +537,10 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
 /// 退出时写回主屏 scrollback 的**纯文本**完整对话。
 ///
 /// 与 TUI 同源：复用 [`build_text_with`]，再按显示宽度硬 wrap。
-/// thinking **总是**打印 —— 退出后终端里没有 `/thinking` 开关可用了。
+/// thinking 遵守 `app.thinking_visible`（默认隐藏，`/thinking on` 后可见）。
 pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let text = build_text_with(app, width, true);
+    let text = build_text_with(app, width, app.thinking_visible);
     let mut out: Vec<String> = Vec::new();
     for line in &text.lines {
         out.extend(wrap_plain(&line.to_string(), width));
@@ -1125,6 +1125,27 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.chars().count() == 10),
             "长行按宽度 wrap：{lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_plain_lines_thinking_follows_visibility_toggle() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript
+            .push(TranscriptLine::Thinking("inner monologue".into()));
+
+        app.thinking_visible = false;
+        let hidden = transcript_plain_lines(&app, 40);
+        assert!(
+            !hidden.iter().any(|l| l.contains("inner monologue")),
+            "thinking_visible=false 时退出回放不应含思考：{hidden:?}"
+        );
+
+        app.thinking_visible = true;
+        let shown = transcript_plain_lines(&app, 40);
+        assert!(
+            shown.iter().any(|l| l.contains("inner monologue")),
+            "thinking_visible=true 时退出回放应含思考：{shown:?}"
         );
     }
 

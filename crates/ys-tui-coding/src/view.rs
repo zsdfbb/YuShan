@@ -66,6 +66,11 @@ pub struct CodingView {
     pub session_path: Option<PathBuf>,
     /// 首次运行（无 `auth.json` 凭证）—— 用于欢迎语。
     pub is_first_run: bool,
+    /// 会话恢复的 `/thinking` 显示开关**启动初值**。
+    ///
+    /// 只在启动时被 `App::new` 消费一次；运行期真值是 `App.thinking_visible`，
+    /// 此后本字段仅是 app 侧持久化镜像的载体（设计 §5.6）。
+    pub thinking_visible: bool,
 }
 
 impl Default for CodingView {
@@ -88,6 +93,7 @@ impl Default for CodingView {
             context_window: None,
             session_path: None,
             is_first_run: true,
+            thinking_visible: false,
         }
     }
 }
@@ -167,6 +173,7 @@ impl CodingView {
             context_window: Some(65_536),
             session_path: None,
             is_first_run: false,
+            thinking_visible: false,
         }
     }
 }

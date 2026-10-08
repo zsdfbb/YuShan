@@ -2184,6 +2184,7 @@ name = "ys-session"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

@@ -7,6 +7,7 @@
 //!   let req = request_rx.recv().await?;
 //!   match req {
 //!     Prompt(msg) => {
+//!       raw = user_text(msg);       // 标题素材：skill 展开之前
 //!       turns += 1;
 //!       let res = {                  ② 回合之内：turn 与事件转发交错
 //!         let ports = wiring.ports();
@@ -20,7 +21,9 @@
 //!         }}
 //!       };
 //!       stats.record(&res.usage);
+//!       finalize_turn_meta(..).await;   // 回合末写穿 meta（title/model/tokens/thinking）
 //!     }
+//!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
 //!     SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
 //!   }
 //!   emit_view();                     // 每个请求处理完刷一次快照
@@ -84,6 +87,11 @@ pub async fn run(
     // 回合号从 1 起（`Envelope.turn` 靠 `begin_turn` 携带）。
     let mut turns: u32 = 0;
 
+    // `/thinking` 显示开关的**进程级缓存**：启动时由 meta 初始化，`Request::SetThinking`
+    // 单向更新，回合末落 meta。UI 的 `App.thinking_visible` 才是运行期真值，本缓存只
+    // 作持久化镜像；**`/new` 不重置它**（展示偏好随进程，设计 §5.6）。
+    let mut thinking_visible = wiring.meta().map(|m| m.thinking_visible).unwrap_or(false);
+
     loop {
         // 空闲期丢掉「上一回合结束后才到的」边界消息。UI 的 `is_turning` 要等
         // 它排空 `Outbound` 才复位（最长一个 poll 周期），期间一次 Ctrl+C 就会
@@ -99,6 +107,9 @@ pub async fn run(
 
         match req {
             Request::Prompt(message) => {
+                // **标题素材取 skill 展开之前的用户原文**（C3）—— 展开后的正文是
+                // `<skill …>` 信封，不能当标题。
+                let raw_user_text = crate::sessions::user_text(&message);
                 // **`/skill-name` 展开**（唯一的 skill 接线点，设计 §选择理由 B）：
                 // 复用 `Request::Prompt` 而**不加协议变体** —— 展开型命令与纯文本输入
                 // 走**同一条**回合启动路径（下面的 `turns += 1` / `set_context_window` /
@@ -151,11 +162,32 @@ pub async fn run(
                     send(&out_tx, Outbound::Event(env)).await?;
                 }
                 match outcome {
-                    Ok(result) => stats.record(&result.usage),
+                    Ok(result) => {
+                        stats.record(&result.usage);
+                        // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
+                        let model = wiring.model_id().map(str::to_string);
+                        if let Err(e) = crate::finalize_turn_meta(
+                            &mut wiring,
+                            raw_user_text.as_deref(),
+                            config.provider.as_deref(),
+                            model.as_deref(),
+                            Some(thinking_visible),
+                            &stats,
+                        )
+                        .await
+                        {
+                            logging::log(&format!("failed to persist session meta: {e}"));
+                        }
+                    }
                     // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
                     // Error 行，这里不再往 transcript 重复刷一条，只落日志。
                     Err(e) => logging::log(&format!("turn {turns} failed: {e}")),
                 }
+            }
+
+            Request::SetThinking { visible } => {
+                // 单向更新进程级镜像；UI 侧已本地即时生效。无输出。
+                thinking_visible = visible;
             }
 
             Request::SetModel { model } => {
@@ -274,7 +306,7 @@ async fn send(
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -391,7 +423,7 @@ mod tests {
         state_store.set_override(tmp.join("state.json"));
 
         let wiring = if persistent {
-            Wiring::persistent(Some(model), Box::new(sink), tmp.join("sessions"))
+            Wiring::persistent_new(Some(model), Box::new(sink), tmp.join("sessions"))
                 .await
                 .unwrap()
         } else {
@@ -819,12 +851,13 @@ mod tests {
         );
     }
 
-    /// 5. `NewSession`：会话换新（`message_count == 0`）、快照刷新；持久化路径下
-    ///    **新会话文件立即落盘且为空**，旧文件保留。
+    /// 5. `NewSession`：会话换新（`message_count == 0`）、快照刷新；旧文件保留，
+    ///    新会话**惰性**（`/new` 不预建空文件，首次追加才落盘）。
     #[tokio::test]
     async fn new_session_swaps_session_and_refreshes_view() {
         let model = MockModel::new("mock");
         model.push_text("hello");
+        model.push_text("again");
         let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
 
         h.requests.send(prompt("hi")).await.unwrap();
@@ -841,15 +874,115 @@ mod tests {
         let new_path = after.session_path.clone().expect("持久会话应有文件");
         assert_ne!(old_path, new_path, "应换到新会话文件");
         assert!(old_path.exists(), "旧会话文件保留");
-        assert!(new_path.exists(), "/new 应立即落盘空文件");
+        assert!(!new_path.exists(), "/new 惰性：未追加前不落盘空文件");
+
+        // 追加后新文件才出现且不含旧内容。
+        h.requests.send(prompt("next")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        assert!(new_path.exists(), "追加后新会话文件落盘");
         assert!(
-            std::fs::read_to_string(&new_path).unwrap().is_empty(),
-            "预建的新会话文件应为空"
+            !std::fs::read_to_string(&new_path)
+                .unwrap()
+                .contains("hello"),
+            "新文件不得含旧会话内容"
         );
     }
 
-    /// 6. **穷尽 `Request` 变体**：7 个变体各发一次，app 循环都必须处理并给出出站
-    ///    消息、不得 panic（`Prompt` → 事件；6 个能力 → `Output` + `View`）。
+    /// 读会话文件首行 meta 的 `thinking_visible`（测试专用）。
+    fn read_meta_thinking(path: &Path) -> bool {
+        let content = std::fs::read_to_string(path).expect("会话文件应存在");
+        let first = content.lines().next().expect("应有首行 meta");
+        let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
+        meta.thinking_visible
+    }
+
+    /// 读会话文件首行 meta 的 `title`（测试专用）。
+    fn read_meta_title(path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(path).expect("会话文件应存在");
+        let first = content.lines().next().expect("应有首行 meta");
+        let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
+        meta.title
+    }
+
+    /// **C3（TUI 路径）**：回合末写进 `meta.title` 的是 **skill 展开之前**的用户原文，
+    /// 不是 `<skill …>` 信封（否则可达 9k 的正文会被当成标题）。
+    ///
+    /// 变异：把 `raw_user_text` 的取点挪到 `expand_skill_invocation` **之后** ⇒ 断言变红。
+    #[tokio::test]
+    async fn title_uses_pre_expansion_user_text() {
+        let model = MockModel::new("mock");
+        model.push_text("done");
+        let mut h = spawn_app_loop_with(Box::new(model), true, Vec::new(), |config, tmp| {
+            let root = tmp.join("skills");
+            let dir = root.join("git-status");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: git-status\ndescription: 仓库状态\n---\n正文第一行\n正文第二行\n",
+            )
+            .unwrap();
+            let (entries, _diags) = crate::skills::scan(&[root]);
+            config.skills = entries;
+            assert_eq!(config.skills.len(), 1, "测试前提：恰好扫到一条 skill");
+        })
+        .await;
+
+        h.requests
+            .send(prompt("/git-status 现在改了什么"))
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let path = view.session_path.expect("持久会话应有文件");
+
+        let title = read_meta_title(&path).expect("回合末应写入 title");
+        assert_eq!(title, "/git-status 现在改了什么");
+        assert!(!title.contains("<skill"), "标题不得含展开信封：{title}");
+    }
+
+    /// `/thinking` 缓存随进程、**`/new` 不重置**（设计 §5.6 / T7）：`SetThinking{true}`
+    /// 后经 `/new` 换会话，下一回合写出的 meta 仍为 `thinking_visible = true`。
+    ///
+    /// 变异：在 `Request::NewSession` 分支把缓存重置为 `false` → 第二条断言变红。
+    #[tokio::test]
+    async fn thinking_cache_survives_new_session() {
+        let model = MockModel::new("mock");
+        model.push_text("a");
+        model.push_text("b");
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        h.requests
+            .send(Request::SetThinking { visible: true })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(prompt("first")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let first_path = view.session_path.clone().expect("持久会话应有文件");
+        assert!(
+            read_meta_thinking(&first_path),
+            "回合末应把 thinking 写进 meta"
+        );
+
+        h.requests.send(Request::NewSession).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(prompt("second")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let second_path = view.session_path.clone().expect("持久会话应有文件");
+        assert_ne!(first_path, second_path, "应换到新会话");
+        assert!(
+            read_meta_thinking(&second_path),
+            "/new 不得重置 thinking 缓存"
+        );
+    }
+
+    /// 6. **穷尽 `Request` 变体**：8 个变体各发一次，app 循环都必须处理并给出出站
+    ///    消息、不得 panic（`Prompt` → 事件；6 个能力 → `Output` + `View`；
+    ///    `SetThinking` → 仅 `View`）。
     #[tokio::test]
     async fn every_request_variant_is_handled() {
         let model = MockModel::new("mock");
@@ -857,7 +990,7 @@ mod tests {
         let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
         let export_path = h.temp_path("exported.jsonl");
 
-        // `Prompt` 之外的 6 个变体 —— 与 `Request` 一一对应（漏一个就少一条断言）。
+        // 除 `Prompt` 外、会产出 `Output` 的 6 个变体（`SetThinking` 无输出，单列）。
         let cases = vec![
             Request::SetModel {
                 model: "gpt-x".into(),
@@ -869,13 +1002,15 @@ mod tests {
                 api_base: Some("https://custom.example.com".into()),
             },
             Request::Logout,
-            Request::NewSession,
-            Request::Compact,
+            // `Export` 在 `NewSession` 之前：`/new` 惰性换出的新文件尚未落盘，
+            // 导出它会（正确地）失败。
             Request::Export {
                 path: Some(export_path.clone()),
             },
+            Request::NewSession,
+            Request::Compact,
         ];
-        assert_eq!(cases.len(), 6, "Request 共 7 个变体：6 个能力 + Prompt");
+        assert_eq!(cases.len(), 6, "6 个有输出的能力变体");
 
         // `Prompt` 先跑：会话有内容，`/export` 才有东西可导。
         h.requests.send(prompt("hello")).await.unwrap();
@@ -902,6 +1037,15 @@ mod tests {
             "/export 应真的把会话文件复制到目标：{}",
             export_path.display()
         );
+
+        // `SetThinking` 无输出：出站序列恰为 `[View]`。
+        h.requests
+            .send(Request::SetThinking { visible: true })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(msgs.is_empty(), "SetThinking 不应产出 Output：{msgs:?}");
     }
 
     /// 7. **UI 退出**：drop `request_tx` → app 循环在超时内**正常返回**（不挂起）。
@@ -1123,20 +1267,19 @@ mod tests {
     #[tokio::test]
     async fn prompt_with_known_skill_is_expanded_into_the_turn_input() {
         let (model, mut probe) = probe_model(ProbePlan::ToolCallThenFinal);
-        let mut h =
-            spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
-                let root = tmp.join("skills");
-                let dir = root.join("git-status");
-                std::fs::create_dir_all(&dir).unwrap();
-                std::fs::write(
-                    dir.join("SKILL.md"),
-                    "---\nname: git-status\ndescription: 仓库状态\n---\n正文第一行\n正文第二行\n",
-                )
-                .unwrap();
-                config.load_skills(&[root]);
-                assert_eq!(config.skills.len(), 1, "测试前提：恰好扫到一条 skill");
-            })
-            .await;
+        let mut h = spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
+            let root = tmp.join("skills");
+            let dir = root.join("git-status");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: git-status\ndescription: 仓库状态\n---\n正文第一行\n正文第二行\n",
+            )
+            .unwrap();
+            config.load_skills(&[root]);
+            assert_eq!(config.skills.len(), 1, "测试前提：恰好扫到一条 skill");
+        })
+        .await;
 
         h.requests
             .send(prompt("/git-status 现在改了什么"))
@@ -1179,20 +1322,16 @@ mod tests {
         let root = temp_dir_for("expand");
         let dir = root.join("git-status");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("SKILL.md"),
-            "---\ndescription: 状态\n---\n正文\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: 状态\n---\n正文\n").unwrap();
         let (skills, _) = crate::skills::scan(&[root.clone()]);
         assert_eq!(skills.len(), 1);
 
         for text in [
             "普通消息",
-            "看看 /git-status 怎么用",   // `/` 不在首位
-            "/unknown-skill 参数",       // 不命中
-            "git-status",                // 无前导 `/`
-            "/",                         // 光一个斜杠
+            "看看 /git-status 怎么用", // `/` 不在首位
+            "/unknown-skill 参数",     // 不命中
+            "git-status",              // 无前导 `/`
+            "/",                       // 光一个斜杠
         ] {
             let msg = user_message(text);
             assert_eq!(
@@ -1215,7 +1354,10 @@ mod tests {
                 is_error: false,
             }],
         };
-        assert_eq!(expand_skill_invocation(tool_first.clone(), &skills), tool_first);
+        assert_eq!(
+            expand_skill_invocation(tool_first.clone(), &skills),
+            tool_first
+        );
 
         // `user-invocable: false` 的 skill：`/` 不认（`expand_invocation` 的契约）。
         let model_only = SkillEntry {

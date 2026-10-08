@@ -2,9 +2,11 @@
 
 mod jsonl;
 mod memory;
+mod meta;
 
 pub use jsonl::JsonlSession;
 pub use memory::*;
+pub use meta::SessionMeta;
 
 // 为方便起见重导出 Session trait
 pub use ys_core::Message;
@@ -16,6 +18,16 @@ use async_trait::async_trait;
 pub trait Session: Send {
     /// 获取 session 中的所有消息
     fn messages(&self) -> &[Message];
+
+    /// 会话级元数据；不支持的实现返回 `None`（默认实现让 `MemorySession` 零改动）。
+    fn meta(&self) -> Option<&SessionMeta> {
+        None
+    }
+
+    /// 写入会话级元数据。默认实现为无操作，落盘由支持持久化的实现覆写。
+    async fn set_meta(&mut self, _meta: SessionMeta) -> Result<(), SessionError> {
+        Ok(())
+    }
 
     /// 向 session 追加一条消息
     async fn append(&mut self, message: Message) -> Result<(), SessionError>;

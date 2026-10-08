@@ -2,10 +2,12 @@ use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{Message, Session, SessionError};
+use crate::{Message, Session, SessionError, SessionMeta};
 
 pub struct JsonlSession {
     path: PathBuf,
+    /// 会话级元数据，落盘于文件**首行**；缺省即无首行 meta。
+    meta: Option<SessionMeta>,
     messages: Vec<Message>,
     /// 仅测试用：`flush_to_file` 的调用次数。用来断言 `replace_all` 只触发一次落盘
     /// （若退回 trait 默认实现，次数会变成 N+1）。
@@ -17,25 +19,33 @@ impl JsonlSession {
     /// 打开或创建 JSONL session 文件
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, SessionError> {
         let path = path.into();
-        let messages = if path.exists() {
+        let (meta, messages) = if path.exists() {
             Self::load_from_file(&path).await?
         } else {
-            Vec::new()
+            (None, Vec::new())
         };
         Ok(Self {
             path,
+            meta,
             messages,
             #[cfg(test)]
             flush_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
-    async fn load_from_file(path: &Path) -> Result<Vec<Message>, SessionError> {
+    /// 逐行判别：先按 `Message` 解析（绝大多数行），失败再按 `SessionMeta` 解析；
+    /// 两者皆失败 ⇒ 告警并跳过（不终止）。
+    ///
+    /// 判别安全：`Message` 无 `type` 字段，`SessionMeta` 的 `type` 为必填 ⇒ 两者互不误判。
+    async fn load_from_file(
+        path: &Path,
+    ) -> Result<(Option<SessionMeta>, Vec<Message>), SessionError> {
         let file = File::open(path)
             .await
             .map_err(|e| SessionError::Storage(format!("failed to open session: {e}")))?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
+        let mut meta = None;
         let mut msgs = Vec::new();
         let mut line_num = 0u64;
         while let Some(line) = lines
@@ -44,15 +54,19 @@ impl JsonlSession {
             .map_err(|e| SessionError::Storage(format!("failed to read session: {e}")))?
         {
             line_num += 1;
-            match serde_json::from_str::<Message>(&line) {
-                Ok(msg) => msgs.push(msg),
+            if let Ok(msg) = serde_json::from_str::<Message>(&line) {
+                msgs.push(msg);
+                continue;
+            }
+            match serde_json::from_str::<SessionMeta>(&line) {
+                Ok(m) => meta = Some(m),
                 Err(e) => {
                     // 损坏行：跳过并告警、不终止（修复 C3）
                     eprintln!("Warning: skipping corrupt session line {line_num}: {e}");
                 }
             }
         }
-        Ok(msgs)
+        Ok((meta, msgs))
     }
 
     /// 原子写入：先写临时文件，再 rename（防止崩溃时数据丢失）
@@ -65,6 +79,18 @@ impl JsonlSession {
             let mut file = File::create(&tmp_path).await.map_err(|e| {
                 SessionError::Storage(format!("failed to create tmp session file: {e}"))
             })?;
+            // 先写 meta 行（若存在）：这是 C1「meta 永不因重写丢失」的唯一落点 ——
+            // append / clear / replace_all / set_meta 都经本函数，故不存在漏写路径。
+            if let Some(meta) = &self.meta {
+                let line = serde_json::to_string(meta)
+                    .map_err(|e| SessionError::Storage(format!("serialize meta failed: {e}")))?;
+                file.write_all(line.as_bytes())
+                    .await
+                    .map_err(|e| SessionError::Storage(format!("write meta failed: {e}")))?;
+                file.write_all(b"\n").await.map_err(|e| {
+                    SessionError::Storage(format!("write meta newline failed: {e}"))
+                })?;
+            }
             for msg in &self.messages {
                 let line = serde_json::to_string(msg)
                     .map_err(|e| SessionError::Storage(format!("serialize failed: {e}")))?;
@@ -88,6 +114,15 @@ impl JsonlSession {
 impl Session for JsonlSession {
     fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    fn meta(&self) -> Option<&SessionMeta> {
+        self.meta.as_ref()
+    }
+
+    async fn set_meta(&mut self, meta: SessionMeta) -> Result<(), SessionError> {
+        self.meta = Some(meta);
+        self.flush_to_file().await
     }
 
     async fn append(&mut self, message: Message) -> Result<(), SessionError> {
@@ -309,5 +344,141 @@ mod tests {
         assert!(reopened.messages().is_empty(), "落盘后文件应为空");
 
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    fn sample_meta() -> SessionMeta {
+        let mut meta = SessionMeta::new(1791234567);
+        meta.title = Some("帮我重构 wiring.rs 的会话恢复逻辑".into());
+        meta.provider = Some("deepseek".into());
+        meta.model = Some("deepseek-chat".into());
+        meta.thinking_visible = true;
+        meta.input_tokens = 12345;
+        meta.output_tokens = 678;
+        meta.turns = 4;
+        meta
+    }
+
+    #[tokio::test]
+    async fn test_meta_roundtrip() {
+        let path = temp_path("meta_roundtrip");
+        let meta = sample_meta();
+        {
+            let mut session = JsonlSession::open(&path).await.unwrap();
+            session.set_meta(meta.clone()).await.unwrap();
+            assert_eq!(session.meta(), Some(&meta));
+        }
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.meta(),
+            Some(&meta),
+            "重新打开后 meta 应精确等于写入值"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_meta_is_first_line() {
+        let path = temp_path("meta_first");
+        let meta = SessionMeta::new(1);
+        {
+            let mut session = JsonlSession::open(&path).await.unwrap();
+            session.set_meta(meta.clone()).await.unwrap();
+            session.append(text_msg(Role::User, "hi")).await.unwrap();
+        }
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let mut lines = content.lines();
+        let first = lines.next().unwrap();
+        let parsed: SessionMeta = serde_json::from_str(first).unwrap();
+        assert_eq!(parsed, meta, "首行应为 meta");
+        assert!(
+            first.contains("\"type\":\"meta\""),
+            "首行应带判别键：{first}"
+        );
+        let second = lines.next().unwrap();
+        let _: Message = serde_json::from_str(second).expect("第二行应为裸 Message");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_meta_survives_clear_and_replace_all() {
+        let path = temp_path("meta_survives");
+        let meta = sample_meta();
+        {
+            let mut session = JsonlSession::open(&path).await.unwrap();
+            session.set_meta(meta.clone()).await.unwrap();
+            session.append(text_msg(Role::User, "old")).await.unwrap();
+
+            session.clear().await.unwrap();
+            assert_eq!(session.meta(), Some(&meta), "clear 后 meta 仍在");
+
+            session.replace_all(Vec::new()).await.unwrap();
+            assert_eq!(session.meta(), Some(&meta), "replace_all(空) 后 meta 仍在");
+
+            session
+                .replace_all(vec![text_msg(Role::Assistant, "summary")])
+                .await
+                .unwrap();
+            assert_eq!(
+                session.meta(),
+                Some(&meta),
+                "replace_all(非空) 后 meta 仍在"
+            );
+        }
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(reopened.meta(), Some(&meta), "落盘后 meta 仍在");
+        assert_eq!(reopened.messages(), [text_msg(Role::Assistant, "summary")]);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_plain_message_file_has_no_meta() {
+        let path = temp_path("no_meta");
+        let msg = text_msg(Role::User, "hello");
+        let content = format!("{}\n", serde_json::to_string(&msg).unwrap());
+        tokio::fs::write(&path, content).await.unwrap();
+
+        // 纯消息文件：每行都先被 Message 命中，不落入告警分支。
+        let session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(session.messages(), [msg]);
+        assert!(session.meta().is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_meta_like_corrupt_lines_skipped() {
+        let path = temp_path("bad_meta");
+        let good = text_msg(Role::User, "ok");
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            r#"{"type":"nope"}"#,
+            // 形状合法但不含判别键：若 `kind` 允许缺省则会假阳性成 meta，必须落回坏行。
+            r#"{"not_a_message":true}"#,
+            r#"{"type":"meta","v":"not-a-number"}"#,
+            serde_json::to_string(&good).unwrap()
+        );
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(session.messages(), [good], "带 type 的非法行仍应被跳过");
+        assert!(session.meta().is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 契约快照：判别的依赖是「`Message` 的序列化形状不含 `type` 键」。
+    #[test]
+    fn test_message_serde_shape_has_no_type_key() {
+        let value = serde_json::to_value(text_msg(Role::User, "hi")).unwrap();
+        assert!(
+            value.get("type").is_none(),
+            "Message 不得带 type 键，否则 meta 判别不再安全：{value}"
+        );
     }
 }

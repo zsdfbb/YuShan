@@ -120,6 +120,8 @@ pub fn build_view(
         session_path: wiring.session_path().map(ToOwned::to_owned),
         // 首次运行 = 没有任何 auth 且没有 state.json（欢迎语用）。
         is_first_run: registry.logged_in_providers().is_empty() && !state.exists(),
+        // `/thinking` 显示开关的**启动初值**（resume 时取自 meta；`App::new` 消费一次）。
+        thinking_visible: wiring.meta().map(|m| m.thinking_visible).unwrap_or(false),
     }
 }
 
@@ -265,7 +267,7 @@ mod tests {
         let mut state = StateStore::new();
         state.set_override(dir.join("state.json"));
         // 持久会话：session_path 应被填进快照。
-        let wiring = Wiring::persistent(
+        let wiring = Wiring::persistent_new(
             Some(Box::new(MockModel::new("deepseek-reasoner"))),
             Box::new(CollectingSink::new()),
             dir.join("sessions"),
@@ -332,7 +334,7 @@ mod tests {
 
         let mut state = StateStore::new();
         state.set_override(dir.join("state.json"));
-        let wiring = Wiring::persistent(
+        let wiring = Wiring::persistent_new(
             Some(Box::new(MockModel::new("MiniMax-M3"))),
             Box::new(CollectingSink::new()),
             dir.join("sessions"),
@@ -398,7 +400,7 @@ mod tests {
 
         let mut state = StateStore::new();
         state.set_override(dir.join("state.json"));
-        let wiring = Wiring::persistent(
+        let wiring = Wiring::persistent_new(
             Some(Box::new(MockModel::new("deepseek-v4"))),
             Box::new(CollectingSink::new()),
             dir.join("sessions"),
@@ -490,15 +492,26 @@ mod tests {
         assert_eq!(
             carried,
             vec![
-                ("zeta".to_string(), "Z 标签".to_string(), "Z 描述".to_string()),
-                ("alpha".to_string(), "A 标签".to_string(), "A 描述".to_string()),
+                (
+                    "zeta".to_string(),
+                    "Z 标签".to_string(),
+                    "Z 描述".to_string()
+                ),
+                (
+                    "alpha".to_string(),
+                    "A 标签".to_string(),
+                    "A 描述".to_string()
+                ),
             ],
             "skill 的 command/label/description 必须逐条透传且保序"
         );
         // `model_visible: false` 的条目**仍进浮层候选**（只给用户敲、不给模型读）——
         // 是否可见由 `Catalogue.lines` 决定，与列表无关。
         assert!(view.skills.iter().any(|s| s.command == "alpha"));
-        assert_eq!(view.skills_omitted, 3, "预算收起的计数必须透传（/status 要显示）");
+        assert_eq!(
+            view.skills_omitted, 3,
+            "预算收起的计数必须透传（/status 要显示）"
+        );
         // 路径不外泄：TUI 拿到的类型里根本没有这个字段。
         assert!(
             !format!("{:?}", view.skills).contains("SKILL.md"),

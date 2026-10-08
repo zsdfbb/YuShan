@@ -139,6 +139,9 @@
 - **`Wiring`（新）**：`apps/coding-agent/src/wiring.rs` 持有 model + session + inbox + events + `sessions_dir`/`session_path`。
   `ports()` 把三样借给 `Agent::run`；`persistent()` 启动时恢复 `sessions_dir` 下**最近**的 `*.jsonl`（无则新建），
   `ephemeral()` 用 `MemorySession`、不落盘不恢复（保持 `-p`/`--json` 行为）。
+  **后续已变（2026-10-07，ADR-0026）**：`persistent()` 拆为 `persistent_new` / `resume`；启动默认**新会话**、
+  不再隐式恢复最近；`ephemeral()` 降为测试专用（生产路径改持久化）。见
+  `docs/design-final/session-default-new.md`。
 - **`/new` = 换队列**：`Wiring::new_session()` 替换 `session`（新会话文件）+ `inbox`（pending 丢弃），旧会话文件保留不删；
   Agent / BasicLoop / ys-channel 全程不知情。命令层 `NewCommand` 只调 `new_session`。
 - **`CommandContext` 不再持 `&mut Agent`**：改为 `&mut Wiring` + `&mut Config` + `&mut StateStore` + `&dyn Prompter`，
@@ -172,6 +175,8 @@
   不会出现「pending 已丢、会话未换」的半新半旧。
 - **验证**：`wiring::tests::new_session_persistent_keeps_old_file_and_creates_empty_new`（新文件预建且为空）、
   `wiring::tests::restart_after_new_without_messages_recovers_new_empty_session`（`/new` 不发消息 → 重建 Wiring → 恢复新空会话）。
+  **该结论已作废（2026-10-07，ADR-0026 / D3）**：启动不再隐式选「最近会话」，`/new` 因此恢复惰性
+  （不预建空文件）。
 
 ## 3. 最终 API 清单（各 crate 公开面）
 ### `ys-event`（契约层，无 tokio 生产依赖）

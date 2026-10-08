@@ -16,6 +16,11 @@ pub enum Request {
     Prompt(Message),
     /// 切换当前模型。
     SetModel { model: String },
+    /// 同步内联思考标签的显示开关。
+    ///
+    /// UI 侧 `App.thinking_visible` 是**运行期真值**，本请求只是把它**单向**
+    /// 同步给 app 侧作持久化镜像（设计 §5.6）—— 不改变 UI 的本地即时生效语义。
+    SetThinking { visible: bool },
     /// 登录一个 provider 并持久化凭证。
     ///
     /// `api_base` 是**用户显式提供的** API base（`/login custom` 这类没有内置 base
@@ -120,6 +125,12 @@ mod tests {
         assert_roundtrip(&Request::SetModel {
             model: "gpt-4o".into(),
         });
+    }
+
+    #[test]
+    fn test_request_set_thinking_roundtrip() {
+        assert_roundtrip(&Request::SetThinking { visible: true });
+        assert_roundtrip(&Request::SetThinking { visible: false });
     }
 
     /// `Login` 的两种 `api_base` 都要能过 serde：`Some` = 用户显式填的 URL

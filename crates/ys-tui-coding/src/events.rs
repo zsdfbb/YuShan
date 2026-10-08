@@ -7,10 +7,12 @@
 //!
 //! Enter 时把输入交给 [`crate::commands::parse_with_skills`]（内置命令 + skill 名），
 //! 按 [`crate::commands::Action`] 分派：
-//! 本地动作当场执行（写 transcript），`Request` 投给 app 线程。**唯一例外是
-//! [`Action::Prompt`]** —— 它要开一块模态浮层，而画屏得握 `Terminal`，故这里只把
-//! 意图记进 [`App::pending_prompt`]，由 `run.rs` 的事件循环取走并跑模态循环
-//! （设计 §3「TUI 自己的浮层选择器」）。
+//! 本地动作当场执行（写 transcript），`Request` 投给 app 线程。**唯一需要模态浮层的
+//! 是 [`Action::Prompt`]** —— 它要画屏，而画屏得握 `Terminal`，故这里只把意图记进
+//! [`App::pending_prompt`]，由 `run.rs` 的事件循环取走并跑模态循环（设计 §3
+//!「TUI 自己的浮层选择器」）。本地动作默认**不发请求**；`/thinking` 是唯一例外 ——
+//! 它本地立即生效后，再把 UI 运行期真值经 [`Request::SetThinking`] **单向**同步给
+//! app 作持久化镜像（设计 §5.1 / §5.6）。
 //!
 //! # 方向键的取舍：上下归聊天、左右归输入
 //!
@@ -229,7 +231,22 @@ fn dispatch(
         }
         Action::Quit => app.should_quit = true,
         Action::Abort => request_abort(boundaries),
-        Action::Local(local) => commands::apply_local(app, local),
+        Action::Local(local) => {
+            let is_thinking = matches!(local, commands::LocalAction::Thinking(_));
+            commands::apply_local(app, local);
+            // `/thinking` 是本地动作的唯一例外：先本地立即生效（`apply_local` 已改写
+            // `app.thinking_visible`），再把改写后的 UI 真值单向同步给 app 持久化。
+            // 其余本地动作不发任何请求。
+            if is_thinking {
+                send_request(
+                    app,
+                    requests,
+                    Request::SetThinking {
+                        visible: app.thinking_visible,
+                    },
+                );
+            }
+        }
         // 需要终端的模态浮层：交给 run.rs 的事件循环（它握着 Terminal）
         Action::Prompt(kind) => app.pending_prompt = Some(kind),
     }
@@ -1027,7 +1044,8 @@ mod tests {
         assert!(a.transcript.is_empty(), "Abort 不动 transcript");
     }
 
-    /// `/thinking on` 当场改状态（本地动作，不发请求）。
+    /// `/thinking on` 当场改状态（本地动作），并把改写后的真值经
+    /// `SetThinking` **单向**同步给 app —— 只发这一条，不发别的请求。
     #[test]
     fn test_thinking_command_toggles_local_state() {
         let ch = channels();
@@ -1035,11 +1053,20 @@ mod tests {
         a.input.insert_str("/thinking on");
         key(&mut a, &ch, KeyCode::Enter);
         assert!(a.thinking_visible);
-        assert!(ch.next_request().is_none());
+        assert_eq!(
+            ch.next_request().unwrap(),
+            Request::SetThinking { visible: true },
+            "本地立即生效后回传一份给 app"
+        );
+        assert!(ch.next_request().is_none(), "只回传一条 SetThinking");
 
         a.input.insert_str("/thinking");
         key(&mut a, &ch, KeyCode::Enter);
         assert!(!a.thinking_visible, "无参 = toggle");
+        assert_eq!(
+            ch.next_request().unwrap(),
+            Request::SetThinking { visible: false }
+        );
         assert!(ch.next_request().is_none());
     }
 

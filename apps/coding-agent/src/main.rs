@@ -14,20 +14,26 @@
 //! `rt.spawn(app_loop)`，再在**当前线程**跑阻塞的 UI 循环。UI 退出 → `tx_req`
 //! 被 drop → app 线程 `recv()` 得 `None` → 自然收摊。
 //!
-//! 初始化顺序（含 R7 的阻塞提前返回）：
+//! 初始化顺序（含 R7 的阻塞提前返回）。`main` 的实际次序：
 //!
 //! ```text
-//! 0. from_env 建 web 配置 → 启动期清理（仅 Primary 档）
-//!    → 装工具表（toolset 探测一次）→ 降级提示打 stderr → 由工具表派生 system prompt
-//! 1. 建 ChannelSink（policy 已定）+ 建 Agent（挂工具与系统提示）
-//! 2. 【阻塞】model + Wiring 构造   ← 可能失败并提前返回（turn 恒 0 也无所谓）
-//! 3. 构造 view₀
-//! 4. 建三条信道 request / boundary / outbound
-//! 5. spawn app 线程 + 当前线程跑 UI
+//! 0. parse_args（含 --resume 形态）
+//! 1. Config::from_env → registry.load_auth → 用户配置（config.json）
+//!    → skill 扫描（default_skill_roots + load_skills + catalogue）
+//! 2. state.json → sessions_dir → resolve_resume（`--resume=id` 解析 / 裸 `--resume` 走 picker）
+//! 3. 模型解析（env > meta > state.json > 首个有凭证）→ resolve_limits → set_model_factory
+//! 4. WebConfig::from_env → 启动期清理（仅 Primary 档）
+//!    → 装工具表（toolset 探测一次）→ 由工具表派生 system prompt → 合并启动期提示
+//! 5. 建 runtime（三模式共用；UI 循环不在它上面跑，见上文线程模型）
+//! 6. 按模式分发：
+//!    - `-p` / `--json`：建 ChannelSink + Agent + Wiring → 跑单回合
+//!    - TUI：建 ChannelSink + Agent + 【阻塞】Wiring → view₀
+//!           → 建三条信道 request / boundary / outbound → spawn app 线程 + 当前线程跑 UI
 //! ```
 //!
-//! 第 0 步在**建 runtime 之前**：工具表既进 agent，也派生提示词清单 —— 同一份表，
-//! 顺序自然一致（设计 §1.2 启动期 / §1.5 提示词来源）。
+//! `--resume` 解析与模型解析必须在**建 runtime 之前**完成：meta 参与模型选择，
+//! 且 picker 的一切输出走 stderr（起屏前才安全，设计 §5.4/D12）。第 4 步的工具表
+//! 既进 agent，也派生提示词清单 —— 同一份表，顺序自然一致（设计 §1.2 / §1.5）。
 //!
 //! 注意 **Agent 先于 Wiring 建**（`run_interactive` 的实际顺序）：二者互不依赖，
 //! 而 `view₀` 要同时借用它们，故都放在 view₀ 之前。承重的不变量是「`begin_turn`
@@ -41,6 +47,7 @@ mod config;
 mod logging;
 mod prompt;
 mod provider;
+mod sessions;
 mod skills;
 mod state;
 mod status;
@@ -53,7 +60,7 @@ mod wiring;
 mod test_env;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -63,6 +70,7 @@ use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
 use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, Request};
 use ys_runtime::{Agent, AgentBuilder, BuildError};
+use ys_session::SessionError;
 use ys_tool::Tool;
 use ys_tools_web::WebConfig;
 use ys_tui_coding::CodingView;
@@ -81,42 +89,90 @@ enum Mode {
     Interactive,
 }
 
+/// 启动期会话形态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resume {
+    /// 新会话（默认）。
+    New,
+    /// `--resume`：交互式列表选择。
+    Pick,
+    /// `--resume=<id>`：指定会话（id 或路径）。
+    Id(String),
+}
+
 /// 解析后的命令行参数。
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     mode: Mode,
     /// `--stats`：显式要求把背压读数摘要写到 stderr（无论有无背压）。
     stats: bool,
+    /// 启动期会话形态。
+    resume: Resume,
 }
 
-/// 摘掉紧随模式 flag 之后、任务文本之前的可选 `--stats`。
+/// 循环剥离「模式 flag 之后、任务文本之前」的 flag 区。
 ///
-/// 只认**紧邻**位置（`-p --stats "任务"`）：任务文本一旦开始，`--stats`
-/// 就是文本的一部分（`-p "任务" --stats` → 文本 `"任务 --stats"`），
-/// 从而保住「任务文本逐字保留」的既有语义。
-fn split_stats_flag(rest: &[String]) -> (bool, &[String]) {
-    match rest.first().map(String::as_str) {
-        Some("--stats") => (true, &rest[1..]),
-        _ => (false, rest),
+/// 只认**紧邻**位置（`-p --stats --resume=x "任务"`）：任务文本一旦开始，后续
+/// `--stats` / `--resume` 就是文本的一部分（`-p "任务" --stats` → 文本
+/// `"任务 --stats"`），从而保住「任务文本逐字保留」的既有语义。
+///
+/// 对 `--stats` 与 `--resume[=<id>]` **顺序无关**（循环剥离）。
+///
+/// 重复 flag **last-wins 且静默丢弃**（`-p --resume=x --resume "任务"` ⇒ 后者把
+/// resume 改回 `Pick`）：这是有意保留的语义，不做冲突报错。
+fn split_leading_flags(rest: &[String]) -> (bool, Resume, &[String]) {
+    let mut stats = false;
+    let mut resume = Resume::New;
+    let mut idx = 0;
+    while idx < rest.len() {
+        match rest[idx].as_str() {
+            "--stats" => {
+                stats = true;
+                idx += 1;
+            }
+            "--resume" => {
+                resume = Resume::Pick;
+                idx += 1;
+            }
+            s if s.starts_with("--resume=") => {
+                resume = Resume::Id(s["--resume=".len()..].to_string());
+                idx += 1;
+            }
+            _ => break,
+        }
     }
+    (stats, resume, &rest[idx..])
 }
 
 /// 解析 argv（不含 argv[0]）。
 ///
 /// **只在首个参数位置判定模式 flag**：任务文本本身可能以 `-` 开头，
 /// 例如 `-p --help me` 的任务文本就是 `--help me`。
-/// 唯一的例外是 `--stats`——见 [`split_stats_flag`]。
+/// 例外是模式 flag 之后的 flag 区——见 [`split_leading_flags`]。
+///
+/// TUI 形态：首个位置可为裸 `--resume`（列表选择）或 `--resume=<id>`（指定会话），
+/// 其后参数照旧忽略。`--resume <id>`（空格）**不支持**（`=` 形式消除与任务文本的
+/// 歧义）。
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let Some(first) = argv.first().map(String::as_str) else {
         return Ok(Args {
             mode: Mode::Interactive,
             stats: false,
+            resume: Resume::New,
         });
     };
 
+    if let Some(id) = first.strip_prefix("--resume=") {
+        return Ok(Args {
+            mode: Mode::Interactive,
+            stats: false,
+            resume: Resume::Id(id.to_string()),
+        });
+    }
+
     match first {
         "-p" => {
-            let (stats, rest) = split_stats_flag(&argv[1..]);
+            let (stats, resume, rest) = split_leading_flags(&argv[1..]);
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("-p 需要一个任务参数，例如：ys-coding-agent -p \"修复这个 bug\"".into())
@@ -124,11 +180,12 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 Ok(Args {
                     mode: Mode::Print(task),
                     stats,
+                    resume,
                 })
             }
         }
         "--json" => {
-            let (stats, rest) = split_stats_flag(&argv[1..]);
+            let (stats, resume, rest) = split_leading_flags(&argv[1..]);
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("--json 需要一个任务参数，例如：ys-coding-agent --json \"修复这个 bug\"".into())
@@ -136,18 +193,25 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 Ok(Args {
                     mode: Mode::Json(task),
                     stats,
+                    resume,
                 })
             }
         }
+        "--resume" => Ok(Args {
+            mode: Mode::Interactive,
+            stats: false,
+            resume: Resume::Pick,
+        }),
         // 未知 flag：仅当它出现在**首个**位置时才算 flag（其余位置属任务文本）。
         // 单独的 `-` 视为普通参数（约定：读 stdin 的占位，本轮不支持）。
         f if f.starts_with('-') && f != "-" => Err(format!(
-            "未知参数：{f}（可用：-p [--stats] <任务> | --json [--stats] <任务>）"
+            "未知参数：{f}（可用：-p [--stats] [--resume[=<id>]] <任务> | --json ... | [--resume[=<id>]]）"
         )),
-        // 无 flag：交互式（与旧实现一致）。
+        // 无 flag：交互式。
         _ => Ok(Args {
             mode: Mode::Interactive,
             stats: false,
+            resume: Resume::New,
         }),
     }
 }
@@ -373,10 +437,98 @@ fn startup_hints(
     }
 }
 
+/// 默认新会话、但会话目录非空时，把一行 `Resume with --resume` 可发现性提示追加进
+/// 既有启动期提示（设计 §9）。
+///
+/// **绝不覆盖**已有提示：`triggered` 为假时原样返回 `hint`；为真时多行拼接、
+/// 原有提示在前（与 [`startup_hints`] 的「一行一事」同规）。
+fn with_resume_hint(hint: Option<String>, triggered: bool) -> Option<String> {
+    if !triggered {
+        return hint;
+    }
+    let line = "Resume with --resume".to_string();
+    Some(match hint {
+        Some(h) => format!("{h}\n{line}"),
+        None => line,
+    })
+}
+
 /// `-p` / `--json` 的 task 展开：与 TUI 的 `Request::Prompt` 走**同一套**逻辑
 /// （`skills::expand_invocation`），三模式行为一致（设计 §关键数据流）。
 fn expand_task(task: String, skill_entries: &[skills::SkillEntry]) -> String {
     skills::expand_invocation(&task, skill_entries).unwrap_or(task)
+}
+
+/// `-p` / `--json`：标题素材取 **skill 展开之前**的原文（C3），展开只用于送给
+/// 模型的正文。
+///
+/// 两臂共用 —— 「先留底稿、再展开」的顺序是 **C3 的唯一保证点**：`raw` 进
+/// [`finalize_turn_meta`] 落盘为 `title`，`expanded` 进 `run_turn` 送给模型；
+/// 顺序反了就会把 `<skill …>` 信封（可达 9k 正文）当成标题。
+fn raw_and_expanded_task(task: String, skills: &[skills::SkillEntry]) -> (String, String) {
+    let raw = task.clone();
+    (raw, expand_task(task, skills))
+}
+
+/// 由 meta 播种回合统计（resume 后状态行的累计不归零；`Envelope.turn` 仍从 1 起）。
+fn seed_stats(wiring: &Wiring) -> status::TurnStats {
+    let mut stats = status::TurnStats::default();
+    if let Some(m) = wiring.meta() {
+        stats.total_input_tokens = m.input_tokens;
+        stats.total_output_tokens = m.output_tokens;
+        stats.turn_count = m.turns;
+    }
+    stats
+}
+
+/// 回合末写穿会话 meta（**三模式共用**，设计 C7）。
+///
+/// - `title`：仅当缺省且素材非空时写 `derive_stored_title(raw)`（幂等，C2）；
+///   素材须是 **skill 展开之前**的用户原文（C3）。
+/// - `provider` / `model`：**仅 `Some` 时写**。env 凭证路径下 `config.provider`
+///   恒为 `None`，无条件写会把 `/login` 落到 meta 的 provider 清空 —— 设计 D10
+///   第 2 级恢复（`meta.provider` + `registry.auth_for`）便永久失效。
+/// - `thinking`：仅 `Some` 时写（`-p`/`--json` 不参与 thinking 开关）。
+/// - tokens / turns：无条件写 `stats`。
+pub(crate) async fn finalize_turn_meta(
+    wiring: &mut Wiring,
+    raw_user_text: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    thinking_visible: Option<bool>,
+    stats: &status::TurnStats,
+) -> Result<(), SessionError> {
+    let title = raw_user_text
+        .map(sessions::derive_stored_title)
+        .filter(|t| !t.is_empty());
+    wiring
+        .update_meta(|meta| {
+            if meta.title.is_none() {
+                if let Some(t) = title {
+                    meta.title = Some(t);
+                }
+            }
+            if let Some(p) = provider {
+                meta.provider = Some(p.to_owned());
+            }
+            if let Some(m) = model {
+                meta.model = Some(m.to_owned());
+            }
+            if let Some(tv) = thinking_visible {
+                meta.thinking_visible = tv;
+            }
+            meta.input_tokens = stats.total_input_tokens;
+            meta.output_tokens = stats.total_output_tokens;
+            meta.turns = stats.turn_count;
+        })
+        .await
+}
+
+/// 会话文件 stem（`session: <id>` 提示用）。
+fn session_id_of(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
 }
 
 /// 抓取落盘文件的保留时长：超过即被启动期清理（**只对 Primary 档**生效）。
@@ -464,6 +616,83 @@ fn sessions_dir() -> PathBuf {
     base.join(format!("yushan-sessions-{}", std::process::id()))
 }
 
+/// 起屏前解析 `--resume`：返回恢复路径（`None` = 默认新会话）与其 meta。
+///
+/// 空列表按**默认新会话**处理（stderr 提示，不报错）；`resolve` / `pick` 的 Err
+/// ⇒ stderr 报错后退出。
+fn resolve_resume(
+    resume: &Resume,
+    dir: &Path,
+) -> (Option<PathBuf>, Option<ys_session::SessionMeta>) {
+    let path = match resume {
+        Resume::New => None,
+        Resume::Id(id) => {
+            if id.is_empty() {
+                eprintln!("--resume= 需要一个会话 id（例如 --resume=2026-10-07-abc）");
+                std::process::exit(1);
+            }
+            match sessions::resolve(dir, id) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Resume::Pick => {
+            let entries = sessions::list(dir);
+            if entries.is_empty() {
+                eprintln!("没有可恢复的会话");
+                None
+            } else {
+                match sessions::pick(&entries) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    };
+    let meta = path.as_deref().and_then(sessions::read_meta);
+    (path, meta)
+}
+
+/// 会话目录是否已有条目（仅用于启动期 `Resume with --resume` 提示）：只读一个
+/// 条目，不做列表 / 解析。
+fn sessions_dir_has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false)
+}
+
+/// `-p` / `--json` 单回合收尾：由 meta 播种统计、`record(usage)` 后写穿 meta，
+/// 并把 `session: <id>` 打到 **stderr**（stdout 属数据流，不得污染）。
+async fn persist_single_turn(
+    wiring: &mut Wiring,
+    raw_task: &str,
+    provider: Option<&str>,
+    result: &RunResult,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stats = seed_stats(wiring);
+    stats.record(&result.usage);
+    let model = wiring.model_id().map(str::to_string);
+    finalize_turn_meta(
+        wiring,
+        Some(raw_task),
+        provider,
+        model.as_deref(),
+        None,
+        &stats,
+    )
+    .await?;
+    if let Some(id) = wiring.session_path().and_then(session_id_of) {
+        eprintln!("session: {id}");
+    }
+    Ok(())
+}
+
 /// print / json 模式的前置检查：无 model 时给出可操作提示并退出。
 ///
 /// **启动期诊断 → stderr**（设计 §5）：此刻 TUI 还没起屏，stderr 是正确去处。
@@ -541,7 +770,7 @@ async fn run_print_mode(
     task: String,
     stats: &ChannelStatsHandle,
     force_stats: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
     // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
@@ -552,13 +781,13 @@ async fn run_print_mode(
 
     // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
     report_channel_stats(stats, force_stats);
-    run_result?;
+    let result = run_result?;
     let printed_any = consume_result?;
 
     if printed_any {
         println!();
     }
-    Ok(())
+    Ok(result)
 }
 
 /// `--json` 模式：并发消费事件流，逐行输出 `Envelope` 的 JSON。
@@ -571,7 +800,7 @@ async fn run_json_mode(
     task: String,
     stats: &ChannelStatsHandle,
     force_stats: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
     let (run_result, consume_result) = tokio::join!(
@@ -580,9 +809,9 @@ async fn run_json_mode(
     );
 
     report_channel_stats(stats, force_stats);
-    run_result?;
+    let result = run_result?;
     consume_result?;
-    Ok(())
+    Ok(result)
 }
 
 /// TUI 模式的全部组装（设计 §7 初始化顺序 1–5）。
@@ -602,6 +831,8 @@ fn run_interactive(
     tools: Vec<Box<dyn Tool>>,
     limits: ys_component::RunLimits,
     startup_hint: Option<String>,
+    sessions_dir: PathBuf,
+    resume_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
@@ -611,8 +842,14 @@ fn run_interactive(
     let agent = build_agent(system_prompt, workspace, tools, limits)?;
 
     // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
+    //    有 resume 路径 ⇒ 恢复它；否则默认新会话（惰性落盘）。
     let model = config.build_model();
-    let wiring = rt.block_on(Wiring::persistent(model, Box::new(sink), sessions_dir()))?;
+    let wiring = rt.block_on(async {
+        match resume_path {
+            Some(path) => Wiring::resume(model, Box::new(sink), sessions_dir, path).await,
+            None => Wiring::persistent_new(model, Box::new(sink), sessions_dir).await,
+        }
+    })?;
 
     // 2b.【阻塞】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
     //
@@ -628,7 +865,9 @@ fn run_interactive(
         let _ = io::stderr().flush();
     }
 
-    let stats = status::TurnStats::default();
+    // 由 meta 播种累计统计（resume 后状态行的 tokens / turns 不归零）。
+    // `session_started`（状态行时长）属展示、非执行状态，不恢复。
+    let stats = seed_stats(&wiring);
     let session_started = Instant::now();
 
     // 3. view₀ —— 在把 config 移交给 app 线程之前构造。
@@ -692,6 +931,10 @@ fn run_interactive(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 模式与 `--resume` 必须在一切之前确定（决定事件消费者 / sink / 会话形态）。
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = parse_args(&argv)?;
+
     let mut config = config::Config::from_env()?;
 
     // 从 auth.json 加载已保存的凭证
@@ -721,39 +964,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_store = state::StateStore::new();
     let saved_state = state_store.load();
 
-    // 启动恢复：若环境变量未提供完整凭证，
-    // 先尝试从 state.json（last-active provider+model）恢复，
-    // 再回退到第一个存有 auth 的 provider。
-    if !config.is_configured() {
-        // 尝试 state.json 恢复：last_active_provider + 匹配的 auth entry
-        let recovered = saved_state
-            .last_active_provider
-            .as_deref()
-            .and_then(|name| config.registry.find_provider(name))
-            .zip(
-                saved_state
-                    .last_active_provider
-                    .as_deref()
-                    .and_then(|name| config.registry.auth_for(name)),
-            );
+    // 会话目录 + `--resume` 解析 —— 必须在**模型解析之前**：meta 参与模型选择。
+    let sessions_dir = sessions_dir();
+    let (resume_path, resume_meta) = resolve_resume(&args.resume, &sessions_dir);
 
-        if let Some((provider, entry)) = recovered {
+    // 模型解析（优先级，设计 §5.6）：env 完整凭证 > resume meta（provider 须有凭证）
+    // > state.json（last-active provider+model）> 第一个存有凭证的 provider。
+    // provider 无凭证时**降级而非失败**。
+    if !config.is_configured() {
+        let from_meta = resume_meta.as_ref().and_then(|m| {
+            let provider = m.provider.as_deref()?;
+            let entry = config.registry.auth_for(provider)?;
+            Some((provider.to_string(), entry, m.model.clone()))
+        });
+        if let Some((provider, entry, model)) = from_meta {
             config.api_base = Some(entry.api_base.clone());
             config.api_key = Some(entry.api_key.clone());
-            config.model = saved_state
-                .last_active_model
-                .clone()
-                .unwrap_or_else(|| entry.model.clone());
-            config.provider = Some(provider.name.clone());
+            config.model = model.unwrap_or_else(|| entry.model.clone());
+            config.provider = Some(provider);
         } else {
-            // 回退：第一个存有凭证的 provider
-            for provider in config.registry.providers() {
-                if let Some(entry) = config.registry.auth_for(&provider.name) {
-                    config.api_base = Some(entry.api_base.clone());
-                    config.api_key = Some(entry.api_key.clone());
-                    config.model = entry.model.clone();
-                    config.provider = Some(provider.name.clone());
-                    break;
+            // state.json 恢复：last_active_provider + 匹配的 auth entry
+            let recovered = saved_state
+                .last_active_provider
+                .as_deref()
+                .and_then(|name| config.registry.find_provider(name))
+                .zip(
+                    saved_state
+                        .last_active_provider
+                        .as_deref()
+                        .and_then(|name| config.registry.auth_for(name)),
+                );
+
+            if let Some((provider, entry)) = recovered {
+                config.api_base = Some(entry.api_base.clone());
+                config.api_key = Some(entry.api_key.clone());
+                config.model = saved_state
+                    .last_active_model
+                    .clone()
+                    .unwrap_or_else(|| entry.model.clone());
+                config.provider = Some(provider.name.clone());
+            } else {
+                // 回退：第一个存有凭证的 provider
+                for provider in config.registry.providers() {
+                    if let Some(entry) = config.registry.auth_for(&provider.name) {
+                        config.api_base = Some(entry.api_base.clone());
+                        config.api_key = Some(entry.api_key.clone());
+                        config.model = entry.model.clone();
+                        config.provider = Some(provider.name.clone());
+                        break;
+                    }
                 }
             }
         }
@@ -786,10 +1045,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )))
     });
-
-    // 模式必须在建 agent 之前确定：它决定事件消费者与 sink 的选择。
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let args = parse_args(&argv)?;
 
     // 构建工具表与 system prompt。
     //
@@ -824,6 +1079,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixed_cost_note(&limits),
     );
 
+    // 启动期可发现性：默认新会话且目录非空时，提示存在可恢复会话。
+    let hint = with_resume_hint(
+        hint,
+        matches!(args.resume, Resume::New) && sessions_dir_has_entries(&sessions_dir),
+    );
+
     // 手工建 runtime（而非 `#[tokio::main]`）：TUI 模式的 UI 循环**必须在
     // 没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -837,15 +1098,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{hint}");
             }
             // 与 TUI 的 `Request::Prompt` **同一套**展开：`-p "/git-status"` 也生效。
-            let task = expand_task(task, &config.skills);
+            // 标题素材（`raw_task`）由 [`raw_and_expanded_task`] 在展开之前留底（C3）。
+            let (raw_task, task) = raw_and_expanded_task(task, &config.skills);
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
             let stats_handle = sink.stats_handle();
             let mut agent = build_agent(system_prompt, workspace, tools, limits)?;
-            // `-p` 是一次性会话：MemorySession，不落盘、不恢复（行为与改动前一致）。
-            let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
-            rt.block_on(run_print_mode(
+            let model = config.build_model();
+            let mut wiring = rt.block_on(async {
+                match resume_path.clone() {
+                    Some(p) => Wiring::resume(model, Box::new(sink), sessions_dir.clone(), p).await,
+                    None => {
+                        Wiring::persistent_new(model, Box::new(sink), sessions_dir.clone()).await
+                    }
+                }
+            })?;
+            let result = rt.block_on(run_print_mode(
                 &mut agent,
                 &mut wiring,
                 rx,
@@ -853,25 +1122,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &stats_handle,
                 args.stats,
             ))?;
+            rt.block_on(persist_single_turn(
+                &mut wiring,
+                &raw_task,
+                config.provider.as_deref(),
+                &result,
+            ))?;
         }
         Mode::Json(task) => {
             // 同 `-p`：无 TUI → stderr（**绝不能**混进 stdout 的逐行 Envelope）。
             if let Some(hint) = &hint {
                 eprintln!("{hint}");
             }
-            let task = expand_task(task, &config.skills);
+            let (raw_task, task) = raw_and_expanded_task(task, &config.skills);
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
             let mut agent = build_agent(system_prompt, workspace, tools, limits)?;
-            let mut wiring = Wiring::ephemeral(config.build_model(), Box::new(sink));
-            rt.block_on(run_json_mode(
+            let model = config.build_model();
+            let mut wiring = rt.block_on(async {
+                match resume_path.clone() {
+                    Some(p) => Wiring::resume(model, Box::new(sink), sessions_dir.clone(), p).await,
+                    None => {
+                        Wiring::persistent_new(model, Box::new(sink), sessions_dir.clone()).await
+                    }
+                }
+            })?;
+            let result = rt.block_on(run_json_mode(
                 &mut agent,
                 &mut wiring,
                 rx,
                 task,
                 &stats_handle,
                 args.stats,
+            ))?;
+            rt.block_on(persist_single_turn(
+                &mut wiring,
+                &raw_task,
+                config.provider.as_deref(),
+                &result,
             ))?;
         }
         Mode::Interactive => {
@@ -886,6 +1175,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tools,
                 limits,
                 hint,
+                sessions_dir,
+                resume_path,
             )?;
         }
     }
@@ -992,6 +1283,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hello".into()),
                 stats: false,
+                resume: Resume::New,
             }
         );
     }
@@ -1004,6 +1296,7 @@ mod tests {
             Args {
                 mode: Mode::Json("do x".into()),
                 stats: false,
+                resume: Resume::New,
             }
         );
     }
@@ -1016,6 +1309,7 @@ mod tests {
             Args {
                 mode: Mode::Interactive,
                 stats: false,
+                resume: Resume::New,
             }
         );
     }
@@ -1053,6 +1347,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hi".into()),
                 stats: true,
+                resume: Resume::New,
             }
         );
         assert_eq!(
@@ -1060,6 +1355,7 @@ mod tests {
             Args {
                 mode: Mode::Json("do x".into()),
                 stats: true,
+                resume: Resume::New,
             }
         );
     }
@@ -1073,6 +1369,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hi --stats".into()),
                 stats: false,
+                resume: Resume::New,
             }
         );
         // 既有语义不破：`--help` 从来不是 flag（仅首位置判定，且此处非 `--stats`）。
@@ -1081,6 +1378,7 @@ mod tests {
             Args {
                 mode: Mode::Print("--help me".into()),
                 stats: false,
+                resume: Resume::New,
             }
         );
     }
@@ -1092,6 +1390,83 @@ mod tests {
         assert!(err.contains("-p"), "err = {err}");
         let err = parse_args(&s(&["--json", "--stats"])).unwrap_err();
         assert!(err.contains("--json"), "err = {err}");
+    }
+
+    /// **解析矩阵**：三模式 × `--resume` / `--resume=id` / `--stats`，含**两种 flag
+    /// 顺序**；任务文本逐字保留；未知 flag 报错。
+    #[test]
+    fn parse_resume_matrix_and_flag_order() {
+        // TUI 形态：裸 `--resume` = Pick；`--resume=id` = Id。
+        assert_eq!(
+            parse_args(&s(&["--resume"])).unwrap(),
+            Args {
+                mode: Mode::Interactive,
+                stats: false,
+                resume: Resume::Pick,
+            }
+        );
+        assert_eq!(
+            parse_args(&s(&["--resume=abc"])).unwrap(),
+            Args {
+                mode: Mode::Interactive,
+                stats: false,
+                resume: Resume::Id("abc".into()),
+            }
+        );
+        // TUI 形态下 `--resume <id>`（空格）不支持：其后参数忽略，仍为 Pick。
+        assert_eq!(
+            parse_args(&s(&["--resume", "abc"])).unwrap(),
+            Args {
+                mode: Mode::Interactive,
+                stats: false,
+                resume: Resume::Pick,
+            }
+        );
+
+        // `-p`：`--stats` 与 `--resume=id` **顺序无关**。
+        let a = parse_args(&s(&["-p", "--stats", "--resume=x", "do", "it"])).unwrap();
+        let b = parse_args(&s(&["-p", "--resume=x", "--stats", "do", "it"])).unwrap();
+        assert_eq!(a, b, "两种 flag 顺序应等价");
+        assert_eq!(
+            a,
+            Args {
+                mode: Mode::Print("do it".into()),
+                stats: true,
+                resume: Resume::Id("x".into()),
+            }
+        );
+
+        // `--json`：裸 `--resume` + 任务。
+        assert_eq!(
+            parse_args(&s(&["--json", "--resume", "task"])).unwrap(),
+            Args {
+                mode: Mode::Json("task".into()),
+                stats: false,
+                resume: Resume::Pick,
+            }
+        );
+
+        // flag 区之后：任务文本逐字保留（`--resume` 落进文本就不再是 flag）。
+        assert_eq!(
+            parse_args(&s(&["-p", "hi", "--resume=x"])).unwrap(),
+            Args {
+                mode: Mode::Print("hi --resume=x".into()),
+                stats: false,
+                resume: Resume::New,
+            }
+        );
+        assert_eq!(
+            parse_args(&s(&["-p", "--resume", "abc", "task"])).unwrap(),
+            Args {
+                mode: Mode::Print("abc task".into()),
+                stats: false,
+                resume: Resume::Pick,
+            }
+        );
+
+        // 拼错的 flag 仍报错。
+        assert!(parse_args(&s(&["--nope"])).is_err());
+        assert!(parse_args(&s(&["--resum=x"])).is_err());
     }
 
     /// 6. `write_json_envelope`：合法 JSON、含 `event` 字段、以 `\n` 结尾；
@@ -1597,15 +1972,15 @@ mod tests {
 
         limits.fixed_prompt_tokens = trigger;
         let note = fixed_cost_note(&limits).expect("固定开销 = 触发点 ⇒ 必须提示");
-        assert!(note.contains(&trigger.to_string()), "提示应给出触发点：{note}");
+        assert!(
+            note.contains(&trigger.to_string()),
+            "提示应给出触发点：{note}"
+        );
         assert!(note.contains("context_window"), "提示应可操作：{note}");
 
         // 差一个 token ⇒ 仍装得下 ⇒ 不提示。
         limits.fixed_prompt_tokens = trigger - 1;
-        assert!(
-            fixed_cost_note(&limits).is_none(),
-            "未达触发点不该打扰用户"
-        );
+        assert!(fixed_cost_note(&limits).is_none(), "未达触发点不该打扰用户");
 
         // 真实量级的对照：128k 窗口装得下 ~9.6k 的 skill 目录。
         let mut wide = ys_component::RunLimits::default();
@@ -1653,6 +2028,28 @@ mod tests {
         );
     }
 
+    /// 启动期可发现性提示（`Resume with --resume`）：`triggered` 为假时**原样返回**
+    /// （`None→None`、`Some(x)→Some(x)`），为真时追加一行且**原有提示在前**。
+    ///
+    /// 变异：忽略 `triggered`（恒加提示）⇒ 第三条断言变红。
+    #[test]
+    fn with_resume_hint_only_appends_when_triggered() {
+        assert_eq!(
+            with_resume_hint(None, true).as_deref(),
+            Some("Resume with --resume")
+        );
+        assert_eq!(
+            with_resume_hint(Some("原有提示".into()), true).as_deref(),
+            Some("原有提示\nResume with --resume")
+        );
+        assert_eq!(with_resume_hint(None, false), None);
+        assert_eq!(
+            with_resume_hint(Some("原有提示".into()), false).as_deref(),
+            Some("原有提示"),
+            "未触发必须原样返回，不得追加"
+        );
+    }
+
     /// 自定义 prompt 提示：**两个条件同时成立**才出（有自定义 SYSTEM.md 且发现了 skill）。
     ///
     /// 变异：去掉 `skill_count == 0` 的守卫 ⇒ 第二条断言变红（没 skill 还提示 skill
@@ -1683,7 +2080,10 @@ mod tests {
         );
         let note = custom_prompt_note(&dir, 3).expect("两者皆有 ⇒ 提示");
         assert!(note.contains('3'), "提示应给出 skill 数：{note}");
-        assert!(note.contains("/skill-name"), "提示应指出确定性路线仍可用：{note}");
+        assert!(
+            note.contains("/skill-name"),
+            "提示应指出确定性路线仍可用：{note}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1706,9 +2106,15 @@ mod tests {
         assert_eq!(entries.len(), 1, "测试前提：{diags:?}");
 
         let expanded = expand_task("/git-status 现在改了什么".to_string(), &entries);
-        assert!(expanded.contains("<skill name=\"git-status\""), "{expanded}");
+        assert!(
+            expanded.contains("<skill name=\"git-status\""),
+            "{expanded}"
+        );
         assert!(expanded.contains("正文第一行"), "{expanded}");
-        assert!(expanded.contains("现在改了什么"), "参数原样保留：{expanded}");
+        assert!(
+            expanded.contains("现在改了什么"),
+            "参数原样保留：{expanded}"
+        );
 
         let plain = "修一下这个 bug".to_string();
         assert_eq!(
@@ -1716,6 +2122,205 @@ mod tests {
             plain,
             "非 skill 的 task 必须逐字节不变"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finalize_turn_meta`：首行为 meta、title 折叠空白取展开前原文、provider/model
+    /// 与 tokens 落盘、title 幂等。
+    #[tokio::test]
+    async fn finalize_turn_meta_writes_title_once_and_refreshes_stats() {
+        let dir = unique_tmp_dir("finalize");
+        let mut wiring =
+            Wiring::persistent_new(None, Box::new(ys_event::CollectingSink::new()), dir.clone())
+                .await
+                .unwrap();
+        let mut stats = status::TurnStats::default();
+        stats.record(&Usage {
+            input_tokens: 11,
+            output_tokens: 4,
+        });
+
+        finalize_turn_meta(
+            &mut wiring,
+            Some("  第一条   用户消息  "),
+            Some("deepseek"),
+            Some("deepseek-chat"),
+            None,
+            &stats,
+        )
+        .await
+        .unwrap();
+
+        let path = wiring.session_path().unwrap().to_path_buf();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // 首行必须是 meta（不是裸 Message）。
+        let meta: ys_session::SessionMeta =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("第一条 用户消息"), "折叠空白");
+        assert_eq!(meta.provider.as_deref(), Some("deepseek"));
+        assert_eq!(meta.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(meta.input_tokens, 11);
+        assert_eq!(meta.output_tokens, 4);
+        assert_eq!(meta.turns, 1);
+
+        // 第二次：title 幂等，tokens / turns 刷新。
+        stats.record(&Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        finalize_turn_meta(
+            &mut wiring,
+            Some("第二条"),
+            Some("deepseek"),
+            Some("deepseek-chat"),
+            None,
+            &stats,
+        )
+        .await
+        .unwrap();
+        let meta = wiring.meta().unwrap();
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("第一条 用户消息"),
+            "title 只写一次"
+        );
+        assert_eq!(meta.turns, 2);
+        assert_eq!(meta.input_tokens, 12);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finalize_turn_meta`：`provider` / `model` **仅 `Some` 时写** —— 后一次调用的
+    /// `None` 不得清空前一次落盘的 provider / model（env 凭证路径下 D10 第 2 级恢复的
+    /// 前提），而 tokens / turns 照常刷新。
+    ///
+    /// 变异：把 `if let Some` 改回无条件赋值 ⇒ 末两条 provider / model 断言变红
+    /// （被清成 null，resume 再也恢复不出该会话的 model）。
+    #[tokio::test]
+    async fn finalize_turn_meta_keeps_provider_model_when_none() {
+        let dir = unique_tmp_dir("finalize_keep");
+        let mut wiring =
+            Wiring::persistent_new(None, Box::new(ys_event::CollectingSink::new()), dir.clone())
+                .await
+                .unwrap();
+
+        let mut stats = status::TurnStats::default();
+        stats.record(&Usage {
+            input_tokens: 3,
+            output_tokens: 2,
+        });
+        finalize_turn_meta(
+            &mut wiring,
+            Some("第一条"),
+            Some("deepseek"),
+            Some("m1"),
+            None,
+            &stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wiring.meta().unwrap().provider.as_deref(), Some("deepseek"));
+        assert_eq!(wiring.meta().unwrap().model.as_deref(), Some("m1"));
+
+        // 第二次：provider / model 为 `None`（env 凭证路径下 `config.provider` 恒为
+        // `None`）—— 不得清空；tokens / turns 仍刷新。
+        stats.record(&Usage {
+            input_tokens: 4,
+            output_tokens: 1,
+        });
+        finalize_turn_meta(&mut wiring, Some("第二条"), None, None, None, &stats)
+            .await
+            .unwrap();
+
+        let meta = wiring.meta().unwrap();
+        assert_eq!(
+            meta.provider.as_deref(),
+            Some("deepseek"),
+            "None 不得清空已落盘的 provider"
+        );
+        assert_eq!(
+            meta.model.as_deref(),
+            Some("m1"),
+            "None 不得清空已落盘的 model"
+        );
+        assert_eq!(meta.input_tokens, 7, "tokens 照常刷新");
+        assert_eq!(meta.turns, 2, "turns 照常刷新");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `raw_and_expanded_task`（`-p` / `--json` 共用）：`expanded` 是带 `<skill …>`
+    /// 信封的正文，`raw` 必须**等于展开前原文**且不含 `<skill` —— 它是
+    /// [`finalize_turn_meta`] 的标题素材（C3），落盘标题里也不可能出现信封。
+    ///
+    /// 变异：把函数体里的 `raw` 改成 `expanded.clone()` ⇒ 第一条断言变红。
+    #[test]
+    fn raw_and_expanded_task_keeps_raw_free_of_skill_envelope() {
+        let dir = unique_tmp_dir("raw_expand");
+        let skill_dir = dir.join("git-status");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: git-status\ndescription: 状态\n---\n正文第一行\n",
+        )
+        .unwrap();
+        let (entries, diags) = crate::skills::scan(&[dir.clone()]);
+        assert_eq!(entries.len(), 1, "测试前提：{diags:?}");
+
+        let original = "/git-status 现在改了什么".to_string();
+        let (raw, expanded) = raw_and_expanded_task(original.clone(), &entries);
+        assert!(
+            expanded.contains("<skill name=\"git-status\""),
+            "展开用于送给模型：{expanded}"
+        );
+        assert_eq!(raw, original, "标题素材必须是展开前原文");
+        assert!(!raw.contains("<skill"), "标题素材不得含信封：{raw}");
+        assert!(
+            !sessions::derive_stored_title(&raw).contains("<skill"),
+            "落盘标题里也不得出现信封"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `persist_single_turn`（`-p`/`--json` 收尾路径）：落盘首行为 meta，title 取
+    /// **展开前**原文，model 来自接线器、tokens 来自 `RunResult.usage`。
+    #[tokio::test]
+    async fn persist_single_turn_writes_meta_with_title_model_tokens() {
+        let dir = unique_tmp_dir("persist_single");
+        let mut wiring = Wiring::persistent_new(
+            Some(Box::new(MockModel::new("harness-model"))),
+            Box::new(ys_event::CollectingSink::new()),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = RunResult {
+            stop_reason: StopReason::Completed,
+            usage: Usage {
+                input_tokens: 7,
+                output_tokens: 5,
+            },
+            rounds: 1,
+            final_message: None,
+        };
+
+        persist_single_turn(&mut wiring, "展开前的原文", Some("deepseek"), &result)
+            .await
+            .unwrap();
+
+        let path = wiring.session_path().unwrap().to_path_buf();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let meta: ys_session::SessionMeta =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("展开前的原文"));
+        assert_eq!(meta.provider.as_deref(), Some("deepseek"));
+        assert_eq!(meta.model.as_deref(), Some("harness-model"));
+        assert_eq!(meta.input_tokens, 7);
+        assert_eq!(meta.output_tokens, 5);
+        assert_eq!(meta.turns, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,6 +3,10 @@
 //! Agent 已降为无状态执行器；「当前是哪个会话」「当前用哪个模型」都归这里。
 //! 调用点经 [`Wiring::ports`] 把这三样借给 `Agent::run_turn`。
 //!
+//! **默认新会话**：启动时 [`Wiring::persistent_new`] 只算出新文件名、**惰性落盘**
+//! （不预建、不扫目录）；恢复只走显式 [`Wiring::resume`]（由 `main` 在起屏前
+//! 解析 `--resume` 得到路径）。
+//!
 //! **`/new` = 换会话**：替换 `session` 句柄 —— 新会话文件（旧文件保留）。
 //! Agent / BasicLoop 全程不知情。
 //!
@@ -16,17 +20,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ys_event::EventSink;
 use ys_model::Model;
 use ys_runtime::AgentPorts;
-use ys_session::{JsonlSession, MemorySession, Session, SessionError};
+use ys_session::{JsonlSession, MemorySession, Session, SessionError, SessionMeta};
 // `Session` trait 需在作用域内才能对 `Box<dyn Session>` 调方法。
 use ys_session::Message;
 
 /// 接线器：agent 之外的所有权所在。
 ///
 /// 两种形态：
-/// - **持久**（[`Wiring::persistent`]）：交互式；会话落 `sessions_dir/{id}.jsonl`，
-///   启动时恢复最近一个。
-/// - **一次性**（[`Wiring::ephemeral`]）：`-p`/`--json`；`MemorySession`，不落盘、
-///   不恢复（保持单次运行行为与改动前一致）。
+/// - **持久**（[`Wiring::persistent_new`] / [`Wiring::resume`]）：会话落
+///   `sessions_dir/{id}.jsonl`。
+/// - **一次性**（[`Wiring::ephemeral`]，仅测试）：`MemorySession`，不落盘、不恢复。
 pub struct Wiring {
     model: Option<Box<dyn Model>>,
     session: Box<dyn Session>,
@@ -38,7 +41,11 @@ pub struct Wiring {
 }
 
 impl Wiring {
-    /// 一次性会话：`MemorySession`，不落盘、不恢复。`-p`/`--json` 用。
+    /// 一次性会话：`MemorySession`，不落盘、不恢复。
+    ///
+    /// 生产路径不再用它（`-p`/`--json` 已改持久化）；保留是 `MemorySession` 作为
+    /// 「不落盘」构造的唯一入口，测试与 `new_session` 的一次性分支共用。
+    #[cfg(test)]
     pub fn ephemeral(model: Option<Box<dyn Model>>, events: Box<dyn EventSink>) -> Self {
         Self {
             model,
@@ -49,11 +56,35 @@ impl Wiring {
         }
     }
 
-    /// 交互会话：恢复 `sessions_dir` 下最近的 `*.jsonl`（无则新建），后续落盘。
-    pub async fn persistent(
+    /// 新会话（默认形态）：`create_dir_all` 后算出 `{unix}_{nanos}.jsonl`，
+    /// `JsonlSession::open` **惰性**打开 —— 不预建文件、不扫目录，首次追加才落盘。
+    pub async fn persistent_new(
         model: Option<Box<dyn Model>>,
         events: Box<dyn EventSink>,
         sessions_dir: PathBuf,
+    ) -> Result<Self, SessionError> {
+        Self::persistent_at(model, events, sessions_dir, None).await
+    }
+
+    /// 恢复指定会话文件（显式 `--resume`）：读回其 meta 与消息。
+    pub async fn resume(
+        model: Option<Box<dyn Model>>,
+        events: Box<dyn EventSink>,
+        sessions_dir: PathBuf,
+        path: PathBuf,
+    ) -> Result<Self, SessionError> {
+        Self::persistent_at(model, events, sessions_dir, Some(path)).await
+    }
+
+    /// 持久形态的公共构造。`path` 为 `Some` 即恢复该文件，`None` 即新文件名。
+    ///
+    /// `create_dir_all` 必须在**两个**入口都发生：惰性落盘时父目录不存在会让首次
+    /// `flush_to_file` 的 rename 失败（`/new` 换出的目录同理）。
+    async fn persistent_at(
+        model: Option<Box<dyn Model>>,
+        events: Box<dyn EventSink>,
+        sessions_dir: PathBuf,
+        path: Option<PathBuf>,
     ) -> Result<Self, SessionError> {
         std::fs::create_dir_all(&sessions_dir).map_err(|e| {
             SessionError::Storage(format!(
@@ -61,8 +92,7 @@ impl Wiring {
                 sessions_dir.display()
             ))
         })?;
-        let path = latest_session_path(&sessions_dir)
-            .unwrap_or_else(|| sessions_dir.join(format!("{}.jsonl", new_session_id())));
+        let path = path.unwrap_or_else(|| sessions_dir.join(format!("{}.jsonl", new_session_id())));
         let session = JsonlSession::open(&path).await?;
         Ok(Self {
             model,
@@ -75,22 +105,16 @@ impl Wiring {
 
     /// **`/new`**：换新会话；旧会话文件保留（不删）。
     ///
-    /// 持久形态下 **先建好新会话并立即落盘**（空文件）：
-    /// - `JsonlSession::open` 不预建文件，只在**首次追加**时落盘。若只 `open`
-    ///   不落盘，用户 `/new` 后不发消息就退出，磁盘上仍只有旧文件，
-    ///   重启时 [`latest_session_path`] 仍选中旧文件 —— `/new` 等于没生效。
-    ///   故 `open` 后立即 `clear()` 触发一次落盘，使新文件名时间戳最新且真实存在。
-    /// - 顺序上**先 open + clear、成功后才替换** `session` / `session_path`：
-    ///   任一步失败时状态保持原样，不会出现「会话未换却已丢历史」的半新半旧。
+    /// 只 `JsonlSession::open`（**惰性**，不预建空文件）：新会话首次追加才落盘。
+    /// 顺序上**先 open 成功后才替换** `session` / `session_path`：任一步失败时状态
+    /// 保持原样，不会出现「会话未换却已丢历史」的半新半旧。
     ///
     /// 返回新会话文件路径（一次性会话返回 `None`）。
     pub async fn new_session(&mut self) -> Result<Option<PathBuf>, SessionError> {
         match &self.sessions_dir {
             Some(dir) => {
                 let path = dir.join(format!("{}.jsonl", new_session_id()));
-                let mut session = JsonlSession::open(&path).await?;
-                // 立即落盘空文件：`clear()` 会 flush_to_file，使文件真实存在。
-                session.clear().await?;
+                let session = JsonlSession::open(&path).await?;
                 self.session = Box::new(session);
                 self.session_path = Some(path.clone());
                 Ok(Some(path))
@@ -141,9 +165,31 @@ impl Wiring {
     pub fn session_path(&self) -> Option<&Path> {
         self.session_path.as_deref()
     }
+
+    /// 当前会话元数据（`None` = 尚无首行 meta）。
+    pub fn meta(&self) -> Option<&SessionMeta> {
+        self.session.meta()
+    }
+
+    /// 就地修改 meta 并落盘。
+    ///
+    /// 缺省 meta 必须用 [`SessionMeta::new`] 起头（`v = 1`）—— 不能用
+    /// `SessionMeta::default()`，后者的 `v = 0` 与 serde 缺省 `1` 不一致。
+    pub async fn update_meta(
+        &mut self,
+        f: impl FnOnce(&mut SessionMeta),
+    ) -> Result<(), SessionError> {
+        let mut meta = self
+            .session
+            .meta()
+            .cloned()
+            .unwrap_or_else(|| SessionMeta::new(now_unix()));
+        f(&mut meta);
+        self.session.set_meta(meta).await
+    }
 }
 
-/// 会话 id：`{unix 秒}_{纳秒零填充}`。按字典序即时间序，便于「取最近一个」。
+/// 会话 id：`{unix 秒}_{纳秒零填充}`。按字典序即时间序。
 fn new_session_id() -> String {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -151,14 +197,12 @@ fn new_session_id() -> String {
     format!("{}_{:09}", d.as_secs(), d.subsec_nanos())
 }
 
-/// 最近一个会话文件：文件名最大者（id 前缀保证字典序 == 时间序）。
-fn latest_session_path(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .max()
+/// 当前 Unix 秒（新建 meta 的 `created_at`）。
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -199,11 +243,11 @@ mod tests {
         assert!(w.session_messages().is_empty(), "历史应清空");
     }
 
-    /// `/new`（持久）：旧文件保留且非空；新文件生成且为空。
+    /// `/new`（持久）：旧文件保留；新会话**惰性**（不发消息则不落盘）。
     #[tokio::test]
-    async fn new_session_persistent_keeps_old_file_and_creates_empty_new() {
+    async fn new_session_persistent_keeps_old_file_and_is_lazy() {
         let dir = temp_dir("new_session");
-        let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
 
@@ -219,17 +263,14 @@ mod tests {
 
         assert_ne!(old_path, new_path, "应生成新会话文件");
         assert!(old_path.exists(), "旧会话文件必须保留");
-        let old_content = std::fs::read_to_string(&old_path).unwrap();
         assert!(
-            old_content.contains("held in old"),
-            "旧文件内容应保留: {old_content}"
+            std::fs::read_to_string(&old_path)
+                .unwrap()
+                .contains("held in old"),
+            "旧文件内容应保留"
         );
-        // 新会话文件由 `/new` **预建**（open 后 clear 立即落盘），不待首次追加。
-        assert!(new_path.exists(), "新会话文件应被预建");
-        assert!(
-            std::fs::read_to_string(&new_path).unwrap().is_empty(),
-            "预建的新文件应为空"
-        );
+        // 惰性：`/new` 只换句柄，不预建空文件。
+        assert!(!new_path.exists(), "未追加前不应落盘新文件");
         assert!(w.session_messages().is_empty(), "新会话历史为空");
 
         w.ports()
@@ -246,15 +287,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `JsonlSession` 恢复：写入 → 重开 → 消息还在，且恢复的是最近一个文件。
+    /// `persistent_new` **惰性**：构造后文件不存在，首次 append 才落盘。
     #[tokio::test]
-    async fn persistent_recovers_latest_session() {
-        let dir = temp_dir("recover");
+    async fn persistent_new_is_lazy_until_first_append() {
+        let dir = temp_dir("lazy_new");
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        let path = w.session_path().unwrap().to_path_buf();
+        assert!(!path.exists(), "构造（open）不得预建文件");
 
-        let path = {
-            let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        w.ports()
+            .session
+            .append(text_message("first"))
+            .await
+            .unwrap();
+        assert!(path.exists(), "首次 append 才落盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `persistent_new` 不扫目录：即使目录里已有别的新会话，也另起一个新文件。
+    #[tokio::test]
+    async fn persistent_new_does_not_scan_existing_sessions() {
+        let dir = temp_dir("no_scan");
+        {
+            let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
                 .await
                 .unwrap();
+            w.ports()
+                .session
+                .append(text_message("existing"))
+                .await
+                .unwrap();
+        }
+
+        let w2 = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        assert!(w2.session_messages().is_empty(), "默认新会话不恢复旧内容");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resume` 读回指定文件的 meta 与消息。
+    #[tokio::test]
+    async fn resume_reads_back_meta_and_messages() {
+        let dir = temp_dir("resume_meta");
+        let path = {
+            let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+                .await
+                .unwrap();
+            w.update_meta(|m| {
+                m.title = Some("标题".into());
+                m.provider = Some("deepseek".into());
+                m.model = Some("deepseek-chat".into());
+                m.thinking_visible = true;
+                m.input_tokens = 10;
+                m.output_tokens = 3;
+                m.turns = 2;
+            })
+            .await
+            .unwrap();
             w.ports()
                 .session
                 .append(text_message("persisted"))
@@ -263,79 +357,57 @@ mod tests {
             w.session_path().unwrap().to_path_buf()
         };
 
-        let w2 = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
-            .await
-            .unwrap();
-        assert_eq!(w2.session_path(), Some(path.as_path()), "应恢复最近文件");
+        let w2 = Wiring::resume(
+            None,
+            Box::new(CollectingSink::new()),
+            dir.clone(),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(w2.session_path(), Some(path.as_path()));
         assert_eq!(w2.session_messages().len(), 1, "消息应恢复");
-        assert_eq!(w2.session_messages()[0].content.len(), 1);
+        let meta = w2.meta().expect("meta 应恢复");
+        assert_eq!(meta.title.as_deref(), Some("标题"));
+        assert_eq!(meta.provider.as_deref(), Some("deepseek"));
+        assert!(meta.thinking_visible);
+        assert_eq!(meta.input_tokens, 10);
+        assert_eq!(meta.turns, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 旧文件保留后，`/new` 再启动恢复的是**新**文件（最近者），不是旧的。
+    /// `update_meta` 幂等：title 只写一次，后续刷新不覆盖；缺省 meta 用 `v = 1`。
     #[tokio::test]
-    async fn recovery_picks_newest_after_new() {
-        let dir = temp_dir("recover_new");
-        {
-            let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
-                .await
-                .unwrap();
-            w.ports().session.append(text_message("old")).await.unwrap();
-            w.new_session().await.unwrap();
-            w.ports().session.append(text_message("new")).await.unwrap();
-        }
-
-        let w2 = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+    async fn update_meta_title_is_written_once() {
+        let dir = temp_dir("meta_idempotent");
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
-        assert_eq!(w2.session_messages().len(), 1);
-        // 新会话只有 "new"。
-        let text = match &w2.session_messages()[0].content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            _ => panic!("expected text"),
-        };
-        assert_eq!(text, "new");
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        w.update_meta(|m| {
+            if m.title.is_none() {
+                m.title = Some("第一次".into());
+            }
+            m.turns = 1;
+        })
+        .await
+        .unwrap();
+        let meta = w.meta().unwrap();
+        assert_eq!(meta.title.as_deref(), Some("第一次"));
+        assert_eq!(meta.v, 1, "缺省 meta 必须 v=1（不能用 default 的 v=0）");
 
-    /// **回归**：`/new` 后**不发消息就退出**，重启必须恢复**新**（空）会话，
-    /// 而不是含旧消息的会话。
-    ///
-    /// 修复前 `new_session` 只 `JsonlSession::open`（惰性落盘），磁盘上只有
-    /// 旧文件 → `latest_session_path` 仍选旧文件 → `/new` 等于没生效。
-    #[tokio::test]
-    async fn restart_after_new_without_messages_recovers_new_empty_session() {
-        let dir = temp_dir("recover_new_empty");
-        let new_path = {
-            let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
-                .await
-                .unwrap();
-            w.ports()
-                .session
-                .append(text_message("first msg"))
-                .await
-                .unwrap();
-            let new_path = w.new_session().await.unwrap().expect("持久会话应返回路径");
-            // 关键：不发任何消息就结束作用域（模拟退出）。
-            assert!(new_path.exists(), "/new 应立即落盘空文件");
-            new_path
-        };
-
-        // 重新构造 Wiring = 模拟重启。
-        let w2 = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            w2.session_path(),
-            Some(new_path.as_path()),
-            "重启应恢复新文件"
-        );
-        assert!(
-            w2.session_messages().is_empty(),
-            "重启应恢复新空会话，而非含 'first msg' 的旧会话"
-        );
+        w.update_meta(|m| {
+            if m.title.is_none() {
+                m.title = Some("第二次".into());
+            }
+            m.turns = 2;
+        })
+        .await
+        .unwrap();
+        let meta = w.meta().unwrap();
+        assert_eq!(meta.title.as_deref(), Some("第一次"), "title 只写一次");
+        assert_eq!(meta.turns, 2, "其余字段照常刷新");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -347,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn session_clear_empties_history_but_keeps_file() {
         let dir = temp_dir("clear");
-        let mut w = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
         w.ports()

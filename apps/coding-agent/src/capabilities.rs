@@ -688,10 +688,10 @@ mod tests {
     /// `/new`（持久会话）：换到新文件，旧文件保留。
     #[tokio::test]
     async fn test_new_session_switches_session_file() {
-        use ys_session::JsonlSession;
+        use ys_session::{JsonlSession, Session as _};
 
         let dir = temp_dir("newsession");
-        let mut wiring = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
         let old = wiring.session_path().unwrap().to_path_buf();
@@ -710,11 +710,23 @@ mod tests {
         let new = wiring.session_path().unwrap().to_path_buf();
         assert_ne!(old, new);
         assert!(old.exists(), "旧会话文件保留");
-        assert!(new.exists(), "/new 应立即落盘空文件");
+        // `/new` 惰性：只换句柄，未追加前不落盘新文件。
+        assert!(!new.exists(), "/new 不预建空文件");
         assert!(wiring.session_messages().is_empty());
         assert!(out[0].contains("New conversation started"), "{out:?}");
-        // 新文件确实是可读的 jsonl（空）
-        assert!(JsonlSession::open(&new).await.is_ok());
+        // 追加后新文件才落盘，且是可读的 jsonl。
+        wiring
+            .ports()
+            .session
+            .append(ys_core::Message {
+                role: ys_core::Role::User,
+                content: vec![ys_core::ContentBlock::Text { text: "new".into() }],
+            })
+            .await
+            .unwrap();
+        assert!(new.exists(), "追加后新会话文件落盘");
+        let reopened = JsonlSession::open(&new).await.unwrap();
+        assert_eq!(reopened.messages().len(), 1, "新文件只含新会话内容");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -732,7 +744,7 @@ mod tests {
         let dir = temp_dir("compact_summarize");
         let model = MockModel::new("mock");
         model.push_text("HANDOFF SUMMARY");
-        let mut wiring = Wiring::persistent(
+        let mut wiring = Wiring::persistent_new(
             Some(Box::new(model)),
             Box::new(CollectingSink::new()),
             dir.clone(),
@@ -790,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn test_compact_without_model_keeps_session_intact() {
         let dir = temp_dir("compact_no_model");
-        let mut wiring = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
         seed(&mut wiring, 6, 100).await;
@@ -822,7 +834,7 @@ mod tests {
         let dir = temp_dir("compact_failure");
         let model = MockModel::new("mock");
         model.push_error("provider 挂了");
-        let mut wiring = Wiring::persistent(
+        let mut wiring = Wiring::persistent_new(
             Some(Box::new(model)),
             Box::new(CollectingSink::new()),
             dir.clone(),
@@ -859,7 +871,7 @@ mod tests {
     async fn test_compact_with_too_few_messages_says_nothing_to_compact() {
         let dir = temp_dir("compact_too_few");
         let model = MockModel::new("mock"); // 队列为空：被调用即 panic
-        let mut wiring = Wiring::persistent(
+        let mut wiring = Wiring::persistent_new(
             Some(Box::new(model)),
             Box::new(CollectingSink::new()),
             dir.clone(),
@@ -881,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_copies_session_file_to_target() {
         let dir = temp_dir("export");
-        let mut wiring = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
         wiring
@@ -913,7 +925,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_without_path_does_not_truncate_session_file() {
         let dir = temp_dir("export_default");
-        let mut wiring = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
         // `JsonlSession` 惰性落盘：先写一条，文件才真实存在。
@@ -946,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_to_session_path_itself_is_guarded() {
         let dir = temp_dir("export_self");
-        let mut wiring = Wiring::persistent(None, Box::new(CollectingSink::new()), dir.clone())
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
             .await
             .unwrap();
         wiring

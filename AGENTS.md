@@ -11,8 +11,9 @@
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（833 passed / 7 ignored）
+- `cargo test --workspace` — 全量测试（896 passed / 7 ignored）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
+- `cargo run -p ys-coding-agent -- --resume[=<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume=<id>` 指定 id / 路径）
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr
@@ -74,7 +75,7 @@
 | 术语（Turn / Round / StopReason / 错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
 | **给新需求归类**（Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
 | 某个决策的 why | `docs/adr/` —— **文件名即摘要**（如 `0021-plugin-seam-without-hook-system.md`） |
-| **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）；其余 as-built：`search-tools` / `tools-web` / `compaction` / `skills` / `truncation-guard` |
+| **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）；其余 as-built：`session-default-new` / `search-tools` / `tools-web` / `compaction` / `skills` / `truncation-guard` |
 | 某个 crate / 文件干什么 | 对应 crate 的 `src/lib.rs`（模块头 `//!` 注释）；目录与分层见 `docs/architecture.md` §1、组件关系见 §3 |
 | `/login` & `/model` 的行为设计 | `docs/arch/commands/login-model-behavior/` |
 | 把项目约定送到模型面前的通道与成本 | `docs/arch/prompt-delivery/notes.md` |

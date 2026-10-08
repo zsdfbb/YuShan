@@ -50,6 +50,9 @@ pub struct App {
 
 impl App {
     pub fn new(view: CodingView) -> Self {
+        // 启动时消费一次视图初值；运行期真值是 `App.thinking_visible` 自身，
+        // 不会随 `Outbound::View` 快照覆盖（设计 §5.6）。
+        let thinking_visible = view.thinking_visible;
         Self {
             view,
             transcript: Vec::new(),
@@ -59,7 +62,7 @@ impl App {
             completion: None,
             pending_prompt: None,
             is_turning: false,
-            thinking_visible: false,
+            thinking_visible,
             should_quit: false,
             turn_started_at: None,
             working_dot: 0,
@@ -295,6 +298,29 @@ mod tests {
 
     fn app() -> App {
         App::new(CodingView::for_test())
+    }
+
+    /// `App::new` 消费一次视图初值：`CodingView.thinking_visible = true` ⇒ App 为真。
+    ///
+    /// 变异：`App::new` 里硬编码 `thinking_visible: false` ⇒ 本测试变红。
+    #[test]
+    fn test_app_new_consumes_view_thinking_initial() {
+        let mut view = CodingView::for_test();
+        assert!(!view.thinking_visible, "for_test 默认隐藏");
+        view.thinking_visible = true;
+        let a = App::new(view);
+        assert!(a.thinking_visible, "启动初值应进 App");
+    }
+
+    /// 运行期 `Outbound::View` 快照**不覆盖** `thinking_visible` —— UI 自身才是真值。
+    #[test]
+    fn test_view_snapshot_does_not_override_thinking() {
+        let mut a = app();
+        a.thinking_visible = true;
+        let mut snapshot = CodingView::for_test();
+        snapshot.thinking_visible = false;
+        a.apply_outbound(Outbound::View(snapshot));
+        assert!(a.thinking_visible, "快照不得覆盖运行期真值");
     }
 
     fn env(event: AgentEvent) -> Envelope {
@@ -735,10 +761,7 @@ mod tests {
         match &a.transcript[0] {
             TranscriptLine::System(s) => {
                 assert!(s.contains("truncated"), "要报出截断这一事实：{s}");
-                assert!(
-                    !s.contains("tool call(s)"),
-                    "纯文本截断不该提工具调用：{s}"
-                );
+                assert!(!s.contains("tool call(s)"), "纯文本截断不该提工具调用：{s}");
             }
             other => panic!("expected System, got {other:?}"),
         }

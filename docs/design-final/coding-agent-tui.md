@@ -334,6 +334,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D8 | `ys-protocol` 里的 `Envelope` / `LifecyclePolicy`「迁往 ys-protocol」（review R1 建议） | 已迁；`ys-channel` 整 crate 删除 | 见 `core-channel.md` §8 |
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
 | D10 | review R2「倾向」在 `Outbound` 加 `Diagnostic { level, text }` | **未采纳** —— 采纳 design §6「没有 `Diagnostic` 变体」 | 命令期诊断走 `Output`、库内部走日志文件，通用变体无消费者 |
+| D11 | 本篇未写（会话默认新会话特性落地后补） | 初始化顺序：`--resume` 解析 + `pick`/`resolve` 与**读回 meta** 必须排在**模型解析之前**（meta 参与模型选择），且都在建 runtime / 起屏之前（picker 输出走 stderr） | 见 `docs/design-final/session-default-new.md`；ADR-0026 |
 
 ### 8.2 design.md 未写、实现时补的微决策
 
@@ -349,6 +350,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M7 | **`/new` 后 `session_started` 重置**（状态行时长据此归零） | `app_loop::run` |
 | M8 | **`export` 为同步 `std::fs::copy`**：会话是本地小文件；把一个非 `Sync` 的 `&Wiring` 借进 app 循环的 future 跨 `await` 会让整个循环不再 `Send`、无法 `spawn` | `capabilities::export` |
 | M10 | **`/skills` 命令（skills 特性落地后补）**：TUI 浮层列全部 skill（`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的**——与 `/` 浮层同一条规则），选中后**回填输入框** `/<command> `（尾随空格）而**不发 `Request`**：skill 常带参数（`/git-status --short`），用户补完再回车；`-p` / `--json` 无 TUI，不涉及此路。为此 `resolve_prompt` 的返回类型由 `Result<Request, _>` 改为 **`Result<PromptOutcome, _>`**（`PromptOutcome::Request` \| `PromptOutcome::Prefill(String)`），`run_prompt` 据此分支「发送」或「回填输入框」。选项文本与 `/` 补全**共用** `completion::skill_label` —— `Prompter::select` 只回传**显示串**，反解回 `command` 靠的就是这条格式（**故它是承重的**） | `ys-tui-coding/src/{commands,prompter,run,completion}.rs` |
+| M11 | **`/new` 惰性不预建会话文件**：默认新会话 + 显式 `--resume` 落地后 `latest_session_path` 已删，「预建空文件以免重启选回旧文件」的旧理由失效 —— `/new` 只换 `session` 句柄，新文件首次 `append` 才落盘（旧文件保留） | `apps/coding-agent/src/{wiring,capabilities}.rs`；见 `docs/design-final/session-default-new.md` |
 
 ---
 

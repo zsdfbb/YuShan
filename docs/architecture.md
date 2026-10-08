@@ -510,7 +510,7 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TB
-    ARGV["argv"] --> PARSE["parse_args()"]
+    ARGV["argv"] --> PARSE["parse_args()<br/>（含 --resume[=&lt;id&gt;]）"]
     PARSE --> M{"mode"}
 
     M -->|"（默认）"| TUI["Interactive"]
@@ -521,9 +521,9 @@ flowchart TB
     P --> P_S["ChannelSink<br/>同上"]
     J --> J_S["ChannelSink<br/>同上"]
 
-    TUI_S --> TUI_W["Wiring::persistent<br/>（JsonlSession 落盘）"]
-    P_S --> P_W["Wiring::ephemeral<br/>（MemorySession 不落盘）"]
-    J_S --> J_W["Wiring::ephemeral"]
+    TUI_S --> TUI_W["Wiring::persistent_new / resume<br/>（JsonlSession 落盘）"]
+    P_S --> P_W["Wiring::persistent_new / resume<br/>（JsonlSession 落盘）"]
+    J_S --> J_W["Wiring::persistent_new / resume<br/>（同上）"]
 
     TUI_W --> TUI_D["rt.spawn(app_loop) + 当前线程跑 UI<br/>① Request / ② Boundary / ③ Outbound"]
     P_W --> P_D["run_single_turn（begin_turn(1)）<br/>tokio::join! 消费 Envelope"]
@@ -539,7 +539,17 @@ flowchart TB
 **为什么消费以「终局事件」而非「信道关闭」为终止条件**：sender 在 agent 侧（`ChannelSink` 归接线器），
 不 drop 信道就不会关闭；等关闭必死锁。
 
-**为什么 `-p`/`--json` 用 `ephemeral`**：避免把上次交互的会话历史灌进一次性任务。行为与引入前等价（此前也是 `MemorySession`）。
+**为什么 `-p`/`--json` 也持久化**：三模式统一落盘（`persistent_new` / `resume`），共用同一个回合末
+meta 写入点 `finalize_turn_meta`（title / model / provider / tokens / thinking）；收尾把
+`session: <id>` 打到 **stderr**（stdout 是数据流），使一次性任务也能被后续 `--resume` 找回。
+`Wiring::ephemeral`（`MemorySession`）降为**测试专用**（`#[cfg(test)]`），生产路径不再用它。
+
+- **默认新会话**：启动不再隐式恢复「最近会话」；恢复只走显式 `--resume`——裸 flag = 列表选择，
+  `--resume=<id>` = 指定 id（或路径）；`--resume <id>`（空格）不支持。
+- `resolve` / `pick` 在**起屏 / 建 runtime 之前**解析（meta 参与模型选择）；picker 的列表 / 提示 /
+  错误**一律写 stderr**。列表为空 ⇒ **回落默认新会话**（stderr 一行提示，不报错）；非 TTY 且裸
+  `--resume` ⇒ stderr 打印列表 + 报错退出。
+- `-p` / `--json` 也落盘（`persistent_new` / `resume`）——见 §12。
 
 ---
 
@@ -555,7 +565,7 @@ flowchart LR
     end
 
     subgraph NEW["新 Wiring"]
-        NS["session: JsonlSession<br/>（立即落盘的空文件）"]
+        NS["session: JsonlSession<br/>（惰性新建：首次 append 才落盘）"]
         NM["model: 当前选择"]
     end
 
@@ -569,7 +579,9 @@ flowchart LR
     classDef note fill:#fff8e1,stroke:#f9a825
 ```
 
-**「立即落盘空文件」是必须的**：新会话文件若惰性创建，用户 `/new` 后**没发消息就退出**，磁盘上只有旧文件 → 重启恢复到的还是旧会话 → **`/new` 等于没生效**（实测复现过的 bug）。
+**`/new` 惰性创建即可**：启动不再隐式恢复「最近会话」（§12，恢复只走显式 `--resume`）后，
+「新文件若惰性创建 → 重启选回旧文件」的旧理由**已失效**——故 `/new` 只换 `session` 句柄，
+新文件**首次 `append` 才落盘**（不预建空文件）；旧文件保留。
 
 > 旧拓扑（2026-09-14 前）的表述是「换队列：pending 丢弃、新 `Inbox` 为空」——`Inbox` 已删，
 > 现只换 `session` / `model`（`Wiring` 的两个字段）。状态行的会话时长在 `/new` 后归零。
@@ -578,28 +590,80 @@ flowchart LR
 
 ## 12. 会话落盘与恢复
 
+**默认新会话；恢复只走显式 `--resume`。** `Wiring` 拆成 `persistent_new`（默认）与 `resume`（显式），
+删除了 `latest_session_path` 的隐式「恢复最近」。会话状态写进 JSONL **首行的 meta**（无 sidecar），
+`JsonlSession` 全量重写时保住它。
+
 ```mermaid
 flowchart TB
-    START["启动"] --> DIR{"~/.yushan/sessions/<br/>有 *.jsonl 吗？"}
-    DIR -->|有| LATEST["取文件名最大者<br/>（{unix秒}_{纳秒} → 字典序 == 时间序）"]
-    DIR -->|无| CREATE["生成新 id，新建"]
-    LATEST --> LOAD["JsonlSession::open<br/>逐行反序列化，坏行跳过并告警"]
-    CREATE --> LOAD
-    LOAD --> RUN["正常运行"]
+    START["启动：parse_args（含 --resume）"] --> R{"--resume ?"}
 
-    RUN --> APPEND["每回合 append<br/>原子写：写 tmp → rename"]
-    RUN --> NEWCMD["/new"] --> NEWSESS["新建空文件并立即落盘<br/>旧文件保留"]
+    R -->|无| NEW["默认新会话：persistent_new<br/>算出 {unix}_{纳秒}.jsonl<br/>惰性：零目录扫描、不预建"]
+    R -->|"--resume=&lt;id&gt;"| RES["sessions::resolve<br/>先 dir/{id}.jsonl，再按字面路径"]
+    R -->|"裸 --resume"| LIST["sessions::list（mtime DESC）<br/>只读首行 + 4 KiB 封顶"]
+
+    LIST --> EMPTY{"列表空？"}
+    EMPTY -->|"是：回落新会话"| NEW
+    EMPTY -->|否| TTY{"TTY？"}
+    TTY -->|否| ABORT["stderr 打列表 + 提示<br/>exit(1)"]:::bad
+    TTY -->|是| PICK["sessions::pick<br/>两列读 stdin（输出全走 stderr）"]
+
+    RES -->|未命中| ABORT
+    RES -->|命中| LOAD
+    PICK --> LOAD
+    NEW --> RUN
+
+    LOAD["JsonlSession::open<br/>逐行判别 meta / Message，坏行跳过并告警<br/>TurnStats 由 meta 播种"] --> RUN["正常运行"]
+    RUN --> APPEND["每回合 append（全量重写）<br/>先写 meta 行、再写消息 ⇒ meta 永不丢（C1）"]
+    RUN --> FTM["回合末 finalize_turn_meta（三模式共用）<br/>title / model / provider / tokens / thinking"]
+    RUN --> NEWCMD["/new"] --> NEWSESS["换 session 句柄，惰性新建<br/>旧文件保留、不预建空文件"]
 
     style LOAD fill:#e8f5e9
+    classDef bad fill:#ffebee,stroke:#c62828
 ```
+
+**默认新会话**：`persistent_new` 只 `create_dir_all` + 算出 `{unix秒}_{纳秒}.jsonl`，**零目录扫描、
+不预建**（首次 `append` 才落盘）。会话目录非空时，启动期给一行 `Resume with --resume` 提示（TUI 走
+transcript，`-p` / `--json` 走 stderr）。
+
+**恢复只走显式 `--resume`**：
+
+- `--resume=<id>` → `sessions::resolve`：先 `dir/{id}.jsonl`、再按字面路径；未命中 ⇒ stderr 报错 + `exit(1)`。
+- 裸 `--resume` → `sessions::list`（**mtime DESC**）+ `sessions::pick`。**空列表回落默认新会话**
+  （stderr 一行提示，不报错）；**非 TTY** ⇒ stderr 打印列表 + 提示改用 `--resume=<id>` 后报错退出。
+- 解析与 pick 都在**起屏 / 建 runtime 之前**（读回的 meta 参与模型选择）；picker 的列表 / 提示 /
+  错误**一律 stderr**（`-p` 的 stdout 是模型文本、`--json` 的 stdout 是逐行 `Envelope`）。
+
+**meta 首行**（可缺省）：形状
+`{"type":"meta","v":1,"title":…,"provider":…,"model":…,"thinking_visible":…,"input_tokens":…,"output_tokens":…,"turns":…,"created_at":…}`；
+`type` 是**必填**判别键。逐行判别：先按 `Message` 解析 → 失败再按 `SessionMeta` → 皆失败走既有
+「坏行跳过 + 告警」。判别安全的依赖是 **`Message` 无顶层 `type`**（有契约快照用例钉住）。
+
+- **C1 · meta 永不因重写丢失**：`flush_to_file` 是唯一落盘点，**先写 meta 行、再写消息**；
+  `append` / `clear` / `replace_all` / `set_meta` 全经它 ⇒ `/compact`（走 `replace_all`）也保住 meta。
+- **title（C2 / C3 / C6）**：素材是 **skill 展开之前**的用户原文（C3）；仅 `title.is_none()` 时写
+  `derive_stored_title(raw)`（折叠空白 + `chars().take(500)`，UTF-8 安全）⇒ 幂等，且已落盘故
+  `/compact` 改写首条也不污染标题。显示层再截到 50 字符 + `…`。500 字符 CJK ≈ 1.5 KiB ⇒ meta 行有界，
+  撑起「列表只读首行 + 4 KiB 封顶」（C6）。
+- **列表读取**：`list` 只 `stat` + 读**首行**（**字节级读取、换行切分、封顶 4 KiB，最后才解码**；
+  打不开 / 首行超封顶切在多字节字符中间 / `.jsonl.tmp` 残留一律跳过）；标题取 `meta.title` 截断，
+  缺省「新会话」。
+- **`/new` 惰性换文件**：只换 `session` 句柄，**不预建空文件**（旧文件保留）——启动不再隐式恢复最近，
+  预建失去理由。
+- **恢复后语义**：`JsonlSession::open` 读回 meta + messages；模型按
+  `env 凭证 > meta（须 registry.auth_for 命中）> state.json > 首个有凭证者` 解析（provider 无凭证时
+  **降级而非失败**，见 `docs/design-final/session-default-new.md`）；`TurnStats` 用 meta 的
+  `input_tokens / output_tokens / turns` **播种**（`session_started` 状态行时长**不恢复**）；
+  `Envelope.turn` 是**本进程**回合序，resume 后仍从 1 起。
 
 | 项 | 值 |
 |---|---|
 | 路径 | `~/.yushan/sessions/{unix秒}_{纳秒}.jsonl` |
-| 覆盖 | 环境变量 `YUSHAN_SESSIONS_DIR`（测试用） |
-| 写策略 | 原子：写 `{file}.jsonl.tmp` → `rename` |
-| 损坏处理 | 跳过坏行并告警，不终止 |
-| 已知缺口 | **多进程并发写同一文件无锁**（整文件重写 + 固定 tmp 名会丢更新） |
+| 覆盖 | 环境变量 `YUSHAN_SESSIONS_DIR`（逐字返回）；缺省 `$HOME/.yushan/sessions`（非绝对 `HOME` ⇒ 降级到绝对临时目录） |
+| 写策略 | 原子：写 `{file}.jsonl.tmp` → `rename`；**全量重写**（每次 `append` 重写整文件） |
+| meta 行 | JSONL **首行**（可缺省），其余行是裸 `Message`；`type:"meta"` 判别键；title 写前 `chars().take(500)` |
+| 损坏处理 | 跳过坏行并告警，不终止；无 meta 的老会话照常可达（标题显示「新会话」） |
+| 已知缺口 | **多进程并发写同一文件无锁**（整文件重写 + 固定 tmp 名会丢更新）；`-p`/`--json` 与 `/new` 会产生空会话（不清理）；`update_meta` 每回合一次全量重写（写放大） |
 
 ---
 
@@ -700,6 +764,7 @@ flowchart TB
         I2["ys-runtime/tests/v0_integration.rs<br/>跨 crate 闭环"]
         I3["coding-agent/tests/integration.rs<br/>工具层"]
         I4["coding-agent/tests/stream_usage_fallback.rs<br/>流式 usage 门控与 400 回退"]
+        I5["coding-agent/tests/session_cli.rs<br/>子进程：会话装配 / --resume / 模型恢复优先级"]
     end
 
     APP["apps/coding-agent/src/app_loop.rs 内联<br/>app 循环：Prompt→事件、残留 Abort 丢弃（变异测试）"]
@@ -708,6 +773,10 @@ flowchart TB
     UNIT --> INTEG --> E2E
     APP --> E2E
 ```
+
+`session_cli.rs` 经 `CARGO_BIN_EXE_*` 起**真实子进程**：捕获真实 stdout/stderr（断言非 TTY picker
+不污染 stdout、空列表回落、退出码）与**真实 HTTP 请求**（回环 mock listener 读 `model` 字段，
+端到端复核恢复优先级）。详见 `docs/design-final/session-default-new.md`。
 
 **测试替身（均为生产导出，供跨 crate 复用）**
 

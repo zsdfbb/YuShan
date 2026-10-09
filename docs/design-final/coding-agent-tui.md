@@ -496,3 +496,43 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 - **错误路径下 `rounds` 记 0**：`app_loop` 的 §4.9 可观测行取 `rounds = match &outcome { Ok(result) => result.rounds, Err(_) => 0 }`（`app_loop.rs:372-375`）；`Err` 路径下 `rounds` 记 0，**低估**真实轮数（`cumulative_rounds` 因此也少加）。仅影响该排障行，不影响执行。
 - **同一 poll 内计时器至多一条说明行**（核实结论，**非**债务）：`budget_exhausted` 在计时器分支体内**先**同步置位（`app_loop.rs:350`）**再** `await` 发送，`select!` 的 `if !budget_exhausted` 前置条件随即禁用该分支 ⇒ 说明行至多一条、`Abort` 至多 push 一次。`-p` / `--json` 的 `run_single_turn` 同形。
+
+---
+
+## 13. subagent 派发（ADR-0022 / 0029）— as-built
+
+形态决策见 [ADR-0022](../adr/0022-subagent-dispatch.md)（accepted），落地裁定见 [ADR-0029](../adr/0029-subagent-landing-decisions.md)（accepted）。本节只记**实际形态**。
+
+### 13.1 装配（启动期一次，之后冻结）
+
+- **父工具表 = 基础 9 元 + `SubagentTool` 追加末位**（`main.rs`：`toolset::build_tools` 之后 `tools.push(Box::new(subagent::SubagentTool::new(setup.outer_timeout())))`）。末位保证**子 tools JSON 是父的字节前缀** ⇒ 命中 prompt cache。
+- **子工具表 = 基础 9 元**（无 `subagent`）⇒ 派发**结构上不可能递归**（`registry.get("subagent")` 未命中 ⇒ 走 `tool not found`）。
+- **两份系统提示**：父（10 工具，能力边界声明改为「CAN delegate tasks to subagents」）、子（9 工具，逐字保留「no subagents」）。由 `prompt::build_system_prompt` 按**工具表派生**，不是常量。
+- **子 `RunLimits`**：与主 agent 同源（同一份 `Config`），但 `fixed_prompt_tokens` 填**子表**的真值（否则子会话系统性晚触发压缩）。
+
+### 13.2 每回合的注入与运行
+
+- 三条入口（TUI `app_loop` / `-p` / `--json`）**每回合**造一份 `AppSubagentRunner`（派发计数器因此天然 per-turn），经 `AgentPorts::with_subagent` → `RuntimeContext.subagent` → `ToolContext.subagent` 三跳送达工具。
+- 一次派发：建**全新子 `Agent`**（`Agent::run_turn` 取 `&mut self`，实例不可共享） + `MemorySession` + `NoopEventSink`（**子事件不进父事件流**）+ `ChildBoundary`。
+- **取消**：`ChildBoundary::take()` 只取自己那份、`is_aborted()` = 自己 **或** 父 —— 父 Abort 经探针向下传播，子吃不到父的 `Steer`。
+- **子预算**：watchdog（`tokio::spawn(sleep(budget) → 子边界源 push(Abort))`，用 **`AbortOnDropHandle`** 防孤儿任务）；子预算与主 agent 同值 ⇒ 真实天花板是父回合那条 deadline。
+- **超时**：`Tool::timeout()` 的优先级链（工具声明 → `bash_timeout` → 300s）；`subagent` 的外闸 = 子预算 + 60s 宽限，**构造期由 `Config` 注入**（ADR-0029 修正 2）。
+
+### 13.3 结果与产物
+
+- **回传**：摘要硬截断 ≤ 8 KB（`MAX_SUMMARY_BYTES`，UTF-8 安全）+ 完整转录落 `~/.yushan/subagents/`（`YUSHAN_SUBAGENTS_DIR` 覆盖口；Primary 档启动期 sweep 7 天）+ **`## Files` 节由 runner 保证存在**（子不报写 `(none)`）。
+- **失败**：子撞 `max_rounds` / 被取消 ⇒ `Ok` + 非 `Completed` 的 `stop_reason` + `diagnostic` ⇒ 父侧 `ToolResult{is_error}`，**父回合不失败**。只有「跑都跑不起来」（如 `model` 名构造失败）才让 `run` 返回 `Err`。
+- **`model` 参数**：按名构造（`Config::build_model_for`）+ `Arc<dyn Model>` 缓存（复用连接池/TLS）；构造失败 **fail-closed**，绝不静默回退父模型。
+- **usage 上卷**：子 usage 累加进 `Arc<UsageTotals>`，回合末 drain 并追加进 `RunResult.usage` ⇒ `TurnStats` / meta / 退出码看到真实总消耗。
+
+### 13.4 并行批（Step 9）
+
+- 准入：批次 `len > 1` **且每一个**工具都 `is_concurrency_safe()` ⇒ 走 `futures_util::stream::iter(..).buffered(max_parallel_tools)`（**保序**、单任务内并发、不需 `'static`）；否则**原串行路径**。
+- 事件顺序：并行批先保序 emit 全部 `ToolCall`、执行、再保序 emit 全部 `ToolResult`；**串行批保持逐个 `C1,R1,C2,R2`**（既有行为逐字节不变）。默认 `is_concurrency_safe() == false` 是这条的守卫；今天只有 `subagent` 覆写为 `true`。
+
+### 13.5 已知缺口（承接 §10/§12 的口径）
+
+- 子 agent 内部活动在**任何输出通道都不可见**（`--json` 亦然），只有落盘转录可查 —— ADR-0022 决策 2 的少数派偏离。
+- 并行子 agent 的**写冲突无人管**（本仓无 branch/worktree、无沙箱），只能靠 guideline「写目标不相交」。
+- 每回合派发总量上限（`DEFAULT_MAX_DISPATCHES_PER_TURN = 16`）是**仅剩的代码级成本防线**：`max_rounds` 默认已放宽到 `u32::MAX`，且子取同一份 `Config`（子自身无独立上界）。
+- ⚠️ **`--json` 的 `RunFinished.usage` 不含子 agent usage**：子 usage 是在 app 侧、回合**结束后**追加进 `RunResult.usage` 的（`merge` 点在 `app_loop::run_turn_once` / `main::run_single_turn`），而 `RunFinished` 由 `BasicLoop` 在回合内发出 ⇒ **事件流里的 usage 只算父**。TUI 的状态行（`TurnStats`）与 `-p` 的 meta 走的是合并后的 `RunResult.usage`，**是正确总数**。⇒ 脚本消费者若要精确总成本，需自行减去或改用 meta；这是「循环拥有 `RunFinished`」这一结构的直接代价，记在此处。

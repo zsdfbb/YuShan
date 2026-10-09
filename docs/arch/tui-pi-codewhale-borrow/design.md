@@ -21,6 +21,8 @@
 > - **不做全屏**（无 alt-screen、无 raw mode）
 > - **静态组件优先**（无动态插件、热插拔）
 > - **后台 agent 定位**：纯 UI 花活（Markdown 渲染、Diff Viewer、Theme、**鼠标**、可配快捷键）已正式砍掉
+>   > **2026-10-09 修订**：**Markdown 渲染已解除**，见 [ADR-0030](../../adr/0030-tui-markdown-render.md)；
+>   > 其余仍砍。注：本文件写于「行式 REPL（rustyline）」方向下，而该方向未落地，实际仍是 ratatui。
 
 ---
 
@@ -31,7 +33,7 @@
 | TUI 实现规模 | 42 文件 / 18k 行 TS | 808 文件 / 966k 行 Rust | 1684 行 Rust | origin 估约 500 行 |
 | 形态 | alt-screen | alt-screen | ratatui alt-screen | **行式 REPL（rustyline）** |
 | 输入 | 自研 Editor 2.4k 行 | 自研 Composer ~600 行 + UI 2.7k 行 | ratatui events.rs 305 行 | **rustyline**（行编辑/历史/补全白送） |
-| Markdown 渲染 | `marked` 替换 + 自定义着色器 ~1k 行 | 自研 tag-parse + 4k 行 renderer | 无 | **无（已砍）** |
+| Markdown 渲染 | `marked` 替换 + 自定义着色器 ~1k 行 | 自研 tag-parse + 4k 行 renderer | 无 | **做**（借库 `tui-markdown`，非自研；[ADR-0030](../../adr/0030-tui-markdown-render.md)） |
 | Slash 命令数 | 23 | 96（9 groups） | 10 | 10–15（按 v1 补遗 P6） |
 | 主题/多语言 | 单色 / 单英文 | 13 主题 / 15 语言 | 单色 / 单中文 | **单色 / 单中文** |
 | 取消路径 | Esc → Loader.AbortSignal | Esc → cancel stack + `1ms` 节拍 | ratatui KeyEvent 路由 | **`tokio::signal::ctrl_c()`** |
@@ -74,7 +76,7 @@ YuShan 目标形态（origin `tui-stack-revisit/design.md:30-49`）：
 | Composer 圆角边框 + 聚焦换色 | **可借鉴**为 line REPL 输入框视觉提示（约 10 行 ANSI） | pi `tui.ts` + CodeWhale `tui/composer_ui.rs` |
 | Topbar 状态条 | **借鉴为单行 footer** | origin §3.3 + CodeWhale `tui/infoline.rs` |
 | Inline hint（光标后灰字）| **直接借鉴** | rustyline `Hinter` 内置 |
-| Markdown 高亮 | **不借鉴** | origin 砍；pi 1k 行 / CodeWhale 4k 行 |
+| Markdown 高亮 | **不借鉴**（注：markdown **渲染**已解除并借库，但**语法高亮**仍不做 —— 见 [ADR-0030](../../adr/0030-tui-markdown-render.md)） | origin 砍；pi 1k 行 / CodeWhale 4k 行 |
 | 持续 alt-screen 刷新 | **不借鉴**——line REPL 用 `\r` 原地覆盖 | — |
 | 终端原生 scrollback 作为 transcript | **完全借鉴** | pi `tui-main-screen.ts:247-616` 的"scrollback inflation"教训是反面教材 |
 
@@ -148,7 +150,7 @@ Rust 实现就一个 `enum CompletionKind { SlashCmd, SlashArg(&'static str), Pa
 
 **借鉴判断**：
 
-- Markdown 高亮：**不做**——成本 1k+ 行，origin 已砍
+- Markdown 高亮：**不做**——成本 1k+ 行，origin 已砍。（注：markdown **渲染**于 2026-10-09 另行解除，借库而非自研，见 [ADR-0030](../../adr/0030-tui-markdown-render.md)；**语法高亮仍不做**。）
 - 流式增量：`apply_agent_event` 已经做对了，**原样保留**；这是 `ui/mod.rs:359-372`
   的纯函数，单元测试（`ui/mod.rs:582-664`）会迁移到 line REPL 测试里
 - 代码块最小着色：**可借鉴**——CodeWhale `tui/markdown_render.rs` 的 fenced-block 检

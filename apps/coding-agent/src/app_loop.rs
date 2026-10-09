@@ -2026,6 +2026,8 @@ mod tests {
                     std::time::Duration::from_secs(30),
                     tmp.to_path_buf(),
                     WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
+                    // 产物目录注入临时路径 —— 不写进用户的 `~/.yushan/subagents/`。
+                    crate::subagent::SubagentsDir::at(tmp.join("subagents"), false),
                 ))
             },
         )

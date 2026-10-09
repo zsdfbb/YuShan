@@ -1232,6 +1232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_turn_duration(),
         workspace.clone(),
         web,
+        subagent::SubagentsDir::resolve(),
     );
     // 产物目录清理：只清 Primary 档的超龄文件（`YUSHAN_SUBAGENTS_DIR` 只写不删）。
     subagent_setup.sweep_old_products();

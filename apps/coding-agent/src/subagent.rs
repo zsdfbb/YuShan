@@ -124,6 +124,13 @@ impl SubagentsDir {
         }
     }
 
+    /// 测试注入用：显式落点，避免测试经 [`resolve`](Self::resolve) 把转录写进真实的
+    /// `~/.yushan/subagents/`。`sweep` 仅在为 `true` 时启用启动期清理。
+    #[cfg(test)]
+    pub fn at(path: PathBuf, sweep: bool) -> Self {
+        Self { path, sweep }
+    }
+
     /// 启动期清理：只对 Primary 档生效，删超过 [`RETENTION`] 的文件。
     pub fn sweep_old(&self) {
         if !self.sweep {
@@ -225,12 +232,16 @@ pub struct SubagentSetup {
 }
 
 impl SubagentSetup {
+    /// 产物目录**由装配方显式给出**（不在构造期隐式读 `YUSHAN_SUBAGENTS_DIR` / `HOME`）——
+    /// 落点决策与 `WebConfig::from_env` / `sweep_fetched` 同在装配点完成，且测试可注入
+    /// 临时目录，不会写进用户的 `~/.yushan/subagents/`。
     pub fn new(
         child_prompt: String,
         child_limits: RunLimits,
         child_budget: Duration,
         workspace: PathBuf,
         web: WebConfig,
+        dir: SubagentsDir,
     ) -> Self {
         Self {
             child_prompt,
@@ -238,7 +249,7 @@ impl SubagentSetup {
             child_budget,
             workspace,
             web,
-            dir: Arc::new(SubagentsDir::resolve()),
+            dir: Arc::new(dir),
             model_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -710,10 +721,7 @@ mod tests {
 
         let model = FixedUsageModel;
 
-        let dir = Arc::new(SubagentsDir {
-            path: base.join("subagents"),
-            sweep: false,
-        });
+        let dir = Arc::new(SubagentsDir::at(base.join("subagents"), false));
         let web = WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
         let totals = Arc::new(UsageTotals::default());
         let runner = AppSubagentRunner::new(
@@ -786,10 +794,7 @@ mod tests {
             Duration::from_secs(30),
             base.clone(),
             web,
-            Arc::new(SubagentsDir {
-                path: base.join("subagents"),
-                sweep: false,
-            }),
+            Arc::new(SubagentsDir::at(base.join("subagents"), false)),
             Arc::new(UsageTotals::default()),
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {

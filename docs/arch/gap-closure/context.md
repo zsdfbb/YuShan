@@ -8,6 +8,8 @@
 
 - 事件出口（`--json` / `-p`）是流式工作的**首个消费者**，TUI 是次要消费者且从简；
 - 纯 UI 花活（Markdown 渲染、Diff Viewer、Theme、鼠标、可配快捷键）**正式砍掉**，不再列为暂缓项。
+  > **2026-10-09 修订**：其中 **Markdown 渲染已解除**（红线反转），见 [ADR-0030](../../adr/0030-tui-markdown-render.md)；
+  > 其余（Diff Viewer / Theme / 鼠标 / 可配快捷键）**仍然砍掉**。
 
 **交互 REPL 入口（待决，本轮不动）**：当前交互模式用 ratatui（`tui-ratatui` feature 默认开），历史上 rustyline 已被 ratatui 替换并彻底删除（`c9a4177`→`645e339`）。后台 agent 定位下，**rustyline 可能是更合适的方向**——它能删掉 `suspend_terminal`/`resume_terminal` dance（`ui/mod.rs:97-128`）、raw-mode 下的取消路由复杂度、手写 `complete_inline` 补全，并白拿持久 history；代价是反转旧决策。**本轮先不替换**，只记录为待决方向，把精力放在后台事件出口那半（见「未澄清问题」Q7）。
 
@@ -388,6 +390,8 @@ apps/coding-agent config/provider/commands/ui/view/state
 ### 范围外（明确不做，本轮）
 
 - **Markdown 渲染 / Diff Viewer / Theme / 鼠标事件 / 可配快捷键**：纯 UI 花活。TUI 定位为「简洁 coding 界面」，这些不纳入；不影响后台 agent 能力。
+  > **2026-10-09 修订**：**Markdown 渲染**已解除（coding agent 的主要产出即 markdown 文本，属核心内容通道而非花活），
+  > 见 [ADR-0030](../../adr/0030-tui-markdown-render.md)；**Diff Viewer / Theme / 鼠标 / 可配快捷键仍砍**。
 - **Session 树分支**：独立 adapter crate（`session-jsonl-tree`），不修改现有 `JsonlSession`；本轮只做平面 `JsonlSession` 接入，树结构留给后续。
 - **动态插件系统 / Client-Server RPC / Lanes**：报告 Tier 4 已明确跳过，符合静态组合哲学。
 - **安全/沙箱/审批**：设计文档「不做安全」，`ToolRegistry` 仍只按名查找。

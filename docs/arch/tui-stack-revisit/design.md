@@ -149,7 +149,7 @@ execute!(stdout, PushKeyboardEnhancementFlags(
 | 能力 | Claude Code | CodeWhale | **YuShan** |
 |---|---|---|---|
 | 全屏 / alt-screen | 有（后加，**造成 scrollback 回归**，需逃生口） | ratatui | **不做** |
-| 富对话渲染（markdown / 高亮 / diff 卡片） | 有（重写 Ink 渲染引擎） | 有 | **不做**（已砍） |
+| 富对话渲染（markdown / 高亮 / diff 卡片） | 有（重写 Ink 渲染引擎） | 有 | **markdown 做；高亮 / diff 卡片不做**（[ADR-0030](../../adr/0030-tui-markdown-render.md) 修订：markdown 红线已解除） |
 | 常驻状态栏 / 侧栏 / 模式指示 | 有 | 有（`underwater.rs` 做 chrome） | **不做**（`/status` 按需） |
 | 鼠标 | 有 | 有 | **不做**（终端原生选择/复制够用） |
 | 审批弹窗 | 有 | 有 | 用 `inquire` 在真终端做（已有 `Prompter` 抽象） |

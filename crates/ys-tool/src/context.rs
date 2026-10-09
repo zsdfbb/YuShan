@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use ys_protocol::BoundarySource;
 
 use crate::summarizer::Summarizer;
+use crate::subagent::SubagentRunner;
 
 #[non_exhaustive]
 pub struct ToolContext<'a> {
@@ -15,6 +16,12 @@ pub struct ToolContext<'a> {
     ///
     /// `None` = 未挂载；工具应视作「本回合不支持摘要」。由上层经 [`ToolContext::with_summarizer`] 挂载。
     pub summarizer: Option<&'a dyn Summarizer>,
+    /// 一次性派发能力（可选）。
+    ///
+    /// `None` = 未挂载；派发工具应视作「本回合不支持派发」。由上层经
+    /// [`ToolContext::with_subagent`] 挂载。**这是第 3 个同形挂载点**
+    /// （先例：`boundary`、`summarizer`）。
+    pub subagent: Option<&'a dyn SubagentRunner>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -28,12 +35,19 @@ impl<'a> ToolContext<'a> {
             cwd,
             workspace_root,
             summarizer: None,
+            subagent: None,
         }
     }
 
     /// 链式挂载摘要能力（照 `RuntimeContext::with_boundary` 的先例）。不挂载时行为逐字节不变。
     pub fn with_summarizer(mut self, summarizer: &'a dyn Summarizer) -> Self {
         self.summarizer = Some(summarizer);
+        self
+    }
+
+    /// 链式挂载派发能力（照 `with_summarizer` 的先例）。不挂载时行为逐字节不变。
+    pub fn with_subagent(mut self, subagent: &'a dyn SubagentRunner) -> Self {
+        self.subagent = Some(subagent);
         self
     }
 }
@@ -78,5 +92,28 @@ mod tests {
         assert!(!mounted.is_aborted(), "boundary 应仍是原来那个源");
         assert_eq!(ctx.cwd, Path::new("有个 cwd"));
         assert_eq!(ctx.workspace_root, Path::new("有个 workspace_root"));
+    }
+
+    /// 派发能力是第 3 个同形挂载点：默认 `None`，`with_subagent` 后为 `Some`。
+    #[test]
+    fn test_with_subagent_mounts() {
+        struct FakeRunner;
+        #[async_trait]
+        impl SubagentRunner for FakeRunner {
+            async fn run(
+                &self,
+                _prompt: &str,
+                _model: Option<&str>,
+                _boundary: Option<&dyn ys_protocol::BoundarySource>,
+            ) -> Result<crate::subagent::SubagentOutcome, String> {
+                unimplemented!()
+            }
+        }
+
+        let plain = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."));
+        assert!(plain.subagent.is_none(), "未挂载时 subagent 应为 None");
+
+        let mounted = plain.with_subagent(&FakeRunner);
+        assert!(mounted.subagent.is_some(), "with_subagent 后应为 Some");
     }
 }

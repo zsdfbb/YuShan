@@ -17,6 +17,8 @@ async-trait = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
 serde_json = "1"
+# 并行工具批的保序并发（`stream::iter(..).buffered(n)`；**不用** spawn，见 Step 9）。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -72,7 +72,12 @@ Guidelines:
     //    门控：有 `read`（skill 正文靠它加载）且目录非空；否则**一字不加**。
     if tools.iter().any(|t| t.name == "read") && !catalogue.lines.is_empty() {
         prompt.push_str("\n\n");
-        prompt.push_str(&skill_section(&catalogue.lines));
+        // 能力边界声明**按工具表派生**：父表有派发工具 ⇒ 不说「no subagents」；
+        // 子表没有 ⇒ 逐字保留（对子 agent 而言那句是真话）。
+        prompt.push_str(&skill_section(
+            &catalogue.lines,
+            tools.iter().any(|t| t.name == "subagent"),
+        ));
     }
 
     prompt
@@ -97,14 +102,19 @@ pub fn has_custom_prompt(cwd: &Path) -> bool {
 ///    skill（如 `../design-interface/SKILL.md`），按 CWD 解析必然找不到。
 /// 3. **能力边界声明**（无 subagent / plan mode）—— 正文里约 20 处 Claude 专有工具名
 ///    在本 runtime 静默失效；不做符号映射（那是把上游知识写死），改为声明边界。
-fn skill_section(lines: &str) -> String {
+fn skill_section(lines: &str, has_subagent: bool) -> String {
+    let capability = if has_subagent {
+        "This runtime CAN delegate tasks to subagents via the `subagent` tool; it has no plan mode — ignore instructions that ask for plan mode."
+    } else {
+        "This runtime has no subagents and no plan mode — ignore instructions that ask for them."
+    };
     format!(
         "<available_skills>\n\
          The following skills are available. Each entry is `- <command>: <description> (location: <absolute path>)`.\n\
          To use a skill, open its `location` with the read tool and follow the instructions in that file.\n\
          Relative paths inside a skill body (e.g. `references/...`, or a sibling skill) resolve \
          relative to that skill's own directory, not the current working directory.\n\
-         This runtime has no subagents and no plan mode — ignore instructions that ask for them.\n\
+         {capability}\n\
          \n\
          {lines}\n\
          </available_skills>"
@@ -132,6 +142,10 @@ fn tool_snippet(name: &str) -> &'static str {
         // 末尾一句是**可选** `prompt` 参数的唯一线索：按意图取摘要而非整页原文。
         "webfetch" => {
             "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
+        }
+        // 派发工具（ADR-0022 决策 18 定的名字，装配端 `spec().name` 是契约）。
+        "subagent" => {
+            "Delegate a self-contained task to an isolated sub-agent and get back a summary plus a transcript path"
         }
         _ => "Custom tool",
     }
@@ -184,6 +198,43 @@ fn tool_guidelines(tools: &[&str]) -> String {
              read that path (read offset=) or grep it for more, and do not refetch the same URL. \
              Pass prompt only when you need an answer rather than the page (e.g. \"how is the auth \
              header built?\"): it costs one extra model call and is slower"
+                .to_string(),
+        );
+    }
+    if tools.contains(&"subagent") {
+        // 防失控 + 防重复劳动（来源：Anthropic 多 agent 博客的量化经验，见
+        // `docs/arch/subagent/research.md` §2.9）。措辞要点：
+        // 规模规则、任务描述四要素、并行写目标不相交、成本提醒。
+        // 并发槽位数读 `ys-component` 的**单一真值常量**（ADR-0022 决策 14 的双轨：
+        // 常量是唯一真值，`RunLimits.max_parallel_tools` 与这里都取它）。
+        guidelines.push(format!(
+            "At most {} subagents run in parallel in one turn; extra calls queue. Dispatch only \
+             as many independent sub-tasks as you actually have.",
+            ys_component::DEFAULT_MAX_PARALLEL_TOOLS
+        ));
+        guidelines.push(
+            "Use subagent to keep big, self-contained investigations out of this context: the \
+             sub-agent does NOT see this conversation, so `prompt` must be fully self-contained"
+                .to_string(),
+        );
+        guidelines.push(
+            "Scale the dispatch: one subagent is enough for a simple lookup; dispatch several in \
+             one message only for genuinely independent sub-tasks"
+                .to_string(),
+        );
+        guidelines.push(
+            "Write each `prompt` with four parts: goal, expected output format, sources/tools to \
+             use, and explicit boundaries — vague prompts make the sub-agents repeat each other's work"
+                .to_string(),
+        );
+        guidelines.push(
+            "parallel subagents share this workspace: never dispatch several in one turn if their \
+             write targets overlap"
+                .to_string(),
+        );
+        guidelines.push(
+            "A subagent is not free: it is another inference call plus another system prompt — \
+             use it to save context, not to look busy"
                 .to_string(),
         );
     }
@@ -745,6 +796,41 @@ mod tests {
         assert_eq!(
             prompt, "Custom system prompt",
             "自定义 prompt 命中时不得追加 skill 段（既有契约逐字保留）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 能力边界声明**按工具表派生**：父表有派发工具 ⇒ 不说「no subagents」；
+    /// 子表（无派发工具）⇒ 逐字保留。
+    ///
+    /// 变异：把 `skill_section` 的 `has_subagent` 参数写死 `false` ⇒ 第一条断言变红。
+    #[test]
+    fn capability_line_follows_the_tool_table() {
+        let dir = unique_dir("cap_line");
+        let cat = one_skill("arch-design", "多方案架构设计");
+
+        let parent = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
+        assert!(
+            parent.contains("CAN delegate tasks to subagents"),
+            "父提示应声明可派发；prompt = {parent}"
+        );
+        assert!(
+            !parent.contains("no subagents"),
+            "父提示不得再说 no subagents；prompt = {parent}"
+        );
+        assert!(
+            parent.contains(&format!(
+                "At most {} subagents run in parallel",
+                ys_component::DEFAULT_MAX_PARALLEL_TOOLS
+            )),
+            "并发槽位数须写进 guideline，且取自常量单一真值；prompt = {parent}"
+        );
+
+        let child = build_system_prompt(&dir, &[spec("read")], &cat);
+        assert!(
+            child.contains("no subagents"),
+            "子提示（无 subagent 工具）应逐字保留那句；prompt = {child}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

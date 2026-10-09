@@ -6,6 +6,7 @@ mod error;
 mod notice;
 mod registry;
 mod spec;
+mod subagent;
 mod summarizer;
 mod truncate;
 
@@ -15,6 +16,7 @@ pub use error::*;
 pub use notice::*;
 pub use registry::*;
 pub use spec::*;
+pub use subagent::*;
 pub use summarizer::*;
 pub use truncate::*;
 
@@ -29,6 +31,28 @@ use serde_json::Value;
 pub trait Tool: Send + Sync {
     /// 返回 tool 的 spec（构建时调用一次，缓存）
     fn spec(&self) -> ToolSpec;
+
+    /// 本工具单次 `call` 的墙钟上限。`None` = 未声明。
+    ///
+    /// `None` 时由循环回落到 `RunLimits::bash_timeout`（再回落 300s）—— 默认实现
+    /// 保证既有工具行为逐字节不变。**不进 `ToolSpec`**，故不改 prompt 前缀。
+    ///
+    /// 语义：工具**声明值优先于** `bash_timeout`（不取 min）。`bash_timeout` 的语义是
+    /// 「shell 命令多久算卡死」，取 min 会让「把 bash 限到 60s」顺手砍掉长任务派发。
+    fn timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// 本工具是否可在**同一批**里与其他工具并发执行。默认 `false`。
+    ///
+    /// 循环只在「批次 > 1 **且每一个**工具都为 `true`」时才走并行 —— 默认 `false`
+    /// 保证既有的一切批次仍走原串行路径（行为逐字节不变）。**不进 `ToolSpec`**。
+    ///
+    /// 准入规则：可证明对共享状态无副作用才准开（只读工具可以；`bash`/`write`/`edit`
+    /// 永远不行）。
+    fn is_concurrency_safe(&self) -> bool {
+        false
+    }
 
     /// 用给定输入执行 tool
     async fn call(&self, input: Value, ctx: ToolContext<'_>) -> Result<ToolResult, ToolError>;

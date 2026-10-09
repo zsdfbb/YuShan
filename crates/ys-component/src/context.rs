@@ -5,7 +5,7 @@ use ys_event::EventSink;
 use ys_model::Model;
 use ys_protocol::BoundarySource;
 use ys_session::Session;
-use ys_tool::{ApprovalHandler, ToolRegistry};
+use ys_tool::{ApprovalHandler, SubagentRunner, ToolRegistry};
 
 #[non_exhaustive]
 pub struct RuntimeContext<'a> {
@@ -22,6 +22,9 @@ pub struct RuntimeContext<'a> {
     ///
     /// `None` = 无边界控制，行为与不挂载时逐字节一致（既无插话也无取消）。
     pub boundary: Option<&'a dyn BoundarySource>,
+    /// 一次性派发能力（可选）。由接线器经 [`RuntimeContext::with_subagent`] 挂载，
+    /// 再经 `BasicLoop` 落到 `ToolContext`。`None` = 本回合不支持派发。
+    pub subagent: Option<&'a dyn SubagentRunner>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -48,12 +51,19 @@ impl<'a> RuntimeContext<'a> {
             approval,
             system_prompt,
             boundary: None,
+            subagent: None,
         }
     }
 
     /// 链式挂载轮边界控制源。`None` 时行为不变。
     pub fn with_boundary(mut self, boundary: &'a dyn BoundarySource) -> Self {
         self.boundary = Some(boundary);
+        self
+    }
+
+    /// 链式挂载派发能力。`None` 时行为不变。
+    pub fn with_subagent(mut self, subagent: &'a dyn SubagentRunner) -> Self {
+        self.subagent = Some(subagent);
         self
     }
 }

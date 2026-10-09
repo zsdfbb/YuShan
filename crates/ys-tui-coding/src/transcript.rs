@@ -40,7 +40,16 @@ pub enum TranscriptLine {
 ///
 /// 这是 coding agent 的产品知识（`read`/`write` 的 `path`、`bash` 的 `command`…），
 /// 故放在本 crate 而不是通用协议里。
-const SUMMARY_KEYS: [&str; 6] = ["path", "file_path", "command", "pattern", "query", "url"];
+const SUMMARY_KEYS: [&str; 7] = [
+    "path",
+    "file_path",
+    "command",
+    "pattern",
+    "query",
+    "url",
+    // 派发工具的「给用户看」标签（ADR-0022 决策 11）—— 排在最后，只有前面都没有时才取它。
+    "description",
+];
 
 /// 摘要的最大字符数（**字符**，不是字节 —— 中文按 1 个算）。
 const SUMMARY_MAX_CHARS: usize = 40;

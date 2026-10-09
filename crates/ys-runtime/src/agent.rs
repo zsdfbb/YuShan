@@ -6,7 +6,7 @@ use ys_loop::{AgentInput, AgentLoop, LoopError, RunResult};
 use ys_model::Model;
 use ys_protocol::BoundarySource;
 use ys_session::Session;
-use ys_tool::{ApprovalHandler, ToolRegistry};
+use ys_tool::{ApprovalHandler, SubagentRunner, ToolRegistry};
 
 /// 一次 `run_turn` 所需的**外部端口**。
 ///
@@ -28,6 +28,11 @@ pub struct AgentPorts<'a> {
     /// 取代了旧的 `CancelToken`：取消与插话共享同一条有序通道，由
     /// `BasicLoop` 在**轮**边界拉取。
     pub boundary: Option<&'a dyn BoundarySource>,
+    /// 一次性派发能力（可选）。`None` = 本回合不支持 `subagent` 派发工具。
+    ///
+    /// 由接线器每回合构造并注入（照 `boundary` 的先例）—— 「造子执行环境」的能力
+    /// 归 app 层，`ys-*` 只经此窄接口穿透。
+    pub subagent: Option<&'a dyn SubagentRunner>,
 }
 
 impl<'a> AgentPorts<'a> {
@@ -43,7 +48,14 @@ impl<'a> AgentPorts<'a> {
             session,
             events,
             boundary,
+            subagent: None,
         }
+    }
+
+    /// 链式挂载派发能力（`AgentPorts::new` 签名不变，保持既有调用点不动）。
+    pub fn with_subagent(mut self, subagent: &'a dyn SubagentRunner) -> Self {
+        self.subagent = Some(subagent);
+        self
     }
 }
 
@@ -111,6 +123,7 @@ impl Agent {
             self.system_prompt.clone(),
         );
         ctx.boundary = ports.boundary;
+        ctx.subagent = ports.subagent;
         self.loop_impl.run_turn(input, &mut ctx).await
     }
 

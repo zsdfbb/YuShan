@@ -1613,6 +1613,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -2054,6 +2055,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "ys-component",
  "ys-core",
  "ys-event",
@@ -2108,6 +2110,7 @@ name = "ys-loop"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures-util",
  "serde_json",
  "thiserror",
  "tokio",

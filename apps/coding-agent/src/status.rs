@@ -35,10 +35,12 @@ mod tests {
         stats.record(&Usage {
             input_tokens: 100,
             output_tokens: 200,
+            ..Default::default()
         });
         stats.record(&Usage {
             input_tokens: 50,
             output_tokens: 75,
+            ..Default::default()
         });
         assert_eq!(stats.total_input_tokens, 150);
         assert_eq!(stats.total_output_tokens, 275);
@@ -54,6 +56,7 @@ mod tests {
         stats.record(&Usage {
             input_tokens: 100,
             output_tokens: 200,
+            ..Default::default()
         });
         assert_eq!(stats.total_input_tokens, u32::MAX); // 不应溢出
         assert_eq!(stats.total_output_tokens, 200);
@@ -66,6 +69,7 @@ mod tests {
             stats.record(&Usage {
                 input_tokens: 1,
                 output_tokens: 1,
+                ..Default::default()
             });
         }
         assert_eq!(stats.turn_count, 3);

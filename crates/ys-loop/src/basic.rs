@@ -4,12 +4,13 @@ use std::time::Duration;
 use super::{AgentInput, AgentLoop, LoopError, ModelSummarizer, RunResult};
 use crate::compact;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
 use ys_event::{AgentEvent, emit};
 use ys_model::{ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
-use ys_tool::{ToolContext, ToolError};
+use ys_tool::{Tool, ToolContext, ToolError};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
@@ -18,6 +19,55 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 const TRUNCATED_TOOL_NOTICE: &str = "tool call was NOT executed: the model response was truncated \
      (output token limit reached). Re-issue this call with a smaller payload, or split it into \
      several calls.";
+
+/// 一次工具调用的超时预算：**工具声明值优先** → 否则 `limits.bash_timeout` → 否则 300s。
+///
+/// 「优先」而非取 min：`bash_timeout` 管的是「shell 命令多久算卡死」，不该成为长任务
+/// 工具（如 subagent 派发）的上限。
+fn tool_budget(tool: &dyn Tool, limits: &ys_component::RunLimits) -> Duration {
+    tool.timeout()
+        .unwrap_or_else(|| Duration::from_secs(limits.bash_timeout.unwrap_or(300)))
+}
+
+/// 执行一次工具调用，并把一切错误形态映射成 `ToolResult`（ADR-0001 错误结果通道）。
+///
+/// 串行与并行两条路径都走这里 —— 保证两路的错误语义逐字相同。
+async fn call_one(
+    tool: &dyn Tool,
+    tool_name: String,
+    args: serde_json::Value,
+    tool_ctx: ToolContext<'_>,
+    budget: Duration,
+) -> CoreToolResult {
+    match tokio::time::timeout(budget, tool.call(args, tool_ctx)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(ToolError::Execution(msg))) => CoreToolResult {
+            content: msg,
+            is_error: true,
+        },
+        Ok(Err(ToolError::InvalidInput(msg))) => CoreToolResult {
+            content: format!("Invalid input: {msg}"),
+            is_error: true,
+        },
+        Ok(Err(ToolError::PermissionDenied(msg))) => CoreToolResult {
+            content: format!("Permission denied: {msg}"),
+            is_error: true,
+        },
+        Ok(Err(ToolError::Timeout(msg))) => CoreToolResult {
+            content: format!("Tool timed out: {msg}"),
+            is_error: true,
+        },
+        Ok(Err(e)) => CoreToolResult {
+            content: e.to_string(),
+            is_error: true,
+        },
+        Err(_elapsed) => CoreToolResult {
+            // 保留 `timed out` 子串（既有文案惯性），并补上工具名与生效预算。
+            content: format!("Tool '{tool_name}' timed out after {budget:?}"),
+            is_error: true,
+        },
+    }
+}
 
 pub struct BasicLoop;
 
@@ -420,18 +470,27 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 9：串行执行工具调用（v0）
-            let mut tool_results_for_message: Vec<ContentBlock> = Vec::new();
+            // Step 9：执行工具调用。**默认串行**；仅当「批次 > 1 **且每一个**工具都声明
+            // `is_concurrency_safe()`」时才走并行 —— 默认 `false` 使既有批次的行为
+            // 逐字节不变（唯一的既有语义变更被默认值完全闸住）。
+            //
+            // 三段式（`ctx.events: &mut dyn EventSink` 不能跨并发任务共享）：
+            //   9a 串行：审批 + emit `ToolCall`（保原顺序）
+            //   9b 执行：all-safe ⇒ `buffered(n)`（**保序**、单任务内并发）；否则原串行
+            //   9c 保序：emit `ToolResult` + 连续错误计数 + 组装单条消息（ADR-0001 配对）
+            let mut outcomes: Vec<Option<CoreToolResult>> = vec![None; tool_calls.len()];
+            let summarizer = ModelSummarizer { model: ctx.model };
 
-            for (tool_call_id, tool_name, tool_args) in &tool_calls {
-                // T11a：审批检查
+            // 9a：审批（串行）。**被拒的工具不进 `pending`** ⇒ 它既不发 `ToolCall`
+            // 也不发 `ToolResult` 事件（既有形状），只在回喂消息里留一条 `is_error`。
+            let mut pending: Vec<usize> = Vec::new();
+            for (idx, (_, tool_name, tool_args)) in tool_calls.iter().enumerate() {
                 if let Some(approval) = &ctx.approval {
                     if approval.needs_approval(tool_name, tool_args) {
                         match approval.request_approval(tool_name, tool_args).await {
                             ys_tool::ApprovalDecision::Approved => {}
                             ys_tool::ApprovalDecision::Denied { reason } => {
-                                tool_results_for_message.push(ContentBlock::ToolResult {
-                                    tool_call_id: tool_call_id.clone(),
+                                outcomes[idx] = Some(CoreToolResult {
                                     content: format!("operation denied: {reason}"),
                                     is_error: true,
                                 });
@@ -440,77 +499,134 @@ impl AgentLoop for BasicLoop {
                         }
                     }
                 }
+                pending.push(idx);
+            }
 
-                // 发出 ToolCall 事件
-                emit(
-                    ctx.events,
-                    AgentEvent::ToolCall {
-                        call: ys_core::ToolCall {
-                            id: tool_call_id.clone(),
-                            name: tool_name.clone(),
-                            arguments: tool_args.clone(),
+            // 准入条件里的「每一个」是承重的 —— 它保证混合批次（如 `subagent` + `bash`）
+            // 自动退回串行；今天除 `subagent` 外没有工具声明 `true` ⇒ 既有批次仍走串行。
+            let parallel_ok = pending.len() > 1
+                && pending.iter().all(|&i| {
+                    ctx.registry
+                        .get(&tool_calls[i].1)
+                        .is_some_and(|t| t.is_concurrency_safe())
+                });
+
+            // 9b：执行。
+            if parallel_ok {
+                // 并行路径：先保序 emit 全部 `ToolCall`（否则执行期无法再借 `ctx.events`）。
+                for &i in &pending {
+                    let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
+                    emit(
+                        ctx.events,
+                        AgentEvent::ToolCall {
+                            call: ys_core::ToolCall {
+                                id: tool_call_id.clone(),
+                                name: tool_name.clone(),
+                                arguments: tool_args.clone(),
+                            },
                         },
-                    },
-                )
-                .await
-                .map_err(LoopError::Event)?;
-
-                // 在 registry 中查找并带超时执行（T11b）与错误恢复（T11c）
-                let result = match ctx.registry.get(tool_name) {
-                    Some(tool) => {
-                        // 唯一的摘要适配器接线点：`ctx.model` / `ctx.registry` / `ctx.boundary`
-                        // 全是不可变借用，可共存；`summarizer` 必须先于 `tool_ctx` 声明。
-                        let summarizer = ModelSummarizer { model: ctx.model };
-                        let tool_ctx = ToolContext::new(
-                            ctx.boundary,
-                            ctx.cwd.clone(),
-                            ctx.workspace_root.clone(),
-                        )
-                        .with_summarizer(&summarizer);
-                        let timeout_secs = ctx.limits.bash_timeout.unwrap_or(300);
-                        match tokio::time::timeout(
-                            Duration::from_secs(timeout_secs),
-                            tool.call(tool_args.clone(), tool_ctx),
-                        )
-                        .await
-                        {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(ToolError::Execution(msg))) => CoreToolResult {
-                                content: msg,
-                                is_error: true,
-                            },
-                            Ok(Err(ToolError::InvalidInput(msg))) => CoreToolResult {
-                                content: format!("Invalid input: {msg}"),
-                                is_error: true,
-                            },
-                            Ok(Err(ToolError::PermissionDenied(msg))) => CoreToolResult {
-                                content: format!("Permission denied: {msg}"),
-                                is_error: true,
-                            },
-                            Ok(Err(ToolError::Timeout(msg))) => CoreToolResult {
-                                content: format!("Tool timed out: {msg}"),
-                                is_error: true,
-                            },
-                            Ok(Err(e)) => CoreToolResult {
-                                content: e.to_string(),
-                                is_error: true,
-                            },
-                            Err(_elapsed) => CoreToolResult {
-                                content: "Command timed out".into(),
-                                is_error: true,
-                            },
-                        }
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                }
+                // `buffered` 而非 `spawn`：`Tool::call` 的 future 借了 `&dyn Tool` 与
+                // `ToolContext<'_>`（非 `'static`）；`buffered` 在**单任务内**并发且**保序**。
+                let mut futs = Vec::with_capacity(pending.len());
+                for &i in &pending {
+                    let (_, tool_name, tool_args) = &tool_calls[i];
+                    let tool = ctx.registry.get(tool_name).expect("已确认命中");
+                    let mut tool_ctx = ToolContext::new(
+                        ctx.boundary,
+                        ctx.cwd.clone(),
+                        ctx.workspace_root.clone(),
+                    )
+                    .with_summarizer(&summarizer);
+                    if let Some(runner) = ctx.subagent {
+                        tool_ctx = tool_ctx.with_subagent(runner);
                     }
-                    None => {
-                        // registry 未命中 -> 合成 is_error 结果（ADR-0001）
-                        CoreToolResult {
+                    let budget = tool_budget(tool, &ctx.limits);
+                    let name = tool_name.clone();
+                    let args = tool_args.clone();
+                    futs.push(async move { call_one(tool, name, args, tool_ctx, budget).await });
+                }
+                let n = ctx.limits.max_parallel_tools.max(1);
+                let executed: Vec<CoreToolResult> = futures_util::stream::iter(futs)
+                    .buffered(n)
+                    .collect()
+                    .await;
+                for (slot, result) in pending.iter().zip(executed) {
+                    outcomes[*slot] = Some(result);
+                }
+                // 再按原始顺序 emit 全部 `ToolResult`。
+                for &i in &pending {
+                    let id = tool_calls[i].0.clone();
+                    let result = outcomes[i].clone().expect("已填");
+                    emit(ctx.events, AgentEvent::ToolResult { id, result })
+                        .await
+                        .map_err(LoopError::Event)?;
+                }
+            } else {
+                // 串行路径：**逐个** emit ToolCall → 执行 → emit ToolResult（保持既有
+                // 交错形状 `C1,R1,C2,R2`，既有批次的行为逐字节不变）。
+                for &i in &pending {
+                    let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
+                    emit(
+                        ctx.events,
+                        AgentEvent::ToolCall {
+                            call: ys_core::ToolCall {
+                                id: tool_call_id.clone(),
+                                name: tool_name.clone(),
+                                arguments: tool_args.clone(),
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+
+                    let result = match ctx.registry.get(tool_name) {
+                        Some(tool) => {
+                            let mut tool_ctx = ToolContext::new(
+                                ctx.boundary,
+                                ctx.cwd.clone(),
+                                ctx.workspace_root.clone(),
+                            )
+                            .with_summarizer(&summarizer);
+                            if let Some(runner) = ctx.subagent {
+                                tool_ctx = tool_ctx.with_subagent(runner);
+                            }
+                            let budget = tool_budget(tool, &ctx.limits);
+                            call_one(tool, tool_name.clone(), tool_args.clone(), tool_ctx, budget)
+                                .await
+                        }
+                        None => CoreToolResult {
                             content: format!("tool not found: {tool_name}"),
                             is_error: true,
-                        }
-                    }
-                };
+                        },
+                    };
 
-                // T11c：连续错误跟踪
+                    emit(
+                        ctx.events,
+                        AgentEvent::ToolResult {
+                            id: tool_call_id.clone(),
+                            result: result.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                    outcomes[i] = Some(result);
+                }
+            }
+
+            // 9c：按**原始顺序**记账 + 组装单条消息（ADR-0001 配对完整性）。
+            let mut tool_results_for_message: Vec<ContentBlock> =
+                Vec::with_capacity(tool_calls.len());
+            for (idx, (tool_call_id, tool_name, _)) in tool_calls.iter().enumerate() {
+                let result = outcomes[idx].take().unwrap_or_else(|| CoreToolResult {
+                    content: format!("tool not executed: {tool_name}"),
+                    is_error: true,
+                });
+
+                // T11c：连续错误跟踪（按原始顺序更新）。
                 if result.is_error {
                     let count = consecutive_errors.entry(tool_name.clone()).or_insert(0);
                     *count += 1;
@@ -522,18 +638,6 @@ impl AgentLoop for BasicLoop {
                     consecutive_errors.remove(tool_name);
                 }
 
-                // 发出 ToolResult 事件
-                emit(
-                    ctx.events,
-                    AgentEvent::ToolResult {
-                        id: tool_call_id.clone(),
-                        result: result.clone(),
-                    },
-                )
-                .await
-                .map_err(LoopError::Event)?;
-
-                // 准备待追加的 content block
                 tool_results_for_message.push(ContentBlock::ToolResult {
                     tool_call_id: tool_call_id.clone(),
                     content: result.content,
@@ -925,6 +1029,399 @@ mod tests {
                 is_error: false,
             })
         }
+    }
+
+    /// 可配超时的 spy：`timeout()` 返回声明值，`call` 睡 `sleep`。
+    struct TimedTool {
+        name: String,
+        timeout: Option<Duration>,
+        sleep: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for TimedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.name.as_str(), "times out", serde_json::json!({}))
+        }
+        fn timeout(&self) -> Option<Duration> {
+            self.timeout
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            tokio::time::sleep(self.sleep).await;
+            Ok(CoreToolResult {
+                content: "ok".into(),
+                is_error: false,
+            })
+        }
+    }
+
+    /// U1-N2a：**工具声明的超时优先于 `bash_timeout` 的 300s 兜底**。
+    ///
+    /// 声明 50ms、`call` 睡 200ms 的工具，在 `bash_timeout = None`（⇒ 300s）下必须被
+    /// **50ms** 杀掉并给出 `is_error`（含工具名）。若实现取 `min` 或忽略声明，本用例
+    /// 要么挂 300s 后变红、要么 `call` 成功返回 ⇒ 两种都变红。
+    #[tokio::test]
+    async fn declared_tool_timeout_beats_bash_timeout_fallback() {
+        let registry = ToolRegistry::build(vec![Box::new(TimedTool {
+            name: "slow".into(),
+            timeout: Some(Duration::from_millis(50)),
+            sleep: Duration::from_millis(200),
+        })])
+        .unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("slow", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.bash_timeout = None; // ⇒ 兜底 300s
+        {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        let results = tool_results_in(&session);
+        assert_eq!(results.len(), 1, "应有恰好一条工具结果");
+        match results[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(is_error, "声明超时应产生 is_error：{content}");
+                assert!(content.contains("timed out"), "文案应含 timed out：{content}");
+                assert!(content.contains("slow"), "文案应含工具名：{content}");
+            }
+            other => panic!("期望 ToolResult，得到 {other:?}"),
+        }
+    }
+
+    /// U1-N2b：**默认 `None` 的工具不受影响**（短调用正常成功，无回归）。
+    #[tokio::test]
+    async fn default_tool_timeout_none_is_unchanged() {
+        let registry = ToolRegistry::build(vec![Box::new(TimedTool {
+            name: "fast".into(),
+            timeout: None,
+            sleep: Duration::from_millis(1),
+        })])
+        .unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("fast", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        let results = tool_results_in(&session);
+        assert_eq!(results.len(), 1);
+        match results[0] {
+            ContentBlock::ToolResult { is_error, .. } => {
+                assert!(!is_error, "默认 None 的短调用应成功");
+            }
+            other => panic!("期望 ToolResult，得到 {other:?}"),
+        }
+    }
+
+    /// U3：`RuntimeContext.subagent` 经 `BasicLoop` 落到工具看到的 `ToolContext.subagent`。
+    #[tokio::test]
+    async fn subagent_runner_reaches_tool_context() {
+        struct ProbeRunner;
+        #[async_trait::async_trait]
+        impl ys_tool::SubagentRunner for ProbeRunner {
+            async fn run(
+                &self,
+                _prompt: &str,
+                _model: Option<&str>,
+                _boundary: Option<&dyn ys_protocol::BoundarySource>,
+            ) -> Result<ys_tool::SubagentOutcome, String> {
+                unimplemented!("probe 不应被调用")
+            }
+        }
+
+        struct SeenTool(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Tool for SeenTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::new("seen", "records subagent mount", serde_json::json!({}))
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+                ctx: ToolContext<'_>,
+            ) -> Result<CoreToolResult, ys_tool::ToolError> {
+                if ctx.subagent.is_some() {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(CoreToolResult {
+                    content: "ok".into(),
+                    is_error: false,
+                })
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let registry =
+            ToolRegistry::build(vec![Box::new(SeenTool(seen.clone()))]).unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("seen", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let runner = ProbeRunner;
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            ctx.subagent = Some(&runner);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "工具应看到经 RuntimeContext 挂载的 subagent runner（三跳注入）"
+        );
+    }
+
+    // ───────────────────────── 刀 6：并行工具批（§4.4 六条） ─────────────────────────
+
+    /// 可声明并发安全的 spy：记录「同时在跑」的峰值。
+    struct ConcTool {
+        name: String,
+        safe: bool,
+        sleep: Duration,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConcTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.name.as_str(), "conc probe", serde_json::json!({}))
+        }
+        fn is_concurrency_safe(&self) -> bool {
+            self.safe
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.sleep).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(CoreToolResult {
+                content: format!("{} ok", self.name),
+                is_error: false,
+            })
+        }
+    }
+
+    /// 一次响应发 N 个工具调用；第二次调用返回文本收尾。
+    struct MultiToolModel {
+        calls: Vec<(String, String)>,
+        round: AtomicUsize,
+    }
+
+    impl MultiToolModel {
+        fn new(calls: &[(&str, &str)]) -> Self {
+            Self {
+                calls: calls
+                    .iter()
+                    .map(|(id, n)| (id.to_string(), n.to_string()))
+                    .collect(),
+                round: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for MultiToolModel {
+        fn model_id(&self) -> &str {
+            "multi"
+        }
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            let round = self.round.fetch_add(1, Ordering::SeqCst);
+            let message = if round == 0 {
+                Message {
+                    role: Role::Assistant,
+                    content: self
+                        .calls
+                        .iter()
+                        .map(|(id, name)| ContentBlock::ToolUse {
+                            id: ys_core::ToolCallId(id.clone()),
+                            name: name.clone(),
+                            arguments: serde_json::json!({}),
+                        })
+                        .collect(),
+                }
+            } else {
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text: "done".into() }],
+                }
+            };
+            Ok(ys_model::ModelResponse {
+                message,
+                usage: Usage::default(),
+                finish_reason: if round == 0 {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                },
+            })
+        }
+    }
+
+    /// 事件流里 `ToolCall` / `ToolResult` 的 (kind, id) 序列 —— 断言**保序**用。
+    fn call_result_order(events: &CollectingSink) -> Vec<(&'static str, String)> {
+        events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCall { call } => Some(("C", call.id.0.clone())),
+                AgentEvent::ToolResult { id, .. } => Some(("R", id.0.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn conc_tool_registry(
+        specs: &[(&str, bool, u64)],
+    ) -> (ToolRegistry, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = specs
+            .iter()
+            .map(|(name, safe, ms)| {
+                Box::new(ConcTool {
+                    name: name.to_string(),
+                    safe: *safe,
+                    sleep: Duration::from_millis(*ms),
+                    active: active.clone(),
+                    peak: peak.clone(),
+                }) as Box<dyn Tool>
+            })
+            .collect();
+        (ToolRegistry::build(tools).unwrap(), active, peak)
+    }
+
+    async fn run_batch(
+        registry: &ToolRegistry,
+        model: &MultiToolModel,
+        max_parallel: usize,
+    ) -> (Vec<(&'static str, String)>, std::time::Duration) {
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.max_parallel_tools = max_parallel;
+        let started = std::time::Instant::now();
+        {
+            let mut ctx = make_ctx(model, registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        (call_result_order(&events), started.elapsed())
+    }
+
+    /// §4.4-1：**默认串行**（两个 `false`）⇒ 事件序列 `C1,R1,C2,R2`，且无重叠。
+    #[tokio::test]
+    async fn batch_is_serial_by_default_and_keeps_order() {
+        let (registry, _, peak) = conc_tool_registry(&[("a", false, 40), ("b", false, 40)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b")]);
+        let (order, _) = run_batch(&registry, &model, 4).await;
+        assert_eq!(
+            order,
+            vec![("C", "1".into()), ("R", "1".into()), ("C", "2".into()), ("R", "2".into())],
+            "默认串行：C1,R1,C2,R2"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "串行不得有重叠执行");
+    }
+
+    /// §4.4-2：**每一个都声明 safe** ⇒ 并行（墙钟 ≈ max 而非 sum），事件 `C1,C2,R1,R2`。
+    #[tokio::test]
+    async fn batch_is_parallel_when_every_tool_is_safe() {
+        let (registry, _, peak) = conc_tool_registry(&[("a", true, 250), ("b", true, 250)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b")]);
+        let (order, elapsed) = run_batch(&registry, &model, 4).await;
+        assert_eq!(
+            order,
+            vec![("C", "1".into()), ("C", "2".into()), ("R", "1".into()), ("R", "2".into())],
+            "并行：先发完全部 ToolCall，再按原序发 ToolResult"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "两个 safe 工具应真的并发");
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "并行墙钟应 ≈ max(250,250) 而非 sum(500)：{elapsed:?}"
+        );
+    }
+
+    /// §4.4-3：**混合批次**（一个 safe 一个 unsafe）⇒ 退回串行。
+    ///
+    /// 变异自检：把准入条件从「每一个都 safe」写成「至少一个 safe」⇒ 本用例变红。
+    #[tokio::test]
+    async fn mixed_batch_falls_back_to_serial() {
+        let (registry, _, peak) = conc_tool_registry(&[("a", true, 60), ("b", false, 60)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b")]);
+        let (order, _) = run_batch(&registry, &model, 4).await;
+        assert_eq!(
+            order,
+            vec![("C", "1".into()), ("R", "1".into()), ("C", "2".into()), ("R", "2".into())],
+            "混合批次必须退回串行"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// §4.4-5：并发上限 `max_parallel_tools` 被遵守（4 个 safe、上限 2 ⇒ 峰值 ≤ 2）。
+    #[tokio::test]
+    async fn parallel_respects_max_parallel_tools() {
+        let (registry, _, peak) =
+            conc_tool_registry(&[("a", true, 60), ("b", true, 60), ("c", true, 60), ("d", true, 60)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
+        let (order, _) = run_batch(&registry, &model, 2).await;
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "峰值并发不得超过上限");
+        // 保序：结果仍按原始 id 顺序回填。
+        assert_eq!(
+            order,
+            vec![
+                ("C", "1".into()),
+                ("C", "2".into()),
+                ("C", "3".into()),
+                ("C", "4".into()),
+                ("R", "1".into()),
+                ("R", "2".into()),
+                ("R", "3".into()),
+                ("R", "4".into()),
+            ]
+        );
     }
 
     /// 会话里所有 `ToolResult` block（按出现顺序）。

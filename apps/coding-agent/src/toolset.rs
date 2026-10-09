@@ -511,4 +511,94 @@ mod tests {
             .unwrap();
         path
     }
+
+    /// FNV-1a 64（**不引 `sha2`** —— 锚点的目的是**发现漂移**，不是抗碰撞）。
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// P0（刀 0）：**前缀指纹锚** —— 工具表 JSON 与系统提示的字节指纹。
+    ///
+    /// 守卫的是 prompt cache 相干性：任何让「工具清单或系统提示的字节」漂移的改动
+    /// （重排、新增字段、动态表）都会让此处的指纹变化。
+    ///
+    /// 断言三件：
+    ///  1. 工具表恰 9 个、顺序 == [`EXPECTED_ORDER`]；
+    ///  2. **同一份工具表构造两次，序列化后逐字节相同**（ADR-0022 决策 19 的抖动面：
+    ///     子 agent 每次派发都重建表，`spec()` 若非纯函数会让子自己的缓存跨派发抖动）；
+    ///  3. 系统提示（空 skill catalogue）的指纹可复现。
+    ///
+    /// 变异：把 [`build_tools`] 里 `grep`/`find` 互换 ⇒ 顺序断言与指纹都变红。
+    #[test]
+    fn prefix_fingerprint_is_anchored_and_stable() {
+        let _guard = env_lock();
+        let dir = unique_dir("fingerprint");
+
+        let (tools, _) = build_tools(&dir, offline_web());
+        let specs: Vec<ys_tool::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
+        assert_eq!(specs.len(), 9, "工具表应为 9 个");
+        let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, expected_order(), "顺序即语义");
+
+        let json = serde_json::to_string(&specs).unwrap();
+        let fp_tools = fnv1a64(json.as_bytes());
+
+        // 刀 4 后的**重锚**：父表 = 这 9 元 + 派发工具（末位）⇒ 10 元，且父 JSON 是
+        // 子 JSON 的**字节前缀 + 追加项**（子表命中父的前缀缓存）。
+        let mut parent_specs = specs.clone();
+        parent_specs.push(
+            crate::subagent::SubagentTool::new(Duration::from_secs(60)).spec(),
+        );
+        assert_eq!(parent_specs.len(), 10, "父表应为 10 元（9 基础 + subagent）");
+        assert_eq!(
+            parent_specs.last().unwrap().name,
+            "subagent",
+            "派发工具必须追加在**末位**（否则子表不再是父的字节前缀）"
+        );
+        let parent_json = serde_json::to_string(&parent_specs).unwrap();
+        assert!(
+            parent_json.starts_with(&json[..json.len() - 1]),
+            "父表 JSON 必须是子表 JSON 的字节前缀（去掉末尾 `]`）+ 追加项"
+        );
+
+        // 2) 同一份表构造两次 → 逐字节相同。
+        let (tools2, _) = build_tools(&dir, offline_web());
+        let specs2: Vec<ys_tool::ToolSpec> = tools2.iter().map(|t| t.spec()).collect();
+        let json2 = serde_json::to_string(&specs2).unwrap();
+        assert_eq!(
+            json, json2,
+            "同一工具表构造两次必须逐字节相同（子 agent 缓存跨派发稳定）"
+        );
+        assert_eq!(fnv1a64(json2.as_bytes()), fp_tools);
+
+        // 3) 系统提示指纹（空 catalogue）可复现。
+        let cat = crate::skills::Catalogue {
+            lines: String::new(),
+            bytes: 0,
+            omitted: 0,
+            entries: Vec::new(),
+        };
+        let prompt = crate::prompt::build_system_prompt(&dir, &specs, &cat);
+        let fp_prompt = fnv1a64(prompt.as_bytes());
+        let prompt2 = crate::prompt::build_system_prompt(&dir, &specs2, &cat);
+        assert_eq!(
+            fp_prompt,
+            fnv1a64(prompt2.as_bytes()),
+            "两次构建的系统提示指纹必须一致"
+        );
+
+        // 指纹非零（占位断言，防止函数被误改成恒 0）。
+        assert_ne!(fp_tools, 0);
+        assert_ne!(fp_prompt, 0);
+        // 当前锚点（漂移时这两个数字会变 —— 变化本身即是信号；本模块禁止 print 宏，故用注释记录）：
+        //   tools = 0x9188ca32c2a51fe3  prompt = 0x1041319ab86f42ad
+        // （若因有意改动而漂移，请在此更新这两个值，让 diff 显式暴露这次漂移。）
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

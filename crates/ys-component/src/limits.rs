@@ -1,5 +1,12 @@
 use super::CompactPolicy;
 
+/// 同一批并发工具调用的默认上限（ADR-0022 决策 14 的**单一真值**）。
+///
+/// 放在 `ys-component`（`RunLimits` 所在 crate）：`ys-loop` 依赖 `ys-component`，
+/// 反向不成立 —— 常量若放 `ys-loop`，`RunLimits::default()` 就引用不到它，
+/// 「单一真值」失效。`prompt.rs` 的 guideline 也应读同一个常量。
+pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
+
 /// 一次 run 的执行限制
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -22,6 +29,10 @@ pub struct RunLimits {
     ///
     /// 默认 `0` ⇒ 既有行为逐字节不变（老调用方无需改动）。
     pub fixed_prompt_tokens: usize,
+    /// 同一批并发工具调用的上限（见 [`DEFAULT_MAX_PARALLEL_TOOLS`]）。
+    ///
+    /// 只有 `BasicLoop` Step 9 的并行分支读它；默认值取自常量 ⇒ 既有行为不变。
+    pub max_parallel_tools: usize,
 }
 
 impl RunLimits {
@@ -42,6 +53,7 @@ impl Default for RunLimits {
             compaction: CompactPolicy::default(),
             // 0 是**承重**默认值：老调用方（不设该字段）的压缩行为逐字节不变。
             fixed_prompt_tokens: 0,
+            max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
         }
     }
 }

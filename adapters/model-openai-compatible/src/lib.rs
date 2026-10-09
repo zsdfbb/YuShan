@@ -649,6 +649,8 @@ impl<'s> StreamAccumulator<'s> {
                     self.usage = Some(Usage {
                         input_tokens: usage.prompt_tokens,
                         output_tokens: usage.completion_tokens,
+                        prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
+                        prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
                     });
                 }
 
@@ -1360,13 +1362,41 @@ mod tests {
         drive(
             &mut buf,
             &mut acc,
-            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n",
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18,\"prompt_cache_hit_tokens\":9,\"prompt_cache_miss_tokens\":2}}\n",
         );
         drive(&mut buf, &mut acc, b"data: [DONE]\n");
 
         let response = acc.finish().unwrap();
         assert_eq!(response.usage.input_tokens, 11);
         assert_eq!(response.usage.output_tokens, 7);
+        assert_eq!(
+            response.usage.prompt_cache_hit_tokens, 9,
+            "缓存命中读数必须从 provider 尾包解析出来"
+        );
+        assert_eq!(response.usage.prompt_cache_miss_tokens, 2);
+    }
+
+    /// 未上报缓存字段的端点：`ChatUsage` 仍能反序列化（按 0），不失败。
+    #[test]
+    fn streamed_usage_without_cache_fields_defaults_to_zero() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+        drive(
+            &mut buf,
+            &mut acc,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n",
+        );
+        drive(
+            &mut buf,
+            &mut acc,
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n",
+        );
+        drive(&mut buf, &mut acc, b"data: [DONE]\n");
+        let response = acc.finish().unwrap();
+        assert_eq!(response.usage.input_tokens, 3);
+        assert_eq!(response.usage.prompt_cache_hit_tokens, 0);
+        assert_eq!(response.usage.prompt_cache_miss_tokens, 0);
     }
 
     /// 流里从头到尾没有 usage（端点不支持 `include_usage`）时，

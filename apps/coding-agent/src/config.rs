@@ -10,6 +10,9 @@ use crate::provider::ProviderRegistry;
 /// config 不完整（缺 api_base/api_key）时返回 None。
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
 
+/// 按**模型名**构造的 factory（subagent 的 `model` 参数）。
+type ModelFactoryFor = Box<dyn Fn(&Config, &str) -> Option<Box<dyn Model>> + Send + Sync>;
+
 /// `~/.yushan/config.json` 的**原始**反序列化形态（**用户手写**，故宽容解析）。
 ///
 /// 值先落 `serde_json::Value`，再由 [`parse_user_config`] 逐项校验 —— 这样
@@ -156,6 +159,7 @@ pub struct Config {
     /// [`Config::compact_policy`] 读出（`main.rs` 装配进 `RunLimits`）。
     user_config: UserConfig,
     model_factory: Option<ModelFactory>,
+    model_factory_for: Option<ModelFactoryFor>,
 }
 
 impl Config {
@@ -182,6 +186,7 @@ impl Config {
             skills_omitted: 0,
             user_config: UserConfig::default(),
             model_factory: None,
+            model_factory_for: None,
         })
     }
 
@@ -200,10 +205,19 @@ impl Config {
     ///
     /// 生产调用点：`main.rs::resolve_limits`（启动初值）与 `app_loop`（每回合刷新）。
     pub fn context_window(&self) -> usize {
-        if let Some(&window) = self.user_config.windows.get(&self.model) {
+        self.context_window_for(&self.model)
+    }
+
+    /// 按**给定模型名**解析 context window（同 [`Self::context_window`] 的三级）：
+    /// ① `config.json` 覆盖 > ② 内置表 > ③ `RunLimits::default().context_window`。
+    ///
+    /// 供 subagent 按 `model` 参数取子模型窗口用 —— 子 agent 换模型却继承父窗口是
+    /// **静默错**（32k 模型按 1M 判 ⇒ 不压缩 ⇒ 撞窗）。
+    pub fn context_window_for(&self, model: &str) -> usize {
+        if let Some(&window) = self.user_config.windows.get(model) {
             return window;
         }
-        if let Some(window) = crate::provider::builtin_context_window(&self.model) {
+        if let Some(window) = crate::provider::builtin_context_window(model) {
             return window;
         }
         ys_component::RunLimits::default().context_window
@@ -347,6 +361,23 @@ impl Config {
         self.model_factory.as_ref().and_then(|f| f(self))
     }
 
+    /// 注册「按**模型名**构造」的 factory（subagent 的 `model` 参数用）。
+    ///
+    /// 与 [`Config::set_model_factory`] 分开：后者的语义是「按 `config.model`」，
+    /// 这条是「按调用方给的名字」。未注册时 [`Config::build_model_for`] 恒 `None`
+    /// ⇒ 调用方 fail-closed（**绝不静默回退**到当前模型）。
+    pub fn set_model_factory_for(
+        &mut self,
+        factory: impl Fn(&Config, &str) -> Option<Box<dyn Model>> + Send + Sync + 'static,
+    ) {
+        self.model_factory_for = Some(Box::new(factory));
+    }
+
+    /// 按**给定模型名**构造 model。未注册 factory 或无法构造 ⇒ `None`。
+    pub fn build_model_for(&self, name: &str) -> Option<Box<dyn Model>> {
+        self.model_factory_for.as_ref().and_then(|f| f(self, name))
+    }
+
     /// 返回当前 provider 的 ProviderCompat（未设置时为 "custom"）。
     pub fn current_compat(&self) -> ys_model_openai_compat::compat::ProviderCompat {
         let name = self.provider.as_deref().unwrap_or("custom");
@@ -475,6 +506,7 @@ mod tests {
             skills_omitted: 0,
             user_config: UserConfig::default(),
             model_factory: None,
+            model_factory_for: None,
         }
     }
 
@@ -536,6 +568,24 @@ mod tests {
         }
     }
 
+    /// `build_model_for`：未注册 factory ⇒ `None`（fail-closed 的基础）；
+    /// 注册后按名字构造，名字不认识仍返回 `None`。
+    #[test]
+    fn test_config_model_factory_for() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+        let mut config = Config::from_env().unwrap();
+        assert!(
+            config.build_model_for("anything").is_none(),
+            "未注册 factory 时必须返回 None（fail-closed）"
+        );
+        config.set_model_factory_for(|_, name| {
+            (name == "ok").then(|| Box::new(DummyModel) as Box<dyn ys_model::Model>)
+        });
+        assert!(config.build_model_for("ok").is_some());
+        assert!(config.build_model_for("nope").is_none());
+    }
+
     #[test]
     fn test_config_from_env_no_vars() {
         let _guard = env_lock();
@@ -545,6 +595,25 @@ mod tests {
         assert!(!config.is_configured());
         assert!(config.build_model().is_none());
         assert!(config.registry.find_provider("deepseek").is_some());
+    }
+
+    /// `context_window_for(name)` 与 `context_window()` 对当前 model 必须一致；
+    /// 未知模型回落到 `RunLimits::default().context_window`。
+    #[test]
+    fn test_context_window_for_matches_current_and_falls_back() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.context_window_for(&config.model),
+            config.context_window(),
+            "按名查与按当前 model 查必须一致"
+        );
+        assert_eq!(
+            config.context_window_for("definitely-not-a-real-model-xyz"),
+            ys_component::RunLimits::default().context_window,
+            "未知模型应回落默认窗口"
+        );
     }
 
     #[test]

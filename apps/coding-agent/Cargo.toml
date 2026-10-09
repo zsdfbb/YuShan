@@ -25,6 +25,8 @@ ys-tools-basic = { path = "../../adapters/tools-basic" }
 # 使「只要本机能力」的装配在类型上拿不到网络（见 tools-web crate 文档）。
 ys-tools-web = { path = "../../adapters/tools-web" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "sync", "time"] }
+# `AbortOnDropHandle`（subagent watchdog 防孤儿任务）。已在 Cargo.lock，无新下载。
+tokio-util = { version = "0.7", features = ["rt"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }

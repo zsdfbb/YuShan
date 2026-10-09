@@ -54,6 +54,7 @@
 //! 开头（每回合都做），故上一回合残留的 `Abort` 不会取消复核回合。
 
 use std::time::Instant;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use ys_core::{ContentBlock, Message, Role};
@@ -94,6 +95,7 @@ pub async fn run(
     mut boundary_rx: mpsc::Receiver<Boundary>,
     out_tx: mpsc::Sender<Outbound<CodingView>>,
     mut sink_rx: mpsc::Receiver<Envelope>,
+    subagent: Option<crate::subagent::SubagentSetup>,
 ) -> Result<(), AppLoopError> {
     // 回合号从 1 起（`Envelope.turn` 靠 `begin_turn` 携带）。
     let mut turns: u32 = 0;
@@ -131,6 +133,8 @@ pub async fn run(
                 // `config.max_turn_duration()`。
                 let request_started = Instant::now();
                 let deadline = request_started + config.max_turn_duration();
+                // 本请求一份子 usage 累加器（跨主回合 + 复核回合）。
+                let subagent_totals = Arc::new(crate::subagent::UsageTotals::default());
                 let mut ctx = TurnCtx {
                     agent: &mut agent,
                     wiring: &mut wiring,
@@ -144,6 +148,8 @@ pub async fn run(
                     out_tx: &out_tx,
                     sink_rx: &mut sink_rx,
                     boundary_rx: &mut boundary_rx,
+                    subagent: subagent.as_ref(),
+                    subagent_totals,
                 };
                 let mut pending = Some((AgentInput::new(message), TurnKind::Initial));
                 while let Some((input, kind)) = pending.take() {
@@ -278,6 +284,10 @@ struct TurnCtx<'a> {
     out_tx: &'a mpsc::Sender<Outbound<CodingView>>,
     sink_rx: &'a mut mpsc::Receiver<Envelope>,
     boundary_rx: &'a mut mpsc::Receiver<Boundary>,
+    /// subagent 派发能力（装配期冻结；`None` = 未启用）。
+    subagent: Option<&'a crate::subagent::SubagentSetup>,
+    /// 本请求累计的子 agent usage（回合末 drain 进 `RunResult.usage`）。
+    subagent_totals: Arc<crate::subagent::UsageTotals>,
 }
 
 /// 一个回合的结局：`Ok` 是本回合的 `RunResult`，`Err` 是模型 / 工具失败
@@ -321,10 +331,16 @@ async fn run_turn_once(
         ports.events.begin_turn(*ctx.turns);
         // 本回合专属的边界源：`Abort` 的标志位随回合作废。
         let boundary = QueueBoundarySource::new();
-        let turn = ctx.agent.run_turn(
-            input,
-            AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary)),
-        );
+        // subagent：每回合造一份 runner（派发计数器天然 per-turn；每次派发建新子 Agent）。
+        let runner = ctx
+            .subagent
+            .map(|s| s.make_runner(Some(ctx.config), ports.model, ctx.subagent_totals.clone()));
+        let mut agent_ports =
+            AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary));
+        if let Some(r) = &runner {
+            agent_ports = agent_ports.with_subagent(r);
+        }
+        let turn = ctx.agent.run_turn(input, agent_ports);
         tokio::pin!(turn);
         // 预算计时器**只允许触发一次**：到点后置位，`select!` 的 `if` 前置条件随即
         // 禁用该分支（否则 `sleep_until` 会持续 Ready ⇒ 忙等 + 重复发说明行）。
@@ -356,6 +372,15 @@ async fn run_turn_once(
                 }
             }
         }
+    };
+    // 子 agent 的 usage **上卷**：预算独立、记账上卷（ADR-0029 决策）。
+    // 追加进 `RunResult.usage` ⇒ 下游（`TurnStats` / meta / 退出码）看到真实总消耗。
+    let outcome = match outcome {
+        Ok(mut r) => {
+            r.usage = r.usage + ctx.subagent_totals.drain();
+            Ok(r)
+        }
+        Err(e) => Err(e),
     };
     // **回合结束后必须排空事件信道**：`select!` 分支的选择是随机的，
     // 它完全可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件
@@ -537,7 +562,7 @@ mod tests {
         prefilled: Vec<Boundary>,
         tweak: impl FnOnce(&mut Config, &PathBuf),
     ) -> Harness {
-        spawn_app_loop_full(model, persistent, prefilled, tweak, |b| b).await
+        spawn_app_loop_full(model, persistent, prefilled, tweak, |b| b, |_| None).await
     }
 
     /// 最底层起法：除 `Config` 外还允许改写 [`ys_runtime::AgentBuilder`]
@@ -549,8 +574,10 @@ mod tests {
         prefilled: Vec<Boundary>,
         tweak: impl FnOnce(&mut Config, &PathBuf),
         build_agent: impl FnOnce(ys_runtime::AgentBuilder) -> ys_runtime::AgentBuilder,
+        subagent: impl FnOnce(&Path) -> Option<crate::subagent::SubagentSetup>,
     ) -> Harness {
         let tmp = TempDir::new("harness");
+        let subagent = subagent(&tmp.0);
         let (sink, sink_rx) =
             ChannelSink::new(64, ys_protocol::LifecyclePolicy::StopWhenConsumerGone);
         let agent = build_agent(ys_runtime::AgentBuilder::new()).build().unwrap();
@@ -599,6 +626,7 @@ mod tests {
             boundary_rx,
             out_tx,
             sink_rx,
+            subagent,
         ));
 
         Harness {
@@ -1961,6 +1989,69 @@ mod tests {
 
     /// **`max_rounds` = `u32::MAX` ⇒ 不被核心默认 10 截断**（ADR-0027 决策 1）。
     ///
+    /// **接线**：`app_loop` 每回合构造 `AppSubagentRunner` 并经 `AgentPorts` 注入 ⇒
+    /// 模型发一个 `subagent` 工具调用时，它真的在环里跑通（子 agent 产出 → 结果回喂父模型）。
+    ///
+    /// 这是唯一覆盖「注入那几行」的用例：`subagent` 单元测试直接调 runner，跳过了
+    /// `TurnCtx.subagent → make_runner → AgentPorts::with_subagent` 这条链。
+    #[tokio::test]
+    async fn subagent_runner_is_injected_each_turn() {
+        use ys_tools_web::{FetchedDir, WebConfig};
+
+        let model = ys_model::MockModel::new("m");
+        // 父第 1 轮：发一个 `subagent` 调用。
+        model.push_tool_call(
+            "subagent",
+            serde_json::json!({"description": "查 X", "prompt": "查 X"}),
+        );
+        // 子 agent 的唯一一次模型调用，吃掉下一条响应。
+        model.push_text("CHILD-OUTPUT");
+        // 父第 2 轮（看到工具结果后）收尾。
+        model.push_text("parent done");
+
+        let mut h = spawn_app_loop_full(
+            Box::new(model),
+            false,
+            Vec::new(),
+            |_, _| {},
+            |b| {
+                b.tools(vec![Box::new(crate::subagent::SubagentTool::new(
+                    std::time::Duration::from_secs(30),
+                ))])
+            },
+            |tmp| {
+                Some(crate::subagent::SubagentSetup::new(
+                    "你是子 agent".to_string(),
+                    ys_component::RunLimits::new(3),
+                    std::time::Duration::from_secs(30),
+                    tmp.to_path_buf(),
+                    WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
+                ))
+            },
+        )
+        .await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let contents: Vec<String> = events_of(&msgs)
+            .into_iter()
+            .filter_map(|env| match &env.event {
+                AgentEvent::ToolResult { result, .. } => Some(result.content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("CHILD-OUTPUT")),
+            "子 agent 的产出必须作为工具结果回喂（注入链未接通？）：{contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains("## Files")),
+            "runner 必须保证产物节存在：{contents:?}"
+        );
+    }
+
     /// 生产侧 `resolve_limits`（`main.rs`）把 `config.max_rounds()`（app 默认
     /// `u32::MAX`，= 不设）装进 `RunLimits.max_rounds`；本用例在测试台重现该装配。
     /// 探针 `CompleteAtCalls(&[12])` 需要跑满 12 轮才收尾 —— 若限制仍是核心默认 10，
@@ -1974,6 +2065,7 @@ mod tests {
             Vec::new(),
             |_, _| {},
             |b| b.limits(ys_component::RunLimits::new(u32::MAX)),
+            |_| None,
         )
         .await;
 

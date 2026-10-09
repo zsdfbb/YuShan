@@ -7,6 +7,12 @@ pub struct ChatUsage {
     /// 部分兼容端点不返回该字段；缺失时按 0 计，不使整包反序列化失败。
     #[serde(default)]
     pub total_tokens: u32,
+    /// DeepSeek 等 provider 上报的 prompt cache 命中 token 数（缺失按 0）。
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: u32,
+    /// 同上，未命中部分（缺失按 0）。
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: u32,
 }
 
 /// SSE 流式 chunk

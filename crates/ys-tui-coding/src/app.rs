@@ -593,6 +593,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 1,
                 output_tokens: 1,
+                ..Default::default()
             },
             rounds: 1,
         }));
@@ -1037,6 +1038,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                ..Default::default()
             },
             rounds: 3,
         }));

@@ -208,10 +208,12 @@ mod tests {
         stats.record(&ys_core::Usage {
             input_tokens: 120,
             output_tokens: 45,
+            ..Default::default()
         });
         stats.record(&ys_core::Usage {
             input_tokens: 1,
             output_tokens: 2,
+            ..Default::default()
         });
 
         let cfg = Config::from_env().unwrap();

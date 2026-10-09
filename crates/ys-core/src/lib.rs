@@ -48,10 +48,12 @@ mod tests {
         let a = Usage {
             input_tokens: 10,
             output_tokens: 20,
+            ..Default::default()
         };
         let b = Usage {
             input_tokens: 5,
             output_tokens: 15,
+            ..Default::default()
         };
         let c = a + b;
         assert_eq!(
@@ -59,8 +61,29 @@ mod tests {
             Usage {
                 input_tokens: 15,
                 output_tokens: 35,
+                ..Default::default()
             }
         );
+    }
+
+    /// 缓存读数必须随 `Add` 一起累加（子 agent usage 上卷靠这条）。
+    #[test]
+    fn test_usage_add_carries_cache_fields() {
+        let a = Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            prompt_cache_hit_tokens: 7,
+            prompt_cache_miss_tokens: 3,
+        };
+        let b = Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            prompt_cache_hit_tokens: 5,
+            prompt_cache_miss_tokens: 4,
+        };
+        let c = a + b;
+        assert_eq!(c.prompt_cache_hit_tokens, 12);
+        assert_eq!(c.prompt_cache_miss_tokens, 7);
     }
 
     #[test]

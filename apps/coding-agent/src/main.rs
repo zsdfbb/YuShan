@@ -52,6 +52,7 @@ mod sessions;
 mod skills;
 mod state;
 mod status;
+mod subagent;
 mod toolset;
 mod view;
 mod wiring;
@@ -73,7 +74,7 @@ use ys_model_openai_compat::{
     OpenAICompatibleConfig, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
 };
 use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, QueueBoundarySource, Request};
-use ys_runtime::{Agent, AgentBuilder, BuildError};
+use ys_runtime::{Agent, AgentBuilder, AgentPorts, BuildError};
 use ys_session::SessionError;
 use ys_tool::Tool;
 use ys_tools_web::WebConfig;
@@ -729,6 +730,8 @@ async fn run_single_turn(
     wiring: &mut Wiring,
     input: AgentInput,
     budget: Duration,
+    config: Option<&config::Config>,
+    subagent: Option<&subagent::SubagentSetup>,
 ) -> Result<RunResult, LoopError> {
     let deadline = Instant::now() + budget;
 
@@ -737,13 +740,26 @@ async fn run_single_turn(
     let ports = wiring.ports_with_boundary(Some(&boundary));
     ports.events.begin_turn(1);
 
-    let turn = agent.run_turn(input, ports);
+    // subagent 能力：每回合造一份 runner（派发计数器天然 per-turn）。
+    let totals = std::sync::Arc::new(subagent::UsageTotals::default());
+    let runner = subagent.map(|s| s.make_runner(config, ports.model, totals.clone()));
+    let mut agent_ports = AgentPorts::new(
+        ports.model,
+        ports.session,
+        ports.events,
+        Some(&boundary),
+    );
+    if let Some(r) = &runner {
+        agent_ports = agent_ports.with_subagent(r);
+    }
+
+    let turn = agent.run_turn(input, agent_ports);
     tokio::pin!(turn);
     // 预算计时器**只允许触发一次**：到点后置位，`select!` 的 `if` 前置条件随即
     // 禁用该分支（`sleep_until` 对已过去的 deadline 会持续 Ready ⇒ 否则忙等 +
     // 重复发说明行 + 重复 push `Abort`）。
     let mut budget_exhausted = false;
-    loop {
+    let outcome = loop {
         tokio::select! {
             result = &mut turn => break result,
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)),
@@ -756,6 +772,14 @@ async fn run_single_turn(
                 boundary.push(Boundary::Abort);
             }
         }
+    };
+    // 子 agent 的 usage **上卷**：预算独立、记账上卷（ADR-0029 决策）。
+    match outcome {
+        Ok(mut r) => {
+            r.usage = r.usage + totals.drain();
+            Ok(r)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -806,12 +830,21 @@ async fn run_print_mode(
     budget: Duration,
     stats: &ChannelStatsHandle,
     force_stats: bool,
+    config: &config::Config,
+    subagent: Option<&subagent::SubagentSetup>,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
     // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
     let (run_result, consume_result) = tokio::join!(
-        run_single_turn(agent, wiring, AgentInput::text(task.as_str()), budget),
+        run_single_turn(
+            agent,
+            wiring,
+            AgentInput::text(task.as_str()),
+            budget,
+            Some(config),
+            subagent,
+        ),
         consume_print_events(rx, io::stdout()),
     );
 
@@ -837,11 +870,20 @@ async fn run_json_mode(
     budget: Duration,
     stats: &ChannelStatsHandle,
     force_stats: bool,
+    config: &config::Config,
+    subagent: Option<&subagent::SubagentSetup>,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
     let (run_result, consume_result) = tokio::join!(
-        run_single_turn(agent, wiring, AgentInput::text(task.as_str()), budget),
+        run_single_turn(
+            agent,
+            wiring,
+            AgentInput::text(task.as_str()),
+            budget,
+            Some(config),
+            subagent,
+        ),
         consume_events(rx, io::stdout(), write_json_envelope),
     );
 
@@ -897,6 +939,7 @@ fn run_interactive(
     startup_hint: Option<String>,
     sessions_dir: PathBuf,
     resume_path: Option<PathBuf>,
+    subagent: Option<subagent::SubagentSetup>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
@@ -976,6 +1019,7 @@ fn run_interactive(
             boundary_rx,
             out_tx,
             sink_rx,
+            subagent,
         )
         .await
         {
@@ -1126,6 +1170,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     });
 
+    // 按**模型名**构造（subagent 的 `model` 参数）：同一 provider 上的另一个模型。
+    // 未配置凭证 / 名字为空 ⇒ `None` ⇒ 调用方 **fail-closed**（绝不静默回退到父模型）。
+    config.set_model_factory_for(|cfg, name| {
+        if name.is_empty() {
+            return None;
+        }
+        let base = cfg.api_base.as_ref()?;
+        let key = cfg.api_key.as_ref()?;
+        let compat = cfg.current_compat();
+        let retry = cfg.model_retry();
+        let timeout = cfg.model_timeout();
+        Some(Box::new(
+            OpenAICompatibleModel::new(OpenAICompatibleConfig {
+                api_base: base.clone(),
+                api_key: key.clone(),
+                model: name.to_string(),
+                max_tokens: Some(4096),
+                temperature: Some(0.7),
+                compat,
+            })
+            .with_retry(RetryConfig {
+                max_attempts: retry.max_attempts,
+                base_delay_ms: retry.base_delay_ms,
+                max_delay_ms: retry.max_delay_ms,
+            })
+            .with_timeouts(TimeoutConfig {
+                connect_secs: timeout.connect_secs,
+                idle_secs: timeout.idle_secs,
+            })
+            .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg))),
+        ))
+    });
+
     // 构建工具表与 system prompt。
     //
     // 顺序即设计 §1.2「启动期」：**先探测装工具**（`toolset` 是唯一装配接缝，
@@ -1138,9 +1215,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // env 一次并冻结，**无副作用到「清理」为止**。
     let web = WebConfig::from_env();
     // 清理在此**显式**发生（不在 `build_tools` / `from_env` 里）：只对 Primary 档，
-    // 且必须在把 `web` move 进 `build_tools` 之前完成。
+    // 且必须在把 `web` 交给装配之前完成。
     sweep_fetched(&web, FETCHED_MAX_AGE);
-    let (tools, hint) = toolset::build_tools(&workspace, web);
+    // 子 agent 的工具表 = 父表**去掉派发工具**（即这份 9 元基础表）—— 结构上不可能递归。
+    let (base_tools, hint) = toolset::build_tools(&workspace, web.clone());
+    let child_specs = base_tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
+    let child_prompt = prompt::build_system_prompt(&cwd, &child_specs, &catalogue);
+
+    // 子预算与主 agent **同源**（同一份 `Config`），但 `fixed_prompt_tokens` 必须填
+    // **子表**的值 —— 否则子会话会系统性晚触发压缩。
+    let mut child_limits = limits.clone();
+    child_limits.fixed_prompt_tokens = fixed_prompt_tokens(&child_prompt, &child_specs);
+    let subagent_setup = subagent::SubagentSetup::new(
+        child_prompt,
+        child_limits,
+        config.max_turn_duration(),
+        workspace.clone(),
+        web,
+    );
+    // 产物目录清理：只清 Primary 档的超龄文件（`YUSHAN_SUBAGENTS_DIR` 只写不删）。
+    subagent_setup.sweep_old_products();
+
+    // 父表 = 基础 9 元 + 派发工具**追加末位**（子 tools JSON 仍是父的字节前缀 ⇒ 命中缓存）。
+    let mut tools = base_tools;
+    tools.push(Box::new(subagent::SubagentTool::new(
+        subagent_setup.outer_timeout(),
+    )));
     let specs = tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
     let system_prompt = prompt::build_system_prompt(&cwd, &specs, &catalogue);
 
@@ -1202,6 +1302,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.max_turn_duration(),
                 &stats_handle,
                 args.stats,
+                &config,
+                Some(&subagent_setup),
             ))?;
             rt.block_on(persist_single_turn(
                 &mut wiring,
@@ -1239,6 +1341,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.max_turn_duration(),
                 &stats_handle,
                 args.stats,
+                &config,
+                Some(&subagent_setup),
             ))?;
             rt.block_on(persist_single_turn(
                 &mut wiring,
@@ -1263,6 +1367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hint,
                 sessions_dir,
                 resume_path,
+                Some(subagent_setup),
             )?;
         }
     }
@@ -1648,7 +1753,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let joined = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
-                run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60)),
+                run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60), None, None),
                 consume_events(rx, &mut out, write_json_envelope),
             )
         })
@@ -1769,7 +1874,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let (run_result, consume_result) = tokio::join!(
-            run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60)),
+            run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60), None, None),
             consume_events(rx, &mut out, write_json_envelope),
         );
         run_result.expect("run_turn 应成功");
@@ -1891,6 +1996,8 @@ mod tests {
                     &mut wiring,
                     AgentInput::text("hi"),
                     config.max_turn_duration(),
+                    None,
+                    None,
                 ),
                 consume_events(rx, &mut out, write_json_envelope),
             )
@@ -2454,6 +2561,7 @@ mod tests {
         stats.record(&Usage {
             input_tokens: 11,
             output_tokens: 4,
+            ..Default::default()
         });
 
         finalize_turn_meta(
@@ -2483,6 +2591,7 @@ mod tests {
         stats.record(&Usage {
             input_tokens: 1,
             output_tokens: 1,
+            ..Default::default()
         });
         finalize_turn_meta(
             &mut wiring,
@@ -2524,6 +2633,7 @@ mod tests {
         stats.record(&Usage {
             input_tokens: 3,
             output_tokens: 2,
+            ..Default::default()
         });
         finalize_turn_meta(
             &mut wiring,
@@ -2543,6 +2653,7 @@ mod tests {
         stats.record(&Usage {
             input_tokens: 4,
             output_tokens: 1,
+            ..Default::default()
         });
         finalize_turn_meta(&mut wiring, Some("第二条"), None, None, None, &stats)
             .await
@@ -2617,6 +2728,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 7,
                 output_tokens: 5,
+                ..Default::default()
             },
             rounds: 1,
             final_message: None,

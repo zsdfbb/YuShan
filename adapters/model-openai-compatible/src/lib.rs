@@ -6,13 +6,15 @@ pub mod stream;
 mod inline_thinking;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use compat::ProviderCompat;
 use inline_thinking::{Segment, SegmentKind};
 use request::*;
 use response::*;
 use stream::{StreamEvent, parse_sse_stream};
-use ys_core::{ContentBlock, Message, Role, ToolCallId, Usage};
+use ys_core::{ContentBlock, EventError, Message, Role, ToolCallId, Usage};
 use ys_model::{
     FinishReason, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
 };
@@ -26,23 +28,124 @@ pub struct OpenAICompatibleConfig {
     pub compat: ProviderCompat,
 }
 
+/// 模型调用的有界重试策略（ADR-0028 决策 4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryConfig {
+    /// **额外**重试次数（不含首次）。0 = 不重试。
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    /// 单次退避硬上限；同时是服务端 `Retry-After` 的硬上限。
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay_ms: 500,
+            max_delay_ms: 30_000,
+        }
+    }
+}
+
+/// 模型调用的两个超时旋钮（ADR-0028 决策 5）。
+///
+/// 连接建立与流空闲分开设：长思考模型（如 `deepseek-reasoner`）首字节可达数十秒，
+/// 若用单一总超时会把正常的「慢首字节」误判为失败。「首字节延迟」与「中途停顿」
+/// 语义不同，必须分开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutConfig {
+    /// 连接建立超时（秒）。
+    pub connect_secs: u64,
+    /// 流空闲超时（秒）：相邻两次字节到达的最长间隔。
+    pub idle_secs: u64,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_secs: 15,
+            idle_secs: 120,
+        }
+    }
+}
+
+/// 诊断日志的去处由调用方注入 —— 适配器不认识 app 侧的 logging 文件（ADR-0028 决策 7）。
+///
+/// 重试痕迹只走这条回调：**对 TUI 不可见、对排障可见**，
+/// 不往 `Envelope` / `AgentEvent` / `ModelEvent` 加任何变体。
+pub type ModelLogger = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct OpenAICompatibleModel {
     config: OpenAICompatibleConfig,
     client: reqwest::Client,
+    retry: RetryConfig,
+    timeouts: TimeoutConfig,
+    log: Option<ModelLogger>,
+    /// client 是本模型自建（`new`）还是调用方注入（`with_client`）。
+    /// 自建时 `with_timeouts` 按新超时重建 client；注入时其连接策略归调用方。
+    owns_client: bool,
 }
 
 impl OpenAICompatibleModel {
-    /// 用默认 client（`reqwest::Client::new()`，遵循进程级/系统代理）构造。
+    /// 用自建 client（遵循进程级/系统代理）构造；超时 / 重试取默认值，可用 builder 覆盖。
     pub fn new(config: OpenAICompatibleConfig) -> Self {
-        Self::with_client(config, reqwest::Client::new())
+        let timeouts = TimeoutConfig::default();
+        let client = build_client(&timeouts);
+        Self {
+            config,
+            client,
+            retry: RetryConfig::default(),
+            timeouts,
+            log: None,
+            owns_client: true,
+        }
     }
 
     /// 用调用方提供的 `reqwest::Client` 构造。
     ///
     /// 便于注入自定义超时、连接池或代理策略（如测试里 `.no_proxy()` 直连回环），
     /// 从而不必改进程级 env——避免同一测试二进制内并行执行时相互污染。
+    /// 连接策略归调用方，故 `with_timeouts` 不会重建此 client。
     pub fn with_client(config: OpenAICompatibleConfig, client: reqwest::Client) -> Self {
-        Self { config, client }
+        Self {
+            config,
+            client,
+            retry: RetryConfig::default(),
+            timeouts: TimeoutConfig::default(),
+            log: None,
+            owns_client: false,
+        }
+    }
+
+    /// 设置有界重试策略。
+    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// 设置两个超时旋钮。仅当 client 由本模型自建时按新值重建；
+    /// 调用方注入的 client（`with_client`）其连接策略归调用方，不改动。
+    pub fn with_timeouts(mut self, timeouts: TimeoutConfig) -> Self {
+        self.timeouts = timeouts;
+        if self.owns_client {
+            self.client = build_client(&self.timeouts);
+        }
+        self
+    }
+
+    /// 注入诊断日志回调（重试痕迹的唯一出口）。
+    pub fn with_logger(mut self, log: ModelLogger) -> Self {
+        self.log = Some(log);
+        self
+    }
+
+    /// 落一行诊断日志；未注入 logger 时静默。**不得**改为直接打印 ——
+    /// 适配器的任何直接输出都会在 TUI 起屏后冲掉整屏。
+    fn log(&self, message: &str) {
+        if let Some(log) = &self.log {
+            log(message);
+        }
     }
 
     /// 发送一次 `/chat/completions` 请求。只负责传输层错误，不解读状态码——
@@ -51,7 +154,7 @@ impl OpenAICompatibleModel {
         &self,
         url: &str,
         chat_request: &ChatCompletionRequest,
-    ) -> Result<reqwest::Response, ModelError> {
+    ) -> Result<reqwest::Response, reqwest::Error> {
         self.client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
@@ -59,7 +162,77 @@ impl OpenAICompatibleModel {
             .json(chat_request)
             .send()
             .await
-            .map_err(|e| ModelError::Provider(format!("HTTP request failed: {e}")))
+    }
+}
+
+/// 按超时配置建 client。
+///
+/// `build()` 失败（极罕见：TLS 后端初始化失败等）时回退到 `Client::new()` ——
+/// 这是一个**保命**分支（宁可丢掉自定义超时也不让整个 agent 起不来），而非正常路径。
+fn build_client(timeouts: &TimeoutConfig) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(timeouts.connect_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 一次尝试的失败分类。只在本模块内活 —— `ModelError` 是纯 `String` 且非
+/// `#[non_exhaustive]`（ADR-0028 决策 1），不承载分类。
+enum AttemptError {
+    /// 值得重试。`server_delay` 是服务端要求的等待（`Retry-After` / `Retry-After-ms`）。
+    Retryable {
+        reason: String,
+        server_delay: Option<Duration>,
+    },
+    /// 确定性失败，直接上报。
+    Fatal(ModelError),
+}
+
+/// 额度 / 计费耗尽的错误体措辞（大小写不敏感的子串匹配）。
+///
+/// `429` 语义二义：瞬时限流（该重试）与账户额度耗尽（重试无用）状态码相同。
+/// 该名单是**开放的常量** —— 为新增 provider 加措辞是加法，**不得**演变成规则引擎。
+const QUOTA_MARKERS: &[&str] = &[
+    "insufficient_quota",
+    "quota exceeded",
+    "out of budget",
+    "billing",
+    "usage limit",
+    "available balance",
+];
+
+/// 记「本次尝试是否已经吐出过 delta」。
+///
+/// 一旦发出过 `TextDelta` / `ThinkingDelta`，其后的任何失败**直接上报、不重试**——
+/// 重放会把已渲染的文本再渲染一遍。**受损的只有渲染，不是会话**：`BasicLoop` 的
+/// `Forwarder` 只把 delta 转成 UI 事件，会话里的 assistant 内容来自适配器收敛出的
+/// `ModelResponse`，delta 从不进会话。但渲染侧重复同样不可接受：TUI 会把它接进同一条
+/// `Assistant` 行，而 `-p` 把增量直写 stdout、**无法撤回**。
+///
+/// **只看这两个事件**：工具参数增量**不冒泡**（在适配器内部组装），不构成「已显示」。
+struct DeltaWatchingSink<'s> {
+    inner: &'s mut dyn ModelEventSink,
+    emitted: bool,
+}
+
+impl<'s> DeltaWatchingSink<'s> {
+    fn new(inner: &'s mut dyn ModelEventSink) -> Self {
+        Self {
+            inner,
+            emitted: false,
+        }
+    }
+}
+
+impl ModelEventSink for DeltaWatchingSink<'_> {
+    fn emit(&mut self, event: ModelEvent) -> Result<(), EventError> {
+        if matches!(
+            event,
+            ModelEvent::TextDelta { .. } | ModelEvent::ThinkingDelta { .. }
+        ) {
+            self.emitted = true;
+        }
+        self.inner.emit(event)
     }
 }
 
@@ -78,17 +251,85 @@ impl Model for OpenAICompatibleModel {
         //    `supports_stream_usage` 决定是否带 `stream_options.include_usage`。
         let mut chat_request = translate_request(&request, &self.config)?;
 
-        // 2. 发送请求。URL 里 base 已 trim 尾部 `/`，统一追加 `/chat/completions`。
+        // 2. URL：base 已 trim 尾部 `/`，统一追加 `/chat/completions`。
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.trim_end_matches('/')
         );
-        let response = self.send(&url, &chat_request).await?;
 
-        // 2b. 一次性回退：端点不认识 `stream_options.include_usage` 时返回 400。
-        //     若本次请求带了该字段，则剥掉后**只重试一次**——避免让严格校验的
-        //     网关直接失败，同时让容忍该字段的端点拿到 token 统计。
-        //     请求本来就没带（`supports_stream_usage = false`）→ 不触发，直接报错。
+        // 3. 有界重试循环。`max_attempts` 是**额外**重试次数，故总尝试数为 max_attempts + 1。
+        //    每次尝试用 DeltaWatchingSink 记「本次是否已吐出 delta」——吐过就不许重试。
+        for attempt in 0..=self.retry.max_attempts {
+            let (outcome, emitted) = {
+                let mut watcher = DeltaWatchingSink::new(&mut *sink);
+                let outcome = self.attempt(&url, &mut chat_request, &mut watcher).await;
+                (outcome, watcher.emitted)
+            };
+
+            match outcome {
+                Ok(response) => return Ok(response),
+                Err(AttemptError::Fatal(error)) => return Err(error),
+                Err(AttemptError::Retryable { reason, server_delay }) => {
+                    // 已吐出 delta ⇒ 一律不重试（重放会把已渲染的文本再渲染一遍）。
+                    if emitted {
+                        return Err(ModelError::Provider(format!(
+                            "{reason} (streaming already began; not retried)"
+                        )));
+                    }
+                    // 次数耗尽 ⇒ 上报最后一次的错误（消息里带尝试次数）。
+                    if attempt == self.retry.max_attempts {
+                        self.log(&format!(
+                            "retry giving up after {} attempt(s): {reason}",
+                            attempt + 1
+                        ));
+                        return Err(ModelError::Provider(format!(
+                            "{reason} (after {} attempt(s))",
+                            attempt + 1
+                        )));
+                    }
+                    // 计算退避；服务端 `Retry-After` 超硬上限则放弃（绝不傻等）。
+                    let delay = match self.backoff_delay(attempt, server_delay) {
+                        Ok(delay) => delay,
+                        Err(error) => {
+                            self.log(&format!("retry giving up: {error}"));
+                            return Err(error);
+                        }
+                    };
+                    // 进入退避前落一行日志（决策 7）：对排障可见、对 TUI 不可见。
+                    self.log(&format!(
+                        "retry attempt {}/{} delay={}ms reason={reason}",
+                        attempt + 1,
+                        self.retry.max_attempts,
+                        delay.as_millis()
+                    ));
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        // 循环在最后一次尝试失败时已 return，不可达；仅为满足类型检查。
+        unreachable!("retry loop always returns")
+    }
+}
+
+impl OpenAICompatibleModel {
+    /// 执行**一次**尝试：发请求 → 处理非成功状态 → 流式解析并收敛。
+    /// 分类（可重试 / 确定性）只活在本方法内。
+    async fn attempt(
+        &self,
+        url: &str,
+        chat_request: &mut ChatCompletionRequest,
+        sink: &mut dyn ModelEventSink,
+    ) -> Result<ModelResponse, AttemptError> {
+        let response = self
+            .send(url, chat_request)
+            .await
+            .map_err(retryable_transport_error)?;
+
+        // 一次性回退：端点不认识 `stream_options.include_usage` 时返回 400。
+        // 这是**单次尝试内部**的「剥掉不认识参数后重发一次」，与重试层无关 ——
+        // 保持其位置与语义不变，之后才进下面的分类。
+        // 请求本来就没带（`supports_stream_usage = false`）→ 不触发，直接报错。
         let response = if response.status() == reqwest::StatusCode::BAD_REQUEST
             && chat_request.stream_options.is_some()
         {
@@ -100,25 +341,166 @@ impl Model for OpenAICompatibleModel {
                  token usage for this run will be reported as 0"
             );
             chat_request.stream_options = None;
-            self.send(&url, &chat_request).await?
+            self.send(url, chat_request)
+                .await
+                .map_err(retryable_transport_error)?
         } else {
             response
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ModelError::Provider(format!("API error {status}: {body}")));
+            return Err(classify_error_response(response).await);
         }
 
-        // 3. 流式解析：SSE 每解析出一个 delta 就立刻推给 sink（真增量，不缓冲）
+        // 流式解析：SSE 每解析出一个 delta 就立刻推给 sink（真增量，不缓冲）。
+        // 每次 `stream.next()` 都由流空闲超时包住 —— 黑洞端点「接受连接但不应答」
+        // 会让 complete 永久挂起，超时是重试的前置。
+        let idle = Duration::from_secs(self.timeouts.idle_secs);
         let mut accumulator =
-            StreamAccumulator::new(sink, self.config.compat.has_reasoning_content);
-        parse_sse_stream(response, |event| accumulator.handle(event)).await?;
-
-        // 4. 收敛为完整 ModelResponse（工具参数已在累积器内组装）
-        accumulator.finish()
+            StreamAccumulator::new(&mut *sink, self.config.compat.has_reasoning_content);
+        match parse_sse_stream(response, idle, |event| accumulator.handle(event)).await {
+            // `finish()` 仅在 `StreamEvent::Error` 置位后报错，而该事件只由传输层错误
+            // 产生（见 `stream::parse_sse_stream` 的 `Ok(Some(Err(..)))` 分支）——
+            // 故此处把它的 `Err` 无条件归为可重试是安全的。
+            // sink 自身的 `Err` 不会落到这里：`StreamAccumulator::handle` 内以
+            // `let _ = self.sink.emit(..)` 吞掉它，`handle` 恒返回 `Ok`，从不外抛。
+            // 因此下面 `Err` 分支当前只由流空闲超时（`stream.rs`）到达，
+            // `classify_stream_error` 的 `Fatal` 分支在当前路径下不可达。
+            Ok(()) => accumulator.finish().map_err(|error| AttemptError::Retryable {
+                reason: error.to_string(),
+                server_delay: None,
+            }),
+            Err(error) => Err(classify_stream_error(error)),
+        }
     }
+
+    /// 计算下一次退避时长。
+    ///
+    /// 服务端给了 `Retry-After` 时**尊重它**，但以 `max_delay_ms` 为**硬上限**：
+    /// 超过上限 ⇒ 返回 `Err` 让调用方立即上报，**绝不取「与上界取 max」**
+    /// （那等于允许服务端让本仓无界地等下去，与「必须有界」自相矛盾）。
+    /// 无服务端要求时用指数退避 + 抖动，抖动位置取当前时钟，
+    /// 由 [`backoff_delay_with_fraction`] 完成「先抖后夹」。
+    fn backoff_delay(
+        &self,
+        attempt: u32,
+        server_delay: Option<Duration>,
+    ) -> Result<Duration, ModelError> {
+        let max = Duration::from_millis(self.retry.max_delay_ms);
+        if let Some(server) = server_delay {
+            if server > max {
+                return Err(ModelError::Provider(format!(
+                    "server requested retry after {}s, exceeding max_delay_ms={}; giving up",
+                    server.as_secs(),
+                    self.retry.max_delay_ms
+                )));
+            }
+            return Ok(server);
+        }
+        Ok(Duration::from_millis(backoff_delay_with_fraction(
+            attempt,
+            &self.retry,
+            jitter_fraction(),
+        )))
+    }
+}
+
+/// 无服务端要求时的退避计算，抖动位置由 `fraction` 注入。
+///
+/// `fraction ∈ [0.0, 1.0]` 是抖动在区间内的位置：`0.0 ⇒ 0.75×exp`、`1.0 ⇒ 1.25×exp`。
+/// 指数项为 `base_delay_ms × 2^min(attempt,32)`，用 `saturating_mul` 兜住乘法饱和。
+/// **先抖后夹**：抖动施加于夹取之前，故 `max_delay_ms` 是绝对上界，抖动不得使其越界。
+fn backoff_delay_with_fraction(attempt: u32, retry: &RetryConfig, fraction: f64) -> u64 {
+    let exp_ms = retry
+        .base_delay_ms
+        .saturating_mul(1u64 << attempt.min(32));
+    let jittered_ms = (exp_ms as f64 * (0.75 + 0.5 * fraction)) as u64;
+    jittered_ms.min(retry.max_delay_ms)
+}
+
+/// 取当前时间纳秒做抖动位置（不引新依赖），返回 `[0.0, 1.0]`。
+fn jitter_fraction() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1001) as f64 / 1000.0
+}
+
+/// 传输层错误（连接 / DNS / TLS / 超时）一律可重试。
+fn retryable_transport_error(error: reqwest::Error) -> AttemptError {
+    AttemptError::Retryable {
+        reason: format!("HTTP request failed: {error}"),
+        server_delay: None,
+    }
+}
+
+/// 流阶段错误分类：空闲超时可重试（属传输层）；其余（`on_event` / sink 错误）不可重试。
+fn classify_stream_error(error: ModelError) -> AttemptError {
+    if error.to_string().contains(stream::IDLE_TIMEOUT_MARKER) {
+        AttemptError::Retryable {
+            reason: error.to_string(),
+            server_delay: None,
+        }
+    } else {
+        AttemptError::Fatal(error)
+    }
+}
+
+/// 非成功响应的可重试性判定，三级从左到右短路：
+/// ① 响应头 `x-should-retry` 定论（不看状态码）→ ② 额度名单否决 → ③ 状态码。
+async fn classify_error_response(response: reqwest::Response) -> AttemptError {
+    let status = response.status();
+    let should_retry = response
+        .headers()
+        .get("x-should-retry")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+    let server_delay = parse_retry_after(response.headers());
+    let body = response.text().await.unwrap_or_default();
+    let reason = format!("API error {status}: {body}");
+
+    // ① 响应头定论：端点自陈的可重试性比从状态码推断更权威。
+    match should_retry.as_deref() {
+        Some("true") => return AttemptError::Retryable { reason, server_delay },
+        Some("false") => return AttemptError::Fatal(ModelError::Provider(reason)),
+        _ => {}
+    }
+
+    // ② 额度否决：即便状态码是 429，额度耗尽也不重试。
+    if looks_like_quota_exhausted(&body) {
+        return AttemptError::Fatal(ModelError::Provider(reason));
+    }
+
+    // ③ 状态码：429 与 5xx 可重试，其余 4xx 是确定性失败。
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        AttemptError::Retryable { reason, server_delay }
+    } else {
+        AttemptError::Fatal(ModelError::Provider(reason))
+    }
+}
+
+fn looks_like_quota_exhausted(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    QUOTA_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// 解析服务端要求的等待：`Retry-After-ms`（毫秒）优先于 `Retry-After`（秒）。
+///
+/// 只识别整数形式（HTTP-date 形式的 `Retry-After` 忽略——国内兼容端点不用它）。
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(ms));
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// 单个 tool call 的流式累积器：按 `index` 分组。
@@ -1081,5 +1463,74 @@ mod tests {
         let response = acc.finish().unwrap();
         assert_eq!(response.finish_reason, FinishReason::Length);
         assert!(response.finish_reason.is_truncated());
+    }
+
+    /// 构造一个仅重试策略可调的最小 model（client 与网络无关，退避是纯计算）。
+    fn model_with_retry(retry: RetryConfig) -> OpenAICompatibleModel {
+        OpenAICompatibleModel::with_client(
+            config_with(ProviderCompat::standard()),
+            reqwest::Client::new(),
+        )
+        .with_retry(retry)
+    }
+
+    /// **`max_delay_ms` 是绝对上界**：先抖后夹，抖动不得越过它。
+    ///
+    /// 抖动位置由 `fraction` 确定注入（不经时钟、无 `sleep`），故断言对区间内
+    /// 任一位置都确定成立。`base` 远大于上限 ⇒ 先抖后夹恒夹到**恰好上限**（此处仅断言
+    /// `<= cap`）；旧式（先夹后抖）会对上限本身再乘抖动，采到 `fraction > 0.5`
+    /// （如 0.75 / 1.0）即 `> max` ⇒ 必红，不依赖采样概率。
+    #[test]
+    fn backoff_delay_never_exceeds_hard_cap() {
+        let retry = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 10_000_000,
+            max_delay_ms: 10,
+        };
+        let cap = retry.max_delay_ms;
+        for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for attempt in [0_u32, 1, 5, 32] {
+                let delay = backoff_delay_with_fraction(attempt, &retry, fraction);
+                assert!(
+                    delay <= cap,
+                    "attempt={attempt} fraction={fraction}：退避 {delay}ms 越过硬上限 {cap}ms"
+                );
+            }
+        }
+
+        // 生产路径（抖动取时钟）同样受硬上限约束。
+        let model = model_with_retry(retry);
+        let delay = model
+            .backoff_delay(0, None)
+            .expect("无服务端要求时必有退避值");
+        assert!(
+            delay <= Duration::from_millis(cap),
+            "时钟路径退避 {delay:?} 越过硬上限"
+        );
+    }
+
+    /// 饱和 + 硬上限：`base = 2^63` 时 `base × 2^32` 溢出 `u64` ⇒ `saturating_mul`
+    /// 饱和到 `u64::MAX`，抖动后仍远大于上限，被夹到**恰好上限**。
+    ///
+    /// 把 `saturating_mul` 换成 `*`：release（wrapping）下 `2^63 × 2^32 ≡ 0 (mod 2^64)`
+    /// ⇒ `exp = 0` ⇒ 结果为 `0 ≠ 上限` ⇒ 红；debug 下算术溢出 panic ⇒ 红。
+    /// 故断言「结果恒等于 `max_delay_ms`」这一确定值，在 debug 与 release 下均有判别力
+    /// （断言本身不依赖 panic）。极大 `attempt` 亦不 panic。
+    #[test]
+    fn backoff_delay_saturates_without_overflow() {
+        let retry = RetryConfig {
+            max_attempts: u32::MAX,
+            base_delay_ms: 1u64 << 63,
+            max_delay_ms: 30_000,
+        };
+        for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for attempt in [32_u32, 40, u32::MAX] {
+                let delay = backoff_delay_with_fraction(attempt, &retry, fraction);
+                assert_eq!(
+                    delay, retry.max_delay_ms,
+                    "attempt={attempt} fraction={fraction}：饱和后应夹到恰好上限"
+                );
+            }
+        }
     }
 }

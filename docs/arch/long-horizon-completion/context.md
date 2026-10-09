@@ -32,8 +32,8 @@
 
 ### 1.2 回合边界是一堵死墙（`app_loop`）
 
-- `app_loop` 的 `Request::Prompt` 臂**恰好一个回合**（`apps/coding-agent/src/app_loop.rs:114`）。
-- 回合结果的 `match` **不看 `stop_reason`**（`app_loop.rs:186-196`）：`Ok` ⇒ 记 usage；`Err` ⇒ 落日志。
+- `app_loop` 的 `Request::Prompt` 臂**恰好一个回合**。
+- 回合结果的 `match` **不看 `stop_reason`**：`Ok` ⇒ 记 usage；`Err` ⇒ 落日志。
   **撞 `MaxRounds` 与正常 `Completed` 走同一条路**，随后回到 `request_rx.recv().await` 等用户下一条输入。
 - ⇒ 无论回合是「完成」还是「撞墙」，`app_loop` 之后的行为**完全一样：等下一条输入**。
   边界不是闸门（有判据可开），是**墙**（一律终止）。
@@ -42,13 +42,13 @@
 
 - `crates/ys-component/src/limits.rs:39` — `max_rounds: 10`，判定在 `basic.rs:115`，撞顶时
   `RunResult { stop_reason: MaxRounds, final_message: None, .. }`（`basic.rs:126-131`）——**无收尾机会**。
-- **在 coding-agent 无任何覆盖路径**：`resolve_limits()`（`apps/coding-agent/src/main.rs:361`）只写
+- **在 coding-agent 无任何覆盖路径**：`resolve_limits()` 只写
   `context_window` 与 `compaction`；`config.json` 无 `max_rounds` 段；无环境变量、无 CLI flag（全仓确认）。
 - ⇒ 例子里的「⚠ 10 rounds」是**够不到**的硬天花板。
 
 ### 1.4 一次性入口根本没有多回合
 
-`-p` / `--json` 走 `run_single_turn`（`main.rs:714-724`）：`begin_turn(1)` + **一次** `run_turn`，随后退出。
+`-p` / `--json` 走 `run_single_turn`：`begin_turn(1)` + **一次** `run_turn`，随后退出。
 ⇒ 长程任务在 `-p` 下 **100% 烂尾**，连「手动再发一条」都没有。
 
 ### 1.5 ⚠️ ADR-0024 的闭环**盖不住这个例子**（本轮最重要的新发现）
@@ -69,7 +69,7 @@
   **它的分支体是空的**（`basic.rs:517-520`：只有一句注释「继续循环…模型应看到反复出现的错误并停止」）。
   ⇒ **这是一个已记录、但未生效的守卫**：计数照涨，行为为零。
 - 于是回合的终点只剩四种（§2.2），其中**能主动刹住「模型原地打转」的只有 `MaxRounds`**。
-- **`-p` / `--json` 连中止都没有**：`run_single_turn` **不传 `boundary`**（`main.rs:715` 注释自陈
+- **`-p` / `--json` 连中止都没有**：`run_single_turn` **不传 `boundary`**（`run_single_turn` 处注释自陈
   「一次性模式没有中途插话/中止的 UI 入口」）⇒ 一次性模式下**既无轮数上限、又无 Abort**。
 
 > ⇒ **把 `max_rounds` 设成极大，等于 TUI 只剩「Ctrl+C」这一条人工兜底，`-p` 想停只能杀进程。**
@@ -196,8 +196,8 @@
 
 | # | 改动 | 落点 | 体量 |
 |---|---|---|---|
-| **① 放开单回合预算** | `max_rounds` 可配 + 默认极大 | `resolve_limits()`（`main.rs:361`）+ `config.rs` | 极小 |
-| **② 完工复核** | `Completed` ⇒ 发一条复核消息、另起一回合；停滞即停 | `app_loop` `Request::Prompt` 臂（`app_loop.rs:114`） | 小（照 `follow-up.md:55-63`） |
+| **① 放开单回合预算** | `max_rounds` 可配 + 默认极大 | `resolve_limits()` + `config.rs` | 极小 |
+| **② 完工复核** | `Completed` ⇒ 发一条复核消息、另起一回合；停滞即停 | `app_loop` `Request::Prompt` 臂 | 小（照 `follow-up.md:55-63`） |
 
 - **建议进入 `arch-design`**：把 ① ② 定稿（含 §7 Q1 的四个「待定」——复核措辞、UI 呈现、计数上限、与 todo 判据的优先级）。
 - **建议先用 `prototype` 验证**（便宜且高价值）：
@@ -239,7 +239,7 @@
 2. **只在「本回合调用过工具」时问**：否则每问一句「这函数干啥」、模型答完都要被追一句「还要继续吗」= 纯噪音。
    判据 = 本回合出现过 `ToolUse` / `ToolResult`。
 
-**落点**：`app_loop` 的 `Request::Prompt` 臂（`app_loop.rs:114`）包成循环（照 `follow-up.md:55-63` 的
+**落点**：`app_loop` 的 `Request::Prompt` 臂包成循环（照 `follow-up.md:55-63` 的
 `while let Some(msg) = pending.take()`）。**不碰** `ys-loop` / `ys-runtime` / `ys-protocol`。
 
 **待定（设计阶段）**：
@@ -268,7 +268,7 @@
 - **保留字段与 `StopReason::MaxRounds`**（不删检查）：机制留着当**日后安全阀**（CI / headless / 长任务失控时设一个界），
   默认值取极大（或 `u32::MAX`）⇒ 行为上等于「不设」。
 - **来源**：`config.json` 新增 `max_rounds` 段（照 `context_window` / `compaction` 的既有三级解析形状），
-  可选加环境变量。`resolve_limits()`（`main.rs:361`）是**唯一**接线点。
+  可选加环境变量。`resolve_limits()` 是**唯一**接线点。
 
 > ⚠️ **代价如实（§1.6）**：默认极大后，TUI 的回合内兜底只剩 Ctrl+C；`-p` / `--json` **连 Abort 都没有**
 > （`run_single_turn` 不传 `boundary`）。若日后要 headless 长任务，需同时给 `-p` 一个可配的界或中止入口。

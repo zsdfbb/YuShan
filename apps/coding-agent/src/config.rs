@@ -24,6 +24,16 @@ struct RawUserConfig {
     context_window: HashMap<String, serde_json::Value>,
     #[serde(default)]
     compaction: RawCompaction,
+    /// 单回合模型调用轮数上限。**顶层标量**（回合属性，不按 model 分）。
+    #[serde(default)]
+    max_rounds: Option<serde_json::Value>,
+    /// 一次用户请求（含复核回合）的 wall-clock 预算，单位**秒**。
+    #[serde(default)]
+    max_turn_duration_secs: Option<serde_json::Value>,
+    #[serde(default)]
+    model_retry: RawModelRetry,
+    #[serde(default)]
+    model_timeout: RawModelTimeout,
 }
 
 /// `config.json` 的 `compaction` 段。字段全可选，未给的用 `CompactPolicy::default()`。
@@ -33,6 +43,71 @@ struct RawCompaction {
     trigger_ratio: Option<serde_json::Value>,
     #[serde(default)]
     keep_ratio: Option<serde_json::Value>,
+}
+
+/// `config.json` 的 `model_retry` 段。字段全可选，未给的用 [`ModelRetryConfig::default`]。
+#[derive(Debug, Default, Deserialize)]
+struct RawModelRetry {
+    #[serde(default)]
+    max_attempts: Option<serde_json::Value>,
+    #[serde(default)]
+    base_delay_ms: Option<serde_json::Value>,
+    #[serde(default)]
+    max_delay_ms: Option<serde_json::Value>,
+}
+
+/// `config.json` 的 `model_timeout` 段。字段全可选，未给的用 [`ModelTimeoutConfig::default`]。
+#[derive(Debug, Default, Deserialize)]
+struct RawModelTimeout {
+    #[serde(default)]
+    connect_secs: Option<serde_json::Value>,
+    #[serde(default)]
+    idle_secs: Option<serde_json::Value>,
+}
+
+/// 模型调用的有界重试策略（ADR-0028 决策 4）。
+///
+/// 是**回合 / 进程属性**，与 model 无关 —— 故落顶层对象段，**不做「按 model 的 map」**
+/// （照 ADR-0027 决策 1 对 `max_rounds` 的同一条理由：重试/超时不属于某个 model 的方言）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelRetryConfig {
+    /// **额外**重试次数（不含首次）。`0` = 不重试。
+    pub max_attempts: u32,
+    /// 指数退避基数（毫秒）。
+    pub base_delay_ms: u64,
+    /// 单次退避硬上限（毫秒），兼作 `Retry-After` 的硬上限。
+    pub max_delay_ms: u64,
+}
+
+impl Default for ModelRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay_ms: 500,
+            max_delay_ms: 30_000,
+        }
+    }
+}
+
+/// 模型调用的两个超时旋钮（ADR-0028 决策 5）：连接建立 + 流空闲（多久无字节算超时）。
+///
+/// 同样是**回合 / 进程属性**，与 model 无关 —— 故落顶层对象段，**不做「按 model 的 map」**
+/// （同 [`ModelRetryConfig`]，照 ADR-0027 决策 1 对 `max_rounds` 的同一条理由）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTimeoutConfig {
+    /// 连接建立超时（秒）。
+    pub connect_secs: u64,
+    /// 流空闲超时（秒）—— 多久无字节即判定超时。
+    pub idle_secs: u64,
+}
+
+impl Default for ModelTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_secs: 15,
+            idle_secs: 120,
+        }
+    }
 }
 
 /// **已校验**的用户配置覆盖项（`config.json` 的规整形态）。
@@ -47,6 +122,14 @@ struct UserConfig {
     trigger_ratio: Option<f64>,
     /// 保留比例覆盖（同上）
     keep_ratio: Option<f64>,
+    /// 单回合模型调用轮数上限覆盖（仅正整数）。`None` = 未给 ⇒ 回落 `u32::MAX`。
+    max_rounds: Option<u32>,
+    /// wall-clock 预算秒数覆盖（仅正整数）。`None` = 未给 ⇒ 回落 48h。
+    max_turn_duration_secs: Option<u64>,
+    /// 重试策略（逐字段独立，缺省已由 [`ModelRetryConfig::default`] 填好）。
+    model_retry: ModelRetryConfig,
+    /// 超时旋钮（逐字段独立，缺省已由 [`ModelTimeoutConfig::default`] 填好）。
+    model_timeout: ModelTimeoutConfig,
 }
 
 pub struct Config {
@@ -137,6 +220,32 @@ impl Config {
             policy.keep_ratio = ratio;
         }
         policy
+    }
+
+    /// 单回合模型调用轮数上限（`config.json` 的 `max_rounds`）。
+    ///
+    /// 缺省回落 [`u32::MAX`]（= 不设）—— 与库的保守默认
+    /// [`ys_component::RunLimits::default().max_rounds`]（`10`）**刻意分离**：
+    /// 库给保守默认，app 的产品默认是不设（ADR-0027 决策 1）。
+    pub fn max_rounds(&self) -> u32 {
+        self.user_config.max_rounds.unwrap_or(u32::MAX)
+    }
+
+    /// 一次用户请求（含复核回合）的 wall-clock 预算（`config.json` 的
+    /// `max_turn_duration_secs`）。缺省 48h —— 需求是 48 小时长程任务，
+    /// 真正的兜底是这条**小时级**阀门，不是轮数（ADR-0027 决策 6）。
+    pub fn max_turn_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.user_config.max_turn_duration_secs.unwrap_or(172_800))
+    }
+
+    /// 模型调用重试策略（`config.json` 的 `model_retry`，ADR-0028 决策 4）。
+    pub fn model_retry(&self) -> ModelRetryConfig {
+        self.user_config.model_retry
+    }
+
+    /// 模型调用超时（`config.json` 的 `model_timeout`，ADR-0028 决策 5）。
+    pub fn model_timeout(&self) -> ModelTimeoutConfig {
+        self.user_config.model_timeout
     }
 
     /// 读 `~/.yushan/config.json`（**用户写、app 只读**）。
@@ -267,7 +376,65 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
 
     user.trigger_ratio = sanitize_ratio("trigger_ratio", raw.compaction.trigger_ratio);
     user.keep_ratio = sanitize_ratio("keep_ratio", raw.compaction.keep_ratio);
+
+    // 标量：正整数（0 会让轮数上限立刻到顶 / 预算立刻到点，一并按非法处理）。
+    user.max_rounds = sanitize_uint("max_rounds", raw.max_rounds, 1u32);
+    user.max_turn_duration_secs =
+        sanitize_uint("max_turn_duration_secs", raw.max_turn_duration_secs, 1u64);
+
+    // 重试 / 超时**逐字段独立**覆盖：未给的项保持默认（照 `compaction` 的
+    // `trigger_ratio` / `keep_ratio` 关系）。重试三项允许 0（`max_attempts: 0` = 不重试、
+    // 延迟 0 = 不退避），超时两项不允许 0（0 无意义）。
+    let mut retry = ModelRetryConfig::default();
+    if let Some(n) = sanitize_uint("model_retry.max_attempts", raw.model_retry.max_attempts, 0u32) {
+        retry.max_attempts = n;
+    }
+    if let Some(n) =
+        sanitize_uint("model_retry.base_delay_ms", raw.model_retry.base_delay_ms, 0u64)
+    {
+        retry.base_delay_ms = n;
+    }
+    if let Some(n) = sanitize_uint("model_retry.max_delay_ms", raw.model_retry.max_delay_ms, 0u64) {
+        retry.max_delay_ms = n;
+    }
+    user.model_retry = retry;
+
+    let mut timeout = ModelTimeoutConfig::default();
+    if let Some(n) =
+        sanitize_uint("model_timeout.connect_secs", raw.model_timeout.connect_secs, 1u64)
+    {
+        timeout.connect_secs = n;
+    }
+    if let Some(n) = sanitize_uint("model_timeout.idle_secs", raw.model_timeout.idle_secs, 1u64) {
+        timeout.idle_secs = n;
+    }
+    user.model_timeout = timeout;
+
     Ok(user)
+}
+
+/// 「取无符号整数 + 落日志」的通用校验（`max_rounds` / `max_turn_duration_secs` /
+/// `model_retry` / `model_timeout` 共用）。`min` 是最小合法值（标量与超时旋钮取 1、
+/// 重试三项取 0）。
+///
+/// `as_u64()` 同时挡下负值、浮点、字符串、布尔、对象、数组；再与 `min` 比较。
+/// `None` 入参（未给）**静默**返回 `None`；给了值但非法则落一行日志并返回 `None`，
+/// 于是**只丢该条**，同文件其余条目照常生效（照 [`sanitize_ratio`] 的宽容语义）。
+fn sanitize_uint<T>(path: &str, value: Option<serde_json::Value>, min: T) -> Option<T>
+where
+    T: TryFrom<u64> + PartialOrd + std::fmt::Display,
+{
+    let value = value?;
+    match value.as_u64().and_then(|n| T::try_from(n).ok()) {
+        Some(n) if n >= min => Some(n),
+        _ => {
+            crate::logging::log(&format!(
+                "ignoring config.json {path}: \
+                 expected an integer >= {min}, got {value}"
+            ));
+            None
+        }
+    }
 }
 
 /// 比例校验：必须是**有限**值且落 `(0, 1]`。`None` 表示「未给 / 非法」→ 用默认值。
@@ -927,5 +1094,209 @@ mod tests {
             "project 仍必须在第一条"
         );
         assert_eq!(roots[1], PathBuf::from(format!("{home}/.yushan/skills")));
+    }
+
+    // ───── 长程完成配置：max_rounds / 时长 / 重试 / 超时（ADR-0027 / 0028） ─────
+    //
+    // 这些用例直接调 `parse_user_config`（传 JSON 字符串），**不碰文件系统**：
+    // 校验 / 丢弃语义全在解析层，无需为「只丢该条」造临时文件。
+
+    /// `max_rounds`：合法正整数被采纳；缺省回落 `u32::MAX`（= 不设）。
+    ///
+    /// 变异：把调用点的 `min` 从 `1u32` 改成 `0u32`（即接受 0）⇒
+    /// [`test_max_rounds_invalid_dropped_individually`] 的 `zero` 用例变红。
+    #[test]
+    fn test_max_rounds_adopted_and_default_is_unset() {
+        let mut config = test_config("deepseek-chat");
+        assert_eq!(config.max_rounds(), u32::MAX, "缺省 = 不设");
+        assert_ne!(
+            config.max_rounds(),
+            ys_component::RunLimits::default().max_rounds,
+            "app 产品默认必须与库的保守默认（10）分离（防恒真）"
+        );
+
+        config.user_config = parse_user_config(r#"{"max_rounds": 42}"#).unwrap();
+        assert_eq!(config.max_rounds(), 42, "合法正整数应被采纳");
+    }
+
+    /// `max_rounds` 非法值**逐条丢弃**，且**只丢该条**（同文件其他项照常生效）。
+    ///
+    /// 变异：`min` 判据从 `>= 1` 放开到 `>= 0` ⇒ `zero` 用例变红。
+    #[test]
+    fn test_max_rounds_invalid_dropped_individually() {
+        for (name, value) in [
+            ("zero", "0"),
+            ("negative", "-3"),
+            ("float", "1.5"),
+            ("string", "\"100\""),
+            ("null", "null"),
+            ("bool", "true"),
+            ("object", "{}"),
+            ("array", "[1, 2]"),
+        ] {
+            let json = format!(r#"{{"max_rounds": {value}}}"#);
+            let user = parse_user_config(&json).unwrap();
+            assert_eq!(user.max_rounds, None, "case {name} 应被丢弃");
+        }
+
+        // 只丢该条：非法 `max_rounds` 不影响同一份文件里的 `context_window`。
+        let user = parse_user_config(
+            r#"{"max_rounds": 0, "context_window": {"deepseek-chat": 64000}}"#,
+        )
+        .unwrap();
+        assert_eq!(user.max_rounds, None, "非法 max_rounds 应被丢弃");
+        assert_eq!(
+            user.windows.get("deepseek-chat"),
+            Some(&64_000),
+            "同文件其他项必须照常生效"
+        );
+    }
+
+    /// `max_turn_duration_secs`：合法正整数被采纳；缺省 = 48h；`0` / 非法类型回落默认。
+    #[test]
+    fn test_max_turn_duration_adopted_and_default() {
+        let mut config = test_config("deepseek-chat");
+        assert_eq!(
+            config.max_turn_duration(),
+            std::time::Duration::from_secs(172_800),
+            "缺省 = 48h"
+        );
+
+        config.user_config = parse_user_config(r#"{"max_turn_duration_secs": 3600}"#).unwrap();
+        assert_eq!(
+            config.max_turn_duration(),
+            std::time::Duration::from_secs(3600)
+        );
+
+        for (name, value) in [
+            ("zero", "0"),
+            ("negative", "-1"),
+            ("float", "1.5"),
+            ("string", "\"3600\""),
+            ("null", "null"),
+        ] {
+            let json = format!(r#"{{"max_turn_duration_secs": {value}}}"#);
+            let user = parse_user_config(&json).unwrap();
+            assert_eq!(user.max_turn_duration_secs, None, "case {name} 应被丢弃");
+        }
+    }
+
+    /// `model_retry` **逐字段独立**覆盖：只给一项时另两项仍是默认；`max_attempts: 0` 合法。
+    ///
+    /// 变异：把逐字段独立改成「三项任一存在就整体覆盖」⇒「只给 base_delay_ms」那组
+    /// 断言变红（未给的字段会被写成 0，而非保持默认）。
+    #[test]
+    fn test_model_retry_independent_fields() {
+        // 缺省全默认。
+        let config = test_config("deepseek-chat");
+        assert_eq!(config.model_retry(), ModelRetryConfig::default());
+        assert_eq!(
+            config.model_retry(),
+            ModelRetryConfig {
+                max_attempts: 5,
+                base_delay_ms: 500,
+                max_delay_ms: 30_000,
+            }
+        );
+
+        // 只给 base_delay_ms ⇒ 另两项保持默认。
+        let user = parse_user_config(r#"{"model_retry": {"base_delay_ms": 1000}}"#).unwrap();
+        assert_eq!(
+            user.model_retry,
+            ModelRetryConfig {
+                max_attempts: 5,
+                base_delay_ms: 1000,
+                max_delay_ms: 30_000,
+            }
+        );
+
+        // `max_attempts: 0`（不重试）是**合法**值；另两项仍默认。
+        let user = parse_user_config(r#"{"model_retry": {"max_attempts": 0}}"#).unwrap();
+        assert_eq!(
+            user.model_retry,
+            ModelRetryConfig {
+                max_attempts: 0,
+                base_delay_ms: 500,
+                max_delay_ms: 30_000,
+            }
+        );
+
+        // 三项都给 ⇒ 三项全采纳。
+        let user = parse_user_config(
+            r#"{"model_retry": {"max_attempts": 2, "base_delay_ms": 250, "max_delay_ms": 8000}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            user.model_retry,
+            ModelRetryConfig {
+                max_attempts: 2,
+                base_delay_ms: 250,
+                max_delay_ms: 8000,
+            }
+        );
+    }
+
+    /// `model_retry` 非法字段被丢弃 ⇒ **该字段**回落默认（不 panic、不整体覆盖）。
+    #[test]
+    fn test_model_retry_invalid_fields_fall_back() {
+        for (name, json) in [
+            ("negative", r#"{"model_retry": {"base_delay_ms": -5}}"#),
+            ("string", r#"{"model_retry": {"max_attempts": "3"}}"#),
+            ("object", r#"{"model_retry": {"max_delay_ms": {}}}"#),
+        ] {
+            let user = parse_user_config(json).unwrap();
+            assert_eq!(
+                user.model_retry,
+                ModelRetryConfig::default(),
+                "case {name} 非法字段应回落默认"
+            );
+        }
+    }
+
+    /// `model_timeout` 逐字段独立；缺省 15 / 120；`0` 无意义 ⇒ 丢弃、回落默认。
+    #[test]
+    fn test_model_timeout_independent_fields() {
+        let config = test_config("deepseek-chat");
+        assert_eq!(config.model_timeout(), ModelTimeoutConfig::default());
+        assert_eq!(
+            config.model_timeout(),
+            ModelTimeoutConfig {
+                connect_secs: 15,
+                idle_secs: 120,
+            }
+        );
+
+        let user = parse_user_config(r#"{"model_timeout": {"connect_secs": 30}}"#).unwrap();
+        assert_eq!(
+            user.model_timeout,
+            ModelTimeoutConfig {
+                connect_secs: 30,
+                idle_secs: 120,
+            },
+            "只给 connect_secs 时 idle_secs 保持默认"
+        );
+
+        let user = parse_user_config(r#"{"model_timeout": {"idle_secs": 300}}"#).unwrap();
+        assert_eq!(
+            user.model_timeout,
+            ModelTimeoutConfig {
+                connect_secs: 15,
+                idle_secs: 300,
+            },
+            "只给 idle_secs 时 connect_secs 保持默认"
+        );
+
+        // 0 无意义（超时为 0 会立刻超时）⇒ 丢该字段、回落默认。
+        for (name, json) in [
+            ("connect_zero", r#"{"model_timeout": {"connect_secs": 0}}"#),
+            ("idle_zero", r#"{"model_timeout": {"idle_secs": 0}}"#),
+        ] {
+            let user = parse_user_config(json).unwrap();
+            assert_eq!(
+                user.model_timeout,
+                ModelTimeoutConfig::default(),
+                "case {name} 应回落默认"
+            );
+        }
     }
 }

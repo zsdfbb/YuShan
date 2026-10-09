@@ -401,3 +401,98 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
   但 CLI 形态下无人投 `Boundary`（交互 TUI 才用得上）。
 - `ys-tui-coding` 的模态浮层与补全浮层共享 `Clear` 后覆盖渲染，未做统一的 `Overlay` 抽象
   （design §1 注允许二选一）。
+- **长程完成（ADR-0027 / 0028）本轮的债务**（未校准初值 / 设计层缺口 / 复核层残余）见 §12。
+
+---
+
+## 11. 长程完成（ADR-0027 / 0028）— as-built
+
+三条生产改动：① `max_rounds` 可配 + **wall-clock 预算**；② 一次性**完工复核**；③ 适配器模型调用**超时 + 有界重试**。
+**零 `ys-protocol` 改动、零 `BasicLoop` 改动、零 core crate 改动**（复核的 UI 呈现只改 `ys-tui-coding` 的渲染分支）。
+
+### 11.1 配置层：四个取数口（`apps/coding-agent/src/config.rs`）
+
+| 取数口 | `config.json` 键 | 缺省 | 校验 |
+|---|---|---|---|
+| `Config::max_rounds() -> u32` | 顶层标量 `max_rounds` | `u32::MAX`（= 不设） | 正整数（`min = 1`） |
+| `Config::max_turn_duration() -> Duration` | 顶层标量 `max_turn_duration_secs` | `172_800`s（48h） | 正整数（`min = 1`） |
+| `Config::model_retry() -> ModelRetryConfig` | 对象段 `model_retry` | `{ max_attempts: 5, base_delay_ms: 500, max_delay_ms: 30_000 }` | 三项**逐字段独立**，允许 0 |
+| `Config::model_timeout() -> ModelTimeoutConfig` | 对象段 `model_timeout` | `{ connect_secs: 15, idle_secs: 120 }` | 两项**逐字段独立**，`min = 1` |
+
+- 校验走共用的 `sanitize_uint`（`as_u64` 挡下负值 / 浮点 / 字符串 / 布尔 / 对象 / 数组）：非法值**只丢该条 + 落日志**，同文件其余条目照常生效；未给静默回落默认。重试三项取 `min = 0`（`max_attempts: 0` = 不重试、延迟 0 = 不退避是合法意图）。
+- `max_rounds` **刻意与库默认分离**：`RunLimits::default().max_rounds` 保持 `10`（库的保守默认），app 的产品默认是 `u32::MAX`（不设）。
+- `model_retry` / `model_timeout` 是**回合 / 进程属性**，落顶层对象段，**不做「按 model 的 map」**（同 `max_rounds` 的理由：重试 / 超时不属于某个 model 的方言）。
+
+### 11.2 limits 注入（`apps/coding-agent/src/main.rs`）
+
+- `resolve_limits` 只注入三行：`context_window` / `compaction` / `max_rounds`（本轮新增最后一行）。**`model_retry` / `model_timeout` 不经 `resolve_limits`** —— 它们是适配器构造参数，经模型工厂 `Config::set_model_factory`（定义于 `config.rs`，由 `main.rs` 调用；`with_retry(cfg.model_retry())` / `with_timeouts(cfg.model_timeout())` 的调用在 `main.rs` 的工厂闭包内）显式传入（生产路径**总是**显式调用，故生效的是 app 侧常量）。
+- `resolve_limits` 是 TUI / `-p` / `--json` 三入口**唯一** limits 接线点，一处修复三模式。
+
+### 11.3 完工复核缝（`apps/coding-agent/src/follow_up.rs` + `app_loop`）
+
+- `enum TurnKind { Initial, Review }`；`fn should_review(kind, &RunResult) -> Option<AgentInput>`；常量 `REVIEW_MIN_ROUNDS = 5`、`REVIEW_PROMPT`（纯常量、确定性字节）。
+- **「只问一次」由结构保证**：`should_review` 首个早退 `if kind != TurnKind::Initial { return None }`，且 `pending` 只在 `Initial` 时被填 ⇒ **每用户输入至多多出一个复核回合**；无计数上限、无停滞判据、无抢占、无逃生开关。
+- **三道门**（从左到右短路）：① `Initial`；② `stop_reason == Completed`（`Cancelled` / `Truncated` / `MaxRounds` 一律不续 —— 用户中止永远赢）；③ `rounds >= REVIEW_MIN_ROUNDS`（`5`）。门槛抬到 5 而非 2：把「读一个文件就答」这类短回合挡在复核之外。
+- **落点**：`app_loop` 的 `Request::Prompt` 臂包成 `while let Some((input, kind)) = pending.take()`；抽出 `run_turn_once`。复核消息经 `AgentInput::text(REVIEW_PROMPT)` 交给 `run_turn` ⇒ `BasicLoop` Step 2 append 为 `Role::User` + emit `UserMessage`。
+- **标题素材仅取 `Initial` 回合**：`Review` 回合交 `None`（绝不把复核文案写成会话标题）。
+
+### 11.4 wall-clock 预算（`app_loop` + `main.rs`）
+
+- **`deadline` 在 `Request::Prompt` 入口算一次**（`request_started + config.max_turn_duration()`），覆盖整个 `pending` 循环 —— 主回合与复核回合**共享同一截止点**；时长只来自 `Config::max_turn_duration()`，绝不写死。
+- **每回合新建 `QueueBoundarySource`**（`Abort` 永久置位，复用会让上一回合的取消取消之后每个回合）；`run_turn_once` **第一步**排空 `boundary_rx` 残留（防队列里那条已投递的 `Abort` 取消本回合）。
+- **计时器臂**：`sleep_until(deadline)` 分支带 `if !budget_exhausted` 前置条件；到点**先**发 `Outbound::Output`（`budget exhausted: wall-clock budget of {secs}s elapsed — aborting this turn`），**再** `boundary.push(Boundary::Abort)`。该回合以 `Cancelled` 收场 ⇒ `should_review` 返回 `None`（预算耗尽不触发复核）。
+- **§4.9 可观测行**：每个回合边界经 `logging` 落一行 `turn=… rounds=… elapsed=…s cumulative_rounds=… budget_remaining=…s`（`budget_remaining` 走 `saturating_duration_since`，到点后为 0）。
+- **`-p` / `--json`（`run_single_turn`）**：合成 `QueueBoundarySource` + **同一**计时器形状；到点**先**写说明行**再** push `Abort`。说明行走 **stderr** —— 该路径**无 outbound 信道**（`stdout` 承载模型文本增量 / 逐行 JSON 流，必须保持干净）。`single_turn_exit_code`：`Cancelled ⇒ 1`，其余（`Completed` / `MaxRounds` / `Truncated`…）`⇒ 0`；`exit_with_code` 非零时先 `flush` stdout 再 `exit`。
+
+### 11.5 适配器超时 + 有界重试（`adapters/model-openai-compatible`）
+
+- `RetryConfig` / `TimeoutConfig`（`lib.rs`）+ builder `with_retry` / `with_timeouts` / `with_logger`。`with_timeouts` 仅在 client 自建（`new`）时按新值重建（`owns_client` 守卫）；`with_client` 注入的 client 连接策略归调用方。
+- **重试循环**（`complete`）：`for attempt in 0..=max_attempts`（`max_attempts` 是**额外**次数，总尝试 = max_attempts + 1）；每次尝试包 `DeltaWatchingSink`。
+- **三级可重试判定**（`classify_error_response`，从左到右短路）：① 响应头 `x-should-retry` 定论（不看状态码）→ ② `QUOTA_MARKERS` 额度名单否决（`insufficient_quota` / `quota exceeded` / `out of budget` / `billing` / `usage limit` / `available balance`，大小写不敏感子串）→ ③ 状态码（连接 / DNS / TLS / 超时、`429`、`5xx` 可重；其余 4xx 与解析失败不重）。
+- **有界退避**（`backoff_delay` / `backoff_delay_with_fraction`）：指数 + 抖动，**先抖后夹**到 `max_delay_ms`（绝对上界）；`429` 的 `Retry-After` / `Retry-After-ms` 被尊重，但**超过 `max_delay_ms` 硬上限即放弃**（不取「与上界取 max」）。
+- **`DeltaWatchingSink`**：只看 `TextDelta` / `ThinkingDelta`；一旦吐出即 `.emitted = true`，其后失败**直接上报、不重试**（重放会把已渲染文本再渲染一遍 —— `-p` 直写 stdout 无法撤回）。
+- **重试日志**经注入的 `ModelLogger` 回调（生产接 `crate::logging::log`）：进入退避前落 `retry attempt k/n delay=…ms reason=…`，放弃时另落一行。**重试日志只经该回调落，不经 stdout / stderr**（TUI 起屏后直写会冲掉整屏）；重试**对 TUI 不可见、对排障可见**。
+- **超时**：连接建立经 `build_client` 的 `.connect_timeout(connect_secs)`；**流空闲超时**落 `stream.rs` 的 `parse_sse_stream` —— `tokio::time::timeout(idle, stream.next())` 包住每次字节读取，超时错误带 `IDLE_TIMEOUT_MARKER`（`classify_stream_error` 据此归为可重试）。黑洞端点「接受连接但不应答」否则会让 `complete` 永久挂起。
+
+### 11.6 TUI 判别式（零 `ys-protocol` 改动）
+
+- `ys-tui-coding/src/app.rs` 的 `AgentEvent::UserMessage` 分支三段：① 回显抑制（`suppress_user_echo`）→ ② 迟到回声认领（`pending_echo_texts`，以 `!is_turning` 为闸）→ ③ **判别式**。
+- **判别式只读 `is_turning` 的真假，绝不按内容匹配**（不嗅探文案是否为复核提示）：
+  - `is_turning == true` ⇒ 轮边界 steering 插话 ⇒ `TranscriptLine::User`；
+  - `is_turning == false` ⇒ app 发起的**复核回合**（主回合已 `RunFinished`，`finish_turn` 已复位）⇒ `TranscriptLine::System` 行 + 点亮 `Working`（置 `is_turning = true` + `turn_started_at`）—— 复核同样是一个回合，谁也不是谁的特例。
+- 全部改动落在 `ys-tui-coding` 渲染分支，**`ys-protocol` 一字节不改**。
+
+### 11.7 新增测试
+
+| 落点 | 条数 | 覆盖 |
+|---|---|---|
+| `apps/coding-agent/src/follow_up.rs` | 4 | `Review` 恒不复核 / 非 `Completed` 不续 / 门槛两侧边界 / 复核输入逐字节 `== REVIEW_PROMPT` |
+| `apps/coding-agent/src/app_loop.rs` | 11 | 复核正例（主回合 5 轮 ⇒ 恰一个复核回合）/ 纯文本·`Cancelled`·`MaxRounds`·`Truncated` 不复核 / **不问第二次** / 跨回合残留 `Abort` 不取消复核 / 标题不被复核覆盖 / 复核回合不交自己的输入作标题 / wall-clock 到点发说明行 + `Cancelled` / `max_rounds = u32::MAX` 不被核心默认 10 截断 |
+| `apps/coding-agent/src/config.rs` | 6 | 四个取数口的采纳 / 非法值逐条丢弃 / 重试·超时逐字段独立 |
+| `apps/coding-agent/src/main.rs` | 4（含 1 条更新） | `resolve_limits` 注入 `max_rounds` 与缺省 `u32::MAX` / `single_turn_exit_code`（`Cancelled ⇒ 1`）/ `budget_exhaustion_cancels_single_turn` / 适配器与 app 侧默认常数不漂移 |
+| `adapters/model-openai-compatible/tests/retry.rs` | 15 | 回环 TCP：空闲超时上报 / `429` 后成功 / `x-should-retry` 双向定论 / 额度否决 `429` / `Retry-After` 超硬上限放弃 / 吐 delta（含 thinking）后不重 / 确定性 4xx 不重 / 重试日志可见 / 两组默认常数 pinned / `max_attempts = 0` / 注入 client 保超时 |
+| `crates/ys-tui-coding/src/app.rs` | 7 | 判别式两侧（`!is_turning` ⇒ `System` 行 + 点亮；`is_turning` ⇒ `User` 行）+ 回显抑制路径不受影响；`pending_echo_texts` 迟到回声认领四条（§11.6 已记为 as-built）：迟到的排队回声不被误标 `System` / 连续排队提交都被认领 / 排队回合保持 `is_turning` / 与复核回合撞车时仍能认领 |
+| `apps/coding-agent/tests/budget_exit.rs` | 4 | **子进程级**（真实二进制）：`-p` / `--json` 预算到点非零退出 / 说明行落 stderr / `--json` 的 stdout 每行皆合法 JSON（说明行不污染）/ 正常路径退出码 0 |
+
+---
+
+## 12. 本轮的已知债务（debt 账）
+
+### 12.A 未校准初值
+
+用户裁定「跳过 prototype、按设计初值实现、记账」；本环境**无** `YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`。以下三个初值**待真实环境校准**：
+
+- `REVIEW_MIN_ROUNDS = 5`；
+- `model_timeout = { connect_secs: 15, idle_secs: 120 }`；
+- `model_retry = { max_attempts: 5, base_delay_ms: 500, max_delay_ms: 30_000 }`。
+
+### 12.B 设计层缺口
+
+- **预算管不住在途模型调用**（`apps/coding-agent/tests/budget_exit.rs` 实证）：`Boundary::Abort` **只在轮边界被 `BasicLoop` 读取** —— Step 1 入口（`crates/ys-loop/src/basic.rs:58`）、Step 3 模型调用前（`basic.rs:95`）、轮边界 `take()`（`basic.rs:213`）；而**模型调用发生在 Step 6**（`basic.rs:258`）。若该调用不返回，预算到点推入的 `Abort` **不会被观察** ⇒ 该调用实际由**适配器的流空闲超时**（`stream.rs:123` 的 `tokio::time::timeout(idle, …)`，默认 120s）界住。预算不打断在途模型调用；最坏 = **一次在途模型调用**（由该空闲超时界住）。
+- **`-p` / `--json` 说明行落点与计划不符**：exec-plan 写 `Outbound::Output`，实际走 **stderr**（`main.rs::run_single_turn`）—— 因为该路径**无 outbound 信道**；这是「stdout 承载模型增量 / JSON 流必须保持干净」的必然结果（`tests/budget_exit.rs` 用例 2 钉住）。
+- **记账**（指向既有 ADR，不展开）：细阀换粗阀（`MAX_CONSECUTIVE_ERRORS` 空分支仍在 —— `basic.rs:14` 常量、`basic.rs:517` 空体只有注释）；`Cancelled` 三义（预算到点与 Ctrl+C 同态，靠一行说明区分）；退避不可中止（`Model::complete` 无取消入参）；重试治抖动不治停服（>~150s 故障仍终止回合）；会话 `append` 每次全量重写 JSONL（48h ≈ 10⁵ 次全文件重写）。
+
+### 12.C 复核层残余
+
+- **错误路径下 `rounds` 记 0**：`app_loop` 的 §4.9 可观测行取 `rounds = match &outcome { Ok(result) => result.rounds, Err(_) => 0 }`（`app_loop.rs:372-375`）；`Err` 路径下 `rounds` 记 0，**低估**真实轮数（`cumulative_rounds` 因此也少加）。仅影响该排障行，不影响执行。
+- **同一 poll 内计时器至多一条说明行**（核实结论，**非**债务）：`budget_exhausted` 在计时器分支体内**先**同步置位（`app_loop.rs:350`）**再** `await` 发送，`select!` 的 `if !budget_exhausted` 前置条件随即禁用该分支 ⇒ 说明行至多一条、`Abort` 至多 push 一次。`-p` / `--json` 的 `run_single_turn` 同形。

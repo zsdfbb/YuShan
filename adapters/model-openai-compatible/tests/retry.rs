@@ -1,0 +1,625 @@
+//! 模型调用**超时 + 有界重试**的端到端验收（ADR-0028）。
+//!
+//! 用**本地回环 TCP mock 服务器**驱动 [`OpenAICompatibleModel::complete`]：
+//! 按预设序列逐个返回响应、记录请求数，覆盖空闲超时、`x-should-retry` 头、
+//! 额度名单否决、状态码分类、`Retry-After` 硬上限、已吐 delta 不重试、退避日志。
+//!
+//! 回环地址需绕过代理：用 `reqwest::Client` 的 `.no_proxy()` 直连，**不改进程级 env**
+//! （同 binary 内并行测试改 env 会数据竞争）；端口交给内核分配（`bind(:0)`）避免撞名。
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ys_core::EventError;
+use ys_model::{Model, ModelEvent, ModelEventSink, ModelRequest};
+use ys_model_openai_compat::{
+    OpenAICompatibleConfig, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
+    compat::ProviderCompat,
+};
+
+// ---------------------------------------------------------------------------
+// 本地 mock HTTP 服务
+// ---------------------------------------------------------------------------
+
+/// 一条预设响应。
+#[derive(Clone)]
+enum Reply {
+    /// 标准一次性 HTTP 响应（带 `Content-Length` + `Connection: close`）。
+    Http {
+        status: &'static str,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    },
+    /// 200 + 完整 SSE（`Content-Length` 与实际字节相等，干净收尾）。
+    Sse(Vec<u8>),
+    /// 200 + 一段 SSE 后**保持连接沉默**（不关、不再发字节）——用于流空闲超时。
+    SseThenSilence(Vec<u8>),
+    /// 200 + 一段 SSE 后**立即关闭**，且 `Content-Length` 声明得比实发字节大 ——
+    /// 客户端读到 delta 后连接关闭，hyper 判定消息不完整 ⇒ 传输层错误。
+    /// 用于「已吐 delta 后断连」。
+    SseThenTruncate(Vec<u8>),
+}
+
+/// 极简 HTTP/1.1 mock：第 N 个连接返回第 N 条预设响应（超出则复用最后一条）。
+struct MockServer {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MockServer {
+    fn start(replies: Vec<Reply>) -> Self {
+        assert!(!replies.is_empty(), "至少一条预设响应");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_thread = requests.clone();
+        let stop_thread = stop.clone();
+        let replies = Arc::new(replies);
+
+        let handle = std::thread::spawn(move || {
+            let mut index = 0usize;
+            while !stop_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let reply = replies
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| replies.last().unwrap().clone());
+                        index += 1;
+                        let _ = handle_connection(stream, &reply, &requests_thread, &stop_thread);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            port,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// api_base（code 会在其后追加 `/chat/completions`）。
+    fn api_base(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    reply: &Reply,
+    requests: &Arc<Mutex<Vec<String>>>,
+    stop: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    // 监听 socket 非阻塞（accept 轮询 stop 需要）；macOS/BSD 上 accept 返回的连接
+    // 会继承 O_NONBLOCK，导致后续 `set_read_timeout` 被忽略。显式复位为阻塞。
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    // 读头部直到 \r\n\r\n，再按 Content-Length 读完请求体。
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let header_end = loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    requests
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(&buf).to_string());
+
+    match reply {
+        Reply::Http {
+            status,
+            headers,
+            body,
+        } => {
+            let mut head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for (k, v) in headers {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+            head.push_str("\r\n");
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(body)?;
+            stream.flush()
+        }
+        Reply::Sse(sse) => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sse.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(sse)?;
+            stream.flush()
+        }
+        Reply::SseThenSilence(sse) => {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(sse)?;
+            stream.flush()?;
+            // 保持沉默，直到测试结束（stop 置位）或兜底上限到点。
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        }
+        Reply::SseThenTruncate(sse) => {
+            let declared = sse.len() + 4096;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(sse)?;
+            stream.flush()?;
+            // 留出时间让客户端先读到 delta，再关闭（触发「消息不完整」）。
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试脚手架
+// ---------------------------------------------------------------------------
+
+/// 只记录事件的空 sink。
+struct NullSink;
+
+impl ModelEventSink for NullSink {
+    fn emit(&mut self, _event: ModelEvent) -> Result<(), EventError> {
+        Ok(())
+    }
+}
+
+/// 测试用小值重试：**不要用默认值**（默认最大等待 ~60s 会让测试很慢）。
+fn fast_retry(max_attempts: u32, max_delay_ms: u64) -> RetryConfig {
+    RetryConfig {
+        max_attempts,
+        base_delay_ms: 1,
+        max_delay_ms,
+    }
+}
+
+/// 关闭 `stream_options` 的配置：避免 400 触发既有的「剥参数回退」，
+/// 让请求计数可预测（回退会在同一次尝试内多发一次请求）。
+fn base_config(api_base: String) -> OpenAICompatibleConfig {
+    OpenAICompatibleConfig {
+        api_base,
+        api_key: "test-key".into(),
+        model: "test-model".into(),
+        max_tokens: None,
+        temperature: None,
+        compat: ProviderCompat {
+            supports_stream_usage: false,
+            ..ProviderCompat::standard()
+        },
+    }
+}
+
+/// 回环直连、无代理的 client。
+fn no_proxy_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build no-proxy client")
+}
+
+/// 日志收集器：`Arc<Mutex<Vec<String>>>` 既是 logger 的载体，也是断言来源。
+type Logs = Arc<Mutex<Vec<String>>>;
+
+fn logs() -> Logs {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn log_listener(logs: &Logs) -> Arc<dyn Fn(&str) + Send + Sync> {
+    let logs = logs.clone();
+    Arc::new(move |message: &str| logs.lock().unwrap().push(message.to_string()))
+}
+
+fn full_sse() -> Vec<u8> {
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n"
+        .to_vec()
+}
+
+fn one_delta_sse() -> Vec<u8> {
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n".to_vec()
+}
+
+/// 只吐一条**思考**增量（内联 `<think>` 标签，经 `inline_thinking` 过滤器
+/// 转成 `ThinkingDelta`），不含任何正文 delta。
+fn thinking_delta_sse() -> Vec<u8> {
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>secret</think>\"}}]}\n\n"
+        .to_vec()
+}
+
+fn json_reply(status: &'static str, headers: Vec<(&'static str, String)>, body: &str) -> Reply {
+    Reply::Http {
+        status,
+        headers,
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// 构造一个注入回环 client、小重试、指定空闲超时的 model。
+fn model_for(
+    server: &MockServer,
+    retry: RetryConfig,
+    idle_secs: u64,
+    logs: Option<&Logs>,
+) -> OpenAICompatibleModel {
+    let model = OpenAICompatibleModel::with_client(base_config(server.api_base()), no_proxy_client())
+        .with_retry(retry)
+        .with_timeouts(TimeoutConfig {
+            connect_secs: 5,
+            idle_secs,
+        });
+    match logs {
+        Some(logs) => model.with_logger(log_listener(logs)),
+        None => model,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+/// 1. **空闲超时**：server 200 + 一条 delta 后沉默 ⇒ `Err`，消息含 `idle timeout`。
+#[tokio::test]
+async fn idle_timeout_surfaces_error() {
+    let server = MockServer::start(vec![Reply::SseThenSilence(one_delta_sse())]);
+    let model = model_for(&server, fast_retry(2, 10), 1, None);
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    let err = result.expect_err("空闲超时必须是 Err");
+    assert!(
+        err.to_string().contains("idle timeout"),
+        "错误消息应含 idle timeout：{err}"
+    );
+}
+
+/// 2. **429 ⇒ 退避后成功**：第 1 个请求 429，第 2 个 200 + 完整 SSE ⇒ `Ok`；
+///    server 收到 2 个请求；日志里有 ≥1 条 `retry attempt`。
+#[tokio::test]
+async fn retry_after_429_then_success() {
+    let logs = logs();
+    let server = MockServer::start(vec![
+        json_reply(
+            "429 Too Many Requests",
+            vec![],
+            "{\"error\":\"rate limited\"}",
+        ),
+        Reply::Sse(full_sse()),
+    ]);
+    let model = model_for(&server, fast_retry(2, 10), 30, Some(&logs));
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_ok(), "429 后一次重试应成功：{result:?}");
+    assert_eq!(server.request_count(), 2, "应恰好重试一次");
+    let lines = logs.lock().unwrap().clone();
+    assert!(
+        lines.iter().any(|l| l.contains("retry attempt")),
+        "日志应有 retry attempt：{lines:?}"
+    );
+}
+
+/// 3. **`x-should-retry: false` 否决状态码**：返回 500 但带头拒绝 ⇒ `Err`，只 1 个请求。
+#[tokio::test]
+async fn x_should_retry_false_vetoes_status() {
+    let server = MockServer::start(vec![json_reply(
+        "500 Internal Server Error",
+        vec![("x-should-retry", "false".into())],
+        "{\"error\":\"boom\"}",
+    )]);
+    let model = model_for(&server, fast_retry(2, 10), 30, None);
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_err(), "x-should-retry:false 应否决 500 的重试");
+    assert_eq!(server.request_count(), 1, "不应重试");
+}
+
+/// 4. **`x-should-retry: true` 覆盖状态码**：返回 400 但带头要求重试 ⇒ 重试（2 个请求）。
+#[tokio::test]
+async fn x_should_retry_true_overrides_status() {
+    let server = MockServer::start(vec![
+        json_reply(
+            "400 Bad Request",
+            vec![("x-should-retry", "true".into())],
+            "{\"error\":\"nope\"}",
+        ),
+        Reply::Sse(full_sse()),
+    ]);
+    let model = model_for(&server, fast_retry(2, 10), 30, None);
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_ok(), "x-should-retry:true 后的第二次应成功：{result:?}");
+    assert_eq!(server.request_count(), 2, "应重试一次");
+}
+
+/// 5. **额度名单否决**：返回 429 + body 含 `insufficient_quota` ⇒ `Err`，只 1 个请求（零退避）。
+#[tokio::test]
+async fn quota_exhaustion_vetoes_429() {
+    let logs = logs();
+    let server = MockServer::start(vec![json_reply(
+        "429 Too Many Requests",
+        vec![],
+        "{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"You exceeded your current quota\"}}",
+    )]);
+    let model = model_for(&server, fast_retry(2, 10_000), 30, Some(&logs));
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    let err = result.expect_err("额度耗尽应立即失败");
+    assert_eq!(server.request_count(), 1, "额度耗尽不得重试");
+    assert!(
+        err.to_string().contains("insufficient_quota"),
+        "错误消息应保留额度原因：{err}"
+    );
+}
+
+/// 6. **`Retry-After` 超硬上限 ⇒ 放弃**：`Retry-After: 999`、`max_delay_ms = 1000`
+///    ⇒ `Err`，只 1 个请求，消息含服务端要求的秒数，且**立即返回**（不睡满）。
+///
+/// 外层 `timeout` 是给变异测试的针脚：若把硬上限改成「与上界取 max」，
+/// `complete` 会睡满 999s，外层超时 ⇒ 断言失败（红）。
+#[tokio::test]
+async fn retry_after_exceeding_hard_cap_gives_up_immediately() {
+    let server = MockServer::start(vec![json_reply(
+        "429 Too Many Requests",
+        vec![("retry-after", "999".into())],
+        "{\"error\":\"slow down\"}",
+    )]);
+    let model = model_for(&server, fast_retry(2, 1_000), 30, None);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        model.complete(ModelRequest::default(), &mut NullSink),
+    )
+    .await
+    .expect("硬上限应让 complete 立即返回，而不是睡满 999s");
+
+    let err = result.expect_err("服务端要求超过硬上限 ⇒ 放弃重试");
+    assert_eq!(server.request_count(), 1, "放弃时不应再发请求");
+    assert!(
+        err.to_string().contains("999"),
+        "错误消息应含服务端要求的秒数 999：{err}"
+    );
+}
+
+/// 7. **已吐 delta 不重试**：200 + 一条 delta 后断连 ⇒ `Err`，只 1 个请求。
+///
+/// 变异靶：去掉 `DeltaWatchingSink` 的 `emitted` 判断后本用例必须变红
+/// （流中途传输错误可重试 ⇒ 会多发请求）。
+#[tokio::test]
+async fn no_retry_after_delta_emitted() {
+    let server = MockServer::start(vec![Reply::SseThenTruncate(one_delta_sse())]);
+    let model = model_for(&server, fast_retry(2, 10), 30, None);
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_err(), "断流的半截流必须是 Err");
+    assert_eq!(server.request_count(), 1, "吐过 delta 后不得重试");
+}
+
+/// 8. **确定性 4xx 不重试**：各状态码一条，均 `Err` 且只 1 个请求。
+///
+/// （配置关闭了 `stream_options`，否则 400 会走既有的「剥参数回退」改变请求数。）
+#[tokio::test]
+async fn deterministic_4xx_never_retried() {
+    let cases: [(&'static str, &'static str); 6] = [
+        ("400 Bad Request", "{\"error\":\"bad\"}"),
+        ("401 Unauthorized", "{\"error\":\"unauthorized\"}"),
+        ("403 Forbidden", "{\"error\":\"forbidden\"}"),
+        ("404 Not Found", "{\"error\":\"missing\"}"),
+        ("413 Payload Too Large", "{\"error\":\"too big\"}"),
+        ("422 Unprocessable Entity", "{\"error\":\"unprocessable\"}"),
+    ];
+    for (status, body) in cases {
+        let server = MockServer::start(vec![json_reply(status, vec![], body)]);
+        let model = model_for(&server, fast_retry(2, 10), 30, None);
+
+        let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+        assert!(result.is_err(), "{status} 应是确定性失败");
+        assert_eq!(server.request_count(), 1, "{status} 不应重试");
+    }
+}
+
+/// 9. **重试日志可见**：连续 500 直到次数耗尽 —— 日志含 `retry attempt`（退避前）
+///    与 `giving up`（最终放弃）两行；错误消息带尝试次数。
+#[tokio::test]
+async fn retry_logs_are_visible() {
+    let logs = logs();
+    let server = MockServer::start(vec![json_reply(
+        "500 Internal Server Error",
+        vec![],
+        "{\"error\":\"boom\"}",
+    )]);
+    let model = model_for(&server, fast_retry(2, 10), 30, Some(&logs));
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_err(), "持续 500 最终应失败");
+    assert_eq!(server.request_count(), 3, "2 次额外重试 ⇒ 共 3 次尝试");
+
+    let lines = logs.lock().unwrap().clone();
+    assert!(
+        lines.iter().any(|l| l.contains("retry attempt")),
+        "应有退避前日志：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("giving up")),
+        "应有最终放弃日志：{lines:?}"
+    );
+}
+
+/// 10. **默认值被钉住**：生产接线落地前，这两组默认值**就是实际生效值**，
+///     且是 48h 自愈面的参数 —— 被人静默改大/改小必须被测试发现。
+///     （真实环境校准记为 debt，届时连同此断言一并更新。）
+#[test]
+fn retry_config_default_is_pinned() {
+    assert_eq!(
+        RetryConfig::default(),
+        RetryConfig {
+            max_attempts: 5,
+            base_delay_ms: 500,
+            max_delay_ms: 30_000,
+        }
+    );
+}
+
+/// 11. **默认值被钉住**（同 10，超时旋钮）。
+#[test]
+fn timeout_config_default_is_pinned() {
+    assert_eq!(
+        TimeoutConfig::default(),
+        TimeoutConfig {
+            connect_secs: 15,
+            idle_secs: 120,
+        }
+    );
+}
+
+/// 12. **`max_attempts = 0` 即不重试**：即便 429 本属可重试，也只发 1 个请求并立即 `Err`。
+#[tokio::test]
+async fn max_attempts_zero_disables_retry() {
+    let server = MockServer::start(vec![json_reply(
+        "429 Too Many Requests",
+        vec![],
+        "{\"error\":\"rate limited\"}",
+    )]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_err(), "max_attempts=0 应直接失败：{result:?}");
+    assert_eq!(server.request_count(), 1, "max_attempts=0 不得重试");
+}
+
+/// 12b. **极大 `max_attempts`（`u32::MAX`）不 panic / 不溢出**：上限极大时
+///      循环仍应在成功时终止（`0..=u32::MAX` 不至于引发范围溢出）。
+///      （退避在 `attempt` 极大时的算术由 lib.rs 的 `backoff_delay_saturates_without_overflow` 覆盖。）
+#[tokio::test]
+async fn huge_max_attempts_terminates_on_success() {
+    let server = MockServer::start(vec![
+        json_reply("429 Too Many Requests", vec![], "{\"error\":\"slow\"}"),
+        Reply::Sse(full_sse()),
+    ]);
+    let model = model_for(
+        &server,
+        RetryConfig {
+            max_attempts: u32::MAX,
+            base_delay_ms: 1,
+            max_delay_ms: 10,
+        },
+        30,
+        None,
+    );
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_ok(), "重试一次即应成功：{result:?}");
+    assert_eq!(server.request_count(), 2, "应恰好重试一次后终止");
+}
+
+/// 13. **`ThinkingDelta` 同样触发 `emitted` 锁**：只吐思考增量后断流 ⇒ 不重试。
+///
+/// 变异靶：`DeltaWatchingSink::emit` 只对 `TextDelta` 置位（漏掉 `ThinkingDelta`）
+/// 时本用例必须变红 —— 断流的传输错误可重试 ⇒ 会多发请求（max_attempts=2 ⇒ 3 次）。
+#[tokio::test]
+async fn no_retry_after_thinking_delta_emitted() {
+    let server = MockServer::start(vec![Reply::SseThenTruncate(thinking_delta_sse())]);
+    let model = model_for(&server, fast_retry(2, 10), 30, None);
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_err(), "断流的半截流必须是 Err");
+    assert_eq!(server.request_count(), 1, "吐过思考增量后不得重试");
+}
+
+/// 14. **`with_client` 注入的 client 归调用方，`with_timeouts` 不得重建它**。
+///
+/// 判别手法（对进程级代理 env 免疫，故比「死代理 + 对照」更确定）：
+/// 给注入的 client 挂一个指向「哨兵服务 B」的**显式代理**，`api_base` 指向另一台
+/// 服务 A。
+/// - client 未被重建 ⇒ 请求经代理 B；B 收到、A 收不到；
+/// - client 被重建（`owns_client` 守卫失效）⇒ 请求直连 A（或经 env 代理），B 收不到。
+/// 断言「B 恰好收到 1 个请求」即可区分两种实现，且与是否存在 env 代理无关。
+#[tokio::test]
+async fn with_client_injected_client_survives_with_timeouts() {
+    let origin = MockServer::start(vec![Reply::Sse(full_sse())]);
+    let sentinel = MockServer::start(vec![Reply::Sse(full_sse())]);
+
+    let injected = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{}", sentinel.port)).unwrap())
+        .build()
+        .expect("build proxied client");
+
+    let model = OpenAICompatibleModel::with_client(base_config(origin.api_base()), injected)
+        .with_retry(fast_retry(2, 10))
+        .with_timeouts(TimeoutConfig {
+            connect_secs: 5,
+            idle_secs: 30,
+        });
+
+    let result = model.complete(ModelRequest::default(), &mut NullSink).await;
+    assert!(result.is_ok(), "经哨兵代理应成功：{result:?}");
+    assert_eq!(
+        sentinel.request_count(),
+        1,
+        "注入 client 的代理必须仍被使用（未被 with_timeouts 重建）"
+    );
+    assert_eq!(origin.request_count(), 0, "请求不应绕过注入的代理直连 origin");
+}

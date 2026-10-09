@@ -19,8 +19,8 @@
 
 | 根因 | 位置 | 现象 |
 |---|---|---|
-| **R1 预算写死** | `RunLimits.max_rounds = 10`（`crates/ys-component/src/limits.rs:39`），app 侧无覆盖路径（`resolve_limits` 只写 `context_window` / `compaction`，`apps/coding-agent/src/main.rs:361-366`） | 撞硬顶，`final_message: None`，**无收尾机会** |
-| **R2 回合边界是死墙** | `app_loop` 的 `Request::Prompt` 臂恰好一个回合，且**不看 `stop_reason`**（`apps/coding-agent/src/app_loop.rs:109-186`） | 撞顶 / 正常完成**走同一条路**：回到 `request_rx.recv().await` 等下一条输入 |
+| **R1 预算写死** | `RunLimits.max_rounds = 10`（`crates/ys-component/src/limits.rs:39`），app 侧无覆盖路径（`apps/coding-agent/src/main.rs` 的 `resolve_limits` 只写 `context_window` / `compaction`） | 撞硬顶，`final_message: None`，**无收尾机会** |
+| **R2 回合边界是死墙** | `app_loop` 的 `Request::Prompt` 臂恰好一个回合，且**不看 `stop_reason`** | 撞顶 / 正常完成**走同一条路**：回到 `request_rx.recv().await` 等下一条输入 |
 
 **用户裁决**（原话）：
 
@@ -156,8 +156,9 @@ pub(crate) fn should_review(kind: TurnKind, result: &RunResult) -> Option<AgentI
 pub(crate) const REVIEW_PROMPT: &str = "..."; // §4.5
 ```
 
-**门 ② 为何用 `rounds` 计数**：`BasicLoop` 里唯一能让 `rounds` 递增的路径，是上一轮 `tool_calls` 非空
-（截断整批作废后的回环，或工具执行后的回环；`crates/ys-loop/src/basic.rs`）。
+**门 ② 为何用 `rounds` 计数**：`BasicLoop` 的 `rounds` 在**每次模型调用**前无条件加一
+（Step 5 组装 `ModelRequest` 处 `rounds += 1`；`crates/ys-loop/src/basic.rs`）；而回环只在上一轮
+`tool_calls` 非空时继续（截断整批作废后的回环，或工具执行后的回环）。
 故 **`rounds >= 2` ⟺ 本回合模型至少发出过一次 `tool_use`**。
 它直接读 `RunResult.rounds`（`crates/ys-loop/src/result.rs:7`，`pub`），**零事件管道、零新增状态** ——
 这正是候选丙「扫两处事件转发点」方案的**漏点风险**所规避的（候选乙也独立给出同一结论）。
@@ -179,14 +180,14 @@ pub(crate) const REVIEW_PROMPT: &str = "..."; // §4.5
   （**顶层标量**，非按 model 的 map —— 预算是回合属性，与 model 无关）；`UserConfig` 增 `max_rounds: Option<u32>`；
   `parse_user_config` 增一支校验（`as_u64()` → `u32::try_from` → `>= 1`；非法**只丢该条并落日志**，
   与既有宽容语义同规）；`Config::max_rounds()` 取数口。
-- `apps/coding-agent/src/main.rs` `resolve_limits`（`:361`）加一行 `limits.max_rounds = config.max_rounds();`。
+- `apps/coding-agent/src/main.rs` 的 `resolve_limits`（TUI / `-p` / `--json` 三入口共用的唯一 limits 接线点）加一行 `limits.max_rounds = config.max_rounds();`。
   **唯一接线点**，`build_agent` 已 `.limits(limits)` ⇒ **TUI / `-p` / `--json` 三模式一次修复**。
 - `Agent` **不加 setter**：`max_rounds` 不随 model 变，启动定死即可（不像 `context_window` 需每回合刷新）。
 
 **⚠️ 核心默认值 `RunLimits::default().max_rounds` 保持 `10`，不动。** 结构性理由两条：
 
 1. `crates/ys-component/src/lib.rs:18` 有断言 `assert_eq!(limits.max_rounds, 10)`；
-2. `app_loop` 既有测试 `abort_yields_cancelled_and_view_still_emitted`（`apps/coding-agent/src/app_loop.rs:847-851`）
+2. `app_loop` 既有测试 `abort_yields_cancelled_and_view_still_emitted`
    用 `ProbePlan::AlwaysToolCall` 靠**核心默认 10** 在可接受轮数内撞 `MaxRounds`；改成极大值会让它空转。
    ⇒ **「库的保守默认」与「app 的产品默认」分离**，是既有的分层，不该被本设计破坏。
 
@@ -211,7 +212,7 @@ pub(crate) const REVIEW_PROMPT: &str = "..."; // §4.5
 > 成本如实：按稳态 ≈10k token-当量/轮，48h ≈ 29k 轮 ≈ **~300M token-当量**（不含周期性压缩，每次 ~87k）。
 > 这是 48h 需求的**正常开销**，不是意外 —— 所以时长/成本必须**可观测、可配**。
 
-#### 4.2.1 wall-clock 预算（`max_turn_duration`，默认 48h）—— 零 `BasicLoop` 改动
+#### 4.2.1 wall-clock 预算（`max_turn_duration_secs` —— 显式单位形式、避免单位歧义；默认 48h）—— 零 `BasicLoop` 改动
 
 - **落点**：`app_loop` 的 `run_turn_once` 的 `select!` 加一条 `tokio::time::sleep_until(deadline)` 分支，
   到点向当前回合的边界源 `push(Boundary::Abort)`，并在**同一处**先发一条 `Outbound::Output`
@@ -223,10 +224,10 @@ pub(crate) const REVIEW_PROMPT: &str = "..."; // §4.5
      靠上面那条 `Outbound::Output` 行区分。要真正区分需新增 `StopReason`（改 `BasicLoop`，本轮**不做**）。
   2. `Abort` **只在轮边界被读**（见 `llm-api-unavailable/context.md` §关键数据流的挂起路径）——
      若到点时模型正卡在一次 `complete()` 里，真正的停止会**推迟到下一次轮边界**（最坏再多一轮，含单工具 300s 超时）。
-- **`-p` / `--json`**：这两条路径的 `run_single_turn` **不传 `boundary`**（`main.rs:717`）。
+- **`-p` / `--json`**：这两条路径的 `run_single_turn`（`apps/coding-agent/src/main.rs`）**不传 `boundary`**。
   要同样兜底，需给它一条**合成边界源** + 同一个计时器分支（同一处改动，属加法）；
   本轮**建议一并做**，否则 `-p` 的 48h 任务没有任何时长上限。
-- **数值**：默认 `48h`（172,800 s），可经 `config.json` 调；它**只是 backstop** ——
+- **数值**：默认 `48h`（172,800 s），可经 `config.json` 的 `max_turn_duration_secs` 调；它**只是 backstop** ——
   正常任务在到点前早就由模型自己收尾，只有失控/挂起才会撞上它。
 - **`-p` / `--json` 的退出码（本轮定）**：预算到点 ⇒ 与「用户中止」同路的**非零退出**（`Cancelled` 语义），
   原因由那条 `Outbound::Output` 行说明；**不得以 `0` 退出** —— 无人值守的调度器 / CI 必须能看出「没跑完」。
@@ -236,14 +237,14 @@ pub(crate) const REVIEW_PROMPT: &str = "..."; // §4.5
 
 ### 4.3 ② 完工复核：`app_loop` 的回合循环
 
-**(a) 抽出 `run_turn_once(...)`**（候选乙 / 丙一致建议的纯重构）：把现在 `app_loop.rs:130-163` 的
+**(a) 抽出 `run_turn_once(...)`**（候选乙 / 丙一致建议的纯重构）：把现在 `app_loop` 的 `Request::Prompt` 臂里的
 「`begin_turn` → 新建 `QueueBoundarySource` → `select!` 三臂 → 回合末 `try_recv` 排空」抽成一个私有 async fn。
 **15+ 条既有 app_loop 测试就是这次纯重构的守门员**（行为须逐字节不变），故风险低。
 
-**(b) 回合前的边界排空移进 `run_turn_once`**：现在 `app_loop.rs:100` 的
-`while boundary_rx.try_recv().is_ok() {}` 只在**首个回合前**执行一次。复核回合也必须排空 ——
-否则上一回合残留的 `Boundary::Abort` 会泵进复核回合把它取消。这正是模块注释 ③（`app_loop.rs:43-44`：
-「`Abort` **永久**置位」）要守的不变量：**新建源只防标志位泄漏，防不了队列里那条消息**。
+**(b) 回合前的边界排空移进 `run_turn_once`**：现在 `app_loop` 外层 `loop` 顶部的
+`while boundary_rx.try_recv().is_ok() {}` 位于**每次 `request_rx.recv()` 之前**
+⇒ **每个请求**进入时都排空一次（单回合制下即每个回合前）。复核回合也必须排空 ——
+否则上一回合残留的 `Boundary::Abort` 会泵进复核回合把它取消。这正是模块注释 ③（「`Abort` **永久**置位」）要守的不变量：**新建源只防标志位泄漏，防不了队列里那条消息**。
 
 **(c) `Request::Prompt` 臂的新形状**（逐字采用设计稿的 `pending.take()` 循环）：
 
@@ -283,7 +284,7 @@ Request::Prompt(msg)
      │    ├─ ports.events.begin_turn(turns)           // ⇒ Envelope.turn = turns
      │    ├─ boundary = QueueBoundarySource::new()     // 每回合新建（comment ③）
      │    ├─ select! { turn | sink_rx→Outbound::Event | boundary_rx→push }
-     │    └─ while sink_rx.try_recv() → 转发           // 回合末排空（既有 :161-163）
+     │    └─ while sink_rx.try_recv() → 转发           // 回合末排空（既有）
      ├─ Ok(result): stats.record(usage); finalize_turn_meta(raw)
      │    └─ pending = should_review(kind, &result)（仅 Initial + Completed + rounds≥REVIEW_MIN_ROUNDS ⇒ Some）
      └─ Err: 落日志，pending 保持 None ⇒ 链终止
@@ -346,6 +347,11 @@ pub(crate) const REVIEW_PROMPT: &str = "Before we wrap up: verify that the origi
 | 轮边界 steering 插话 | 回合**进行中**（输入侧按 `is_turning` 分流，`events.rs:91,108`） | `true` |
 | app 发起的复核回合 | 主回合 `RunFinished` **之后**（`finish_turn` 已复位） | `false` |
 
+> **现状**：生产侧当前**没有** `Boundary::Steer` 生产者（steering 通路备而不用），故 `is_turning == true`
+> 一行暂不出现。判别式本身**正确且前向兼容** —— `apply_event` 的 `UserMessage` 分支按 `is_turning`
+> 真假分派（`true` ⇒ 用户行、不改 `is_turning`；`false` ⇒ System 行 + 置 `is_turning`），
+> `RunFinished` 经 `finish_turn` 复位 `is_turning`。
+
 **改法**（`app.rs` 的 `apply_event`，非回显 `UserMessage` 分支）：
 
 ```rust
@@ -392,7 +398,8 @@ self.follow = true;
 1. **只有适配器知道** HTTP 状态码与连接错误 —— 而重试判据正是这些。`ModelError::Provider(String)`
    （`crates/ys-model/src/error.rs:8`）在 `ys-model` 里**没有结构**，上层无法判定「可否重试」。
 2. `llm-api-unavailable/context.md` §约束已定死：`ys-model` / `ys-core` / `ys-event` / `ys-protocol`
-   **不得引入 tokio** ⇒ 超时只能落适配器或 `ys-loop`；而 `ys-loop` 是**最高爆炸半径**。
+   **不得引入 tokio**（`ys-component` 同属**纯契约层**、自身代码也不用 tokio API，仅经 `ys-session`
+   间接引入 —— ADR-0012）⇒ 超时只能落适配器或**执行层**的 `ys-loop`；而 `ys-loop` 是**最高爆炸半径**。
 3. **零 `Model` trait 改动、零 `ModelError` 改动、零 `BasicLoop` 改动**
    （`ModelError` 非 `#[non_exhaustive]`，加变体是 breaking —— 见该文 §约束）。
 
@@ -411,7 +418,7 @@ self.follow = true;
       名单是**开放常量**，扩词是加法，不得演变成规则引擎；
    ③ **状态码** —— 连接 / DNS / TLS / 超时错误、`429`、`500/502/503/504` ⇒ **可重试**；
       `400/401/403/404/413/422`、serde 解析失败、sink 错误 ⇒ **不重试**（确定性失败）。
-3. **有界退避**：指数退避 + 抖动，次数与上限可配（建议 base `500ms`、×2、cap `30s`、最大 5 次 ⇒ 总等待 ≤ ~60s）；
+3. **有界退避**：指数退避 + 抖动，次数与上限可配（建议 base `500ms`、×2、cap `30s`、最大 5 次；单次退避以 `max_delay_ms` 为硬上限，总等待最坏 = `max_attempts × max_delay_ms` = 150s，纯指数路径实际 ≈ ≤ 20s）；
    带 `Retry-After` / `Retry-After-ms` 时**尊重它，但以 `max_delay_ms` 为硬上限** ——
    **服务端要求的等待超过上限 ⇒ 放弃重试、立即上报**（消息带上服务端要求的秒数）。
    **不取「与上界取 max」**：那等于让服务端**无界地**把回合挂住，与「必须有界」自相矛盾。
@@ -422,7 +429,7 @@ self.follow = true;
 
 **退避不可中止（如实记账）**：`Model::complete`（`crates/ys-model/src/trait_def.rs:12`）**没有取消入参**，
 `Boundary::Abort` 只在轮边界被读 ⇒ **退避睡眠期间 Ctrl+C 无效**。传入取消源要改核心 trait（违反零破坏面），
-本轮不做；可行的界是「总退避 ≤ ~60s + 每次尝试由流空闲超时包住」⇒ 不可中断时长**有界**。
+本轮不做；可行的界是「总退避最坏 150s（单次以 `max_delay_ms` 为硬上限）+ 每次尝试由流空闲超时包住」⇒ 不可中断时长**有界**。
 
 **超时用两个旋钮，不用单一总超时**（总超时会误杀长思考模型 —— `deepseek-reasoner` 首字节可达数十秒，
 见该文 §约束「性能」）：
@@ -602,7 +609,7 @@ self.follow = true;
 | **风险 6** 去掉轮数上限后防打转只剩粗阀 | 明写为「细阀换粗阀」的交换 | §4.2.1、§6 |
 | **风险 7** `-p` 预算非「加法」、退出码未定 | **定退出码**（预算到点非零退出） | §4.2.1 |
 | **风险 8** ③ 的本地回环 TCP 测试本环境难自验 | 记账（写进测试基础设施前提） | §4.8、ADR-0028 |
-| **风险 9** 重试不覆盖 >~60 s 停服 | 明写边界（治抖动不治停服） | ADR-0028 |
+| **风险 9** 重试不覆盖 >~150 s 停服 | 明写边界（治抖动不治停服） | ADR-0028 |
 | **风险 10** `rounds` 在截断批次下的假阳性 | 接受（`rounds` 计数含「截断作废后回环」，仍代表够长的回合，轻微） | 本表 |
 | **建议 4** 测试矩阵缺端到端「48h 形态」 | **加一条组合测试**（长回合 + 压缩 + 复核） | §5.2 |
 | **建议 10** `MAX_CONSECUTIVE_ERRORS` 空分支 | 记账（在 `BasicLoop` 内，不动） | §6 |

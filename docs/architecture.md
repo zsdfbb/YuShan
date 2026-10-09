@@ -391,6 +391,11 @@ pub struct QueueBoundarySource { inner: Mutex<Inner { queue: VecDeque<Boundary>,
 - **工具级取消载体**：`ToolContext.boundary: Option<&dyn BoundarySource>`。`BashTool` 挂载时
   以 **100ms** 间隔轮询 `is_aborted()`，命中则杀**进程组**（`sh -c "kill -9 -{pid}"`，**不引 libc**）；
   未挂载时行为与改动前完全一致。
+- **工具表与执行批**：启动期装配 **10 个工具**（基础 9：`read/write/edit/bash/grep/find/ls/websearch/webfetch`
+  + 末位 `subagent`；见 `docs/design-final/coding-agent-tui.md` §13）。`Tool` 另有两个不进 `ToolSpec`
+  的默认方法：`timeout()`（per-tool 墙钟上限，优先级 工具声明 → `bash_timeout` → 300s）与
+  `is_concurrency_safe()`（默认 `false`）。只有当一批 **每一个**工具都为 `true` 时才并发
+  （`buffered(max_parallel_tools)`，**保序**）；否则保持原串行路径（事件 `C1,R1,C2,R2`）。
 
 ---
 

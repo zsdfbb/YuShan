@@ -140,7 +140,7 @@ fn setup_terminal() -> Result<Term, TuiError> {
     Ok(terminal)
 }
 
-fn event_loop<B: Backend + Write + Send>(
+fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     mut outbound: Receiver<Outbound<CodingView>>,
@@ -216,7 +216,7 @@ fn event_loop<B: Backend + Write + Send>(
 ///
 /// **取消不改任何状态** —— `Err(Cancelled)` 直接吞掉，transcript / 输入框 /
 /// 模型配置都不动（半截登录比什么都不做更糟）。
-fn run_prompt<B: Backend + Write + Send>(
+fn run_prompt<B: Backend<Error = std::io::Error> + Write + Send>(
     kind: PromptKind,
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -265,7 +265,7 @@ fn run_prompt<B: Backend + Write + Send>(
 /// 重入即自锁死锁（同一个 `TuiPrompter` 的两个方法都去 `lock()` 同一把锁）。
 /// [`resolve_prompt`] 是本类型的唯一调用方，它保证 `select` 与 `text` **串行**
 /// （前一个返回后才问下一个），不会有嵌套问答。
-struct ModalHost<'a, B: Backend + Write> {
+struct ModalHost<'a, B: Backend<Error = std::io::Error> + Write> {
     terminal: &'a mut Terminal<B>,
     app: &'a mut App,
     outbound: &'a mut Receiver<Outbound<CodingView>>,
@@ -273,9 +273,9 @@ struct ModalHost<'a, B: Backend + Write> {
 }
 
 /// [`Prompter`] 的 TUI 实现（`run.rs` 内，因为它握着 `Terminal`）。
-pub(crate) struct TuiPrompter<'a, B: Backend + Write>(Mutex<ModalHost<'a, B>>);
+pub(crate) struct TuiPrompter<'a, B: Backend<Error = std::io::Error> + Write>(Mutex<ModalHost<'a, B>>);
 
-impl<'a, B: Backend + Write> TuiPrompter<'a, B> {
+impl<'a, B: Backend<Error = std::io::Error> + Write> TuiPrompter<'a, B> {
     fn new(
         terminal: &'a mut Terminal<B>,
         app: &'a mut App,
@@ -295,7 +295,7 @@ impl<'a, B: Backend + Write> TuiPrompter<'a, B> {
     }
 }
 
-impl<B: Backend + Write + Send> Prompter for TuiPrompter<'_, B> {
+impl<B: Backend<Error = std::io::Error> + Write + Send> Prompter for TuiPrompter<'_, B> {
     fn select(
         &self,
         prompt: &str,
@@ -310,7 +310,7 @@ impl<B: Backend + Write + Send> Prompter for TuiPrompter<'_, B> {
     }
 }
 
-impl<B: Backend + Write> ModalHost<'_, B> {
+impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
     /// 模态打开期间继续排空 `Outbound`。
     ///
     /// 不排空的话，agent 在模态开着时吐事件会把有界信道灌满，把 app 线程堵在
@@ -444,7 +444,7 @@ impl<B: Backend + Write> ModalHost<'_, B> {
 /// **best-effort**：恢复路径上的每一步都不得 `?` 提前返回 —— 否则
 /// `disable_raw_mode()` 会被跳过，终端留在 raw mode。这里吞掉 IO 错误，
 /// 保证「无论如何都退出 raw mode / 恢复主屏」。
-fn restore_terminal<B: Backend + Write>(terminal: &mut Terminal<B>, app: &App) {
+fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(terminal: &mut Terminal<B>, app: &App) {
     let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = (cols as usize).clamp(10, 400);
     let lines = draw::transcript_plain_lines(app, width);

@@ -5,7 +5,7 @@
 //! 1. [`SearchBackends`] —— 启动期在 `PATH` 上找 `rg` / `fd`（**纯路径扫描**：不 spawn
 //!    进程、不探 `--version`）。是**值**而非 `OnceLock`，故降级路径可在同进程内注入复现。
 //! 2. [`run_bounded`] —— spawn 一个外部二进制，**有界**地收 stdout/stderr，并在中止/超时/
-//!    超限时把它杀掉。`grep` / `find` 的两种后端（`rg`/`grep`、`fd`/`find`）共用它。
+//!    超限时把**它的整个进程组**杀掉。`grep` / `find` 的两种后端（`rg`/`grep`、`fd`/`find`）共用它。
 //!
 //! # 为什么「有界」要单独成一个原语
 //!
@@ -22,6 +22,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use ys_protocol::BoundarySource;
 use ys_tool::ToolError;
+
+#[cfg(unix)]
+use crate::bash::kill_process_group;
 
 /// 中止 / 上限轮询间隔 —— 与 `bash.rs::ABORT_POLL_INTERVAL` 一致：中止的感知延迟上界。
 const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -157,7 +160,7 @@ pub struct Bounded {
     pub stop: Stop,
 }
 
-/// spawn 外部二进制，**有界**收集输出；达上限 / 被中止 / 超时则杀掉它。
+/// spawn 外部二进制，**有界**收集输出；达上限 / 被中止 / 超时则杀掉**它的整个进程组**。
 ///
 /// - `byte_cap`：stdout 累积上限（字节）。达到即杀子进程、`stop = Cap`（`grep`/`find` 传 1 MiB）。
 /// - `deadline`：从本函数开始跑的**最长时间**（调用方自带兜底 timeout —— 一次性模式
@@ -176,8 +179,13 @@ pub struct Bounded {
 ///
 /// # 杀与收尸
 ///
-/// `kill_on_drop(true)` 保证本 future 被外层 `timeout` drop 时子进程随之被杀（不泄漏）；
-/// 主动杀之后**必须 `wait()` 收尸**（否则留僵尸）。管道写端随之关闭，两个排空任务自然结束。
+/// 杀的是**整个进程组**（spawn 时 `process_group(0)`，故 pgid == 子进程 pid）：
+/// 只杀直接子进程时，`sh -c '... &'` 这类后端的孙进程会漏网 —— 它们被 launchd 收养成
+/// `ppid=1` 的孤儿，还会一直攥着管道写端，让两个排空任务永远等不到 EOF。
+/// 顺序固定为 **杀组 → `start_kill()` 兜底 → `wait()` 收尸**（收尸后再按 pid 杀组不安全：
+/// pid 可能已被复用）。`kill_on_drop(true)` 另外保证本 future 被外层 `timeout` drop 时
+/// 子进程随之被杀（不泄漏 —— 但 drop 路径只及直接子进程）。组内进程全部退出后管道写端
+/// 关闭，两个排空任务自然收到 EOF。
 ///
 /// # 错误
 ///
@@ -187,8 +195,9 @@ pub struct Bounded {
 ///
 /// # 前提
 ///
-/// 适用于 `rg` / `fd` / `grep` / `find` 这类**不 fork 孙进程**的单个搜索二进制：
-/// 杀只及直接子进程，若孙进程持有管道写端，排空任务会一直等 EOF。
+/// 适用于 `rg` / `fd` / `grep` / `find` 这类单个搜索二进制。唯一未覆盖的形态：直接子进程
+/// **自然退出**（`stop == Eof`）而孙进程仍攥着管道写端 —— 那条路径没有「我们杀的」这一步，
+/// 无法安全定位进程组（leader 已收尸），排空任务会等不到 EOF。要覆盖它须由调用方保证不 fork。
 pub async fn run_bounded(
     prog: &Path,
     args: &[String],
@@ -204,6 +213,16 @@ pub async fn run_bounded(
         .stderr(std::process::Stdio::piped())
         // 外层超时 drop future 时连带杀子进程（与 `bash.rs` 同款，防泄漏）。
         .kill_on_drop(true);
+
+    // 独立进程组（pgid == 子进程 pid），与 [`kill_process_group`] 配对：**只有进了自己的组，
+    // `kill -9 -<pid>` 才覆盖得到孙进程**。否则「被杀」只及直接子进程 —— `sh -c '... &'`
+    // 这类后端的孙进程会漏网成 `ppid=1` 的孤儿，并继续攥着管道写端。
+    #[cfg(unix)]
+    {
+        #[allow(unused_imports)]
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .spawn()
@@ -296,7 +315,13 @@ pub async fn run_bounded(
     };
 
     if stop != Stop::Eof {
-        // 是我们杀的：先 kill，再 **wait() 收尸**（防僵尸）。管道写端随子进程关闭。
+        // 是我们杀的：先杀**整个进程组**（含孙进程），再 `start_kill()` 兜底、`wait()` 收尸
+        // （防僵尸）。组内进程全部退出后管道写端才关得干净 —— 只杀直接子进程时，孙进程会
+        // 攥着写端让下面两个排空任务永远等不到 EOF。**必须赶在 `wait()` 之前**（见该函数文档）。
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            kill_process_group(pid).await;
+        }
         let _ = child.start_kill();
         if let Ok(status) = child.wait().await {
             code = status.code();
@@ -414,22 +439,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Cap`：刷不完的写者（`yes` 无限输出）→ 达 `byte_cap` 即被杀，`stdout.len() == byte_cap`。
+    /// `Cap`：产出远超 `byte_cap` 的写者 → 达 `byte_cap` 即被杀，`stdout.len() == byte_cap`。
     ///
-    /// `prog` 直接给二进制（经 `PATH` 找 `yes`），**不经 `sh -c`** —— 杀只及直接子进程，
-    /// 孙进程会攥着管道写端使排空任务等不到 EOF（见函数文档「前提」）。
+    /// 构造：`head -c 500000 /dev/zero` 先把管道写出 5 倍上限（保证 `capped` 置位），
+    /// 再 `exec sleep 30` 让这个 pid **在检测到上限时仍然存活** —— 两条合起来才既触发
+    /// `Stop::Cap` 又不依赖任何竞速。**刻意不用 `yes`**：无限写者一旦因回归漏杀就是
+    /// 100% CPU 的空转孤儿；这里最坏情况只是一个 0% CPU 的 `sleep`。
     ///
-    /// 变异：删掉主循环里的 `capped.load(..) → break Stop::Cap` → 本用例因 `yes` 永不退出
-    /// 而撞上外层 timeout（挂起）→ 红。
+    /// 变异：删掉主循环里的 `capped.load(..) → break Stop::Cap` → 走到 deadline 才返回
+    /// `TimedOut` → `stop == Cap` 断言红（且 stdout 仍是截断后的长度，故只能靠 `stop` 抓）。
     #[tokio::test]
-    async fn test_run_bounded_cap_kills_endless_writer() {
+    async fn test_run_bounded_cap_kills_writer_at_byte_cap() {
         let dir = test_dir("cap");
         std::fs::create_dir_all(&dir).unwrap();
         let byte_cap = 100_000;
 
         let (result, elapsed) = run_guarded(
-            "yes",
-            &[],
+            "sh",
+            &["-c", "head -c 500000 /dev/zero; exec sleep 30"],
             &dir,
             byte_cap,
             Duration::from_secs(10),
@@ -529,6 +556,45 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "中止应在 200ms 后的下一次轮询内收场，实际 {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ⑤ 杀的是整个进程组（孙进程不得漏网） ─────────────────────────────
+
+    /// 越限被杀时，**整个进程组**都必须死 —— 只杀直接子进程会让孙进程漏网。
+    ///
+    /// 形态：`sh -c 'sleep 300 & wait'`。`sh` 是直接子进程，`sleep 300` 是它的**孙进程**，
+    /// 与它同组、且继承了 stdout/stderr 的写端。若只杀直接子进程，孙进程会活着攥住管道
+    /// 写端 ⇒ 两个排空任务永远等不到 EOF ⇒ 本函数**不返回**（挂到 guard 才 panic）。
+    /// 故「本用例能返回」本身就证明孙进程已死，无需再去 `ps` 里找它。
+    ///
+    /// 线上形态同此：漏网的孙进程会变成 `ppid=1` 的孤儿继续跑 —— 若它的 stdout 指向
+    /// 一个仍有人在读的管道（或文件），它会以 ~100% CPU 永久空转。
+    ///
+    /// 变异：删掉 spawn 处的 `process_group(0)` → 本用例挂起 → 撞满 guard → 红。
+    #[tokio::test]
+    async fn test_run_bounded_kill_reaps_descendants() {
+        let dir = test_dir("descendants");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (result, elapsed) = run_guarded(
+            "sh",
+            &["-c", "sleep 300 & wait"],
+            &dir,
+            1024 * 1024,
+            Duration::from_millis(150),
+            None,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let b = result.expect("超时不是错误（是我们杀的）");
+        assert_eq!(b.stop, Stop::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "孙进程存活则排空任务等不到 EOF，本函数只能挂到 guard 才返回；实际 {elapsed:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

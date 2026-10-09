@@ -67,11 +67,15 @@ fn render_result(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> ToolRe
 
 /// 尽力终止整个进程组（spawn 时已 `process_group(0)`，故进程组 id == 子进程 pid）。
 ///
+/// **`exec::run_bounded` 复用同一份** —— 两处的前置条件相同（都 `process_group(0)`），
+/// 各写一份会漂移。调用方**必须**在 `wait()` 收尸**之前**调用：leader 一旦被收尸，
+/// 它的 pid 就可能被复用，`kill -9 -<pid>` 便可能打到无关的进程组。
+///
 /// 不引入 `libc` 依赖：借助本工具已依赖的 `sh` 内建 `kill`，向负 pid（= 进程组）
 /// 发 `SIGKILL`。仅覆盖 `sh` fork 出的孙进程（如 `sh -c "npm test"` 的 node 子进程）；
 /// 失败时静默 —— 调用方仍有 `Child::start_kill()` 兜底。
 #[cfg(unix)]
-async fn kill_process_group(pid: u32) {
+pub(crate) async fn kill_process_group(pid: u32) {
     let _ = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(format!("kill -9 -{pid}"))

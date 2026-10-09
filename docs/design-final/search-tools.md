@@ -28,7 +28,7 @@ apps/coding-agent/src/prompt.rs      build_system_prompt(cwd, &[ToolSpec])，清
 
 **退出码：先看 `stop` 再看 `code`**。`stop != Eof`（我们杀的：Cap/Aborted/TimedOut）→ 忽略 `code`、**不是错误**；`1` = 无命中（**不是错误**）；`Eof + code 0` 但零 match 事件 → **格式漂移报错**；`Eof + >=2` → `is_error=true` + stderr 前 4 KiB。
 
-**子进程**：一律**直接 spawn 二进制**（`rg`/`grep`/`fd`/`find`），**绝不 `sh -c`** —— 孙进程会攥住管道写端，使 `deadline` 失去硬上界。argv **恒带路径参数**。两个管道都排空到 EOF（防死锁）。工具自带 **60s 兜底 deadline**（因 `-p`/`--json` 下 `boundary` 恒为 `None`）。
+**子进程**：一律**直接 spawn 二进制**（`rg`/`grep`/`fd`/`find`），**绝不 `sh -c`**。spawn 时进**独立进程组**，达上限/中止/超时杀的是**整个进程组** —— 只杀直接子进程会让 `sh -c '… &'` 形态的孙进程漏网成 `ppid=1` 的孤儿，并攥住管道写端使排空任务等不到 EOF。唯一未覆盖的仍是「直接子进程**自然退出**、孙进程仍攥着写端」那条路径（无「我们杀的」这一步，进程组不可安全定位），故**不 fork 依旧是调用前提**。argv **恒带路径参数**。两个管道都排空到 EOF（防死锁）。工具自带 **60s 兜底 deadline**（因 `-p`/`--json` 下 `boundary` 恒为 `None`）。
 
 **探测**：`SearchBackends::detect_from(path)` 纯 PATH 扫描 + 可执行位检查，**不 spawn、不探版本**；注入式（非 `OnceLock`）→ 降级路径可确定性测试。`fd` 认 Debian 别名 `fdfind`。
 
@@ -49,7 +49,7 @@ apps/coding-agent/src/prompt.rs      build_system_prompt(cwd, &[ToolSpec])，清
 ## 测试资产
 
 - `crates/ys-tool/src/truncate.rs`：19 条（含 `tail` 字节闸为约束、`head` 首行保留、UTF-8 字符切分）
-- `adapters/tools-basic/src/exec.rs`：12 条（四态 + stderr 狂写不挂 + 探测 + F1 护栏）
+- `adapters/tools-basic/src/exec.rs`：13 条（四态 + stderr 狂写不挂 + **越限杀满进程组** + 探测 + F1 护栏）
 - `adapters/tools-basic/src/{grep,find,ls}.rs`：30 条（退出码四态、F1、原生解析用**假二进制注入**、降级排除、glob、ls 上限）
 - `apps/coding-agent/src/toolset.rs`：5 条（顺序、穿透 agent、降级提示、不 print 源码扫描）
 - `apps/coding-agent/src/prompt.rs`：5 条（派生顺序、漂移、snippet 字面量）

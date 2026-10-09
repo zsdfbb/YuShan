@@ -7,21 +7,26 @@
 //!   let req = request_rx.recv().await?;
 //!   match req {
 //!     Prompt(msg) => {
-//!       raw = user_text(msg);       // 标题素材：skill 展开之前
-//!       turns += 1;
-//!       let res = {                  ② 回合之内：turn 与事件转发交错
-//!         let ports = wiring.ports();
-//!         ports.events.begin_turn(turns);
-//!         let boundary = QueueBoundarySource::new();
-//!         let turn = agent.run_turn(input, AgentPorts::new(.., Some(&boundary)));
-//!         loop { select! {
-//!           r   = &mut turn            => break r,       // 回合结束
-//!           Some(env) = sink_rx.recv() => out.send(Event(env)).await?,  // 事件转发
-//!           Some(b) = boundary_rx.recv() => boundary.push(b),            // 轮边界
-//!         }}
-//!       };
-//!       stats.record(&res.usage);
-//!       finalize_turn_meta(..).await;   // 回合末写穿 meta（title/model/tokens/thinking）
+//!       raw = user_text(msg);       // 标题素材：skill 展开之前（仅首回合）
+//!       msg = expand_skill(msg);    // /skill-name 展开（仅首回合，复核文案不展开）
+//!       pending = Some((msg, Initial));
+//!       while let Some((input, kind)) = pending.take() {   // 主回合 + 至多一次复核
+//!         turns += 1;
+//!         let res = {                 ② 回合之内：turn 与事件转发交错
+//!           let ports = wiring.ports();
+//!           ports.events.begin_turn(turns);
+//!           let boundary = QueueBoundarySource::new();
+//!           let turn = agent.run_turn(input, AgentPorts::new(.., Some(&boundary)));
+//!           loop { select! {
+//!             r   = &mut turn            => break r,       // 回合结束
+//!             Some(env) = sink_rx.recv() => out.send(Event(env)).await?,  // 事件转发
+//!             Some(b) = boundary_rx.recv() => boundary.push(b),            // 轮边界
+//!           }}
+//!         };
+//!         stats.record(&res.usage);
+//!         finalize_turn_meta(..).await;   // 回合末写穿 meta（title 仅首回合）
+//!         pending = should_review(kind, &res);   // 够长 + 自称完工 ⇒ 一次复核回合
+//!       }
 //!     }
 //!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
 //!     SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
@@ -30,7 +35,7 @@
 //! }
 //! ```
 //!
-//! # 三个要点
+//! # 四个要点
 //!
 //! **① `ports` 的借用必须包在块里**：`wiring.ports()` 可变借用 `wiring`，且被
 //! `turn` future 持有整个回合。若写在 `match` 臂里跨到外层循环，外层就再也不能
@@ -42,18 +47,24 @@
 //!
 //! **③ 一次性 BoundarySource 每回合新建**：`Abort` 会**永久**置位 `is_aborted`，
 //! 复用同一个源会让「上一回合的取消」把之后每个回合立刻取消。
+//!
+//! **④ 完工复核 = `pending.take()` 循环里的第二个回合**（ADR-0027）：首回合以
+//! `Completed` 收场且够长时，`should_review` 产出复核输入、另起一个回合；`Review`
+//! 恒 `None` ⇒ 每次用户输入至多多出一个回合。回合前的边界排空在 `run_turn_once`
+//! 开头（每回合都做），故上一回合残留的 `Abort` 不会取消复核回合。
 
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 use ys_core::{ContentBlock, Message, Role};
-use ys_loop::AgentInput;
+use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
 use ys_tui_coding::CodingView;
 
 use crate::capabilities;
 use crate::config::Config;
+use crate::follow_up::{should_review, TurnKind};
 use crate::logging;
 use crate::state::StateStore;
 use crate::status::TurnStats;
@@ -93,12 +104,6 @@ pub async fn run(
     let mut thinking_visible = wiring.meta().map(|m| m.thinking_visible).unwrap_or(false);
 
     loop {
-        // 空闲期丢掉「上一回合结束后才到的」边界消息。UI 的 `is_turning` 要等
-        // 它排空 `Outbound` 才复位（最长一个 poll 周期），期间一次 Ctrl+C 就会
-        // 投出一条来不及被本回合消费的 `Abort` —— 留着它会把**下一个**回合
-        // 立刻取消。回合已结束，这些消息在语义上就是废的。
-        while boundary_rx.try_recv().is_ok() {}
-
         let Some(req) = request_rx.recv().await else {
             return Ok(()); // UI 侧 drop 了发送端 → 正常退出
         };
@@ -112,76 +117,75 @@ pub async fn run(
                 let raw_user_text = crate::sessions::user_text(&message);
                 // **`/skill-name` 展开**（唯一的 skill 接线点，设计 §选择理由 B）：
                 // 复用 `Request::Prompt` 而**不加协议变体** —— 展开型命令与纯文本输入
-                // 走**同一条**回合启动路径（下面的 `turns += 1` / `set_context_window` /
-                // `run_turn` 一字未动）。位置必须在 `turns += 1` 之前：展开后的正文才是
-                // 本回合真正的输入。
+                // 走**同一条**回合启动路径（`run_turn_once` 内部的 `turns += 1` /
+                // `set_context_window` / `run_turn` 一字未动）。位置必须在
+                // `run_turn_once` 之前：展开后的正文才是本回合真正的输入。
+                // **只作用于用户原文** —— 复核消息由 `should_review` 直接产出、不再展开。
                 let message = expand_skill_invocation(message, &config.skills);
-                turns += 1;
-                // **每回合刷新 context window**（唯一调用点，结构上不可能漏）。
+
+                // 一个 `Request::Prompt` 至多跑两个回合：主回合 + 一次完工复核
+                // （ADR-0027）。`pending.take()` 是既有 follow-up 缝的形状。
                 //
-                // `/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍
-                // （128k ↔ 1M）：只在 `build_agent` 解析的话，用户 `/login` 到 1M
-                // 模型后仍按旧窗口压缩 —— 这正是「1M 模型在 11 万 token 就被压缩」
-                // 的后半截根因。
-                //
-                // 放在回合**开头**（而非 login/set_model 各加一处）：命令的实现散在
-                // `capabilities`，而窗口由 `config` 派生 —— 一处读取、不可能漂移。
-                agent.set_context_window(config.context_window());
-                let outcome = {
-                    let ports = wiring.ports();
-                    ports.events.begin_turn(turns);
-                    // 本回合专属的边界源：`Abort` 的标志位随回合作废。
-                    let boundary = QueueBoundarySource::new();
-                    let turn = agent.run_turn(
-                        AgentInput::new(message),
-                        AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary)),
-                    );
-                    tokio::pin!(turn);
-                    loop {
-                        tokio::select! {
-                            result = &mut turn => break result,
-                            // 事件转发。**必须用 `Some(..) = …` 模式形式**：
-                            // 信道关闭后 `recv()` 会立即返回 `None`，裸分支
-                            // （`env = … => match`）会让 select 每次都立刻选中它
-                            // → 忙等。模式不匹配时 tokio 会**禁用**该分支。
-                            Some(env) = sink_rx.recv() => {
-                                send(&out_tx, Outbound::Event(env)).await?;
-                            }
-                            // 轮边界中途插话 / 中止：UI 写信道 ②，这里泵进
-                            // `BoundarySource`，由 `BasicLoop` 在轮边界拉取。
-                            Some(b) = boundary_rx.recv() => boundary.push(b),
-                        }
-                    }
+                // **wall-clock 预算在此算一次**：`deadline` 覆盖整个 `pending` 循环
+                // —— 主回合与复核回合共享同一个截止点，时长只来自
+                // `config.max_turn_duration()`。
+                let request_started = Instant::now();
+                let deadline = request_started + config.max_turn_duration();
+                let mut ctx = TurnCtx {
+                    agent: &mut agent,
+                    wiring: &mut wiring,
+                    config: &config,
+                    turns: &mut turns,
+                    stats: &mut stats,
+                    thinking_visible,
+                    deadline,
+                    request_started,
+                    cumulative_rounds: 0,
+                    out_tx: &out_tx,
+                    sink_rx: &mut sink_rx,
+                    boundary_rx: &mut boundary_rx,
                 };
-                // **回合结束后必须排空事件信道**：`select!` 分支的选择是随机的，
-                // 它完全可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件
-                // 还躺在信道里。不排空就会晚一整回合才转发（UI 的 `is_turning`
-                // 不复位、turn 摘要不显示），且会插到本条 `View` 之后。
-                // 回合已结束 → 生产者不会再发，`try_recv` 排到 `Empty` 即止。
-                while let Ok(env) = sink_rx.try_recv() {
-                    send(&out_tx, Outbound::Event(env)).await?;
-                }
-                match outcome {
-                    Ok(result) => {
-                        stats.record(&result.usage);
-                        // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
-                        let model = wiring.model_id().map(str::to_string);
-                        if let Err(e) = crate::finalize_turn_meta(
-                            &mut wiring,
-                            raw_user_text.as_deref(),
-                            config.provider.as_deref(),
-                            model.as_deref(),
-                            Some(thinking_visible),
-                            &stats,
-                        )
-                        .await
-                        {
-                            logging::log(&format!("failed to persist session meta: {e}"));
+                let mut pending = Some((AgentInput::new(message), TurnKind::Initial));
+                while let Some((input, kind)) = pending.take() {
+                    // 标题素材只取**首回合**的用户原文；复核回合传 `None`
+                    // （绝不把复核文案写成会话标题）。
+                    //
+                    // 这处 `Review => None` **不承重**（`raw_user_text` 是本请求用户
+                    // 原文，循环内只算一次）：首回合若已写标题，`finalize_turn_meta`
+                    // 的 `meta.title.is_none()` 守卫让复核回合的贡献恒为 no-op；
+                    // 首回合若无标题素材，`raw_user_text` 本就是 `None`。保留它是为把
+                    // T5B「复核回合不提供标题素材」的意图**显式**写在标题派生点。
+                    let raw = match kind {
+                        TurnKind::Initial => raw_user_text.as_deref(),
+                        TurnKind::Review => None,
+                    };
+                    match run_turn_once(&mut ctx, input).await? {
+                        Ok(result) => {
+                            ctx.stats.record(&result.usage);
+                            // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
+                            let model = ctx.wiring.model_id().map(str::to_string);
+                            if let Err(e) = crate::finalize_turn_meta(
+                                ctx.wiring,
+                                raw,
+                                ctx.config.provider.as_deref(),
+                                model.as_deref(),
+                                Some(ctx.thinking_visible),
+                                ctx.stats,
+                            )
+                            .await
+                            {
+                                logging::log(&format!("failed to persist session meta: {e}"));
+                            }
+                            // 只有首回合「够长 + 自称完工」才追问；`Review` 恒 `None`
+                            // ⇒ 至多多出一个复核回合。
+                            pending = should_review(kind, &result)
+                                .map(|next| (next, TurnKind::Review));
                         }
+                        // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
+                        // Error 行，这里不再往 transcript 重复刷一条，只落日志。
+                        // 回合链到此终止（`pending` 保持 `None`，不 `?` 出去终止循环）。
+                        Err(e) => logging::log(&format!("turn {} failed: {e}", ctx.turns)),
                     }
-                    // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
-                    // Error 行，这里不再往 transcript 重复刷一条，只落日志。
-                    Err(e) => logging::log(&format!("turn {turns} failed: {e}")),
                 }
             }
 
@@ -248,6 +252,139 @@ pub async fn run(
         );
         send(&out_tx, Outbound::View(view)).await?;
     }
+}
+
+/// 跑一个回合所需的运行时句柄（一次 `Request::Prompt` 一份，跨该请求的回合链复用）。
+///
+/// 收进结构体只是为把 `run_turn_once` 的形参收敛；各字段的**类型与所有权不改**。
+/// `wiring` / `turns` / `stats` 跨回合可变，其余只读。回合末的记账 / 写穿 meta
+/// 由外层循环用同一份 ctx 完成（`stats` / `wiring` / `config` / `thinking_visible`
+/// 因此留在结构体里）。
+struct TurnCtx<'a> {
+    agent: &'a mut Agent,
+    wiring: &'a mut Wiring,
+    config: &'a Config,
+    turns: &'a mut u32,
+    stats: &'a mut TurnStats,
+    thinking_visible: bool,
+    /// 本请求（含复核回合）的 wall-clock 截止点 —— 在 `Request::Prompt` 入口算
+    /// **一次**，主回合与复核回合共享同一个值（`Instant` 是 `Copy`，跨回合不变）。
+    /// 时长只来自 [`Config::max_turn_duration`]，**绝不写死**。
+    deadline: Instant,
+    /// 本请求的起始时刻（= 预算计时的原点）—— 供 §4.9 可观测行的 `elapsed` 用。
+    request_started: Instant,
+    /// 本请求**累计**的模型调用轮数（主回合 + 复核回合的 `RunResult.rounds` 之和）。
+    cumulative_rounds: u32,
+    out_tx: &'a mpsc::Sender<Outbound<CodingView>>,
+    sink_rx: &'a mut mpsc::Receiver<Envelope>,
+    boundary_rx: &'a mut mpsc::Receiver<Boundary>,
+}
+
+/// 一个回合的结局：`Ok` 是本回合的 `RunResult`，`Err` 是模型 / 工具失败
+/// （`BasicLoop` 已在返回前发 `RunFailed`）。二者都属**本回合**；它不与
+/// [`AppLoopError`]（「UI 侧已收摊」）混为一谈 —— 后者才终止整个 app 循环。
+type TurnOutcome = Result<RunResult, LoopError>;
+
+/// 跑**一个回合**：排空残留边界 → `begin_turn` → 新建边界源 → `run_turn` 与事件
+/// 转发交错 → 回合末排空事件信道。**记账 / 写穿 meta 不在此处** —— 由调用方拿到
+/// [`TurnOutcome`] 后完成（复核判据也要用这份结果）。
+///
+/// **函数第一步就是排空边界信道**：上一回合结束后才到的 `Abort` 在语义上已是废的
+/// （UI 的 `is_turning` 复位最长滞后一个 poll 周期），**上一回合的取消不得取消本回合**。
+///
+/// **`Abort` 永久置位**（模块注释 ③）：下面的 `QueueBoundarySource::new()` 只防标志位
+/// 复用，防不了**队列里那条已投递的边界消息** —— 故排空必须在新建边界源**之前**。
+///
+/// **返回 `Result<_, AppLoopError>`**：外层只对「UI 侧已收摊」（`send` 失败）
+/// 用 `?` 终止循环；`run_turn` 的失误留在 [`TurnOutcome`] 内交给调用方落日志。
+async fn run_turn_once(
+    ctx: &mut TurnCtx<'_>,
+    input: AgentInput,
+) -> Result<TurnOutcome, AppLoopError> {
+    // 排空上一回合残留的边界消息（含 `Abort`）—— 契约见函数头。
+    while ctx.boundary_rx.try_recv().is_ok() {}
+
+    // 回合号从 1 起（`begin_turn` 把它带进 `Envelope.turn`）。
+    *ctx.turns += 1;
+    // **每回合刷新 context window**（唯一调用点，结构上不可能漏）。
+    //
+    // `/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍
+    // （128k ↔ 1M）：只在 `build_agent` 解析的话，用户 `/login` 到 1M
+    // 模型后仍按旧窗口压缩 —— 这正是「1M 模型在 11 万 token 就被压缩」
+    // 的后半截根因。
+    //
+    // 放在回合**开头**（而非 login/set_model 各加一处）：命令的实现散在
+    // `capabilities`，而窗口由 `config` 派生 —— 一处读取、不可能漂移。
+    ctx.agent.set_context_window(ctx.config.context_window());
+    let outcome = {
+        let ports = ctx.wiring.ports();
+        ports.events.begin_turn(*ctx.turns);
+        // 本回合专属的边界源：`Abort` 的标志位随回合作废。
+        let boundary = QueueBoundarySource::new();
+        let turn = ctx.agent.run_turn(
+            input,
+            AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary)),
+        );
+        tokio::pin!(turn);
+        // 预算计时器**只允许触发一次**：到点后置位，`select!` 的 `if` 前置条件随即
+        // 禁用该分支（否则 `sleep_until` 会持续 Ready ⇒ 忙等 + 重复发说明行）。
+        let mut budget_exhausted = false;
+        loop {
+            tokio::select! {
+                result = &mut turn => break result,
+                // 事件转发。**必须用 `Some(..) = …` 模式形式**：
+                // 信道关闭后 `recv()` 会立即返回 `None`，裸分支
+                // （`env = … => match`）会让 select 每次都立刻选中它
+                // → 忙等。模式不匹配时 tokio 会**禁用**该分支。
+                Some(env) = ctx.sink_rx.recv() => {
+                    send(ctx.out_tx, Outbound::Event(env)).await?;
+                }
+                // 轮边界中途插话 / 中止：UI 写信道 ②，这里泵进
+                // `BoundarySource`，由 `BasicLoop` 在轮边界拉取。
+                Some(b) = ctx.boundary_rx.recv() => boundary.push(b),
+                // wall-clock 预算到点：**先**发一条说明行，**再**向本回合的边界源
+                // push `Abort`。该回合以 `Cancelled` 收场；`should_review` 对非
+                // `Completed` 返回 `None` ⇒ 预算耗尽不会触发复核回合。
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(ctx.deadline)),
+                    if !budget_exhausted => {
+                    budget_exhausted = true;
+                    let secs = ctx.config.max_turn_duration().as_secs();
+                    send(ctx.out_tx, Outbound::Output(format!(
+                        "budget exhausted: wall-clock budget of {secs}s elapsed — aborting this turn"
+                    ))).await?;
+                    boundary.push(Boundary::Abort);
+                }
+            }
+        }
+    };
+    // **回合结束后必须排空事件信道**：`select!` 分支的选择是随机的，
+    // 它完全可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件
+    // 还躺在信道里。不排空就会晚一整回合才转发（UI 的 `is_turning`
+    // 不复位、turn 摘要不显示），且会插到本条 `View` 之后。
+    // 回合已结束 → 生产者不会再发，`try_recv` 排到 `Empty` 即止。
+    while let Ok(env) = ctx.sink_rx.try_recv() {
+        send(ctx.out_tx, Outbound::Event(env)).await?;
+    }
+
+    // §4.9 可观测性：每个回合边界经**日志**落一行（对 TUI 不可见，供排障）。
+    // `elapsed` / `budget_remaining` 都取**整数秒**便于 grep；`budget_remaining`
+    // 走 `saturating_duration_since` ⇒ 到点后为 0，绝不出现负数或 panic。
+    let rounds = match &outcome {
+        Ok(result) => result.rounds,
+        Err(_) => 0,
+    };
+    ctx.cumulative_rounds = ctx.cumulative_rounds.saturating_add(rounds);
+    let remaining = ctx.deadline.saturating_duration_since(Instant::now());
+    logging::log(&format!(
+        "turn={} rounds={} elapsed={}s cumulative_rounds={} budget_remaining={}s",
+        *ctx.turns,
+        rounds,
+        ctx.request_started.elapsed().as_secs(),
+        ctx.cumulative_rounds,
+        remaining.as_secs(),
+    ));
+
+    Ok(outcome)
 }
 
 /// 展开 `/skill-name <args>`：命中已知 skill 时把消息**重写**为带正文的信封
@@ -400,10 +537,23 @@ mod tests {
         prefilled: Vec<Boundary>,
         tweak: impl FnOnce(&mut Config, &PathBuf),
     ) -> Harness {
+        spawn_app_loop_full(model, persistent, prefilled, tweak, |b| b).await
+    }
+
+    /// 最底层起法：除 `Config` 外还允许改写 [`ys_runtime::AgentBuilder`]
+    /// （例如把 [`ys_component::RunLimits::max_rounds`] 调到 app 产品默认的
+    /// `u32::MAX`）—— 生产侧由 `resolve_limits` 装配的限制，测试在此显式重建。
+    async fn spawn_app_loop_full(
+        model: Box<dyn Model>,
+        persistent: bool,
+        prefilled: Vec<Boundary>,
+        tweak: impl FnOnce(&mut Config, &PathBuf),
+        build_agent: impl FnOnce(ys_runtime::AgentBuilder) -> ys_runtime::AgentBuilder,
+    ) -> Harness {
         let tmp = TempDir::new("harness");
         let (sink, sink_rx) =
             ChannelSink::new(64, ys_protocol::LifecyclePolicy::StopWhenConsumerGone);
-        let agent = ys_runtime::AgentBuilder::new().build().unwrap();
+        let agent = build_agent(ys_runtime::AgentBuilder::new()).build().unwrap();
 
         // `Config::from_env` 会 `getenv` 凭证 key，而 `config.rs` 的用例正在
         // `env_lock` 下 `set_var` / `remove_var` —— 只读也须串行。
@@ -538,6 +688,47 @@ mod tests {
             .collect()
     }
 
+    /// `RunFinished` 各自的 `Envelope.turn`，按转发顺序。
+    fn run_finished_turns(events: &[&Envelope]) -> Vec<u32> {
+        events
+            .iter()
+            .filter(|e| matches!(e.event, AgentEvent::RunFinished { .. }))
+            .map(|e| e.turn)
+            .collect()
+    }
+
+    /// 转发序列里各条 `UserMessage` 的用户原文（复核回合的输入即 `REVIEW_PROMPT`）。
+    fn forwarded_user_texts(events: &[&Envelope]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match &e.event {
+                AgentEvent::UserMessage { message } => {
+                    crate::sessions::user_text(message)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 收出站消息直到**第一条** `RunFinished`（含）—— 用于「主回合已收场、
+    /// 复核回合尚未开始」这一刻投递边界消息。
+    async fn collect_until_first_run_finished(
+        h: &mut Harness,
+    ) -> Vec<Outbound<CodingView>> {
+        let mut msgs = Vec::new();
+        loop {
+            let m = recv_out(&mut h.outbound).await;
+            let hit = matches!(
+                &m,
+                Outbound::Event(env) if matches!(env.event, AgentEvent::RunFinished { .. })
+            );
+            msgs.push(m);
+            if hit {
+                return msgs;
+            }
+        }
+    }
+
     // ------------------------------------- probe 型 model（供「回合进行中」注入边界）
 
     /// probe model 的行为计划。
@@ -554,6 +745,14 @@ mod tests {
         /// 泄漏的 `Abort` 才有机会被 `BasicLoop` 的探针看见（否则第 1 轮直接
         /// 正常收尾，泄漏与不泄漏都产出 `Completed`，测试就分不出红绿）。
         ToolCallThenFinal,
+        /// 第 `calls` 列出的每次（以及其后的每次）调用回结束文本，其余调用回
+        /// **不存在**的 tool call —— 把回合推过 `REVIEW_MIN_ROUNDS` 轮（≥5 轮才够
+        /// 复核门槛）。多个阈值可造「主回合 + 复核回合都够长」的两段式场景。
+        CompleteAtCalls(&'static [u32]),
+        /// 前 `n - 1` 次回不存在的 tool call，第 `n` 次起回**被截断的纯文本**
+        /// （`FinishReason::Length`）—— 供「`Truncated` ⇒ 不复核」用（需够长，
+        /// 否则即便门槛失效也够不到复核）。
+        TruncateAtCall(u32),
     }
 
     struct ProbeInner {
@@ -665,10 +864,35 @@ mod tests {
                 self.inner.gate.notified().await;
             }
 
+            // 截断计划单独走一条：收尾响应带 `FinishReason::Length`（⇒ `Truncated`）。
+            if let ProbePlan::TruncateAtCall(n) = self.inner.plan {
+                if call >= n {
+                    sink.emit(ModelEvent::TextDelta {
+                        text: "partial".into(),
+                    })?;
+                    return Ok(ModelResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::Text {
+                                text: "partial".into(),
+                            }],
+                        },
+                        usage: Usage::default(),
+                        finish_reason: FinishReason::Length,
+                    });
+                }
+            }
+
             let done = match self.inner.plan {
                 ProbePlan::UntilMarker(marker) => has_text(&request, marker),
                 ProbePlan::AlwaysToolCall => false,
                 ProbePlan::ToolCallThenFinal => call > 1,
+                // 列出的调用收尾；其后（两段式场景里复核回合的后续调用）也收尾，
+                // 避免卡进「复核回合又跑满 MaxRounds」的噪声。
+                ProbePlan::CompleteAtCalls(calls) => {
+                    calls.contains(&call) || calls.last().is_some_and(|&last| call > last)
+                }
+                ProbePlan::TruncateAtCall(_) => false,
             };
 
             if done {
@@ -902,6 +1126,14 @@ mod tests {
         let first = content.lines().next().expect("应有首行 meta");
         let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
         meta.title
+    }
+
+    /// 读会话文件首行 meta 的 `turns`（测试专用）。
+    fn read_meta_turns(path: &Path) -> u32 {
+        let content = std::fs::read_to_string(path).expect("会话文件应存在");
+        let first = content.lines().next().expect("应有首行 meta");
+        let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
+        meta.turns
     }
 
     /// **C3（TUI 路径）**：回合末写进 `meta.title` 的是 **skill 展开之前**的用户原文，
@@ -1227,8 +1459,8 @@ mod tests {
     /// 轮边界探针（`rounds: 1`）看到它，回合以 `Cancelled` 收场 ——
     /// [`ProbePlan::ToolCallThenFinal`] 特地为后者跨过一个轮边界。故断言 `Completed`。
     ///
-    /// 变异：删掉循环顶部的 `while boundary_rx.try_recv().is_ok() {}` → 本测试
-    /// **确定性**变红（回合以 `Cancelled` 收场）。
+    /// 变异：删掉 `run_turn_once` 开头的 `while ctx.boundary_rx.try_recv().is_ok() {}`
+    /// → 本测试**确定性**变红（回合以 `Cancelled` 收场）。
     #[tokio::test]
     async fn stale_abort_queued_before_first_turn_is_discarded() {
         let (model, mut probe) = probe_model(ProbePlan::ToolCallThenFinal);
@@ -1253,6 +1485,275 @@ mod tests {
             stop_reasons(&events_of(&msgs)),
             vec![StopReason::Completed],
             "残留的 Abort 不该影响本回合：{msgs:?}"
+        );
+    }
+
+    // ─────────────── 完工复核（ADR-0027）：够长 + Completed ⇒ 至多一次 ───────────────
+
+    use crate::follow_up::REVIEW_PROMPT;
+
+    /// **够长 + 自称完工 ⇒ 恰好复核一次**：主回合跑 5 轮（4 批工具 + 收尾，够
+    /// `REVIEW_MIN_ROUNDS` 门槛）⇒ 系统追问一次，另起复核回合（第 6 次 model 调用
+    /// 直接收尾）。
+    ///
+    /// 断言出站序列：`RunFinished` 恰两条（`turn` 依次 1、2）、恰好一条转发的
+    /// `UserMessage` 文本 `== REVIEW_PROMPT`、`view.turn_count == 2`、meta 的 `turns`
+    /// 含复核回合。
+    ///
+    /// 变异 A（`pending` 永不复核，`pending = None`）⇒ 只剩一条 `RunFinished` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn completed_long_turn_triggers_exactly_one_review_turn() {
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[5, 6]));
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let events = events_of(&msgs);
+
+        assert_eq!(
+            run_finished_turns(&events),
+            vec![1, 2],
+            "主回合 + 复核回合各一条 RunFinished：{msgs:?}"
+        );
+        assert_eq!(
+            forwarded_user_texts(&events)
+                .iter()
+                .filter(|t| t.as_str() == REVIEW_PROMPT)
+                .count(),
+            1,
+            "恰好一条复核文案：{msgs:?}"
+        );
+        assert_eq!(view.turn_count, 2, "两回合都要计入回合数");
+        let path = view.session_path.clone().expect("持久会话应有文件");
+        assert_eq!(read_meta_turns(&path), 2, "meta.turns 应含复核回合");
+    }
+
+    /// **纯文本回合（`rounds=1`，远低于门槛）⇒ 不复核**：只有一条 `RunFinished`。
+    #[tokio::test]
+    async fn plain_text_turn_is_not_reviewed() {
+        let model = MockModel::new("mock");
+        model.push_text("done");
+        let mut h = spawn_with_mock(model).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        assert_eq!(run_finished_turns(&events_of(&msgs)), vec![1]);
+        assert_eq!(view.turn_count, 1);
+    }
+
+    /// **`Cancelled` ⇒ 不复核**（用户 Ctrl+C 永远赢）。
+    #[tokio::test]
+    async fn cancelled_turn_is_not_reviewed() {
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        h.boundaries.send(Boundary::Abort).await.unwrap();
+        probe.let_app_task_pump().await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert_eq!(run_finished_turns(&events_of(&msgs)), vec![1]);
+        assert_eq!(stop_reasons(&events_of(&msgs)), vec![StopReason::Cancelled]);
+    }
+
+    /// **`MaxRounds` ⇒ 不复核**（撞顶即终止，不追问）。
+    #[tokio::test]
+    async fn max_rounds_turn_is_not_reviewed() {
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert_eq!(run_finished_turns(&events_of(&msgs)), vec![1]);
+        assert_eq!(stop_reasons(&events_of(&msgs)), vec![StopReason::MaxRounds]);
+    }
+
+    /// **`Truncated` ⇒ 不复核**：前 4 轮工具调用把回合推过门槛，第 5 次调用返回被
+    /// 截断的纯文本 ⇒ `Truncated`；够长也不追问。
+    #[tokio::test]
+    async fn truncated_turn_is_not_reviewed() {
+        let (model, mut probe) = probe_model(ProbePlan::TruncateAtCall(5));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert_eq!(run_finished_turns(&events_of(&msgs)), vec![1]);
+        assert_eq!(stop_reasons(&events_of(&msgs)), vec![StopReason::Truncated]);
+    }
+
+    /// **不问第二次（核心变异靶）**：主回合与复核回合**都**「够长 + `Completed`」
+    /// ⇒ 恰好两个回合；复核回合自己不再触发第三个。
+    ///
+    /// 探针 `CompleteAtCalls(&[5, 10])`：主回合第 5 次收尾（5 轮），复核回合第 10 次
+    /// 收尾（第 6–9 轮工具、第 10 轮收尾 = 5 轮）。若复核回合被当成 `Initial`（判据
+    /// 漏了 `kind`），它会再触发第三个回合 ⇒ `run_finished_turns` 变长 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn review_turn_does_not_review_again() {
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[5, 10]));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let events = events_of(&msgs);
+
+        assert_eq!(
+            run_finished_turns(&events),
+            vec![1, 2],
+            "复核回合不得再触发第三次：{msgs:?}"
+        );
+        assert_eq!(
+            stop_reasons(&events),
+            vec![StopReason::Completed, StopReason::Completed],
+            "{msgs:?}"
+        );
+        assert_eq!(view.turn_count, 2);
+    }
+
+    /// **跨回合残留 `Abort` 不取消复核回合**：主回合结束、复核回合开始前投一条
+    /// `Abort` ⇒ 复核**仍发生**。
+    ///
+    /// 主回合 5 轮、复核回合 2 轮（第 6 轮工具、第 7 轮收尾）—— 复核回合**跨过一个
+    /// 轮边界**，泄漏的 `Abort` 才有机会被 `BasicLoop` 探针看见（否则第 6 轮直接收尾，
+    /// 泄漏与否都产出 `Completed`，测试分不出红绿，与 `stale_abort_...` 同理）。
+    /// 复核回合开头的排空（`run_turn_once` 第一步）必须把这条 `Abort` 丢掉。
+    ///
+    /// # 前提与失效形态（**调度性**，非结构性保证）
+    ///
+    /// 「投一条 `Abort`」到「复核回合开始」之间可注入的窗口，来自回合末
+    /// `finalize_turn_meta` → `JsonlSession::set_meta` → `flush_to_file().await`
+    /// 的真实异步落盘**让出的 await**：`persistent=true`（本用例）时它让出，控制权
+    /// 才交给本测试任务；`MemorySession`（一次性会话）的 `set_meta` 是空实现、不让出。
+    /// 故这是**调度性**窗口，不是结构性保证。
+    ///
+    /// 窗口消失时，那条 `Abort` 会在复核**收场之后**才到，复核回合开头的排空**根本
+    /// 没被行使** —— 失效形态是**静默假绿**（不是假红）。末尾的信道容量断言把这种
+    /// 失效形态变成**红**。
+    ///
+    /// **残余失效形态（末尾断言管不住）**：若那条 `Abort` 恰在复核回合**最后一次
+    /// model 调用进行期间**被 `select!` 泵入**当轮**的 `BoundarySource`（而非被回合
+    /// 开头的排空消费），则它不会被 `BasicLoop` 看见 —— `is_aborted()` 只在每次
+    /// model 调用**之前**探，收尾轮之后不再回探，回合照旧 `Completed` 收场。此时
+    /// 信道容量也已回到上限（消息已被泵出），末尾那条容量断言**同样通过** ⇒ 排空
+    /// 未被行使，静默假绿再现。故本用例只能确定性地覆盖「窗口在回合开头存在」这一
+    /// 形态。
+    ///
+    /// 变异：删掉 `run_turn_once` 开头的排空 ⇒ `Abort` 泄漏进复核回合 ⇒ 复核以
+    /// `Cancelled` 收场 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn stale_abort_between_turns_does_not_cancel_review() {
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[5, 7]));
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        // 收主回合的 RunFinished（持久会话下此刻 app 正卡在回合末 meta 落盘上）。
+        let mut msgs = collect_until_first_run_finished(&mut h).await;
+        h.boundaries.send(Boundary::Abort).await.unwrap();
+        // 复核回合自己的边界源新建 + 开头排空 ⇒ 这条 Abort 不该取消它。
+        msgs.extend(collect_until_view(&mut h).await);
+        let _ = take_view(&mut msgs);
+
+        let events = events_of(&msgs);
+        assert_eq!(
+            run_finished_turns(&events),
+            vec![1, 2],
+            "残留 Abort 不得阻止复核回合：{msgs:?}"
+        );
+        assert_eq!(
+            stop_reasons(&events),
+            vec![StopReason::Completed, StopReason::Completed],
+            "复核回合不该被跨回合残留的 Abort 取消：{msgs:?}"
+        );
+        // 前提断言：注入的 `Abort` 必须已被**复核回合开头的排空**消费（信道容量回到
+        // 上限）。若它仍躺在信道里，说明「跨回合窗口」不存在 —— 那条 `Abort` 在复核
+        // 收场后才到，本用例并未真正行使排空。把这种静默假绿变成**红**。
+        assert_eq!(
+            h.boundaries.capacity(),
+            h.boundaries.max_capacity(),
+            "前提失效：注入的 Abort 未被复核回合消费 ⇒ 本用例未真正行使排空"
+        );
+    }
+
+    /// **标题素材只取首回合**：复核回合跑完后，落盘标题仍来自首回合用户原文，
+    /// 绝不变成复核文案。
+    #[tokio::test]
+    async fn review_does_not_overwrite_title() {
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[5, 6]));
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        h.requests.send(prompt("原始标题原文")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let path = view.session_path.expect("持久会话应有文件");
+
+        let title = read_meta_title(&path).expect("首回合应在 meta 写入标题");
+        assert_eq!(title, "原始标题原文", "标题必须来自首回合用户原文");
+        assert_ne!(title, REVIEW_PROMPT, "复核文案绝不得成为标题");
+    }
+
+    /// **复核回合不得把「自己的输入」（复核文案）当成标题素材**。
+    ///
+    /// [`finalize_turn_meta`]（`main.rs`）只在 `meta.title.is_none()` 时写标题。本例
+    /// 首块是 `ToolResult` ⇒ `sessions::user_text` 返回 `None` ⇒ 首回合**不写**标题，
+    /// 到复核回合时 `meta.title` 仍是 `None`。此时复核回合若把自己的输入（复核文案）
+    /// 当素材交上去，它就会被写成会话标题。故复核回合必须交 `None`（而非自己的输入）。
+    ///
+    /// 变异：复核回合改传自己的输入文本（复核文案）⇒ 标题被写成 `REVIEW_PROMPT`
+    /// ⇒ 本用例变红。
+    #[tokio::test]
+    async fn review_turn_does_not_offer_its_own_input_as_title() {
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[5, 6]));
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        // 首块是 `ToolResult` ⇒ `user_text` 为 `None` ⇒ 首回合不写标题。
+        h.requests
+            .send(Request::Prompt(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_call_id: ToolCallId("c1".into()),
+                    content: "ignored".into(),
+                    is_error: false,
+                }],
+            }))
+            .await
+            .unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let path = view.session_path.expect("持久会话应有文件");
+
+        assert_eq!(
+            read_meta_title(&path),
+            None,
+            "首回合无标题素材 ⇒ 复核回合也不得把复核文案写成标题"
         );
     }
 
@@ -1373,6 +1874,139 @@ mod tests {
         assert_eq!(expand_skill_invocation(msg.clone(), &[model_only]), msg);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ────────── wall-clock 预算 + §4.9 可观测性（ADR-0027 决策 6） ──────────
+
+    /// **预算时长来自 config、到点即中止**（本轮「可配」的验收点）。
+    ///
+    /// 临时 `config.json` 写 `max_turn_duration_secs: 1` 并经 `load_user_config`
+    /// 加载 ⇒ `config.max_turn_duration()` = 1s。这正是「时长来自 config 而非写死」
+    /// 的验收点：若把时长写死成默认 48h，本用例等不到说明行 ⇒ 超时变红。
+    ///
+    /// 探针 `AlwaysToolCall` + 第 1 次 model 调用被 gate 卡住 ⇒ 回合主动停留 > 1s，
+    /// 计时器得以在回合**进行中**到点：先发一条含 `budget exhausted` 的 `Output`，
+    /// 再向本回合边界源 push `Abort`。放行 gate 后回合在轮边界看到 `Abort` ⇒
+    /// `Cancelled`。
+    #[tokio::test]
+    async fn wall_clock_budget_exhaustion_aborts_turn_with_output() {
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
+            let path = tmp.join("config.json");
+            std::fs::write(&path, r#"{"max_turn_duration_secs": 1}"#).unwrap();
+            config.load_user_config(&path);
+            assert_eq!(
+                config.max_turn_duration(),
+                Duration::from_secs(1),
+                "测试前提：预算时长来自 config.json"
+            );
+        })
+        .await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await; // 回合此刻卡在第 1 次 model 调用上
+
+        // 等预算到点：app 应在回合**仍进行中**发说明行（证明计时器与回合并发，而非
+        // 等回合结束后才补账）。**有界等待**（预算 1s，给 4s 余量）：收不到说明行
+        // （变异：时长写死 / 漏发这一行）也**不 panic**，落到底部断言统一报红。
+        let mut msgs = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let m = h
+                    .outbound
+                    .recv()
+                    .await
+                    .expect("app 循环不应提前收摊");
+                let hit = matches!(&m, Outbound::Output(t) if t.contains("budget exhausted"));
+                msgs.push(m);
+                if hit {
+                    break;
+                }
+            }
+        })
+        .await;
+        // 让 app 任务把 `Abort` push 进本回合边界源，再放行被 gate 卡住的调用。
+        probe.let_app_task_pump().await;
+        probe.release();
+        msgs.extend(collect_until_view(&mut h).await);
+        let _ = take_view(&mut msgs);
+
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Outbound::Output(t) if t.contains("budget exhausted")))
+                .count(),
+            1,
+            "预算到点应**恰有一条**说明行：{msgs:?}"
+        );
+        // 钉住说明行里的**时长值** = `config.max_turn_duration().as_secs()`（此处 config.json
+        // 写的是 1s）。若把时长写死成另一个「足够短但错误」的值（如 2s），它仍会在用例窗口内
+        // 到点、仍含 "budget exhausted"，但本条断言会红。
+        let budget_line = msgs
+            .iter()
+            .find_map(|m| match m {
+                Outbound::Output(t) if t.contains("budget exhausted") => Some(t.as_str()),
+                _ => None,
+            })
+            .expect("应有一条 budget exhausted 说明行");
+        assert!(
+            budget_line.contains("of 1s"),
+            "说明行须含配置的时长值 1s（来自 config.max_turn_duration()）：{budget_line:?}"
+        );
+        assert_eq!(
+            stop_reasons(&events_of(&msgs)),
+            vec![StopReason::Cancelled],
+            "预算耗尽应以 Cancelled 收场：{msgs:?}"
+        );
+    }
+
+    /// **`max_rounds` = `u32::MAX` ⇒ 不被核心默认 10 截断**（ADR-0027 决策 1）。
+    ///
+    /// 生产侧 `resolve_limits`（`main.rs`）把 `config.max_rounds()`（app 默认
+    /// `u32::MAX`，= 不设）装进 `RunLimits.max_rounds`；本用例在测试台重现该装配。
+    /// 探针 `CompleteAtCalls(&[12])` 需要跑满 12 轮才收尾 —— 若限制仍是核心默认 10，
+    /// 回合会在第 10 轮以 `MaxRounds` 收场 ⇒ 断言变红。
+    #[tokio::test]
+    async fn max_rounds_above_core_default_runs_to_completion() {
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[12]));
+        let mut h = spawn_app_loop_full(
+            Box::new(model),
+            false,
+            Vec::new(),
+            |_, _| {},
+            |b| b.limits(ys_component::RunLimits::new(u32::MAX)),
+        )
+        .await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let events = events_of(&msgs);
+        // 主回合必须 `Completed`（而非被核心默认 10 截断的 `MaxRounds`）。
+        assert_eq!(
+            stop_reasons(&events).first(),
+            Some(&StopReason::Completed),
+            "max_rounds = u32::MAX 时主回合须 Completed，不得被核心默认截断：{msgs:?}"
+        );
+        assert!(
+            !stop_reasons(&events).contains(&StopReason::MaxRounds),
+            "不得出现 MaxRounds：{msgs:?}"
+        );
+        // 主回合实际跑到的轮数 > 10 —— 直接证明未被核心默认 10 截断。
+        let main_rounds = events
+            .iter()
+            .find_map(|e| match &e.event {
+                AgentEvent::RunFinished { rounds, .. } => Some(*rounds),
+                _ => None,
+            })
+            .expect("应有 RunFinished");
+        assert!(
+            main_rounds > 10,
+            "主回合应跑过 10 轮（证明未被核心默认 10 截断），实际 {main_rounds} 轮"
+        );
     }
 
     /// 临时目录（含进程内原子序号 + pid；调用方负责删除）。

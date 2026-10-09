@@ -38,7 +38,7 @@ accepted（2026-10-08；评审修订 2026-10-09）
 
 - `apps/coding-agent/src/config.rs` 按 `context_window` / `compaction` 的既有「Raw → 校验 → 规整」形状加
   **顶层标量** `max_rounds`（非按 model 的 map —— 预算是回合属性，与 model 无关）；非法值**只丢该条并落日志**。
-- `apps/coding-agent/src/main.rs` `resolve_limits`（`:361`）加一行 `limits.max_rounds = config.max_rounds();`
+- `apps/coding-agent/src/main.rs` 的 `resolve_limits`（TUI / `-p` / `--json` 三入口共用的唯一 limits 接线点）加一行 `limits.max_rounds = config.max_rounds();`
   —— **唯一接线点**，三种模式（TUI / `-p` / `--json`）一次修复。
 - **`RunLimits::default().max_rounds` 保持 `10`**（结构性理由：`crates/ys-component/src/lib.rs:18` 有断言；
   且 app_loop 测试 `abort_yields_cancelled_and_view_still_emitted` 靠核心默认 10 收尾）。⇒「库的保守默认」与
@@ -55,7 +55,7 @@ accepted（2026-10-08；评审修订 2026-10-09）
   抽出 `run_turn_once(...)` 消除重复。**不另起第二套「回合边界续跑」机制。**
 - **两道门**：只在 `stop_reason == Completed` 后问（`Cancelled` / `Truncated` / `MaxRounds` 一律不续 —— 用户中止永远赢）；
   只在**本回合调用过工具且够长**时问。后者用 **`result.rounds >= REVIEW_MIN_ROUNDS`（`REVIEW_MIN_ROUNDS = 5`）** 判定
-  —— `rounds` 是 `BasicLoop` 里「上一轮有 tool call 才递增」的计数，直接读 `RunResult.rounds`（`pub`），
+  —— `rounds` 是 `BasicLoop` 里**每次模型调用**无条件加一的计数（回环仅在上一轮有 tool call 时继续），直接读 `RunResult.rounds`（`pub`），
   **零事件管道、零新增状态**，规避「扫事件转发点会漏点」的风险。
   **门槛取 `5` 而非 `2`**：`rounds >= 2` 只排除纯文本完工，「读一个文件就答」这类短回合仍满足它 ⇒ 复核会落在
   几乎每次 coding 交互上（成本见设计 §4.7）；而短回合早收的代价只是用户补一句。⇒ 抬到 `5` 把短回合挡在门外，
@@ -80,9 +80,10 @@ accepted（2026-10-08；评审修订 2026-10-09）
 
 ### 5. 每回合开头排空边界队列（兑现 comment ③）
 
-- 现有 `while boundary_rx.try_recv().is_ok() {}`（`app_loop.rs:100`）只在**首个回合前**执行一次。
+- 现有 `app_loop` 外层 `loop` 顶部的 `while boundary_rx.try_recv().is_ok() {}` 位于**每次 `request_rx.recv()` 之前**
+  —— 即每个请求进入时都排空一次（单回合制下即每个回合前）。
   把它移进 `run_turn_once` 开头 ⇒ 上一回合残留的 `Abort` 不会取消复核回合。
-  这是模块注释 ③（`app_loop.rs:43-44`：「`Abort` **永久**置位」）的必然推论：**新建 `BoundarySource` 只防标志位泄漏，防不了队列里那条消息。**
+  这是模块注释 ③（「`Abort` **永久**置位」）的必然推论：**新建 `BoundarySource` 只防标志位泄漏，防不了队列里那条消息。**
 
 ### 6. 兜底改用 wall-clock 预算（默认 48h），零 `BasicLoop` 改动
 
@@ -90,8 +91,11 @@ accepted（2026-10-08；评审修订 2026-10-09）
   并先发一条 `Outbound::Output` 说明行；`deadline` 在 `Request::Prompt` 入口算一次，覆盖整个回合链。
 - **为什么是小时而非轮数**：需求用小时陈述（见决策 1）；`Boundary::Abort` 是既有机制、`BasicLoop` 在轮边界读取它 ⇒ **零 `BasicLoop` 改动**。
 - **两条代价如实**：① 这样收场 `StopReason` 只能是 `Cancelled`，与用户 Ctrl+C **同态**，靠那条 `Outbound::Output` 行区分
-  （要真区分需新增 `StopReason` = 改 `BasicLoop`，本轮不做）；② `Abort` **只在轮边界被读** ⇒ 到点时的停止会推迟到下一次轮边界（最坏多一轮）。
-- **`-p` / `--json`**：其 `run_single_turn` 不传 `boundary`（`main.rs:717`）⇒ 需给它一条**合成边界源** + 同一计时器分支，方能同样兜底；
+  （要真区分需新增 `StopReason` = 改 `BasicLoop`，本轮不做）；② `Abort` **只在轮边界被读**
+  （`BasicLoop` 的 Step 1 / Step 3 / 轮边界 `take()`），而**模型调用发生在 Step 6** ⇒ 若该次调用不返回，
+  到点推入的 `Abort` **不会被观察**，停止实际推迟到**该次在途模型调用返回**、由**适配器的流空闲超时**（默认 120s）界住。
+  ⇒ 最坏 = **一次在途模型调用**（**非**「多一轮」）。
+- **`-p` / `--json`**：其 `run_single_turn`（`apps/coding-agent/src/main.rs`）不传 `boundary` ⇒ 需给它一条**合成边界源** + 同一计时器分支，方能同样兜底；
   预算到点**非零退出**（无人值守的调度器 / CI 必须能看出「没跑完」）。
 - **这是一次「细阀换粗阀」（如实记账）**：去掉轮数上限后，回合内**唯一的**防失控阀就是这条 wall-clock 预算，而它**很粗**
   —— 小输出空转可持续数小时才到点（`MAX_CONSECUTIVE_ERRORS` 仍是空分支）。不是「无损失」。
@@ -137,3 +141,22 @@ accepted（2026-10-08；评审修订 2026-10-09）
 - 设计全文（含三候选对比矩阵、成本分析、测试与变异靶）：[`../arch/long-horizon-completion/design.md`](../arch/long-horizon-completion/design.md)；
   上下文与实证：[`../arch/long-horizon-completion/context.md`](../arch/long-horizon-completion/context.md)；
   同类软件调研（Pi）：[`../arch/long-horizon-completion/research.md`](../arch/long-horizon-completion/research.md)。
+
+## As-built 注记（2026-10-09）
+
+实际落点（符号 → 文件）：
+
+- **复核缝**：`apps/coding-agent/src/follow_up.rs` —— `enum TurnKind { Initial, Review }`、`fn should_review(kind, &RunResult) -> Option<AgentInput>`、常量 `REVIEW_MIN_ROUNDS = 5` 与 `REVIEW_PROMPT`；`app_loop` 的 `Request::Prompt` 臂包成 `while let Some((input, kind)) = pending.take()`，回合体抽为 `run_turn_once`（`apps/coding-agent/src/app_loop.rs`）。
+- **`resolve_limits` 一行**：`apps/coding-agent/src/main.rs::resolve_limits` 加 `limits.max_rounds = config.max_rounds();`（三入口唯一接线点）。`Config::max_rounds()`（`config.rs`，缺省 `u32::MAX`）与 `Config::max_turn_duration()`（缺省 `172_800`s）为两个新取数口。
+- **预算计时器形状**：`deadline` 在 `Request::Prompt` 入口算一次（覆盖整个 `pending` 循环）；每回合新建 `QueueBoundarySource`；`select!` 计时器臂带 `if !budget_exhausted` 前置条件，到点**先**发 `Outbound::Output` 说明行、**再** `boundary.push(Boundary::Abort)`（`app_loop.rs`）。
+- **`-p` / `--json` 兜底**：`main.rs::run_single_turn` 合成 `QueueBoundarySource` + 同一计时器，到点先写说明行再 push `Abort`；`single_turn_exit_code` 令 `Cancelled ⇒ 1`（其余 `⇒ 0`）；`exit_with_code` 非零时先 `flush` stdout 再 `exit`。
+- **UI 判别式**：`ys-tui-coding/src/app.rs` 的 `AgentEvent::UserMessage` 分支按 `is_turning` 真假区分 steering 插话（`User` 行）与复核回合（`System` 行 + 点亮 `Working`），零 `ys-protocol` 改动。
+
+新增测试：`follow_up.rs`（4）、`app_loop.rs`（11：复核正例 / 四类 `stop_reason` 不复核 / 不问第二次 / 跨回合残留 `Abort` / 标题不被复核覆盖 / 复核不交标题 / wall-clock 到点 / `u32::MAX` 不被核心默认 10 截断）、`config.rs`（6）、`main.rs`（4，含 `resolve_limits` 与 `single_turn_exit_code`）、`ys-tui-coding/src/app.rs`（7）。
+
+### 债务
+
+- **A. 未校准初值**（用户裁定跳过 prototype、按设计初值实现并记账；本环境无模型凭证）：`REVIEW_MIN_ROUNDS = 5`。
+- **B. 设计层缺口 —— 预算管不住在途模型调用**：`Boundary::Abort` 只在轮边界被读（`crates/ys-loop/src/basic.rs:58` Step 1、`:95` Step 3、`:212` 轮边界 `take()`），模型调用在 Step 6（`basic.rs:258`）；调用不返回则到点的 `Abort` 不被观察，实际由适配器流空闲超时（`stream.rs` 的 `timeout(idle, …)`，默认 120s）界住 ⇒ 最坏 = 一次在途模型调用。
+- **C. `-p` / `--json` 说明行落点与计划不符**：计划写 `Outbound::Output`，实际走 **stderr**（该路径无 outbound 信道、stdout 须保持干净），`apps/coding-agent/tests/budget_exit.rs` 进程级钉住。
+- **D. 复核层残余**：`app_loop` 的 §4.9 可观测行在 `Err` 路径记 `rounds = 0`（低估真实轮数，仅影响排障行）；计时器说明行同一 poll 内至多一条（正例，非债务）。详见 `docs/design-final/coding-agent-tui.md` §12。

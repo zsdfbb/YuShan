@@ -44,6 +44,7 @@ mod app_loop;
 mod capabilities;
 mod channel;
 mod config;
+mod follow_up;
 mod logging;
 mod prompt;
 mod provider;
@@ -65,10 +66,13 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use ys_core::StopReason;
 use ys_event::AgentEvent;
 use ys_loop::{AgentInput, LoopError, RunResult};
-use ys_model_openai_compat::{OpenAICompatibleConfig, OpenAICompatibleModel};
-use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, Request};
+use ys_model_openai_compat::{
+    OpenAICompatibleConfig, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
+};
+use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentBuilder, BuildError};
 use ys_session::SessionError;
 use ys_tool::Tool;
@@ -362,6 +366,7 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     let mut limits = ys_component::RunLimits::default();
     limits.context_window = config.context_window();
     limits.compaction = config.compact_policy();
+    limits.max_rounds = config.max_rounds();
     limits
 }
 
@@ -713,15 +718,45 @@ fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> 
 ///
 /// `Inbox` / `Agent::run` 已删（T1）：单次运行就是一次 `run_turn`，`begin_turn(1)`
 /// 让 `Envelope.turn` 从 1 起（不再有逐回合递增的多回合循环）。
-/// `boundary` 传 `None` —— 一次性模式没有中途插话/中止的 UI 入口。
+///
+/// **wall-clock 预算**：`deadline = Instant::now() + budget`，本路径只有一个回合，
+/// 故只算一次。到点**先**向 **stderr** 写说明行（stdout 承载模型增量流 / JSON 流，
+/// 必须保持干净），**再**向本回合新建的边界源 `push(Boundary::Abort)`；回合在轮
+/// 边界看到后以 `Cancelled` 收场。`budget` 由调用方取自
+/// `config.max_turn_duration()`，**绝不写死**。
 async fn run_single_turn(
     agent: &mut Agent,
     wiring: &mut Wiring,
     input: AgentInput,
+    budget: Duration,
 ) -> Result<RunResult, LoopError> {
-    let ports = wiring.ports();
+    let deadline = Instant::now() + budget;
+
+    // 本回合专属的边界源：`Abort` 的标志位随回合作废，绝不跨回合复用。
+    let boundary = QueueBoundarySource::new();
+    let ports = wiring.ports_with_boundary(Some(&boundary));
     ports.events.begin_turn(1);
-    agent.run_turn(input, ports).await
+
+    let turn = agent.run_turn(input, ports);
+    tokio::pin!(turn);
+    // 预算计时器**只允许触发一次**：到点后置位，`select!` 的 `if` 前置条件随即
+    // 禁用该分支（`sleep_until` 对已过去的 deadline 会持续 Ready ⇒ 否则忙等 +
+    // 重复发说明行 + 重复 push `Abort`）。
+    let mut budget_exhausted = false;
+    loop {
+        tokio::select! {
+            result = &mut turn => break result,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)),
+                if !budget_exhausted => {
+                budget_exhausted = true;
+                let secs = budget.as_secs();
+                eprintln!(
+                    "budget exhausted: wall-clock budget of {secs}s elapsed — aborting this turn"
+                );
+                boundary.push(Boundary::Abort);
+            }
+        }
+    }
 }
 
 /// `-p` 模式的事件消费：只把 [`AgentEvent::ModelTextDelta`] 的文本增量写入 `w`
@@ -768,6 +803,7 @@ async fn run_print_mode(
     wiring: &mut Wiring,
     rx: mpsc::Receiver<Envelope>,
     task: String,
+    budget: Duration,
     stats: &ChannelStatsHandle,
     force_stats: bool,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
@@ -775,7 +811,7 @@ async fn run_print_mode(
 
     // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
     let (run_result, consume_result) = tokio::join!(
-        run_single_turn(agent, wiring, AgentInput::text(task.as_str())),
+        run_single_turn(agent, wiring, AgentInput::text(task.as_str()), budget),
         consume_print_events(rx, io::stdout()),
     );
 
@@ -798,13 +834,14 @@ async fn run_json_mode(
     wiring: &mut Wiring,
     rx: mpsc::Receiver<Envelope>,
     task: String,
+    budget: Duration,
     stats: &ChannelStatsHandle,
     force_stats: bool,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring)?;
 
     let (run_result, consume_result) = tokio::join!(
-        run_single_turn(agent, wiring, AgentInput::text(task.as_str())),
+        run_single_turn(agent, wiring, AgentInput::text(task.as_str()), budget),
         consume_events(rx, io::stdout(), write_json_envelope),
     );
 
@@ -812,6 +849,33 @@ async fn run_json_mode(
     let result = run_result?;
     consume_result?;
     Ok(result)
+}
+
+/// 一次性模式的退出码：wall-clock 预算到点（回合以 `Cancelled` 收场）⇒ `1`；
+/// 其余（`Completed` / `MaxRounds` / `Truncated`…）⇒ `0`。
+///
+/// `Cancelled` 是这条路径唯一的「预算用尽」信号 —— 一次性模式没有别的 `Abort`
+/// 来源（无 UI、无 Ctrl+C 处理）。
+fn single_turn_exit_code(result: &RunResult) -> i32 {
+    if result.stop_reason == StopReason::Cancelled {
+        1
+    } else {
+        0
+    }
+}
+
+/// 预算兜底退出的落地：非零退出码时**先 `flush` 再 `exit`**。
+///
+/// `-p` 的文本增量是直写 stdout 的（不带换行）。`process::exit` 会经 `rt::cleanup`
+/// 冲刷 stdout（std 的 `process::exit` → `rt::cleanup` → `io::stdio`），故此处显式
+/// `flush` **不是**补救缺陷，而是把「退出前 stdout 已排空」这一语义写显、并对未来
+/// 的缓冲实现保持保守。说明行已由 [`run_single_turn`] 写到 stderr，这里**不打印
+/// `Error:` 噪声**。
+fn exit_with_code(code: i32) {
+    if code != 0 {
+        let _ = io::stdout().flush();
+        std::process::exit(code);
+    }
 }
 
 /// TUI 模式的全部组装（设计 §7 初始化顺序 1–5）。
@@ -1034,16 +1098,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base = cfg.api_base.as_ref()?;
         let key = cfg.api_key.as_ref()?;
         let compat = cfg.current_compat();
-        Some(Box::new(OpenAICompatibleModel::new(
-            OpenAICompatibleConfig {
+        // `new` 自建 client（`owns_client == true`），故 `with_timeouts` 会按配置重建
+        // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
+        let retry = cfg.model_retry();
+        let timeout = cfg.model_timeout();
+        Some(Box::new(
+            OpenAICompatibleModel::new(OpenAICompatibleConfig {
                 api_base: base.clone(),
                 api_key: key.clone(),
                 model: cfg.model.clone(),
                 max_tokens: Some(4096),
                 temperature: Some(0.7),
                 compat,
-            },
-        )))
+            })
+            .with_retry(RetryConfig {
+                max_attempts: retry.max_attempts,
+                base_delay_ms: retry.base_delay_ms,
+                max_delay_ms: retry.max_delay_ms,
+            })
+            .with_timeouts(TimeoutConfig {
+                connect_secs: timeout.connect_secs,
+                idle_secs: timeout.idle_secs,
+            })
+            // 重试痕迹走 app 的 logging（ADR-0028 决策 7）：对 TUI 不可见、对排障可见。
+            // 适配器绝不直接 print —— 这条回调是它唯一的诊断出口。
+            .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg))),
+        ))
     });
 
     // 构建工具表与 system prompt。
@@ -1119,6 +1199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut wiring,
                 rx,
                 task,
+                config.max_turn_duration(),
                 &stats_handle,
                 args.stats,
             ))?;
@@ -1128,6 +1209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.provider.as_deref(),
                 &result,
             ))?;
+            // 预算到点 ⇒ 非零退出（正常完成路径退出码不变）。
+            exit_with_code(single_turn_exit_code(&result));
         }
         Mode::Json(task) => {
             // 同 `-p`：无 TUI → stderr（**绝不能**混进 stdout 的逐行 Envelope）。
@@ -1153,6 +1236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut wiring,
                 rx,
                 task,
+                config.max_turn_duration(),
                 &stats_handle,
                 args.stats,
             ))?;
@@ -1162,6 +1246,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.provider.as_deref(),
                 &result,
             ))?;
+            // 预算到点 ⇒ 非零退出（正常完成路径退出码不变）。
+            exit_with_code(single_turn_exit_code(&result));
         }
         Mode::Interactive => {
             // TUI 模式下提示**不进 stderr**，改走 transcript（`Outbound::Output`）——
@@ -1562,7 +1648,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let joined = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
-                run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi")),
+                run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60)),
                 consume_events(rx, &mut out, write_json_envelope),
             )
         })
@@ -1683,7 +1769,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let (run_result, consume_result) = tokio::join!(
-            run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi")),
+            run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60)),
             consume_events(rx, &mut out, write_json_envelope),
         );
         run_result.expect("run_turn 应成功");
@@ -1704,6 +1790,155 @@ mod tests {
         assert!(
             turns.iter().all(|&t| t == 1),
             "所有信封的 turn 应从 1 开始；turns = {turns:?}"
+        );
+    }
+
+    /// 测试模型：每次 `complete` 先停留 [`SlowToolCallModel::DELAY`]，再返回一个
+    /// **不存在**的 tool call。
+    ///
+    /// 停留让 wall-clock 计时器得以在回合**进行中**到点；返回 tool call（而非纯文本）
+    /// 让回合跨过一个轮边界，`BasicLoop` 的 abort 探针得以命中计时器 push 的 `Abort`。
+    struct SlowToolCallModel;
+
+    impl SlowToolCallModel {
+        /// 略长于测试用的 `1s` 预算，保证计时器先到点。
+        const DELAY: Duration = Duration::from_millis(1300);
+
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ys_model::Model for SlowToolCallModel {
+        fn model_id(&self) -> &str {
+            "slow-tool-call"
+        }
+
+        async fn complete(
+            &self,
+            _request: ys_model::ModelRequest,
+            _sink: &mut dyn ys_model::ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            tokio::time::sleep(Self::DELAY).await;
+            Ok(ys_model::ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: ToolCallId("slow-1".into()),
+                        name: "noop".into(),
+                        arguments: serde_json::Value::Null,
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: ys_model::FinishReason::ToolCalls,
+            })
+        }
+    }
+
+    /// 13b. **一次性模式的 wall-clock 预算**（`-p` / `--json` 的兜底）：预算到点 ⇒
+    ///      回合以 `Cancelled` 收场。
+    ///
+    /// 预算时长来自 `config.json` 的 `max_turn_duration_secs`（经 `load_user_config`
+    /// 加载）。先钉住「取到的正是写入的 `1s`」——与配置值绑定，**不是**写死的常量；
+    /// 再断言回合终局。变异：把 `config.max_turn_duration()` 换成写死的 48h 默认值 ⇒
+    /// 计时器不会在用例内到点，回合跑满 `max_rounds` 以 `MaxRounds` 收场 ⇒ 本用例变红。
+    ///
+    /// `max_rounds = 2` 给「无计时器」的情形一个**有界**收场（`MaxRounds`），使误删
+    /// 计时器表现为干净的断言失败，而非无限挂起。
+    ///
+    /// **说明**：到点的说明行走 **stderr**（stdout 承载模型增量 / JSON 流，必须干净），
+    /// 进程内无法可靠捕获 ⇒ 说明行的存在性留给进程级 T10 用例；本用例只钉住用户可观察
+    /// 的终局 `Cancelled`。
+    #[tokio::test]
+    async fn budget_exhaustion_cancels_single_turn() {
+        // `Config::from_env` 会 `getenv` 凭证 key，须与并发改写 env 的测试串行。
+        let mut config = {
+            let _guard = crate::test_env::env_lock();
+            config::Config::from_env().unwrap()
+        };
+
+        let dir = unique_tmp_dir("budget_cancel");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"max_turn_duration_secs": 1}"#).unwrap();
+        config.load_user_config(&path);
+        // 不写死时长：断言取到的正是配置里写的 1s（与写入值绑定）。
+        assert_eq!(
+            config.max_turn_duration(),
+            Duration::from_secs(1),
+            "预算时长必须来自 config.json（max_turn_duration_secs）"
+        );
+
+        let (sink, rx) = ChannelSink::new(
+            DEFAULT_CHANNEL_CAPACITY,
+            LifecyclePolicy::StopWhenConsumerGone,
+        );
+        let mut agent = build_agent(
+            String::new(),
+            PathBuf::from("."),
+            Vec::new(),
+            ys_component::RunLimits::new(2),
+        )
+        .unwrap();
+        let mut wiring =
+            Wiring::ephemeral(Some(Box::new(SlowToolCallModel::new())), Box::new(sink));
+
+        let mut out: Vec<u8> = Vec::new();
+        let joined = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(
+                run_single_turn(
+                    &mut agent,
+                    &mut wiring,
+                    AgentInput::text("hi"),
+                    config.max_turn_duration(),
+                ),
+                consume_events(rx, &mut out, write_json_envelope),
+            )
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (run_result, consume_result) = joined.expect(
+            "预算到点后回合应结束（预算不生效时回合跑满 max_rounds 收场，非挂起）",
+        );
+        let result = run_result.expect("turn 应成功返回（Cancelled 是正常 RunResult）");
+        consume_result.expect("consume 应成功");
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Cancelled,
+            "预算耗尽应以 Cancelled 收场（时长写死为默认 48h ⇒ 本回合 MaxRounds 收场，用例变红）"
+        );
+    }
+
+    /// 13c. **预算到点 ⇒ 非零退出码**（`-p` / `--json` 的退出契约）。
+    ///
+    /// 钉住退出码**判定**：`Cancelled` ⇒ 1，正常完成 ⇒ 0。`process::exit` 本身
+    /// 只能在进程级验证（留给 T10），但「按什么退出」由 [`single_turn_exit_code`]
+    /// 决定，故此处直接覆盖：变异「去掉 `Cancelled` 判定 ⇒ 恒 0」会让第一条断言变红。
+    #[test]
+    fn single_turn_exit_code_is_nonzero_on_budget_cancellation() {
+        let cancelled = RunResult {
+            stop_reason: StopReason::Cancelled,
+            usage: Usage::default(),
+            rounds: 0,
+            final_message: None,
+        };
+        let completed = RunResult {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            rounds: 1,
+            final_message: None,
+        };
+        assert_eq!(
+            single_turn_exit_code(&cancelled),
+            1,
+            "预算到点（Cancelled）须非零退出"
+        );
+        assert_eq!(
+            single_turn_exit_code(&completed),
+            0,
+            "正常完成路径退出码不变（回归护栏）"
         );
     }
 
@@ -1893,7 +2128,8 @@ mod tests {
             &path,
             r#"{
                 "context_window": { "resolve-limits-model": 262144 },
-                "compaction": { "trigger_ratio": 0.5, "keep_ratio": 0.25 }
+                "compaction": { "trigger_ratio": 0.5, "keep_ratio": 0.25 },
+                "max_rounds": 42
             }"#,
         )
         .unwrap();
@@ -1925,8 +2161,87 @@ mod tests {
             ys_component::CompactPolicy::default().trigger_ratio,
             "若等于默认 0.85，说明装配没引用 config"
         );
+        assert_eq!(
+            limits.max_rounds, 42,
+            "max_rounds 必须来自 config（config.json 的显式值）"
+        );
+        assert_eq!(
+            limits.max_rounds,
+            config.max_rounds(),
+            "resolve_limits 必须逐值取自 config.max_rounds()"
+        );
+
+        // 缺省回落：`config.json` 未给 `max_rounds` ⇒ `u32::MAX`（= 不设）。
+        // 断言取与库默认（10）不同的值，避免「恰好等于保守默认」的恒真。
+        let dir_default = unique_tmp_dir("resolve_limits_default");
+        let path_default = dir_default.join("config.json");
+        std::fs::write(
+            &path_default,
+            r#"{ "context_window": { "resolve-limits-model": 262144 } }"#,
+        )
+        .unwrap();
+        let mut config_default = config::Config::from_env().unwrap();
+        config_default.model = "resolve-limits-model".into();
+        config_default.load_user_config(&path_default);
+        let limits_default = resolve_limits(&config_default);
+        assert_eq!(
+            limits_default.max_rounds,
+            config_default.max_rounds(),
+            "缺省时必须取自 config.max_rounds()"
+        );
+        assert_eq!(limits_default.max_rounds, u32::MAX, "缺省 = 不设");
+        assert_ne!(
+            limits_default.max_rounds,
+            ys_component::RunLimits::default().max_rounds,
+            "app 产品默认必须与库的保守默认（10）分离（防恒真）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_default);
+    }
+
+    /// **两组默认常数不许漂移**（跨 crate 守卫）。
+    ///
+    /// 适配器侧 `RetryConfig::default()` / `TimeoutConfig::default()` 与 app 侧
+    /// [`config::ModelRetryConfig::default`] / [`config::ModelTimeoutConfig::default`]
+    /// 是同一组常数各写一份，本用例逐字段钉住相等。
+    ///
+    /// **两侧语义不对称**：生产路径的 model factory（本文件）**总是**显式调用
+    /// `.with_retry(cfg.model_retry())` / `.with_timeouts(cfg.model_timeout())`，
+    /// 故生效的是 **app 侧常量** —— 改 app 侧默认值有生产后果；改适配器侧的
+    /// `RetryConfig::default()` / `TimeoutConfig::default()` 在生产行为上**惰性**
+    /// （它们不在任何生产路径上），仅当将来撤掉显式注入、或出现别的直接消费者时
+    /// 才显现。本用例的价值是把两组常数锁在一起，堵住「谁才是真源」的漂移。
+    ///
+    /// 变异：把 app 侧任一默认值改掉（如 `ModelRetryConfig::max_attempts` 5 → 4）⇒
+    /// 本用例变红。
+    #[test]
+    fn adapter_and_app_defaults_do_not_drift() {
+        let app_retry = config::ModelRetryConfig::default();
+        let adapter_retry = RetryConfig::default();
+        assert_eq!(
+            app_retry.max_attempts, adapter_retry.max_attempts,
+            "model_retry.max_attempts 默认值两边必须一致"
+        );
+        assert_eq!(
+            app_retry.base_delay_ms, adapter_retry.base_delay_ms,
+            "model_retry.base_delay_ms 默认值两边必须一致"
+        );
+        assert_eq!(
+            app_retry.max_delay_ms, adapter_retry.max_delay_ms,
+            "model_retry.max_delay_ms 默认值两边必须一致"
+        );
+
+        let app_timeout = config::ModelTimeoutConfig::default();
+        let adapter_timeout = TimeoutConfig::default();
+        assert_eq!(
+            app_timeout.connect_secs, adapter_timeout.connect_secs,
+            "model_timeout.connect_secs 默认值两边必须一致"
+        );
+        assert_eq!(
+            app_timeout.idle_secs, adapter_timeout.idle_secs,
+            "model_timeout.idle_secs 默认值两边必须一致"
+        );
     }
 
     // ───────────────────── skills 启动装配（T13） ─────────────────────

@@ -92,12 +92,26 @@ where
     Ok(false)
 }
 
+/// 流空闲超时错误消息的标记子串。
+///
+/// `complete` 用它从其他流阶段错误里区分出**可重试**的空闲超时（属传输层）：
+/// 构造与匹配共用同一常量，避免两处措辞漂移。
+pub const IDLE_TIMEOUT_MARKER: &str = "stream idle timeout";
+
 /// 从 OpenAI 兼容 API 解析 SSE 流，**边解析边回调** `on_event`。
 ///
 /// 每解析出一行就立刻回调，不先攒成 `Vec`——这是「增量实时推送」的前提。
 /// 传输层错误回调 [`StreamEvent::Error`]（不在此返回 `Err`），让调用方统一
 /// 在流结束时收敛；`on_event` 自身的错误则原样上抛。
-pub async fn parse_sse_stream<F>(response: Response, mut on_event: F) -> Result<(), ModelError>
+///
+/// `idle` 是**流空闲超时**：相邻两次字节到达的最长间隔。每一次 `stream.next()`
+/// 都被它包住 —— 「接受连接但不应答」的黑洞端点否则会让 `complete` 永久挂起，
+/// 而「没有失败」就「没有重试」。
+pub async fn parse_sse_stream<F>(
+    response: Response,
+    idle: std::time::Duration,
+    mut on_event: F,
+) -> Result<(), ModelError>
 where
     F: FnMut(StreamEvent) -> Result<(), ModelError>,
 {
@@ -105,20 +119,26 @@ where
     let mut buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(chunk) => {
+    loop {
+        match tokio::time::timeout(idle, stream.next()).await {
+            Err(_) => {
+                return Err(ModelError::Provider(format!(
+                    "{IDLE_TIMEOUT_MARKER} after {}s",
+                    idle.as_secs()
+                )));
+            }
+            Ok(None) => return Ok(()),
+            Ok(Some(Ok(chunk))) => {
                 if feed_sse_bytes(&mut buffer, &chunk, &mut on_event)? {
                     return Ok(());
                 }
             }
-            Err(e) => {
+            Ok(Some(Err(e))) => {
                 on_event(StreamEvent::Error(e.to_string()))?;
                 return Ok(());
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

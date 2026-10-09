@@ -4,7 +4,7 @@
 //! transcript、滚动、输入、补全、Working 动画。二者互不越界 ——
 //! UI 不读 `Session`，app 不碰 `scroll_offset`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use ys_core::{ContentBlock, Message, ToolCallId};
@@ -46,6 +46,20 @@ pub struct App {
     /// 本地回显抑制计数：提交时已本地 push 的那条 `UserMessage`，
     /// 不应被随后的 `AgentEvent::UserMessage` 重复推入。
     pub(crate) suppress_user_echo: usize,
+    /// 「本地已渲染、但 `UserMessage` 回声尚未出现」的提交文本（FIFO）。
+    ///
+    /// 回合进行中提交的消息会被排到**后续回合**：其回声抵达时，上一回合的
+    /// `finish_turn` 已把 `suppress_user_echo` 清零。凭**提交文本**认领它，才不会把它
+    /// 误判成 steering（再画一条 User 行）或复核回合（误标成 System 行）。
+    ///
+    /// 之所以按文本而非回合号认领：完工复核回合会占用一个回合号，而
+    /// `begin_local_turn` 提交时并不知道它 —— 排队提交的**真实**回合因此整体后移一格，
+    /// 推定的回合号会撞上复核回合，凭号认领会把复核提示错当回声吞掉。
+    ///
+    /// **边界**：`/skill-name` 提交在 app 侧被 `expand_skill_invocation` 改写成
+    /// `<skill …>` 信封后才进会话，而这里登记的是**展开前**的原文 —— 该回声文本不等、
+    /// 认领不到，会退回「`is_turning == false` ⇒ 误标 `System`」。
+    pending_echo_texts: VecDeque<String>,
 }
 
 impl App {
@@ -68,6 +82,7 @@ impl App {
             working_dot: 0,
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
+            pending_echo_texts: VecDeque::new(),
         }
     }
 
@@ -89,14 +104,44 @@ impl App {
     pub fn apply_event(&mut self, env: Envelope) {
         match env.event {
             AgentEvent::UserMessage { message } => {
+                // ① 既有回显抑制：提交时已本地 push 过那条 User 行，这条事件就是它的
+                //    回声 —— 递减计数并跳过，别重复画。
                 if self.suppress_user_echo > 0 {
-                    // 本地已回显（提交时 push 过了）—— 跳过，别重复
                     self.suppress_user_echo -= 1;
                     return;
                 }
-                // 未本地回显的 UserMessage = 轮边界的 steering 插话
-                self.transcript
-                    .push(TranscriptLine::User(message_text(&message)));
+                let text = message_text(&message);
+                // ② 迟到的回声：回合进行中提交的消息被**排到后续回合**，其回声抵达时
+                //    上一回合的 `finish_turn` 已把 `suppress_user_echo` 清零 —— 凭**提交文本**
+                //    认出「这条正是我自己刚画过的提交」，消费关联、不重复画那条 User 行。
+                //    该回合此刻才真正开始，故点亮 Working（否则本回合会以 `is_turning ==
+                //    false` 运行，连它期间提交的下一条也会被误判）。
+                //
+                //    以 `!is_turning` 为闸：队列提交的回声恒在前一回合 `finish_turn` 复位后抵达
+                //    （此刻 `is_turning == false`）；而 `is_turning == true` 时的 `UserMessage`
+                //    语义是轮边界 steering 插话，即便文本偶然与某条待回声提交相同，也归 ③ 的用户行。
+                if !self.is_turning
+                    && let Some(pos) = self.pending_echo_texts.iter().position(|t| t == &text)
+                {
+                    self.pending_echo_texts.remove(pos);
+                    self.is_turning = true;
+                    self.turn_started_at = Some(Instant::now());
+                    return;
+                }
+                // ③④ 未本地回显、也不属于任何待回声提交的 `UserMessage` 有两种来源，
+                //     仅以 `is_turning` 的**真假**区分 —— 绝不按内容匹配（不嗅探文案里
+                //     是不是复核提示）。契约：
+                // - `is_turning == true` ⇒ 回合进行中的轮边界 steering 插话，仍是用户行；
+                // - `is_turning == false` ⇒ app 发起的复核回合（主回合已 `RunFinished`，
+                //   `finish_turn` 已复位 `is_turning`），渲染成 System 行并点亮 Working ——
+                //   复核同样是一个回合，谁也不是谁的特例。
+                if self.is_turning {
+                    self.transcript.push(TranscriptLine::User(text));
+                } else {
+                    self.transcript.push(TranscriptLine::System(text));
+                    self.is_turning = true;
+                    self.turn_started_at = Some(Instant::now());
+                }
                 self.follow = true;
             }
             AgentEvent::ModelTextDelta { text } => self.append_stream(text, StreamKind::Assistant),
@@ -192,6 +237,13 @@ impl App {
     ///
     /// 返回被提交的文本（调用方负责包成 `Request::Prompt`）。
     pub fn begin_local_turn(&mut self, text: String) {
+        // 仅**回合进行中**的提交需要登记待回声：它被排到后续回合，回声晚于本回合的
+        // `finish_turn`（届时 `suppress_user_echo` 已清零）抵达。空闲时的提交就是下一个
+        // 回合，回声在其自身 `finish_turn` **之前**到达，由 `suppress_user_echo` 抑制即可
+        // —— 不登记，免得留下永不消掉、还会与同回合 steering 撞车的条目。
+        if self.is_turning {
+            self.pending_echo_texts.push_back(text.clone());
+        }
         self.transcript.push(TranscriptLine::User(text));
         // 下一条 UserMessage 事件就是这条 —— 抑制掉，避免出现两遍
         self.suppress_user_echo += 1;
@@ -325,6 +377,22 @@ mod tests {
 
     fn env(event: AgentEvent) -> Envelope {
         Envelope::new(Source::agent(), 1, event)
+    }
+
+    /// 指定回合号的信封 —— 用于构造跨回合的序列（回声关联凭 `Envelope.turn`）。
+    fn env_at(turn: u32, event: AgentEvent) -> Envelope {
+        Envelope::new(Source::agent(), turn, event)
+    }
+
+    fn run_finished(turn: u32) -> Envelope {
+        env_at(
+            turn,
+            AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 1,
+            },
+        )
     }
 
     fn text_delta(text: &str) -> Envelope {
@@ -601,6 +669,364 @@ mod tests {
         assert!(matches!(&a.transcript[1], TranscriptLine::User(s) if s == "插话"));
     }
 
+    /// 复核回合（app 发起）：`is_turning == false` 时到达的非回显 `UserMessage`
+    /// 渲染成 `System` 行，并**点亮 Working**（置 `is_turning` + `turn_started_at`）。
+    ///
+    /// 判别式只读 `is_turning`，绝不按内容匹配 —— 这里用一句普通文案验证。
+    ///
+    /// 变异：把判别式改成「非回显即 `System`」（恒走 `System` 分支）→ 本测试仍绿，
+    /// 但 `test_steering_user_message_is_still_user_line_regardless` 变红。
+    #[test]
+    fn test_non_echo_user_message_while_idle_is_review_system_line() {
+        let mut a = app();
+        assert!(!a.is_turning, "前置：不在 turn 态（主回合已 RunFinished）");
+        assert!(a.turn_started_at.is_none());
+
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("复核：任务真的完成了吗？"),
+        }));
+
+        assert_eq!(a.transcript.len(), 1);
+        match &a.transcript[0] {
+            TranscriptLine::System(s) => assert_eq!(s, "复核：任务真的完成了吗？"),
+            other => panic!("expected System, got {other:?}"),
+        }
+        assert!(a.is_turning, "复核回合同样是一个回合 ⇒ 点亮 Working");
+        assert!(a.turn_started_at.is_some(), "复核回合 elapsed 从此刻起算");
+        assert!(a.follow, "新内容到达 → 回到贴底");
+    }
+
+    /// **回归护栏**：`is_turning == true` 时到达的非回显 `UserMessage` 仍是
+    /// **用户行**（轮边界 steering 插话），且 `is_turning` / `turn_started_at`
+    /// **不被改动**。
+    ///
+    /// **合成性说明**：生产侧暂无 `Boundary::Steer` 生产者（steering 通路备而不用），
+    /// 故这里手工造态 —— `begin_local_turn` 是**空闲**提交（`is_turning == false`），
+    /// 不登记待回声，故这条 `UserMessage` 既非 echo 也非迟到的回声，正落在 steering 的
+    /// 判别格（`is_turning == true`）上。reset `suppress_user_echo` 只是把「回显已被
+    /// 消耗」这一步跳过，不影响判别。
+    ///
+    /// 变异：把判别式写成「非回显即 `System`」（恒走 `System` 分支）→ 本测试变红。
+    #[test]
+    fn test_steering_user_message_is_still_user_line_regardless() {
+        let mut a = app();
+        a.begin_local_turn("first".into());
+        let started_before = a.turn_started_at;
+        assert!(a.is_turning);
+
+        // 非回显（此处未消耗回显计数前先投一条）—— 显式造出「非回显」的情形：
+        // 重置抑制计数，使这条 UserMessage 不走 echo 分支。
+        a.suppress_user_echo = 0;
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("插话：顺便改下这里"),
+        }));
+
+        assert_eq!(a.transcript.len(), 2, "User(first) + User(插话)");
+        assert!(
+            matches!(&a.transcript[1], TranscriptLine::User(s) if s == "插话：顺便改下这里"),
+            "steering 插话仍是用户行：{:?}",
+            a.transcript
+        );
+        assert!(a.is_turning, "steering 不改变 is_turning");
+        assert_eq!(a.turn_started_at, started_before, "steering 不动 turn_started_at");
+    }
+
+    /// 回显路径不受影响：抑制计数未耗尽时投 `UserMessage` ⇒ 仍被跳过（行为与改动前一致），
+    /// 且 **不**进入任何渲染分支（`is_turning` / `turn_started_at` 不动）。
+    #[test]
+    fn test_echo_suppression_path_unaffected_by_discriminant() {
+        let mut a = app();
+        a.begin_local_turn("你好".into());
+        assert_eq!(a.suppress_user_echo, 1);
+        let started_before = a.turn_started_at;
+
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("你好"),
+        }));
+
+        assert_eq!(a.transcript.len(), 1, "事件里那条被抑制，不重复");
+        assert_eq!(a.suppress_user_echo, 0);
+        assert!(a.is_turning, "回显抑制不改 turn 态");
+        assert_eq!(a.turn_started_at, started_before);
+    }
+
+    /// **回归护栏（本轮 P0）**：回合进行中提交的消息会排到后续回合，其回声抵达时
+    /// 上一回合的 `finish_turn` 已把 `suppress_user_echo` 清零 —— 若不凭回合号认领，
+    /// 就会落进「非回显 ⇒ `is_turning == false` ⇒ 复核回合」的分支，把用户自己的话
+    /// 误标成 `System`。
+    ///
+    /// 场景：回合 A 进行中本地提交 "B"（排队）→ A 的 `RunFinished` 抵达 → 回合 B 的
+    /// `UserMessage("B")` 抵达。
+    ///
+    /// 变异：删掉 `apply_event` 里的「迟到的回声」判定（第 ② 条）⇒ 本测试变红
+    /// （出现 `System("B")`）。
+    #[test]
+    fn test_queued_submission_echo_is_not_mislabeled_as_system() {
+        let mut a = app();
+
+        // 回合 A：空闲提交 "A"（其回声由 suppress 抑制）
+        a.begin_local_turn("A".into());
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("A"),
+        }));
+        assert_eq!(a.suppress_user_echo, 0, "A 的回声已消耗抑制计数");
+
+        // 回合 A 仍进行中：用户再提交 "B" —— 排队等下一回合
+        a.begin_local_turn("B".into());
+        assert_eq!(a.suppress_user_echo, 1);
+
+        // 回合 A 收尾（turn 1）
+        a.apply_event(run_finished(1));
+        assert!(!a.is_turning, "A 的 RunFinished 复位 turn 态");
+        assert_eq!(a.suppress_user_echo, 0, "finish_turn 清零抑制计数");
+
+        // 回合 B 开始（turn 2）：其 UserMessage("B") 此刻才到
+        a.apply_event(env_at(
+            2,
+            AgentEvent::UserMessage {
+                message: user_message("B"),
+            },
+        ));
+
+        assert!(
+            !a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::System(s) if s == "B")),
+            "用户自己的话不得被误标成 System：{:?}",
+            a.transcript
+        );
+        assert_eq!(
+            a.transcript
+                .iter()
+                .filter(|l| matches!(l, TranscriptLine::User(s) if s == "B"))
+                .count(),
+            1,
+            "本地那条 User(B) 已在，回声不得再画一遍：{:?}",
+            a.transcript
+        );
+        assert!(a.is_turning, "回声抵达即回合 B 开始 ⇒ 点亮 Working");
+    }
+
+    /// 连排两条：推定回合依次 +1、+2，两条回声都被各自认领 —— 均不重复画、不误标。
+    #[test]
+    fn test_consecutive_queued_submissions_are_both_claimed() {
+        let mut a = app();
+        a.begin_local_turn("A".into()); // 空闲提交：推定 turn 1
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("A"),
+        }));
+        assert_eq!(a.suppress_user_echo, 0);
+
+        // 回合 A 进行中连排两条
+        a.begin_local_turn("B".into()); // 推定 turn 2
+        a.begin_local_turn("C".into()); // 紧随其后：推定 turn 3
+        assert_eq!(a.suppress_user_echo, 2);
+
+        a.apply_event(run_finished(1)); // 回合 A 收尾
+        a.apply_event(env_at(
+            2,
+            AgentEvent::UserMessage {
+                message: user_message("B"),
+            },
+        ));
+        a.apply_event(run_finished(2)); // 回合 B 收尾
+        a.apply_event(env_at(
+            3,
+            AgentEvent::UserMessage {
+                message: user_message("C"),
+            },
+        ));
+
+        for text in ["B", "C"] {
+            assert_eq!(
+                a.transcript
+                    .iter()
+                    .filter(|l| matches!(l, TranscriptLine::User(s) if s == text))
+                    .count(),
+                1,
+                "{text}：本地一条，回声不再画：{:?}",
+                a.transcript
+            );
+            assert!(
+                !a.transcript
+                    .iter()
+                    .any(|l| matches!(l, TranscriptLine::System(s) if s == text)),
+                "{text}：不得被误标成 System：{:?}",
+                a.transcript
+            );
+        }
+    }
+
+    /// 回声抵达即视为**该回合开始**（点亮 Working）—— 于是该回合进行中再提交的消息
+    /// 仍被正确判为「排队提交」，其回声同样被认领，不误标。
+    ///
+    /// 变异：删掉「迟到的回声」分支里的 `is_turning = true` ⇒ 本测试变红
+    /// （B 回合运行期间再提交的 C 落入复核分支，被误标成 `System("C")`）。
+    #[test]
+    fn test_queued_turn_stays_turning_so_further_submissions_are_claimed() {
+        let mut a = app();
+        // A：空闲提交 → turn 1
+        a.begin_local_turn("A".into());
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("A"),
+        }));
+        // B：A 进行中提交 → 排队，推定 turn 2
+        a.begin_local_turn("B".into());
+        // A 收尾
+        a.apply_event(run_finished(1));
+        // B 的回声（turn 2）：认领并点亮
+        a.apply_event(env_at(
+            2,
+            AgentEvent::UserMessage {
+                message: user_message("B"),
+            },
+        ));
+        assert!(a.is_turning, "B 回合由此开始");
+        assert!(
+            a.turn_started_at.is_some(),
+            "认领回声即点亮 turn_started_at（Working 计时的另一半）"
+        );
+
+        // B 进行中再提交 C → 推定 turn 3
+        a.begin_local_turn("C".into());
+        // B 收尾
+        a.apply_event(run_finished(2));
+        // C 的回声（turn 3）：应被认领，不误标
+        a.apply_event(env_at(
+            3,
+            AgentEvent::UserMessage {
+                message: user_message("C"),
+            },
+        ));
+
+        assert!(
+            !a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::System(s) if s == "C")),
+            "C 不得被误标成 System：{:?}",
+            a.transcript
+        );
+        assert_eq!(
+            a.transcript
+                .iter()
+                .filter(|l| matches!(l, TranscriptLine::User(s) if s == "C"))
+                .count(),
+            1,
+            "{:?}",
+            a.transcript
+        );
+    }
+
+    /// transcript 一行的「形状」签名：只区分变体与文本，忽略 `Summary` 的
+    /// `elapsed_secs`（它由 `Instant::now()` 起算，不可逐字节 fixture）。
+    fn line_shape(line: &TranscriptLine) -> String {
+        match line {
+            TranscriptLine::User(s) => format!("User({s})"),
+            TranscriptLine::System(s) => format!("System({s})"),
+            TranscriptLine::Summary { .. } => "Summary".to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// **回归护栏（碰撞场景 P1）**：回合进行中提交 "B" 后，该回合**触发完工复核** ——
+    /// 复核回合占用的回合号与提交时推定的 "B" 回合号**撞号**，"B" 的真实回合整体后移一格。
+    ///
+    /// 若凭回合号认领：复核提示（命中推定号）会被当迟到回声**吞掉**，而 "B" 的真实回声
+    /// （号已错位、无登记命中）在 `is_turning == false` 下落进复核分支被误标 `System`。
+    /// 凭**提交文本**认领即可把二者分开。
+    ///
+    /// 场景（回合号）：turn 1 = 主回合（运行中提交 "B"）→ app 触发复核 ⇒ turn 2 = 复核回合
+    /// → turn 3 = "B" 的真实回合。复核文案用**字面量**代表（本单元不认识 app 侧常量）。
+    ///
+    /// 变异：删掉分支 ② 的**文本相等**判据（改成「有待回声即消费」）⇒ 复核提示被吞 ⇒
+    /// `System(REVIEW)` 断言变红。
+    #[test]
+    fn test_queued_submission_survives_colliding_review_turn() {
+        const REVIEW: &str = "复核：原始需求真的都完成了吗？";
+        let mut a = app();
+
+        // turn 1：空闲提交 "A"（其回声由 suppress 抑制）
+        a.begin_local_turn("A".into());
+        a.apply_event(env_at(
+            1,
+            AgentEvent::UserMessage {
+                message: user_message("A"),
+            },
+        ));
+        assert_eq!(a.suppress_user_echo, 0, "A 的回声已消耗抑制计数");
+
+        // turn 1 仍进行中：提交 "B" —— 排队等后续回合，登记其文本
+        a.begin_local_turn("B".into());
+        assert_eq!(a.suppress_user_echo, 1);
+
+        // turn 1 收尾（StopReason::Completed + rounds >= 5 ⇒ app 侧触发复核）
+        a.apply_event(env_at(
+            1,
+            AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 5,
+            },
+        ));
+        assert!(!a.is_turning, "turn 1 收尾复位 turn 态");
+
+        // turn 2：复核回合的 UserMessage（文案与 "B" 不等 ⇒ 不得被当回声认领）
+        a.apply_event(env_at(
+            2,
+            AgentEvent::UserMessage {
+                message: user_message(REVIEW),
+            },
+        ));
+        // turn 2 收尾
+        a.apply_event(run_finished(2));
+
+        // turn 3："B" 的真实回声（回合号因复核后移一格）
+        a.apply_event(env_at(
+            3,
+            AgentEvent::UserMessage {
+                message: user_message("B"),
+            },
+        ));
+
+        let shapes: Vec<String> = a.transcript.iter().map(line_shape).collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "User(A)".to_string(),
+                "User(B)".to_string(),
+                "Summary".to_string(),
+                format!("System({REVIEW})"),
+                "Summary".to_string(),
+            ],
+            "逐行形状：{:?}",
+            a.transcript
+        );
+        // 至少这三条显式钉住验收口径
+        assert!(
+            a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::System(s) if s == REVIEW)),
+            "复核提示必须可见（不得被当迟到回声吞掉）：{:?}",
+            a.transcript
+        );
+        assert!(
+            !a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::System(s) if s == "B")),
+            "用户自己的话不得被误标成 System：{:?}",
+            a.transcript
+        );
+        assert_eq!(
+            a.transcript
+                .iter()
+                .filter(|l| matches!(l, TranscriptLine::User(s) if s == "B"))
+                .count(),
+            1,
+            "本地那条 User(B) 已在，回声不得再画一遍：{:?}",
+            a.transcript
+        );
+    }
+
     #[test]
     fn test_run_finished_pushes_summary_and_resets_turn() {
         let mut a = app();
@@ -641,8 +1067,12 @@ mod tests {
 
     /// **行为级**断言（review 点名的边界）：`RunFailed` 必须复位抑制计数 ——
     /// 失败回合里那条 `UserMessage` 事件从未到达（错误发生在更早），若不复位，
-    /// 残留的 `1` 会吞掉**下一回合**真正的 `UserMessage`（如轮边界 steering 插话），
-    /// 用户消息凭空消失。
+    /// 残留的 `1` 会吞掉**下一回合**真正的 `UserMessage`，用户消息凭空消失。
+    ///
+    /// `RunFailed` 同时复位 `is_turning`（见 `finish_turn`），故其后到达的这条
+    /// 非回显 `UserMessage` 落入 `is_turning == false` 分支，渲染为 `System`
+    /// （§4.6.1：idle 下的非回显 `UserMessage` = app 发起的回合）。本测试的核心
+    /// 不变量是**它不被误吞**（进程里仍出现这条文本），而非它渲染成哪种行。
     ///
     /// 变异：去掉 `finish_turn` 里的 `suppress_user_echo = 0` → 本测试变红。
     #[test]
@@ -657,17 +1087,17 @@ mod tests {
         }));
         assert_eq!(a.suppress_user_echo, 0, "RunFailed 必须复位计数");
 
-        // 下一回合的 UserMessage（未本地回显）必须正常显示，不被误吞
+        // 其后到达的 UserMessage（未本地回显）必须正常显示，不被误吞
         a.apply_event(env(AgentEvent::UserMessage {
             message: user_message("next"),
         }));
         assert_eq!(
             a.transcript.len(),
             3,
-            "User(first) + Error + User(next)：{:?}",
+            "User(first) + Error + System(next)：{:?}",
             a.transcript
         );
-        assert!(matches!(a.transcript.last(), Some(TranscriptLine::User(s)) if s == "next"));
+        assert!(matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s == "next"));
     }
 
     /// 压缩成功：推一条 `System` 行，文案带 `~` 估算前缀与四个计数。

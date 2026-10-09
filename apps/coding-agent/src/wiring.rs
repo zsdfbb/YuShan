@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ys_event::EventSink;
 use ys_model::Model;
+use ys_protocol::BoundarySource;
 use ys_runtime::AgentPorts;
 use ys_session::{JsonlSession, MemorySession, Session, SessionError, SessionMeta};
 // `Session` trait 需在作用域内才能对 `Box<dyn Session>` 调方法。
@@ -127,16 +128,31 @@ impl Wiring {
         }
     }
 
-    /// 借用端口给 `Agent::run_turn`。
+    /// 借用端口给 `Agent::run_turn`，**不携带**边界源。
     ///
-    /// 轮边界源**不在这里**：它由 `app_loop` 每回合新建、经 [`AgentPorts::new`]
-    /// 就地传入（`Abort` 的标志位必须随回合作废）。
+    /// 轮边界源由调用方每回合新建、经 [`Wiring::ports_with_boundary`] 就地传入
+    /// （`Abort` 的标志位必须随回合作废）。交互模式与一次性模式共用本方法。
     pub fn ports(&mut self) -> AgentPorts<'_> {
+        self.ports_with_boundary(None)
+    }
+
+    /// 借用端口给 `Agent::run_turn`，并**就地传入本回合的边界源**。
+    ///
+    /// `boundary` 为 `None` 时与 [`Wiring::ports`] 等价。`-p` / `--json` 的一次性
+    /// 回合经此把合成边界源交给运行时：wall-clock 预算到点时向它
+    /// `push(Boundary::Abort)`，回合在轮边界看到后以 `Cancelled` 收场。
+    ///
+    /// **每回合必须新建边界源** —— `Abort` 的标志位永久置位，复用会立刻取消
+    /// 之后的回合。
+    pub fn ports_with_boundary<'a>(
+        &'a mut self,
+        boundary: Option<&'a dyn BoundarySource>,
+    ) -> AgentPorts<'a> {
         AgentPorts::new(
             self.model.as_deref(),
             self.session.as_mut(),
             self.events.as_mut(),
-            None,
+            boundary,
         )
     }
 

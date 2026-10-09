@@ -25,7 +25,7 @@ accepted（2026-10-08；同类软件调研增补 2026-10-09）
   **未设任何 timeout**，端点「接受连接但不应答」（黑洞/半开）时 `complete` **永久挂起**；
   TUI 下 `Ctrl-C` 此刻走 `Abort` 而 `Abort` 只在轮边界被读 ⇒ **按了没反应**。没有超时，就没有「失败」可供重试。
 - **落点的既有约束**（`llm-api-unavailable/context.md` §约束，逐条沿用）：
-  `ys-model` / `ys-core` / `ys-event` / `ys-protocol` **不得引入 tokio** ⇒ 超时只能落适配器或 `ys-loop`；
+  `ys-model` / `ys-core` / `ys-event` / `ys-protocol` **不得引入 tokio**（`ys-component` 同属**纯契约层**、自身代码也不用 tokio API）⇒ 超时只能落适配器或 `ys-loop`；
   `ModelEventSink` 必须保持同步 `fn`；`ModelError` **非 `#[non_exhaustive]`**，加变体是 breaking；
   方言归适配器、词汇归 `ys-model`。
 - **同类软件佐证**（[`../arch/long-horizon-completion/research.md`](../arch/long-horizon-completion/research.md)
@@ -86,7 +86,9 @@ accepted（2026-10-08；同类软件调研增补 2026-10-09）
 
 ### 4. 有界退避
 
-- 指数退避 + 抖动，**次数与上限可配**；建议 **base 500 ms、×2、cap 30 s、最大 5 次**（总等待 ≤ ~60 s）。
+- 指数退避 + 抖动，**次数与上限可配**；建议 **base 500 ms、×2、cap 30 s、最大 5 次**。
+  单次退避以 `max_delay_ms` 为**硬上限**；总等待最坏 = `max_attempts × max_delay_ms` = 5 × 30 s = **150 s**
+  （每次 `Retry-After` 都取到上限时），纯指数路径实际 ≈ ≤ 20 s。
 - `429` 带 `Retry-After` / `Retry-After-ms` 时**尊重它**，但**以 `max_delay_ms`（默认同 cap）为硬上限**：
   **服务端要求的等待超过上限 ⇒ 放弃重试、立即上报**（错误消息带上服务端要求的秒数）。
   **不取「与上界取 max」** —— 那等于允许服务端让本仓**无界地等下去**，与「必须有界」自相矛盾，
@@ -94,7 +96,8 @@ accepted（2026-10-08；同类软件调研增补 2026-10-09）
 - **必须有界**：无界重试会把「provider 长期不可用」变成「永久占用会话」。
 - **退避不可中止（如实记账）**：`Model::complete`（`crates/ys-model/src/trait_def.rs:12`）**没有取消入参**，
   `Boundary::Abort` 只在轮边界被读 ⇒ **退避睡眠期间 Ctrl+C 无效**。传入取消源要改核心 trait（违反零破坏面），
-  故本轮不做；可行的界是「总退避 ≤ ~60 s + 每次尝试由流空闲超时包住」⇒ 不可中断时长**有界**。
+  故本轮不做；可行的界是「总退避最坏 = `max_attempts × max_delay_ms` = 5 × 30 s = 150 s
+  （单次以 `max_delay_ms` 为硬上限）+ 每次尝试由流空闲超时包住」⇒ 不可中断时长**有界**。
 
 ### 5. 超时用两个旋钮，不用单一总超时
 
@@ -150,7 +153,7 @@ accepted（2026-10-08；同类软件调研增补 2026-10-09）
 - **48h 任务的抗抖动能力**从 0 变为「有界重试」；一次 429/网络抖动不再毁掉整个回合。
 - **`-p` / `--json` 同样受益**（重试在适配器内，与驱动路径无关）。
 - **TUI 黑洞挂起不再是无限**：空闲超时让 `complete` 必然返回 ⇒ `RunFailed` ⇒ `is_turning` 复位（此前需 Ctrl-D 强退）。
-- **重试治「抖动」不治「停服」（如实）**：有界退避总等待 ≤ ~60 s ⇒ **超过约一分钟的 provider 故障仍会终止回合**。
+- **重试治「抖动」不治「停服」（如实）**：有界退避总等待最坏 = `max_attempts × max_delay_ms` = 150 s ⇒ **超过约两分半的 provider 故障仍会终止回合**。
   这是必要的界（无界重试会把「长期不可用」变成「永久占用会话」），但**不得**把 48h 无人值守理解成已能容忍长时间停服。
 - **额度耗尽不再退避**：命中额度名单的 `429` 立即失败 ⇒ 48h 任务不会在账户欠费后在退避里空转，`RunFailed` 更快到达。
 - **重试对排障可见、对 TUI 不可见**（决策 7）：一行 `logging`；不进事件流。
@@ -162,3 +165,22 @@ accepted（2026-10-08；同类软件调研增补 2026-10-09）
 - 上位设计：[`../arch/long-horizon-completion/design.md`](../arch/long-horizon-completion/design.md) §4.8；
   需求上下文：[`../arch/long-horizon-completion/context.md`](../arch/long-horizon-completion/context.md)；
   被 supersede 的原始范围界定：[`../arch/llm-api-unavailable/context.md`](../arch/llm-api-unavailable/context.md) §范围外。
+
+## As-built 注记（2026-10-09）
+
+实际落点（符号 → 文件）：
+
+- **构造面**：`adapters/model-openai-compatible/src/lib.rs` 的 `RetryConfig` / `TimeoutConfig` + builder `with_retry` / `with_timeouts` / `with_logger`（`with_timeouts` 只在 client 自建时按新值重建，`with_client` 注入的 client 连接策略归调用方）。生产路径在 `apps/coding-agent/src/main.rs` 的 model factory 里显式 `with_retry` / `with_timeouts` / `with_logger(Arc::new(|msg| crate::logging::log(msg)))`；取数口为 `Config::model_retry()` / `Config::model_timeout()`（`config.rs`）。
+- **重试循环**：`lib.rs::complete` 的 `for attempt in 0..=max_attempts`（`max_attempts` 是**额外**次数，总尝试 = max_attempts + 1）；单次尝试体为 `attempt`。
+- **可重试判定**：`AttemptError::{Retryable, Fatal}`、额度名单常量 `QUOTA_MARKERS`、三级判定 `classify_error_response`（`x-should-retry` 头 → 额度否决 → 状态码）；流侧 `classify_stream_error` + `retryable_transport_error`。
+- **有界退避**：`backoff_delay` / `backoff_delay_with_fraction`（指数 + 抖动，先抖后夹到 `max_delay_ms`）；`parse_retry_after` 尊重 `Retry-After`，超 `max_delay_ms` 硬上限即放弃。
+- **delta 护栏**：`DeltaWatchingSink`（只看 `TextDelta` / `ThinkingDelta`，吐过即 `.emitted = true`，其后不重试）。
+- **空闲超时**：`stream.rs::parse_sse_stream` 的 `tokio::time::timeout(idle, stream.next())` 包住每次字节读取，超时错误带 `IDLE_TIMEOUT_MARKER`；连接超时经 `build_client` 的 `connect_timeout`。
+
+新增测试：`adapters/model-openai-compatible/tests/retry.rs`（15，回环 TCP）：空闲超时上报 / `429` 后成功 / `x-should-retry` 双向定论 / 额度否决 / `Retry-After` 超硬上限放弃 / 吐 delta（含 thinking）后不重 / 确定性 4xx 不重 / 重试日志可见 / 两组默认常数 pinned / `max_attempts = 0` / 注入 client 保超时。
+
+### 债务
+
+- **A. 未校准初值**（用户裁定跳过 prototype、按设计初值实现并记账；本环境无模型凭证）：`model_timeout = { connect_secs: 15, idle_secs: 120 }`、`model_retry = { max_attempts: 5, base_delay_ms: 500, max_delay_ms: 30_000 }`。
+- **B. 设计层缺口 —— 退避不可中止**：`Model::complete` 无取消入参 ⇒ 退避期间 Ctrl+C 无效（决策 4 末条；改核心 trait 才治）。有界退避总等待最坏 = `max_attempts × max_delay_ms` = 150 s，故**超过约两分半的 provider 故障仍终止回合**（决策后 Consequences 已如实记账）。
+- **C. 空闲超时是「在途模型调用」的唯一界**：`Boundary::Abort` 只在轮边界被读，模型调用在 Step 6；调用不返回时预算的 `Abort` 不被观察，该调用实际由 `stream.rs` 的空闲超时（默认 120s）界住。详见 `docs/design-final/coding-agent-tui.md` §12。

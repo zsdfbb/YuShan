@@ -41,6 +41,12 @@ pub struct App {
     pub turn_started_at: Option<Instant>,
     /// Working 动画相位（0..WORKING_DOTS）。
     pub working_dot: u8,
+    /// assistant 渲染产物缓存 + 流式节流状态（设计 §2.5）。
+    ///
+    /// `RefCell`：`draw.rs` 的 `build_text_with` / `total_rows` 走 `&App`，而缓存需要
+    /// 可变访问；UI 侧单线程、无重入 ⇒ 单借用、无竞态（不变量 5）。缓存是**纯 memo**，
+    /// 清空只损失 CPU、绝不改变输出。
+    pub(crate) md_cache: std::cell::RefCell<crate::cache::RenderCache>,
     /// `ToolCallId` → transcript 下标 —— 工具结果据此回填到对应的 Tool 行。
     pub(crate) tool_index: HashMap<ToolCallId, usize>,
     /// 本地回显抑制计数：提交时已本地 push 的那条 `UserMessage`，
@@ -80,6 +86,7 @@ impl App {
             should_quit: false,
             turn_started_at: None,
             working_dot: 0,
+            md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
             pending_echo_texts: VecDeque::new(),
@@ -282,6 +289,18 @@ impl App {
     /// （循环按「工具执行 → 汇总结果 → 收尾」的顺序发事件）。留着它只会跨回合
     /// 单调增长（每回合若干 `ToolCallId` + `String`）。
     fn finish_turn(&mut self) {
+        // 该回合最后一条 assistant 到此定型：标记其缓存槽位「结束」，令下一次取用忽略节流、
+        // 做一次完整渲染 —— 否则节流窗口内最后一段增量会永久停留不显示（设计 §2.5 边界 ②）。
+        //
+        // **只在回合结算调一次**：`finish` 置 `forced`，而 `lines_for` 重算后会清掉它；
+        // 每帧调用等于「每条 assistant 每帧整条重解析」，缓存完全失效。
+        if let Some(idx) = self
+            .transcript
+            .iter()
+            .rposition(|l| matches!(l, TranscriptLine::Assistant(_)))
+        {
+            self.md_cache.borrow_mut().finish(idx);
+        }
         self.is_turning = false;
         self.turn_started_at = None;
         self.suppress_user_echo = 0;

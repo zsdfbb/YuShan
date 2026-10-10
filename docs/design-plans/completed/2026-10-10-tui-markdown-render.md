@@ -62,7 +62,8 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)        ap
         └─ Assistant(s) ⇒ cache.lines_for(i, s, inner_w, styles, now)
                             └─ 未命中 ⇒ md::render(s, inner_w, styles)
         └─ Paragraph::new(text).wrap(Wrap{trim:false}).scroll(..)     draw.rs:124-128
-   total_rows → Paragraph::line_count(inner_w)                        draw.rs:102-106
+   （滚动数学：draw_transcript 内对同一份 text 取 Paragraph::line_count(inner_w)；
+     total_rows 只服务事件路径 App::compute_max_scroll，不在帧内调用）
 ```
 
 **宽度传递注意**：库的 `table_width` 语义是「该表格可用的总列数（含边框、内边距、外层列表/引用前缀）」
@@ -132,9 +133,11 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)        ap
 - **优先级**: 必测
 - **验收人**: review subagent
 
-#### N5: 表格窄屏守卫：无超宽行
-- **验收方法**: 单测 —— 宽度 `1..=80` × 若干表格，断言 `md::render` 产出的每行 `Line::width() <= w`
-  （越界时已退回 raw，同样须满足）
+#### N5: 表格窄屏守卫：无超宽行（**越界判定只作用于表格行**）
+- **验收方法**: 单测 —— 宽度 `1..=80` × 若干表格，断言 `md::render` 产出中**含表格框线字符的行**
+  （`│┌┬┐├┼┤└┴┘`）满足 `Line::width() <= w`；越界时该条已退回 raw。
+  **同时**钉住反面：一段长于 `w` 的**正文**必须**保住 Markdown 样式**（不得被守卫退成 raw）——
+  库 `Options::table_width` 明言只 wrap 表格、其余块交给消费方折行，若判定放宽回「任意行」此用例即红。
 - **优先级**: 必测
 - **验收人**: review subagent
 
@@ -163,7 +166,7 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)        ap
 - **验收人**: review subagent
 
 #### N10: release 体积增量 < +500KB
-- **验收方法**: `cargo build --release` 前后比字节数（基线 ~5.7MB）
+- **验收方法**: `cargo build --release -p ys-coding-agent` 前后比字节数（实测 +453,120 B ≈ 442.5 KiB < 500 KiB；基线 7,747,024 B → 8,200,144 B）
 - **优先级**: 可推迟
 - **验收人**: review subagent
 
@@ -181,6 +184,7 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)        ap
 | M3 | 漏覆写一个 `StyleSheet` 方法 | 默认色泄漏用例（N3）|
 | M4 | `Borders::TOP` 后把内区改回 `saturating_sub(2)` | 贴底 / 滚动上限用例（N4）|
 | M5 | 摘掉节流，改回逐 delta 重渲染 | 「窗口内调用次数 ≤ 11」与「条末完整渲染」用例（N7）|
+| M6 | **把守卫的表格行判定放宽回「任意行」** | 「长段正文保住 Markdown 样式」用例（N5 反面）|
 
 ### 测试框架与命令
 

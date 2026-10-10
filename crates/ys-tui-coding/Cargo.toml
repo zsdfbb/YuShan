@@ -22,5 +22,11 @@ serde_json = "1"
 # 只保留 crossterm 后端与 line_count 所需的 unstable-rendered-line-info。
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
+# assistant 文本的 Markdown 渲染（设计 §2.1）。库把解析 / 表格列宽分配 / 折行 / CJK 宽度
+# 合成一次 `from_str_with_options` 调用，本仓侧只剩 style sheet + owned 转换 + 缓存胶水。
+# default-features = false：关掉 `highlight-code` ⇒ `syntect` / `ansi-to-tui` / `onig`（C 库）
+# 全不进入依赖树（本仓不做语法高亮）。库依赖 `ratatui-core 0.1`，与 `ratatui 0.30` 的
+# `Text` / `Style` 是同一类型（`Cargo.lock` 只有一条 `ratatui-core`），故类型可互传。
+tui-markdown = { version = "0.3.10", default-features = false }
 # UI 线程本身不跑 async；tokio 只提供 mpsc 类型（与 app 线程的信道契约）。
 tokio = { version = "1", default-features = false, features = ["sync"] }

@@ -203,11 +203,18 @@ impl QueueBoundarySource {
 
 | pane | 约束 | 说明 |
 |---|---|---|
-| **Chat** | `Constraint::Min(3)` | 唯一可滚动区域；滚动以 **wrap 后的视觉行**为单位 |
-| **Input** | `Constraint::Length(1..=5)` | 高度随内容自适应（`INPUT_MAX_LINES = 5`） |
+| **Chat** | `Constraint::Min(3)` | 唯一可滚动区域；滚动以 **wrap 后的视觉行**为单位；窗格**只留顶部标题线**（见下） |
+| **Input** | `Constraint::Length(1..=5)` | 高度随内容自适应（`INPUT_MAX_LINES = 5`）；窗格**四边带框**（有意保留） |
 | **Status** | `Constraint::Length(1)` | **最底**，常驻一行 |
 
 补全浮层 / 模态选择器**独立于三 pane**：`Clear` 后盖在 Chat 区域上，不参与布局高度计算。
+
+**Chat 窗格几何（拷贝友好）**：Chat 外框为 `Block::new().borders(Borders::TOP)`（只留顶部标题线）
+—— 终端原生选择不再把窗格竖线拷进剪贴板。内区因此为「宽 `w` / 高 `h-1`」，且**统一取自同一个
+`chat_block()` 实例的 `inner(area)`**（`max_scroll_offset` 与 `draw_transcript` 共用同一构造，
+杜绝散落的手写 `saturating_sub(2)` 漂移 —— `inner_h` 漏改是合法 `usize` 减法、编译器不抓）。
+**Input 窗格仍是 `Block::bordered()`（有意保留，只有 Chat 去边框）**；表格**保留方框线**
+（有意接受的例外）。详见 §14.4。
 
 **对话区**：`TranscriptLine` 是**结构化**的（`User` / `Assistant` / `Thinking` / `Tool{id,name,summary,result,success}` /
 `Summary{rounds,stop,elapsed_secs}` / `Error` / `System`）—— 工具调用压一行渲染，摘要由
@@ -231,6 +238,8 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 
 **退出**：无条件恢复终端 —— 把完整对话按当前宽度 wrap 后逐行写回**主屏 scrollback**，再离开
 alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinking 遵守 `thinking_visible`（默认隐藏，`/thinking on` 后退出可见）。
+**assistant 行的回放走 raw 路径**（按 `\n` 原样切行、不经 md 渲染 + 缓存）⇒ 主屏 scrollback 里留
+**原始 markdown 源**（可复制、可搜索、可 grep），折行交给终端；其余变体行为不变（详见 §14.6）。
 
 > **回放不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到**进入 alt-screen 时**
 > 的位置 —— 也就是本 app 自己那段启动输出的下一行。回放从那里往下写即可。**不得** `MoveTo(0, 0)`：
@@ -335,6 +344,8 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
 | D10 | review R2「倾向」在 `Outbound` 加 `Diagnostic { level, text }` | **未采纳** —— 采纳 design §6「没有 `Diagnostic` 变体」 | 命令期诊断走 `Output`、库内部走日志文件，通用变体无消费者 |
 | D11 | 本篇未写（会话默认新会话特性落地后补） | 初始化顺序：`--resume` 解析 + `pick`/`resolve` 与**读回 meta** 必须排在**模型解析之前**（meta 参与模型选择），且都在建 runtime / 起屏之前（picker 输出走 stderr） | 见 `docs/design-final/session-default-new.md`；ADR-0026 |
+| D12 | md 渲染设计 §2.6 / 不变量 3：「量一遍产出行的显示宽度，**任一行** > `inner_w` 即令该条退回 raw 文本」 | 越界判定**只作用于表格行**（行内含框线字符 `│┌┬┐├┼┤└┴┘` 之一即视为表格行；**不含 `─`** —— 分隔线 `---` 是普通连字符） | 库的 `Options::table_width` **只 wrap 表格单元格、不 wrap 正文**（`options.rs:104-108`；`table_width` 全库仅 `renderer/mod.rs:91` 一处消费）⇒ 按「任一行」判会让任何长于窗宽的正文段落把整条回答退成纯文本，**特性静默失效** |
+| D13 | md 渲染设计 §2.4：「`build_text` 每帧被调 2 次（`max_scroll_offset` 一次 + `draw_transcript` 一次）」 | 帧路径 `build_text` **每帧只被调 1 次**（`draw_transcript` 内），其后的 `line_count` 与它基于**同一份**产物 | `ui` 顶部取一次 `now` 只传给它下面的绘制链；`total_rows` / `max_scroll_offset` **只服务事件路径**（↑↓ 滚动 / resize 夹取 `scroll_offset`），不在帧内调用 |
 
 ### 8.2 design.md 未写、实现时补的微决策
 
@@ -351,6 +362,11 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M8 | **`export` 为同步 `std::fs::copy`**：会话是本地小文件；把一个非 `Sync` 的 `&Wiring` 借进 app 循环的 future 跨 `await` 会让整个循环不再 `Send`、无法 `spawn` | `capabilities::export` |
 | M10 | **`/skills` 命令（skills 特性落地后补）**：TUI 浮层列全部 skill（`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的**——与 `/` 浮层同一条规则），选中后**回填输入框** `/<command> `（尾随空格）而**不发 `Request`**：skill 常带参数（`/git-status --short`），用户补完再回车；`-p` / `--json` 无 TUI，不涉及此路。为此 `resolve_prompt` 的返回类型由 `Result<Request, _>` 改为 **`Result<PromptOutcome, _>`**（`PromptOutcome::Request` \| `PromptOutcome::Prefill(String)`），`run_prompt` 据此分支「发送」或「回填输入框」。选项文本与 `/` 补全**共用** `completion::skill_label` —— `Prompter::select` 只回传**显示串**，反解回 `command` 靠的就是这条格式（**故它是承重的**） | `ys-tui-coding/src/{commands,prompter,run,completion}.rs` |
 | M11 | **`/new` 惰性不预建会话文件**：默认新会话 + 显式 `--resume` 落地后 `latest_session_path` 已删，「预建空文件以免重启选回旧文件」的旧理由失效 —— `/new` 只换 `session` 句柄，新文件首次 `append` 才落盘（旧文件保留） | `apps/coding-agent/src/{wiring,capabilities}.rs`；见 `docs/design-final/session-default-new.md` |
+| M12 | **`chat_block() -> Block<'static>`**：Chat 内区统一取自同一 `Block` 实例的 `inner(area)` —— `max_scroll_offset_at` 与 `draw_transcript` 共用同一构造，杜绝各处手写 `saturating_sub(2)` 漂移（`inner_h` 漏改是合法 `usize` 减法、编译器不抓） | `ys-tui-coding/src/draw.rs` |
+| M13 | **表格行判定 `is_table_line`**：行内含 `│┌┬┐├┼┤└┴┘` 任一即视为表格行（**不含 `─`**）；raw 路径按 `\n` **原样切行、无样式、不预折行**（正文折行归消费方 `Paragraph`，预折行会把单词 / URL 从中间截断）。`tui_markdown::` 路径**只出现在** `md.rs` 与 `styles.rs`（可 grep 断言） | `ys-tui-coding/src/md.rs` |
+| M14 | **缓存 + 节流状态落在 `RenderCache` 内**：键 `(槽下标, src.len(), width)`；`now: Instant` **由调用方注入**（缓存内不调 `Instant::now()`，否则无法确定性单测）；`RENDER_THROTTLE = 100ms`；单条 > `MAX_CACHED_SRC`(256 KiB) 渲染进 `scratch` 暂存并返回、**不写 slot**（真的不入缓存）；`finish(idx)` 由 `App::finish_turn` 调用，而 `finish_turn` **只在 `RunFinished` / `RunFailed` 两个分支**被调 —— **不是每帧**（每帧调会让每条消息每帧整条重解析，缓存完全失效） | `ys-tui-coding/src/{cache,app}.rs` |
+| M15 | **panic hook 的 `panic_hook_body<T>(restore, delegate, info)` 泛型化**：泛型 `T` 是为**可单测**（`PanicHookInfo` 无法在测试里构造，单测传一个假 `T` 即可断言「先恢复、后 delegate」）；`restore_sequence()` 由 `exit_payload`（正常退出）与 panic hook **共用**（四条命令各改一个互不相干的模式位；唯一先后约束是「退 alt-screen 必须在回放段之前」—— 回放落点靠 `?1049l` 恢复） | `ys-tui-coding/src/run.rs` |
+| M16 | **绘制路径不得 panic**：`push_non_assistant` 的 `Assistant` 分支从 `unreachable!()` 改为**降级为 raw** + `debug_assert!(false, …)`（测试期大声、生产期降级）—— 绘制 panic 会把终端留在 raw mode（§14.7）。该分支正常不可达（两个调用点都提前分流 Assistant） | `ys-tui-coding/src/draw.rs` |
 
 ---
 
@@ -371,7 +387,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | 落点 | 条数 | 覆盖 |
 |---|---|---|
 | `crates/ys-protocol` | 28 | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
-| `crates/ys-tui-coding` | 200（**当前值**；路线 B 当时为 166，其后 skills 特性与本表下方的 `/skills` 陆续补入） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消） |
+| `crates/ys-tui-coding` | 242（**当前值**） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消）；**本轮 md 渲染 +30**（逐项见 §9.4） |
 | `crates/ys-runtime/tests/run_turn_boundary.rs` | 5 | `run_turn` + `AgentPorts` 带 `BoundarySource` 的轮边界语义（跨 crate，不反向依赖 app） |
 | `apps/coding-agent/src/app_loop.rs` | 2 | Prompt → 事件（turn 从 1）→ View；`NewSession` → Output + 刷新快照；**残留 `Abort` 被空闲期丢弃**（变异测试钉住） |
 | `apps/coding-agent/src/capabilities.rs` | 13 | `/login`（成功 / 未知 provider / custom 无 base / 回退）、`/logout`、`/model`（成功 / 缺凭证置空）、`/new`、`/compact`、`/export`（含**自拷贝护栏**变异测试） |
@@ -388,6 +404,34 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 - `/skills` 选中改回「直接发 `Request::Prompt`」→ `test_pick_skill_prefills_slash_command_with_trailing_space` 变红（它断言的是 `PromptOutcome::Prefill`）。
 - `/skills` 候选取消 `selectable_skills` 的内置遮蔽过滤 → `test_pick_skill_excludes_skill_shadowed_by_builtin_command` 变红。
 
+### 9.4 本轮 md 渲染：新增用例（+30）与变异
+
+**新增 30 条单测全部落在 `ys-tui-coding` lib**（其它 crate 用例数不变）：212 → 242；
+workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `cache.rs` 中
+`RenderCache::lines_for` 的文档测试）。
+
+| 模块（新/改） | 条数 | 用例 |
+|---|---|---|
+| `cache.rs`（**新**） | 9 | `pure_memo_rerender_is_identical` / `same_key_within_window_reuses` / `len_change_forces_rerender_after_window` / `width_change_forces_rerender` / `different_idx_are_independent_slots` / `sync_len_growth_finishes_previous_line` / `explicit_finish_forces_rerender` / `oversized_src_is_not_cached` / `n7_streaming_throttle_bounds_calls_and_finishes_complete` |
+| `md.rs`（**新**） | 11 | `n3_heading_levels_…` / `n3_bold_italic_inline_code_link` / `n3_blockquote_list_fenced_code_table` / `n3_no_default_palette_leak` / `n5_table_never_exceeds_width` / `n6_non_table_has_no_vertical_border` / `edge_inputs_do_not_panic_and_table_stays_within_width` / `empty_input_yields_no_overwide_lines` / `long_plain_line_is_not_prewrapped` / `narrow_width_long_prose_keeps_markdown_styles` / `narrow_table_falls_back_to_raw` |
+| `styles.rs`（**新**） | 2 | `overrides_do_not_match_default_palette` / `chosen_shapes_are_as_designed` |
+| `draw.rs`（**改**） | 6 | `n4_line_count_equals_per_line_accumulation` / `n6_chat_inner_has_no_vertical_border_for_non_table_md` / `n8_plain_lines_contain_raw_markdown` / `geometry_top_border_inner_is_h_minus_1_by_w` / `geometry_follow_keeps_last_line_and_scroll_matches_line_count` / `throttle_consistency_scroll_and_draw_share_product` |
+| `run.rs`（**改**） | 2 | `restore_sequence_contains_terminal_state_restore` / `panic_hook_body_restores_then_delegates` |
+
+**变异义务（六条 + U3 的 panic hook 变异）—— 全部演示「注入 bug ⇒ 用例变红」**：
+
+- **M1** 关掉表格窄屏守卫（`if false && …`）→ **2 条**用例变红：`n5_table_never_exceeds_width`
+  与 `narrow_table_falls_back_to_raw`。
+- **M2** 让缓存永不失效 / 命中键去掉 `width` → `width_change_forces_rerender` 变红。
+- **M3** 漏覆写一个 `StyleSheet` 方法（删 `fn link`）→ **3 条**用例变红：`overrides_do_not_match_default_palette`、
+  `n3_bold_italic_inline_code_link`、`n3_no_default_palette_leak`。
+- **M4** 内区改回 `saturating_sub(2)` / `h-2` → **3 条**用例变红：`geometry_follow_keeps_last_line_and_scroll_matches_line_count`、
+  `test_scroll_uses_wrapped_rows_not_transcript_entries`、`throttle_consistency_scroll_and_draw_share_product`。
+- **M5** 摘掉节流、改回逐 delta 重渲染 → `n7_streaming_throttle_bounds_calls_and_finishes_complete` 变红。
+- **M6** 把守卫判定放宽回「任意行」（去掉 `is_table_line`）→ `narrow_width_long_prose_keeps_markdown_styles` 变红。
+- **U3 的 panic hook 变异 A–D**（先 delegate 后 restore / 删 `LeaveAlternateScreen` / 删 `restore()` / 删 `delegate()`）
+  均变红；**变异 G**（删 `restore_sequence()` 的 `PopKeyboardEnhancementFlags`）在补断言后由「存活」转为被捕获。
+
 ---
 
 ## 10. 已知缺口（诚实清单）
@@ -402,6 +446,38 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 - `ys-tui-coding` 的模态浮层与补全浮层共享 `Clear` 后覆盖渲染，未做统一的 `Overlay` 抽象
   （design §1 注允许二选一）。
 - **长程完成（ADR-0027 / 0028）本轮的债务**（未校准初值 / 设计层缺口 / 复核层残余）见 §12。
+
+**md 渲染（§14）的诚实清单**：
+
+- **字面 `│`(U+2502) 会被误判为表格行**：正文里若出现字面 `│` 且该行超窗宽，会整条退 raw ——
+  **设计有意接受**（代价极低；ASCII `|` 不触发）。
+- **「整条退」的粒度**：文档里只要含**一张窄表**（渲染后某表格行超窗宽），**整条消息（含其中正文）**
+  都退 raw（设计即「整条退」，不做逐行降级）。
+- **缓存命中时每帧仍 clone 一遍** `Vec<Line>`：100 KiB 量级约 0.3–0.6 MB/帧（设计明写「缓存省的是解析、
+  不是拷贝」）。
+- **`n6_non_table_has_no_vertical_border`（`md.rs` 层）近乎恒真**：库唯一产 `│` 处是表格渲染，故该断言
+  对非表文档天然成立；真判据在 draw 层集成版 `n6_chat_inner_has_no_vertical_border_for_non_table_md`。
+- **7 个 `StyleSheet` 方法本仓配色与默认相同**（`table_cell` / `definition_description` / `alert_label` 等）⇒
+  「默认色泄漏」在它们身上**不可观测**（漏写也不产生差异）—— 已在测试注释与文档中标注，**未假装覆盖**。
+- **panic hook 里 `disable_raw_mode()` / `Show` 无字节断言**（系统调用 / 无字节）⇒ 归**代码走查**；
+  单测只覆盖恢复序列的字节与「先恢复、后 delegate」的顺序。
+- **已知库缺陷（`tui-markdown` 0.3.10 实测）**：**4 空格缩进式**代码块会把多行内容**合并成一行**
+  （围栏式不受影响）。
+- **resize 后该帧全量重算**（库把解析与表格布局合在一次调用里，无法只重排表格）—— 一次性抖动；
+  库自述 experimental PoC、0.3.x API 未冻结 ⇒ 库被**隔离在 `md.rs` 这层薄胶水**（将来可换）。
+- **panic hook 写的是 `stdout`，而 std 的 stdout 是 `ReentrantLock`**：若 panic 恰好发生在当前线程
+  **已持有 stdout 锁**的时刻，hook 内的写会触发「cannot recursively lock stdout」而**二次 panic ⇒ abort**。
+  实际绘制路径下该窗口很窄 —— `draw::ui` 的闭包在 ratatui 缓冲阶段执行，那时 stdout **未加锁**，
+  故 markdown 解析 panic 这条主线不受影响；只有 std/crossterm 内部在 `write_fmt` 里 panic 才可能命中。
+  彻底消除须改为直写 `/dev/tty`（引入平台分支），当前**接受**此残余。
+
+**MANUAL_ACK_REQUIRED（须由用户勾选）**：
+
+- [ ] 在真实终端喂一条 ≥100 KiB 的长回答（含表格），确认滚动与输入无可感卡顿（N11）
+- [ ] 确认 Chat 窗格去掉左右边框后的观感、以及表格极窄时退回 raw 的画面可接受
+
+**未能机器验证的清单**：panic hook 的真终端恢复路径本身（`disable_raw_mode()` / 转义序列是否真的复位终端）、
+N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式代码块合并多行」在真实输出中的表现。
 
 ---
 
@@ -536,3 +612,98 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 - 并行子 agent 的**写冲突无人管**（本仓无 branch/worktree、无沙箱），只能靠 guideline「写目标不相交」。
 - 每回合派发总量上限（`DEFAULT_MAX_DISPATCHES_PER_TURN = 16`）是**仅剩的代码级成本防线**：`max_rounds` 默认已放宽到 `u32::MAX`，且子取同一份 `Config`（子自身无独立上界）。
 - ⚠️ **`--json` 的 `RunFinished.usage` 不含子 agent usage**：子 usage 是在 app 侧、回合**结束后**追加进 `RunResult.usage` 的（`merge` 点在 `app_loop::run_turn_once` / `main::run_single_turn`），而 `RunFinished` 由 `BasicLoop` 在回合内发出 ⇒ **事件流里的 usage 只算父**。TUI 的状态行（`TurnStats`）与 `-p` 的 meta 走的是合并后的 `RunResult.usage`，**是正确总数**。⇒ 脚本消费者若要精确总成本，需自行减去或改用 meta；这是「循环拥有 `RunFinished`」这一结构的直接代价，记在此处。
+
+---
+
+## 14. assistant 文本 Markdown 渲染 — as-built
+
+形态决策见 [ADR-0030](../adr/0030-tui-markdown-render.md)（accepted）；设计与风险见
+`docs/arch/tui-markdown-render/design.md`。本节只记**实际形态**（「实现 ≠ 设计原文」的两条已入 §8.1 D12 / D13，
+微决策入 §8.2 M12–M16）。
+
+### 14.1 依赖与渲染管线
+
+- **依赖**：`tui-markdown = { version = "0.3.10", default-features = false }` —— 关掉 `highlight-code`
+  ⇒ `syntect` / `ansi-to-tui` / `onig`（C 库）**全不进入**依赖树。前置已升级 `ratatui 0.30` + `crossterm 0.29`
+  （否则库的 `ratatui-core 0.1.2` 与本仓 `Text` 是**不同类型、不可互传**）。
+- **管线**：`Assistant(src)` → `md::render(src, inner_w, AssistantStyles) -> Vec<Line<'static>>`
+  → `Paragraph::new(..).wrap(Wrap { trim: false })`。
+- `md.rs` 是库的**唯一调用点**：把库返回的 `Text<'a>` 收成 owned `Vec<Line<'static>>`（缓存需要 owned），
+  保留 `Line::style` 与 `Line::alignment`（库会写这两者）。
+- `styles.rs`：`impl tui_markdown::StyleSheet`，**23 个方法逐一覆写** —— `DefaultStyleSheet` 自带主观配色，
+  漏写会把默认色漏进来。粗体 / 斜体由库硬编码为纯修饰符、**不可配色**，本仓本就要 Strong=BOLD / Emphasis=ITALIC（无颜色）。
+- `tui_markdown::` 路径**只出现在** `md.rs` 与 `styles.rs`（可 grep 断言；库成熟度风险的缓解）。
+
+### 14.2 表格窄屏守卫（只作用于表格行）
+
+- 库的 `Options::table_width` **只 wrap 表格单元格、不 wrap 正文**（`options.rs:104-108`；`table_width`
+  全库仅 `renderer/mod.rs:91` 一处消费）⇒ 长于窗宽的正文段落本身就是一条超宽行。
+- **当前实现**：越界判定**只作用于表格行** —— 行内含框线字符 `│┌┬┐├┼┤└┴┘` 之一即视为表格行
+  （**不含 `─`** —— 分隔线 `---` 是普通连字符）；命中则**整条**退回 raw。
+- **raw 路径**：按 `\n` 原样切行、无样式、**不预折行**（正文折行归消费方 `Paragraph`；预折行会把单词 / URL
+  从中间截断）。
+- 反之：若按「任一行超宽即退 raw」判，任何长于窗宽的正文段落都会把整条回答退成纯文本 ⇒ 特性静默失效
+  （§8 D12）。
+
+### 14.3 缓存与流式节流
+
+- `App.md_cache: RefCell<RenderCache>`；键 `(槽下标, src.len(), width)`；**只覆盖 `Assistant` 槽位**
+  （其余变体每帧现算，O(1) 格式化、不解析）。
+- `RENDER_THROTTLE = 100ms`；`now: Instant` **由调用方注入**（缓存内不调 `Instant::now()`，否则无法确定性单测）。
+  正在增长的那条：距上次渲染 < 100ms 时沿用上次产物，到点或该条结束时重算。
+- 节流状态**存在 `RenderCache` 内** ⇒ 滚动数学（事件路径）与画面（帧路径）读到**同一份**上次产物；
+  两路径一致性**不靠共用时钟**。
+- 单条 > 256 KiB（`MAX_CACHED_SRC`）：渲染进 `scratch` 暂存并返回，**不写 slot**（真的不入缓存，退化每帧现算）。
+- `finish(idx)` 由 `App::finish_turn` 调用，而 `finish_turn` **只在 `RunFinished` / `RunFailed` 两个分支**被调
+  —— **不是每帧**（每帧调会让每条消息每帧整条重解析，缓存完全失效）。
+- **借用纪律**：`lines_for` 返回切片绑在 `RefMut` 守卫上，须在守卫内 clone 进目标，不得带出、不得重入 `borrow_mut`。
+
+### 14.4 几何改道（拷贝友好）
+
+- Chat 窗格 `Block::bordered()` → `Block::new().borders(Borders::TOP)`（**只留顶部标题线**）——
+  终端原生选择不会再把窗格竖线拷进剪贴板。
+- 内区**统一取自同一个 `Block` 实例**：`fn chat_block() -> Block<'static>` 的 `inner(area)`
+  （`max_scroll_offset_at` 与 `draw_transcript` 共用）—— 各处不再手写 `saturating_sub(2)`；
+  `inner_h` 漏改是合法 `usize` 减法、**编译器不抓**。
+- **Input 窗格仍是 `Block::bordered()`**（有意保留，只有 Chat 去边框）。
+- 表格**保留方框线**（有意接受的例外：框线即可读性）。
+
+### 14.5 帧时钟
+
+- `ui` 顶部取一次 `now`，传给它下面的绘制链。**帧内 `build_text` 只被调 1 次**（`draw_transcript` 内），
+  其后的 `line_count` 与它基于**同一份**产物。
+- `total_rows` / `draw::max_scroll_offset` **只服务事件路径**（`App::compute_max_scroll` ← ↑↓ 滚动 / resize
+  夹取 `scroll_offset`），该路径**自取** `Instant::now()`。
+
+### 14.6 回放走 raw
+
+- `transcript_plain_lines` 的 `Assistant` 分支走 raw 路径：按 `\n` 原样切行、无样式、不经缓存
+  ⇒ 退出后主屏 scrollback 留**原始 markdown 源**（可复制、可搜索）。其他变体行为不变。
+- `/copy` 本就读原始串，未改。
+
+### 14.7 panic 边界
+
+- **动机**：`run()` 在 `event_loop` panic 时会**跳过** `restore_terminal`，终端会留在 raw mode / alt-screen；
+  而模型输出是**不可信输入**、且被喂给自述 PoC 的第三方解析器。
+- `fn restore_sequence() -> String`：`EnableLineWrap` → `LeaveAlternateScreen` → `DisableBracketedPaste`
+  → `PopKeyboardEnhancementFlags` 的字节序列，由 `exit_payload` 与 panic hook **共用**。（四条各改互不相干的
+  模式位；唯一先后约束是「退 alt-screen 必须在回放段之前」—— 回放落点靠 `?1049l` 恢复。）
+- `install_panic_hook()` 在 `run()` **入口**（`setup_terminal()` **之前**）调用；先 `take_hook()` 取上游默认 hook，
+  再 `set_hook`，hook 体最后调用它 ⇒ 保留默认的 panic 信息打印与 unwind 语义。
+- `fn panic_hook_body<T>(restore: impl FnOnce(), delegate: &(dyn Fn(&T) + Sync), info: &T)`：先恢复再 delegate。
+  泛型 `T` 是为**可单测**（`PanicHookInfo` 无法在测试里构造）。
+- `restore_terminal_on_panic()`：写 `restore_sequence()` → flush → `disable_raw_mode()` → `execute!(out, Show)`，
+  **每步吞 IO 错误、绝不二次 panic**；**不** `process::exit`；**不**用 `catch_unwind` 续跑（panic 后状态不保证一致）。
+- 绘制路径**不得 panic**：`push_non_assistant` 的 `Assistant` 分支已从 `unreachable!()` 改为**降级为 raw**
+  + `debug_assert!(false, …)`（测试期大声、生产期降级）。
+
+### 14.8 落地数字
+
+- `cargo test --workspace`：基线 **975 passed / 0 failed / 7 ignored** → 现在 **1005 passed / 0 failed / 8 ignored**。
+- `cargo test -p ys-tui-coding`：**212 → 242**（增量分布见 §9.4）。
+- `cargo clippy --all-targets`：**无新增 warning**（与基线副本的 warning 站点集合逐一相同）；
+  `ys-protocol` 的 `this impl can be derived`（`lifecycle.rs`）为**既有**、与本变更无关。
+- release 体积：基线 **7,747,024 B** → 现在 **8,200,144 B**，差 **+453,120 B（≈ 442.5 KiB）< 500 KiB**。
+  （仓库 `Cargo.toml` 无 `[profile]` 段，两侧同工具链、同 cargo 默认 release profile。）
+- 依赖：`Cargo.lock` 中 `ratatui-core` **只有 1 条**（v0.1.2 单版本）；`syntect` / `ansi-to-tui` / `onig` 均不出现；
+  独立包数 194 → 201（+7）。

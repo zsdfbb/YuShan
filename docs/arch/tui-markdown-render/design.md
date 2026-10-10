@@ -168,7 +168,10 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 
 **帧频事实**（`run.rs:58,155`）：`terminal.draw` 在**每次 `poll(50ms)` 超时或事件后**都执行
 ⇒ **空闲也 ~20fps 重绘**。故缓存是稳态必需，不是可选项；而**增长中的那条**由 §2.5 的节流兜住。
-另注意 `build_text` **每帧被调 2 次**（`max_scroll_offset` 一次 + `draw_transcript` 一次）。
+另注意 `build_text` 在**帧路径**内**只被调 1 次**（`draw_transcript` 内），滚动数学由同一处对同一份
+`text` 取 `line_count` 得到；`total_rows` 只服务**事件路径**（`App::compute_max_scroll` ← ↑↓ / resize 夹取），
+不在帧内调用。两路径的一致性不靠共用时钟，而由 §2.5 边界 ①（节流状态存在缓存内 ⇒ 读同一份产物）保证
+（落地订正，2026-10-10）。
 
 **宽度传递注意**：`table_width` 的语义是「**该表格可用的总列数**（含边框、内边距、外层列表/引用前缀）」，
 不是整段文本宽度。故传 `inner_w`；库在 `end_table` 会自行扣除嵌套前缀。
@@ -214,8 +217,25 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 表格边框被切断。**但 `line_count` 与渲染自洽**（二者同用该 `Wrap`）⇒ 滚动数学不崩，**只是表格视觉损坏**。
 
 **本仓守卫（保证不变量 3 恒成立）**：**渲染后校验** —— 量一遍产出行的显示宽度，
-**任一行 > `inner_w` 即令该条退回 raw 文本**（`Assistant(src)` 原样切行）。（比「固定阈值」更稳：
-自动覆盖任意列数 / CJK 组合，且只需量宽度，代价可忽略。）
+**凡「表格行」超宽即令该条退回 raw 文本**（`Assistant(src)` 原样切行）。比「固定阈值」更稳：
+自动覆盖任意列数 / CJK 组合，且只需量宽度，代价可忽略。
+
+> ⚠️ **越界判定必须只作用于表格行 —— 库不 wrap 正文**。库自己的文档写得很明确
+> （`Options::table_width`，`options.rs:104-108`）：
+>
+> > *Wraps table cells to fit within `width` terminal columns. … Other Markdown blocks are
+> > **unaffected and can be wrapped by the consuming widget**.*
+>
+> 且 `table_width` 在全库只有 `renderer/mod.rs:91` 一处消费点 —— **库只对表格用宽度**。
+> 因此**任何长于窗宽的正文段落本身就是一条超宽行**：若按「任一行超宽就退 raw」实现，
+> **每一条稍有长度的回答都会整条丢掉 Markdown 样式**，特性被静默关掉。
+> 库自带 doctest 的 `all(|line| line.width() <= 20)` **只对「纯表格文档」成立**，不可推广。
+>
+> **表格行的判定**：库画表格只用 `│ ┌ ┬ ┐ ├ ┼ ┤ └ ┴ ┘`；产出行含其中任一字符即视为表格行
+> （不单独用 `─` —— 分隔线 `---` 是三个普通连字符）。这样嵌套在列表 / 引用里的表格也能被覆盖。
+>
+> 推论：回退只在「表格窄到库用它自己的最小宽」时发生（即上文 ⚠️ 的溢出条件）；正文超宽**不再**触发回退
+> —— 正文 wrap 一律交给 `Paragraph`（这正是本设计的意图）。
 
 ### 2.7 样式与「与库绑定的既成事实」
 
@@ -279,6 +299,9 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 - `/copy`（`commands.rs:404`）**本就读原始串**，不受渲染影响；且**本就不带边框**。
 - 退出回放 `transcript_plain_lines`（`draw.rs:541`）现复用 `build_text_with` ⇒ 会带上 md 样式。
   **决定：回放走 raw 路径**（`Assistant` 原样切行），主屏 scrollback 里留**原始 markdown 源**（可复制可搜）。
+- **raw 路径一律「按 `\n` 原样切行」，不预折行** —— 回放与 §2.6 的回退同理。折行由 `Paragraph`
+  （`wrap(trim:false)`）做，与既有 assistant 纯文本渲染的行为一致；不变量 3 只约束**表格行**，
+  故 raw 行宽不受它约束（预折行会把单词 / URL 从中间截断，属无谓加码）。
 
 ### 2.11 panic 边界（新）
 
@@ -313,6 +336,7 @@ result
 1. `transcript.rs` 保持无样式；assistant markdown 的一切颜色只经 `styles.rs`。
 2. 块级装饰只用**宽度 = 1** 的字符（避免 `•`/emoji 被判 2 列 ⇒ 滚动错位）。
 3. **表格输出的每一行显示宽度 ≤ width** —— **库不保证，须由 §2.6 的守卫补上**。
+   该约束**只及表格行**：正文行超宽是常态（库不 wrap 正文），由 `Paragraph` 折行，不触发任何回退。
 4. `RenderCache` 是**纯 memo**：`clear()` 只损失 CPU，绝不改变输出。
 5. `ys-tui-coding` **不依赖 `ys-runtime`**；UI 线程**无 runtime 上下文**（`RefCell` 单线程内使用）。
 6. `tui-markdown` 的 `StyleSheet`/`Options` 分别是 trait 与 `#[non_exhaustive]` 结构：`Options` 只能用
@@ -330,17 +354,18 @@ result
 | 现有代码改动 | **~10 行**（run.rs bound）+ `draw.rs` 内区改道 | 第二份调研逐 API 核对 |
 | 新增代码 | **~120–200 行**（md.rs 胶水 + styles.rs 覆写 + cache.rs + app/draw 接线 + panic hook）+ 测试 | 对照：自研 A/B/C 为 180–950 行 |
 | **每帧解析成本（热路径）** | **增长中的那条**：`O(当前消息字节数)` ÷ `RENDER_THROTTLE`(100ms) ⇒ 上界 ≈ **10 × 消息字节数/秒**（200 KiB 消息 ≈ 2 MB/s）；**已完成的消息**命中缓存 ⇒ O(clone) | §2.5；点估计，须以实测替换 |
-| 每帧固定成本 | `build_text` ×2/帧（§2.4）+ 每命中行 clone 一遍（§2.3 借用纪律）| `draw.rs` 现状 |
+| 每帧固定成本 | `build_text` ×1/帧（§2.4 落地订正）+ 每命中行 clone 一遍（§2.3 借用纪律）| `draw.rs` 现状 |
 | 依赖增量（默认特性关掉后）| 传递依赖 **81 → 44** 个；**syntect/onig C 库全不进入** | `cargo tree` 实测 |
 | 边际新依赖 | `pulldown-cmark` + `itertools` + `tracing`（其余 44 个多来自 ratatui-core，升级 ratatui 本就要）。**`tracing` 本仓不消费**（库的传递依赖，无 subscriber）| 实测 |
-| release 体积增量 | **未测**（须 `cargo build --release` 对比；基线历史 ~5.7MB）| — |
+| release 体积增量 | **实测 +453,120 B（≈ 442.5 KiB）< 500 KiB**（基线 7,747,024 B → 8,200,144 B；同工具链、同 cargo 默认 release profile）| `cargo build --release -p ys-coding-agent` 前后 `stat -f%z` 对比 |
 
 **可测验收目标**：
 ① **依赖接入 + 最小 `md::render` 编译通过**（`cargo add tui-markdown` 后 `cargo build -p ys-tui-coding`）——
    这是 §2.1 那三件未验证项的**唯一收敛方式**；
 ② `cargo build --workspace` + `cargo test -p ys-tui-coding` 全过（**前置升级已验证**，见 §2.1）；
 ③ `line_count(w)` 与实际渲染视觉行数一致（含 CJK + 表格），多宽度断言；
-④ 表格窄屏守卫：越界行数 = 0（属性测试；**不断言固定阈值**，见 §2.6）；
+④ 表格窄屏守卫：**表格行**越界数 = 0（属性测试；**不断言固定阈值**，见 §2.6），
+   且**长段正文保住 Markdown 样式**（反向用例，见 R13）；
 ⑤ 拷贝不含 `│`（S8）；
 ⑥ **长流式消息**（≥100 KiB）期间无可感卡顿（验证 §2.5 节流）；
 ⑦ release 体积增量 < +500KB。
@@ -363,11 +388,13 @@ result
 | R10 | **几何漂移**：`inner_h` 或 `max_scroll_offset` 内的同源常数漏改 ⇒ 贴底裁行 / 滚动失配（**编译器不抓**）| §2.8：内区统一取自同一 `Block`（`block.inner(area)`），消灭手写减法；不变量 7 |
 | R11 | **节流窗口内新旧产物混用** ⇒ 滚动按新、画面按旧 | §2.5 边界 ①：节流状态存 `RenderCache` 内，两调用点读**同一份**上次产物；边界 ②：该条结束时强制重算 |
 | R12 | **库 panic ⇒ 终端留在 raw mode**（不可信输入 + PoC 库）| §2.11：`run()` 装 panic hook 做终端恢复；不变量 8 |
+| R13 | **守卫范围过宽**：若按「任一行超宽即退 raw」实现 ⇒ 一切长于窗宽的正文段落都退 raw ⇒ Markdown 渲染被**静默关掉**（本轮实现中真实发生，非假设）| §2.6：越界判定**只作用于表格行**（按框线字符判定）；用例须**同时**钉住「长段正文保住样式」与「窄表退 raw」两个方向 |
 
 **变异测试义务**：① 关掉窄屏守卫（超宽用例应红）；② 让缓存永不失效（流式增长用例应红）；
 ③ 覆写漏掉一个 `StyleSheet` 方法（默认色泄漏用例应红）；④ **`Borders::TOP` 后把内区改回
 `saturating_sub(2)`**（贴底/滚动上限用例应红）；⑤ **摘掉节流、改回逐 delta 重渲染**
-（"该条结束时内容完整"用例应红）。
+（"该条结束时内容完整"用例应红）；⑥ **把守卫的表格行判定放宽回「任意行」**
+（「长段正文保住样式」用例应红 —— 见 R13）。
 
 ---
 
@@ -409,9 +436,10 @@ result
 | 缓存策略 | `App.md_cache: RefCell<RenderCache>`，键 = (下标, 内容长度, 宽度)；**无 L1/L2 拆分** |
 | 回放 / `/copy` | 保持纯文本；回放走 raw 路径 |
 | 半截 fence 策略 | **立即渲染**（库内建行为，会画出假收场围栏）|
-| 依赖体积 | 未测，须实测 |
+| 依赖体积 | 实测 +453,120 B（≈ 442.5 KiB）< 500 KiB（基线 7,747,024 B → 8,200,144 B）|
 | **拷贝友好（新增）** | §2.8：去 Chat 左右边框；表格留框线；代码块无竖线 |
 | **几何改道（复核新增）** | §2.8：内区不再手写 `saturating_sub`，改由同一 `Block` 取（含 `inner_h`，涉及 4 站点）|
 | **流式节流（复核新增）** | §2.5：增长中的那条按 `RENDER_THROTTLE`(100ms) 节流，状态存缓存内 |
 | **panic 边界（复核新增）** | §2.11：`run()` 装 panic hook 恢复终端（独立于 md，一并落地）|
 | **实证口径（复核收窄）** | §2.1：已实证的只是**前置升级**；库集成为落地第 1 步的验收项 |
+| **守卫范围订正（落地发现）** | §2.6 / 不变量 3：越界判定**只作用于表格行**（库不 wrap 正文）；raw 路径按 `\n` 原样切行、**不预折行**。见 R13 |

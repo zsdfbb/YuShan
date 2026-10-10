@@ -13,7 +13,7 @@
 
 ## 基线
 
-- **基线 ref**: `<Phase 3 开始时由 scripts/baseline.sh 填写>`
+- **基线 ref**: `9e0b492faa1ce65108d257269904364db9dfe10d`（备份分支 `sw-backup/2026-10-10-tui-markdown-render`）
 - 用途: review 执行 `git diff <基线 ref> -- <files>` 取字节级证据（含 git 中显示为 `??` 的新文件）
 
 ## 任务清单
@@ -29,11 +29,14 @@
 ### Task 2: crates/ys-tui-coding — md 渲染核心测试 [type=test]
 - **涉及目录**: `crates/ys-tui-coding/src/`
 - **涉及文件**: `crates/ys-tui-coding/src/md.rs`, `crates/ys-tui-coding/src/styles.rs`, `crates/ys-tui-coding/src/cache.rs`
-- **描述**: 在三个新模块内联 `#[cfg(test)] mod tests`，覆盖 N3（元素覆盖与样式映射）、N5（表格窄屏守卫无超宽行，宽度 `1..=80`）、N6（非表格 md 渲染无 `│`）、N7（注入 `now`，1 秒 1000 次 delta ⇒ 渲染 ≤ 11 次 + 条末完整渲染）、N1（最小渲染编译通过）；并**演示** M2 / M3 / M5 变异会令用例变红
+- **描述**: 在三个新模块内联 `#[cfg(test)] mod tests`，覆盖 N3（元素覆盖与样式映射）、N5（**表格行**窄屏守卫无超宽行，宽度 `1..=80`；**反面**：长段正文须保住 Markdown 样式）、N6（非表格 md 渲染无 `│`）、N7（注入 `now`，1 秒 1000 次 delta ⇒ 渲染 ≤ 11 次 + 条末完整渲染）、N1（最小渲染编译通过）；并**演示** M1 / M2 / M3 / M5 / M6 变异会令用例变红（M1、M6 都作用在 `md.rs` 的守卫上）
 - **验证方法**:
   - `cargo build -p ys-tui-coding` — 期望退出 0（N1）
   - `cargo test -p ys-tui-coding` — 期望全 passed、0 failed（含既有 212 项）
-  - `cargo clippy --all-targets -p ys-tui-coding` — 期望无新增 warning
+  - `cargo clippy --all-targets -p ys-tui-coding` — 期望**除** `md` / `styles` / `cache` 三模块的
+    `dead_code` 外无新增 warning。该 `dead_code` 是预期的：U2（Task 3）接线之前，这三个 `pub(crate)`
+    API 在本轮内尚无调用者，而 `cargo build` 的分析看不到 `#[cfg(test)]` 内的使用。
+    **终局零 warning 由 Task 7 把关**
 - **关联 impl**: Task 1
 - **依赖**: Task 1
 
@@ -47,7 +50,7 @@
 ### Task 4: crates/ys-tui-coding — 绘制接线测试 [type=test]
 - **涉及目录**: `crates/ys-tui-coding/src/`
 - **涉及文件**: `crates/ys-tui-coding/src/draw.rs`
-- **描述**: 在 `draw.rs` 内联 `mod tests` 补/改：N4（宽度 `1..=80` × {含 CJK 表格, 不含表格} 断言 `Paragraph::line_count(w)` 与逐行折行一致）、N6 的 Chat 内区集成版（渲染非表格 md 后内区无 `│`）、N8（`transcript_plain_lines` 输出含原始 `#` / `**`）、贴底/滚动上限用例（守住几何改道）；并**演示** M1 / M4 变异会令用例变红
+- **描述**: 在 `draw.rs` 内联 `mod tests` 补/改：N4（宽度 `1..=80` × {含 CJK 表格, 不含表格} 断言 `Paragraph::line_count(w)` 与逐行折行一致）、N6 的 Chat 内区集成版（渲染非表格 md 后内区无 `│`）、N8（`transcript_plain_lines` 输出含原始 `#` / `**`）、贴底/滚动上限用例（守住几何改道）；并**演示** M4 变异会令用例变红（M1 属 Task 2 的守卫，不在本任务）
 - **验证方法**:
   - `cargo test -p ys-tui-coding` — 期望全 passed、0 failed
   - `git diff <基线> -- crates/ys-tui-coding/src/draw.rs` — 期望 4 个 `saturating_sub(2)` 站点确已改道，未被逐个改成常数
@@ -92,9 +95,20 @@
 
 | 单元 | 含任务 | 涉及文件 | 依赖 | 波次 | review 档 |
 |------|--------|---------|------|------|-----------|
-| | | | | | |
+| U1 | T1, T2 | `crates/ys-tui-coding/Cargo.toml`, `src/lib.rs`, `src/md.rs`, `src/styles.rs`, `src/cache.rs` | 无 | **W0** | deep |
+| U2 | T3, T4 | `crates/ys-tui-coding/src/draw.rs`, `src/app.rs` | U1 | **W1** | deep |
+| U3 | T5, T6 | `crates/ys-tui-coding/src/run.rs` | 无 | **W1** | deep |
+| U4 | T7 | `docs/reports/2026-10-10-tui-markdown-render-verify.md` | U1, U2, U3 | **W2** | shallow |
 
-（同波内文件集必须互不相交；相交则顺延到下一波）
+**合并判定（3.2）**：R1 按文件相交合并 → U1(T1+T2) / U2(T3+T4) / U3(T5+T6)；
+U1 与 U2 虽同 crate 但文件集不相交，**不**合并（R2 只针对「≤2 文件的小任务」，
+U2 含 `draw.rs` 1500 行的几何改道与缓存接线，非小任务）。R3 通过：各单元 ≤5 文件。
+
+**为什么 U3 不放进 W0**：U3 本身无依赖，但 U1 会改写 `Cargo.toml` / `Cargo.lock`；
+与 U3 的 `cargo test` 并发会让后者的依赖解析撞上正在改写的 manifest。
+更关键的是 design §6 把第 1 步定为**其余全部任务的闸门** —— W0 只跑闸门，符合该语义。
+
+（同波内文件集必须互不相交；相交则顺延到下一波 —— W1 的 `{draw.rs, app.rs}` 与 `{run.rs}` 不相交 ✅）
 
 ## 验证清单
 
@@ -104,6 +118,6 @@
 - [ ] `cargo test --workspace` — 0 failed（N2，基线 975 passed / 7 ignored）
 - [ ] `cargo clippy --all-targets` — 无新增 warning
 - [ ] N3–N9 逐一有对应用例且通过；N10 体积已测或显式标为推迟
-- [ ] M1–M5 变异义务均已演示「注入 bug ⇒ 用例变红」
+- [ ] M1–M6 变异义务均已演示「注入 bug ⇒ 用例变红」
 - [ ] `grep -rn 'tui_markdown::' crates/ys-tui-coding/src/` 只命中 `md.rs` / `styles.rs`
 - [ ] N11 + 观感两项 MANUAL_ACK_REQUIRED 已原样呈报用户

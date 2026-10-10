@@ -60,6 +60,7 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 │    300ms 节拍 → Working 动画（仅 turn 中）                       │
 │    提交输入 → tx_req.blocking_send(Request)                     │
 │    中途插话 / Ctrl+C → tx_boundary.blocking_send(Boundary)       │
+│      （turn 中第二段：再按一次 Ctrl+C → should_quit，见 §8.2 M17）│
 │  }                                                              │
 └────────────────┬──────────────────────────────▲────────────────┘
      ① Request / ② Boundary              ③ Outbound<CodingView>
@@ -356,7 +357,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M3 | **`/login` 的 api_base 解析**：TUI 在所选 provider **没有内置 base** 时（`custom` 这类）**追加一问 URL**，随 `Request::Login { api_base: Option<String> }` 交给 app；app 侧按 ① 用户显式 URL → ② provider 内置 base → ③ 回退 `config.api_base`（`YUSHAN_API_BASE`）→ ④ 都没有则**明确提示**要设环境变量（不静默失败、不写空 base 的 auth）。**协议因此比 design §6 多一个 `api_base` 字段**（初版实现漏了它，导致 `custom` 的交互式 URL 失效——已修） | `ys-tui-coding::prompter::resolve_prompt` + `capabilities::login` |
 | M4 | **`/model` 无参的模型列表来自 `CodingView.available_models`** —— 由**启动期拉取**的目录填充：`ProviderRegistry::refresh_models` 在 TUI 起屏**之前**（`run_interactive` 的阻塞步骤）对**每个已登录 provider 并发**拉一次 `/v1/models`（`JoinSet`，5s 超时），失败静默回退静态表（`known_models_static` 按 `owned_by` 过滤到该 provider）。候选 = **所有已登录 provider** 的并集（去重）+ 当前正在跑的模型。**渲染路径一次 HTTP 都不发**（重绘不得触发 HTTP）—— 故拉取只在启动期做，此后每回合 `build_view` 只读缓存 | `apps/coding-agent/src/{provider,view,main}.rs` |
 | M9 | **跨 provider 选模型**：候选是多个 provider 的并集，故 `capabilities::set_model` 用 `ProviderRegistry::provider_for_model` 定位模型归属；归属与当前 provider 不同则**连端点一起切**（api_base / api_key / provider，取自该 provider 的 auth 条目）。目录里都没有的手敲名字**保持当前 provider 不变** —— 只改 `config.model` 会把 A 家的模型名发到 B 家的 base | `apps/coding-agent/src/capabilities.rs` |
-| M5 | **`Action::Abort` 目前是保留变体**：`parse()` 不产出它；Ctrl+C / Esc 在 `handle_key` 里直接投 `Boundary::Abort`。留作将来 `/abort` | `ys-tui-coding/src/commands.rs` |
+| M5 | **`Action::Abort` 目前是保留变体**：`parse()` 不产出它；Ctrl+C / Esc 在 `handle_key` 里直接投 `Boundary::Abort`。留作将来 `/abort`。turn 中 Ctrl+C 是**两段式**（第一次取消、第二次退出），见 M17 | `ys-tui-coding/src/commands.rs` |
 | M6 | **`app_loop` 的回合失败只落日志、不刷 transcript**：`BasicLoop` 返回错误前已发 `RunFailed`（UI 已看到 Error 行） | `app_loop::run` |
 | M7 | **`/new` 后 `session_started` 重置**（状态行时长据此归零） | `app_loop::run` |
 | M8 | **`export` 为同步 `std::fs::copy`**：会话是本地小文件；把一个非 `Sync` 的 `&Wiring` 借进 app 循环的 future 跨 `await` 会让整个循环不再 `Send`、无法 `spawn` | `capabilities::export` |
@@ -367,6 +368,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M14 | **缓存 + 节流状态落在 `RenderCache` 内**：键 `(槽下标, src.len(), width)`；`now: Instant` **由调用方注入**（缓存内不调 `Instant::now()`，否则无法确定性单测）；`RENDER_THROTTLE = 100ms`；单条 > `MAX_CACHED_SRC`(256 KiB) 渲染进 `scratch` 暂存并返回、**不写 slot**（真的不入缓存）；`finish(idx)` 由 `App::finish_turn` 调用，而 `finish_turn` **只在 `RunFinished` / `RunFailed` 两个分支**被调 —— **不是每帧**（每帧调会让每条消息每帧整条重解析，缓存完全失效） | `ys-tui-coding/src/{cache,app}.rs` |
 | M15 | **panic hook 的 `panic_hook_body<T>(restore, delegate, info)` 泛型化**：泛型 `T` 是为**可单测**（`PanicHookInfo` 无法在测试里构造，单测传一个假 `T` 即可断言「先恢复、后 delegate」）；`restore_sequence()` 由 `exit_payload`（正常退出）与 panic hook **共用**（四条命令各改一个互不相干的模式位；唯一先后约束是「退 alt-screen 必须在回放段之前」—— 回放落点靠 `?1049l` 恢复） | `ys-tui-coding/src/run.rs` |
 | M16 | **绘制路径不得 panic**：`push_non_assistant` 的 `Assistant` 分支从 `unreachable!()` 改为**降级为 raw** + `debug_assert!(false, …)`（测试期大声、生产期降级）—— 绘制 panic 会把终端留在 raw mode（§14.7）。该分支正常不可达（两个调用点都提前分流 Assistant） | `ys-tui-coding/src/draw.rs` |
+| M17 | **turn 中 Ctrl+C 两段式**（ADR-0031）：第一次投 `Boundary::Abort` + 写一行 transcript 回执「再按一次 Ctrl-C 退出」；第二次 `should_quit = true`（与 Ctrl-D 同一条退出路径）。标记 `App.abort_requested` **随回合生命周期复位**（进 turn 的三处 + `finish_turn`），否则上一回合按过的 Ctrl-C 会让下一回合的第一次直接退出 | `ys-tui-coding/src/{events,app}.rs` |
 
 ---
 

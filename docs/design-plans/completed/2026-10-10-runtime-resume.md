@@ -181,7 +181,7 @@ pub enum Outbound<V> {
 - **验收人**: review subagent
 
 #### N4: 启动期顺序
-- **验收方法**: `cargo test -p ys-coding-agent` — 期望：启动期 `startup_hint`（`main.rs:1017-1021` 先行入队）**不被 `clear()` 吃掉** ⇒ 启动期的 `SessionResumed` 排在它**之后**（或改为先回放再投提示）
+- **验收方法**: `cargo test -p ys-coding-agent` — 期望：启动期带 `--resume` 时**先投 `SessionResumed`（回放）、再投 `startup_hint`**（`main.rs:1017-1021`），使启动提示**不被回放的 `clear()` 吃掉**；反序应能被测试抓住
 - **优先级**: 必测
 - **验收人**: review subagent
 

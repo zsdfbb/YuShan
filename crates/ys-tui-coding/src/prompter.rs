@@ -13,9 +13,11 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
 
-use ys_protocol::Request;
+use ys_protocol::{Request, SessionSummary};
 
 use crate::commands::{PROMPT_PAGE_SIZE, PromptKind};
 use crate::completion::{selectable_skills, skill_label};
@@ -62,17 +64,22 @@ pub trait Prompter: Send + Sync {
     fn text(&self, prompt: &str, help: Option<&str>) -> Result<String, PromptError>;
 }
 
-/// [`resolve_prompt`] 的结局 —— 模态问答收尾的两种去向。
+/// [`resolve_prompt`] / [`resolve_session_pick`] 的结局 —— 模态问答收尾的去向。
 ///
-/// 大多数命令问完就发一条 [`Request`]；`/skills` 是例外：选中一条 skill 只把
-/// `/<command> ` **回填到输入框**，由用户补参数后自行提交（见
-/// [`PromptKind::PickSkill`]）。
+/// 大多数命令问完就发一条 [`Request`]；两处例外：`/skills` 选中一条 skill 只把
+/// `/<command> ` **回填到输入框**（见 [`PromptKind::PickSkill`]）；`/resume` 选中
+/// **当前会话**是 [`NoOp`](Self::NoOp)（不发请求，只提示）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum PromptOutcome {
     /// 产出一条待发的请求。
     Request(Request),
     /// 回填输入框的文本（**不发送**）—— 与 Tab 补全的 `replacement` 同形（尾随空格）。
     Prefill(String),
+    /// 有意义的无操作：不发请求，但把这条提示写进 transcript。
+    ///
+    /// 唯一来源是 `/resume` 选中**当前会话**（见 [`resolve_session_pick`]）——
+    /// 不能静默无反应，否则用户以为命令坏了。
+    NoOp(String),
 }
 
 /// 把「需要模态浮层的命令」跑成一条 [`Request`] —— **纯决策逻辑，可单测**。
@@ -146,6 +153,106 @@ pub fn resolve_prompt(
             };
             Ok(PromptOutcome::Prefill(format!("/{} ", skill.command)))
         }
+        // 会话候选来自 `App.pending_sessions`（与 `&CodingView` 不同源），由
+        // [`resolve_session_pick`] 处理 —— 本函数拿不到候选，故不走这里。
+        PromptKind::PickSession => Err(PromptError::Other(
+            "PickSession 须经 resolve_session_pick 处理".into(),
+        )),
+    }
+}
+
+/// `/resume` 无参浮层的决策逻辑 —— **独立于 [`resolve_prompt`]**。
+///
+/// 与 `resolve_prompt` 分开的原因：候选会话来自调用方的 `App.pending_sessions`
+/// （`Vec<SessionSummary>`），与 `&CodingView` 不同源；把会话塞进 `CodingView` 会让
+/// 「一次性载荷」混进「长期快照」，也会把这条命令的分支波及另三条浮层命令与全部
+/// `FakePrompter` 单测。
+///
+/// `current_path` 是**当前会话**的文件路径（`CodingView.session_path`）；选中它就是
+/// [`PromptOutcome::NoOp`]（不发请求、明确提示）。`None` 表示当前是无文件会话。
+///
+/// Esc 取消（`select` 返回 [`PromptError::Cancelled`]）原样上抛，调用方**不改任何状态**。
+pub fn resolve_session_pick(
+    prompter: &dyn Prompter,
+    sessions: &[SessionSummary],
+    current_path: Option<&Path>,
+) -> Result<PromptOutcome, PromptError> {
+    resolve_session_pick_at(prompter, sessions, current_path, SystemTime::now())
+}
+
+/// [`resolve_session_pick`] 的实现体，`now` 由调用方给定。
+///
+/// 单测据此**注入固定时刻**：标签与反解共用同一个 `now`，从而消除「标签用一次
+/// `now`、反解再用一次 `now`」这一隐含假设 —— 两次独立取时若跨过相对时间的档位
+/// （如午夜换日），标签与反解不再逐字节相同，反解落空。生产路径恒传
+/// `SystemTime::now()`（见 [`resolve_session_pick`]）。
+fn resolve_session_pick_at(
+    prompter: &dyn Prompter,
+    sessions: &[SessionSummary],
+    current_path: Option<&Path>,
+    now: SystemTime,
+) -> Result<PromptOutcome, PromptError> {
+    // 标签**只算一次**并原样复用做反解：`select` 只回传显示串，反解必须与它逐字节
+    // 相同。`now` 是本函数唯一的时刻来源，算标签与比较标签都取它 —— 不经第二次
+    // `SystemTime::now()` 重算，否则跨相对时间档位时两串不再相等，反解落空。
+    let labels: Vec<String> = sessions
+        .iter()
+        .map(|s| session_label(s, now, current_path == Some(s.path.as_path())))
+        .collect();
+
+    let picked = prompter.select("Select session", labels.clone(), PROMPT_PAGE_SIZE)?;
+    // 在**候选集**里反解（而非 `sessions` 重新生成）：契约是「回传 `options` 里的一项」。
+    let Some(idx) = labels.iter().position(|l| *l == picked) else {
+        // 候选在问答期间变了这类不可能情形：当作取消，什么都不改。
+        return Err(PromptError::Cancelled);
+    };
+    let chosen = &sessions[idx];
+    if current_path == Some(chosen.path.as_path()) {
+        return Ok(PromptOutcome::NoOp(format!(
+            "已在会话 {}（无需切换）",
+            chosen.id
+        )));
+    }
+    Ok(PromptOutcome::Request(Request::ResumeSession {
+        target: chosen.id.clone(),
+    }))
+}
+
+/// 会话候选标签：`<id> · <title> · <相对时间>`；当前会话加 ` [current]` 后缀。
+///
+/// **id 必须完整入标签，且置于最前**：
+/// - 完整 —— 它是反解的唯一依据（[`Prompter::select`] 只回传显示串）。会话 id 由
+///   app 侧 `new_session_id()` 生成，格式为 `{unix秒}_{纳秒:09}`（如
+///   `1760000000_123456789`），`sessions::list` 用 `path.file_stem()` 取回。同一**秒**
+///   创建的会话共享 `{secs}_` 前缀 —— 故任何**定长**短码都会相撞，令 `position`
+///   反解到错误会话；只有完整 id 唯一，标签因此唯一可反解。
+/// - 在最前 —— 绘制层（`draw.rs::prompt_select`）对超宽选项做 `truncate_to_width`，
+///   末尾字段最先被截掉。id 前置后，同标题会话在窄终端上仍靠 id 前缀可区分（否则
+///   屏幕上的两行趋于雷同，用户可能选中错误的**行**；反解本身仍正确，因为 `select`
+///   回传的是未截断串）。
+///
+/// `title` 由 app 侧（`sessions::derive_title`）收在 50 字符内。
+fn session_label(summary: &SessionSummary, now: SystemTime, is_current: bool) -> String {
+    let suffix = if is_current { " [current]" } else { "" };
+    format!(
+        "{} · {} · {}{suffix}",
+        summary.id,
+        summary.title,
+        relative_time(summary.mtime, now)
+    )
+}
+
+/// mtime → 相对时间的中文短语（**显示用**，未来时间按「刚刚」处理）。
+fn relative_time(mtime: SystemTime, now: SystemTime) -> String {
+    let secs = now
+        .duration_since(mtime)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match secs {
+        0..=59 => "刚刚".to_string(),
+        60..=3_599 => format!("{} 分钟前", secs / 60),
+        3_600..=86_399 => format!("{} 小时前", secs / 3_600),
+        _ => format!("{} 天前", secs / 86_400),
     }
 }
 
@@ -577,5 +684,140 @@ mod tests {
         let e: PromptError = std::io::Error::other("boom").into();
         assert_eq!(e, PromptError::Other("boom".to_string()));
         assert_eq!(PromptError::Cancelled.to_string(), "已取消");
+    }
+
+    // -----------------------------------------------------------------------
+    // /resume 无参 → 浮层（resolve_session_pick，候选来自 App.pending_sessions）
+    // -----------------------------------------------------------------------
+
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn summary(id: &str, title: &str, mtime_secs: u64) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            path: std::path::PathBuf::from(format!("/sessions/{id}.jsonl")),
+            mtime: UNIX_EPOCH + Duration::from_secs(mtime_secs),
+            title: title.into(),
+        }
+    }
+
+    /// **同标题不切错**（本单元最要紧的一条）：两个 title 都是「新会话」的不同 id，
+    /// 标签靠**完整 id** 区分 ⇒ 反解出被选中的那一个。
+    ///
+    /// **时刻固定**（`resolve_session_pick_at`）：标签与反解共用同一个注入的 `now`，
+    /// 不依赖「两次 `SystemTime::now()` 相同」——否则两次调用跨相对时间档位（如午夜
+    /// 换日）时标签与反解串不再相等，反解落空而误红。
+    ///
+    /// 变异：把 `session_label` 换成只放「id 前 8 字符」的短码（两 id 同前缀）⇒
+    /// 候选标签不再唯一，反解落到错误会话（或第一个），本用例变红。
+    #[test]
+    fn test_session_pick_resolves_correct_session_among_same_titles() {
+        let sessions = vec![
+            summary("1760000000_000000001", "新会话", 1_760_000_000),
+            summary("1760000000_000000002", "新会话", 1_760_000_100),
+        ];
+        let now = UNIX_EPOCH + Duration::from_secs(1_760_000_200);
+        // 选中 B —— 用 FakePrompter 回传 B 的显示串（与 resolve 共用同一个 now）。
+        let label_b = session_label(&sessions[1], now, false);
+        let p = FakePrompter::with_answers(vec![Ok(label_b)]);
+
+        let outcome = resolve_session_pick_at(&p, &sessions, None, now)
+            .expect("选中一个会话应产出请求");
+        assert_eq!(
+            outcome,
+            PromptOutcome::Request(Request::ResumeSession {
+                target: "1760000000_000000002".into(),
+            }),
+            "同标题下必须反解到被选中的 id"
+        );
+    }
+
+    /// **P2-3**：id 前置 —— 窄终端下（绘制层 `draw.rs::prompt_select` 对超宽选项做
+    /// 前缀截断）两个同标题会话仍可区分。截到「只够放下 id」的宽度时两串必须不同。
+    ///
+    /// 变异：把 id 挪回末尾 ⇒ ① id 前置断言红；② 前缀截断先切掉 id，两串趋同 ⇒
+    /// 可区分断言红。
+    #[test]
+    fn test_session_label_id_leads_so_narrow_truncation_stays_distinguishable() {
+        let a = summary("1760000000_000000001", "新会话", 1_760_000_000);
+        let b = summary("1760000000_000000002", "新会话", 1_760_000_000);
+        let now = UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        let la = session_label(&a, now, false);
+        let lb = session_label(&b, now, false);
+
+        // id 必须出现在 title 之前（前置契约）。
+        assert!(
+            la.find(a.id.as_str()).unwrap() < la.find("新会话").unwrap(),
+            "id 必须前置：{la}"
+        );
+
+        // 截到只够放下完整 id 的宽度（+1 容纳其后分隔符），两行仍不同。
+        let width = a.id.chars().count() + 1;
+        let pa: String = la.chars().take(width).collect();
+        let pb: String = lb.chars().take(width).collect();
+        assert_ne!(pa, pb, "窄宽前缀截断后仍须可区分：{pa:?} vs {pb:?}");
+        assert!(pa.contains(a.id.as_str()), "id 应落在可见前缀内：{pa:?}");
+    }
+
+    /// 选中**当前会话** ⇒ `NoOp`（不发请求、给一句明确提示），并带 `[current]` 标记。
+    ///
+    /// 同 [`test_session_pick_resolves_correct_session_among_same_titles`]：注入固定
+    /// `now`，消除对「两次 `SystemTime::now()` 相同」的依赖。
+    #[test]
+    fn test_session_pick_current_session_is_noop_with_hint() {
+        let sessions = vec![
+            summary("a", "会话 A", 1_760_000_000),
+            summary("b", "会话 B", 1_760_000_100),
+        ];
+        let current = std::path::PathBuf::from("/sessions/a.jsonl");
+        let now = UNIX_EPOCH + Duration::from_secs(1_760_000_200);
+        let label_a = session_label(&sessions[0], now, true);
+        assert!(label_a.ends_with("[current]"), "当前会话带标记：{label_a}");
+        let p = FakePrompter::with_answers(vec![Ok(label_a)]);
+
+        let outcome = resolve_session_pick_at(&p, &sessions, Some(current.as_path()), now)
+            .expect("选中当前会话不应报错");
+        match outcome {
+            PromptOutcome::NoOp(hint) => assert!(hint.contains("无需切换"), "{hint}"),
+            other => panic!("选中当前会话应为 NoOp，得到 {other:?}"),
+        }
+    }
+
+    /// Esc（FakePrompter 队列空）⇒ `Err(Cancelled)` —— 调用方据此**不改任何状态**。
+    #[test]
+    fn test_session_pick_cancel_produces_nothing() {
+        let sessions = vec![summary("a", "会话 A", 1_760_000_000)];
+        let p = FakePrompter::with_answers(vec![]);
+        assert_eq!(
+            resolve_session_pick(&p, &sessions, None),
+            Err(PromptError::Cancelled)
+        );
+    }
+
+    /// 标签里含 **完整 id / title / 相对时间** 三样，`id` 前置；相对时间按区间给出中文短语。
+    #[test]
+    fn test_session_label_shape_and_relative_time() {
+        let s = summary("1760000000_123456789", "修复 UTF-8", 1_760_000_000);
+        let now = UNIX_EPOCH + Duration::from_secs(1_760_000_000 + 120);
+        let label = session_label(&s, now, false);
+        assert!(label.contains("修复 UTF-8"), "{label}");
+        assert!(
+            label.contains("1760000000_123456789"),
+            "必须含完整 id 以备反解：{label}"
+        );
+        assert!(label.contains("2 分钟前"), "{label}");
+        assert!(!label.contains("[current]"), "非当前会话无标记：{label}");
+        // 顺序：id → title → 相对时间（id 前置，窄宽截断下先于 title 可见）。
+        assert!(
+            label.starts_with("1760000000_123456789 · 修复 UTF-8 · "),
+            "id 必须前置：{label}"
+        );
+
+        let at = |secs: u64| relative_time(UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(at(30), "刚刚");
+        assert_eq!(at(3_600), "1 小时前");
+        assert_eq!(at(90_000), "1 天前");
+        // 未来时间（时钟回拨）按「刚刚」，不 panic、不出负数
+        assert_eq!(relative_time(UNIX_EPOCH + Duration::from_secs(100), UNIX_EPOCH), "刚刚");
     }
 }

@@ -42,7 +42,7 @@ pub struct CommandSpec {
 ///
 /// 补全浮层（`completion.rs`）、`/help`（[`help_text`]）与解析（[`parse`]）三者
 /// 都从这一张表派生，故「浮层里看得到、敲下去却不认识」在结构上不可能发生。
-static COMMANDS: [CommandSpec; 12] = [
+static COMMANDS: [CommandSpec; 13] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -92,6 +92,11 @@ static COMMANDS: [CommandSpec; 12] = [
         name: "new",
         description: "开新会话",
         arg_hint: None,
+    },
+    CommandSpec {
+        name: "resume",
+        description: "恢复既有会话（无参列出并选择）",
+        arg_hint: Some("[id]"),
     },
     CommandSpec {
         name: "compact",
@@ -161,6 +166,14 @@ pub enum PromptKind {
     /// 且 `-p` / `--json` 无 TUI，不涉及此路。落地在
     /// [`crate::prompter::PromptOutcome::Prefill`]。
     PickSkill,
+    /// 选会话 → `Request::ResumeSession { target }`。
+    ///
+    /// **不来自 [`parse`]**：`/resume` 无参产出的是 `Request::ListSessions`（一次往返），
+    /// 由 app 侧的 `Outbound::SessionList` 经 `App::apply_outbound` 设上本值 ——
+    /// 候选数据（`App.pending_sessions`）只有那时才在 UI 手上。解析逻辑见
+    /// [`crate::prompter::resolve_session_pick`]（候选与 `&CodingView` **不同源**，
+    /// 故不走 `resolve_prompt`）。
+    PickSession,
 }
 
 /// 解析一次提交的输入。
@@ -230,6 +243,15 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
         "login" => Action::Prompt(PromptKind::Login),
         "logout" => Action::Request(Request::Logout),
         "new" => Action::Request(Request::NewSession),
+        // 无参 → 先拉列表（一次往返：`ListSessions` → `SessionList` → 浮层）；
+        // 有参 → 直接把 id/路径交给 app 侧的 `sessions::resolve`（与 `/model` 双形态对称）。
+        "resume" => {
+            if args.is_empty() {
+                Action::Request(Request::ListSessions)
+            } else {
+                Action::Request(Request::ResumeSession { target: arg() })
+            }
+        }
         "compact" => Action::Request(Request::Compact),
         // 无参 → `None`：**默认落点由 app 侧按会话文件决定**（设计 §6「会话文件
         // 在 app 侧」）。TUI 不替 app 猜一个相对 cwd 的路径（那样会静默覆盖同名文件）。
@@ -477,6 +499,13 @@ mod tests {
             ("/login", Action::Prompt(PromptKind::Login)),
             ("/logout", Action::Request(Request::Logout)),
             ("/new", Action::Request(Request::NewSession)),
+            ("/resume", Action::Request(Request::ListSessions)),
+            (
+                "/resume abc",
+                Action::Request(Request::ResumeSession {
+                    target: "abc".into(),
+                }),
+            ),
             ("/compact", Action::Request(Request::Compact)),
             ("/export", Action::Request(Request::Export { path: None })),
             (
@@ -509,6 +538,8 @@ mod tests {
             "/model gpt",
             "/logout",
             "/new",
+            "/resume",
+            "/resume abc",
             "/compact",
             "/export p",
         ]
@@ -549,6 +580,14 @@ mod tests {
         assert!(has(|r| matches!(r, Request::Login { .. })), "缺 Login");
         assert!(has(|r| matches!(r, Request::Logout)), "缺 Logout");
         assert!(has(|r| matches!(r, Request::NewSession)), "缺 NewSession");
+        assert!(
+            has(|r| matches!(r, Request::ListSessions)),
+            "缺 ListSessions"
+        );
+        assert!(
+            has(|r| matches!(r, Request::ResumeSession { .. })),
+            "缺 ResumeSession"
+        );
         assert!(has(|r| matches!(r, Request::Compact)), "缺 Compact");
         assert!(has(|r| matches!(r, Request::Export { .. })), "缺 Export");
     }
@@ -613,7 +652,7 @@ mod tests {
             names,
             vec![
                 "help", "status", "skills", "copy", "quit", "thinking", "model", "login", "logout",
-                "new", "compact", "export",
+                "new", "resume", "compact", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );
@@ -628,6 +667,34 @@ mod tests {
                 .arg_hint,
             Some("[model_name]"),
             "浮层要显示 arg_hint（设计 §2.4）"
+        );
+    }
+
+    /// `/resume` 的三处同源：`all_commands()`（补全浮层的来源）、`/help` 正文、`parse`。
+    ///
+    /// 变异：把 `COMMANDS` 里的 `resume` 条目删掉（或把 `parse` 的 `resume` 分支去掉）
+    /// ⇒ 本测试的对应断言变红。
+    #[test]
+    fn test_resume_command_is_registered_and_parsed() {
+        let spec = all_commands()
+            .iter()
+            .find(|c| c.name == "resume")
+            .expect("命令表里必须有 resume");
+        assert_eq!(spec.arg_hint, Some("[id]"));
+        assert!(!spec.description.is_empty());
+
+        assert!(
+            help_text().contains("/resume [id]"),
+            "`/help` 必须列出 /resume 及其参数提示：{}",
+            help_text()
+        );
+
+        assert_eq!(parse("/resume"), Action::Request(Request::ListSessions));
+        assert_eq!(
+            parse("/resume 2026-10-10-abc"),
+            Action::Request(Request::ResumeSession {
+                target: "2026-10-10-abc".into()
+            })
         );
     }
 

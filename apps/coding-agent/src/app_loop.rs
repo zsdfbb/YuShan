@@ -30,6 +30,7 @@
 //!     }
 //!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
 //!     SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
+//!     ListSessions/ResumeSession => { 会话列表 / 原子恢复 → SessionList/SessionResumed }
 //!   }
 //!   emit_view();                     // 每个请求处理完刷一次快照
 //! }
@@ -152,6 +153,9 @@ pub async fn run(
         };
 
         let mut lines: Vec<String> = Vec::new();
+        // `/resume` 的会话出站（`SessionList` / `SessionResumed`）：**排在 `Output`
+        // 之前**是固定不变量（I2）—— 反了的话，UI 侧回放的清屏会把通知吃掉。
+        let mut session_event: Option<Outbound<CodingView>> = None;
 
         match req {
             Request::Prompt(message) => {
@@ -282,6 +286,55 @@ pub async fn run(
             Request::Export { path } => {
                 lines = capabilities::export(&wiring, path);
             }
+
+            Request::ListSessions => {
+                match wiring.sessions_dir_path() {
+                    // I13：内存会话不可恢复 —— **只**提示，不发列表（不弹浮层）。
+                    None => {
+                        lines = vec![
+                            "Cannot list sessions: this session is not persisted.".to_string(),
+                        ];
+                    }
+                    // I4：**空列表也要发** —— UI 据此提示「没有可恢复的会话」。
+                    Some(dir) => {
+                        session_event = Some(Outbound::SessionList(capabilities::list_sessions(dir)));
+                    }
+                }
+            }
+
+            Request::ResumeSession { target } => {
+                let (out_lines, resumed) =
+                    capabilities::resume_session(&mut config, &mut wiring, &state_store, &target)
+                        .await;
+                lines = out_lines;
+                if let Some(r) = resumed {
+                    // 提交步的 app 侧一半（§3.3 第 5 步；此后不得再有失败路径）。
+                    //
+                    // **I9：thinking 三方真值必须一次对齐** —— `thinking_visible` 是本
+                    // 进程的持久化镜像，**每回合末无条件写进 meta**（见下方 `Prompt` 臂）。
+                    // 只改 UI 的真值而漏了它 ⇒ 切换后**第一个回合**就把**旧会话**的
+                    // thinking 写进**新会话** meta。
+                    thinking_visible = r.thinking_visible;
+                    // 决策 5：`TurnStats` 由目标 meta 重新播种（「等于重启打开该会话」）。
+                    // `turns`（`Envelope.turn` 的驱动）是「本**进程**回合序」，**不归零**
+                    // —— 两者语义不同，刻意分叉。
+                    stats = crate::seed_stats(&wiring);
+                    session_started = Instant::now();
+                    // **I3：会话路径快照必须刷新** —— 否则退出提示仍指向旧会话。
+                    session_path.record(wiring.session_path());
+                    session_event = Some(Outbound::SessionResumed {
+                        summary: r.summary,
+                        thinking_visible: r.thinking_visible,
+                        history: r.history,
+                    });
+                }
+            }
+        }
+
+        // 会话出站必须抢在 `Output` 之前（I2）——`SessionResumed` 的清屏会吃掉
+        // 其后紧跟的提示，故它排在最前。
+        if let Some(msg) = session_event {
+            send(&out_tx, msg).await?;
         }
 
         // 命令输出走 transcript（设计 §5：命令期间的诊断 → `Outbound::Output`）。
@@ -2205,5 +2258,281 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ─────────────────────── 运行期 `/resume`（U5 / T12） ───────────────────────
+
+    /// 持久 harness + 「可恢复」的配置：env 凭证齐备（`/resume` 的模型解析走档 1
+    /// 短路）+ 一个**每次造全新 `MockModel`** 的 factory（候选 model 由它构建）。
+    /// `replies` 给每次 factory 调用造出的 MockModel 压入若干 `"done"` 文本 ——
+    /// 切换后要跑回合的用例给 `>= 1`。
+    ///
+    /// **初始 model 也预压一条 `"initial"` 文本**：用例若在 `/resume` **之前**先跑
+    /// 一个回合（进程回合序从 1 起），需要它可被完整跑完 —— `MockModel` 无预写响应
+    /// 时 `complete` 的 `remove(0)` 会 panic。仅跑 `/resume`（不先跑回合）的既有
+    /// 用例不受影响（初始 model 不会被调用）。
+    async fn spawn_resumable(replies: usize) -> Harness {
+        let initial = MockModel::new("initial");
+        initial.push_text("initial");
+        spawn_app_loop_with(
+            Box::new(initial),
+            true,
+            Vec::new(),
+            move |config, _tmp| {
+                config.api_base = Some("http://resume-base/v1".into());
+                config.api_key = Some("sk-resume".into());
+                config.set_model_factory(move |_| {
+                    let m = MockModel::new("resumed");
+                    for _ in 0..replies {
+                        m.push_text("done");
+                    }
+                    Some(Box::new(m))
+                });
+            },
+        )
+        .await
+    }
+
+    /// 往 harness 的 `sessions/` 里落一个会话文件（首行 meta + 若干消息）。
+    fn write_target_session(
+        h: &Harness,
+        id: &str,
+        meta: &ys_session::SessionMeta,
+        msgs: &[Message],
+    ) -> PathBuf {
+        let dir = h.tmp.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut content = format!("{}\n", serde_json::to_string(meta).unwrap());
+        for m in msgs {
+            content.push_str(&format!("{}\n", serde_json::to_string(m).unwrap()));
+        }
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// **N3（I2）运行期出站顺序**：`SessionResumed` → `Output` → `View`。
+    ///
+    /// 变异：把 `Request::ResumeSession` 臂的 `session_event` 移到 `Output` 之后
+    /// 投递 ⇒ 本用例断言变红（且真实 UI 侧回放的清屏会吃掉那条提示）。
+    #[tokio::test]
+    async fn resume_emits_session_resumed_then_output_then_view() {
+        let mut h = spawn_resumable(0).await;
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.title = Some("目标会话".into());
+        write_target_session(&h, "target-1", &meta, &[user_message("hello")]);
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-1".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        assert_eq!(msgs.len(), 2, "应恰为 SessionResumed + Output：{msgs:?}");
+        match &msgs[0] {
+            Outbound::SessionResumed {
+                summary,
+                thinking_visible,
+                history,
+            } => {
+                assert_eq!(summary.id, "target-1");
+                assert_eq!(summary.title, "目标会话");
+                assert!(!*thinking_visible, "目标 meta 未开 thinking");
+                assert_eq!(history.len(), 1, "应带目标历史");
+            }
+            other => panic!("第一条出站必须是 SessionResumed（I2）：{other:?}"),
+        }
+        assert!(
+            matches!(&msgs[1], Outbound::Output(t) if t.contains("Resumed session")),
+            "第二条应为成功提示 Output：{msgs:?}"
+        );
+    }
+
+    /// **决策 5（成功路径）**：`/resume` **成功**后进程级回合序 `turns`（`Envelope.turn`
+    /// 的驱动）**不归零**；而 `view.turn_count` 由目标 meta 的 `turns` 重新播种 ——
+    /// 两者**不同源**、刻意分叉。
+    ///
+    /// 既有用例 `resume_without_sessions_dir_prompts_and_turns_not_reset` 钉的是
+    /// **内存会话**（`/resume` 必失败）⇒ `if let Some(r) = resumed` 的**成功块从不
+    /// 执行**，本决策实际无保护。本用例走**持久 harness + 真实会话文件**，让成功块
+    /// 真正执行。
+    ///
+    /// 断言：回合 1 `Envelope.turn == 1`；成功 `/resume` 发 `SessionResumed` 且
+    /// `view.turn_count` 由目标 meta（`turns = 7`）播种；回合 2 `Envelope.turn == 2`
+    /// （不归零），`view.turn_count == 8`（目标 meta 7 + 本回合）—— 与 `Envelope.turn`
+    /// 数字不同，证两者异源。
+    ///
+    /// 变异：在成功块里插入 `turns = 0;`（`stats = seed_stats(...)` 之前）⇒ 回合 2 的
+    /// `Envelope.turn` 变 1 ⇒ 本用例第二条 `turns` 断言变红。
+    #[tokio::test]
+    async fn resume_success_keeps_process_turn_sequence_but_seeds_view_from_target_meta() {
+        let mut h = spawn_resumable(1).await;
+
+        // 回合 1：进程回合序 = 1。
+        h.requests.send(prompt("one")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert_eq!(view.turn_count, 1);
+        let turns: Vec<u32> = events_of(&msgs).iter().map(|e| e.turn).collect();
+        assert!(
+            !turns.is_empty() && turns.iter().all(|&t| t == 1),
+            "回合 1 的 Envelope.turn 应为 1：{turns:?}"
+        );
+
+        // 目标会话：meta.turns = 7（**刻意 ≠ 进程回合序**）⇒ 播种后 view.turn_count = 7。
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.turns = 7;
+        write_target_session(&h, "target-meta", &meta, &[user_message("prior")]);
+
+        // **成功** `/resume` ⇒ 必须发出 `SessionResumed`（证明走的是成功块）。
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-meta".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert!(
+            matches!(msgs.first(), Some(Outbound::SessionResumed { .. })),
+            "成功 /resume 必须发 SessionResumed：{msgs:?}"
+        );
+        assert_eq!(view.turn_count, 7, "view.turn_count 应由目标 meta.turns 播种");
+
+        // 回合 2：`turns` 不归零 ⇒ Envelope.turn = 2；`stats` 在 7 上 +1 ⇒ 8。
+        h.requests.send(prompt("two")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let turns: Vec<u32> = events_of(&msgs).iter().map(|e| e.turn).collect();
+        assert!(
+            !turns.is_empty() && turns.iter().all(|&t| t == 2),
+            "进程回合序不因 /resume 归零：Envelope.turn 应为 2，得到 {turns:?}"
+        );
+        assert_eq!(
+            view.turn_count, 8,
+            "view.turn_count 走目标 meta(7) + 本回合 ⇒ 与 Envelope.turn(2) 不同源"
+        );
+    }
+
+    /// **N7（I9）thinking 镜像变异**：目标会话 `T_target = true`、当前（新）会话
+    /// 无 meta ⇒ `T_old = false`。切换后跑**一个回合**，断言**目标文件 meta** 的
+    /// `thinking_visible == T_target`。
+    ///
+    /// 变异：删掉 `Request::ResumeSession` 臂里的 `thinking_visible = r.thinking_visible`
+    /// ⇒ 镜像仍是旧值 false ⇒ 下一回合把 false 写进目标 meta ⇒ 本用例变红。
+    #[tokio::test]
+    async fn resume_resets_thinking_mirror_so_next_turn_writes_target_value() {
+        let mut h = spawn_resumable(1).await;
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.thinking_visible = true; // T_target = true ≠ T_old（新会话默认 false）
+        let path = write_target_session(&h, "target-think", &meta, &[]);
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-think".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        // 切换后跑一个回合 —— 回合末无条件把进程级镜像写进**目标** meta。
+        h.requests.send(prompt("hi")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        assert!(
+            read_meta_thinking(&path),
+            "切换后第一回合必须把**目标**的 thinking(true) 写进目标 meta \
+             —— 漏了镜像重设就会写回旧会话的 false"
+        );
+    }
+
+    /// **I4**：空列表**照发** `SessionList(vec![])`（UI 据此提示，不弹空浮层）。
+    #[tokio::test]
+    async fn list_sessions_sends_empty_list_when_dir_empty() {
+        let mut h = spawn_resumable(0).await;
+        // 启动的新会话是**惰性**的：未追加前 sessions 目录为空。
+
+        h.requests.send(Request::ListSessions).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        match msgs.as_slice() {
+            [Outbound::SessionList(items)] => assert!(items.is_empty(), "空列表照发（I4）"),
+            other => panic!("应发 SessionList(vec![])：{other:?}"),
+        }
+    }
+
+    /// `/resume` 无参：目录里有会话时列出它（id + 标题）。
+    #[tokio::test]
+    async fn list_sessions_returns_existing_sessions() {
+        let mut h = spawn_resumable(0).await;
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.title = Some("可恢复".into());
+        write_target_session(&h, "listed-1", &meta, &[]);
+
+        h.requests.send(Request::ListSessions).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        match msgs.as_slice() {
+            [Outbound::SessionList(items)] => {
+                assert_eq!(items.len(), 1, "{items:?}");
+                assert_eq!(items[0].id, "listed-1");
+                assert_eq!(items[0].title, "可恢复");
+            }
+            other => panic!("应发 SessionList：{other:?}"),
+        }
+    }
+
+    /// **N11（I13 + 决策 5）**：内存会话（`sessions_dir == None`）⇒
+    /// `/resume` 与列表请求**只有** `Output`、**不发** `SessionList` / `SessionResumed`；
+    /// 且 `Envelope.turn` **不归零**（切换/内存会话不重置进程级回合序）。
+    #[tokio::test]
+    async fn resume_without_sessions_dir_prompts_and_turns_not_reset() {
+        let model = MockModel::new("m");
+        model.push_text("a");
+        model.push_text("b");
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        // 回合 1（进程回合序 = 1）。
+        h.requests.send(prompt("one")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let v = take_view(&mut msgs);
+        assert_eq!(v.turn_count, 1);
+
+        // 列表：内存会话 ⇒ 只有 Output，无 SessionList（I13）。
+        h.requests.send(Request::ListSessions).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            matches!(msgs.as_slice(), [Outbound::Output(_)]),
+            "内存会话不得发 SessionList：{msgs:?}"
+        );
+
+        // 恢复：内存会话 ⇒ 只有 Output，无 SessionResumed。
+        h.requests
+            .send(Request::ResumeSession {
+                target: "whatever".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            matches!(msgs.as_slice(), [Outbound::Output(_)]),
+            "内存会话不得发 SessionResumed：{msgs:?}"
+        );
+
+        // 回合 2：`turns` 不因上面的请求归零 —— 仍递增到 2。
+        h.requests.send(prompt("two")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let v = take_view(&mut msgs);
+        assert_eq!(v.turn_count, 2, "turns 是进程级回合序，不因切换归零");
+        let turns: Vec<u32> = events_of(&msgs).iter().map(|e| e.turn).collect();
+        assert!(turns.iter().all(|&t| t == 2), "{turns:?}");
     }
 }

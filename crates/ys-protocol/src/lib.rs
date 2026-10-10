@@ -28,8 +28,10 @@ mod boundary;
 mod envelope;
 mod lifecycle;
 mod request;
+mod session;
 
 pub use boundary::*;
 pub use envelope::*;
 pub use lifecycle::*;
 pub use request::*;
+pub use session::*;

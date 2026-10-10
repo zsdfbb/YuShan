@@ -596,7 +596,8 @@ flowchart LR
 
 ## 12. 会话落盘与恢复
 
-**默认新会话；恢复只走显式 `--resume`。** `Wiring` 拆成 `persistent_new`（默认）与 `resume`（显式），
+**默认新会话；恢复走显式入口 —— 启动期 `--resume` flag，运行期 `/resume` 命令，两者共用同一套
+模型 / 统计 / 历史语义。** `Wiring` 拆成 `persistent_new`（默认）与 `resume`（显式），
 删除了 `latest_session_path` 的隐式「恢复最近」。会话状态写进 JSONL **首行的 meta**（无 sidecar），
 `JsonlSession` 全量重写时保住它。
 
@@ -632,13 +633,20 @@ flowchart TB
 不预建**（首次 `append` 才落盘）。会话目录非空时，启动期给一行 `Resume with --resume` 提示（TUI 走
 transcript，`-p` / `--json` 走 stderr）。
 
-**恢复只走显式 `--resume`**：
+**启动期恢复走显式 `--resume`**：
 
 - `--resume=<id>` → `sessions::resolve`：先 `dir/{id}.jsonl`、再按字面路径；未命中 ⇒ stderr 报错 + `exit(1)`。
 - 裸 `--resume` → `sessions::list`（**mtime DESC**）+ `sessions::pick`。**空列表回落默认新会话**
   （stderr 一行提示，不报错）；**非 TTY** ⇒ stderr 打印列表 + 提示改用 `--resume=<id>` 后报错退出。
 - 解析与 pick 都在**起屏 / 建 runtime 之前**（读回的 meta 参与模型选择）；picker 的列表 / 提示 /
   错误**一律 stderr**（`-p` 的 stdout 是模型文本、`--json` 的 stdout 是逐行 `Envelope`）。
+
+**运行期恢复走 `/resume` 命令**（仅 TUI；`-p` / `--json` 是一次性进程，无运行期切换）：无参时浮层
+列出既有会话（`Request::ListSessions` → `Outbound::SessionList`），有参（`/resume <id>`）直切；两者最终
+都发 `Request::ResumeSession{target}`。app 侧把「恢复一个既有会话」做成与启动期**共用的能力路径** ——
+同一条模型优先级链、同样的统计播种（`TurnStats` 由 meta 落值、`session_started` 不恢复）、同一份历史
+（经 `Outbound::SessionResumed` 回放上屏）。切换失败**不改状态**；切换是**替换而非合并** —— `Wiring.session`
+整体替换、内存里的旧 transcript 被丢弃、**磁盘上的旧文件不删**（`/new` 同此）。
 
 **meta 首行**（可缺省）：形状
 `{"type":"meta","v":1,"title":…,"provider":…,"model":…,"thinking_visible":…,"input_tokens":…,"output_tokens":…,"turns":…,"created_at":…}`；
@@ -703,7 +711,7 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 
 ## 14. `ys-tui-coding` 形态与命令分工
 
-**表在 TUI 侧**（`crates/ys-tui-coding/src/commands.rs`，11 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`crates/ys-tui-coding/src/commands.rs`，13 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app（`capabilities.rs`）。二者唯一契约是 `Request` ——
 漏实现是**编译错误**（app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -722,6 +730,7 @@ flowchart TB
 |---|---|---|
 | `/help [command]` | 本地打印命令表（有参只给该条） | — |
 | `/status` | 本地（`CodingView` 在 TUI 手里） | — |
+| `/skills` | **浮层选择** skill，选中后把 `/<command> ` 回填输入框（**不发请求**） | — |
 | `/copy` | 本地（最后一条 assistant 回复写进 transcript，**无剪贴板依赖**） | — |
 | `/quit` | 本地 | — |
 | `/thinking [on\|off]` | 本地开关（thinking 默认隐藏，开启后暗色渲染） | — |
@@ -729,6 +738,7 @@ flowchart TB
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
 | `/new` | — | `NewSession` |
+| `/resume [id]` | 无参时**浮层选择**（会话列表，Esc 取消）；有参**直切** | `ListSessions` / `ResumeSession` |
 | `/compact` | — | `Compact` |
 | `/export [path]` | — | `Export` |
 
@@ -737,8 +747,10 @@ flowchart TB
 `TuiPrompter` 把同一套问答画成嵌套事件循环的模态浮层。任一问答步骤取消 → **不产生任何 `Request`**。
 
 **app 侧能力**（`apps/coding-agent/src/capabilities.rs`）：`login` / `logout` / `set_model` /
-`new_session` / `compact` / `export`，每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
-`Outbound::Output`。
+`new_session` / `compact` / `export` 每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
+`Outbound::Output`；`list_sessions` 返回 `Vec<SessionSummary>`（走 `Outbound::SessionList`）；
+`resume_session` 返回「文本行 + 可选 `ResumedSession`」（成功后由 `app_loop` 组装
+`Outbound::SessionResumed`）。
 
 ### UI 形态
 

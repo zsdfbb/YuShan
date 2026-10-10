@@ -477,7 +477,7 @@ fn raw_and_expanded_task(task: String, skills: &[skills::SkillEntry]) -> (String
 }
 
 /// 由 meta 播种回合统计（resume 后状态行的累计不归零；`Envelope.turn` 仍从 1 起）。
-fn seed_stats(wiring: &Wiring) -> status::TurnStats {
+pub(crate) fn seed_stats(wiring: &Wiring) -> status::TurnStats {
     let mut stats = status::TurnStats::default();
     if let Some(m) = wiring.meta() {
         stats.total_input_tokens = m.input_tokens;
@@ -685,6 +685,97 @@ fn sessions_dir_has_entries(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|mut it| it.next().is_some())
         .unwrap_or(false)
+}
+
+/// 模型选择的**纯解析结果** —— [`resolve_model_from_meta`] 的产物。
+///
+/// 纯数据：调用方决定何时写回 `Config`（启动期立即写；运行期 `/resume` 在提交步写）。
+pub(crate) struct ModelChoice {
+    pub provider: Option<String>,
+    pub api_base: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+/// 按**既定优先级链**纯解析出要用的模型四字段（**不写 `cfg`**）：
+///
+/// 1. **env 完整凭证**（`cfg.is_configured()`）⇒ 原样取 `cfg` 的四字段；
+/// 2. `meta` 的 `provider` + `model`（`provider` 须 `registry.auth_for` 命中）；
+/// 3. `state` 的 last-active `provider` + `model`（`provider` 须为**已知 provider**且
+///    有凭证）；
+/// 4. 第一个存有凭证的内置 provider。
+///
+/// 某档的 provider 无凭证时**降级到下一档而非失败**；全部耗尽 ⇒ `None`。启动期与
+/// 运行期 `/resume` 共用这一条链（设计 §5.6 / §3.3）。
+pub(crate) fn resolve_model_from_meta(
+    cfg: &config::Config,
+    meta: Option<&ys_session::SessionMeta>,
+    state: Option<&state::AppState>,
+) -> Option<ModelChoice> {
+    // 档 1：env 完整凭证 —— 原样保留（等价于启动期的 `if !is_configured()` 短路）。
+    if cfg.is_configured() {
+        return Some(ModelChoice {
+            provider: cfg.provider.clone(),
+            api_base: cfg.api_base.clone().unwrap_or_default(),
+            api_key: cfg.api_key.clone().unwrap_or_default(),
+            model: cfg.model.clone(),
+        });
+    }
+
+    // 档 2：resume meta（provider 须有 auth entry；不看是否为已知 provider）。
+    if let Some(provider) = meta.and_then(|m| m.provider.as_deref())
+        && let Some(entry) = cfg.registry.auth_for(provider)
+    {
+        let model = meta
+            .and_then(|m| m.model.clone())
+            .unwrap_or_else(|| entry.model.clone());
+        return Some(ModelChoice {
+            provider: Some(provider.to_string()),
+            api_base: entry.api_base.clone(),
+            api_key: entry.api_key.clone(),
+            model,
+        });
+    }
+
+    // 档 3：state.json 的 last-active（provider 须为已知 provider 且有凭证）。
+    if let Some(state) = state
+        && let Some(recovered) = state
+            .last_active_provider
+            .as_deref()
+            .and_then(|name| cfg.registry.find_provider(name))
+            .zip(
+                state
+                    .last_active_provider
+                    .as_deref()
+                    .and_then(|name| cfg.registry.auth_for(name)),
+            )
+    {
+        let (provider, entry) = recovered;
+        let model = state
+            .last_active_model
+            .clone()
+            .unwrap_or_else(|| entry.model.clone());
+        return Some(ModelChoice {
+            provider: Some(provider.name.clone()),
+            api_base: entry.api_base.clone(),
+            api_key: entry.api_key.clone(),
+            model,
+        });
+    }
+
+    // 档 4：第一个存有凭证的内置 provider。
+    for provider in cfg.registry.providers() {
+        if let Some(entry) = cfg.registry.auth_for(&provider.name) {
+            return Some(ModelChoice {
+                provider: Some(provider.name.clone()),
+                api_base: entry.api_base.clone(),
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+            });
+        }
+    }
+
+    None
 }
 
 /// `-p` / `--json` 单回合收尾：由 meta 播种统计、`record(usage)` 后写穿 meta，
@@ -930,6 +1021,41 @@ fn exit_with_code(code: i32) {
     }
 }
 
+/// 启动期要入队的出站序列，按**入队顺序**排列。
+///
+/// **顺序不变量（I10）**：`--resume` 的回放（`SessionResumed`）必须排在启动降级提示
+/// **之前** —— 反了的话，回放触发的 UI 清屏会把先入队的提示吃掉。这是启动期唯一
+/// 给出该次序的地方，`run_interactive` 只按返回的次序投递。
+fn startup_outbound_sequence(
+    replay: Option<Outbound<CodingView>>,
+    hint: Option<String>,
+) -> Vec<Outbound<CodingView>> {
+    let mut out = Vec::new();
+    if let Some(msg) = replay {
+        out.push(msg);
+    }
+    if let Some(hint) = hint {
+        out.push(Outbound::Output(hint));
+    }
+    out
+}
+
+/// 启动期回放载荷：仅在**本次带 `--resume`**（`resuming`）时构造 `Outbound::SessionResumed`
+/// —— 让恢复的会话历史上屏（设计 D3）。`history` / `thinking_visible` 取自接线器已恢复
+/// 的会话。
+fn resume_replay(wiring: &Wiring, resuming: bool) -> Option<Outbound<CodingView>> {
+    if !resuming {
+        return None;
+    }
+    let path = wiring.session_path()?;
+    let meta = wiring.meta();
+    Some(Outbound::SessionResumed {
+        summary: capabilities::session_summary(path, meta),
+        thinking_visible: meta.map(|m| m.thinking_visible).unwrap_or(false),
+        history: wiring.session_messages().to_vec(),
+    })
+}
+
 /// TUI 模式的全部组装（设计 §7 初始化顺序 1–5）。
 ///
 /// **必须在非 async 线程上调用末尾的 UI 循环** —— 故这里只做「异步初始化 +
@@ -962,8 +1088,10 @@ fn run_interactive(
     //    有 resume 路径 ⇒ 恢复它；否则默认新会话（惰性落盘）。
     let model = config.build_model();
     let wiring = rt.block_on(async {
-        match resume_path {
-            Some(path) => Wiring::resume(model, Box::new(sink), sessions_dir, path).await,
+        match resume_path.as_deref() {
+            Some(path) => {
+                Wiring::resume(model, Box::new(sink), sessions_dir, path.to_path_buf()).await
+            }
             None => Wiring::persistent_new(model, Box::new(sink), sessions_dir).await,
         }
     })?;
@@ -1008,16 +1136,24 @@ fn run_interactive(
     let (boundary_tx, boundary_rx) = mpsc::channel::<Boundary>(BOUNDARY_CAPACITY);
     let (out_tx, out_rx) = mpsc::channel::<Outbound<CodingView>>(OUTBOUND_CAPACITY);
 
-    // 4b. 启动期降级提示 → transcript（**不是 stderr**）。
+    // 4b. 启动期入队：**先回放（`--resume`）、后降级提示**（顺序不变量 I10）。
+    //
+    // 带 `--resume` 时把历史经 `Outbound::SessionResumed` 交给 UI —— `App::new` 的
+    // transcript 恒空，不回放则恢复的会话在屏上是空的（设计 D3）。
+    //
+    // **顺序不可反**：回放触发 UI 侧的清屏（`reset_for_replay`），若降级提示先入队，
+    // 它会被这次清屏吃掉 —— 正是 I10 要防的 bug。故二者由
+    // [`startup_outbound_sequence`] 统一给出次序，本地不再各投各的。
     //
     // 起屏前写 stderr 的行会留在主屏缓冲区里，退出 alt-screen 后又回到屏幕上，
     // 成为残渣（设计 §5 的「命令期间 → `Outbound::Output`」在启动期的延伸）。
-    // 在 spawn 之前投递 ⇒ 它是信道里的第一条，稳稳排在对话之前。
+    // 在 spawn 之前投递 ⇒ 它在信道里稳稳排在对话之前。
     // 容量 1024 且信道全新 ⇒ `try_send` 不可能失败；真失败也只落日志，不 panic。
-    if let Some(hint) = startup_hint
-        && let Err(e) = out_tx.try_send(Outbound::Output(hint))
-    {
-        logging::log(&format!("failed to enqueue startup hint: {e}"));
+    let replay = resume_replay(&wiring, resume_path.is_some());
+    for msg in startup_outbound_sequence(replay, startup_hint) {
+        if let Err(e) = out_tx.try_send(msg) {
+            logging::log(&format!("failed to enqueue startup outbound: {e}"));
+        }
     }
 
     // 5. app 线程（tokio worker）跑循环；当前线程跑**阻塞**的 UI 循环。
@@ -1103,52 +1239,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 模型解析（优先级，设计 §5.6）：env 完整凭证 > resume meta（provider 须有凭证）
     // > state.json（last-active provider+model）> 第一个存有凭证的 provider。
-    // provider 无凭证时**降级而非失败**。
-    if !config.is_configured() {
-        let from_meta = resume_meta.as_ref().and_then(|m| {
-            let provider = m.provider.as_deref()?;
-            let entry = config.registry.auth_for(provider)?;
-            Some((provider.to_string(), entry, m.model.clone()))
-        });
-        if let Some((provider, entry, model)) = from_meta {
-            config.api_base = Some(entry.api_base.clone());
-            config.api_key = Some(entry.api_key.clone());
-            config.model = model.unwrap_or_else(|| entry.model.clone());
-            config.provider = Some(provider);
-        } else {
-            // state.json 恢复：last_active_provider + 匹配的 auth entry
-            let recovered = saved_state
-                .last_active_provider
-                .as_deref()
-                .and_then(|name| config.registry.find_provider(name))
-                .zip(
-                    saved_state
-                        .last_active_provider
-                        .as_deref()
-                        .and_then(|name| config.registry.auth_for(name)),
-                );
-
-            if let Some((provider, entry)) = recovered {
-                config.api_base = Some(entry.api_base.clone());
-                config.api_key = Some(entry.api_key.clone());
-                config.model = saved_state
-                    .last_active_model
-                    .clone()
-                    .unwrap_or_else(|| entry.model.clone());
-                config.provider = Some(provider.name.clone());
-            } else {
-                // 回退：第一个存有凭证的 provider
-                for provider in config.registry.providers() {
-                    if let Some(entry) = config.registry.auth_for(&provider.name) {
-                        config.api_base = Some(entry.api_base.clone());
-                        config.api_key = Some(entry.api_key.clone());
-                        config.model = entry.model.clone();
-                        config.provider = Some(provider.name.clone());
-                        break;
-                    }
-                }
-            }
-        }
+    // provider 无凭证时**降级而非失败**。整条链抽成**纯函数** `resolve_model_from_meta`
+    // —— 启动期与运行期 `/resume` 共用，杜绝两处漂移。
+    if let Some(choice) = resolve_model_from_meta(&config, resume_meta.as_ref(), Some(&saved_state))
+    {
+        config.provider = choice.provider;
+        config.api_base = Some(choice.api_base);
+        config.api_key = Some(choice.api_key);
+        config.model = choice.model;
     }
 
     // 窗口配置接线（U6b）—— 必须在 **provider 恢复之后**：`context_window()` 按
@@ -1419,6 +1517,7 @@ mod tests {
     use ys_protocol::Source;
     use ys_tools_web::FetchedDir;
 
+    use crate::provider::AuthEntry;
     use crate::test_env::{EnvRestore, env_lock};
 
     /// 进程内唯一临时目录（**原子序号 + `process::id()`**，与 `toolset.rs` 同规）：
@@ -2818,6 +2917,252 @@ mod tests {
         assert_eq!(meta.input_tokens, 7);
         assert_eq!(meta.output_tokens, 5);
         assert_eq!(meta.turns, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────── 运行期 `/resume`：模型解析纯函数 + 启动期顺序（T10 / N4） ─────────────
+
+    /// 造一份**未配置**（无 env 凭证）的 `Config`，auth 落临时目录。
+    fn unconfigured_config(tag: &str) -> (config::Config, PathBuf) {
+        let dir = unique_tmp_dir(tag);
+        let mut cfg = config::Config::from_env().unwrap();
+        cfg.api_base = None;
+        cfg.api_key = None;
+        cfg.provider = None;
+        cfg.model = "cfg-default-model".into();
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        (cfg, dir)
+    }
+
+    fn auth(api_base: &str, api_key: &str, model: &str) -> AuthEntry {
+        AuthEntry {
+            api_base: api_base.into(),
+            api_key: api_key.into(),
+            model: model.into(),
+        }
+    }
+
+    fn meta_with(provider: Option<&str>, model: Option<&str>) -> ys_session::SessionMeta {
+        let mut m = ys_session::SessionMeta::new(0);
+        m.provider = provider.map(str::to_string);
+        m.model = model.map(str::to_string);
+        m
+    }
+
+    /// **T10 —— 四档优先级链**：env 完整凭证 > meta（provider 须 `auth_for` 命中）
+    /// > state.json > 首个有凭证者；provider 无凭证时**降级而非失败**。
+    ///
+    /// 与 `apps/coding-agent/tests/session_cli.rs` 组 3 的五例同源（那里钉的是子进程
+    /// 实发的 `"model"`）—— 本函数是它们的**纯函数版**。
+    #[test]
+    fn resolve_model_from_meta_follows_priority_chain() {
+        let _guard = crate::test_env::env_lock();
+
+        // ---- 档 1：env 完整凭证 ⇒ 原样取 cfg（即便 meta 指向别的 provider）。----
+        let (mut cfg, dir) = unconfigured_config("rmfm_env");
+        cfg.api_base = Some("http://env-base/v1".into());
+        cfg.api_key = Some("sk-env".into());
+        cfg.model = "env-model".into();
+        cfg.registry
+            .save_auth("minimax", &auth("http://minimax/v1", "sk-mm", "mm-default"))
+            .unwrap();
+        let choice = resolve_model_from_meta(
+            &cfg,
+            Some(&meta_with(Some("minimax"), Some("meta-model"))),
+            None,
+        )
+        .expect("env 档应有结果");
+        assert_eq!(choice.api_base, "http://env-base/v1");
+        assert_eq!(choice.api_key, "sk-env");
+        assert_eq!(choice.model, "env-model", "env 凭证必须压过 meta");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ---- 档 2：meta 的 provider + model（provider 须 auth_for 命中）。----
+        let (mut cfg, dir) = unconfigured_config("rmfm_meta");
+        cfg.registry
+            .save_auth("minimax", &auth("http://minimax/v1", "sk-mm", "mm-default"))
+            .unwrap();
+        let choice =
+            resolve_model_from_meta(&cfg, Some(&meta_with(Some("minimax"), Some("meta-model"))), None)
+                .expect("meta 档");
+        assert_eq!(choice.provider.as_deref(), Some("minimax"));
+        assert_eq!(choice.api_base, "http://minimax/v1");
+        assert_eq!(choice.api_key, "sk-mm");
+        assert_eq!(choice.model, "meta-model");
+
+        // 档 2b：meta.model 为 None ⇒ 回落 entry.model。
+        let choice =
+            resolve_model_from_meta(&cfg, Some(&meta_with(Some("minimax"), None)), None).unwrap();
+        assert_eq!(choice.model, "mm-default", "meta.model 为空应回落 entry.model");
+
+        // 档 2c：meta 的 provider **无凭证** ⇒ 降级（不失败）到下一档。
+        cfg.registry
+            .save_auth("deepseek", &auth("http://ds/v1", "sk-ds", "ds-default"))
+            .unwrap();
+        // 无 state ⇒ 落到档 4（首个有凭证者，注册序 deepseek 在前）。
+        let choice =
+            resolve_model_from_meta(&cfg, Some(&meta_with(Some("ghost"), Some("ghost-model"))), None)
+                .expect("降级到档 4");
+        assert_eq!(
+            choice.provider.as_deref(),
+            Some("deepseek"),
+            "无凭证的 meta provider 应降级，不得启用"
+        );
+        assert_ne!(choice.model, "ghost-model");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ---- 档 3：state.json 的 last-active。----
+        let (mut cfg, dir) = unconfigured_config("rmfm_state");
+        cfg.registry
+            .save_auth("deepseek", &auth("http://ds/v1", "sk-ds", "ds-default"))
+            .unwrap();
+        cfg.registry
+            .save_auth("minimax", &auth("http://mm/v1", "sk-mm", "mm-default"))
+            .unwrap();
+        let state = crate::state::AppState {
+            last_active_provider: Some("minimax".into()),
+            last_active_model: Some("state-model".into()),
+        };
+        let choice = resolve_model_from_meta(&cfg, None, Some(&state)).expect("state 档");
+        assert_eq!(choice.provider.as_deref(), Some("minimax"));
+        assert_eq!(choice.model, "state-model");
+
+        // 档 3 的 provider 是**未知** provider ⇒ 降级到档 4。
+        let unknown = crate::state::AppState {
+            last_active_provider: Some("nope".into()),
+            last_active_model: Some("nope-model".into()),
+        };
+        let choice = resolve_model_from_meta(&cfg, None, Some(&unknown)).expect("降级到档 4");
+        assert_eq!(
+            choice.provider.as_deref(),
+            Some("deepseek"),
+            "未知 provider 应降级到首个有凭证者"
+        );
+        assert_ne!(choice.model, "nope-model");
+
+        // 档 4：无 meta / 无 state ⇒ 首个有凭证者（注册序 deepseek 在前）。
+        let choice = resolve_model_from_meta(&cfg, None, None).expect("档 4");
+        assert_eq!(choice.provider.as_deref(), Some("deepseek"));
+        assert_eq!(choice.model, "ds-default");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ---- 全部耗尽：无任何凭证 ⇒ None（降级到耗尽，不 panic、不 Err）。----
+        let (cfg, dir) = unconfigured_config("rmfm_none");
+        assert!(
+            resolve_model_from_meta(&cfg, None, None).is_none(),
+            "无凭证 ⇒ None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **N4（I10）—— 启动期出站顺序**：`--resume` 的回放（`SessionResumed`）必须排在
+    /// 启动降级提示**之前** —— 反序会让回放触发的 UI 清屏把提示吃掉。
+    ///
+    /// 变异：把 `startup_outbound_sequence` 的两个 push 对调 ⇒ 本用例第一条断言变红。
+    #[test]
+    fn startup_outbound_sequence_puts_replay_before_hint() {
+        let replay = Outbound::<CodingView>::SessionResumed {
+            summary: ys_protocol::SessionSummary {
+                id: "sess-1".into(),
+                path: PathBuf::from("/tmp/sess-1.jsonl"),
+                mtime: SystemTime::UNIX_EPOCH,
+                title: "标题".into(),
+            },
+            thinking_visible: true,
+            history: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+        };
+
+        let seq = startup_outbound_sequence(Some(replay), Some("降级提示".into()));
+        assert_eq!(seq.len(), 2);
+        assert!(
+            matches!(seq[0], Outbound::SessionResumed { .. }),
+            "回放必须排在最前（I10）：{seq:?}"
+        );
+        assert!(
+            matches!(&seq[1], Outbound::Output(t) if t == "降级提示"),
+            "启动提示排在回放之后：{seq:?}"
+        );
+
+        // 无回放时只剩提示；无提示时只剩回放。
+        assert!(matches!(
+            startup_outbound_sequence(None, Some("h".into())).as_slice(),
+            [Outbound::Output(_)]
+        ));
+        assert!(matches!(
+            startup_outbound_sequence(Some(Outbound::Quit), None).as_slice(),
+            [Outbound::Quit]
+        ));
+    }
+
+    /// `resume_replay` 的**构造本身**（区别于 `startup_outbound_sequence` 只管顺序）：
+    /// 带 `--resume`（`resuming = true`）时**真的**从接线器已恢复的会话造出
+    /// `SessionResumed` —— `history` 非空、`thinking_visible` 取自目标 meta；不带时
+    /// 恒 `None`（不回放）。既有用例只喂**手工构造**的 replay，不证「带 `--resume`
+    /// 时 replay 真的会被构造出来」。
+    ///
+    /// 变异：删掉 `if !resuming { return None; }` ⇒ 第二条断言变红；把 `history` 改成
+    /// `Vec::new()` ⇒ 第一条的 `history.len()` 断言变红。
+    #[tokio::test]
+    async fn resume_replay_builds_session_resumed_only_when_resuming() {
+        let dir = unique_tmp_dir("resume_replay");
+        let path = dir.join("sess-replay.jsonl");
+
+        // 手写一份含 meta + 两条消息的会话文件（`Wiring::resume` 读回）。
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.title = Some("回放目标".into());
+        meta.thinking_visible = true;
+        let mut content = format!("{}\n", serde_json::to_string(&meta).unwrap());
+        for m in [
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "旧问题".into(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "旧回答".into(),
+                }],
+            },
+        ] {
+            content.push_str(&format!("{}\n", serde_json::to_string(&m).unwrap()));
+        }
+        std::fs::write(&path, content).unwrap();
+
+        let wiring = Wiring::resume(
+            None,
+            Box::new(ys_event::CollectingSink::new()),
+            dir.clone(),
+            path.clone(),
+        )
+        .await
+        .unwrap();
+
+        // 带 `--resume` ⇒ 构造出回放：history 非空、thinking 取自 meta、id/标题正确。
+        match resume_replay(&wiring, true) {
+            Some(Outbound::SessionResumed {
+                summary,
+                thinking_visible,
+                history,
+            }) => {
+                assert_eq!(summary.id, "sess-replay");
+                assert_eq!(summary.title, "回放目标");
+                assert!(thinking_visible, "thinking 取自目标 meta");
+                assert_eq!(history.len(), 2, "history 应含会话全部消息：{history:?}");
+            }
+            other => panic!("带 --resume 必须构造 SessionResumed：{other:?}"),
+        }
+
+        // 不带 `--resume` ⇒ 不回放。
+        assert!(
+            resume_replay(&wiring, false).is_none(),
+            "未带 --resume 不得构造回放"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

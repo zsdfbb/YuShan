@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ys_core::Message;
 
-use crate::Envelope;
+use crate::{Envelope, SessionSummary};
 
 /// UI → app 的能力请求（设计 §6）。
 ///
@@ -44,6 +44,10 @@ pub enum Request {
     /// 导出会话：`Some(path)` 为用户显式指定的路径，`None` 表示**由 app 侧
     /// 决定默认落点**（设计 §6「会话文件在 app 侧」）—— UI 不替 app 猜路径。
     Export { path: Option<PathBuf> },
+    /// 列出既有会话（`/resume` 无参）。只读元数据，不加载消息体。
+    ListSessions,
+    /// 恢复既有会话。`target` 交给 app 侧 `sessions::resolve` 解析（id 或路径）。
+    ResumeSession { target: String },
 }
 
 /// app → UI 的出站消息（设计 §6）。
@@ -59,17 +63,31 @@ pub enum Outbound<V> {
     View(V),
     /// 命令输出 → transcript。
     Output(String),
+    /// 会话列表（`Request::ListSessions` 的响应）。**空列表也要发** —— 让 UI
+    /// 能提示「没有可恢复的会话」。
+    SessionList(Vec<SessionSummary>),
+    /// 会话已恢复 —— UI 见它即「清屏 + 回放」。三样必须**同时**生效，故装在同
+    /// 一条消息里：分开传会出现「模型换了但屏上还是旧会话」的中间态。
+    SessionResumed {
+        summary: SessionSummary,
+        /// 目标会话 meta 的 thinking 开关（照启动期 `--resume` 的初值语义）。
+        thinking_visible: bool,
+        /// 目标会话的完整历史 —— UI 侧负责转成 transcript 行。
+        history: Vec<Message>,
+    },
     /// 退出。
     Quit,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
     use serde_json::json;
     use ys_core::{ContentBlock, Role, ToolCallId};
 
-    use crate::Boundary;
+    use crate::{Boundary, SessionSummary};
 
     /// 本地测试视图 —— 只用标准 derive 实现 serde，用来实例化
     /// `Outbound<TestView>`，验证泛型 derive 为 `V` 加上的
@@ -208,6 +226,136 @@ mod tests {
     #[test]
     fn test_outbound_quit_roundtrip() {
         assert_roundtrip(&Outbound::<TestView>::Quit);
+    }
+
+    /// 确定性构造的 `SessionSummary`（`mtime` 用固定 epoch 偏移而非 `now()`，
+    /// 保证用例可复现）。覆盖 `PathBuf` / `SystemTime` 的 serde 往返。
+    fn sample_summary() -> SessionSummary {
+        SessionSummary {
+            id: "2026-10-10-abc123".into(),
+            path: PathBuf::from("/tmp/sessions/2026-10-10-abc123.jsonl"),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_760_000_000),
+            title: "修复 UTF-8 边界".into(),
+        }
+    }
+
+    #[test]
+    fn test_request_list_sessions_roundtrip() {
+        assert_roundtrip(&Request::ListSessions);
+    }
+
+    #[test]
+    fn test_request_resume_session_roundtrip() {
+        assert_roundtrip(&Request::ResumeSession {
+            target: "2026-10-10-abc123".into(),
+        });
+    }
+
+    /// `SessionList` 非空：`SessionSummary` 的 `PathBuf` / `SystemTime` 字段
+    /// 必须真的能经 JSON 往返（漏测则 app 侧回声列表时字段可能被静默丢失）。
+    #[test]
+    fn test_outbound_session_list_roundtrip() {
+        assert_roundtrip(&Outbound::<TestView>::SessionList(vec![sample_summary()]));
+    }
+
+    /// `SessionResumed` 三样（summary / thinking_visible / history）必须同时往返。
+    /// `history` 里放一条带 `ToolUse` 的 assistant 消息，覆盖 ys-core 的 serde
+    /// （`arguments` 是 `Value`）。
+    ///
+    /// 变异：给 `thinking_visible` 加 `#[serde(skip)]`（令其不参与 roundtrip）
+    /// ⇒ 本用例变红 —— 断言 thinking 开关随同一条消息一起送达，不会出现
+    /// 「模型换了但屏上还是旧会话」的中间态。
+    #[test]
+    fn test_outbound_session_resumed_roundtrip() {
+        let history = vec![
+            text_message(Role::User, "你好"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "calling".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: ToolCallId("call_9".into()),
+                        name: "bash".into(),
+                        arguments: json!({ "cmd": "ls", "flag": false }),
+                    },
+                ],
+            },
+        ];
+        assert_roundtrip(&Outbound::<TestView>::SessionResumed {
+            summary: sample_summary(),
+            thinking_visible: true,
+            history,
+        });
+    }
+
+    /// **向后兼容**：新变体是纯追加，既有变体的线格式不变 —— 旧形态 JSON
+    /// （单元变体裸串 + 结构变体外部标签）必须仍能反序列化。
+    #[test]
+    fn test_legacy_request_variants_still_deserialize() {
+        assert_eq!(
+            serde_json::from_value::<Request>(json!("NewSession")).unwrap(),
+            Request::NewSession
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({ "SetModel": { "model": "gpt-4o" } })).unwrap(),
+            Request::SetModel {
+                model: "gpt-4o".into()
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({ "Export": { "path": null } })).unwrap(),
+            Request::Export { path: None }
+        );
+    }
+
+    /// 既有的 `Outbound` **线格式**（外部标签 + 单元变体裸串 + 新类型变体载荷）。
+    ///
+    /// roundtrip 只保证 ser/de **自洽**：对**对称改动**（给 `Outbound` 整体加
+    /// `#[serde(tag = "kind")]`、重命名某字段）依旧通过，但真实信道上旧对端会解析
+    /// 失败。此处钉死裸 JSON 形态，与 `Request` 侧的
+    /// `test_legacy_request_variants_still_deserialize` 对等。用 Value 比较而非
+    /// 字符串匹配，避免依赖 JSON 空白/转义细节。
+    #[test]
+    fn test_outbound_wire_format() {
+        // 单元变体：裸字符串 `"Quit"`。
+        assert_eq!(
+            serde_json::to_value(Outbound::<TestView>::Quit).unwrap(),
+            json!("Quit"),
+            "Quit 线格式变化"
+        );
+        // 新类型变体：外部标签 + 载荷（`{"Output": "x"}`）。
+        assert_eq!(
+            serde_json::to_value(Outbound::<TestView>::Output("x".into())).unwrap(),
+            json!({ "Output": "x" }),
+            "Output 线格式变化"
+        );
+        // 新变体 `SessionResumed`：仅断言**顶层键名/结构**与设计 §3.2 一致
+        // （summary / thinking_visible / history），否则 UI 侧读不到字段。
+        // `summary.mtime` 是 `SystemTime`，其序列化形态属 serde 内部细节，
+        // 钉死会很脆，故不深断言。
+        let v = serde_json::to_value(Outbound::<TestView>::SessionResumed {
+            summary: sample_summary(),
+            thinking_visible: true,
+            history: vec![text_message(Role::User, "hi")],
+        })
+        .unwrap();
+        let outer = v.as_object().unwrap();
+        assert_eq!(outer.len(), 1, "SessionResumed 外层应只含单个变体键：{v}");
+        let inner = outer["SessionResumed"].as_object().unwrap();
+        let mut keys: Vec<&str> = inner.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["history", "summary", "thinking_visible"],
+            "SessionResumed 字段名与设计 §3.2 不一致：{v}"
+        );
+        assert_eq!(
+            inner["thinking_visible"],
+            json!(true),
+            "thinking_visible 线格式变化：{v}"
+        );
     }
 
     #[test]

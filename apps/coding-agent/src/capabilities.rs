@@ -19,6 +19,12 @@
 //! 命令期间的失败（凭证/状态落盘失败、无法构建 model）也走同一条路。
 
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use ys_core::Message;
+use ys_model::Model;
+use ys_protocol::SessionSummary;
+use ys_session::SessionMeta;
 
 use crate::config::Config;
 use crate::provider::AuthEntry;
@@ -308,6 +314,163 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(real_a), Ok(real_b)) => real_a == real_b,
         _ => a == b,
+    }
+}
+
+/// 列出会话目录下的既有会话（`/resume` 无参的能力）。
+///
+/// **同步**调用 `sessions::list`（决策 2：照惯例在 app 线程同步调用，**不**引入
+/// `spawn_blocking`）。上界论证沿 [`export`] 的先例：`list` 是对目录内每个
+/// `*.jsonl` 的**一次 `stat` + 首行 4 KiB 读取**，条目数即用户自己的会话数
+/// （数十量级），单次总成本在毫秒量级；把它包成 `spawn_blocking` 只会引入一次
+/// 线程跨跳与一次 `&Path` 的所有权搬运，收益不抵复杂度。**不落盘、不发网络**。
+pub fn list_sessions(dir: &Path) -> Vec<SessionSummary> {
+    crate::sessions::list(dir)
+}
+
+/// 一次成功的运行期恢复 —— `app_loop` 据此完成提交步与出站。
+///
+/// 三样恰好对应 [`Outbound::SessionResumed`](ys_protocol::Outbound::SessionResumed)
+/// 的载荷；**不放进 `ys-protocol`** —— 它是 app 侧的中间产物（`summary` 供
+/// `app_loop` 组装，`thinking_visible` 还要用来重设进程级镜像）。
+pub struct ResumedSession {
+    pub summary: SessionSummary,
+    /// 目标会话 meta 的 thinking 开关（`app_loop` 用它重设进程级镜像，见 I9）。
+    pub thinking_visible: bool,
+    /// 目标会话的完整历史（`app_loop` 随 `SessionResumed` 交给 UI 回放）。
+    pub history: Vec<Message>,
+}
+
+/// `/resume` 的运行期恢复：把当前会话切到 `target`，并跟随目标 meta 的 thinking。
+///
+/// # 顺序即不变量（设计 §3.3）
+///
+/// 所有**可失败**步全部前置到「替换会话」之前：解析目标 → 读 meta → 纯解析模型
+/// 四字段 → 构建候选 model。`wiring.resume_into` 一旦执行就已替换会话，故它之后
+/// **只有**不可失败的提交步。任一步失败都只返回一条错误文案，**不改动**会话、
+/// 模型、thinking、统计（I1）。这与启动期 `--resume` 的真实顺序严格对齐。
+///
+/// # 错误形态
+///
+/// 沿既有 `capabilities::*` 形态返回文本行（**失败不返回 `Err`**）；`None` 表示
+/// 未切换。内部**不吞掉** `SessionError` 的分类（`open` 失败时把其 `Display`
+/// 带进文案）。
+///
+/// # app 侧其余提交步归调用方
+///
+/// 进程级 thinking 镜像、`TurnStats` 播种、`session_started`、会话路径快照都是
+/// `app_loop` 自己的运行期状态，由它在本函数成功后完成。
+pub async fn resume_session(
+    cfg: &mut Config,
+    wiring: &mut Wiring,
+    state: &StateStore,
+    target: &str,
+) -> (Vec<String>, Option<ResumedSession>) {
+    // 1. 目录：内存会话无目录可扫（生产恒有）。
+    let Some(dir) = wiring.sessions_dir_path().map(Path::to_path_buf) else {
+        return (
+            vec!["Cannot resume: this session is not persisted.".to_string()],
+            None,
+        );
+    };
+    // 2. 解析目标（id 或路径）—— 失败 ⇒ 只报错，状态未动。
+    let path = match crate::sessions::resolve(&dir, target) {
+        Ok(p) => p,
+        Err(e) => return (vec![e], None),
+    };
+    // 3. 读目标 meta（只读首行）—— 复用启动期的读法。
+    let meta = crate::sessions::read_meta(&path);
+    // 4. **纯解析**模型四字段（不写 `cfg`）；无可用凭证 ⇒ 报错、状态未动。
+    let saved = state.load();
+    let Some(choice) = crate::resolve_model_from_meta(cfg, meta.as_ref(), Some(&saved)) else {
+        return (
+            vec!["Cannot resume: no usable API credentials for this session.".to_string()],
+            None,
+        );
+    };
+    // 5. 用**候选四字段**构建候选 model（不改动 `cfg` 的可见状态）—— 构建失败 ⇒ 报错。
+    let Some(built) = build_candidate_model(cfg, &choice) else {
+        return (
+            vec!["Cannot resume: failed to build a model for this session.".to_string()],
+            None,
+        );
+    };
+    // 6. 替换会话（`open` 成功才替换）。
+    let meta = match wiring.resume_into(path.clone()).await {
+        Ok(m) => m,
+        Err(e) => return (vec![format!("Failed to resume session: {e}")], None),
+    };
+    // 7. 提交（此后不得再有失败路径）：写回 `cfg` 四字段 + 交给接线器。
+    cfg.provider = choice.provider;
+    cfg.api_base = Some(choice.api_base);
+    cfg.api_key = Some(choice.api_key);
+    cfg.model = choice.model;
+    wiring.set_model(Some(built));
+
+    let summary = session_summary(&path, meta.as_ref());
+    let thinking_visible = meta.as_ref().map(|m| m.thinking_visible).unwrap_or(false);
+    let history = wiring.session_messages().to_vec();
+    (
+        vec![format!("Resumed session: {}", summary.id)],
+        Some(ResumedSession {
+            summary,
+            thinking_visible,
+            history,
+        }),
+    )
+}
+
+/// 用**候选四字段**构建 model，但**不改动 `cfg` 对外可见的状态**。
+///
+/// `build_model()` 需要一份带候选凭证的 `&Config`，而 `Config` 持有不可克隆的
+/// factory（`Box<dyn Fn>`），无法拷出一份「带候选字段的副本」。故就地换入候选四
+/// 字段、**同步**构建、随即还原 —— 全过程在任一 `await` 之前完成，对调用方而言
+/// `cfg` 从未改变（这是设计 §3.3「此步之前不得写 cfg」的落地：不留下可观测的写）。
+///
+/// # 前置条件：factory 不得 panic
+///
+/// 「换入 → 构建 → 还原」不是 RAII：还原步靠控制流顺序到达。`Config` 的 model
+/// factory（`build_model()` 间接调用）若 panic，栈展开会**跳过**还原，把候选四字段
+/// 留在 `cfg` 里（后续 `build_model()` 会用错凭证）。生产 factory 只做构造、不
+/// panic；此处显式声明该契约，供改动者判断是否要改成 guard 式还原。
+fn build_candidate_model(cfg: &mut Config, choice: &crate::ModelChoice) -> Option<Box<dyn Model>> {
+    let prev_provider = cfg.provider.take();
+    let prev_api_base = cfg.api_base.take();
+    let prev_api_key = cfg.api_key.take();
+    let prev_model = std::mem::replace(&mut cfg.model, choice.model.clone());
+    cfg.provider = choice.provider.clone();
+    cfg.api_base = Some(choice.api_base.clone());
+    cfg.api_key = Some(choice.api_key.clone());
+    let built = cfg.build_model();
+    cfg.provider = prev_provider;
+    cfg.api_base = prev_api_base;
+    cfg.api_key = prev_api_key;
+    cfg.model = prev_model;
+    built
+}
+
+/// 由目标会话路径 + 其 meta 构造一条 [`SessionSummary`]（`sessions::list` 的
+/// **单文件版**）。`title` 走 [`crate::sessions::derive_title`]；无 title 时复用
+/// [`crate::sessions::DEFAULT_TITLE`] —— 与 `sessions::list` 对同一文件给出的
+/// 标题**同源**，改缺省标题只需改一处。
+pub(crate) fn session_summary(path: &Path, meta: Option<&SessionMeta>) -> SessionSummary {
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let title = meta
+        .and_then(|m| m.title.as_deref())
+        .map(crate::sessions::derive_title)
+        .unwrap_or_else(|| crate::sessions::DEFAULT_TITLE.to_string());
+    SessionSummary {
+        id,
+        path: path.to_path_buf(),
+        mtime,
+        title,
     }
 }
 
@@ -1073,6 +1236,67 @@ mod tests {
             !out.iter().any(|l| l.contains("Provider switched")),
             "未知名不该切 provider：{out:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// **N2 —— 顺序变异（I1）**：模型解析失败 ⇒ **会话 / 模型全不变**，只回错误文案。
+    ///
+    /// 当前实现把所有可失败步（解析目标 / 读 meta / 解析模型四字段 / 构建候选 model）
+    /// **全部前置**到 `wiring.resume_into` 之前；`resume_into` 一旦执行就已换会话，
+    /// 故模型解析失败时当前会话必须仍是旧的。
+    ///
+    /// **变异**：把 `resume_into` 挪到模型解析**之前**（或删掉候选构建的前置检查）
+    /// ⇒ 会话已被替换 ⇒ 本条「必须是旧会话」断言变红。
+    #[tokio::test]
+    async fn resume_session_model_failure_leaves_session_untouched() {
+        let dir = temp_dir("resume_model_fail");
+
+        // 目标会话文件：**可被 open**（确保失败来自模型解析，而非 open）。
+        let target_path = dir.join("target.jsonl");
+        let mut meta = SessionMeta::new(0);
+        meta.provider = Some("ghost".into()); // 无凭证的 provider
+        std::fs::write(
+            &target_path,
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        let old_path = wiring.session_path().unwrap().to_path_buf();
+        let old_model = wiring.model_id().map(str::to_string);
+
+        // 未配置的 cfg（无 env 凭证）+ 空 auth ⇒ `resolve_model_from_meta` 返回 None。
+        //
+        // env 锁**只圈住这次 `getenv`**（`Config::from_env`），不跨下方的 `.await`
+        // —— `MutexGuard` 非 `Send`，跨 await 会让 future 失去 `Send` 并触发 clippy。
+        let mut cfg = {
+            let _guard = crate::test_env::env_lock();
+            Config::from_env().unwrap()
+        };
+        cfg.api_base = None;
+        cfg.api_key = None;
+        cfg.provider = None;
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        let (state, state_dir) = test_state();
+
+        let (lines, resumed) = resume_session(&mut cfg, &mut wiring, &state, "target").await;
+
+        assert!(resumed.is_none(), "模型解析失败 ⇒ 未切换：{lines:?}");
+        assert_eq!(
+            wiring.session_path(),
+            Some(old_path.as_path()),
+            "模型解析失败时必须是**旧**会话（变异：resume_into 前置 ⇒ 本断言变红）"
+        );
+        assert_eq!(
+            wiring.model_id().map(str::to_string),
+            old_model,
+            "模型解析失败时模型不得变"
+        );
+        assert_eq!(lines.len(), 1, "应恰回一条错误文案：{lines:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state_dir);

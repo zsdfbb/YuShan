@@ -121,7 +121,7 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
   ★ 全程在「建 runtime / 起屏」之前 —— 因为读回的 meta 参与模型选择
 → 模型解析优先级链（main.rs:1104-1152）：env 凭证 > meta（须 registry.auth_for 命中）> state.json > 首个有凭证者
 → Wiring::resume(model, events, sessions_dir, path)（wiring.rs:71-78）
-→ 恢复：messages + meta；thinking_visible 初值（view.rs:124）；TurnStats 由 meta 播种（seed_stats main.rs:480-488）
+→ 恢复：messages + meta；thinking_visible 初值（view.rs:69-73）；TurnStats 由 meta 播种（seed_stats main.rs:480-488）
    不恢复：cwd/workspace（meta 无此字段）、system prompt / 工具表 / skill（每次重装）、
           session_started（显式声明「属展示、非执行状态」main.rs:990-993）、
           **以及：历史不上屏（见 D3 推论）**
@@ -236,7 +236,7 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
 - [ ] **Q3 是否支持 `/resume <id|路径>` 直切？** 用户只答了浮层形态；原话是「直接切换到指定的 session」。`per-turn-model-switch` 的 `/model` 是「无参浮层 / 有参直切」双形态 —— 是否照此对称？（成本低但多一个入口）
 - [ ] **Q4 状态行「会话时长」与统计是否随切换归零/播种？** 启动期：tokens 由 meta 播种、**时长不恢复**（`main.rs:990-993`）。运行期照同一口径吗？
 - [ ] **Q5 ADR-0026 决策 6 怎么处置？** 新增 ADR 显式取代决策 6（保留 0026 其余：默认新会话、meta 首行、三模式统一持久化…），还是修订 0026 原文？**倾向新增**（ADR 是历史记录）。另外：ADR-0026 决策 4 对候选 B 的否决理由（「决策 6 排除运行期 `/resume` ⇒ 无第二消费者」）**前提已消失** —— 是否在本轮一并复访？
-- [ ] **Q6 `thinking_visible` 是否跟随目标 meta？** 启动期 resume 会取 meta 的 `thinking_visible` 作初值（`view.rs:124`）；但 session-default-new 的 T7 修订规定「UI 拥有运行期真值、`/new` 不重置」（`session-default-new/context.md` 的 D10 修订、`session-default-new.md:132-139`）。运行期切换**既不是启动也不是 `/new`** —— 三种语义需对齐，否则「两份真值漂移」会复现。
+- [ ] **Q6 `thinking_visible` 是否跟随目标 meta？** 启动期 resume 会取 meta 的 `thinking_visible` 作初值（`view.rs:69-73`）；但 session-default-new 的 T7 修订规定「UI 拥有运行期真值、`/new` 不重置」（`session-default-new/context.md` 的 D10 修订、`session-default-new.md:132-139`）。运行期切换**既不是启动也不是 `/new`** —— 三种语义需对齐，否则「两份真值漂移」会复现。
 - [ ] **Q7 浮层列表的排序与呈现字段？** 沿用 `list` 的 mtime DESC？标题用 `derive_title`（50 字符截断，`sessions.rs:173-180`）？是否显示「当前会话」标记（避免 E3 误选）？
 - [ ] **Q8 排队期间的 UI 反馈？** D4 下切换是「静默排队到回合末」。回合跑动中用户敲了 `/resume` 选完，屏幕上要显示什么（pending 提示？）还是什么都不显示（与 `/model` 现状一致）？
 - [ ] **Q9 回放与「退出回放」的叠加？** 退出时 TUI 把 `transcript` 倾到 scrollback；切换后 transcript 含回放的历史 —— 退出时是否会重复倾倒（观感）？是否需要标记「回放行」不计入退出回放？

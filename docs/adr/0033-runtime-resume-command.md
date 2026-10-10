@@ -33,36 +33,57 @@ accepted（2026-10-10）
 1. **协议层加两个请求、两个出站变体**（`crates/ys-protocol`）：
    - `Request::ListSessions` / `Request::ResumeSession { target: String }` —— **查询与变更分开**
      （不合并成 `Resume { Option<String> }`：两种语义的生命周期与失败模式不同）。
-   - `Outbound::SessionList(Vec<SessionSummary>)` / `Outbound::SessionActivated(SessionActivation)`。
-   - 新纯数据类型 `SessionSummary { id, path, mtime, title }`（从 `apps/.../sessions.rs` 的 `Listing` 升格）与
-     `SessionActivation { summary, thinking_visible, history: Vec<Message> }`。
-   - **一次性载荷走 `Outbound`，不放 `CodingView`**：`CodingView` 自我定义是「显示**快照**」，
-     而列表与历史是**消息**。（`CodingView.thinking_visible` 不是反例 —— 它是**启动初值**，仍派生自实时状态。）
-2. **「激活一个会话」是启动期与运行期共用的能力**：把模型恢复的优先级链
-   （env 凭证 > meta > state.json > 首个有凭证者）从 `main.rs` 抽出为共用函数；
+   - `Outbound::SessionList(Vec<SessionSummary>)` / `Outbound::SessionResumed { summary, thinking_visible, history }`。
+   - 新纯数据类型 `SessionSummary { id, path, mtime, title }`；`apps/.../sessions.rs` 的本地 `Listing` **删除**、改用它
+     （不留两个同义类型）。
+   - **一次性载荷走 `Outbound`，不放 `CodingView`**：判据是**生命周期** —— `CodingView` 本就是**长期有效**的
+     显示快照（它已装 `providers` / `available_models` / `skills` 三张表），而 session list 与 replay 是
+     **一次性、消费即弃**的载荷，塞进快照会被每请求重建、每回合重发。
+   - 术语：动作一律叫 **resume**，不另造「激活」；`resume ≠ /new` —— `/new` 是同一会话谱系里开下一段，
+     resume 是换到另一条谱系。
+2. **恢复的步骤顺序：可失败步全部前置，提交步不可失败**。`resolve → read_meta → 纯解析并构建候选 model →
+   resume_into（open 成功才替换）→ 提交（写 config / 设 model / 设 thinking 镜像 / 播种统计 / 记会话路径）`。
+   这条顺序与**启动期真实顺序**（`main.rs` 的 `read_meta` → 模型优先级链 → `Wiring::resume`）严格对齐；
+   反过来写（先替换会话再解析模型）会在模型解析失败时留下「会话已换、模型还是旧的」的半切换。
+3. **「恢复一个既有会话」是启动期与运行期共用的能力**：把模型恢复的优先级链
+   （env 凭证 > meta > state.json > 首个有凭证者）从 `main.rs` 抽出为**纯函数**（不写 `Config`，写入交给提交步）；
    `Wiring` 新增 `resume_into(&mut self, path) -> Result<SessionMeta, _>`，
    **镜像 `new_session` 的「先 open 成功后才替换」**（失败 ⇒ 当前会话完好无损）。
-3. **模型与 thinking 跟随目标会话 meta**（`SessionActivation` 一次性传递）。
-   运行期切换**不等同于 `/new`**：`/new` 换的是「同一会话谱系里的下一段」，切换换的是**整个会话**，
+4. **模型与 thinking 跟随目标会话 meta**（经 `SessionResumed` 一次性传递）。
+   运行期 resume**不等同于 `/new`**：`/new` 换的是「同一会话谱系里的下一段」，resume 换的是**整个会话**，
    与「重启后用 `--resume` 打开它」同构 —— 观感必须一致，否则同一会话两处语义分叉。
-   一次性载荷**不**经快照，故不破「快照不覆盖 `App.thinking_visible` 运行期真值」。
-4. **历史回放 = 清屏 + 由持久化 `Vec<Message>` 重建 transcript**（不是事件重放 —— 与 pi、Codewhale 一致）。
-   转换 `Message → TranscriptLine` 归 **UI 侧**，与 `apply_event` 的映射共用同一套规则。
-   回放**默认全量**（要的是「切过去就等于打开那个会话」）。
-5. **回放前必须显式使 `RenderCache` 失效**。`cache.rs` 的槽位键是 `(槽下标, src.len(), width)`，
-   其「长度相等即内容相同」的合法性由 `debug_assert!` 钉在「**transcript 只增不减**」上；
-   回放是本 app **第一个**清屏/缩短 transcript 的操作，不失效就会**假命中、显示上一个会话的旧内容**。
-   ⇒ 同时修订 `cache.rs` 的模块头不变量（`/new` 不触、`/resume` 触）。
-6. **不引入 `SessionCatalog` / `SessionPicker` trait**：trait 服务**多实现**，不是多消费者；
-   本轮的第二消费者（启动期 + 运行期）用**模块函数**即可。`sessions.rs` 升格为「会话目录视图」，
+   **这是一次有意的破例**：`SessionResumed` 确实改写了 UI 的运行期真值 `App.thinking_visible`
+   （与「快照不得覆盖运行期真值」相抵 —— `crates/ys-tui-coding/src/app.rs:83-84`；启动期的初值语义见
+   `crates/ys-tui-coding/src/view.rs:69-73`）。破例的理由是「resume 不是 `/new`」，不是「没破不变量」。
+   **同理，app 侧那份进程级镜像（`app_loop.rs:147`，每回合末无条件写进 meta）必须一并重设** ——
+   否则切换后第一回合就把旧会话的 thinking 写进新会话 meta。
+5. **回放前必须显式使 `RenderCache` 失效，且时机要对**：`crates/ys-tui-coding/src/cache.rs` 的槽位键是
+   `(槽下标, src.len(), width)`，其「长度相等即内容相同」的合法性由 `debug_assert!` 钉在
+   「**transcript 只增不减**」上；回放是本 app **第一个**清屏/缩短 transcript 的操作。
+   注意 `sync_len` 有「增长」与「缩短」两条分支：clear 与 extend 若在同一帧前完成，长度看起来没变，
+   会走**增长**分支而**绕过**缩短 ⇒ 假命中。⇒ 必须**显式 `reset()`**（或在 extend **之前**单独 `sync_len(0)`）。
+   同时修订 `cache.rs` 的模块头不变量（`/new` 不触、`/resume` 触）。
+6. **历史回放 = 清屏 + 由持久化 `Vec<Message>` 重建 transcript**（不是事件重放 —— 与 pi、Codewhale 一致）。
+   转换 `Message → TranscriptLine` 归 **UI 侧**，且**镜像** `apply_event` 的输出约定（**不是**「共用同一套规则」：
+   `apply_event` 是**事件驱动**的单块事件，回放输入是**复合** `Message`，形状不同）；共享的是
+   `summarize_tool_args` 与 id 配对约定。**回放默认全量**（要的是「切过去就等于打开那个会话」）。
+   清屏要抽一个 `reset_for_replay()`，**一次性重置全部同源状态**（transcript / 渲染缓存 / `tool_index` /
+   `suppress_user_echo` / `pending_echo_texts` / `follow` / `scroll_offset` / thinking），逐项由测试钉住。
+7. **不引入 `SessionCatalog` / `SessionPicker` trait**：trait 服务**多实现**，不是多消费者；
+   本轮的第二消费者（启动期 + 运行期）用**模块函数**即可。**且本仓测试用真临时目录而非 mock**，
+   trait 唯一可能的收益（可 mock）在本项目不存在。`sessions.rs` 升格为「会话目录视图」，
    出现第二实现（远程后端、归档目录）时再按 0026 候选 B 的形态收窄引入。`TitlePolicy` 维持否决。
-7. **忙碌时排队，回合结束后生效**：不新增 busy 状态位 —— app 线程跑回合时本就不 `recv` 信道①，
+8. **忙碌时排队，回合结束后生效**：不新增 busy 状态位 —— app 线程跑回合时本就不 `recv` 信道①，
    语义天然成立（与 `/model` 的「下一回合生效」一致）。**代价**：回合进行中连会话列表都拿不到。
-8. **出站顺序是不变量**：`SessionActivated` → `Output` → `View`。反了，切换通知会被回放的清屏吃掉。
-9. **失败不改状态**：目标不存在/不可读/JSONL 损坏/模型不可解析 ⇒ 报错并保持当前会话、transcript、
-   模型全不变（照 `Wiring::new_session` 的既有不变量）。空列表 ⇒ 提示「没有可恢复的会话」，不弹空浮层。
-10. **列表不静默过滤或截断**。会话目录的 picker「只见最近几个」是两个生态级 issue 的根因；
+9. **出站顺序是不变量**：`SessionResumed` → `Output` → `View`。反了，恢复通知会被回放的清屏吃掉。
+   **启动期同样适用**：启动提示先入队，故启动期的 `SessionResumed` 必须排在它**之后**。
+10. **失败不改状态**：目标不存在/不可读/JSONL 损坏/模型不可解析 ⇒ 报错并保持当前会话、transcript、
+    模型、thinking、统计全不变（照 `Wiring::new_session` 的既有不变量）。空列表 ⇒ 提示「没有可恢复的会话」，
+    不弹空浮层。
+11. **列表不静默过滤或截断**。会话目录的 picker「只见最近几个」是两个生态级 issue 的根因；
     `list()` 本就是 `stat` + 首行 4 KiB 封顶，量级可控，先全量。
+12. **回放的渲染边界**：`User` 消息只含 `ToolResult` 块是常态 ⇒ 不得渲染成**空用户行**；
+    `ToolUse` 无配对 `ToolResult`（被中断的会话）⇒ 不得渲染成「看着像成功」。
 
 ## Considered Options
 

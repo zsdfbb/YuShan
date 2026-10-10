@@ -91,7 +91,10 @@ impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "bash",
-            "Execute shell commands. Supports timeout.",
+            "Execute shell commands. Supports timeout. Every call starts a fresh shell in the \
+             workspace root (the system prompt's `Current working directory`) — `cd` does NOT \
+             carry over between calls, so do not prefix every command with `cd`; use absolute \
+             paths, or chain `cd dir && cmd` inside the one call that needs it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -243,6 +246,28 @@ mod tests {
 
     fn make_ctx() -> ToolContext<'static> {
         ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
+    }
+
+    /// **描述即契约**：`bash` 每次调用都在 `workspace` 起新 shell，`cd` 不跨调用 ——
+    /// 这句话必须留在模型读得到的 `description` 里。
+    ///
+    /// 依据（实测）：本机 5 个会话里 69 次 bash 调用有 **68 次**以 `cd <绝对路径> &&` 开头，
+    /// 那 3128 字符是纯噪音；根因就是这条契约没写出来（`ToolSpec` 随每轮请求发给模型，
+    /// 命中前缀缓存，故这是零边际成本的通道）。
+    ///
+    /// 变异：把描述改回一句 `Execute shell commands. Supports timeout.` ⇒ 本用例变红。
+    #[test]
+    fn spec_description_states_the_cwd_contract() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let d = tool.spec().description;
+        assert!(
+            d.contains("workspace root"),
+            "描述须说明每次调用的工作目录；description = {d}"
+        );
+        assert!(
+            d.contains("`cd` does NOT") && d.contains("carry over"),
+            "描述须说明 `cd` 不跨调用保留（否则模型仍会防御性加前缀）；description = {d}"
+        );
     }
 
     /// 临时目录名含**进程内原子序号 + `process::id()`**（并行安全的既有样板，见 `read.rs`）。

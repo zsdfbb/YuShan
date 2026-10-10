@@ -46,6 +46,12 @@ impl Tool for LsTool {
         )
     }
 
+    /// 只读工具：同一批里可与其它只读工具并发执行（`BasicLoop` Step 9 要求批内**每一个**
+    /// 都为 `true` 才走并行 ⇒ 混入 `bash`/`write`/`edit` 的批次自动退回串行）。
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn call(&self, input: Value, _ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let path = input["path"].as_str().unwrap_or(".");
         // `limit` 至少为 1：0 会让「已截断」判定恒真、并产出 `Use limit=0 for more` 这类废话。

@@ -184,6 +184,19 @@ fn tool_guidelines(tools: &[&str]) -> String {
         guidelines
             .push("Use ls to list directories instead of running ls through bash".to_string());
     }
+    // 多目标探索走**多条工具调用**，而不是把若干命令拼进一条 bash：只有工具通道才保留
+    // `.gitignore` 语义与统一的截断 / notice 形态。只读批次真的并行（工具侧声明
+    // `is_concurrency_safe`，见 `adapters/tools-basic`），故这条不只是「更好看」。
+    if tools
+        .iter()
+        .any(|t| matches!(*t, "read" | "grep" | "find" | "ls"))
+    {
+        guidelines.push(
+            "To inspect several files or directories, send several tool calls in one message — \
+             read-only calls in a batch run in parallel; do not chain them through bash"
+                .to_string(),
+        );
+    }
     if tools.contains(&"websearch") {
         guidelines.push(
             "Use websearch for information outside the repository (API docs, error meanings)"
@@ -601,6 +614,43 @@ mod tests {
         assert!(
             !without_web.contains("Use webfetch"),
             "无 webfetch 时不得出现其指引；prompt = {without_web}"
+        );
+    }
+
+    /// 「多目标 ⇒ 发多条调用」这条 guideline **只在只读工具在场时**出现。
+    ///
+    /// 它之所以是承重的：工具通道保住了 `.gitignore` 语义与统一的截断 / notice，而把若干
+    /// 命令拼进一条 bash 会全丢掉；同时只读批次**真的并行**（工具侧声明
+    /// `is_concurrency_safe`，见 `apps/coding-agent/src/toolset.rs` 的准入表测试）。
+    ///
+    /// 反向断言（只有 `bash` 时不得出现）同样关键：模型不该被建议用不存在的工具。
+    ///
+    /// 变异：把守卫从 `any(read|grep|find|ls)` 改成无条件 push ⇒ 第二条断言变红。
+    #[test]
+    fn multi_target_guideline_appears_only_with_read_only_tools() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_tools = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("grep"), spec("bash")],
+            &no_skills(),
+        );
+        assert!(
+            with_tools.contains(
+                "- To inspect several files or directories, send several tool calls in one message"
+            ),
+            "有只读工具时应给「多目标发多条调用」的指引；prompt = {with_tools}"
+        );
+        assert!(
+            with_tools.contains("read-only calls in a batch run in parallel"),
+            "指引应点明并行这一事实（否则它只是风格偏好）；prompt = {with_tools}"
+        );
+
+        let bash_only = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
+        assert!(
+            !bash_only.contains("send several tool calls in one message"),
+            "只有 bash 时不得出现该指引；prompt = {bash_only}"
         );
     }
 

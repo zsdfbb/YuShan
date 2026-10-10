@@ -18,7 +18,8 @@ impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "read",
-            "Read file contents. Supports text files.",
+            "Read file contents (text). Use `offset` (1-indexed) and `limit` to read a line \
+             range of a long file instead of shelling out to cat/sed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -29,6 +30,12 @@ impl Tool for ReadTool {
                 "required": ["path"]
             }),
         )
+    }
+
+    /// 只读工具：同一批里可与其它只读工具并发执行（`BasicLoop` Step 9 要求批内**每一个**
+    /// 都为 `true` 才走并行 ⇒ 混入 `bash`/`write`/`edit` 的批次自动退回串行）。
+    fn is_concurrency_safe(&self) -> bool {
+        true
     }
 
     async fn call(&self, input: Value, _ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -102,6 +109,23 @@ mod tests {
 
     fn make_ctx() -> ToolContext<'static> {
         ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
+    }
+
+    /// **描述即契约**：`read` 支持 `offset` / `limit` 读区间 —— 这句话必须留在模型读得到的
+    /// `description` 里。
+    ///
+    /// 依据（实测）：本机 5 个会话里 `sed -n a,bp file` 出现 13 次，而 `read` 只被调用 2 次；
+    /// 模型不是不能用 `read`，是不知道它能读区间（参数 schema 里有，但描述里没提）。
+    ///
+    /// 变异：把描述改回 `Read file contents. Supports text files.` ⇒ 本用例变红。
+    #[test]
+    fn spec_description_points_at_offset_and_limit() {
+        let tool = ReadTool::new(PathBuf::from("."));
+        let d = tool.spec().description;
+        assert!(
+            d.contains("`offset`") && d.contains("`limit`") && d.contains("line range"),
+            "描述须提示用 offset/limit 读区间（替代 sed/cat）；description = {d}"
+        );
     }
 
     fn test_dir() -> PathBuf {

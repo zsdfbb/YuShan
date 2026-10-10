@@ -501,6 +501,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&fetched);
     }
 
+    /// 9. **并发准入表**：只有**只读**工具声明 `is_concurrency_safe`。
+    ///
+    ///    `BasicLoop` Step 9 的准入是「批内**每一个**都为 `true`」才走并行 ⇒ 少了这里的声明，
+    ///    只读批次会**静默退回串行**（没有任何报错，只有变慢）；把写/执行类工具误标成 `true`
+    ///    则会让同一批里的两个写操作并发跑。两个方向都必须被钉住，故本条断言的是**精确集合**，
+    ///    不是「至少含有」。
+    ///
+    ///    变异 1：删掉 `read`/`grep`/`find`/`ls` 任一处的 `is_concurrency_safe` ⇒ 变红。
+    ///    变异 2：给 `bash`/`write`/`edit` 加上 `is_concurrency_safe() -> true` ⇒ 变红。
+    ///    （`subagent` 不在这张表里：它由 `main` 追加，且在自己的模块里声明。）
+    #[test]
+    fn only_read_only_tools_are_concurrency_safe() {
+        let _guard = env_lock();
+        let dir = unique_dir("concurrency");
+
+        let (tools, _hint) = build_tools(&dir, offline_web());
+        let safe: Vec<String> = tools
+            .iter()
+            .filter(|t| t.is_concurrency_safe())
+            .map(|t| t.spec().name)
+            .collect();
+        assert_eq!(
+            safe,
+            vec!["read", "grep", "find", "ls"],
+            "并发安全的应恰是四个只读工具（顺序随工具表）；写/执行/联网工具必须保持默认 false"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 在 `dir` 下写一个**超龄**（mtime = 8 天前）且名字**符合落盘命名形状**的文件，
     /// 返回其路径 —— 供「装配不清理」这类断言做**真会命中 sweep 判据**的靶子。
     fn write_aged_fetched(dir: &Path, final_url: &str) -> PathBuf {
@@ -598,7 +628,10 @@ mod tests {
         assert_ne!(fp_tools, 0);
         assert_ne!(fp_prompt, 0);
         // 当前锚点（漂移时这两个数字会变 —— 变化本身即是信号；本模块禁止 print 宏，故用注释记录）：
-        //   tools = 0x9188ca32c2a51fe3  prompt = 0x1041319ab86f42ad
+        //   tools = 0x505fa9711a7adcbc
+        // 只为**工具表**记值：`fp_tools` 与运行环境无关（`ToolSpec` 里不含任何路径）。
+        // `fp_prompt` **不入锚** —— 它含 `Current working directory: <临时目录>`，逐次运行都不同，
+        // 只由上一条「同一目录两次构建一致」的断言守卫。
         // （若因有意改动而漂移，请在此更新这两个值，让 diff 显式暴露这次漂移。）
 
         let _ = std::fs::remove_dir_all(&dir);

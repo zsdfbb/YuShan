@@ -48,6 +48,22 @@ impl ProviderCompat {
         }
     }
 
+    /// OpenCode Go 网关（`https://opencode.ai/zen/go/v1`）。
+    ///
+    /// 该网关上的**推理型模型按 DeepSeek 方言**回思考内容：实测
+    /// `deepseek-v4-pro` / `deepseek-flash` 的流式 delta 与终包都带
+    /// `reasoning_content`（非标准 `reasoning` 字段）。故解析开关沿用
+    /// [`ProviderCompat::deepseek`]。
+    ///
+    /// `supports_stream_usage` 保持开启：网关放行 `stream_options.include_usage`；
+    /// 若将来拒绝，适配器的「剥参数一次性回退」仍能兜住。
+    pub fn opencode_go() -> Self {
+        Self {
+            has_reasoning_content: true,
+            ..Default::default()
+        }
+    }
+
     /// 标准 / 未知端点：默认**开启**流式 usage，以拿到 token 统计。
     ///
     /// OpenAI 兼容端点普遍容忍未知顶层字段（反序列化到 struct 时忽略未知键），
@@ -82,5 +98,15 @@ mod tests {
         assert!(!ProviderCompat::minimax().supports_stream_usage);
         assert!(ProviderCompat::minimax().tool_calls_as_text);
         assert!(ProviderCompat::deepseek().has_reasoning_content);
+    }
+
+    /// opencode go 的推理模型用 `reasoning_content`（同 DeepSeek 方言），
+    /// 且放行 `stream_options.include_usage`。
+    #[test]
+    fn opencode_go_uses_deepseek_thinking_dialect_and_stream_usage() {
+        let compat = ProviderCompat::opencode_go();
+        assert!(compat.has_reasoning_content);
+        assert!(compat.supports_stream_usage);
+        assert!(!compat.tool_calls_as_text);
     }
 }

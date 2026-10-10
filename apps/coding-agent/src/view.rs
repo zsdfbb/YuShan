@@ -177,8 +177,12 @@ mod tests {
         assert!(view.provider.is_none());
         assert!(view.model.is_none(), "无 model → 状态行显示 (no model)");
         assert!(view.logged_in_providers.is_empty());
-        assert_eq!(view.providers.len(), 3, "内置三个 provider");
+        assert_eq!(view.providers.len(), 4, "内置四个 provider");
         assert!(view.provider_names().contains(&"deepseek".to_string()));
+        assert!(
+            view.provider_names().contains(&"opencode-go".to_string()),
+            "opencode-go 必须出现在 /login 的 provider 选择器里"
+        );
         // **回归锚点**：内置 base 必须原样透传 —— `/login custom` 要靠这个空串
         // 判定「该追问 API base URL」。把 api_base 拍成空 → 本断言变红。
         assert!(

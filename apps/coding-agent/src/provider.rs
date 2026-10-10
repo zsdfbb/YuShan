@@ -1,8 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ys_model_openai_compat::compat::ProviderCompat;
+
+/// OpenCode Go 网关要求的会话头名。
+///
+/// 网关按该头做路由与 prompt cache 亲和；缺失或为空一律 `400 MissingSessionID`
+/// （实测 `/chat/completions` 与 `/responses` 皆然）。
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
 /// 带元数据的已知 provider。
 #[derive(Debug, Clone)]
@@ -11,6 +19,11 @@ pub struct ProviderInfo {
     pub api_base: String,
     pub default_model: String,
     pub compat: ProviderCompat,
+    /// 需要随**每个模型请求**发送的会话 id 头名（`None` = 无此要求）。
+    ///
+    /// 值是 [`session_id`] 给的**进程级稳定** id —— 网关只要求「一段对话用同一个
+    /// id」，不要求它在进程之间延续。
+    pub session_header: Option<String>,
 }
 
 /// auth.json 中按 provider 存储的凭证。
@@ -71,18 +84,28 @@ impl ProviderRegistry {
                 api_base: "https://api.deepseek.com".into(),
                 default_model: "deepseek-chat".into(),
                 compat: ProviderCompat::deepseek(),
+                session_header: None,
             },
             ProviderInfo {
                 name: "minimax".into(),
                 api_base: "https://api.minimax.chat/v1".into(),
                 default_model: "MiniMax-Text-01".into(),
                 compat: ProviderCompat::minimax(),
+                session_header: None,
+            },
+            ProviderInfo {
+                name: "opencode-go".into(),
+                api_base: "https://opencode.ai/zen/go/v1".into(),
+                default_model: "deepseek-flash".into(),
+                compat: ProviderCompat::opencode_go(),
+                session_header: Some(OPENCODE_SESSION_HEADER.into()),
             },
             ProviderInfo {
                 name: "custom".into(),
                 api_base: String::new(),
                 default_model: String::new(),
                 compat: ProviderCompat::standard(),
+                session_header: None,
             },
         ];
         Self {
@@ -108,6 +131,39 @@ impl ProviderRegistry {
         self.find_provider(name)
             .map(|p| p.compat.clone())
             .unwrap_or_else(ProviderCompat::standard)
+    }
+
+    /// 当前会话要随**每个模型请求**发送的额外头。
+    ///
+    /// 两条判定路径，前者优先：
+    /// ① **按 provider 名** —— `/login` / `/model` 走的那条（`provider` 有值）；
+    /// ② **按 api_base 与内置 provider 的 base 相等** —— 给 env 直连
+    ///    （`YUSHAN_API_BASE` 指向同一网关）用：那条路径 `provider` **恒为 `None`**。
+    ///
+    /// 头值是**进程级稳定**的 [`session_id`]。同一进程内 `/new` / `/resume` 复用同一个
+    /// id：网关侧的差别只是路由与 prompt cache 亲和，不影响请求正确性。
+    ///
+    /// 无要求的 provider 返回空 vec（绝大多数端点）。
+    pub fn request_headers(
+        &self,
+        provider: Option<&str>,
+        api_base: Option<&str>,
+    ) -> Vec<(String, String)> {
+        let header = provider
+            .and_then(|name| self.find_provider(name))
+            .and_then(|p| p.session_header.clone())
+            .or_else(|| {
+                let base = api_base?.trim_end_matches('/');
+                self.providers
+                    .iter()
+                    .filter(|p| !p.api_base.is_empty())
+                    .find(|p| p.api_base.trim_end_matches('/') == base)
+                    .and_then(|p| p.session_header.clone())
+            });
+        match header {
+            Some(name) => vec![(name, session_id())],
+            None => Vec::new(),
+        }
     }
 
     /// 设置 auth 存储的覆盖路径（便于测试）。
@@ -405,6 +461,27 @@ pub fn builtin_context_window(model: &str) -> Option<usize> {
         .map(|(_, window)| *window)
 }
 
+/// 网关侧的会话 id：`ys-<pid>-<启动秒>_<纳秒>`，**每进程生成一次**。
+///
+/// 为什么是进程级而不是会话级：模型的构造点（`Config::build_model`）拿不到
+/// `Wiring` 里的会话 id —— 启动期 model 先于 wiring 构造。网关对该值的要求只是
+/// 「一段对话内稳定」，故进程内固定即可；进程 id + 启动时刻保证不同进程不撞。
+pub fn session_id() -> String {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let d = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        format!(
+            "ys-{}-{}_{:09}",
+            std::process::id(),
+            d.as_secs(),
+            d.subsec_nanos()
+        )
+    })
+    .clone()
+}
+
 /// 构建 /v1/models endpoint 的 URL。
 /// 若 base 已以 "/v1" 或 "/v1/" 结尾，则追加 "/models"。
 /// 否则追加 "/v1/models"。
@@ -549,6 +626,71 @@ mod tests {
         assert_eq!(models[1].owned_by.as_deref(), Some("deepseek"));
         assert_eq!(models[2].id, "MiniMax-Text-01");
         assert_eq!(models[2].owned_by.as_deref(), Some("minimax"));
+    }
+
+    /// opencode-go 的内置元数据：网关 base、默认模型（**必须是 chat/completions
+    /// 协议的模型** —— 适配器只会打那个端点）与会话头。
+    #[test]
+    fn test_opencode_go_provider_metadata() {
+        let reg = ProviderRegistry::new();
+        let provider = reg.find_provider("opencode-go").expect("已注册");
+        assert_eq!(provider.api_base, "https://opencode.ai/zen/go/v1");
+        assert_eq!(provider.default_model, "deepseek-flash");
+        assert_eq!(
+            provider.session_header.as_deref(),
+            Some(OPENCODE_SESSION_HEADER)
+        );
+        // 路由与 prompt cache 亲和都靠 `reasoning_content` 方言解析思考增量。
+        assert!(reg.compat_for("opencode-go").has_reasoning_content);
+    }
+
+    /// 按 provider 名给出会话头（`/login` / `/model` 那条路径）。
+    #[test]
+    fn test_request_headers_by_provider_name() {
+        let reg = ProviderRegistry::new();
+        let headers = reg.request_headers(Some("opencode-go"), None);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, OPENCODE_SESSION_HEADER);
+        assert!(!headers[0].1.is_empty(), "网关拒绝空会话 id");
+
+        // 其余内置 provider 无此要求。
+        assert!(reg.request_headers(Some("deepseek"), None).is_empty());
+        assert!(reg.request_headers(Some("custom"), None).is_empty());
+        assert!(reg.request_headers(None, None).is_empty());
+    }
+
+    /// env 直连（`YUSHAN_API_BASE` 指向网关）时 `provider` 恒为 `None`：
+    /// 会话头必须能**只凭 api_base** 得出，否则那条路径每次请求都 400。
+    #[test]
+    fn test_request_headers_by_api_base_for_env_path() {
+        let reg = ProviderRegistry::new();
+        let headers = reg.request_headers(None, Some("https://opencode.ai/zen/go/v1"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, OPENCODE_SESSION_HEADER);
+
+        // 尾斜杠不影响匹配。
+        assert_eq!(
+            reg.request_headers(None, Some("https://opencode.ai/zen/go/v1/"))
+                .len(),
+            1
+        );
+        // 别的 base 一律不加头。
+        assert!(
+            reg.request_headers(None, Some("https://api.deepseek.com"))
+                .is_empty()
+        );
+        assert!(
+            reg.request_headers(None, Some("https://example.com/v1"))
+                .is_empty()
+        );
+    }
+
+    /// 会话 id 在进程内**稳定**：同一进程两次取到的值必须相同，
+    /// 否则网关侧每次请求都是新会话（丢掉路由与缓存亲和）。
+    #[test]
+    fn test_session_id_is_process_stable() {
+        assert_eq!(session_id(), session_id());
+        assert!(session_id().starts_with("ys-"));
     }
 
     #[test]

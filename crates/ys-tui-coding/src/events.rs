@@ -1,7 +1,7 @@
 //! crossterm 事件 → [`App`] 状态迁移 + 对 app 线程的请求（`Request` / `Boundary`）。
 //!
-//! 键位集：**Enter 提交或填入补全 / Ctrl-C·Ctrl-D·Esc 退出或取消 / 上下翻页滚动 /
-//! 左右与 Home·Delete 归输入光标 / Tab 开补全浮层**。
+//! 键位集：**Enter 提交或填入补全 / Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 /
+//! Esc 取消或清空输入 / 上下翻页滚动 / 左右与 Home·Delete 归输入光标 / Tab 开补全浮层**。
 //!
 //! # 命令分发（T10）
 //!
@@ -89,7 +89,23 @@ pub fn handle_key(
         match key.code {
             KeyCode::Char('c') => {
                 if app.is_turning {
-                    request_abort(boundaries);
+                    // 两段式：第一次请求取消，第二次退出。
+                    //
+                    // 只做「取消」是不够的 —— `Boundary::Abort` 是消息，`BasicLoop` 只在
+                    // 轮边界（与工具轮询）里读它，**模型调用期间无人读**。于是一次挂住的
+                    // 模型请求背后，Ctrl-C 按下去毫无反应：UI 不动、进程不退，用户手里
+                    // 就没有杀死本进程的键了（默认流空闲超时 120s × 有界重试，窗口以分钟计）。
+                    // 第二段让「按到不动就再按一次」成为可靠的退出路径，且不夺走第一段的取消语义。
+                    if app.abort_requested {
+                        app.should_quit = true;
+                    } else {
+                        app.abort_requested = true;
+                        request_abort(boundaries);
+                        app.transcript.push(crate::transcript::TranscriptLine::System(
+                            "已请求取消当前回合；若长时间无响应，再按一次 Ctrl-C 退出".into(),
+                        ));
+                        app.follow = true;
+                    }
                 } else {
                     app.should_quit = true;
                 }
@@ -487,6 +503,27 @@ mod tests {
         );
         assert!(!a.should_quit, "turn 中 Ctrl-C 是取消，不是退出");
         assert_eq!(ch.next_boundary().unwrap(), Boundary::Abort);
+    }
+
+    /// **回归（每次都必须能杀死进程）**：turn 中 **第二次** Ctrl-C 必须退出。
+    ///
+    /// 取消是**消息**（`Boundary::Abort` 只在轮边界 / 工具轮询里被读到），而一次
+    /// 模型调用期间无人读它 —— 于是「turn 中 Ctrl-C 只取消」在真实终端里表现为
+    /// **按了毫无反应**：UI 不动、进程不退，用户唯一的手动退出键失效。
+    /// 本用例钉住第二段语义：第一次请求取消，第二次直接退出（Ctrl-C 永远能杀死本进程）。
+    #[test]
+    fn test_ctrl_c_second_press_quits_while_turning() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        let ctrl_c = || with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(ctrl_c(), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(!a.should_quit, "第一次仍是取消请求");
+        assert_eq!(ch.next_boundary().unwrap(), Boundary::Abort);
+
+        handle_key(ctrl_c(), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(a.should_quit, "第二次 Ctrl-C 必须退出 —— 否则没有杀死进程的手段");
     }
 
     #[test]

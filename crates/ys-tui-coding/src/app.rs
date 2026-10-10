@@ -35,6 +35,15 @@ pub struct App {
     /// 交还给持有 `Terminal` 的事件循环（设计 §3「模态循环在 run.rs 里跑」）。
     pub pending_prompt: Option<PromptKind>,
     pub is_turning: bool,
+    /// 本回合是否已经按过一次 Ctrl-C（取消已请求）。
+    ///
+    /// 用途单一：让 `Ctrl-C` 在 turn 中**第二段**有语义（第一次请求取消，第二次退出）。
+    /// 取消是消息（`Boundary::Abort` 只在轮边界 / 工具轮询里被读到），而模型调用期间
+    /// 无人读它 ⇒ 只做「取消」时 Ctrl-C 会长时间毫无反应，用户失去杀死本进程的手段。
+    ///
+    /// 生命周期与 turn 对齐：任何进入 turn 的路径都清零，`finish_turn` 也清零 ——
+    /// 否则上一回合按过的 Ctrl-C 会让**下一回合的第一次** Ctrl-C 直接退出。
+    pub(crate) abort_requested: bool,
     /// `/thinking` 开关（默认隐藏思考内容）。
     pub thinking_visible: bool,
     pub should_quit: bool,
@@ -82,6 +91,7 @@ impl App {
             completion: None,
             pending_prompt: None,
             is_turning: false,
+            abort_requested: false,
             thinking_visible,
             should_quit: false,
             turn_started_at: None,
@@ -132,6 +142,7 @@ impl App {
                 {
                     self.pending_echo_texts.remove(pos);
                     self.is_turning = true;
+                    self.abort_requested = false;
                     self.turn_started_at = Some(Instant::now());
                     return;
                 }
@@ -147,6 +158,7 @@ impl App {
                 } else {
                     self.transcript.push(TranscriptLine::System(text));
                     self.is_turning = true;
+                    self.abort_requested = false;
                     self.turn_started_at = Some(Instant::now());
                 }
                 self.follow = true;
@@ -255,6 +267,7 @@ impl App {
         // 下一条 UserMessage 事件就是这条 —— 抑制掉，避免出现两遍
         self.suppress_user_echo += 1;
         self.is_turning = true;
+        self.abort_requested = false;
         self.turn_started_at = Some(Instant::now());
         self.working_dot = 0;
         self.follow = true;
@@ -302,6 +315,7 @@ impl App {
             self.md_cache.borrow_mut().finish(idx);
         }
         self.is_turning = false;
+        self.abort_requested = false;
         self.turn_started_at = None;
         self.suppress_user_echo = 0;
         self.tool_index.clear();
@@ -1071,6 +1085,25 @@ mod tests {
             }
             other => panic!("expected Summary, got {other:?}"),
         }
+    }
+
+    /// **回归**：「取消已请求」标记必须随回合生命周期复位。
+    ///
+    /// 若它跨回合残留，**下一回合的第一次** Ctrl-C 就落在「第二次」分支上 ⇒ 直接退出；
+    /// 用户只是想在长回合里取消一次，进程却没了。两个入口都要复位：回合结束（`finish_turn`）
+    /// 与回合开始（`begin_local_turn` / 迟到回声点亮 Working 的那两处）。
+    #[test]
+    fn test_abort_request_resets_with_turn() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        a.abort_requested = true;
+        a.apply_event(run_finished(1));
+        assert!(!a.is_turning, "前置：回合已结束");
+        assert!(!a.abort_requested, "回合结束必须复位");
+
+        a.abort_requested = true;
+        a.begin_local_turn("q2".into());
+        assert!(!a.abort_requested, "新回合起始必须复位");
     }
 
     #[test]

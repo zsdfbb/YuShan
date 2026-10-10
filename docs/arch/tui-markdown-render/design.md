@@ -10,9 +10,11 @@
 1. **采用现成库 `tui-markdown` 0.3.10**（`default-features = false`，彻底不引语法高亮），产出 ratatui `Text`，
    替换 `draw.rs:445-450` 的 `Assistant` 分支。
 2. **前置：ratatui 0.29 → 0.30 升级**（`tui-markdown` 依赖 `ratatui-core 0.1`，与 0.29 的 `Text` 是**不同类型、
-   不可互传**）。**代价实测仅约 10 行**：`Cargo.toml` 2 行 + `run.rs` 7–8 处泛型 bound；`draw.rs` 一行不改。
-3. **样式映射点 = 在 `draw.rs` 写一个 `impl StyleSheet`**（而非新建 md 模块）。`tui-markdown` 的
-   `StyleSheet` 是**编译期 trait**、非主题系统 ⇒ 与「颜色只在 `draw.rs` 决定」「不引 Theme」两条约束**相容**。
+   不可互传**）。**升级本身的代价实测仅约 10 行**：`Cargo.toml` 2 行 + `run.rs` 8 处泛型 bound
+   —— **升级单独不动 `draw.rs`**（`draw.rs` 的改动见 §2.2/§2.8，属**本方案**而非升级）。
+   **该升级已编译实证；库集成本身尚未验证** —— 见 §2.1 的说明与 §6 第 1 步。
+3. **样式映射点 = 新文件 `styles.rs` 里的一个 `impl StyleSheet`**（不是内联进 `draw.rs`）。`tui-markdown` 的
+   `StyleSheet` 是**编译期 trait**、非主题系统 ⇒ 与「颜色只在渲染层决定」「不引 Theme」两条约束**相容**。
 4. **拷贝友好是横切原则**（`context.md` 新增节）：Chat 窗格**只留顶部标题线**（去左右竖线）；表格**保留方框线**
    （有意接受的例外）；代码块**不用 `│` 左槽**；引用 `> `、列表 `- `（后者恰是库的默认）。
 5. **缓存按 `(槽下标, 内容长度, 宽度)` 记忆渲染产物**；库把「解析」与「表格布局」合在一次调用里，
@@ -20,6 +22,11 @@
 6. **接受三项与库绑定的既成事实**（详见 §2.7）：① 解析选项由库写死、**表格无法关闭**；
    ② 若干字形写死（无序标记 `- `、引用 `>`、表格框线）；③ 库自述 *experimental Proof of Concept*。
 7. **这是产品红线的反转**（Markdown 渲染原被「正式砍掉」）—— 由 ADR-0030 记录，并回改三处「已砍」文档。
+8. **渲染路径加 panic 边界**（新，§2.11）：模型输出是**不可信输入**，而解析库自述 PoC。
+   `run()` 装 panic hook 恢复终端，避免「库 panic ⇒ 终端留在 raw mode」。
+9. **流式尾部重渲染做时间节流**（新，§2.5）：缓存键含 `src.len()` ⇒ 消息**增长期间**每条 delta 都把
+   整条重解析（缓存对"正在生成的那条"收益为零）。以 `RENDER_THROTTLE`（~100ms）把解析成本与
+   帧率解耦 —— 见 §2.5 与 §4 的成本估算。
 
 ---
 
@@ -32,11 +39,11 @@
 | 依赖 | +pulldown-cmark | +pulldown-cmark | +pulldown-cmark | **ratatui 0.29→0.30 + crossterm 0.28→0.29 + tui-markdown + pulldown-cmark** |
 | 自研代码量 | ~180 行 | ~535 行 | ~800–950 行 | **~120–200 行**（`impl StyleSheet` + 接线 + 缓存）|
 | 表格 | ✗ 需自研 | ✗ 需自研 | ✗ 需自研 | **✓ 库内置**（列宽分配/折行/对齐/CJK/框线，469 行实现 + 快照测试）|
-| 现有代码改动 | 0 | 0 | 0 | **~10 行**（`run.rs` 泛型 bound；`draw.rs` 0）|
+| 现有代码改动 | 0 | 0 | 0 | **~10 行**（`run.rs` 泛型 bound）+ `draw.rs` 内区改道 / Assistant 分支 / 回放 raw 路径 |
 | 样式控制 | 完全 | 完全 | 完全 | **受限**：粗/斜体颜色不可改、若干字形写死（§2.7）|
-| 缓存 | 自定 | 自定 | L1/L2 分层 | **只能整体按 `(内容, 宽度)`**（库内不可分）|
-| 成熟度风险 | 自担 | 自担 | 自担 | **库自述 PoC、0.3.x API 未冻结** |
-| 主要风险 | 长会话重解析 | 分层略厚 | 前缀冻结正确性 | **表格极窄时突破宽度**、**升级的连带** |
+| 缓存 | 自定 | 自定 | L1/L2 分层 | **只能整体按 `(内容, 宽度)`**（库内不可分）+ 需补流式节流（§2.5）|
+| 成熟度风险 | 自担 | 自担 | 自担 | **库自述 PoC、0.3.x API 未冻结**；解析不可信输入 ⇒ 需 panic 边界（§2.11）|
+| 主要风险 | 长会话重解析 | 分层略厚 | 前缀冻结正确性 | **表格极窄时突破宽度**、**升级的连带**、**几何漂移**（§2.8）|
 
 **决定性事实**（`research.md` §2.2）：与本仓 ratatui 0.29 兼容的最新 `tui-markdown`（0.3.6）
 **不支持表格**（`lib.rs:154` `warn!("Table not yet supported")`）；带表格的 0.3.7+ 要求 ratatui 0.30。
@@ -73,10 +80,17 @@
 泛型 `B: Backend` + `?` 无法把 `B::Error` 转成 `TuiError`/`PromptError` ⇒ 8 处 bound 改为
 `B: Backend<Error = std::io::Error> + Write`。**`draw.rs` 约 1500 行（含全部单测）零改动。**
 
-> ✅ **已编译实证**（2026-10-09，Rust 1.99.0 / cargo 1.99.0）：
+> ✅ **前置升级已编译实证**（2026-10-09，Rust 1.99.0 / cargo 1.99.0）：
 > `cargo build --workspace` 通过（`Finished in 1m 48s`）；
 > `cargo test -p ys-tui-coding` **212 passed / 0 failed**。
-> §2.1 的 bound 推断由源码推断升为**实测结论**。
+> 该实测使「`Backend::Error` 必须加 bound」由源码推断升为结论。
+>
+> ⚠️ **但它覆盖的范围仅限升级本身** —— 那次构建时 `tui-markdown` **尚未进入依赖树**
+> （`Cargo.lock` 无该条目）。因此以下三件**仍未验证**，属落地第一步的验收项（§6 第 1 步）：
+> ① 库返回的 `Text` 与本仓 `ratatui::text::Text` 是否**同一类型**（依赖 `ratatui 0.30` 与库的
+> `ratatui-core 0.1` 版本统一，是全案地基）；② `StyleSheet` 十余个方法的**实际名字与签名**；
+> ③ `Options` 的 builder 用法与 `table_width` 语义。以下 §2.3 / §2.7 的接口与覆写清单**均来自阅读源码，
+> 非编译结论** —— 落地时是最可能返工之处。
 
 ### 2.2 模块划分
 
@@ -120,6 +134,19 @@ impl tui_markdown::StyleSheet for AssistantStyles {
 pub(crate) struct RenderCache { /* slots 与 transcript 等长；仅 Assistant 槽位被填充 */ }
 impl RenderCache {
     pub fn sync_len(&mut self, transcript_len: usize);
+    /// 取该槽位的渲染行（未命中则 `md::render` 并记住）。
+    ///
+    /// **借用纪律（必须遵守）**：调用方经 `app.md_cache.borrow_mut()` 取得 `RefMut`，
+    /// 返回的 `&[Line]` **生命周期绑在该守卫上** —— 不得带出守卫作用域。唯一正确写法是
+    /// **在守卫内 clone 进目标**：
+    /// ```ignore
+    /// { let mut c = app.md_cache.borrow_mut();
+    ///   out.extend(c.lines_for(i, s, w, styles).iter().cloned()); }
+    /// ```
+    /// 缓存省的是**解析**、不是拷贝；每次命中仍会 clone 一遍（CJK 行宽校验也须在守卫内做完）。
+    ///
+    /// **不得重入** —— 同一 `RefCell` 二次 `borrow_mut()` 即 panic（与 `run.rs` 的
+    /// `TuiPrompter`「禁止重入 `select`/`text`」同性质）；本仓调用点无嵌套，靠此约束保持。
     pub fn lines_for(&mut self, idx: usize, src: &str, width: usize,
                      styles: AssistantStyles) -> &[Line<'static>];
 }
@@ -140,7 +167,8 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 ```
 
 **帧频事实**（`run.rs:58,155`）：`terminal.draw` 在**每次 `poll(50ms)` 超时或事件后**都执行
-⇒ **空闲也 ~20fps 重绘**，流式时每个 delta 一次。故缓存是稳态必需，不是可选项。
+⇒ **空闲也 ~20fps 重绘**。故缓存是稳态必需，不是可选项；而**增长中的那条**由 §2.5 的节流兜住。
+另注意 `build_text` **每帧被调 2 次**（`max_scroll_offset` 一次 + `draw_transcript` 一次）。
 
 **宽度传递注意**：`table_width` 的语义是「**该表格可用的总列数**（含边框、内边距、外层列表/引用前缀）」，
 不是整段文本宽度。故传 `inner_w`；库在 `end_table` 会自行扣除嵌套前缀。
@@ -155,6 +183,19 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 | 为何不含全量哈希 | Assistant 只经 `append_stream` 在**尾部 `push_str`**、transcript 只增 ⇒ 非尾部条目内容恒定，长度相等即内容相同。`debug_assert!` 钉住；将来若支持编辑历史须升级为内容哈希 |
 | 为何 `RefCell` | `build_text_with`/`total_rows`/`compute_max_scroll` 现均为 `&App`；改 `&mut` 会波及 `draw_transcript` 与大量测试调用点。UI 侧单线程 ⇒ `RefCell` 低 churn（与 `TuiPrompter` 用 `Mutex` 同手法）|
 | 内存上界 | ≈ 1.0–1.3 × assistant 源文本总字节；单条 > 256 KiB 不入缓存（退化每帧现算，不失控）|
+| **流式节流** | **正在增长的那条**不逐 delta 重解析：距上次渲染 < `RENDER_THROTTLE`（100 ms）时**沿用上次产物**；到点、或该条**结束时**（新 delta 落到下一条 / turn 结算）**必须**重算一次 |
+
+**为什么必须节流（缓存覆盖不到的那一段）**：键含 `src.len()` ⇒ **消息每长一个字节键就变，整条重解析**。
+即 **缓存对「正在生成的那条」收益为零**，它只在消息**结束之后**的下一次重绘才生效。而流式正是文本
+**持续增长**的时段：一条 200 KiB 的长回答（含表格）在 ~20fps 下等于 ~4 MB/s 的无谓解析。
+节流把「解析成本」与「帧率」解耦 —— 代价是最末一个字最多晚 100 ms 成型（`POLL_INTERVAL` 本就 50 ms，
+用户不可感），收益是超长回答不卡。
+
+**两个必须做对的边界**：
+1. 节流窗口内沿用旧产物时，**`total_rows` 与 `draw_transcript` 必须用同一个「上次产物」** —— 否则
+   滚动上限按新内容算、画面按旧内容画，二者错位（本仓"滚动/宽度失配"前科类）。故节流状态
+   **存在 `RenderCache` 内**（它自己记住"这条上次算出什么、什么时候"），**不由两个调用点各自判断**。
+2. **该条结束时强制重算**，否则最后一段增量会永久停留不显示。
 
 ### 2.6 表格（库负责；本仓只做宽度传入与溢出守卫）
 
@@ -162,9 +203,12 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 自然宽取每列最大显示宽（非等分）；自然宽总和超预算则压到「单字素最小宽」再按最窄列优先逐列 +1；
 单元格按**字素边界**折行；行高取该行最高单元格；框线用 Unicode `─│┌┬┐├┼┤└┴┘`；对齐由分隔行决定。
 
-**⚠️ 溢出条件（精确，实测）**：库**不保证**「输出行宽 ≤ 给定宽度」。溢出**当且仅当**
+**⚠️ 溢出条件**：库**不保证**「输出行宽 ≤ 给定宽度」。溢出**当且仅当**
 `width < (3N+1) + Σ(每列最宽单字素的显示宽)`（N=列数；每列 2 空格 padding + 1 右框线，外加 1 左框线）。
-如 2 列 ASCII 的最小宽 = **9**，2 列 CJK = **10**。低于此值库**不截断内容、直接超宽**（实测 `table_width(0)` → 输出 9 列）。
+如 2 列 ASCII 的最小宽 = **9**（7+1+1），2 列 CJK = **11**（7+2+2）。低于此值库**不截断内容、直接超宽**。
+
+> 该公式**仅供参考**，**守卫不依赖它**（见下：守卫是"渲染后量行宽"）。**切勿把它硬编码成阈值常数** ——
+> 列数、字素宽度、嵌套前缀都会让常数失真。此处记它只为解释"为什么会溢出"。
 
 **破坏后果**：本仓 `draw.rs:124-126` 用 `wrap(trim:false)` ⇒ 超宽行会被 `Paragraph` **二次折行**，
 表格边框被切断。**但 `line_count` 与渲染自洽**（二者同用该 `Wrap`）⇒ 滚动数学不崩，**只是表格视觉损坏**。
@@ -199,10 +243,29 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 
 | 位置 | 决定 | 库现状 |
 |---|---|---|
-| Chat 窗格边框 | **只留顶部标题线**（`draw.rs:125` 的 `Block::bordered()` → 仅 TOP）；连带 `inner_w` 从 `area.width - 2` 变 `area.width`（draw.rs:109），换行与 `line_count` 须一起验 | 本仓改动 |
+| Chat 窗格边框 | **只留顶部标题线**（`draw.rs:125` 的 `Block::bordered()` → `Borders::TOP`）；**几何随之变化，见下** | 本仓改动 |
 | 表格 | **保留方框线**（有意接受的例外：框线即可读性；拷贝带 `│─┌┐`）| 库默认即此 |
 | 代码块 | **不用 `│` 左槽**，改缩进/底色 ⇒ 拷贝得到纯代码 | **库天然无 gutter**；仅需 `code_block_fence()=""` 去围栏 + `code()` 设背景 |
 | 引用 / 列表 | `> ` / `- `（拷出仍是有效 Markdown）| **恰是库默认** —— 白拿 |
+
+**⚠️ 几何连带（不只是 `inner_w`，也不只一处）**：去掉左右竖线后内区从「宽 `w-2` / 高 `h-2`」
+变为「宽 `w` / 高 `h-1`」——**宽度和高度的两个数都变了**，且同一约束在代码里有 **4 个站点**
+（`max_scroll_offset` 与 `draw_transcript` 各 2 个），必须同进同退：
+
+| 站点 | 现在 | `Borders::TOP` 后 |
+|---|---|---|
+| `draw.rs:96` | `chat.width.saturating_sub(2)` | `chat.width` |
+| `draw.rs:97` | `chat.height.saturating_sub(2)` | `chat.height - 1` |
+| `draw.rs:109` | `area.width.saturating_sub(2)` | `area.width` |
+| `draw.rs:110` | `area.height.saturating_sub(2)` | `area.height - 1` |
+
+**`inner_h` 漏改的后果比 `inner_w` 更隐蔽**：`follow` 贴底时最后一行被裁、`max_scroll_offset` 差 1 行
+—— 而两处都是合法 `usize` 减法，**编译器不抓**。
+
+**做法（不要改这 4 个常数）**：把内区改为**从同一个 `Block` 实例取**（`block.inner(area)`，
+`draw.rs:133/327` 已是此写法），即 `max_scroll_offset` 与 `draw_transcript` **共用同一个 block 构造**，
+让"算滚动 / 画帧 / `line_count`"三者的几何**不可能漂移**。这既是本项改动，也是顺手还掉的既有重复债
+—— 成本低于逐个改常数。
 
 ### 2.9 流式半截输入
 
@@ -217,6 +280,32 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 - 退出回放 `transcript_plain_lines`（`draw.rs:541`）现复用 `build_text_with` ⇒ 会带上 md 样式。
   **决定：回放走 raw 路径**（`Assistant` 原样切行），主屏 scrollback 里留**原始 markdown 源**（可复制可搜）。
 
+### 2.11 panic 边界（新）
+
+**问题**：`run()` 的形状是
+
+```rust
+let result = event_loop(...);          // run.rs:109  ← 绘制在循环内，panic 从这里传出
+restore_terminal(&mut terminal, &app); // run.rs:113  ← 被 unwind 跳过
+result
+```
+
+全仓 `set_hook` / `catch_unwind` **零命中** ⇒ **绘制路径 panic 后终端留在 raw mode + alt-screen**，
+用户只能 `reset`（`docs/CONTEXT.md` 的"血的教训"类）。本方案之前绘制全是自家代码；本方案**第一次把
+模型输出（不可信输入）喂给第三方解析器**，而该库自述 *experimental PoC*。
+
+**决定：在 `run()` 入口装 panic hook**，hook 内执行终端恢复（`disable_raw_mode` + `?1049l` +
+`EnableLineWrap` + `DisableBracketedPaste`，复用 `exit_payload` 的前段），**然后才调用上游默认 hook**。
+
+- **为什么是 hook 而非 `catch_unwind` 包 `md::render`**：hook **覆盖全部绘制路径**（不止 md 一处），
+  且与本仓"**恢复无条件发生**"的既有精神一致（`restore_terminal` 的注释已申明哪怕出错也不能把终端
+  留在 raw mode —— 只是它没管 panic 这条出口）。`catch_unwind` 只能包住你**预先想到**的那个调用点。
+- **恢复必须 best-effort**：hook 里每步都吞 IO 错误，绝不二次 panic。
+- **`catch_unwind` 不用于"吞掉库 panic 继续跑"**：panic 后 `App`/缓存状态不保证一致，**失败即退出**
+  （恢复终端后让进程结束）比带伤续跑安全。
+
+> 这一项**独立于 md 渲染**（任何绘制 panic 都受益），但本方案是它最强的触发理由，故在此落地。
+
 ---
 
 ## 3. 不变量
@@ -228,6 +317,9 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 5. `ys-tui-coding` **不依赖 `ys-runtime`**；UI 线程**无 runtime 上下文**（`RefCell` 单线程内使用）。
 6. `tui-markdown` 的 `StyleSheet`/`Options` 分别是 trait 与 `#[non_exhaustive]` 结构：`Options` 只能用
    `new`/`default` + builder，**不可字段字面量构造**。
+7. **内区几何只有一个来源**：`max_scroll_offset` / `draw_transcript` / 渲染三处的内区取自**同一个
+   `Block` 实例**（§2.8），不得各自手写 `saturating_sub`。
+8. **任何绘制路径 panic 后终端不得留在 raw mode / alt-screen**（§2.11 的 panic hook 保证）。
 
 ---
 
@@ -235,15 +327,23 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 
 | 项 | 估计 | 依据 |
 |---|---|---|
-| 现有代码改动 | **~10 行**（run.rs bound）+ `draw.rs` 0 | 第二份调研逐 API 核对 |
-| 新增代码 | **~120–200 行**（md.rs 胶水 + styles.rs 覆写 + cache.rs + app/draw 接线）+ 测试 | 对照：自研 A/B/C 为 180–950 行 |
+| 现有代码改动 | **~10 行**（run.rs bound）+ `draw.rs` 内区改道 | 第二份调研逐 API 核对 |
+| 新增代码 | **~120–200 行**（md.rs 胶水 + styles.rs 覆写 + cache.rs + app/draw 接线 + panic hook）+ 测试 | 对照：自研 A/B/C 为 180–950 行 |
+| **每帧解析成本（热路径）** | **增长中的那条**：`O(当前消息字节数)` ÷ `RENDER_THROTTLE`(100ms) ⇒ 上界 ≈ **10 × 消息字节数/秒**（200 KiB 消息 ≈ 2 MB/s）；**已完成的消息**命中缓存 ⇒ O(clone) | §2.5；点估计，须以实测替换 |
+| 每帧固定成本 | `build_text` ×2/帧（§2.4）+ 每命中行 clone 一遍（§2.3 借用纪律）| `draw.rs` 现状 |
 | 依赖增量（默认特性关掉后）| 传递依赖 **81 → 44** 个；**syntect/onig C 库全不进入** | `cargo tree` 实测 |
-| 边际新依赖 | `pulldown-cmark` + `itertools` + `tracing`（其余 44 个多来自 ratatui-core，升级 ratatui 本就要）| 实测 |
+| 边际新依赖 | `pulldown-cmark` + `itertools` + `tracing`（其余 44 个多来自 ratatui-core，升级 ratatui 本就要）。**`tracing` 本仓不消费**（库的传递依赖，无 subscriber）| 实测 |
 | release 体积增量 | **未测**（须 `cargo build --release` 对比；基线历史 ~5.7MB）| — |
 
-**可测验收目标**：① `cargo build`+`cargo test -p ys-tui-coding` 通过（**已验证**：workspace 构建通过 + 212 测试全过，见 §2.1）；
-② `line_count(w)` 与实际渲染视觉行数一致（含 CJK + 表格），多宽度断言；③ 表格窄屏守卫：`inner_w < 阈值`
-时无超宽行（属性测试）；④ 拷贝不含 `│`（S8）；⑤ release 体积增量 < +500KB。
+**可测验收目标**：
+① **依赖接入 + 最小 `md::render` 编译通过**（`cargo add tui-markdown` 后 `cargo build -p ys-tui-coding`）——
+   这是 §2.1 那三件未验证项的**唯一收敛方式**；
+② `cargo build --workspace` + `cargo test -p ys-tui-coding` 全过（**前置升级已验证**，见 §2.1）；
+③ `line_count(w)` 与实际渲染视觉行数一致（含 CJK + 表格），多宽度断言；
+④ 表格窄屏守卫：越界行数 = 0（属性测试；**不断言固定阈值**，见 §2.6）；
+⑤ 拷贝不含 `│`（S8）；
+⑥ **长流式消息**（≥100 KiB）期间无可感卡顿（验证 §2.5 节流）；
+⑦ release 体积增量 < +500KB。
 
 ---
 
@@ -252,33 +352,49 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 | # | 风险 | 缓解 |
 |---|---|---|
 | R1 | **表格极窄时突破宽度** ⇒ `Paragraph` 二次折行 ⇒ 表格视觉损坏 | §2.6 守卫：渲染后校验行宽，越界该条退回 raw；属性测试 |
-| R2 | **升级编译未实证**（`Backend::Error` bound 是推断）| **已消解**（2026-10-09 实测：workspace 构建 + 212 测试全过，见 §2.1）|
+| R2 | **~~升级编译未实证~~** | **前置升级已消解**（2026-10-09 实测：workspace 构建 + 212 测试全过，见 §2.1）。**但库集成仍未验证** —— 见 §2.1 ⚠️ 与 §6 第 1 步；落地时 `StyleSheet` 方法名/`Options` 用法最可能返工 |
 | R3 | **库默认配色漏进来** ⇒ 破坏「无 Theme」 | `styles.rs` **逐方法覆写**；测试断言产出样式不含库默认色 |
 | R4 | **半截护栏视觉跳动** | 确定性、不 panic；若实测刺眼再议 |
 | R5 | **resize 全量重算**（放弃了自研的 L1/L2 分层）| 库不可分；resize 是一次性帧抖动，稳态仍 O(1)。若实测卡顿，退路是只对**可见区**渲染 |
-| R6 | **库成熟度**（PoC 自述、0.3.x API 未冻结）| ADR 记录；`md.rs` 把库隔离在一处薄胶水里，将来可换 |
+| R6 | **库成熟度**（PoC 自述、0.3.x API 未冻结）| ADR 记录；`md.rs` 把库隔离在一处薄胶水里，将来可换。**约束：`tui_markdown::` 路径只准出现在 `md.rs`/`styles.rs`**（可用 CI grep 断言钉住）|
 | R7 | **产品红线反转 + 文档未回改** | 交付项含 ADR-0030 + 回改三处「已砍」文档（与功能 diff 分开）|
 | R8 | **回放语义漂移**（忘做 raw 路径）| 回放走 raw；测试断言回放含原始 `#`/`**` |
 | R9 | **库缺陷（0.3.10 实测）**：**4 空格缩进式**代码块会把多行内容**合并成一行**（围栏式不受影响）| LLM 输出基本是围栏式 ⇒ 影响小；用例钉住围栏式正常；若实测遇到，可在 `md.rs` 侧对 `Indented` 块补救或上报上游 |
+| R10 | **几何漂移**：`inner_h` 或 `max_scroll_offset` 内的同源常数漏改 ⇒ 贴底裁行 / 滚动失配（**编译器不抓**）| §2.8：内区统一取自同一 `Block`（`block.inner(area)`），消灭手写减法；不变量 7 |
+| R11 | **节流窗口内新旧产物混用** ⇒ 滚动按新、画面按旧 | §2.5 边界 ①：节流状态存 `RenderCache` 内，两调用点读**同一份**上次产物；边界 ②：该条结束时强制重算 |
+| R12 | **库 panic ⇒ 终端留在 raw mode**（不可信输入 + PoC 库）| §2.11：`run()` 装 panic hook 做终端恢复；不变量 8 |
 
 **变异测试义务**：① 关掉窄屏守卫（超宽用例应红）；② 让缓存永不失效（流式增长用例应红）；
-③ 覆写漏掉一个 `StyleSheet` 方法（默认色泄漏用例应红）。
+③ 覆写漏掉一个 `StyleSheet` 方法（默认色泄漏用例应红）；④ **`Borders::TOP` 后把内区改回
+`saturating_sub(2)`**（贴底/滚动上限用例应红）；⑤ **摘掉节流、改回逐 delta 重渲染**
+（"该条结束时内容完整"用例应红）。
 
 ---
 
 ## 6. 交付顺序
 
-1. **依赖升级**：`Cargo.toml`（ratatui 0.30 `default-features = false` / crossterm 0.29）+ `run.rs` bound ⇒ **已完成，`cargo build` 实证通过**（R2 消解）
-2. **`styles.rs`**：`impl StyleSheet`，逐方法覆写（含漏写检测测试）
-3. **`md.rs`**：调库 + owned 转换 + `table_width`；接入 `draw.rs` `Assistant` 分支（先不缓存）
-4. **拷贝友好**：Chat 窗格改仅顶边框 + `inner_w` 连带修正 + 表格窄屏守卫
-5. **`cache.rs` + `App` 字段**
-6. **回放 raw 路径** + `/copy` 回归
-7. 测试：S1 半截 fence / S2 代码块 / S3 CJK 列宽 / S4 长会话 / S8 拷贝无边框 / 表格窄屏降级 / 变异
-8. **ADR-0030 + 文档回改**
+1. **依赖接入 + 最小渲染跑通（最高优先）**：
+   - `cargo add tui-markdown --no-default-features`（落 `Cargo.toml`）；
+   - 写**最小** `md.rs`：一个 `from_str_with_options` 调用，把 `Text` 收成 owned；
+   - 先只验证 **`Text` 类型统一 + `Options`/`StyleSheet` 能否编译** ⇒ `cargo build -p ys-tui-coding`。
+   这一步把 §2.1 的三件未验证项一次性收敛，**结果未出前不更新 R2 的"已消解"措辞**。
+2. **`styles.rs`**：`impl StyleSheet`，逐方法覆写（**以编译器给出的方法表为准**，含漏写检测测试）
+3. **`md.rs`**：owned 转换 + `table_width`；接入 `draw.rs` `Assistant` 分支（先不缓存）
+4. **几何改道（R10）**：Chat 窗格改 `Borders::TOP`；`max_scroll_offset` 与 `draw_transcript`
+   改为**共用同一 `Block` 取内区**（§2.8），**不要**只去改那 4 个常数
+5. **表格窄屏守卫**（§2.6；渲染后量行宽，越界退 raw）
+6. **`cache.rs` + `App` 字段** + **流式节流**（§2.5 两条边界；`RENDER_THROTTLE`）
+7. **panic hook**（§2.11）—— 独立于 md，但趁 `run.rs` 已动时一并做
+8. **回放 raw 路径** + `/copy` 回归（`transcript_plain_lines` 改道；注意 `draw.rs` 内 4 个测试调用点）
+9. 测试：S1 半截 fence / S2 代码块 / S3 CJK 列宽 / S4 长会话 / **S4b 长流式消息（节流）** /
+   S8 拷贝无边框 / 表格窄屏降级 / **几何变异** / 变异
+10. **ADR-0030 + 文档回改**
 
-`prototype` 先验三点：~~ratatui 0.30 能否编译通过~~（**已验证通过**，见 §2.1）、
-**表格窄屏守卫阈值与观感**、**`line_count` 一致性**。
+**前置升级（ratatui 0.30 + crossterm 0.29 + `run.rs` bound）已完成并实证**（commit `87bd1ec`），
+是第 1 步的前提，不是第 1 步本身。
+
+`prototype` 尚待验证两点：**表格窄屏守卫的观感**（越界退 raw 后的画面是否可接受）、
+**`line_count` 一致性**（§2.4 的宽度传递与 §2.8 的几何改道合起来跑，含 CJK + 表格）。
 
 ---
 
@@ -295,3 +411,7 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 | 半截 fence 策略 | **立即渲染**（库内建行为，会画出假收场围栏）|
 | 依赖体积 | 未测，须实测 |
 | **拷贝友好（新增）** | §2.8：去 Chat 左右边框；表格留框线；代码块无竖线 |
+| **几何改道（复核新增）** | §2.8：内区不再手写 `saturating_sub`，改由同一 `Block` 取（含 `inner_h`，涉及 4 站点）|
+| **流式节流（复核新增）** | §2.5：增长中的那条按 `RENDER_THROTTLE`(100ms) 节流，状态存缓存内 |
+| **panic 边界（复核新增）** | §2.11：`run()` 装 panic hook 恢复终端（独立于 md，一并落地）|
+| **实证口径（复核收窄）** | §2.1：已实证的只是**前置升级**；库集成为落地第 1 步的验收项 |

@@ -90,20 +90,55 @@ accepted（2026-10-09）
   内容不丢只丢换行，上游无对应测试）。LLM 输出基本是围栏式 ⇒ 影响小，但须记档并在用例中钉住围栏式行为。
 - **`draw.rs` 零改动，`run.rs` 8 处 bound**；`Cargo.toml` 两处版本 + 一个新依赖。
   **依赖方向不变**：仍不依赖 `ys-runtime`；UI 线程仍无 runtime 上下文；`ys-protocol` 仍零 tokio。
-- ✅ **升级的编译影响已实证**（2026-10-09，Rust 1.99.0）：`cargo build --workspace` 通过
+- ✅ **前置升级的编译影响已实证**（2026-10-09，Rust 1.99.0）：`cargo build --workspace` 通过
   （`Finished in 1m 48s`），`cargo test -p ys-tui-coding` **212 passed / 0 failed**。
   `Backend::Error` 必须加 bound 由编译日志证实，非仅源码推断。
+  ⚠️ **该实证的范围仅限升级**：当时 `tui-markdown` 尚未进入依赖树（`Cargo.lock` 无该条目），
+  故**库集成本身仍未验证** —— `Text` 类型是否统一、`StyleSheet` 方法名、`Options` 用法三者
+  均为阅读源码所得。**落地第一步即"加依赖 + 最小渲染编译"**，在此之前不得宣称本方案已实证。
 - ⚠️ **文档回改是本 ADR 的交付项**：三处「已砍」表述须对齐新事实，并写明**只反转 Markdown 渲染，
   高亮/Theme/Diff/鼠标/快捷键仍砍**。不改则文档自相矛盾。
 - **已知风险**（详见 design.md §5）：表格窄屏溢出（R1，须加守卫）、库默认配色泄漏（R3，须逐项覆写）、
-  resize 全量重算（R5）、库成熟度（R6）。
+  resize 全量重算（R5）、库成熟度（R6）、几何漂移（R10，内区统一取 `block.inner`）、
+  节流窗口内新旧产物混用（R11）、库 panic 致终端滞留（R12，panic hook 兜底）。
 - **变异测试义务**：关掉窄屏守卫（超宽用例应红）、让缓存永不失效（流式增长用例应红）、
   漏覆写一个 `StyleSheet` 方法（默认色泄漏用例应红）。
+
+## 复核补充（2026-10-10，`/arch-validate` 后修订）
+
+对设计方案做了逐条代码核对（产出见 `review.md`），据此增补两条**与本 ADR 同级**的决策，
+并修正若干文档不自洽：
+
+7. **渲染路径加 panic 边界**。`run()`（`run.rs:109→113`）在 `event_loop` panic 时**跳过**
+   `restore_terminal`，全仓无 panic hook ⇒ 终端会留在 raw mode。本方案第一次把**模型输出**这种
+   不可信输入喂给自述 PoC 的第三方解析器，**决定在 `run()` 入口装 panic hook**：hook 内 best-effort
+   执行终端恢复（复用 `exit_payload` 前段），再调上游默认 hook。**选 hook 而非 `catch_unwind` 包
+   `md::render`** —— 前者覆盖**全部**绘制路径，且契合本仓"恢复无条件发生"的既有精神。
+   panic 后**不续跑**（状态不保证一致），恢复终端即退出。
+
+8. **流式尾部重渲染做时间节流**。缓存键含 `src.len()` ⇒ 消息**每长一个字节键就变、整条重解析**，
+   即 **缓存对"正在生成的那条"收益为零**——而这恰是解析唯一持续在跑的时段。
+   **决定按 `RENDER_THROTTLE`（100 ms）节流**：窗口内沿用上次产物，到点或该条结束时强制重算。
+   两条边界必须做对：① 节流状态**存在缓存内**，令 `total_rows` 与 `draw_transcript` 读**同一份**
+   上次产物（否则滚动按新、画面按旧）；② 该条结束**必须**重算，否则尾部增量永久不显示。
+   代价：最末一个字最多晚 100 ms（`POLL_INTERVAL` 本就 50 ms，不可感）。
+
+**另修正（不改变已定决策，属实现细节与措辞）**：
+
+- **几何改道**：去左右边框后内区「宽 `w-2`→`w`、**高 `h-2`→`h-1`**」，涉及 **4 个站点**
+  （`draw.rs:96,97,109,110`）。**决定：不逐个改常数，改为内区统一取自同一个 `Block` 实例**
+  （`block.inner(area)`），令"算滚动 / 画帧 / `line_count`"的几何不可能漂移。理由：`inner_h` 漏改
+  是合法 `usize` 减法，**编译器不抓**，而后果是贴底裁行 + 滚动上限差 1。
+- **表格溢出公式非承重**：`(3N+1)+Σ` 仅供参考，守卫是"渲染后量行宽"，**不得**把该式硬编码为阈值常数。
+- **实证口径收窄**：见上 Consequences。
+- **`tui_markdown::` 路径只准出现在 `md.rs`/`styles.rs`**（R6 缓解的可检验形式）。
 
 ## 参考
 
 - 设计与调研：[`docs/arch/tui-markdown-render/design.md`](../arch/tui-markdown-render/design.md)、
   [`context.md`](../arch/tui-markdown-render/context.md)、[`research.md`](../arch/tui-markdown-render/research.md)
+- 复核报告：[`docs/arch/tui-markdown-render/review.md`](../arch/tui-markdown-render/review.md)
+  （本次修订的依据；四维判断 + 风险排序 + A1–A5/B1–B2）
 - 被反转的红线：[`docs/arch/gap-closure/context.md`](../arch/gap-closure/context.md)、
   [`docs/arch/tui-stack-revisit/design.md`](../arch/tui-stack-revisit/design.md)、
   [`docs/arch/tui-pi-codewhale-borrow/design.md`](../arch/tui-pi-codewhale-borrow/design.md)

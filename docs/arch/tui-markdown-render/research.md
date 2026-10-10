@@ -47,6 +47,11 @@
 
 **官方自述**：README 称 *experimental Proof of Concept*。维护者 joshka 是 ratatui 生态核心贡献者。
 
+**License 与活跃度**（2026-10-10 核实）：**Apache-2.0** —— 但**只在仓库里声明**：
+`crates.io` API 的 `license` 字段为 `None`（元数据未填）。仓库未归档，116 stars，
+最近一次 push 2026-10-09（即本调研当日）⇒ 活跃。**注意 Apache-2.0 含专利授权与 NOTICE 义务**，
+与本仓分发条款兼容性由本仓自行确认。
+
 ### 2.2 ⚠ 版本断层（本次调研的**决定性发现**）
 
 `tui-markdown` 各版的 `ratatui` 依赖（查 crates.io sparse index）：

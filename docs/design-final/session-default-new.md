@@ -35,8 +35,8 @@ crates/ys-session/src/jsonl.rs（改）         meta 字段；load_from_file 逐
 crates/ys-session/Cargo.toml（改）           + serde（derive）
 apps/coding-agent/src/sessions.rs（新建）     list / resolve / pick / read_meta / user_text / derive_title / derive_stored_title
 apps/coding-agent/src/wiring.rs（改）         persistent_new / resume / meta / update_meta / new_session（惰性）；删 latest_session_path；ephemeral 标 #[cfg(test)]
-apps/coding-agent/src/main.rs（改）           parse_args --resume + split_leading_flags；resolve_resume；四档模型恢复；finalize_turn_meta；persist_single_turn（session: <id> → stderr）；raw_and_expanded_task
-apps/coding-agent/src/app_loop.rs（改）       回合末 finalize_turn_meta；thinking 进程级镜像；SetThinking 臂；/new 后 thinking 不重置
+apps/coding-agent/src/main.rs（改）           parse_args --resume + split_leading_flags；resolve_resume；四档模型恢复；finalize_turn_meta；session_exit_line（三模式退出的 session: <id> → stderr，ADR-0032）；raw_and_expanded_task
+apps/coding-agent/src/app_loop.rs（改）       回合末 finalize_turn_meta；thinking 进程级镜像；SetThinking 臂；/new 后 thinking 不重置；SessionPathHandle（退出提示取号，/new 后刷新）
 apps/coding-agent/src/view.rs（改）           build_view 填 CodingView.thinking_visible 初值
 apps/coding-agent/src/capabilities.rs（改）   /new 惰性（不再预建空文件）
 crates/ys-protocol/src/request.rs（改）       Request::SetThinking { visible: bool }
@@ -170,7 +170,8 @@ provider 无凭证时**降级而非失败**（不挡起屏）。四档以及「m
 - **`provider` / `model` 可能不成对**：逐字段「仅 `Some` 时写」⇒ env provider 为 `None` 时会保留旧
   `provider` 而刷新 `model`，出现 provider/model 不匹配（对恢复优先级无害，但读 meta 时需知情）。
 - **meta 仅在成功回合写**：首回合失败 ⇒ 无 title、脚本拿不到 `session: <id>`
-  （`persist_single_turn` 在 `run_single_turn` 之后）。
+  （`persist_single_turn` 在 `run_single_turn` 之后）。TUI 侧同理：**没落盘就不打**
+  （`session_exit_line` 的 `is_file` 守卫，ADR-0032）。
 - **`update_meta` 每回合全量重写**：写放大 ≈ `1/(N+1)` 级；长会话下与 `append` 的 O(n²) 都属既有
   `JsonlSession` 策略。
 - **多进程并发写同一文件无锁**：整文件重写 + 固定 tmp 名会丢更新（既有缺口，未改）。

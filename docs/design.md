@@ -526,7 +526,7 @@ let agent = AgentBuilder::new()
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |
 | `HookDispatcher` | Hook 顺序、Observer 错误、Transform 修改和 Control 决策 |
 | 动态插件 | Manifest、ABI 版本、组件注册、Hook 注册、初始化失败和生命周期 |
-| Coding Agent | 项目上下文发现、四个默认工具、Print 模式、JSON 事件和会话恢复；会话默认新会话（零目录扫描）、`--resume`（pick / 指定 / 非 TTY 与空列表的两种收场）、meta 首行（title/provider/model/tokens）与 resume 的模型恢复优先级（env > meta > state.json > 首个有凭证）；TUI：turn 活渲染（提交即见 + Working 动画 + Turn 行）、事件路径取消、slash 命令时 TUI 让位（真实终端执行）、退出回放按 thinking 开关打印对话、单键退出、默认仅对话窗口（status/footer 可选面板）；**subagent 派发**：P0 前缀指纹（父 10 元 / 子 9 元 / 同表构造两次逐字节相同）、`subagent` 工具（子失败不拖垮父 + `is_error`）、usage 上卷、**每回合派发总量上限**、产物目录 sweep 与 `YUSHAN_SUBAGENTS_DIR`、`model` 名解析失败 fail-closed、父子提示词的能力边界声明 |
+| Coding Agent | 项目上下文发现、四个默认工具、Print 模式、JSON 事件和会话恢复；会话默认新会话（零目录扫描）、`--resume`（pick / 指定 / 非 TTY 与空列表的两种收场）、meta 首行（title/provider/model/tokens）与 resume 的模型恢复优先级（env > meta > state.json > 首个有凭证）；**退出时三模式都打 `session: <id>`**（TUI 退出回放后 / 一次性收尾，仅对已落盘会话，见 ADR-0032）；TUI：turn 活渲染（提交即见 + Working 动画 + Turn 行）、事件路径取消、slash 命令时 TUI 让位（真实终端执行）、退出回放按 thinking 开关打印对话、单键退出、默认仅对话窗口（status/footer 可选面板）；**subagent 派发**：P0 前缀指纹（父 10 元 / 子 9 元 / 同表构造两次逐字节相同）、`subagent` 工具（子失败不拖垮父 + `is_error`）、usage 上卷、**每回合派发总量上限**、产物目录 sweep 与 `YUSHAN_SUBAGENTS_DIR`、`model` 名解析失败 fail-closed、父子提示词的能力边界声明 |
 
 ## 13. 总结
 

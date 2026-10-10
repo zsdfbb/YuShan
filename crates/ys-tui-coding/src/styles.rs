@@ -164,10 +164,26 @@ mod tests {
     #[test]
     fn overrides_do_not_match_default_palette() {
         let s = AssistantStyles;
-        assert_ne!(s.link(), Style::default().blue().underlined(), "链接不得回落默认蓝");
-        assert_ne!(s.blockquote(), Style::default().green(), "引用不得回落默认绿");
-        assert_ne!(s.table_header(), Style::default().bold().cyan(), "表头不得回落默认 cyan");
-        assert_ne!(s.code(), Style::default().white().on_black(), "code 不得回落白字黑底");
+        assert_ne!(
+            s.link(),
+            Style::default().blue().underlined(),
+            "链接不得回落默认蓝"
+        );
+        assert_ne!(
+            s.blockquote(),
+            Style::default().green(),
+            "引用不得回落默认绿"
+        );
+        assert_ne!(
+            s.table_header(),
+            Style::default().bold().cyan(),
+            "表头不得回落默认 cyan"
+        );
+        assert_ne!(
+            s.code(),
+            Style::default().white().on_black(),
+            "code 不得回落白字黑底"
+        );
     }
 
     /// 有意选择的形态：标题用品红、无 `#` 标记、围栏置空、code 只加背景。
@@ -183,6 +199,10 @@ mod tests {
         assert!(s.heading(1).add_modifier.contains(Modifier::UNDERLINED));
         assert!(s.heading(2).add_modifier.contains(Modifier::BOLD));
         assert!(!s.heading(2).add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(s.alert_icon(AlertKind::Warning), "", "emoji 图标应去掉（多列宽）");
+        assert_eq!(
+            s.alert_icon(AlertKind::Warning),
+            "",
+            "emoji 图标应去掉（多列宽）"
+        );
     }
 }

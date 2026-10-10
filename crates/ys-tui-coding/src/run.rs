@@ -278,7 +278,9 @@ struct ModalHost<'a, B: Backend<Error = std::io::Error> + Write> {
 }
 
 /// [`Prompter`] 的 TUI 实现（`run.rs` 内，因为它握着 `Terminal`）。
-pub(crate) struct TuiPrompter<'a, B: Backend<Error = std::io::Error> + Write>(Mutex<ModalHost<'a, B>>);
+pub(crate) struct TuiPrompter<'a, B: Backend<Error = std::io::Error> + Write>(
+    Mutex<ModalHost<'a, B>>,
+);
 
 impl<'a, B: Backend<Error = std::io::Error> + Write> TuiPrompter<'a, B> {
     fn new(
@@ -449,7 +451,10 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
 /// **best-effort**：恢复路径上的每一步都不得 `?` 提前返回 —— 否则
 /// `disable_raw_mode()` 会被跳过，终端留在 raw mode。这里吞掉 IO 错误，
 /// 保证「无论如何都退出 raw mode / 恢复主屏」。
-fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(terminal: &mut Terminal<B>, app: &App) {
+fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(
+    terminal: &mut Terminal<B>,
+    app: &App,
+) {
     let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = (cols as usize).clamp(10, 400);
     let lines = draw::transcript_plain_lines(app, width);
@@ -539,11 +544,7 @@ fn install_panic_hook() {
 /// （如 `()`）就能断言「恢复先发生、delegate 后发生」，**无需触发真实 panic、不接触真终端**。
 /// 恢复动作经 `impl FnOnce` 注入，正因如此 [`restore_terminal_on_panic`] 的真实现与
 /// **不写任何字节**的探针可以在同一条码路上被演练。
-fn panic_hook_body<T>(
-    restore: impl FnOnce(),
-    delegate: &(dyn Fn(&T) + Sync),
-    info: &T,
-) {
+fn panic_hook_body<T>(restore: impl FnOnce(), delegate: &(dyn Fn(&T) + Sync), info: &T) {
     restore();
     delegate(info);
 }

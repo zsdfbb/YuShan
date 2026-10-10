@@ -370,10 +370,7 @@ fn truncated_tool_batch_is_never_executed() {
     // 预先存在、装着用户内容的文件 —— 回归的哨兵。
     std::fs::write(&victim, USER_CONTENT).unwrap();
 
-    let server = MockServer::start(vec![
-        truncated_round(&partial, &victim),
-        recovered_round(),
-    ]);
+    let server = MockServer::start(vec![truncated_round(&partial, &victim), recovered_round()]);
 
     let out = run_json(&server.api_base(), "write the file", &home);
     let stdout = String::from_utf8_lossy(&out.stdout);

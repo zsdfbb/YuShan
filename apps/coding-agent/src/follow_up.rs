@@ -87,8 +87,11 @@ mod tests {
             StopReason::MaxRounds,
         ] {
             assert!(
-                should_review(TurnKind::Initial, &result(stop.clone(), REVIEW_MIN_ROUNDS + 100))
-                    .is_none(),
+                should_review(
+                    TurnKind::Initial,
+                    &result(stop.clone(), REVIEW_MIN_ROUNDS + 100)
+                )
+                .is_none(),
                 "{stop:?} 不得触发复核（用户中止 / 截断 / 撞顶都不续）"
             );
         }

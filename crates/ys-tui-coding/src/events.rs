@@ -101,9 +101,10 @@ pub fn handle_key(
                     } else {
                         app.abort_requested = true;
                         request_abort(boundaries);
-                        app.transcript.push(crate::transcript::TranscriptLine::System(
-                            "已请求取消当前回合；若长时间无响应，再按一次 Ctrl-C 退出".into(),
-                        ));
+                        app.transcript
+                            .push(crate::transcript::TranscriptLine::System(
+                                "已请求取消当前回合；若长时间无响应，再按一次 Ctrl-C 退出".into(),
+                            ));
                         app.follow = true;
                     }
                 } else {
@@ -523,7 +524,10 @@ mod tests {
         assert_eq!(ch.next_boundary().unwrap(), Boundary::Abort);
 
         handle_key(ctrl_c(), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
-        assert!(a.should_quit, "第二次 Ctrl-C 必须退出 —— 否则没有杀死进程的手段");
+        assert!(
+            a.should_quit,
+            "第二次 Ctrl-C 必须退出 —— 否则没有杀死进程的手段"
+        );
     }
 
     #[test]

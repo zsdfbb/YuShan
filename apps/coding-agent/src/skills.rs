@@ -322,7 +322,10 @@ fn read_prefix(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
 fn shadow_diagnostics(entries: &[SkillEntry]) -> Vec<String> {
     let mut groups: BTreeMap<&str, Vec<&SkillEntry>> = BTreeMap::new();
     for entry in entries {
-        groups.entry(entry.command.as_str()).or_default().push(entry);
+        groups
+            .entry(entry.command.as_str())
+            .or_default()
+            .push(entry);
     }
 
     let mut diags = Vec::new();
@@ -885,10 +888,8 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "yushan_skills_{tag}_{}_{seq}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("yushan_skills_{tag}_{}_{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -915,7 +916,11 @@ mod tests {
     /// 断言**恰好一条**并返回它 + 诊断（大多数单文件用例的入口）。
     fn scan_one(command: &str, content: &str) -> (SkillEntry, Vec<String>) {
         let (mut entries, diags) = scan_text(command, content);
-        assert_eq!(entries.len(), 1, "应恰好加载 1 条：{entries:?}（诊断 {diags:?}）");
+        assert_eq!(
+            entries.len(),
+            1,
+            "应恰好加载 1 条：{entries:?}（诊断 {diags:?}）"
+        );
         (entries.remove(0), diags)
     }
 
@@ -962,10 +967,7 @@ mod tests {
         assert_eq!(entry.description, "描述: 内含冒号与，标点。");
         assert_eq!(entry.label, "带引号的名字");
 
-        let (entry, _) = scan_one(
-            "single",
-            "---\ndescription: '单引号描述'\n---\n正文\n",
-        );
+        let (entry, _) = scan_one("single", "---\ndescription: '单引号描述'\n---\n正文\n");
         assert_eq!(entry.description, "单引号描述");
 
         // 只去外层引号：内部的引号原样保留（caveman 的 description 就含 `"caveman mode"`）。
@@ -1026,11 +1028,23 @@ mod tests {
         // 缺 description
         assert!(scan_text("a", "---\nname: a\n---\n正文\n").0.is_empty());
         // `description:` 空值
-        assert!(scan_text("b", "---\nname: b\ndescription:\n---\n正文\n").0.is_empty());
+        assert!(
+            scan_text("b", "---\nname: b\ndescription:\n---\n正文\n")
+                .0
+                .is_empty()
+        );
         // `description: ""` 引号空串
-        assert!(scan_text("c", "---\nname: c\ndescription: \"\"\n---\n正文\n").0.is_empty());
+        assert!(
+            scan_text("c", "---\nname: c\ndescription: \"\"\n---\n正文\n")
+                .0
+                .is_empty()
+        );
         // 只有空白
-        assert!(scan_text("d", "---\nname: d\ndescription: \"   \"\n---\n正文\n").0.is_empty());
+        assert!(
+            scan_text("d", "---\nname: d\ndescription: \"   \"\n---\n正文\n")
+                .0
+                .is_empty()
+        );
         // 完全无 frontmatter（首行不是 `---`）
         assert!(
             scan_text("e", "name: e\ndescription: 有值但没块界\n")
@@ -1101,10 +1115,8 @@ mod tests {
     #[test]
     fn test_flow_value_dropped_with_diagnostic() {
         // description 是流集合 ⇒ 字段被丢 ⇒ 无描述 ⇒ 整条不加载，但**要有诊断**
-        let (entries, diags) = scan_text(
-            "flow",
-            "---\nname: flow\ndescription: [a, b]\n---\n正文\n",
-        );
+        let (entries, diags) =
+            scan_text("flow", "---\nname: flow\ndescription: [a, b]\n---\n正文\n");
         assert!(entries.is_empty(), "丢字段后没有 description，不该加载");
         assert_eq!(diags.len(), 1, "一条一事一行：{diags:?}");
         assert!(diags[0].contains("description"), "{}", diags[0]);
@@ -1122,10 +1134,7 @@ mod tests {
         assert!(diags[0].contains('{'), "{}", diags[0]);
 
         // 引号包着的 `[a, b]` 是**字符串**，不是流集合 ⇒ 不丢、不诊断
-        let (entry, diags) = scan_one(
-            "quoted-flow",
-            "---\ndescription: \"[a, b]\"\n---\n正文\n",
-        );
+        let (entry, diags) = scan_one("quoted-flow", "---\ndescription: \"[a, b]\"\n---\n正文\n");
         assert_eq!(entry.description, "[a, b]");
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -1246,7 +1255,11 @@ mod tests {
 
         let (raw, diags) = scan(&[project.clone(), user.clone()]);
         assert_eq!(diags.len(), 1, "遮蔽**恰好一条**诊断：{diags:?}");
-        assert!(diags[0].contains("project") && diags[0].contains("user"), "{}", diags[0]);
+        assert!(
+            diags[0].contains("project") && diags[0].contains("user"),
+            "{}",
+            diags[0]
+        );
 
         let cat = catalogue(raw, Budget::default());
         assert_eq!(cat.entries.len(), 1, "同名只留一条");
@@ -1302,7 +1315,10 @@ mod tests {
         let forward = catalogue(raw, Budget::default());
         let backward = catalogue(reversed, Budget::default());
 
-        assert_eq!(forward.lines, backward.lines, "同样的条目 ⇒ 逐字节相同的目录");
+        assert_eq!(
+            forward.lines, backward.lines,
+            "同样的条目 ⇒ 逐字节相同的目录"
+        );
         assert_eq!(forward.entries, backward.entries);
         // 顺带钉住升序本身（去重键是 command）
         let order: Vec<&str> = forward.entries.iter().map(|e| e.command.as_str()).collect();
@@ -1320,7 +1336,11 @@ mod tests {
         model_only.user_invocable = false;
 
         let cat = catalogue(
-            vec![synthetic("visible", "两边都能用", Scope::User), hidden, model_only],
+            vec![
+                synthetic("visible", "两边都能用", Scope::User),
+                hidden,
+                model_only,
+            ],
             Budget::default(),
         );
 
@@ -1348,9 +1368,18 @@ mod tests {
 
         // 部分收起：预算按**渲染后的逐字节**算（第二条起还多一个 `\n` 分隔符）
         let one_line = render_line(&synthetic("s0", "描述", Scope::User));
-        let partial = catalogue(raw.clone(), Budget { total_bytes: one_line.len() * 2 + 1 });
+        let partial = catalogue(
+            raw.clone(),
+            Budget {
+                total_bytes: one_line.len() * 2 + 1,
+            },
+        );
         assert_eq!(partial.omitted, 3, "{}", partial.lines);
-        assert!(partial.lines.ends_with("- (3 more skills omitted)"), "{}", partial.lines);
+        assert!(
+            partial.lines.ends_with("- (3 more skills omitted)"),
+            "{}",
+            partial.lines
+        );
         assert_eq!(partial.lines.lines().count(), 3, "两行条目 + 一行计数");
         assert_eq!(partial.bytes, partial.lines.len());
 
@@ -1435,11 +1464,7 @@ mod tests {
     #[test]
     fn test_expand_invocation_does_not_swallow_plain_text() {
         let root = temp_dir("expand_miss");
-        write_skill(
-            &root,
-            "git-status",
-            "---\ndescription: 状态\n---\n正文\n",
-        );
+        write_skill(&root, "git-status", "---\ndescription: 状态\n---\n正文\n");
         let (skills, _) = scan(&[root.clone()]);
 
         assert!(expand_invocation("看看 /git-status 怎么用", &skills).is_none()); // `/` 不在首位
@@ -1717,8 +1742,14 @@ mod tests {
         // 超限：截断落在 char 边界上 + 附提示行
         // "改过了\n"：'改'(0..3) '过'(3..6) '了'(6..9) '\n'(9) ⇒ 上限 6 恰好落在边界上
         let capped = load_body(&md, 6).unwrap();
-        assert_eq!(capped, "改过\n\n[Truncated: SKILL.md body exceeds 6 bytes.]");
-        assert!(!capped.contains('\u{fffd}'), "不得切坏多字节字符：{capped:?}");
+        assert_eq!(
+            capped,
+            "改过\n\n[Truncated: SKILL.md body exceeds 6 bytes.]"
+        );
+        assert!(
+            !capped.contains('\u{fffd}'),
+            "不得切坏多字节字符：{capped:?}"
+        );
         // 上限切在字符**中间**（7 ∈ '了' 的 6..9）⇒ 退到前一个边界，不切坏字符
         assert_eq!(
             load_body(&md, 7).unwrap(),

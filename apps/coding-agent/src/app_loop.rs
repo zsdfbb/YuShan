@@ -53,8 +53,8 @@
 //! 恒 `None` ⇒ 每次用户输入至多多出一个回合。回合前的边界排空在 `run_turn_once`
 //! 开头（每回合都做），故上一回合残留的 `Abort` 不会取消复核回合。
 
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use ys_core::{ContentBlock, Message, Role};
@@ -65,7 +65,7 @@ use ys_tui_coding::CodingView;
 
 use crate::capabilities;
 use crate::config::Config;
-use crate::follow_up::{should_review, TurnKind};
+use crate::follow_up::{TurnKind, should_review};
 use crate::logging;
 use crate::state::StateStore;
 use crate::status::TurnStats;
@@ -184,8 +184,8 @@ pub async fn run(
                             }
                             // 只有首回合「够长 + 自称完工」才追问；`Review` 恒 `None`
                             // ⇒ 至多多出一个复核回合。
-                            pending = should_review(kind, &result)
-                                .map(|next| (next, TurnKind::Review));
+                            pending =
+                                should_review(kind, &result).map(|next| (next, TurnKind::Review));
                         }
                         // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
                         // Error 行，这里不再往 transcript 重复刷一条，只落日志。
@@ -580,7 +580,9 @@ mod tests {
         let subagent = subagent(&tmp.0);
         let (sink, sink_rx) =
             ChannelSink::new(64, ys_protocol::LifecyclePolicy::StopWhenConsumerGone);
-        let agent = build_agent(ys_runtime::AgentBuilder::new()).build().unwrap();
+        let agent = build_agent(ys_runtime::AgentBuilder::new())
+            .build()
+            .unwrap();
 
         // `Config::from_env` 会 `getenv` 凭证 key，而 `config.rs` 的用例正在
         // `env_lock` 下 `set_var` / `remove_var` —— 只读也须串行。
@@ -730,9 +732,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match &e.event {
-                AgentEvent::UserMessage { message } => {
-                    crate::sessions::user_text(message)
-                }
+                AgentEvent::UserMessage { message } => crate::sessions::user_text(message),
                 _ => None,
             })
             .collect()
@@ -740,9 +740,7 @@ mod tests {
 
     /// 收出站消息直到**第一条** `RunFinished`（含）—— 用于「主回合已收场、
     /// 复核回合尚未开始」这一刻投递边界消息。
-    async fn collect_until_first_run_finished(
-        h: &mut Harness,
-    ) -> Vec<Outbound<CodingView>> {
+    async fn collect_until_first_run_finished(h: &mut Harness) -> Vec<Outbound<CodingView>> {
         let mut msgs = Vec::new();
         loop {
             let m = recv_out(&mut h.outbound).await;
@@ -1940,11 +1938,7 @@ mod tests {
         let mut msgs = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(4), async {
             loop {
-                let m = h
-                    .outbound
-                    .recv()
-                    .await
-                    .expect("app 循环不应提前收摊");
+                let m = h.outbound.recv().await.expect("app 循环不应提前收摊");
                 let hit = matches!(&m, Outbound::Output(t) if t.contains("budget exhausted"));
                 msgs.push(m);
                 if hit {

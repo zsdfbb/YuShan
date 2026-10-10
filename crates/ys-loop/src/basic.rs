@@ -535,12 +535,9 @@ impl AgentLoop for BasicLoop {
                 for &i in &pending {
                     let (_, tool_name, tool_args) = &tool_calls[i];
                     let tool = ctx.registry.get(tool_name).expect("已确认命中");
-                    let mut tool_ctx = ToolContext::new(
-                        ctx.boundary,
-                        ctx.cwd.clone(),
-                        ctx.workspace_root.clone(),
-                    )
-                    .with_summarizer(&summarizer);
+                    let mut tool_ctx =
+                        ToolContext::new(ctx.boundary, ctx.cwd.clone(), ctx.workspace_root.clone())
+                            .with_summarizer(&summarizer);
                     if let Some(runner) = ctx.subagent {
                         tool_ctx = tool_ctx.with_subagent(runner);
                     }
@@ -550,10 +547,8 @@ impl AgentLoop for BasicLoop {
                     futs.push(async move { call_one(tool, name, args, tool_ctx, budget).await });
                 }
                 let n = ctx.limits.max_parallel_tools.max(1);
-                let executed: Vec<CoreToolResult> = futures_util::stream::iter(futs)
-                    .buffered(n)
-                    .collect()
-                    .await;
+                let executed: Vec<CoreToolResult> =
+                    futures_util::stream::iter(futs).buffered(n).collect().await;
                 for (slot, result) in pending.iter().zip(executed) {
                     outcomes[*slot] = Some(result);
                 }
@@ -662,9 +657,9 @@ impl AgentLoop for BasicLoop {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use ys_component::RunLimits;
     use ys_event::{AgentEvent, CollectingSink, EventSink};
     use ys_model::{FinishReason, MockModel, Model, ModelError, ModelResponse};
@@ -1016,7 +1011,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Tool for SpyTool {
         fn spec(&self) -> ToolSpec {
-            ToolSpec::new(self.name.as_str(), "counts invocations", serde_json::json!({}))
+            ToolSpec::new(
+                self.name.as_str(),
+                "counts invocations",
+                serde_json::json!({}),
+            )
         }
         async fn call(
             &self,
@@ -1093,7 +1092,10 @@ mod tests {
                 content, is_error, ..
             } => {
                 assert!(is_error, "声明超时应产生 is_error：{content}");
-                assert!(content.contains("timed out"), "文案应含 timed out：{content}");
+                assert!(
+                    content.contains("timed out"),
+                    "文案应含 timed out：{content}"
+                );
                 assert!(content.contains("slow"), "文案应含工具名：{content}");
             }
             other => panic!("期望 ToolResult，得到 {other:?}"),
@@ -1175,8 +1177,7 @@ mod tests {
         }
 
         let seen = Arc::new(AtomicUsize::new(0));
-        let registry =
-            ToolRegistry::build(vec![Box::new(SeenTool(seen.clone()))]).unwrap();
+        let registry = ToolRegistry::build(vec![Box::new(SeenTool(seen.clone()))]).unwrap();
         let model = MockModel::new("m");
         model.push_tool_call("seen", serde_json::json!({}));
         model.push_text("done");
@@ -1284,7 +1285,9 @@ mod tests {
             } else {
                 Message {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::Text { text: "done".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
                 }
             };
             Ok(ys_model::ModelResponse {
@@ -1360,7 +1363,12 @@ mod tests {
         let (order, _) = run_batch(&registry, &model, 4).await;
         assert_eq!(
             order,
-            vec![("C", "1".into()), ("R", "1".into()), ("C", "2".into()), ("R", "2".into())],
+            vec![
+                ("C", "1".into()),
+                ("R", "1".into()),
+                ("C", "2".into()),
+                ("R", "2".into())
+            ],
             "默认串行：C1,R1,C2,R2"
         );
         assert_eq!(peak.load(Ordering::SeqCst), 1, "串行不得有重叠执行");
@@ -1374,7 +1382,12 @@ mod tests {
         let (order, elapsed) = run_batch(&registry, &model, 4).await;
         assert_eq!(
             order,
-            vec![("C", "1".into()), ("C", "2".into()), ("R", "1".into()), ("R", "2".into())],
+            vec![
+                ("C", "1".into()),
+                ("C", "2".into()),
+                ("R", "1".into()),
+                ("R", "2".into())
+            ],
             "并行：先发完全部 ToolCall，再按原序发 ToolResult"
         );
         assert_eq!(peak.load(Ordering::SeqCst), 2, "两个 safe 工具应真的并发");
@@ -1394,7 +1407,12 @@ mod tests {
         let (order, _) = run_batch(&registry, &model, 4).await;
         assert_eq!(
             order,
-            vec![("C", "1".into()), ("R", "1".into()), ("C", "2".into()), ("R", "2".into())],
+            vec![
+                ("C", "1".into()),
+                ("R", "1".into()),
+                ("C", "2".into()),
+                ("R", "2".into())
+            ],
             "混合批次必须退回串行"
         );
         assert_eq!(peak.load(Ordering::SeqCst), 1);
@@ -1403,8 +1421,12 @@ mod tests {
     /// §4.4-5：并发上限 `max_parallel_tools` 被遵守（4 个 safe、上限 2 ⇒ 峰值 ≤ 2）。
     #[tokio::test]
     async fn parallel_respects_max_parallel_tools() {
-        let (registry, _, peak) =
-            conc_tool_registry(&[("a", true, 60), ("b", true, 60), ("c", true, 60), ("d", true, 60)]);
+        let (registry, _, peak) = conc_tool_registry(&[
+            ("a", true, 60),
+            ("b", true, 60),
+            ("c", true, 60),
+            ("d", true, 60),
+        ]);
         let model = MultiToolModel::new(&[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
         let (order, _) = run_batch(&registry, &model, 2).await;
         assert_eq!(peak.load(Ordering::SeqCst), 2, "峰值并发不得超过上限");
@@ -1485,10 +1507,12 @@ mod tests {
 
         // 事件：必须有一条 ResponseTruncated，且 dropped_tool_calls = 1
         assert!(
-            events
-                .events()
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ResponseTruncated { dropped_tool_calls: 1 })),
+            events.events().iter().any(|e| matches!(
+                e,
+                AgentEvent::ResponseTruncated {
+                    dropped_tool_calls: 1
+                }
+            )),
             "必须发出 ResponseTruncated{{dropped_tool_calls: 1}}：{:?}",
             events.events()
         );
@@ -1588,10 +1612,12 @@ mod tests {
             terminal[0]
         );
         assert!(
-            events
-                .events()
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ResponseTruncated { dropped_tool_calls: 0 })),
+            events.events().iter().any(|e| matches!(
+                e,
+                AgentEvent::ResponseTruncated {
+                    dropped_tool_calls: 0
+                }
+            )),
             "纯文本截断也要发 ResponseTruncated（dropped = 0）：{:?}",
             events.events()
         );

@@ -551,10 +551,12 @@ mod tests {
         // 刀 4 后的**重锚**：父表 = 这 9 元 + 派发工具（末位）⇒ 10 元，且父 JSON 是
         // 子 JSON 的**字节前缀 + 追加项**（子表命中父的前缀缓存）。
         let mut parent_specs = specs.clone();
-        parent_specs.push(
-            crate::subagent::SubagentTool::new(Duration::from_secs(60)).spec(),
+        parent_specs.push(crate::subagent::SubagentTool::new(Duration::from_secs(60)).spec());
+        assert_eq!(
+            parent_specs.len(),
+            10,
+            "父表应为 10 元（9 基础 + subagent）"
         );
-        assert_eq!(parent_specs.len(), 10, "父表应为 10 元（9 基础 + subagent）");
         assert_eq!(
             parent_specs.last().unwrap().name,
             "subagent",

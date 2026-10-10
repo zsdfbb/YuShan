@@ -762,7 +762,10 @@ mod tests {
             a.transcript
         );
         assert!(a.is_turning, "steering 不改变 is_turning");
-        assert_eq!(a.turn_started_at, started_before, "steering 不动 turn_started_at");
+        assert_eq!(
+            a.turn_started_at, started_before,
+            "steering 不动 turn_started_at"
+        );
     }
 
     /// 回显路径不受影响：抑制计数未耗尽时投 `UserMessage` ⇒ 仍被跳过（行为与改动前一致），

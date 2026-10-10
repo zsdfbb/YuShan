@@ -38,8 +38,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// 子进程退出上限。正常路径 2s 级返回；超时 = 挂起 = kill + panic。
@@ -445,7 +445,10 @@ fn json_budget_exhaustion_keeps_stdout_json_clean_and_exits_nonzero() {
     // **关键断言**（先于 stderr 断言，好让它成为变异 `eprintln!→println!` 的**首个**
     // 命中点）：stdout 全行可解析 JSON —— 说明行不得混入。
     let values = parse_all_json_lines(&stdout);
-    assert!(!values.is_empty(), "应至少收到一个 Envelope\nstdout:\n{stdout}");
+    assert!(
+        !values.is_empty(),
+        "应至少收到一个 Envelope\nstdout:\n{stdout}"
+    );
 
     assert!(
         stderr.contains("budget exhausted"),

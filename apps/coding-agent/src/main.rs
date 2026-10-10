@@ -743,12 +743,8 @@ async fn run_single_turn(
     // subagent 能力：每回合造一份 runner（派发计数器天然 per-turn）。
     let totals = std::sync::Arc::new(subagent::UsageTotals::default());
     let runner = subagent.map(|s| s.make_runner(config, ports.model, totals.clone()));
-    let mut agent_ports = AgentPorts::new(
-        ports.model,
-        ports.session,
-        ports.events,
-        Some(&boundary),
-    );
+    let mut agent_ports =
+        AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary));
     if let Some(r) = &runner {
         agent_ports = agent_ports.with_subagent(r);
     }
@@ -1146,28 +1142,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
         let retry = cfg.model_retry();
         let timeout = cfg.model_timeout();
-        Some(Box::new(
-            OpenAICompatibleModel::new(OpenAICompatibleConfig {
-                api_base: base.clone(),
-                api_key: key.clone(),
-                model: cfg.model.clone(),
-                max_tokens: Some(4096),
-                temperature: Some(0.7),
-                compat,
-            })
-            .with_retry(RetryConfig {
-                max_attempts: retry.max_attempts,
-                base_delay_ms: retry.base_delay_ms,
-                max_delay_ms: retry.max_delay_ms,
-            })
-            .with_timeouts(TimeoutConfig {
-                connect_secs: timeout.connect_secs,
-                idle_secs: timeout.idle_secs,
-            })
-            // 重试痕迹走 app 的 logging（ADR-0028 决策 7）：对 TUI 不可见、对排障可见。
-            // 适配器绝不直接 print —— 这条回调是它唯一的诊断出口。
-            .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg))),
-        ))
+        let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
+            api_base: base.clone(),
+            api_key: key.clone(),
+            model: cfg.model.clone(),
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            compat,
+        })
+        .with_retry(RetryConfig {
+            max_attempts: retry.max_attempts,
+            base_delay_ms: retry.base_delay_ms,
+            max_delay_ms: retry.max_delay_ms,
+        })
+        .with_timeouts(TimeoutConfig {
+            connect_secs: timeout.connect_secs,
+            idle_secs: timeout.idle_secs,
+        })
+        // 重试痕迹走 app 的 logging（ADR-0028 决策 7）：对 TUI 不可见、对排障可见。
+        // 适配器绝不直接 print —— 这条回调是它唯一的诊断出口。
+        .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg)));
+        // 网关接入要求（OpenCode Go 的 `x-opencode-session` 等）：属**传输层**，
+        // 由 provider 知识给出，不经 `OpenAICompatibleConfig`（那是方言）。
+        for (header, value) in cfg.request_headers() {
+            model = model.with_extra_header(&header, &value);
+        }
+        Some(Box::new(model))
     });
 
     // 按**模型名**构造（subagent 的 `model` 参数）：同一 provider 上的另一个模型。
@@ -1181,26 +1181,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let compat = cfg.current_compat();
         let retry = cfg.model_retry();
         let timeout = cfg.model_timeout();
-        Some(Box::new(
-            OpenAICompatibleModel::new(OpenAICompatibleConfig {
-                api_base: base.clone(),
-                api_key: key.clone(),
-                model: name.to_string(),
-                max_tokens: Some(4096),
-                temperature: Some(0.7),
-                compat,
-            })
-            .with_retry(RetryConfig {
-                max_attempts: retry.max_attempts,
-                base_delay_ms: retry.base_delay_ms,
-                max_delay_ms: retry.max_delay_ms,
-            })
-            .with_timeouts(TimeoutConfig {
-                connect_secs: timeout.connect_secs,
-                idle_secs: timeout.idle_secs,
-            })
-            .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg))),
-        ))
+        let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
+            api_base: base.clone(),
+            api_key: key.clone(),
+            model: name.to_string(),
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            compat,
+        })
+        .with_retry(RetryConfig {
+            max_attempts: retry.max_attempts,
+            base_delay_ms: retry.base_delay_ms,
+            max_delay_ms: retry.max_delay_ms,
+        })
+        .with_timeouts(TimeoutConfig {
+            connect_secs: timeout.connect_secs,
+            idle_secs: timeout.idle_secs,
+        })
+        .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg)));
+        for (header, value) in cfg.request_headers() {
+            model = model.with_extra_header(&header, &value);
+        }
+        Some(Box::new(model))
     });
 
     // 构建工具表与 system prompt。
@@ -1754,7 +1756,14 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let joined = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
-                run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60), None, None),
+                run_single_turn(
+                    &mut agent,
+                    &mut wiring,
+                    AgentInput::text("hi"),
+                    Duration::from_secs(60),
+                    None,
+                    None
+                ),
                 consume_events(rx, &mut out, write_json_envelope),
             )
         })
@@ -1875,7 +1884,14 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let (run_result, consume_result) = tokio::join!(
-            run_single_turn(&mut agent, &mut wiring, AgentInput::text("hi"), Duration::from_secs(60), None, None),
+            run_single_turn(
+                &mut agent,
+                &mut wiring,
+                AgentInput::text("hi"),
+                Duration::from_secs(60),
+                None,
+                None
+            ),
             consume_events(rx, &mut out, write_json_envelope),
         );
         run_result.expect("run_turn 应成功");
@@ -2007,9 +2023,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
 
-        let (run_result, consume_result) = joined.expect(
-            "预算到点后回合应结束（预算不生效时回合跑满 max_rounds 收场，非挂起）",
-        );
+        let (run_result, consume_result) =
+            joined.expect("预算到点后回合应结束（预算不生效时回合跑满 max_rounds 收场，非挂起）");
         let result = run_result.expect("turn 应成功返回（Cancelled 是正常 RunResult）");
         consume_result.expect("consume 应成功");
         assert_eq!(

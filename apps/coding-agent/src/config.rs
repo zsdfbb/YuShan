@@ -341,8 +341,7 @@ impl Config {
     /// （那是 app 会 `save()` 覆盖的文件）。
     pub fn load_skills(&mut self, roots: &[PathBuf]) -> Vec<String> {
         let (entries, diags) = crate::skills::scan(roots);
-        let catalogue =
-            crate::skills::catalogue(entries, crate::skills::Budget::default());
+        let catalogue = crate::skills::catalogue(entries, crate::skills::Budget::default());
         self.skills_omitted = catalogue.omitted;
         self.skills = catalogue.entries;
         diags
@@ -383,6 +382,15 @@ impl Config {
         let name = self.provider.as_deref().unwrap_or("custom");
         self.registry.compat_for(name)
     }
+
+    /// 当前 provider / api_base 要求的额外请求头（透传给适配器）。
+    ///
+    /// 生产消费者：`main.rs` 的两个 model factory —— 每次 `build_model` 都重取，
+    /// 故 `/login`、`/model` 换 provider 后头也跟着换。
+    pub fn request_headers(&self) -> Vec<(String, String)> {
+        self.registry
+            .request_headers(self.provider.as_deref(), self.api_base.as_deref())
+    }
 }
 
 /// 解析 + 校验 `config.json` 文本。`Err` 仅表示**整份** JSON 畸形；
@@ -417,23 +425,35 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
     // `trigger_ratio` / `keep_ratio` 关系）。重试三项允许 0（`max_attempts: 0` = 不重试、
     // 延迟 0 = 不退避），超时两项不允许 0（0 无意义）。
     let mut retry = ModelRetryConfig::default();
-    if let Some(n) = sanitize_uint("model_retry.max_attempts", raw.model_retry.max_attempts, 0u32) {
+    if let Some(n) = sanitize_uint(
+        "model_retry.max_attempts",
+        raw.model_retry.max_attempts,
+        0u32,
+    ) {
         retry.max_attempts = n;
     }
-    if let Some(n) =
-        sanitize_uint("model_retry.base_delay_ms", raw.model_retry.base_delay_ms, 0u64)
-    {
+    if let Some(n) = sanitize_uint(
+        "model_retry.base_delay_ms",
+        raw.model_retry.base_delay_ms,
+        0u64,
+    ) {
         retry.base_delay_ms = n;
     }
-    if let Some(n) = sanitize_uint("model_retry.max_delay_ms", raw.model_retry.max_delay_ms, 0u64) {
+    if let Some(n) = sanitize_uint(
+        "model_retry.max_delay_ms",
+        raw.model_retry.max_delay_ms,
+        0u64,
+    ) {
         retry.max_delay_ms = n;
     }
     user.model_retry = retry;
 
     let mut timeout = ModelTimeoutConfig::default();
-    if let Some(n) =
-        sanitize_uint("model_timeout.connect_secs", raw.model_timeout.connect_secs, 1u64)
-    {
+    if let Some(n) = sanitize_uint(
+        "model_timeout.connect_secs",
+        raw.model_timeout.connect_secs,
+        1u64,
+    ) {
         timeout.connect_secs = n;
     }
     if let Some(n) = sanitize_uint("model_timeout.idle_secs", raw.model_timeout.idle_secs, 1u64) {
@@ -661,6 +681,27 @@ mod tests {
         let compat = config.current_compat();
         assert!(!compat.has_reasoning_content);
         assert!(!compat.tool_calls_as_text);
+    }
+
+    /// `request_headers` 跟着 `provider` / `api_base` 走：opencode-go 需要会话头，
+    /// 其余 provider 不需要 —— 给别家多带一个无谓的头只会污染请求。
+    #[test]
+    fn test_config_request_headers_track_provider_and_base() {
+        let mut config = test_config("deepseek-chat");
+        assert!(config.request_headers().is_empty(), "未登录时无额外头");
+
+        config.provider = Some("opencode-go".into());
+        config.api_base = Some("https://opencode.ai/zen/go/v1".into());
+        let headers = config.request_headers();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, crate::provider::OPENCODE_SESSION_HEADER);
+
+        // env 直连：`provider` 缺席，仅凭 api_base 也得带上。
+        config.provider = None;
+        assert_eq!(config.request_headers().len(), 1);
+
+        config.api_base = Some("https://api.deepseek.com".into());
+        assert!(config.request_headers().is_empty());
     }
 
     #[test]
@@ -1111,7 +1152,9 @@ mod tests {
             "第二条才是用户级"
         );
         assert!(
-            roots.iter().all(|r| !r.to_string_lossy().contains(".claude")),
+            roots
+                .iter()
+                .all(|r| !r.to_string_lossy().contains(".claude")),
             "不扫 `.claude/skills`（设计 D2）：{roots:?}"
         );
 
@@ -1209,10 +1252,9 @@ mod tests {
         }
 
         // 只丢该条：非法 `max_rounds` 不影响同一份文件里的 `context_window`。
-        let user = parse_user_config(
-            r#"{"max_rounds": 0, "context_window": {"deepseek-chat": 64000}}"#,
-        )
-        .unwrap();
+        let user =
+            parse_user_config(r#"{"max_rounds": 0, "context_window": {"deepseek-chat": 64000}}"#)
+                .unwrap();
         assert_eq!(user.max_rounds, None, "非法 max_rounds 应被丢弃");
         assert_eq!(
             user.windows.get("deepseek-chat"),

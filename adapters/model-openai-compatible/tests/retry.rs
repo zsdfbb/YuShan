@@ -307,16 +307,57 @@ fn model_for(
     idle_secs: u64,
     logs: Option<&Logs>,
 ) -> OpenAICompatibleModel {
-    let model = OpenAICompatibleModel::with_client(base_config(server.api_base()), no_proxy_client())
-        .with_retry(retry)
-        .with_timeouts(TimeoutConfig {
-            connect_secs: 5,
-            idle_secs,
-        });
+    let model =
+        OpenAICompatibleModel::with_client(base_config(server.api_base()), no_proxy_client())
+            .with_retry(retry)
+            .with_timeouts(TimeoutConfig {
+                connect_secs: 5,
+                idle_secs,
+            });
     match logs {
         Some(logs) => model.with_logger(log_listener(logs)),
         None => model,
     }
+}
+
+/// 断言在**线路上**（而不只是 builder 内部）能看到额外头。
+///
+/// 网关接入要求走这条路（OpenCode Go 的 `x-opencode-session`）：头必须出现在
+/// 真实请求里，光有 `with_extra_header` 的返回值不算数。
+#[tokio::test]
+async fn extra_headers_are_sent_on_the_wire() {
+    let server = MockServer::start(vec![Reply::Sse(full_sse())]);
+    let model = model_for(&server, fast_retry(0, 10), 5, None)
+        .with_extra_header("x-opencode-session", "ys-test-session");
+
+    model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect("call ok");
+
+    let raw = server.requests.lock().unwrap()[0].to_ascii_lowercase();
+    assert!(
+        raw.contains("x-opencode-session: ys-test-session"),
+        "请求里应带上会话头，实际：{raw}"
+    );
+}
+
+/// 非法头名/头值**只丢自己**：不 panic、不影响后续头与请求本身。
+#[tokio::test]
+async fn invalid_extra_header_is_dropped_without_failing_the_call() {
+    let server = MockServer::start(vec![Reply::Sse(full_sse())]);
+    let model = model_for(&server, fast_retry(0, 10), 5, None)
+        .with_extra_header("bad header name", "x")
+        .with_extra_header("x-opencode-session", "ys-test-session");
+
+    model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect("call ok");
+
+    let raw = server.requests.lock().unwrap()[0].to_ascii_lowercase();
+    assert!(raw.contains("x-opencode-session: ys-test-session"));
+    assert!(!raw.contains("bad header name"));
 }
 
 // ---------------------------------------------------------------------------
@@ -391,7 +432,10 @@ async fn x_should_retry_true_overrides_status() {
     let model = model_for(&server, fast_retry(2, 10), 30, None);
 
     let result = model.complete(ModelRequest::default(), &mut NullSink).await;
-    assert!(result.is_ok(), "x-should-retry:true 后的第二次应成功：{result:?}");
+    assert!(
+        result.is_ok(),
+        "x-should-retry:true 后的第二次应成功：{result:?}"
+    );
     assert_eq!(server.request_count(), 2, "应重试一次");
 }
 
@@ -621,5 +665,9 @@ async fn with_client_injected_client_survives_with_timeouts() {
         1,
         "注入 client 的代理必须仍被使用（未被 with_timeouts 重建）"
     );
-    assert_eq!(origin.request_count(), 0, "请求不应绕过注入的代理直连 origin");
+    assert_eq!(
+        origin.request_count(),
+        0,
+        "请求不应绕过注入的代理直连 origin"
+    );
 }

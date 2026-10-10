@@ -82,6 +82,9 @@ pub struct OpenAICompatibleModel {
     retry: RetryConfig,
     timeouts: TimeoutConfig,
     log: Option<ModelLogger>,
+    /// 随**每个请求**发送的额外头。空的默认值覆盖绝大多数端点；
+    /// 少数网关有接入要求（如 OpenCode Go 的 `x-opencode-session`）。
+    extra_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
     /// client 是本模型自建（`new`）还是调用方注入（`with_client`）。
     /// 自建时 `with_timeouts` 按新超时重建 client；注入时其连接策略归调用方。
     owns_client: bool,
@@ -98,6 +101,7 @@ impl OpenAICompatibleModel {
             retry: RetryConfig::default(),
             timeouts,
             log: None,
+            extra_headers: Vec::new(),
             owns_client: true,
         }
     }
@@ -114,6 +118,7 @@ impl OpenAICompatibleModel {
             retry: RetryConfig::default(),
             timeouts: TimeoutConfig::default(),
             log: None,
+            extra_headers: Vec::new(),
             owns_client: false,
         }
     }
@@ -140,6 +145,24 @@ impl OpenAICompatibleModel {
         self
     }
 
+    /// 追加一个随每个请求发送的额外头（可重复调用来追加多个）。
+    ///
+    /// 这是**传输层**契约，与 [`RetryConfig`] / [`TimeoutConfig`] / 日志回调同类；
+    /// 不进 [`OpenAICompatibleConfig`] —— 后者描述的是**方言**（字段名与 payload
+    /// 形状），而网关要求的是「每个请求都得带上这个头」。
+    ///
+    /// 头名 / 头值不合法（`HeaderName` / `HeaderValue` 校验失败）时**丢弃该条**：
+    /// 一个拼错的头不该让整次请求失败，而校验结果在构建期就固定，不需要每请求重判。
+    pub fn with_extra_header(mut self, name: &str, value: &str) -> Self {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::try_from(name),
+            reqwest::header::HeaderValue::try_from(value),
+        ) {
+            self.extra_headers.push((name, value));
+        }
+        self
+    }
+
     /// 落一行诊断日志；未注入 logger 时静默。**不得**改为直接打印 ——
     /// 适配器的任何直接输出都会在 TUI 起屏后冲掉整屏。
     fn log(&self, message: &str) {
@@ -155,13 +178,15 @@ impl OpenAICompatibleModel {
         url: &str,
         chat_request: &ChatCompletionRequest,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        self.client
+        let mut request = self
+            .client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(chat_request)
-            .send()
-            .await
+            .header("Content-Type", "application/json");
+        for (name, value) in &self.extra_headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        request.json(chat_request).send().await
     }
 }
 
@@ -269,7 +294,10 @@ impl Model for OpenAICompatibleModel {
             match outcome {
                 Ok(response) => return Ok(response),
                 Err(AttemptError::Fatal(error)) => return Err(error),
-                Err(AttemptError::Retryable { reason, server_delay }) => {
+                Err(AttemptError::Retryable {
+                    reason,
+                    server_delay,
+                }) => {
                     // 已吐出 delta ⇒ 一律不重试（重放会把已渲染的文本再渲染一遍）。
                     if emitted {
                         return Err(ModelError::Provider(format!(
@@ -366,10 +394,12 @@ impl OpenAICompatibleModel {
             // `let _ = self.sink.emit(..)` 吞掉它，`handle` 恒返回 `Ok`，从不外抛。
             // 因此下面 `Err` 分支当前只由流空闲超时（`stream.rs`）到达，
             // `classify_stream_error` 的 `Fatal` 分支在当前路径下不可达。
-            Ok(()) => accumulator.finish().map_err(|error| AttemptError::Retryable {
-                reason: error.to_string(),
-                server_delay: None,
-            }),
+            Ok(()) => accumulator
+                .finish()
+                .map_err(|error| AttemptError::Retryable {
+                    reason: error.to_string(),
+                    server_delay: None,
+                }),
             Err(error) => Err(classify_stream_error(error)),
         }
     }
@@ -411,9 +441,7 @@ impl OpenAICompatibleModel {
 /// 指数项为 `base_delay_ms × 2^min(attempt,32)`，用 `saturating_mul` 兜住乘法饱和。
 /// **先抖后夹**：抖动施加于夹取之前，故 `max_delay_ms` 是绝对上界，抖动不得使其越界。
 fn backoff_delay_with_fraction(attempt: u32, retry: &RetryConfig, fraction: f64) -> u64 {
-    let exp_ms = retry
-        .base_delay_ms
-        .saturating_mul(1u64 << attempt.min(32));
+    let exp_ms = retry.base_delay_ms.saturating_mul(1u64 << attempt.min(32));
     let jittered_ms = (exp_ms as f64 * (0.75 + 0.5 * fraction)) as u64;
     jittered_ms.min(retry.max_delay_ms)
 }
@@ -462,7 +490,12 @@ async fn classify_error_response(response: reqwest::Response) -> AttemptError {
 
     // ① 响应头定论：端点自陈的可重试性比从状态码推断更权威。
     match should_retry.as_deref() {
-        Some("true") => return AttemptError::Retryable { reason, server_delay },
+        Some("true") => {
+            return AttemptError::Retryable {
+                reason,
+                server_delay,
+            };
+        }
         Some("false") => return AttemptError::Fatal(ModelError::Provider(reason)),
         _ => {}
     }
@@ -474,7 +507,10 @@ async fn classify_error_response(response: reqwest::Response) -> AttemptError {
 
     // ③ 状态码：429 与 5xx 可重试，其余 4xx 是确定性失败。
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        AttemptError::Retryable { reason, server_delay }
+        AttemptError::Retryable {
+            reason,
+            server_delay,
+        }
     } else {
         AttemptError::Fatal(ModelError::Provider(reason))
     }

@@ -25,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use ys_core::StopReason;
 
@@ -36,6 +36,15 @@ use crate::transcript::TranscriptLine;
 
 /// 输入区最多显示的内容行数（不含边框）。
 const INPUT_MAX_LINES: usize = 5;
+/// Chat 内容区底部与 Input 顶边框之间保留的**空白行数**。
+///
+/// 用空行而不是给 Chat 加一条底边框来当分隔：Input 区块自带带标题的边框
+/// （见 `draw_input`），再画一条就成了相邻的两条横线；空行不添视觉噪音，
+/// 拷贝时也不留痕 —— 与 Chat 去掉左右竖线是同一取向。
+///
+/// 它计入 `chat_block` 的 padding，故 `chat_block().inner(area)` 自动把它扣掉：
+/// 内区几何的取用方（`max_scroll_offset` / `draw_transcript`）不必各自记得减它。
+const INPUT_GAP_ROWS: u16 = 1;
 /// 窗口小于此尺寸直接不渲染（留给「终端太小」）。
 const MIN_WIDTH: u16 = 10;
 const MIN_HEIGHT: u16 = 5;
@@ -91,13 +100,18 @@ fn chat_area(app: &App, area: Rect) -> Rect {
     .split(area)[0]
 }
 
-/// Chat 窗格的外框：**只留顶部标题线**（去掉左右竖线，拷贝友好，设计 §2.8）。
+/// Chat 窗格的外框：**只留顶部标题线**（去掉左右竖线，拷贝友好，设计 §2.8），
+/// 底部另留 [`INPUT_GAP_ROWS`] 行空白 —— 上轮输出不贴输入框。
 ///
 /// 内区几何的唯一来源 —— `max_scroll_offset` 与 `draw_transcript` 都经它取
 /// `inner(area)`（不变量 7）。`Borders::TOP` 令内区从「宽 `w-2` / 高 `h-2`」变为
-/// 「宽 `w` / 高 `h-1`」；宽度与高度**两个数都变了**，故绝不逐处手写减法。
+/// 「宽 `w` / 高 `h-1`」（无左右竖线 ⇒ `inner.width` 仍 = `w`），再扣掉底部 padding。
+/// **宽度与高度的逐项扣减都只发生在这一个调用里**，故绝不逐处手写减法。
 fn chat_block() -> Block<'static> {
-    Block::new().borders(Borders::TOP).title(" Chat ")
+    Block::new()
+        .borders(Borders::TOP)
+        .padding(Padding::bottom(INPUT_GAP_ROWS))
+        .title(" Chat ")
 }
 
 /// 允许的最大 `scroll_offset`（**视觉行**，0 = 贴底）。
@@ -765,35 +779,51 @@ mod tests {
     ///
     /// 精确钉死数值：反例（旧 bug / 变异）「按 transcript 条数算滚动」时，
     /// 单条记录会算出 `0`，与下面三个期望值全部不符。
+    ///
+    /// **几何从 `chat_block().inner(chat_area(...))` 推导**（设计 §「内区几何的唯一来源」）：
+    /// 不写 `H - 3 - 1 - 1 - 1` 之类的硬编码魔法数字 —— 顶边框策略或
+    /// [`INPUT_GAP_ROWS`] 一变，这里自动跟随。
     #[test]
     fn test_scroll_uses_wrapped_rows_not_transcript_entries() {
-        // 固定 40×40 渲染。推导（不依赖实现内部常量，只依赖布局定义）：
-        //   空输入 → 输入区 3 行（1 行内容 + 上下边框）、状态行 1 行（常驻）
-        //   Chat 外框高 = 40 - 3 - 1 = 36  →  Chat 内高 = 36 - 1 = 35（只留顶边框）
-        //   Chat 内宽   = 40            = 40（无左右竖线）
-        //   "x".repeat(N) 无空格 → 每 40 列硬折一行，视觉行数 = ceil(N / 40)
         const W: u16 = 40;
         const H: u16 = 40;
-        const INNER_W: usize = W as usize; // 40
-        const INNER_H: usize = H as usize - 3 - 1 - 1; // 35
 
         let probe = app_with(CodingView::for_test());
         assert_eq!(input_height(&probe), 3, "推导前提：空输入占 3 行");
 
+        // 从布局推：避免硬编码「h-3-1-1」这类随 spacing / 边框策略变化的魔法数字。
+        let chat = chat_area(&probe, Rect::new(0, 0, W, H));
+        let inner = chat_block().inner(chat);
+        let inner_w = inner.width as usize;
+        let inner_h = inner.height as usize;
+        assert_eq!(inner_w, 40, "推导前提：无左右竖线 ⇒ w=40");
+        // 内区高 = Chat 区高 − 顶边框 − 输入间距。**不是**终端总高减常数：
+        // Chat 区高还要先扣掉输入区与状态行。
+        assert_eq!(
+            inner_h,
+            chat.height as usize - 1 - INPUT_GAP_ROWS as usize,
+            "内区高 = Chat 区高({}) − 顶边框 − 间距({INPUT_GAP_ROWS})",
+            chat.height
+        );
+        assert_eq!(
+            inner_h, 34,
+            "H=40 时 = 40 − 3(输入) − 1(状态) − 1(顶边框) − 1(间距)"
+        );
+
         // 3 个数据点：恰好铺满（不可滚）、多 1 行、多 6 行
         for (n, expected) in [
-            (INNER_W * INNER_H, 0usize),
-            (INNER_W * INNER_H + 1, 1),
-            (INNER_W * (INNER_H + 6), 6),
+            (inner_w * inner_h, 0usize),
+            (inner_w * inner_h + 1, 1),
+            (inner_w * (inner_h + 6), 6),
         ] {
             let mut a = app_with(CodingView::for_test());
             a.transcript.push(TranscriptLine::Assistant("x".repeat(n)));
             let got = max_scroll_offset(&a, W, H);
             assert_eq!(
                 got,
-                n.div_ceil(INNER_W) - INNER_H,
-                "N={n}：{} 视觉行 - {INNER_H} 可见行",
-                n.div_ceil(INNER_W)
+                n.div_ceil(inner_w) - inner_h,
+                "N={n}：{} 视觉行 - {inner_h} 可见行",
+                n.div_ceil(inner_w)
             );
             assert_eq!(got, expected, "N={n}");
         }
@@ -801,7 +831,7 @@ mod tests {
         // 滚动真的改变可见内容，且 Status 行不随 Chat 滚动移动
         let mut app = app_with(CodingView::for_test());
         app.transcript.push(TranscriptLine::Assistant(
-            "x".repeat(INNER_W * (INNER_H + 6)),
+            "x".repeat(inner_w * (inner_h + 6)),
         ));
         let max = max_scroll_offset(&app, W, H);
         assert_eq!(max, 6);
@@ -811,6 +841,50 @@ mod tests {
         assert!(
             top[H as usize - 1].contains("deepseek-chat"),
             "Status 行仍在（Chat 滚动不影响布局）"
+        );
+    }
+
+    /// **Chat 末行与 Input 顶边框之间必须有 [`INPUT_GAP_ROWS`] 行空白** ——
+    /// 上轮输出与输入框压在一起看不清边界。用的是**空行**而非横线：
+    /// Input 自带带标题的边框，再画一条会成相邻双线，且横线会被拷进复制内容。
+    ///
+    /// **变异**：去掉 `chat_block` 的 `padding(bottom: …)` ⇒ 间距被内区吃掉、
+    /// Chat 末行贴到 Input 顶框 ⇒ 本用例红。
+    #[test]
+    fn test_chat_has_one_row_gap_before_input() {
+        const W: u16 = 40;
+        const H: u16 = 40;
+        // 铺满一屏以上：`follow` 靠滚动实现，内容不足一屏时首行在顶部、
+        // 末行反而是空的 —— 本用例要的正是「最后一行内容」贴着间距。
+        let mut app = full_chat_app();
+
+        let chat = chat_area(&app, Rect::new(0, 0, W, H));
+        let inner = chat_block().inner(chat);
+        // Chat 内区末行 = inner.y + inner.height - 1；其下 INPUT_GAP_ROWS 行是间距
+        let chat_inner_bottom = inner.y as usize + inner.height as usize - 1;
+        let gap_first = inner.y as usize + inner.height as usize;
+        let input_top = gap_first + INPUT_GAP_ROWS as usize;
+
+        let rows = rows_of(&mut app, W, H);
+        // 末行内容必须可见 —— 间距不得把 Chat 的最后一行吃成空行
+        assert!(
+            rows[chat_inner_bottom].contains("CHATMARK-39"),
+            "Chat 末行应显示最后一条记录（贴底）：{:?}",
+            rows[chat_inner_bottom]
+        );
+        // 间距行必须是空白：既不是内容，也不是横线
+        for (i, row) in rows[gap_first..input_top].iter().enumerate() {
+            assert!(
+                row.trim().is_empty(),
+                "间距行 y={} 必须为空：{row:?}",
+                gap_first + i
+            );
+        }
+        // 间距之下才是 Input 顶边框（带 `Input` 标题）
+        assert!(
+            rows[input_top].contains("Input"),
+            "Input 顶边框应在间距之后：{:?}",
+            rows[input_top]
         );
     }
 
@@ -1328,13 +1402,39 @@ mod tests {
         }
     }
 
-    /// `Borders::TOP` ⇒ 内区高 `h-1`、宽 `w`（只截顶边框，不分左右）。
+    /// `Borders::TOP` + 底部 [`INPUT_GAP_ROWS`] padding ⇒ 内区宽 `w`、
+    /// 内区高 `h − 1（顶边框） − INPUT_GAP_ROWS`。
     #[test]
-    fn geometry_top_border_inner_is_h_minus_1_by_w() {
+    fn geometry_inner_keeps_w_and_drops_border_and_gap() {
         let area = Rect::new(0, 0, 40, 36);
         let inner = chat_block().inner(area);
         assert_eq!(inner.width, 40, "无左右竖线 ⇒ 内区宽 = w");
-        assert_eq!(inner.height, 35, "只有顶边框 ⇒ 内区高 = h-1");
+        assert_eq!(
+            inner.height,
+            36 - 1 - INPUT_GAP_ROWS,
+            "内区高 = h − 顶边框 − 间距"
+        );
+        assert_eq!(inner.height, 34, "h=36 时");
+    }
+
+    /// 矮终端的边界：内区还要再扣掉 [`INPUT_GAP_ROWS`]，Chat 区可能被压到只剩边框。
+    /// 此高度下 `inner.height` 最多夹到 0 —— **不得**回绕成巨大的 `usize`（rustc 的
+    /// 无符号下溢在 debug 会 panic），渲染与滚动算术也不得 panic。
+    #[test]
+    fn geometry_survives_tiny_heights() {
+        for h in MIN_HEIGHT..=8 {
+            let mut app = full_chat_app();
+            let chat = chat_area(&app, Rect::new(0, 0, 40, h));
+            let inner = chat_block().inner(chat);
+            assert!(
+                inner.height <= chat.height,
+                "h={h}：内区不得高于 Chat 区（chat={}，inner={}）",
+                chat.height,
+                inner.height
+            );
+            let _ = rows_of(&mut app, 40, h);
+            let _ = max_scroll_offset(&app, 40, h);
+        }
     }
 
     /// 几何改道的核心：贴底时最后一行必须可见，且 `max_scroll_offset` 与 `line_count` 一致。
@@ -1357,8 +1457,9 @@ mod tests {
         let inner = chat_block().inner(chat);
         let inner_w = inner.width;
         let inner_h = inner.height as usize;
-        // 40 - 3（输入区）- 1（状态行）- 1（顶边框）= 35
-        assert_eq!(inner_h, 35, "内区高 = h-1（顶边框后）");
+        // 40 − 3（输入区）− 1（状态行）− 1（顶边框）− 1（间距）= 34
+        // 与 `chat_block().inner(chat_area(...))` 同一份几何 —— 不要逐处手算。
+        assert_eq!(inner_h, 34, "内区高 = Chat 区高 − 顶边框 − INPUT_GAP_ROWS");
 
         // 滚动上限应与同一 now 下的 line_count 一致
         let now = Instant::now();

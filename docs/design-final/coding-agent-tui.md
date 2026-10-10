@@ -210,10 +210,15 @@ impl QueueBoundarySource {
 
 补全浮层 / 模态选择器**独立于三 pane**：`Clear` 后盖在 Chat 区域上，不参与布局高度计算。
 
-**Chat 窗格几何（拷贝友好）**：Chat 外框为 `Block::new().borders(Borders::TOP)`（只留顶部标题线）
-—— 终端原生选择不再把窗格竖线拷进剪贴板。内区因此为「宽 `w` / 高 `h-1`」，且**统一取自同一个
+**Chat 窗格几何（拷贝友好）**：Chat 外框为
+`Block::new().borders(Borders::TOP).padding(Padding::bottom(INPUT_GAP_ROWS))`
+（只留顶部标题线，底部再留 `INPUT_GAP_ROWS = 1` 行空白）—— 终端原生选择不再把窗格竖线拷进剪贴板；
+底部那行空白让**上一轮的输出不贴输入框**。用**空行**而不是给 Chat 加一条底边框：Input 自带
+带标题的四边框（见下），再画一条就成了相邻的两条横线；横线还会被拷进剪贴板（与去竖线同一取向）。
+内区因此为「宽 `w` / 高 `h − 1（顶边框） − INPUT_GAP_ROWS`」，且**统一取自同一个
 `chat_block()` 实例的 `inner(area)`**（`max_scroll_offset` 与 `draw_transcript` 共用同一构造，
 杜绝散落的手写 `saturating_sub(2)` 漂移 —— `inner_h` 漏改是合法 `usize` 减法、编译器不抓）。
+间距也走同一个 `inner`：它计入 padding，故取用方无需各自记得减它。
 **Input 窗格仍是 `Block::bordered()`（有意保留，只有 Chat 去边框）**；表格**保留方框线**
 （有意接受的例外）。详见 §14.4。
 

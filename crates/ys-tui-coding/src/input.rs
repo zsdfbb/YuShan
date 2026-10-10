@@ -8,9 +8,10 @@
 //! 再 `replace_range`。
 //!
 //! **本模块的每一个编辑原语都遵守这条**：`cursor_left/right` 是 `±1` 个 char，
-//! `cursor_home/end` 以 `'\n'` 为行界（char 层），`delete_forward` 删的是**一个
-//! char** 而非一个字节。字节索引只在一个地方出现：[`InputBuffer::byte_index`]，
-//! 且它只会返回合法边界。
+//! `cursor_home/end` 以 `'\n'` 为行界（char 层），`cursor_word_left/right` 按
+//! [`is_word_char`] 划词、**按词计数**（故跨 CJK 与多字节字符都落在 char 边界上），
+//! `delete_forward` 删的是**一个 char** 而非一个字节。字节索引只在一个地方出现：
+//! [`InputBuffer::byte_index`]，且它只会返回合法边界。
 
 /// 单行/多行输入缓冲。
 #[derive(Clone, Debug, Default)]
@@ -74,6 +75,47 @@ impl InputBuffer {
         if self.cursor < self.char_count() {
             self.cursor += 1;
         }
+    }
+
+    /// 光标左移一个**词**（emacs `backward-word`）：先回退吃掉非词字符，
+    /// 再回退吃掉词字符。已在缓冲开头则 no-op。
+    ///
+    /// 不跨词地停：越过前一个词后**不吞**它左边那个分隔符。
+    /// `'\n'` 是非词字符 ⇒ 会退回上一行行尾（见 [`is_word_char`]）。
+    pub fn cursor_word_left(&mut self) {
+        let at = self.byte_index(self.cursor);
+        let mut consumed = 0;
+        let mut in_word = false;
+        for c in self.text[..at].chars().rev() {
+            if is_word_char(c) {
+                in_word = true;
+                consumed += 1;
+            } else if in_word {
+                break;
+            } else {
+                consumed += 1;
+            }
+        }
+        self.cursor -= consumed;
+    }
+
+    /// 光标右移一个**词**（emacs `forward-word`）：先前进吃掉非词字符，
+    /// 再前进吃掉词字符，停在词后的第一个非词字符**之前**。
+    pub fn cursor_word_right(&mut self) {
+        let at = self.byte_index(self.cursor);
+        let mut advance = 0;
+        let mut in_word = false;
+        for c in self.text[at..].chars() {
+            if is_word_char(c) {
+                in_word = true;
+                advance += 1;
+            } else if in_word {
+                break;
+            } else {
+                advance += 1;
+            }
+        }
+        self.cursor += advance;
     }
 
     /// 移到**当前行**行首（行界是 `'\n'`，不是缓冲开头）。
@@ -155,6 +197,14 @@ impl InputBuffer {
             .map(|(b, _)| b)
             .unwrap_or(self.text.len())
     }
+}
+
+/// 词字符 = 字母 / 数字 / `_`；其余（空白、标点、`'\n'`）都是分隔符。
+///
+/// 注意 `char::is_alphanumeric()` 对 CJK 汉字为真 ⇒ **一整段中文算一个词**，
+/// 按词移动会整段跳过而不是逐字 —— 对中文语料这是想要的行为。
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 #[cfg(test)]
@@ -466,5 +516,101 @@ mod tests {
             b.cursor_home();
             assert_eq!(b.cursor_row_col(), (row, 0), "start={start}");
         }
+    }
+
+    /// 按词右移：停在**词后第一个分隔符之前**，分隔符不前进。
+    #[test]
+    fn test_word_right_stops_before_separator() {
+        let mut b = InputBuffer::new();
+        b.insert_str("foo bar_baz  qux");
+        b.cursor = 0; // insert_str 会把光标留在末尾
+
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 3, "越过 foo，停在空格前");
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 11, "`bar_baz` 里 `_` 是词字符，算一个词");
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 16, "连续空格一次吃掉，停在 qux 之后（缓冲末尾）");
+    }
+
+    /// 按词左移：先吃掉分隔符，再退回整个词；越过词后**不吞**它左边的分隔符。
+    #[test]
+    fn test_word_left_skips_separators_then_word() {
+        let mut b = InputBuffer::new();
+        b.insert_str("foo bar_baz  qux");
+        b.cursor = b.text.chars().count();
+
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 13, "越过 qux 停在词首");
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 4, "吃掉两个空格 + 整个 bar_baz，停在空格后");
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 0, "吃掉空格 + foo，到缓冲开头");
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 0, "已在开头：no-op");
+    }
+
+    /// 边界：空缓冲、只有分隔符、光标在词中间。
+    #[test]
+    fn test_word_motion_boundaries() {
+        let mut b = InputBuffer::new();
+        b.cursor_word_left();
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 0, "空缓冲两侧都是 no-op");
+
+        b.insert_str("   ");
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 3, "只有空白 ⇒ 一路吃到末尾");
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 0, "反向亦同");
+
+        let mut b = InputBuffer::new();
+        b.insert_str("alpha beta");
+        b.cursor = 2;
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 5, "从词中间：先吃完本词，不属于下一个词");
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 0, "从词中间左移：回到本词词首");
+    }
+
+    /// 跨行：`'\n'` 是分隔符 ⇒ 按词移动会跨行，且**不吞**它。
+    #[test]
+    fn test_word_motion_crosses_newline() {
+        let mut b = InputBuffer::new();
+        b.insert_str("aa\nbb");
+
+        b.cursor = 2; // 第一行行尾（'\n' 之前）
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 5, "吃掉换行与 bb，到缓冲末尾");
+
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 3, "退回 bb 的词首（'\n' 之下）");
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 0, "再左移：吃掉换行 + aa");
+    }
+
+    /// CJK：`is_alphanumeric` 对汉字为真 ⇒ **一整段中文算一个词**，整段跳过。
+    /// 且不得 panic、不得落在多字节字符中间。
+    #[test]
+    fn test_word_motion_cjk_is_one_word_and_never_panics() {
+        let mut b = InputBuffer::new();
+        b.insert_str("中文 段落 word");
+        b.cursor = 0; // insert_str 会把光标留在末尾
+
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 2, "「中文」两字算一个词");
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 5, "「段落」同上");
+        b.cursor_word_right();
+        assert_eq!(b.cursor, 10, "再吃掉空格与 word");
+
+        b.cursor_word_left();
+        assert_eq!(b.cursor, 6, "退回 word 词首");
+        // 反复移动不得 panic，且始终停在 char 边界上
+        for _ in 0..20 {
+            b.cursor_word_left();
+            assert!(b.text.is_char_boundary(b.byte_index(b.cursor)));
+        }
+        assert_eq!(b.cursor, 0);
     }
 }

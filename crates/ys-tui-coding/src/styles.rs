@@ -8,8 +8,8 @@
 //!
 //! **必须逐项覆写全部方法**：`DefaultStyleSheet` 自带一套主观配色（链接蓝、引用绿、
 //! 表格头 cyan、`code()` 白字黑底…），漏写一项即会把默认色漏进渲染（风险 R3）。
-//! 本实现的配色**刻意不使用蓝 / 绿 / cyan，也不使用白字黑底**，使「默认色泄漏」可被单测
-//! 以「产出样式不含这些颜色」直接钉住。
+//! 本实现的配色**刻意不使用蓝 / 绿**，也不使用白字黑底 / `DIM`，使「默认色泄漏」可被单测
+//! 以「产出样式不含这些颜色」直接钉住（唯一例外：`code()` 有意用 cyan，见下）。
 //!
 //! `tui_markdown::` 路径只准出现在 `md.rs` / `styles.rs`（R6 缓解）。
 
@@ -36,9 +36,14 @@ impl StyleSheet for AssistantStyles {
         }
     }
 
-    /// 行内码与围栏代码块：**只加背景**（默认是 `white on black`，会把整块代码变白字黑底）。
+    /// 行内码与围栏代码块：**只有前景色 cyan**（默认是 `white on black`，会把整块代码变白字黑底）。
+    ///
+    /// 为什么是单一前景色（2026-10-10）：`code()` 同时作用于行内码与围栏代码块，**不分语言** ——
+    /// 目标是「与正文区分开」，不是编辑器级语法高亮。
+    /// 为什么不用背景：围栏块是整行级样式，底色会给长代码块糊一大片，代码的缩进 / 行尾空白
+    /// 也会成片显色（原 `bg(DarkGray)` 即因此撤掉）。
     fn code(&self) -> Style {
-        Style::default().bg(Color::DarkGray)
+        Style::new().fg(Color::Cyan)
     }
 
     /// 链接：**只加下划线、不上色**（默认是蓝色下划线；URL 尾注由库附在公司默认形态里）。
@@ -193,8 +198,8 @@ mod tests {
         assert_eq!(s.heading_marker(1), "");
         assert_eq!(s.heading_marker(3), "");
         assert_eq!(s.code_block_fence(), "");
-        assert_eq!(s.code().fg, None, "code 只加背景，不设前景");
-        assert_eq!(s.code().bg, Some(Color::DarkGray));
+        assert_eq!(s.code().fg, Some(Color::Cyan), "code 用单一 cyan 前景");
+        assert_eq!(s.code().bg, None, "code 不得带底色");
         assert_eq!(s.heading(1).fg, Some(Color::Magenta));
         assert!(s.heading(1).add_modifier.contains(Modifier::UNDERLINED));
         assert!(s.heading(2).add_modifier.contains(Modifier::BOLD));

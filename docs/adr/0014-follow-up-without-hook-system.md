@@ -48,6 +48,11 @@ accepted（2026-09-15）
   将来要「可插」时，把这**一个函数**升级为列表即可（**加法，非重写**）。今天**不预埋抽象**。
 - **两个「compact」澄清**（写入 `CONTEXT.md`）：**自动压缩已实现**（回合内）；**`/compact` 命令仍是占位**
   （实为 `clear_session`）——那是独立缺口，与本 ADR 无关。
+  > **状态更新**（2026-10，compaction 加固闭环后）：`/compact` 命令**不再是占位**——
+  > `apps/coding-agent/src/capabilities.rs:230` 的 `pub async fn compact(...)` 走真压缩
+  > （摘要 + 保留尾部），并由 4 个测试钉住核心不变量（变小且含摘要 / 无 model 一行提示 /
+  > 失败不动 session 一字节 / 太少消息不改）。`Wiring` 也不再暴露 `clear_session`。
+  > 详见 `docs/design-final/compaction.md` §8 [已关闭] 与 commit `dc5277d`。
 - **将来若做 hook 系统**，两条约束已探明（勿重蹈）：
   1. 落点 **`ys-component`**（`RuntimeContext` 所在）；
   2. 签名**只用 `ys-core` / `ys-model` 类型**，**绝不用 `ys-loop` 类型**（否则依赖环）。

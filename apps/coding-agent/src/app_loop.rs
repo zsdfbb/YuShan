@@ -53,7 +53,8 @@
 //! 恒 `None` ⇒ 每次用户输入至多多出一个回合。回合前的边界排空在 `run_turn_once`
 //! 开头（每回合都做），故上一回合残留的 `Abort` 不会取消复核回合。
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -71,6 +72,45 @@ use crate::state::StateStore;
 use crate::status::TurnStats;
 use crate::view::build_view;
 use crate::wiring::Wiring;
+
+/// 会话文件路径的**进程内快照**：app 循环写、`main` 在 UI 退出后读。
+///
+/// # 为什么不能靠 app 线程收摊后再取
+///
+/// UI 退出**不等于** app 线程已结束：回合可能正卡在模型调用里，
+/// `run_interactive` 只能宽限一段时间，到点连 runtime 一起丢。若等 app 线程
+/// 收摊才取路径，最常见的情形（长回合中途退出）恰好取不到。
+///
+/// # 写者与播种
+///
+/// 启动态由**调用方播种**（此刻的会话路径归构造 `Wiring` 的一方知道）；
+/// `/new` 之后由 app 循环刷新。读取失败（锁中毒）按「无会话」处理 —— 只影响
+/// 退出提示行，不影响任何执行路径。
+#[derive(Clone, Debug, Default)]
+pub struct SessionPathHandle {
+    path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl SessionPathHandle {
+    /// 以当前会话路径播种（一次性会话给 `None`）。
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path: Arc::new(Mutex::new(path)),
+        }
+    }
+
+    /// 刷新快照（换会话后调用）。
+    fn record(&self, path: Option<&Path>) {
+        if let Ok(mut slot) = self.path.lock() {
+            *slot = path.map(Path::to_path_buf);
+        }
+    }
+
+    /// 当前快照。
+    pub fn get(&self) -> Option<PathBuf> {
+        self.path.lock().ok().and_then(|slot| slot.clone())
+    }
+}
 
 /// app 循环的失败：只有「UI 侧已经收摊」这一种（`Outbound` 信道关闭）。
 ///
@@ -96,6 +136,7 @@ pub async fn run(
     out_tx: mpsc::Sender<Outbound<CodingView>>,
     mut sink_rx: mpsc::Receiver<Envelope>,
     subagent: Option<crate::subagent::SubagentSetup>,
+    session_path: SessionPathHandle,
 ) -> Result<(), AppLoopError> {
     // 回合号从 1 起（`Envelope.turn` 靠 `begin_turn` 携带）。
     let mut turns: u32 = 0;
@@ -227,6 +268,8 @@ pub async fn run(
                 lines = capabilities::new_session(&mut wiring).await;
                 // 新会话 = 新的会话起点（状态行的时长据此重置）。
                 session_started = Instant::now();
+                // 换会话也换了文件 —— 刷新给 `main` 的退出提示快照。
+                session_path.record(wiring.session_path());
             }
 
             Request::Compact => {
@@ -530,6 +573,8 @@ mod tests {
         boundaries: mpsc::Sender<Boundary>,
         outbound: mpsc::Receiver<Outbound<CodingView>>,
         handle: tokio::task::JoinHandle<Result<(), AppLoopError>>,
+        /// 与 app 循环共享的会话路径快照（退出提示行的取数口）。
+        session_path: SessionPathHandle,
         tmp: TempDir,
     }
 
@@ -613,6 +658,11 @@ mod tests {
         let (boundaries, boundary_rx) = mpsc::channel(8);
         let (out_tx, outbound) = mpsc::channel(64);
 
+        // 与生产侧同规：启动态由建 `Wiring` 的一方播种（`/new` 之后由循环刷新）。
+        let session_path =
+            SessionPathHandle::new(wiring.session_path().map(std::path::Path::to_path_buf));
+        let app_session_path = session_path.clone();
+
         for b in prefilled {
             boundaries.try_send(b).unwrap();
         }
@@ -629,6 +679,7 @@ mod tests {
             out_tx,
             sink_rx,
             subagent,
+            app_session_path,
         ));
 
         Harness {
@@ -636,6 +687,7 @@ mod tests {
             boundaries,
             outbound,
             handle,
+            session_path,
             tmp,
         }
     }
@@ -1125,6 +1177,11 @@ mod tests {
         assert_ne!(old_path, new_path, "应换到新会话文件");
         assert!(old_path.exists(), "旧会话文件保留");
         assert!(!new_path.exists(), "/new 惰性：未追加前不落盘空文件");
+        assert_eq!(
+            h.session_path.get().as_ref(),
+            Some(&new_path),
+            "/new 后退出提示快照应指向新会话文件"
+        );
 
         // 追加后新文件才出现且不含旧内容。
         h.requests.send(prompt("next")).await.unwrap();
@@ -1135,6 +1192,45 @@ mod tests {
                 .unwrap()
                 .contains("hello"),
             "新文件不得含旧会话内容"
+        );
+    }
+
+    /// 退出提示快照（[`SessionPathHandle`]）：启动态一播种就是首个会话文件；
+    /// 普通回合不动它；`/new` 之后指向新文件。
+    ///
+    /// 变异：删掉 `Request::NewSession` 分支里的 `record` ⇒ 最后一段断言变红。
+    #[tokio::test]
+    async fn session_path_handle_follows_new_session() {
+        let model = MockModel::new("mock");
+        model.push_text("hello");
+        model.push_text("again");
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        let first = h.session_path.get().expect("持久会话应在启动时播种路径");
+        assert!(!first.exists(), "惰性新会话：未追加前不落盘");
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert_eq!(view.session_path.as_ref(), Some(&first));
+        assert!(first.exists(), "回合结束后会话文件应落盘");
+        assert_eq!(
+            h.session_path.get().as_ref(),
+            Some(&first),
+            "普通回合不得换会话文件"
+        );
+
+        h.requests.send(Request::NewSession).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        let second = h.session_path.get().expect("换会话后仍应有路径");
+        assert_ne!(second, first, "/new 后快照应指向新会话文件");
+
+        h.requests.send(prompt("next")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        assert_eq!(
+            h.session_path.get().as_ref(),
+            Some(&second),
+            "快照只随 /new 变，不随回合变"
         );
     }
 
@@ -1321,6 +1417,7 @@ mod tests {
             boundaries,
             outbound,
             mut handle,
+            session_path: _,
             tmp,
         } = h;
         drop(requests);

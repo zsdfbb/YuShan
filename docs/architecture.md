@@ -545,8 +545,9 @@ flowchart TB
 不 drop 信道就不会关闭；等关闭必死锁。
 
 **为什么 `-p`/`--json` 也持久化**：三模式统一落盘（`persistent_new` / `resume`），共用同一个回合末
-meta 写入点 `finalize_turn_meta`（title / model / provider / tokens / thinking）；收尾把
-`session: <id>` 打到 **stderr**（stdout 是数据流），使一次性任务也能被后续 `--resume` 找回。
+meta 写入点 `finalize_turn_meta`（title / model / provider / tokens / thinking）；**三模式退出时**
+都把 `session: <id>` 打到 **stderr**（stdout 是数据流）—— TUI 在退出回放之后、`-p`/`--json` 在
+收尾处 —— 三处共用 `main::session_exit_line`，使任何一次运行都能被后续 `--resume` 找回。
 `Wiring::ephemeral`（`MemorySession`）降为**测试专用**（`#[cfg(test)]`），生产路径不再用它。
 
 - **默认新会话**：启动不再隐式恢复「最近会话」；恢复只走显式 `--resume`——裸 flag = 列表选择，
@@ -680,7 +681,13 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 |---|---|---|
 | **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
+| **退出时** | `session: <id>`（TUI 退出回放**之后**写主屏；`-p` / `--json` 收尾） | **stderr** |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
+
+**退出时**是第三类时机：TUI 已退 alt-screen（`restore_terminal` 把对话回放到 stdout），此刻写 stderr
+的字节落在主屏、不会被冲掉，也不污染 `-p` 的模型文本 / `--json` 的逐行 `Envelope`。内容由
+`main::session_exit_line` 唯一给出（**只对已落盘的会话**打印 —— 惰性新会话若一个回合都没跑过就没有
+文件，打出的 id `--resume` 也找不到），详见 ADR-0032。
 
 **日志文件**（`apps/coding-agent/src/logging.rs`）：手写极简 logger —— 追加写、行首 `[unix秒]` 前缀、
 **best-effort**（目录创建 / 打开 / 写入的任何 IO 错误一律静默忽略，返回值 `()`，不 panic、不传播）。

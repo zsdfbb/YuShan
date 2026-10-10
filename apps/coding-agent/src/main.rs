@@ -537,6 +537,20 @@ fn session_id_of(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 退出时的会话提示行：`session: <id>`；`None` = 不打。
+///
+/// **只在会话文件已落盘时才打** —— 默认新会话是惰性的（首次追加才落盘），一个回合
+/// 都没跑过的会话压根没有文件，打出的 id 连 `--resume` 都找不到（`sessions::resolve`
+/// 会报「找不到会话」），那是误导而不是提示。
+///
+/// 三模式共用同一条：`-p` / `--json` 收尾与 TUI 退出后（`run_interactive`）都经此，
+/// 措辞因此不可能漂移。三处都写 **stderr**（stdout 属数据流：`-p` 是模型文本、
+/// `--json` 是逐行 `Envelope`、TUI 是退出回放的 transcript）。
+fn session_exit_line(path: Option<&Path>) -> Option<String> {
+    let path = path.filter(|p| p.is_file())?;
+    Some(format!("session: {}", session_id_of(path)?))
+}
+
 /// 抓取落盘文件的保留时长：超过即被启动期清理（**只对 Primary 档**生效）。
 ///
 /// `tools-web` 未把它导出为 pub 常量（设计 §1.8 的常量清单里只有散文），故在此
@@ -693,8 +707,8 @@ async fn persist_single_turn(
         &stats,
     )
     .await?;
-    if let Some(id) = wiring.session_path().and_then(session_id_of) {
-        eprintln!("session: {id}");
+    if let Some(line) = session_exit_line(wiring.session_path()) {
+        eprintln!("{line}");
     }
     Ok(())
 }
@@ -954,6 +968,11 @@ fn run_interactive(
         }
     })?;
 
+    // 会话路径快照：UI 退出后打印 `session: <id>` 用。启动态在此播种（此刻只有
+    // 这里知道 `persistent_new` 算出的文件名），`/new` 之后由 app 循环刷新。
+    let session_path =
+        app_loop::SessionPathHandle::new(wiring.session_path().map(Path::to_path_buf));
+
     // 2b.【阻塞】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
     //
     // 必须在**起屏之前**（此后一次重绘都不该发 HTTP，设计 M4）；5s 超时且并发，
@@ -1003,6 +1022,7 @@ fn run_interactive(
 
     // 5. app 线程（tokio worker）跑循环；当前线程跑**阻塞**的 UI 循环。
     //    app 循环唯一的失败是「UI 侧收摊」，不该惊动用户 —— 落日志即可。
+    let app_session_path = session_path.clone();
     rt.spawn(async move {
         if let Err(e) = app_loop::run(
             agent,
@@ -1016,6 +1036,7 @@ fn run_interactive(
             out_tx,
             sink_rx,
             subagent,
+            app_session_path,
         )
         .await
         {
@@ -1028,7 +1049,15 @@ fn run_interactive(
 
     // UI 退出已把 `request_tx` / `boundary_tx` drop → app 线程 `recv()` 得 `None`。
     // 给一段宽限让它收摊（回合跑在半途时最多等这么久），超时连 runtime 一起丢。
+    // 宽限**先于**读快照：正在收尾的 `/new` 有机会把新路径写进来。
     rt.shutdown_timeout(APP_THREAD_GRACE);
+
+    // 退出提示：`session: <id>` 落到**主屏**（alt-screen 已由 TUI 退出时恢复），
+    // 让用户拿得到刚才那轮的会话号去 `--resume`。与 `-p` / `--json` 同一行、同一去处
+    // ——见 [`session_exit_line`]。
+    if let Some(line) = session_exit_line(session_path.get().as_deref()) {
+        eprintln!("{line}");
+    }
 
     tui_result?;
     Ok(())
@@ -2486,6 +2515,31 @@ mod tests {
             Some("原有提示"),
             "未触发必须原样返回，不得追加"
         );
+    }
+
+    /// 退出提示行（[`session_exit_line`]）：会话文件已落盘 ⇒ `session: <id>`
+    /// （id = 文件 stem）；未落盘 / 无路径 ⇒ `None`。
+    ///
+    /// 变异：去掉 `is_file` 守卫 ⇒ 惰性新会话也会打出一个 `--resume` 找不到的 id，
+    /// 第一条与第三条断言变红。
+    #[test]
+    fn session_exit_line_requires_persisted_file() {
+        let dir = unique_tmp_dir("session_exit_line");
+        let path = dir.join("2026-10-10-abc.jsonl");
+        assert_eq!(session_exit_line(Some(&path)), None, "未落盘不得打 id");
+        assert_eq!(session_exit_line(None), None, "一次性会话无文件");
+
+        std::fs::write(&path, "{}\n").unwrap();
+        assert_eq!(
+            session_exit_line(Some(&path)).as_deref(),
+            Some("session: 2026-10-10-abc"),
+            "id 取文件 stem"
+        );
+
+        // 目录（而非文件）同名时不算落盘：`is_file` 而非 `exists`。
+        let as_dir = dir.join("2026-10-10-dir.jsonl");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        assert_eq!(session_exit_line(Some(&as_dir)), None);
     }
 
     /// 自定义 prompt 提示：**两个条件同时成立**才出（有自定义 SYSTEM.md 且发现了 skill）。

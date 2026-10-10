@@ -2,11 +2,25 @@
 
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
-> **本文件按渐进式披露组织**：只放**每一轮都需要**的东西 —— 定位 / 常用命令 / 硬性约束 / 工作约定 / 去哪找。
+> **本文件按渐进式披露组织**：只放**每一轮都需要**的东西 —— 定位 / 目录结构 / 常用命令 / 硬性约束 / 工作约定 / 去哪找。
 > 架构、模块职责、数据流、命令分工等**细节一律在 `docs/`**（见文末「去哪找什么」）。
 >
 > **往这里加内容前先问一句：它每一轮都需要吗？** 不是 ⇒ 写进 `docs/`，这里只留一行指针。
 > 判据与先例见 `docs/arch/skills/design.md`（skill 的渐进式披露）与 `docs/CONTEXT.md`。
+
+## 目录结构
+
+```
+YuShan/
+├── crates/      # 运行时核心库：10 个 ys-* crate（分层见 docs/architecture.md §1）
+├── adapters/    # 可选实现：模型（OpenAI 兼容）与工具（basic / web）
+├── apps/        # 可执行入口：coding-agent（TUI / -p / --json 三模式）
+├── docs/        # 设计、架构、ADR、as-built —— 入口见文末「去哪找什么」
+├── .claude/     # Claude Code 本地配置
+└── tmp/         # 临时目录（已被 .gitignore 忽略，勿放正式内容）
+```
+
+根文件：`Cargo.toml`（workspace 成员表）、`AGENTS.md`（`CLAUDE.md` 是指向它的软链）、`LICENSE`、`README.md`。
 
 ## 常用命令
 

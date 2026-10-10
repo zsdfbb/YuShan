@@ -635,6 +635,8 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
   保留 `Line::style` 与 `Line::alignment`（库会写这两者）。
 - `styles.rs`：`impl tui_markdown::StyleSheet`，**23 个方法逐一覆写** —— `DefaultStyleSheet` 自带主观配色，
   漏写会把默认色漏进来。粗体 / 斜体由库硬编码为纯修饰符、**不可配色**，本仓本就要 Strong=BOLD / Emphasis=ITALIC（无颜色）。
+  `code()`（行内码 + 围栏代码块）**只用单一 `cyan` 前景色，不分语言**（2026-10-10 修订）——
+  整块底色会在长代码块上糊成一大片、并给缩进染色，故不用底色；也不引 `highlight-code`（`syntect` + `onig_sys` C 库）。
 - `tui_markdown::` 路径**只出现在** `md.rs` 与 `styles.rs`（可 grep 断言；库成熟度风险的缓解）。
 
 ### 14.2 表格窄屏守卫（只作用于表格行）

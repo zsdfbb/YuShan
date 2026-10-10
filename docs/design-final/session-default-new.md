@@ -5,6 +5,17 @@
 > 报告见 `docs/reports/2026-10-08-session-default-new-report.md`。
 > 日期：2026-10-08 ｜ 基线 `58e0e3b`。
 
+> **已由 ADR-0033 取代（2026-10-10）—— 仅针对「resume 仅启动期一次性」这一点**：
+> 本特性立项时的立场是「resume 发生在**启动期一次性**、**不做运行期切换**」（对应 ADR-0026 决策 6 /
+> `docs/arch/session-default-new/context.md` 的 **D11**）。ADR-0033 已落地**运行期 `/resume`**
+> ⇒ **D11 的后半句「不做运行期切换（无 `/resume` 中途换会话）」作废**。
+> **D12 的「列表交互落点 = 起屏前 stdin 选择」未被推翻** —— 它仍是**启动期裸 `--resume`** 的形态；
+> 运行期 `/resume` 走的是**另一条通路**（TUI 浮层，经协议 `Request::ListSessions` / `Request::ResumeSession`）。
+> 运行期 as-built 见 `docs/design-final/runtime-resume.md`。
+> **本文件其余决策（默认新建、meta 首行、三模式统一持久化、`/new` 惰性不预建文件、thinking 单真值、
+> 标题派生…）全部保留**；下列正文（含「恢复的三条分支」「恢复优先级」等）描述的是**启动期 `--resume`**
+> 的形态，未因运行期 `/resume` 的加入而失效。
+
 ## 一句话
 
 交互式启动从「无条件恢复最近会话」改为**默认新会话**；恢复收进显式 `--resume[=<id>]`

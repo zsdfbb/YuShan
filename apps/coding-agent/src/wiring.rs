@@ -128,6 +128,32 @@ impl Wiring {
         }
     }
 
+    /// **运行期 `/resume`**：恢复到指定会话文件。
+    ///
+    /// `JsonlSession::open` **成功后才替换** `session` / `session_path` —— 镜像
+    /// [`Wiring::new_session`] 的不变量。`open` 失败（路径不可读等）时 `self` 保持
+    /// 原样，不会留下「会话半换、模型还是旧的」的中间态。
+    ///
+    /// 返回读回的 meta（`None` = 该文件尚无首行 meta）。`sessions_dir` **不变**
+    /// （恢复不换目录）；调用方负责刷新会话路径快照与统计。
+    pub async fn resume_into(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<Option<SessionMeta>, SessionError> {
+        let session = JsonlSession::open(&path).await?;
+        let meta = session.meta().cloned();
+        self.session = Box::new(session);
+        self.session_path = Some(path);
+        Ok(meta)
+    }
+
+    /// 会话落盘目录（`None` = 一次性 / 内存会话）—— 运行期 `/resume` 扫目录的取数口。
+    ///
+    /// 命名刻意避开 `main.rs` 的同名自由函数 `sessions_dir()`，防读码混淆。
+    pub fn sessions_dir_path(&self) -> Option<&Path> {
+        self.sessions_dir.as_deref()
+    }
+
     /// 借用端口给 `Agent::run_turn`，**不携带**边界源。
     ///
     /// 轮边界源由调用方每回合新建、经 [`Wiring::ports_with_boundary`] 就地传入
@@ -476,5 +502,104 @@ mod tests {
             w.ports().boundary.is_none(),
             "接线器不持有边界源 —— 它随回合生灭"
         );
+    }
+
+    /// **T10 —— `resume_into` 成功**：换到目标会话文件并读回其 meta / 消息，
+    /// `sessions_dir` 不变。
+    #[tokio::test]
+    async fn resume_into_swaps_session_and_returns_meta() {
+        let dir = temp_dir("resume_into_ok");
+        let target = {
+            let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+                .await
+                .unwrap();
+            w.update_meta(|m| {
+                m.title = Some("目标".into());
+                m.thinking_visible = true;
+                m.turns = 3;
+            })
+            .await
+            .unwrap();
+            w.ports()
+                .session
+                .append(text_message("目标历史"))
+                .await
+                .unwrap();
+            w.session_path().unwrap().to_path_buf()
+        };
+
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        w.ports()
+            .session
+            .append(text_message("当前历史"))
+            .await
+            .unwrap();
+        let dir_getter = w.sessions_dir_path().map(Path::to_path_buf);
+        assert_eq!(dir_getter.as_deref(), Some(dir.as_path()));
+
+        let meta = w.resume_into(target.clone()).await.unwrap();
+
+        assert_eq!(w.session_path(), Some(target.as_path()), "应换到目标文件");
+        let meta = meta.expect("目标会话应有 meta");
+        assert_eq!(meta.title.as_deref(), Some("目标"));
+        assert!(meta.thinking_visible);
+        assert_eq!(meta.turns, 3);
+        assert_eq!(w.session_messages().len(), 1, "应读回目标历史");
+        assert_eq!(
+            w.sessions_dir_path(),
+            Some(dir.as_path()),
+            "恢复不换目录"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **T10 —— `resume_into` 失败原子性**：`open` 失败时 `session` / `session_path` /
+    /// `meta` **全部不变**。
+    ///
+    /// 注：`JsonlSession::open` 是**惰性**的 —— 路径不存在（`path.exists()` 为假）、
+    /// 内容非法（逐行跳过坏行）都**不**失败。真正会失败的是对**已存在**路径的 OS 级
+    /// 读取错误，故这里传入一个**目录**（`exists()` 为真、`read` 返回 `EISDIR`）。
+    #[tokio::test]
+    async fn resume_into_failure_leaves_current_session_untouched() {
+        let dir = temp_dir("resume_into_fail");
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        w.update_meta(|m| m.title = Some("当前".into()))
+            .await
+            .unwrap();
+        w.ports()
+            .session
+            .append(text_message("当前历史"))
+            .await
+            .unwrap();
+
+        let before_path = w.session_path().unwrap().to_path_buf();
+        let before_meta = w.meta().cloned();
+        let before_msgs = w.session_messages().to_vec();
+
+        // 目录：`exists()` 为真 ⇒ 走 `load_from_file` ⇒ `read` 必失败（EISDIR）。
+        let bad = temp_dir("resume_into_fail_target");
+
+        let err = w.resume_into(bad.clone()).await;
+
+        assert!(err.is_err(), "打开不可读路径必须失败");
+        assert_eq!(
+            w.session_path(),
+            Some(before_path.as_path()),
+            "失败时不得换会话文件"
+        );
+        assert_eq!(w.meta().cloned(), before_meta, "失败时 meta 不得变");
+        assert_eq!(
+            w.session_messages(),
+            before_msgs.as_slice(),
+            "失败时历史不得变"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bad);
     }
 }

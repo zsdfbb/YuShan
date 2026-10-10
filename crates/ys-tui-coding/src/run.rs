@@ -50,7 +50,9 @@ use ys_protocol::{Boundary, Outbound, Request};
 use crate::app::App;
 use crate::commands::PromptKind;
 use crate::input::InputBuffer;
-use crate::prompter::{PromptError, PromptOutcome, Prompter, resolve_prompt};
+use crate::prompter::{
+    PromptError, PromptOutcome, Prompter, resolve_prompt, resolve_session_pick,
+};
 use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
 use crate::{draw, events};
@@ -173,12 +175,26 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             }
         }
 
+        // 1b) 排空 Outbound **之后**立刻检查浮层意图 —— `apply_outbound` 可能刚设上
+        //     `pending_prompt`（如 `/resume` 无参拿到 `SessionList` 非空）；不在这里检查，
+        //     浮层要等用户再敲一个键才弹。
+        if let Some(kind) = app.pending_prompt.take() {
+            run_prompt(
+                kind,
+                terminal,
+                app,
+                &mut outbound,
+                &mut outbound_open,
+                requests,
+            );
+        }
+
         // 2) 等输入，最多 POLL_INTERVAL
         if crossterm::event::poll(POLL_INTERVAL)? {
             let event = crossterm::event::read()?;
             events::handle_event(event, app, requests, boundaries, size.width, size.height);
-            // `/login`、`/model` 无参要开模态浮层 —— 画屏需要 Terminal，
-            // 而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
+            // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
+            // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
             if let Some(kind) = app.pending_prompt.take() {
                 run_prompt(
                     kind,
@@ -231,6 +247,12 @@ fn run_prompt<B: Backend<Error = std::io::Error> + Write + Send>(
 ) {
     // 视图快照必须在把 `app` 借给 prompter **之前**取走（CodingView 是 Clone）
     let view = app.view.clone();
+    // `/resume` 的候选与当前会话路径来自 `App`（与 `view` 不同源）—— 一并先取走。
+    // `take()` 同时把 `pending_sessions` 清空：浮层结束时不再残留旧列表（与
+    // `pending_prompt` 同 take 同清）。
+    let sessions = app.pending_sessions.take().unwrap_or_default();
+    let current_path = app.view.session_path.clone();
+
     let outcome = {
         let prompter = TuiPrompter::new(
             &mut *terminal,
@@ -238,9 +260,27 @@ fn run_prompt<B: Backend<Error = std::io::Error> + Write + Send>(
             &mut *outbound,
             &mut *outbound_open,
         );
-        resolve_prompt(kind, &prompter, &view)
+        match kind {
+            // 会话候选来自 `App.pending_sessions`（与 `&CodingView` 不同源）⇒ 独立解析器。
+            PromptKind::PickSession => {
+                resolve_session_pick(&prompter, &sessions, current_path.as_deref())
+            }
+            _ => resolve_prompt(kind, &prompter, &view),
+        }
     };
 
+    apply_prompt_outcome(app, requests, outcome);
+}
+
+/// 把一条模态问答的**结局**落进 `App` / 请求信道。
+///
+/// 抽成自由函数：真模态循环需要真终端与真键盘，无法单测，但「取消不改任何状态」
+/// 这条契约（`Err(Cancelled) => {}`）可以在这里单独钉住。
+fn apply_prompt_outcome(
+    app: &mut App,
+    requests: &Sender<Request>,
+    outcome: Result<PromptOutcome, PromptError>,
+) {
     match outcome {
         Ok(PromptOutcome::Request(req)) => {
             if requests.blocking_send(req).is_err() {
@@ -251,6 +291,11 @@ fn run_prompt<B: Backend<Error = std::io::Error> + Write + Send>(
         // 后自行回车（与 `Tab` 补全接受一项后的处置一致）。此时输入框必空
         // （`submit` 已 `take()`，光标归零），故 `insert_str` 即「从头写入」。
         Ok(PromptOutcome::Prefill(text)) => app.input.insert_str(&text),
+        // 有意义的无操作（`/resume` 选中当前会话）：不发请求，但**不静默**。
+        Ok(PromptOutcome::NoOp(hint)) => {
+            app.transcript.push(TranscriptLine::System(hint));
+            app.follow = true;
+        }
         Err(PromptError::Cancelled) => {}
         Err(PromptError::Other(msg)) => {
             app.transcript
@@ -323,6 +368,15 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
     /// 不排空的话，agent 在模态开着时吐事件会把有界信道灌满，把 app 线程堵在
     /// 发送端 —— 用户只是开了个选择器，不该让整条流水线停摆。
     /// 顺带：`Outbound::Quit` 在此时也照样生效（走 `should_quit`）。
+    ///
+    /// **不在这里开嵌套浮层**：模态期间到达的 `SessionList`（非空）会被
+    /// `apply_outbound` 设上 `pending_prompt`，但这里只**存起来**、不消费它 ——
+    /// 当前模态结束后，主循环的检查点（排空 Outbound 之后）自会把它打开。
+    ///
+    /// **模态期间到达 `SessionResumed` 会经 `apply_outbound` 走 `reset_for_replay` 清屏**，
+    /// 把模态的底衬换掉。按 Q8 的顺序这**不应发生**：`SessionResumed` 只在回合边界抵达，
+    /// 且通常在 `SessionList`（模态正是由它开启）之后。这里**不做防护** —— 依赖 Q8 成立；
+    /// 若前提变化（设计 §7 的遗留项），需在此按事件类型分流。
     fn drain_outbound(&mut self) {
         if !*self.outbound_open {
             return;
@@ -666,6 +720,45 @@ mod tests {
             seq.contains("\x1b[<1u"),
             "须弹出键盘增强标志（否则泄漏进 shell）：{seq:?}"
         );
+    }
+
+    /// `apply_prompt_outcome(Err(Cancelled))` ⇒ **无副作用**：transcript / 输入框 /
+    /// `pending_sessions` 全不变（Esc 取消的契约）。
+    ///
+    /// 变异：把 `Err(PromptError::Cancelled)` 臂改成推一条提示（或改 `NoOp` 那样写
+    /// transcript）⇒ 本用例变红。
+    #[test]
+    fn test_apply_prompt_outcome_cancel_is_side_effect_free() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Request>(4);
+        let mut app = App::new(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("keep".into()));
+        app.input.insert_str("/resume");
+        app.pending_sessions = Some(Vec::new());
+        let before = app.transcript.clone();
+
+        apply_prompt_outcome(&mut app, &tx, Err(PromptError::Cancelled));
+
+        assert_eq!(app.transcript, before, "取消不改 transcript");
+        assert_eq!(app.input.text, "/resume", "取消不改输入框");
+        assert!(app.pending_sessions.is_some(), "取消不改 pending_sessions");
+    }
+
+    /// `NoOp` 结局 ⇒ 不发请求，但把提示写进 transcript 并贴底（不静默）。
+    #[test]
+    fn test_apply_prompt_outcome_noop_pushes_hint() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Request>(4);
+        let mut app = App::new(CodingView::for_test());
+        apply_prompt_outcome(
+            &mut app,
+            &tx,
+            Ok(PromptOutcome::NoOp("已在当前会话".into())),
+        );
+        assert!(
+            matches!(app.transcript.last(), Some(TranscriptLine::System(s)) if s == "已在当前会话"),
+            "{:?}",
+            app.transcript
+        );
+        assert!(app.follow);
     }
 
     /// N9 ②：hook 体**先**跑注入的恢复动作，**再**调用 delegate —— 后者保留默认的 panic

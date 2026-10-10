@@ -31,7 +31,7 @@
 | **T8** | ✅ 修入 design **I8**：抽 `reset_for_replay()`，穷举同源状态 |
 | T9 | ✅ 修入 design §3.1：**删除** `Listing`，改用 `ys_protocol::SessionSummary` |
 | T10 | ✅ 修入 design §1/§3.2 + ADR：统一叫 **resume**，不造「激活」 |
-| T11 | ✅ 修入 design **I10**：启动期 `SessionResumed` 必须排在 `startup_hint` 之后 |
+| T11 | ✅ 修入 design **I10**：启动期**先投 `SessionResumed`（回放）、再投 `startup_hint`** —— 反序会让提示被 `clear()` 吃掉 |
 | T12 | ✅ 修入 design **I11** + ADR 决策 12：空用户行与「看着像成功」的悬空工具 |
 | T13 | ✅ 修入 design §7：`pending_sessions` 与 `pending_prompt` 同 take 同清；后到覆盖 |
 | T14 | ✅ 修入 design **I13**：`sessions_dir == None` ⇒ 提示不可恢复，不弹浮层 |

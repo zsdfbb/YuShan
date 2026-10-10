@@ -9,12 +9,12 @@ use std::time::Instant;
 
 use ys_core::{ContentBlock, Message, ToolCallId};
 use ys_event::AgentEvent;
-use ys_protocol::{Envelope, Outbound};
+use ys_protocol::{Envelope, Outbound, SessionSummary};
 
 use crate::commands::PromptKind;
 use crate::completion::CompletionState;
 use crate::input::InputBuffer;
-use crate::transcript::{TranscriptLine, summarize_tool_args};
+use crate::transcript::{TranscriptLine, replay_lines, summarize_tool_args};
 use crate::view::CodingView;
 
 /// Working 动画的点数（1..=3）。
@@ -34,6 +34,11 @@ pub struct App {
     /// `events.rs` 只认识键与缓冲，画不了屏；需要终端的部分一律经这个字段
     /// 交还给持有 `Terminal` 的事件循环（设计 §3「模态循环在 run.rs 里跑」）。
     pub pending_prompt: Option<PromptKind>,
+    /// `/resume` 的候选会话（`Outbound::SessionList` 送来）。
+    ///
+    /// 与 `pending_prompt` **同 take 同清**：`run.rs` 在开 `/resume` 浮层时把它
+    /// `take()` 走，浮层结束（选中 / Esc）后即空，不会残留旧列表被下一次浮层读到。
+    pub pending_sessions: Option<Vec<SessionSummary>>,
     pub is_turning: bool,
     /// 本回合是否已经按过一次 Ctrl-C（取消已请求）。
     ///
@@ -90,6 +95,7 @@ impl App {
             input: InputBuffer::new(),
             completion: None,
             pending_prompt: None,
+            pending_sessions: None,
             is_turning: false,
             abort_requested: false,
             thinking_visible,
@@ -114,7 +120,64 @@ impl App {
                 self.follow = true;
             }
             Outbound::Quit => self.should_quit = true,
+            // 会话列表（`/resume` 无参的响应）。**空列表不弹空浮层**，只提示（I4）——
+            // 与启动期 `resolve_resume` 的空列表分支对齐。
+            Outbound::SessionList(items) => {
+                if items.is_empty() {
+                    // 空列表连**既有候选**一并清掉：同一轮 drain 内可能先到非空、再到空
+                    // 的一条（例如两次 `/resume` 的响应交错抵达），若只推提示而不清字段，
+                    // 旧的候选会残留在 `pending_sessions` / `pending_prompt` 上，主循环
+                    // 随后的检查点就会弹出**过期**列表。
+                    self.pending_sessions = None;
+                    self.pending_prompt = None;
+                    self.transcript
+                        .push(TranscriptLine::System("没有可恢复的会话".into()));
+                    self.follow = true;
+                } else {
+                    // 由 `pending_prompt` 驱动浮层；候选数据挂在 `pending_sessions`。
+                    self.pending_sessions = Some(items);
+                    self.pending_prompt = Some(PromptKind::PickSession);
+                }
+            }
+            // 会话已恢复：清屏 + 回放（设计 §3.3 第 6 步）。
+            Outbound::SessionResumed {
+                summary: _,
+                thinking_visible,
+                history,
+            } => {
+                self.reset_for_replay();
+                self.transcript = replay_lines(&history);
+                // **对「UI 运行期真值」的一次有意破例**：`/resume` **不是** `/new`，
+                // 其语义是「打开该会话」，故 thinking 跟随目标会话的 meta（与启动期
+                // `--resume` 同源），而非保留旧值。三方真值对齐见设计 I9 —— app 侧
+                // 另有进程级镜像，不在这里。
+                self.thinking_visible = thinking_visible;
+                self.follow = true;
+            }
         }
+    }
+
+    /// 回放（`/resume`）前的**清屏**：一次性重置全部与 transcript 同源的状态。
+    ///
+    /// 缺一项都会留下跨会话的脏状态。**不在此重置 `thinking_visible`** —— 它由
+    /// [`App::apply_outbound`] 的 `SessionResumed` 臂单独按目标会话的 meta 设定
+    /// （语义不同：这里是清屏，那里是「跟随目标会话」）。
+    ///
+    /// **也不清回合态**（`is_turning` / `turn_started_at` / `working_dot`）：清屏发生在
+    /// [`App::apply_outbound`] 收到 `SessionResumed` 时，**依赖该事件恒在回合边界抵达**
+    /// （app 线程在 `run_turn` 中阻塞、请求只在回合边界被处理），故此刻本无进行中的回合，
+    /// 回合态本就是空闲值。**若该前提将来变化**（设计 §7 已把「回合中拿到列表」列为遗留），
+    /// 这里必须重审 —— 否则旧回合的 `is_turning` / `turn_started_at` 会泄漏进回放后的新会话。
+    fn reset_for_replay(&mut self) {
+        // transcript 整体替换，任何按「槽下标」记忆的渲染产物都已失效（cache.rs 的
+        // 等长碰撞陷阱 ⇒ 必须显式 reset，不能指望 `sync_len` 兜住）。
+        self.transcript.clear();
+        self.md_cache.borrow_mut().reset();
+        self.tool_index.clear();
+        self.suppress_user_echo = 0;
+        self.pending_echo_texts.clear();
+        self.follow = true;
+        self.scroll_offset = 0;
     }
 
     /// 把一个 agent 事件应用到 transcript / 状态。
@@ -1270,6 +1333,184 @@ mod tests {
 
         a.apply_outbound(Outbound::Quit);
         assert!(a.should_quit);
+    }
+
+    // -----------------------------------------------------------------------
+    // /resume：SessionList / SessionResumed / reset_for_replay（N8 / I4 / I8）
+    // -----------------------------------------------------------------------
+
+    fn summary(id: &str, title: &str) -> SessionSummary {
+        use std::time::{Duration, UNIX_EPOCH};
+        SessionSummary {
+            id: id.into(),
+            path: std::path::PathBuf::from(format!("/sessions/{id}.jsonl")),
+            mtime: UNIX_EPOCH + Duration::from_secs(1_760_000_000),
+            title: title.into(),
+        }
+    }
+
+    fn assistant_message(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// **N8**：`reset_for_replay()` **逐项**清空与 transcript 同源的状态。
+    ///
+    /// 每一项都被单独断言 ⇒ 删掉 `reset_for_replay` 里对应的任一行，本用例即变红：
+    /// - 删 `transcript.clear()` ⇒ `transcript` 断言红
+    /// - 删 `md_cache.reset()`   ⇒ 等长碰撞断言红（下面用 `AAAA`/`BBBB` 钉住，见注释）
+    /// - 删 `tool_index.clear()` ⇒ `tool_index` 断言红
+    /// - 删 `suppress_user_echo = 0` ⇒ 计数断言红
+    /// - 删 `pending_echo_texts.clear()` ⇒ 队列断言红
+    /// - 删 `follow = true` ⇒ `follow` 断言红
+    /// - 删 `scroll_offset = 0` ⇒ 滚动断言红
+    #[test]
+    fn test_reset_for_replay_clears_every_same_source_state() {
+        use crate::styles::AssistantStyles;
+        use std::time::Instant;
+
+        let mut a = app();
+        // 各项先填成「非默认」态。
+        a.transcript.push(TranscriptLine::User("q".into()));
+        a.transcript.push(TranscriptLine::Assistant("AAAA".into()));
+        a.tool_index.insert(ToolCallId("c1".into()), 0);
+        a.suppress_user_echo = 2;
+        a.pending_echo_texts.push_back("pending".into());
+        a.follow = false;
+        a.scroll_offset = 5;
+        // md_cache：先渲染 "AAAA" 占住槽位（长度 4、宽度 60）。
+        crate::md::reset_render_calls();
+        {
+            let mut c = a.md_cache.borrow_mut();
+            c.sync_len(a.transcript.len());
+            c.lines_for(1, "AAAA", 60, AssistantStyles, Instant::now());
+        }
+        assert_eq!(crate::md::render_calls(), 1, "前置：AAAA 已入缓存");
+
+        a.reset_for_replay();
+
+        assert!(a.transcript.is_empty(), "transcript 清空");
+        assert!(a.tool_index.is_empty(), "tool_index 清空");
+        assert_eq!(a.suppress_user_echo, 0, "回显抑制计数清零");
+        assert!(a.pending_echo_texts.is_empty(), "待回声文本清空");
+        assert!(a.follow, "回到贴底");
+        assert_eq!(a.scroll_offset, 0, "滚动归零");
+
+        // md_cache 已失效：**等长**的新内容必须重渲染，不得复用旧槽位（I6 等长碰撞）。
+        // 若把 `reset()` 删掉，`lines_for` 会命中 "AAAA" 的产物（键 = 槽下标+len+width 全同）。
+        {
+            let mut c = a.md_cache.borrow_mut();
+            let lines = c.lines_for(1, "BBBB", 60, AssistantStyles, Instant::now());
+            let flattened: String = lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                .collect();
+            assert_eq!(flattened, "BBBB", "reset_for_replay 必须使 md_cache 失效");
+        }
+        assert_eq!(crate::md::render_calls(), 2, "reset 后等长内容必须重算");
+    }
+
+    /// `SessionList(非空)` ⇒ **同时**设 `pending_sessions` 与 `pending_prompt`
+    /// （钉住「谁负责开浮层」：是 `pending_prompt`，候选取自 `pending_sessions`）。
+    ///
+    /// 变异：只设 `pending_sessions`、不设 `pending_prompt`（或反之）⇒ 本用例红。
+    #[test]
+    fn test_apply_outbound_session_list_nonempty_sets_both_fields() {
+        let mut a = app();
+        let items = vec![summary("a", "会话 A"), summary("b", "会话 B")];
+        a.apply_outbound(Outbound::SessionList(items.clone()));
+
+        assert_eq!(
+            a.pending_sessions.as_deref(),
+            Some(items.as_slice()),
+            "候选会话已设"
+        );
+        assert_eq!(
+            a.pending_prompt,
+            Some(PromptKind::PickSession),
+            "由 pending_prompt 驱动浮层"
+        );
+    }
+
+    /// **I4**：空列表 ⇒ 只往 transcript 推一条提示，**不**设候选、**不**开浮层。
+    ///
+    /// 变异：把空列表也走非空分支（设 `pending_prompt`）⇒ 本用例的 `pending_prompt`
+    /// 断言红；把提示去掉 ⇒ transcript 断言红。
+    #[test]
+    fn test_apply_outbound_empty_session_list_hints_without_modal() {
+        let mut a = app();
+        a.apply_outbound(Outbound::SessionList(vec![]));
+
+        assert!(a.pending_sessions.is_none(), "空列表不设候选");
+        assert!(a.pending_prompt.is_none(), "空列表不弹浮层（I4）");
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s.contains("没有可恢复的会话")),
+            "空列表要给一句提示：{:?}",
+            a.transcript
+        );
+    }
+
+    /// **P2-7**：同一轮 drain 内先到**非空** `SessionList`、再到**空**的一条 ⇒ 旧候选必须
+    /// 被清掉（两字段归 `None`），只留提示 —— 否则主循环会弹出过期列表。
+    ///
+    /// 变异：删掉空分支里的 `pending_sessions = None` / `pending_prompt = None` ⇒ 本用例红
+    /// （旧候选仍在，`pending_prompt` 仍指 `PickSession`）。
+    #[test]
+    fn test_empty_session_list_after_nonempty_clears_stale_candidates() {
+        let mut a = app();
+        a.apply_outbound(Outbound::SessionList(vec![summary("a", "会话 A")]));
+        assert!(a.pending_sessions.is_some(), "前置：非空列表已设候选");
+        assert_eq!(a.pending_prompt, Some(PromptKind::PickSession));
+
+        a.apply_outbound(Outbound::SessionList(vec![]));
+
+        assert!(
+            a.pending_sessions.is_none(),
+            "随后的空列表必须清掉旧候选：{:?}",
+            a.pending_sessions
+        );
+        assert!(a.pending_prompt.is_none(), "也不得留下降层指令");
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s.contains("没有可恢复的会话")),
+            "仍要给一句提示：{:?}",
+            a.transcript
+        );
+    }
+
+    /// `SessionResumed` ⇒ 清屏 + 回放目标历史、`thinking_visible` 跟随载荷、贴底。
+    ///
+    /// 变异：① 不调 `reset_for_replay()` ⇒ 旧行残留，「清屏」断言红（旧 Q 行还在）；
+    /// ② 不设 `thinking_visible` ⇒ 跟随断言红；③ 不设 `follow` ⇒ 贴底断言红。
+    #[test]
+    fn test_apply_outbound_session_resumed_replays_and_follows_thinking() {
+        let mut a = app();
+        a.transcript.push(TranscriptLine::User("旧的 Q".into()));
+        a.follow = false;
+        assert!(!a.thinking_visible, "前置：UI 真值为隐藏");
+
+        let history = vec![user_message("hi"), assistant_message("hello")];
+        a.apply_outbound(Outbound::SessionResumed {
+            summary: summary("target", "目标会话"),
+            thinking_visible: true,
+            history: history.clone(),
+        });
+
+        assert_eq!(
+            a.transcript,
+            replay_lines(&history),
+            "transcript 必须变成回放内容"
+        );
+        assert!(
+            !a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::User(s) if s == "旧的 Q")),
+            "回放前必须清屏（旧会话的行不得残留）：{:?}",
+            a.transcript
+        );
+        assert!(a.thinking_visible, "thinking 跟随目标会话的 meta（有意破例）");
+        assert!(a.follow, "回放后回到贴底");
     }
 
     #[test]

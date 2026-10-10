@@ -252,7 +252,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 ## 6. 命令划分：TUI 侧表 vs app 侧能力
 
-**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，11 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，13 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app。二者唯一契约是 `Request` —— 漏实现是**编译错误**
 （app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -277,6 +277,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
 | `/new` | — | `NewSession` |
+| `/resume [id]` | 无参时**浮层列出现有会话**供选择（Esc 取消、空列表只提示）；有参直切 | `ListSessions` / `ResumeSession` |
 | `/compact` | — | `Compact` |
 | `/export [path]` | — | `Export` |
 
@@ -339,7 +340,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D3 | app 循环伪代码把 `boundary_rx` 直接交给 `BasicLoop`（§7） | app 侧在 `select!` 里把 `boundary_rx` 收到的 `Boundary` **push 进每回合新建的 `QueueBoundarySource`** | ① app 循环在回合中已经 `select!` 着 `boundary_rx`，顺手泵进源即可；② 一次性源避免 `Abort` 标记跨回合污染（§4）。另加空闲期排空残留 |
 | D4 | app 循环伪代码在回合末**不排空**事件信道（§7） | 回合结束后 `while let Ok(env) = sink_rx.try_recv()` 排空 | `select!` 分支选择是随机的，可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件还躺在信道里；不排空会晚一整回合转发（`is_turning` 不复位、turn 摘要不显示） |
 | D5 | `CodingView` 字段清单「含 `ToolCallId → ToolCall` 映射，供工具结果回填」（§9 未决） | **视图不含映射**；结果回填靠 **UI 侧** `App` 自己的 `tool_index`（transcript 下标） | 视图只承载「状态行 / `/status`」要显示的东西；回填是渲染关注点，归 UI |
-| D6 | 命令表只有 §6 的 9 条 | 表里有 **12 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）与 **`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4 |
+| D6 | 命令表只有 §6 的 9 条 | 表里有 **13 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）与 **`/resume`**（运行期切换会话落地后补，见 §8.2 M19） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md` |
 | D7 | 初始化顺序编号为 1.信道 2.sink 3.阻塞 Wiring 4.Agent 5.view₀ 6.spawn（§7） | 实际 1+2.channel/sink → **4.Agent** → **3.阻塞 Wiring** → 5.view₀ → 6.spawn | Agent 构建不阻塞、不依赖 Wiring；先建 Agent 后建 Wiring 不破坏 R7 的承重结论（**阻塞早退发生在 spawn 之前**，`begin_turn` 只在 agent 真跑时发生） |
 | D8 | `ys-protocol` 里的 `Envelope` / `LifecyclePolicy`「迁往 ys-protocol」（review R1 建议） | 已迁；`ys-channel` 整 crate 删除 | 见 `core-channel.md` §8 |
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
@@ -370,6 +371,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M16 | **绘制路径不得 panic**：`push_non_assistant` 的 `Assistant` 分支从 `unreachable!()` 改为**降级为 raw** + `debug_assert!(false, …)`（测试期大声、生产期降级）—— 绘制 panic 会把终端留在 raw mode（§14.7）。该分支正常不可达（两个调用点都提前分流 Assistant） | `ys-tui-coding/src/draw.rs` |
 | M17 | **turn 中 Ctrl+C 两段式**（ADR-0031）：第一次投 `Boundary::Abort` + 写一行 transcript 回执「再按一次 Ctrl-C 退出」；第二次 `should_quit = true`（与 Ctrl-D 同一条退出路径）。标记 `App.abort_requested` **随回合生命周期复位**（进 turn 的三处 + `finish_turn`），否则上一回合按过的 Ctrl-C 会让下一回合的第一次直接退出 | `ys-tui-coding/src/{events,app}.rs` |
 | M18 | **退出后打 `session: <id>`**（ADR-0032）：TUI 退出（alt-screen 已恢复、transcript 已回放）后由 `main` 往 **stderr** 写一行 `session: <id>`，与 `-p` / `--json` 同文案同去处；只在**已落盘**时打（惰性新会话没跑过回合就没有文件）。会话号取自 `app_loop::SessionPathHandle` —— 启动态由 `run_interactive` 从 `Wiring` 播种、`/new` 后由 app 循环刷新，**不等 app 线程收摊**（长回合中途退出时正卡在模型调用里，等就取不到） | `apps/coding-agent/src/{main,app_loop}.rs` |
+| M19 | **`/resume` 运行期切换会话**（ADR-0033，取代 ADR-0026 决策 6）：无参 → 浮层（候选挂 `App.pending_sessions`，由 `resolve_session_pick` 决策、标签含**完整 id** 以供反解、Esc 取消、空列表只提示不弹浮层）；有参 → 直切。app 侧 `resume_session` **可失败步全部前置**（解析 → 读 meta → 纯解析模型四字段 → 构建候选 model），`wiring.resume_into` **open 成功才替换**句柄（失败 ⇒ 当前会话全不变）。UI 侧回放经 `Outbound::SessionResumed` → `reset_for_replay()` + `replay_lines()`，**必须显式 `RenderCache::reset()`**（回放是本 app **第一个**清屏/缩短 transcript 的操作）。启动期 `--resume` 复用同一通路、顺带修掉空屏（出站顺序 `SessionResumed` 先于启动提示）。**`-p` / `--json` 不受影响**（不收 `Outbound`） | `ys-protocol/src/{session,request,lib}.rs`；`ys-tui-coding/src/{cache,transcript,commands,prompter,app,run,lib}.rs`；`apps/coding-agent/src/{wiring,capabilities,main,app_loop,sessions}.rs`；`apps/coding-agent/tests/resume_cli.rs`；见 `docs/design-final/runtime-resume.md` |
 
 ---
 

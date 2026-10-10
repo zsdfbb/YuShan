@@ -14,24 +14,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ys_core::{ContentBlock, Message, Role};
+use ys_protocol::SessionSummary;
 use ys_session::SessionMeta;
 
 /// 只读首行的字节上限。meta 行由 `derive_stored_title` 保证有界，恒落在此内。
 const FIRST_LINE_CAP: u64 = 4096;
 
-/// 无 meta / 无标题时的占位显示标题。
-const DEFAULT_TITLE: &str = "新会话";
-
-/// 列表项：一个 `*.jsonl` 会话文件的只读摘要。
-pub struct Listing {
-    /// 文件 stem（即 [`resolve`] 接受的 id）。
-    pub id: String,
-    pub path: PathBuf,
-    /// 最后修改时间（全量重写 ⇒ ≈「最近活动」）。
-    pub mtime: SystemTime,
-    /// `meta.title` 折叠截断后的显示标题；缺省 [`DEFAULT_TITLE`]。
-    pub title: String,
-}
+/// 无 meta / 无标题时的占位显示标题。**缺省标题的唯一定义** ——
+/// `capabilities::session_summary` 复用本条，二者不得漂移。
+pub(crate) const DEFAULT_TITLE: &str = "新会话";
 
 /// 读文件首行：字节级 + 换行切分 + [`FIRST_LINE_CAP`] 封顶，最后才解码。
 ///
@@ -52,12 +43,13 @@ pub fn read_meta(path: &Path) -> Option<SessionMeta> {
 /// 列出目录下的会话文件，按 mtime **倒序**（最近活动在前）。
 ///
 /// 目录不存在 ⇒ 空；`*.jsonl` 之外（含 `.jsonl.tmp` 残留）跳过；首行读不出的
-/// 文件跳过；无 meta 的文件标题为 [`DEFAULT_TITLE`]。
-pub fn list(dir: &Path) -> Vec<Listing> {
+/// 文件跳过；无 meta 的文件标题为 [`DEFAULT_TITLE`]。`title` 取自 `meta.title`
+/// 折叠截断后的显示形态，其余字段一一对应条目本身。
+pub fn list(dir: &Path) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<Listing> = Vec::new();
+    let mut out: Vec<SessionSummary> = Vec::new();
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         // `path.extension()` 对 `x.jsonl.tmp` 是 `tmp` ⇒ 残留天然被跳过。
@@ -86,7 +78,7 @@ pub fn list(dir: &Path) -> Vec<Listing> {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        out.push(Listing {
+        out.push(SessionSummary {
             id,
             path,
             mtime,
@@ -115,7 +107,7 @@ pub fn resolve(dir: &Path, id_or_path: &str) -> Result<PathBuf, String> {
 ///
 /// 列表与提示一律写 **stderr**（stdout 属数据流，不得污染）；非 TTY ⇒ 打印列表
 /// 后 `Err`（调用方提示改用 `--resume=<id>`）。
-pub fn pick(entries: &[Listing]) -> Result<PathBuf, String> {
+pub fn pick(entries: &[SessionSummary]) -> Result<PathBuf, String> {
     let stdin = std::io::stdin();
     let stdin_is_tty = stdin.is_terminal();
     let mut input = stdin.lock();
@@ -130,7 +122,7 @@ pub fn pick(entries: &[Listing]) -> Result<PathBuf, String> {
 /// 这样测试能断言列表确实落在同一个写者上 —— 否则把 `writeln!` 换成 `println!`
 /// （泄漏到 stdout、污染 `-p`/`--json` 的数据流）也不会有人察觉（T4/C8）。
 fn pick_with(
-    entries: &[Listing],
+    entries: &[SessionSummary],
     stdin_is_tty: bool,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
@@ -323,6 +315,35 @@ mod tests {
 
         let ids: Vec<String> = list(&dir).into_iter().map(|e| e.id).collect();
         assert_eq!(ids, vec!["ok"], "只有真实可读的 .jsonl 入选");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// T4：`list` 的契约锚定在 [`SessionSummary`] 上 —— 同一目录里混放真实
+    /// `.jsonl`、`.jsonl.tmp` 残留、不可读链接与超封顶首行时，只有前者入选；
+    /// 且返回类型**具名**为 `Vec<SessionSummary>`（类型一旦漂移即编译失败）。
+    ///
+    /// 变异：`list` 放宽扩展名过滤（收 `.jsonl.tmp`）或去掉封顶 ⇒ 本用例变红。
+    #[test]
+    fn list_contract_pinned_to_session_summary() {
+        let dir = temp_dir("list_contract");
+        write_with_mtime(
+            &dir.join("keep.jsonl"),
+            &meta_line("保留"),
+            SystemTime::now(),
+        );
+        fs::write(dir.join("residue.jsonl.tmp"), "junk").unwrap();
+        // 首行 4 KiB 以上且无换行 ⇒ 读不出 ⇒ 跳过（封顶语义）。
+        fs::write(dir.join("over_cap.jsonl"), "中".repeat(2000).as_bytes()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/nonexistent/yushan-probe", dir.join("broken.jsonl")).unwrap();
+
+        let entries: Vec<SessionSummary> = list(&dir);
+        assert_eq!(entries.len(), 1, "只留真实可读的 .jsonl");
+        let only = &entries[0];
+        assert_eq!(only.id, "keep");
+        assert_eq!(only.path, dir.join("keep.jsonl"));
+        assert_eq!(only.title, "保留");
 
         let _ = fs::remove_dir_all(&dir);
     }

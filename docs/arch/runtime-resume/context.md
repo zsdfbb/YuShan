@@ -70,7 +70,7 @@ UI(ys-tui-coding)                     app 线程（apps/coding-agent）
   ← Outbound::Output / View      ◄──③──  out_tx
 ```
 
-- 命令的**用户可见行为**：`crates/ys-tui-coding/src/commands.rs`（静态表 `COMMANDS` `:45`，12 条；`CommandSpec` `:32`）
+- 命令的**用户可见行为**：`crates/ys-tui-coding/src/commands.rs`（静态表 `COMMANDS` `:45`，本文件成稿时 12 条；**`/resume` 落地后为 13 条**；`CommandSpec` `:32`）
 - 命令的**能力实现**：`apps/coding-agent/src/capabilities.rs`
 - 唯一契约：`ys_protocol::Request`（8 变体，`crates/ys-protocol/src/request.rs:14-47`）与 `Outbound<V>`（4 变体，`request.rs:55-64`）
 - **app 侧 `match` 穷尽** ⇒ 加变体漏实现是编译错误（这是设计上的优点，也是本需求的改动成本）
@@ -149,8 +149,8 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
 4. **app 侧 `match` 穷尽**：新增 `Request` 变体必须同时改 `app_loop.rs` 的分发（漏改是编译错误，好事）。新增 `Outbound` 变体则只需改 `ys-tui-coding::App::apply_outbound` —— **`-p` / `--json` 不经 `Outbound`**（它们直接消费 `Receiver<Envelope>`，`main.rs:802 / :838 / :878`）。
 5. **`Wiring::new_session` 的失败原子性必须保持**：**先 `open` 成功后才替换句柄**（`wiring.rs:114-129`）。运行期切换同理 —— 目标不存在/不可读/JSONL 损坏时**必须保持当前会话不变**，不得留下「半个切换」。
 6. **模型重建路径已存在但**：启动期那条优先级链目前**内联在 `main.rs:1104-1152`**，不是可复用函数。运行期要「跟随 meta」就得把它**抽成共用函数**（否则两处语义会漂移）。
-7. **`RunLimits` / `context_window` 构建期冻结**（`run_limits` 在 `build_agent` 一次构造）：跨 provider/模型切换后**窗口不跟随**（与 `per-turn-model-switch` 的 ⑦ / E3 同源问题）。切换目标是**不同窗口的模型**时会算错压缩阈值。
-8. **`ProviderCompat` 随 `config.provider`**：跟随 meta 换 provider 时 compat 必须一起换，否则 reasoning / tool-call 格式处理错。
+7. **`RunLimits` / `context_window` 构建期冻结**（`run_limits` 在 `build_agent` 一次构造）：跨 provider/模型切换后**窗口不跟随**（与 `per-turn-model-switch` 的 ⑦ / E3 同源问题）。切换目标是**不同窗口的模型**时会算错压缩阈值。⇒ **已被既有机制化解**：`app_loop` 每回合开头调 `set_context_window(config.context_window())`（**唯一调用点**，测试 `context_window_is_recomputed_after_model_switch` 钉住）—— 窗口下回合自动跟随 `config.model`，无需本需求另做。
+8. **`ProviderCompat` 随 `config.provider`**：跟随 meta 换 provider 时 compat 必须一起换，否则 reasoning / tool-call 格式处理错。⇒ **已被既有机制化解**：`compat` 随 `config.provider` 经 `build_model()` 重建 —— 只要切换时改 `config.provider`，compat 下回合自动跟随。
 9. **`Outbound` 是单一出站写者**：事件、`Output`、`View` 共用一条信道（容量 1024，`main.rs:235-239`），顺序即用户所见顺序。插入回放数据时**顺序语义要明确**（回放必须先于后续事件）。
 10. **回合进行中 app 线程阻塞在 `agent.run_turn()`**，不可能 `recv` 信道① —— 这正是 D4「排队」天然成立的原因，**不需要** busy 状态位；但反过来也意味着**切换期间 UI 无从知道「已受理、待生效」**（见 Q8）。
 
@@ -172,6 +172,7 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
 18. 测试隔离硬约定：临时目录名含**进程内原子序号 + `process::id()`**；进程级 env 改写走 `crate::test_env::env_lock()` + `EnvRestore`。
 19. **关键逻辑必须做变异测试**（本项目多个真 bug 是「测试全绿时依然存在」）—— 切换的失败原子性、回放正确性都属此列。
 20. **文档口径已有既存偏差**：`docs/architecture.md:706` 写「11 条 `CommandSpec`」，代码实际 **12 条**（`commands.rs:45`，`/skills` 未同步）。`/resume` 落地后建议一并校正。
+    > **已处置（T14）**：`architecture.md` §14 已改为 **13 条**并补上原先整表缺失的 `/skills` 与新增的 `/resume [id]`；本节偏差关闭。
 
 ---
 
@@ -257,3 +258,4 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
   - 长历史一次性回放的渲染/滚动体感（约束 12）。
 - **实现期须补的测试**（对应 `docs/design.md` §12）：切换失败保持原状（变异测试：把「先 open 成功后替换」改成先替换）、Esc 无副作用、meta 无凭证降级、切换后退出打新 id。
 - **文档需同步校正**：`docs/architecture.md:706`（11 条 → 12/13 条）、§14 命令表加 `/resume`、`docs/architecture.md:593` 关于 `/new` 换 `session`/`model` 两字段的表述（as-built 实际只换 session + session_path，见 `wiring.rs:114-129`）。
+  > **已处置（T14）**：§14 命令表已改 13 条并补 `/skills` + `/resume [id]`，§12 补了运行期 `/resume` 一段；`architecture.md:593` 的 `/new` 两字段表述**未改**（不在 T14 范围内，仍待订正）。

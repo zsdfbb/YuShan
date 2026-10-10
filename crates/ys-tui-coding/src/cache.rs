@@ -8,6 +8,15 @@
 //! **必须含 width** —— 库输出对表格依赖宽度（resize 后必须重算）。
 //! 「长度相等即内容相同」的前提：transcript **只增不减**、Assistant 只经**尾部 `push_str`**
 //! 增长（无编辑历史）；用 `debug_assert!` 钉住这条前提。
+//!
+//! **回放是第一个打破「只增不减」的操作**：`/resume` 会用目标会话的历史**替换**（而非追加）
+//! transcript，调用方**必须在回放前显式 [`RenderCache::reset`]**。
+//! `/new` **不触**重置（它只换 session 句柄、不清 transcript）；`/resume` **触**。
+//!
+//! ⚠️ **不能指望 `sync_len` 自动兜住**：[`RenderCache::sync_len`] 的「缩短」分支只在长度
+//! **变小**时走到。若调用方先 clear、再立刻 extend 到**相同长度**，长度看起来没变，会走
+//! 「增长」分支而**绕过**缩短 ⇒ 等长内容假命中（旧槽位的 `len`/`width` 与新内容恰好相同即
+//! 直接复用旧产物）。故必须显式 `reset()`。
 
 use std::time::{Duration, Instant};
 
@@ -71,6 +80,19 @@ impl RenderCache {
                 self.streaming = None;
             }
         }
+    }
+
+    /// 清空全部槽位 —— **回放（`/resume`）专用**：transcript 将被整体替换，任何按「槽下标」
+    /// 记忆的产物都已失效（见模块头的不变量与等长碰撞陷阱）。
+    ///
+    /// `streaming` 一并归零，避免它继续指向已被丢弃的槽位。`scratch` **不清**：它只服务超长
+    /// 单条的退化路径，每次退化渲染都**整体覆写**它，且不参与任何命中判定 —— 留着既不污染
+    /// 输出、也不会造成误命中。
+    ///
+    /// 消费方是 app 侧的 `reset_for_replay`（`/resume`）。
+    pub fn reset(&mut self) {
+        self.slots.clear();
+        self.streaming = None;
     }
 
     /// 显式标记某槽位「该条结束」：下次取用忽略节流、必算。
@@ -304,6 +326,39 @@ mod tests {
         assert_eq!(md::render_calls(), 2);
     }
 
+    /// **N6（最易假绿）**：回放用等长内容**替换** transcript 时，不得复用旧槽位的产物。
+    ///
+    /// 构造两条**字节长度相同、width 也相同**的 assistant 文本（`"AAAA"` / `"BBBB"`）：
+    /// 键 = `(槽下标, src.len(), width)` 三者全同，若不清槽位就会命中 A 的产物。
+    /// 又因 `reset()` 后立刻渲染到**相同长度**，`sync_len` 的「缩短」分支不会走到（长度没变小）
+    /// —— 这正是「不能指望 `sync_len` 自动兜住、必须显式 `reset()`」的原因。
+    ///
+    /// **变异自检**：把 `reset()` 里的 `self.slots.clear();` 注释掉 ⇒ 本用例必须**红**
+    /// （`lines_for` 得到 `"AAAA"`；且渲染调用数停在 1）。
+    #[test]
+    fn n6_reset_prevents_equal_length_collision() {
+        md::reset_render_calls();
+        let mut cache = RenderCache::default();
+        cache.sync_len(1);
+        let base = Instant::now();
+
+        let a = cache.lines_for(0, "AAAA", 60, AssistantStyles, base).to_vec();
+        assert_eq!(flat_all(&a), "AAAA", "先填充 A 的产物");
+        assert_eq!(md::render_calls(), 1);
+
+        // 回放：清屏后立刻 extend 到**相同长度** —— 长度没变，键看起来「没变」。
+        cache.reset();
+        let b = cache.lines_for(0, "BBBB", 60, AssistantStyles, base).to_vec();
+
+        assert_eq!(flat_all(&b), "BBBB", "回放后必须重渲染，不得复用等长旧产物");
+        assert!(
+            !flat_all(&b).contains("AAAA"),
+            "屏上不得残留 A 的文本：{:?}",
+            flat_all(&b)
+        );
+        assert_eq!(md::render_calls(), 2, "reset 后即便同键也必须重算");
+    }
+
     /// 单条 > 256 KiB 不入缓存：同键同刻也每次重算，且**槽位保持为空**（真的没进缓存）。
     #[test]
     fn oversized_src_is_not_cached() {
@@ -345,5 +400,58 @@ mod tests {
             1000,
             "结束时必须完整渲染到最后一段增量（否则尾部增量永久不显示）"
         );
+    }
+
+    /// **N13 首帧基准（`#[ignore]`）**：量 `/resume` **新增**的那笔成本 —— `reset()` 之后
+    /// **首帧**把整段历史全部重渲染一遍（每条 assistant 重解析 markdown）。先渲染一轮把槽位
+    /// 占上再 `reset()`，复刻「已有旧会话 → 回放替换」的真实产品路径（空 cache 上 `reset()`
+    /// 是 no-op，量不到等长碰撞面）。
+    ///
+    /// 只量首帧，**不**量稳态每帧的 `line_count` —— 后者是任何长会话今天就在付的既有成本，
+    /// 与本改动无关（设计 I7）。断言不做硬失败，仅 `eprintln!` 出耗时供人读；100 ms 是给人看的
+    /// 参照阈值（设计 I7）。
+    ///
+    /// 之所以是本模块内的**内联**单测而非 `tests/replay_bench.rs`：`RenderCache` 是
+    /// `pub(crate)`，集成测试文件访问不到。
+    ///
+    /// 运行：`cargo test -p ys-tui-coding --release n13_first_frame_baseline -- --ignored --nocapture`
+    #[test]
+    #[ignore = "基准，需 --release --ignored --nocapture 手动读耗时"]
+    fn n13_first_frame_baseline() {
+        const N: usize = 500;
+        // 每条约 2 KiB 的 assistant 正文（含标题/列表/代码块，尽量贴近真实 markdown 结构）。
+        let para = "这是一段用于基准测试的正文，包含中英文混排与 `inline code` 片段。\n\n";
+        let docs: Vec<String> = (0..N)
+            .map(|i| {
+                let mut s = format!("# 条目 {i}\n\n");
+                while s.len() < 2000 {
+                    s.push_str(para);
+                }
+                s.push_str("```rust\nfn main() { println!(\"hi\"); }\n```\n");
+                s
+            })
+            .collect();
+        let total_bytes: usize = docs.iter().map(|s| s.len()).sum();
+
+        // 复刻 `/resume` 的**真实**失效路径：先有一屏旧产物（槽位已填），再 `reset()` 整体
+        // 失效，然后量重渲首帧。空 cache 上 `reset()` 是 no-op，量不到「等长旧槽位」这一
+        // 真正会走的碰撞面（cache.rs 模块头 / I6）。
+        let mut cache = RenderCache::default();
+        let warm = Instant::now();
+        for (i, src) in docs.iter().enumerate() {
+            let _ = cache.lines_for(i, src, 80, AssistantStyles, warm);
+        }
+        cache.reset();
+
+        let start = Instant::now();
+        for (i, src) in docs.iter().enumerate() {
+            let _ = cache.lines_for(i, src, 80, AssistantStyles, start);
+        }
+        let elapsed = start.elapsed();
+
+        eprintln!(
+            "N13 首帧基准：{N} 条 × ~2 KiB（共 {total_bytes} 字节），reset() 后首帧全量渲染耗时 = {elapsed:?}（参照阈值 100 ms）"
+        );
+        assert_eq!(docs.len(), N, "基准规模自检（不参与性能断言）");
     }
 }

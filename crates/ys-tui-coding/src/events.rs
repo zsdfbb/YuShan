@@ -1,7 +1,8 @@
 //! crossterm 事件 → [`App`] 状态迁移 + 对 app 线程的请求（`Request` / `Boundary`）。
 //!
 //! 键位集：**Enter 提交或填入补全 / Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 /
-//! Esc 取消或清空输入 / 上下翻页滚动 / 左右与 Home·Delete 归输入光标 / Tab 开补全浮层**。
+//! Esc 取消或清空输入 / 上下翻页滚动 / 左右与 Home·Delete 归输入光标
+//! （`Ctrl`·`⌥` + 左右 = 按词移动）/ Ctrl-A·Ctrl-E 输入行首·行尾 / Tab 开补全浮层**。
 //!
 //! # 命令分发（T10）
 //!
@@ -22,13 +23,20 @@
 //! |---|---|
 //! | `Up` / `Down` / `PageUp` / `PageDown` | **聊天滚动**（`App::scroll_offset`） |
 //! | `Left` / `Right` / `Delete` / `Home` | **输入光标**（`InputBuffer`） |
+//! | `Ctrl`·`⌥` + `Left` / `Right`（或 `⌥b` / `⌥f`） | **输入按词移动** |
+//! | `Ctrl-A` / `Ctrl-E` | **输入行首 / 行尾** |
 //! | `End` | **回到最新消息**（`scroll_offset = 0`、`follow = true`） |
 //!
 //! 即：竖直方向 = 聊天，水平方向 = 输入。`Home`/`End` 这一对**不做对称绑定** ——
 //! `End` 早在 T5 就钉住了「跳回聊天底部」的语义（有测试），`Home` 之前空着，
 //! 于是给输入行首。理由：聊天滚动已有 4 个键（且退回底部是高频操作），而输入
-//! 行首此前**无键可用**（`Home` 是唯一自然的候选）。若日后要让输入也拥有
-//! 「行尾/缓冲末尾」，优先候选是 `Ctrl-E`（不占用 `End`），而不是改 `End` 的语义。
+//! 行首此前**无键可用**（`Home` 是唯一自然的候选）。输入的「行尾」因此**不占 `End`**：
+//! 走 `Ctrl-E`，行首走 `Ctrl-A` —— 成对且是 readline 约定。
+//!
+//! **`⌘` 组合到不了应用**：终端自己消费 `⌘`，从不把它交给程序，所以 ⌘←/⌘→ 只能靠
+//! 终端把它们映射成别的字节。Terminal.app 与 iTerm2 的出厂映射恰好是 `Ctrl-A` /
+//! `Ctrl-E` —— 绑这两个即等价于「⌘ + 左右」可用。按词移动另给 `Ctrl`/`⌥` + 左右
+//! 与 `⌥b`/`⌥f`（后者是 Terminal.app 映射 ⌥← 的形态）。
 //!
 //! **补全浮层打开时上下归浮层**（设计 §2.4）—— 焦点在浮层上，聊天滚动让位。
 
@@ -116,6 +124,18 @@ pub fn handle_key(
                 app.should_quit = true;
                 return;
             }
+            // 行首 / 行尾（readline 约定）。macOS 上 ⌘←/⌘→ **默认就发这两个控制
+            // 字符**（Terminal.app / iTerm2 的出厂键映射），而 ⌘ 本身从不交给应用
+            // —— 绑这里等价于让「⌘ + 左右」可用。`End` 不动（它归「回到最新消息」，
+            // 见模块文档的取舍表）。
+            KeyCode::Char('a') => {
+                app.input.cursor_home();
+                return;
+            }
+            KeyCode::Char('e') => {
+                app.input.cursor_end();
+                return;
+            }
             _ => {}
         }
     }
@@ -133,7 +153,12 @@ pub fn handle_key(
         KeyCode::Enter => submit(app, requests, boundaries),
         KeyCode::Backspace => app.input.backspace(),
         KeyCode::Delete => app.input.delete_forward(),
-        // 左右归**输入光标**（上下归聊天滚动 —— 见模块文档的取舍表）
+        // 左右归**输入光标**（上下归聊天滚动 —— 见模块文档的取舍表）。
+        // 带 Ctrl / Alt 时**按词**移动：macOS 的 ⌥←/⌥→ 与多数终端的 Ctrl+←/Ctrl+→
+        // 都落到这一支（终端各自发 `ESC[1;5D` 或 `ESC b` 这类序列，crossterm 解出
+        // 的就是 Left/Right + 修饰键）。终端的键映射若把 ⌘← 发成别的，见 Ctrl-A/E。
+        KeyCode::Left if ctrl || alt => app.input.cursor_word_left(),
+        KeyCode::Right if ctrl || alt => app.input.cursor_word_right(),
         KeyCode::Left => app.input.cursor_left(),
         KeyCode::Right => app.input.cursor_right(),
         // Home 之前未绑定：给输入**行首**（End 保留给「回到最新消息」）
@@ -153,6 +178,10 @@ pub fn handle_key(
                 app.completion = Some(state);
             }
         }
+        // ⌥b / ⌥f：readline 的词移动别名。macOS Terminal.app 若把 ⌥← 映射成
+        // `ESC b`，到这里就是 `Char('b') + ALT` —— 与上面的 `Left + ALT` 同源但不同形。
+        KeyCode::Char('b') if alt => app.input.cursor_word_left(),
+        KeyCode::Char('f') if alt => app.input.cursor_word_right(),
         // 字符输入（Ctrl-* 已在上面 return）
         KeyCode::Char(c) if !ctrl => app.input.insert_char(c),
         _ => {}
@@ -691,6 +720,100 @@ mod tests {
             40,
         );
         assert_eq!(a.input.cursor, a.input.text.chars().count());
+    }
+
+    /// Ctrl/⌥ + 左右 = **按词**移动；Ctrl-A / Ctrl-E = 输入行首 / 行尾。
+    ///
+    /// **变异**：把 `Left`/`Right` 的 `if ctrl || alt` 守卫删掉（回到只看键码）
+    /// ⇒ 下面的按词断言全变红（光标只在原地动一个 char）。
+    #[test]
+    fn test_word_and_line_motion_keys() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("foo bar");
+        assert_eq!(a.input.cursor, 7, "insert_str 后光标在末尾");
+
+        // 按词左移的三个来源：⌥← / Ctrl+← / ⌥b（Terminal.app 把 ⌥← 发成 `ESC b`）。
+        // 每个来源都从同一位置起步 —— 「按词移动」不幂等（已在词首时会走到上一个词）。
+        for key in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        ] {
+            a.input.cursor = 7;
+            handle_key(key, &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+            assert_eq!(a.input.cursor, 4, "按词左移：越过 bar，停在空格之后");
+        }
+        // 按词右移：⌥→ / Ctrl+→ / ⌥f
+        for key in [
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            a.input.cursor = 4;
+            handle_key(key, &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+            assert_eq!(a.input.cursor, 7, "按词右移：越过 bar 到行尾");
+        }
+
+        // Ctrl-E / Ctrl-A：行尾 / 行首 —— macOS 的 ⌘→ / ⌘← 出厂就发这两个控制字符
+        a.input.cursor = 2;
+        handle_key(
+            with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.cursor, 7, "Ctrl-E 到行尾");
+        handle_key(
+            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.cursor, 0, "Ctrl-A 到行首");
+        assert_eq!(a.input.text, "foo bar", "移动不修改文本");
+
+        // `End` 的语义**不变**（回到最新消息）—— 行尾走 Ctrl-E，不抢 `End`
+        a.follow = false;
+        a.scroll_offset = 5;
+        handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.scroll_offset, 0, "End 仍回聊天底部");
+        assert!(a.follow);
+        assert_eq!(a.input.cursor, 0, "End 不动输入光标");
+    }
+
+    /// 多行输入下 Ctrl-A / Ctrl-E 只到**本行**首尾（与 `cursor_home`/`cursor_end` 同语义，
+    /// 不是缓冲首尾）。
+    #[test]
+    fn test_ctrl_a_e_are_line_scoped_in_multiline_input() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("aa\nbbbb\ncc");
+        a.input.cursor = 9; // 第三行「cc」的第二个字符之后
+
+        handle_key(
+            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.cursor, 8, "Ctrl-A 到本行行首，不是缓冲开头");
+
+        handle_key(
+            with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.cursor, 10, "Ctrl-E 到本行行尾（末行即缓冲末尾）");
     }
 
     /// `Delete` 删光标**后**一个 char。

@@ -59,10 +59,10 @@ use std::time::Duration;
 
 use ys_core::Usage;
 use ys_event::NoopEventSink;
-use ys_loop::token::estimate_text_tokens;
 use ys_loop::AgentInput;
+use ys_loop::token::estimate_text_tokens;
 use ys_model_openai_compat::{
-    compat::ProviderCompat, OpenAICompatibleConfig, OpenAICompatibleModel,
+    OpenAICompatibleConfig, OpenAICompatibleModel, compat::ProviderCompat,
 };
 use ys_runtime::{AgentBuilder, AgentPorts};
 use ys_session::MemorySession;

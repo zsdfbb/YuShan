@@ -638,7 +638,8 @@ mod tests {
 
         let specs = vec![spec("read"), spec("bash")];
         let bare = build_system_prompt(&dir, &specs, &no_skills());
-        let with_skills = build_system_prompt(&dir, &specs, &one_skill("git-status", "查看仓库状态"));
+        let with_skills =
+            build_system_prompt(&dir, &specs, &one_skill("git-status", "查看仓库状态"));
 
         assert!(
             with_skills.starts_with(&bare),
@@ -673,7 +674,8 @@ mod tests {
 
         // 条目逐字来自 `Catalogue.lines`（含 location —— 零工具路线的唯一线索）。
         assert!(
-            prompt.contains("- arch-design: 多方案架构设计 (location: /skills/arch-design/SKILL.md)"),
+            prompt
+                .contains("- arch-design: 多方案架构设计 (location: /skills/arch-design/SKILL.md)"),
             "skill 行应逐字来自 catalogue.lines；prompt = {prompt}"
         );
         assert!(prompt.contains("with the read tool"), "须指出用 read 打开");

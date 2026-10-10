@@ -168,7 +168,12 @@ mod tests {
     fn flat_all(lines: &[Line<'static>]) -> String {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -185,8 +190,9 @@ mod tests {
     fn pure_memo_rerender_is_identical() {
         let mut cache = RenderCache::default();
         let base = Instant::now();
-        let first: Vec<Line<'static>> =
-            cache.lines_for(0, "# T\n\nbody **x**", 60, AssistantStyles, base).to_vec();
+        let first: Vec<Line<'static>> = cache
+            .lines_for(0, "# T\n\nbody **x**", 60, AssistantStyles, base)
+            .to_vec();
         cache.finish(0);
         let second: Vec<Line<'static>> = cache
             .lines_for(0, "# T\n\nbody **x**", 60, AssistantStyles, base)
@@ -202,7 +208,13 @@ mod tests {
         let mut cache = RenderCache::default();
         let base = Instant::now();
         cache.lines_for(0, "hello world", 60, AssistantStyles, base);
-        cache.lines_for(0, "hello world", 60, AssistantStyles, base + Duration::from_millis(50));
+        cache.lines_for(
+            0,
+            "hello world",
+            60,
+            AssistantStyles,
+            base + Duration::from_millis(50),
+        );
         assert_eq!(md::render_calls(), 1, "窗口内应复用、不重算");
     }
 
@@ -219,7 +231,9 @@ mod tests {
         cache.lines_for(0, "aaaa", 60, AssistantStyles, later);
         assert_eq!(md::render_calls(), 1, "长度相同应永久命中");
         // 长度 +1：键变 ⇒ 重算
-        let out = cache.lines_for(0, "aaaaa", 60, AssistantStyles, later).to_vec();
+        let out = cache
+            .lines_for(0, "aaaaa", 60, AssistantStyles, later)
+            .to_vec();
         assert_eq!(md::render_calls(), 2, "长度变化应重算");
         assert_eq!(flat_all(&out), "aaaaa");
     }
@@ -246,8 +260,14 @@ mod tests {
         cache.lines_for(1, "two", 60, AssistantStyles, base);
         assert_eq!(md::render_calls(), 2);
         // 再取回 idx 0/1，窗口内均命中
-        assert_eq!(flat_all(cache.lines_for(0, "one", 60, AssistantStyles, base)), "one");
-        assert_eq!(flat_all(cache.lines_for(1, "two", 60, AssistantStyles, base)), "two");
+        assert_eq!(
+            flat_all(cache.lines_for(0, "one", 60, AssistantStyles, base)),
+            "one"
+        );
+        assert_eq!(
+            flat_all(cache.lines_for(1, "two", 60, AssistantStyles, base)),
+            "two"
+        );
         assert_eq!(md::render_calls(), 2);
     }
 
@@ -262,7 +282,13 @@ mod tests {
         assert_eq!(md::render_calls(), 1);
         // 下一条出现（transcript 增长）→ 上一条结束
         cache.sync_len(2);
-        cache.lines_for(0, "grow", 60, AssistantStyles, base + Duration::from_millis(1));
+        cache.lines_for(
+            0,
+            "grow",
+            60,
+            AssistantStyles,
+            base + Duration::from_millis(1),
+        );
         assert_eq!(md::render_calls(), 2, "上一条结束后必须重算一次");
     }
 
@@ -307,10 +333,7 @@ mod tests {
             cache.lines_for(0, &src, 40, AssistantStyles, now);
         }
         let in_loop = md::render_calls();
-        assert!(
-            in_loop <= 10,
-            "1 秒窗口内渲染次数应 ≤ 10（实际 {in_loop}）"
-        );
+        assert!(in_loop <= 10, "1 秒窗口内渲染次数应 ≤ 10（实际 {in_loop}）");
         // 该条结束（例如紧接着追加下一条 / turn 结算）→ 强制完整渲染
         cache.finish(0);
         let final_now = base + Duration::from_millis(1000);

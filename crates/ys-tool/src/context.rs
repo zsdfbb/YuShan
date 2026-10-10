@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use ys_protocol::BoundarySource;
 
-use crate::summarizer::Summarizer;
 use crate::subagent::SubagentRunner;
+use crate::summarizer::Summarizer;
 
 #[non_exhaustive]
 pub struct ToolContext<'a> {

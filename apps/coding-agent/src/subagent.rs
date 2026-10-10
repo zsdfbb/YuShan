@@ -6,11 +6,11 @@
 //! `is_aborted`。落地裁定见 [ADR-0029](../../../docs/adr/0029-subagent-landing-decisions.md)：
 //! 每回合派发总量上限、`model` 名解析失败 fail-closed、产物目录 sweep + 环境变量覆盖口。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::collections::HashMap;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -22,7 +22,9 @@ use ys_model::Model;
 use ys_protocol::{Boundary, BoundarySource, QueueBoundarySource};
 use ys_runtime::{AgentBuilder, AgentPorts};
 use ys_session::{MemorySession, Session};
-use ys_tool::{SubagentOutcome, SubagentRunner, Tool, ToolContext, ToolError, ToolResult, ToolSpec};
+use ys_tool::{
+    SubagentOutcome, SubagentRunner, Tool, ToolContext, ToolError, ToolResult, ToolSpec,
+};
 use ys_tools_web::WebConfig;
 
 /// 回传摘要的**硬上限**（截断责任在代码，不在提示词）。
@@ -77,8 +79,10 @@ pub struct UsageTotals {
 
 impl UsageTotals {
     pub fn add(&self, u: &Usage) {
-        self.input.fetch_add(u.input_tokens as u64, Ordering::Relaxed);
-        self.output.fetch_add(u.output_tokens as u64, Ordering::Relaxed);
+        self.input
+            .fetch_add(u.input_tokens as u64, Ordering::Relaxed);
+        self.output
+            .fetch_add(u.output_tokens as u64, Ordering::Relaxed);
         self.hit
             .fetch_add(u.prompt_cache_hit_tokens as u64, Ordering::Relaxed);
         self.miss
@@ -142,7 +146,9 @@ impl SubagentsDir {
         let now = std::time::SystemTime::now();
         for e in entries.flatten() {
             let Ok(meta) = e.metadata() else { continue };
-            let Ok(modified) = meta.modified() else { continue };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
             let Ok(age) = now.duration_since(modified) else {
                 continue;
             };
@@ -157,9 +163,7 @@ impl SubagentsDir {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::fs::create_dir_all(&self.path)?;
-        let path = self
-            .path
-            .join(format!("{}_{}.md", std::process::id(), seq));
+        let path = self.path.join(format!("{}_{}.md", std::process::id(), seq));
         std::fs::write(&path, body)?;
         Ok(std::fs::canonicalize(&path).unwrap_or(path))
     }
@@ -213,7 +217,6 @@ impl<'a> AppSubagentRunner<'a> {
             totals,
         }
     }
-
 }
 
 /// 装配期冻结的派发输入：每回合据此造一份 [`AppSubagentRunner`]。
@@ -319,7 +322,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 }
             }
         };
-       let resolved: &dyn Model = match &owned {
+        let resolved: &dyn Model = match &owned {
             Some(m) => &**m,
             None => self
                 .parent_model
@@ -437,14 +440,10 @@ fn transcript_summary(session: &MemorySession, final_message: Option<&ys_core::M
         .map(text_of)
         .filter(|t| !t.trim().is_empty())
         .or_else(|| {
-            session
-                .messages()
-                .iter()
-                .rev()
-                .find_map(|m| {
-                    let t = text_of(m);
-                    (!t.trim().is_empty()).then_some(t)
-                })
+            session.messages().iter().rev().find_map(|m| {
+                let t = text_of(m);
+                (!t.trim().is_empty()).then_some(t)
+            })
         })
         .unwrap_or_default();
     truncate_bytes(&text, MAX_SUMMARY_BYTES)
@@ -588,7 +587,10 @@ mod tests {
         });
         let d = t.drain();
         assert_eq!((d.input_tokens, d.output_tokens), (7, 7));
-        assert_eq!((d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens), (7, 9));
+        assert_eq!(
+            (d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens),
+            (7, 9)
+        );
         assert_eq!(t.drain().input_tokens, 0, "drain 后清零");
     }
 
@@ -638,8 +640,8 @@ mod tests {
 
         let tool = SubagentTool::new(Duration::from_secs(60));
         let runner = FakeRunner(StopReason::Completed);
-        let ctx = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
-            .with_subagent(&runner);
+        let ctx =
+            ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_subagent(&runner);
         let r = tool
             .call(serde_json::json!({"description":"d","prompt":"干活"}), ctx)
             .await
@@ -649,8 +651,8 @@ mod tests {
         assert!(r.content.contains("[full transcript: /tmp/t.md]"));
 
         let runner2 = FakeRunner(StopReason::MaxRounds);
-        let ctx2 = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
-            .with_subagent(&runner2);
+        let ctx2 =
+            ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_subagent(&runner2);
         let r2 = tool
             .call(serde_json::json!({"description":"d","prompt":"干活"}), ctx2)
             .await
@@ -712,10 +714,8 @@ mod tests {
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "yushan_subagent_{}_{seq}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("yushan_subagent_{}_{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
 
@@ -739,7 +739,11 @@ mod tests {
 
         let out = runner.run("查 X", None, None).await.unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
-        assert!(out.summary.contains("子 agent 的结论"), "摘要 = {}", out.summary);
+        assert!(
+            out.summary.contains("子 agent 的结论"),
+            "摘要 = {}",
+            out.summary
+        );
         assert!(
             out.summary.contains("## Files"),
             "runner 必须保证产物节存在（子没报 ⇒ 写 (none)）：{}",
@@ -759,7 +763,10 @@ mod tests {
         );
 
         // fail-closed：指定 model 名 ⇒ Err（不静默回退）。
-        let err = runner.run("x", Some("other-model"), None).await.unwrap_err();
+        let err = runner
+            .run("x", Some("other-model"), None)
+            .await
+            .unwrap_err();
         assert!(err.contains("fail-closed"));
 
         let _ = std::fs::remove_dir_all(&base);
@@ -773,10 +780,8 @@ mod tests {
 
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "yushan_subagent_cap_{}_{seq}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("yushan_subagent_cap_{}_{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
 

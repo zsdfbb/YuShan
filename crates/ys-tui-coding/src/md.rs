@@ -41,10 +41,8 @@ pub(crate) fn render(src: &str, width: usize, styles: AssistantStyles) -> Vec<Li
 
     // `table_width` 是 `u16`；`width` 是 `usize`，做饱和转换。
     let table_width = u16::try_from(width).unwrap_or(u16::MAX);
-    let text = tui_markdown::from_str_with_options(
-        src,
-        &Options::new(styles).table_width(table_width),
-    );
+    let text =
+        tui_markdown::from_str_with_options(src, &Options::new(styles).table_width(table_width));
 
     // `Text` / `Line` / `Span` 都没有 `into_owned`；字段是 pub 的，手写 owned 转换。
     // **务必保留 `Line::style` 与 `Line::alignment`** —— 库会写这两者（对齐、行级样式）。
@@ -252,12 +250,15 @@ fn main() {}
             .add_modifier
             .contains(Modifier::BOLD)));
         let joined = flat_all(&lines);
-        assert!(joined.contains('─') && joined.contains('│'), "应画出表格框线");
         assert!(
-            lines.iter().any(|l| l.spans.iter().any(|s| s
-                .content
-                .starts_with('┌')
-                && s.style.fg == Some(Color::DarkGray))),
+            joined.contains('─') && joined.contains('│'),
+            "应画出表格框线"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                .spans
+                .iter()
+                .any(|s| s.content.starts_with('┌') && s.style.fg == Some(Color::DarkGray))),
             "框线应为暗灰"
         );
     }
@@ -376,10 +377,11 @@ Term
         );
         // 5 heading_meta
         assert!(
-            lines.iter().any(|l| l.spans.iter().any(|s| s
-                .content
-                .contains("{#anchor}")
-                && s.style.fg == Some(Color::DarkGray))),
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(
+                    |s| s.content.contains("{#anchor}") && s.style.fg == Some(Color::DarkGray)
+                )),
             "heading_meta 未触发"
         );
         // 6 metadata_block
@@ -427,7 +429,10 @@ Term
             "definition_term 未触发"
         );
         // 15 definition_description（`: ` 前缀 span 存在）
-        assert!(has_span(&lines, ": ", |_| true), "definition_description 未触发");
+        assert!(
+            has_span(&lines, ": ", |_| true),
+            "definition_description 未触发"
+        );
         // 16/17/18 alert（五种 kind）+ alert_icon（置空 ⇒ 行文本恰为 `> {label}`）+ alert_label
         for (color, label) in [
             (Color::Magenta, "Note"),
@@ -458,10 +463,10 @@ Term
         );
         // 21 table_border
         assert!(
-            lines.iter().any(|l| l.spans.iter().any(|s| s
-                .content
-                .starts_with('┌')
-                && s.style.fg == Some(Color::DarkGray))),
+            lines.iter().any(|l| l
+                .spans
+                .iter()
+                .any(|s| s.content.starts_with('┌') && s.style.fg == Some(Color::DarkGray))),
             "table_border 未触发"
         );
         // 22 list_marker
@@ -540,7 +545,11 @@ Term
     fn n6_non_table_has_no_vertical_border() {
         let src = "# T\n\npara **b**\n\n> q\n\n- a\n\n```\ncode\n```\n";
         for line in r(src, 120) {
-            assert!(!flat(&line).contains('│'), "非表格行不应含 │：{}", flat(&line));
+            assert!(
+                !flat(&line).contains('│'),
+                "非表格行不应含 │：{}",
+                flat(&line)
+            );
         }
     }
 
@@ -623,13 +632,16 @@ Term
             "raw 应严格按 `\\n` 原样切行（含结尾空行）"
         );
         assert!(
-            lines.iter().all(|l| l.style == ratatui::style::Style::default()),
+            lines
+                .iter()
+                .all(|l| l.style == ratatui::style::Style::default()),
             "raw 不应带行级样式"
         );
         assert!(
-            lines
+            lines.iter().all(|l| l
+                .spans
                 .iter()
-                .all(|l| l.spans.iter().all(|s| s.style == ratatui::style::Style::default())),
+                .all(|s| s.style == ratatui::style::Style::default())),
             "raw 不应带 span 样式"
         );
     }

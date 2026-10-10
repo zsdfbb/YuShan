@@ -475,12 +475,7 @@ fn push_transcript_line(
             let mut cache = app.md_cache.borrow_mut();
             cache.sync_len(app.transcript.len());
             let styles = crate::styles::AssistantStyles;
-            out.extend(
-                cache
-                    .lines_for(idx, s, width, styles, now)
-                    .iter()
-                    .cloned(),
-            );
+            out.extend(cache.lines_for(idx, s, width, styles, now).iter().cloned());
         }
         return;
     }
@@ -1238,8 +1233,7 @@ mod tests {
     #[test]
     fn test_plain_lines_cjk_wrap_by_display_width() {
         let mut app = app_with(CodingView::for_test());
-        app.transcript
-            .push(TranscriptLine::User("中".repeat(12)));
+        app.transcript.push(TranscriptLine::User("中".repeat(12)));
         // 每字 2 列；`> ` 前缀 2 列 → 10 列的宽度只能再放 4 个汉字（首行）
         let lines = transcript_plain_lines(&app, 10);
         for l in &lines {
@@ -1265,14 +1259,18 @@ mod tests {
     #[test]
     fn n8_plain_lines_contain_raw_markdown() {
         let mut app = app_with(CodingView::for_test());
-        app.transcript
-            .push(TranscriptLine::Assistant("# 标题\n\n**粗体** 与 `code`".into()));
+        app.transcript.push(TranscriptLine::Assistant(
+            "# 标题\n\n**粗体** 与 `code`".into(),
+        ));
         let lines = transcript_plain_lines(&app, 80);
         let joined = lines.join("\n");
         assert!(joined.contains('#'), "回放应保留原始 `#`：{lines:?}");
         assert!(joined.contains("**"), "回放应保留原始 `**`：{lines:?}");
         assert!(joined.contains("`code`"), "回放应保留反引号码：{lines:?}");
-        assert!(lines.iter().any(|l| l == "# 标题"), "按 \\n 原样成行：{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "# 标题"),
+            "按 \\n 原样成行：{lines:?}"
+        );
     }
 
     /// N4：任意宽度下，**整段** `Paragraph::line_count(w)` 应等于**逐行累计**折行 ——
@@ -1288,7 +1286,8 @@ mod tests {
         for src in sources {
             for w in 1..=80u16 {
                 let mut app = app_with(CodingView::for_test());
-                app.transcript.push(TranscriptLine::Assistant(src.to_string()));
+                app.transcript
+                    .push(TranscriptLine::Assistant(src.to_string()));
                 let text = build_text_with(&app, w as usize, false, Instant::now());
                 let whole = Paragraph::new(text.clone())
                     .wrap(Wrap { trim: false })
@@ -1349,7 +1348,8 @@ mod tests {
         let mut app = app_with(CodingView::for_test());
         // 50 条各占一行的 User 行：总视觉行 = 50，远超可见行
         for i in 0..50 {
-            app.transcript.push(TranscriptLine::User(format!("m{i:02}")));
+            app.transcript
+                .push(TranscriptLine::User(format!("m{i:02}")));
         }
         assert!(app.follow, "默认贴底");
 
@@ -1363,7 +1363,9 @@ mod tests {
         // 滚动上限应与同一 now 下的 line_count 一致
         let now = Instant::now();
         let text = build_text(&app, inner_w as usize, now);
-        let total = Paragraph::new(text).wrap(Wrap { trim: false }).line_count(inner_w);
+        let total = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .line_count(inner_w);
         assert_eq!(
             max_scroll_offset_at(&app, W, H, Instant::now()),
             total.saturating_sub(inner_h),

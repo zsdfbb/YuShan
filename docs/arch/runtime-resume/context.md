@@ -2,6 +2,10 @@
 
 > 产出：`/arch-explore`。用途：为「**coding-agent 运行期间提供 resume 命令，直接切换到指定 session**」界定现状、约束与范围，供后续 `arch-design` 使用。
 > 证据均带 `文件:行号`，对应本工作区状态（`master`，HEAD `3a3bb86`，工作区干净）。
+>
+> **后续**：`/arch-design` 已完成 —— 见 `./design.md`（推荐方案 + 三候选对比）与
+> `docs/adr/0033-runtime-resume-command.md`。本文的 Q1–Q10 在 design.md §4 逐条裁决；
+> 约束 7/8 经核实**在本路径上不成立**（`app_loop.rs:371` 每回合刷新 `context_window`）。
 
 ---
 
@@ -76,7 +80,7 @@ UI(ys-tui-coding)                     app 线程（apps/coding-agent）
 | 抽象 | 位置 | 与本需求的关系 |
 |---|---|---|
 | `enum Request` | `crates/ys-protocol/src/request.rs:14-47` | **无 `Resume`/`LoadSession` 变体**，只有 `NewSession`（`:41`）—— 必须新增 |
-| `enum Outbound<V>` | `request.rs:55-64` | `Event / View / Output / Quit` 四变体。若回放走这里，需新增变体 —— **注意 `-p` / `--json` 的消费循环也 match 它**（`main.rs`） |
+| `enum Outbound<V>` | `request.rs:55-64` | `Event / View / Output / Quit` 四变体。若回放走这里，需新增变体。**`-p` / `--json` 不消费它** —— 那两个模式直接收 `Receiver<Envelope>`（`main.rs:802 / :838 / :878`），故新增 `Outbound` 变体的改动面只有 `ys-tui-coding::App::apply_outbound` 与 `app_loop` 的构造点 |
 | `enum Action` / `PromptKind` | `crates/ys-tui-coding/src/commands.rs:115` / `:151` | `PromptKind` 现有 3 个：`Login \| PickModel \| PickSkill` —— 浮层选择器的既有范式，`PickSession` 照它加 |
 | `CommandSpec` / `COMMANDS[12]` | `commands.rs:32` / `:45` | 表是 `/help`、`/` 补全、`parse` 的**唯一来源**（三处派生）⇒ 加命令只改这一处 |
 | `Wiring { model, session, events, sessions_dir, session_path }` | `apps/coding-agent/src/wiring.rs:34` | **切换 = 换 `session` + `session_path` + 可能的 `model`** |
@@ -142,7 +146,7 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
 1. **依赖方向**：`ys-tui-coding` **不依赖** `ys-runtime`（不认识 `Agent` / `Session`），**编译器强制**。⇒ 会话列表与历史回放的数据**必须经 `CodingView` 或 `Outbound` 过**，UI 侧不得自己扫目录/读 `JsonlSession`。
 2. **`ys-protocol` 零 tokio**（`AGENTS.md` 硬性约束）：若把 `Listing` 搬进协议层，它必须是纯数据（现值 `id/path/mtime/title` 满足；`mtime: SystemTime` 无 tokio 依赖）。
 3. **UI 线程必须无 runtime 上下文**：UI 用 `blocking_send`（`events.rs:274`），在 async 上下文 panic。⇒ 浮层的发起/取消**只能在 UI 事件循环里做**，不能 `rt.spawn` 出个 async 选择器。
-4. **app 侧 `match` 穷尽**：新增 `Request` / `Outbound` 变体必须同时改 `app_loop.rs` 与 `-p` / `--json` 的消费循环 —— 漏改是编译错误（好事），但要一次改齐。
+4. **app 侧 `match` 穷尽**：新增 `Request` 变体必须同时改 `app_loop.rs` 的分发（漏改是编译错误，好事）。新增 `Outbound` 变体则只需改 `ys-tui-coding::App::apply_outbound` —— **`-p` / `--json` 不经 `Outbound`**（它们直接消费 `Receiver<Envelope>`，`main.rs:802 / :838 / :878`）。
 5. **`Wiring::new_session` 的失败原子性必须保持**：**先 `open` 成功后才替换句柄**（`wiring.rs:114-129`）。运行期切换同理 —— 目标不存在/不可读/JSONL 损坏时**必须保持当前会话不变**，不得留下「半个切换」。
 6. **模型重建路径已存在但**：启动期那条优先级链目前**内联在 `main.rs:1104-1152`**，不是可复用函数。运行期要「跟随 meta」就得把它**抽成共用函数**（否则两处语义会漂移）。
 7. **`RunLimits` / `context_window` 构建期冻结**（`run_limits` 在 `build_agent` 一次构造）：跨 provider/模型切换后**窗口不跟随**（与 `per-turn-model-switch` 的 ⑦ / E3 同源问题）。切换目标是**不同窗口的模型**时会算错压缩阈值。
@@ -159,7 +163,7 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
 
 13. **`Listing` 刻意最小**（`:26-34` 只有 id/path/mtime/title，**无消息数/token**）—— 若浮层想显示更多（轮数、token），要先扩数据源与封装（`message_count` 之类的字段默认不读消息体）。
 14. **多进程并发写同一文件无锁**是已知缺口（`session-default-new` 已知缺口）：运行期切换到「另一个进程正在写的会话」有整文件重写丢更新的风险。
-15. **`-p` / `--json` 无运行期概念**（一次性进程）：本命令的范围天然限于 TUI。但**回放通路**若走 `Outbound` 新变体，那两个模式的消费循环也得处理它。
+15. **`-p` / `--json` 无运行期概念**（一次性进程）：本命令的范围天然限于 TUI。它们**不消费 `Outbound`**（直接收 `Receiver<Envelope>`），故回放通路若走 `Outbound` 新变体也**不会**牵动这两个模式。
 
 ### 组织
 
@@ -221,6 +225,8 @@ parse_args(main.rs:161-222) → resolve_resume(main.rs:643-680)
 ---
 
 ## 未澄清问题
+
+> **均已由 `./design.md` §4 裁决**（本节保留为探索时的原始问题清单）。
 
 - [ ] **Q1 列表数据怎么到 TUI？** 三条候选：
       (a) **按需往返** —— TUI 发 `Request::ListSessions` → app 回 `Outbound::SessionList(Vec<Listing>)`，TUI 再开浮层（`Listing` 需搬进 `ys-protocol`）；

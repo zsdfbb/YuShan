@@ -31,6 +31,7 @@ use std::io::Write;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -103,6 +104,10 @@ pub fn run(
     requests: Sender<Request>,
     boundaries: Sender<Boundary>,
 ) -> Result<(), TuiError> {
+    // panic hook 必须在 `setup_terminal` **之前**装好：`enable_raw_mode()` 已把终端切进
+    // raw mode，此后到 `restore_terminal` 之间的任何 panic（含 `setup_terminal` 半途）
+    // 都不会再经过那条正常恢复路径。
+    install_panic_hook();
     let mut terminal = setup_terminal()?;
     let mut app = App::new(view);
 
@@ -457,6 +462,31 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(terminal: &mut T
     let _ = terminal.show_cursor();
 }
 
+/// 终端状态恢复的字节序列：开换行 / 退 alt-screen / 关括号粘贴 / 弹键盘增强。
+///
+/// 抽成自由函数，让**正常退出**（[`exit_payload`]）与**异常退出**（panic hook）共用同一份
+/// 序列 —— 两处若各写一遍，改一处必漏另一处。
+///
+/// **顺序**（与抽取前逐字节一致）：`EnableLineWrap` → `LeaveAlternateScreen` →
+/// `DisableBracketedPaste` → `PopKeyboardEnhancementFlags`。四条命令各改一个**互不相干**的
+/// 终端模式位，除「`LeaveAlternateScreen` 在回放之前」外彼此无先后依赖（回放段的落点靠
+/// `?1049l` 恢复的光标，见 [`exit_payload`]）；此顺序沿用既有实现，不另作调整。
+///
+/// 只含**字节序列**：`disable_raw_mode()` 是系统调用（改 termios），无法塞进这里，
+/// 由两个调用方各自按需发出（见 [`restore_terminal`] 与 [`restore_terminal_on_panic`]）。
+/// crossterm 的命令是 `impl Command`（写字节）而非 `Display`，故先 `queue!` 进缓冲区再转字符串。
+fn restore_sequence() -> String {
+    let mut restore: Vec<u8> = Vec::new();
+    let _ = crossterm::queue!(
+        restore,
+        EnableLineWrap,
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    );
+    String::from_utf8_lossy(&restore).into_owned()
+}
+
 /// 退出时写给终端的**全部字节** —— 抽成纯函数，好让「不得绝对定位」这条能被单测钉住。
 ///
 /// `restore_terminal` 除本函数的产物外**不再写任何东西**，所以单测直接盯着这里，
@@ -466,17 +496,8 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(terminal: &mut T
 /// 后段是回放 —— 逐行 `\r\x1b[2K{line}\x1b[0m`、行间 `\r\n`、末尾一个 `\r\n`，
 /// **不含任何光标定位转义**：落点是进入 alt-screen 时保存、`?1049l` 恢复的那个位置。
 fn exit_payload(lines: &[String]) -> String {
-    // 前段：终端状态恢复。crossterm 的命令是 `impl Command`（写字节）而非 `Display`，
-    // 故先 `queue!` 进一个缓冲区再拼进字符串。
-    let mut restore: Vec<u8> = Vec::new();
-    let _ = crossterm::queue!(
-        restore,
-        EnableLineWrap,
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        PopKeyboardEnhancementFlags
-    );
-    let mut out = String::from_utf8_lossy(&restore).into_owned();
+    // 前段：终端状态恢复 —— 与 panic hook 共用同一份序列（改一处即两处都改）。
+    let mut out = restore_sequence();
 
     // 后段：回放。**不含任何光标定位转义** —— 落点由 `?1049l` 恢复。
     for (i, line) in lines.iter().enumerate() {
@@ -489,6 +510,56 @@ fn exit_payload(lines: &[String]) -> String {
     }
     out.push_str("\r\n");
     out
+}
+
+// ---------------------------------------------------------------------------
+// panic 边界
+// ---------------------------------------------------------------------------
+
+/// 装 panic hook，使**任何绘制路径的 panic** 都先恢复终端再让默认 hook 打印信息。
+///
+/// [`run`] 的正常恢复（[`restore_terminal`]）在 `event_loop` panic 时会被 unwind **跳过**，
+/// 故本方案第一次把模型输出（不可信输入）喂给自述 PoC 的第三方解析器后，必须把恢复挂到
+/// panic 路径上。用 hook 而非 `catch_unwind` 包某一处：hook 覆盖**全部**绘制路径。
+///
+/// **先 `take_hook` 取走上游默认 hook 再 `set_hook` 自己的**，并在 hook 体里最后调用它 ——
+/// 这样保留默认的 panic 信息打印与 unwind 语义。hook 体**不** `process::exit`、
+/// **不**用 `catch_unwind` 吞掉 panic：panic 后 `App` / 缓存状态不保证一致，**失败即退出**
+/// 比带伤续跑安全。
+fn install_panic_hook() {
+    let delegate = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        panic_hook_body(restore_terminal_on_panic, &*delegate, info);
+    }));
+}
+
+/// panic hook 的**体**：先跑注入的恢复动作，再把控制权交给上游 delegate。
+///
+/// 泛型入参 `T` 只为实现可单测 —— hook 内 `T = PanicHookInfo`，而单测用一个假 `T`
+/// （如 `()`）就能断言「恢复先发生、delegate 后发生」，**无需触发真实 panic、不接触真终端**。
+/// 恢复动作经 `impl FnOnce` 注入，正因如此 [`restore_terminal_on_panic`] 的真实现与
+/// **不写任何字节**的探针可以在同一条码路上被演练。
+fn panic_hook_body<T>(
+    restore: impl FnOnce(),
+    delegate: &(dyn Fn(&T) + Sync),
+    info: &T,
+) {
+    restore();
+    delegate(info);
+}
+
+/// panic 路径上的**真**恢复动作：best-effort，每步吞 IO 错误、**绝不二次 panic**。
+///
+/// 顺序固定为：恢复字节序列 → `disable_raw_mode()` → 显示光标。
+/// `disable_raw_mode()` 是**系统调用**（改 termios），不在 [`restore_sequence`] 的字节内，
+/// 必须在这里单独发出。任一步失败都只能忽略 —— 在 panic hook 里再 panic 会导致进程 abort。
+fn restore_terminal_on_panic() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{}", restore_sequence());
+    let _ = out.flush();
+    let _ = disable_raw_mode();
+    // 绘制中途 panic 时光标可能仍处于隐藏状态，恢复回显。
+    let _ = execute!(out, Show);
 }
 
 /// 模态选择器里 ↑↓ 的落点（回卷；空列表原地不动）。
@@ -574,6 +645,54 @@ mod tests {
         assert!(
             seq.find("\x1b[?1049l").unwrap() < seq.find("\r\x1b[2K").unwrap(),
             "退出 alt-screen 必须排在回放之前：{seq:?}"
+        );
+    }
+
+    /// N9 ①：恢复序列必须含退 alt-screen / 开换行 / 关括号粘贴 / 弹键盘增强这四条 ——
+    /// 缺任一条，panic 后终端都会停在 alt-screen、关闭换行、括号粘贴模式，或把键盘增强
+    /// 标志泄漏进 shell（用户只能 `reset`）。
+    ///
+    /// 字节值取自 `crossterm` 0.29 实测（非凭记忆）；`disable_raw_mode()` 是**系统调用**
+    /// （改 termios），不在本字节序列内，故无从在此断言 —— 它由
+    /// [`restore_terminal_on_panic`] 在序列之后单独发出。
+    #[test]
+    fn restore_sequence_contains_terminal_state_restore() {
+        let seq = restore_sequence();
+        assert!(seq.contains("\x1b[?1049l"), "须退出 alt-screen：{seq:?}");
+        assert!(seq.contains("\x1b[?7h"), "须开启换行：{seq:?}");
+        assert!(seq.contains("\x1b[?2004l"), "须关闭括号粘贴：{seq:?}");
+        assert!(
+            seq.contains("\x1b[<1u"),
+            "须弹出键盘增强标志（否则泄漏进 shell）：{seq:?}"
+        );
+    }
+
+    /// N9 ②：hook 体**先**跑注入的恢复动作，**再**调用 delegate —— 后者保留默认的 panic
+    /// 信息打印与 unwind 语义，绝不能被恢复路径吞掉。
+    ///
+    /// 用不接触真终端的探针（`AtomicBool`）与假 `T = ()` 断言，**不触发真实 panic**
+    /// （真触发会污染测试输出、并与并行测试互相干扰）。
+    #[test]
+    fn panic_hook_body_restores_then_delegates() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let restored = AtomicBool::new(false);
+        let delegated = AtomicBool::new(false);
+        // delegate 里回看一眼恢复探针：钉住「delegate 时恢复已经发生」。
+        let restored_before_delegate = AtomicBool::new(false);
+
+        let restore = || restored.store(true, Ordering::SeqCst);
+        let delegate = |_: &()| {
+            restored_before_delegate.store(restored.load(Ordering::SeqCst), Ordering::SeqCst);
+            delegated.store(true, Ordering::SeqCst);
+        };
+        panic_hook_body(restore, &delegate, &());
+
+        assert!(restored.load(Ordering::SeqCst), "恢复动作必须被调用");
+        assert!(delegated.load(Ordering::SeqCst), "delegate 必须仍被调用");
+        assert!(
+            restored_before_delegate.load(Ordering::SeqCst),
+            "恢复必须发生在 delegate 之前"
         );
     }
 }

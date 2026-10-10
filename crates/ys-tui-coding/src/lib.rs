@@ -32,14 +32,17 @@
 //! 代价与收益：agent 不能跑在 `run()` 里，TUI 也不认识 `Agent`。
 
 mod app;
+mod cache;
 mod commands;
 mod completion;
 mod draw;
 mod events;
 mod format;
 mod input;
+mod md;
 mod prompter;
 mod run;
+mod styles;
 mod transcript;
 mod view;
 

@@ -1,279 +1,213 @@
 # git worktree 支持 — 架构设计
 
-> 上承 [`context.md`](./context.md)（用户已裁定的范围与约束）。决策记录见
-> [`docs/adr/0034-worktree-command.md`](../../adr/0034-worktree-command.md)。
-> 三个候选方案由并行 subagent 产出（最小复杂度 / 可扩展优先 / 资源与缓存效率优先），
-> 本文取其骨架并记录否决理由。
+> 上承 [`context.md`](./context.md)。决策记录见 [`docs/adr/0034-worktree-cli.md`](../../adr/0034-worktree-cli.md)。
+> §4 记录了并行 subagent 产出的三个候选方案；**最终形态经用户两轮裁定后，比三者都小**（见 §1 与 §4.3）。
 
 ## 1. 结论先行
 
-**推荐：单函数骨架 + 共享信元上卷 + 仓库外落点 + 只建不回收。**
+**CLI 子命令组 `ys-coding-agent worktree {create, attach, list, remove}`；工作区只在进程启动时选定一次。**
 
-一句话形态：**两个新函数（`provision` / `assemble`）承载全部逻辑，一个 `Arc<Mutex<Option<PathBuf>>>`
-信元把「换工作区」的意图从工具上卷到 app_loop，切换在回合边界重建 Agent。**
+| 动词 | 性质 | 实现 |
+|---|---|---|
+| `create <name>` | git 包装 | `git worktree add -b worktree-<name> <ys目录>/<repo>-<name> HEAD` |
+| `list` | git 包装 | `git worktree list --porcelain`，筛出 ys 目录下的条目 |
+| `remove <name>` | git 包装 | `git worktree remove <path>`（**天然留分支、脏则拒删**） |
+| **`attach <name>`** | **ys 特有** | **启动（或 resume）一个会话，工作区绑定到该树** —— git 里没有对应物 |
 
-选型的三条主判据，全部来自本仓既有约束（不是外部偏好）：
+⇒ **无工具、无斜杠命令、无中途切换、无 IPC、零核心改动。**
 
-1. **不新增 trait、不改核心 crate。** `worktree` 工具与命令都在 `apps/coding-agent`，工具调用
-   `provision()` **不需要任何核心 crate 的能力** ⇒ 照 `SubagentRunner` 加 `ToolContext` 挂载点
-   是把字段穿 `ys-runtime::AgentPorts`→`ys-loop`→`ys-tool` 三个 crate，**收益为零**（见 §5.a）。
-2. **落点必须在仓库外。** 三条独立理由全部指向仓库外，其中两条是真的 bug（见 §5.b）。
-3. **切换必然付一次 prompt cache miss**，且比候选 C 估计的更宽 —— 必须如实计入（见 §5.f）。
+**为什么这么小**：用户裁定 `attach` = 「**启动即绑定**」⇒ 一切「工作区切换」都发生在**构造点**
+（`main` 启动期）。而代码里 workspace **本来就是单点量、启动期冻结**
+（`apps/coding-agent/src/main.rs:1341-1342`：`let cwd = config.cwd.clone(); let workspace = cwd.clone();`）
+⇒ **四路扇出（`build_tools` / `working_dir` / `build_system_prompt` / `SubagentSetup`）原样不动**，
+只把「workspace 取什么值」从「恒等于 `cwd`」改成：
 
-## 2. 需求与约束（摘自 context.md，只列设计相关的）
+```rust
+let workspace = match args.worktree {
+    Some(Attach::Name(name)) => worktree::resolve(&cwd, &name)?,  // 解析到 ys 目录下的树
+    None => cwd.clone(),                                          // 现状：共享工作区
+};
+```
 
-- 一个需求 ⇒ 一个 worktree；**两条口共用一份实现**：`/worktree` 命令（用户）与 `worktree`
-  工具（模型，由 skill 正文指示）。
-- 职责 **创建 + 切进当前会话**；需求内多 agent 共用同一树，**冲突靠 skill 协商，运行时不做机制兜底**。
-- **只隔离不回流**（不自动 merge）；**显式降级**（非 git / git 不可用 / `add` 失败 ⇒ 退回共享工作区）。
-- 硬约束（全部带指针）：
-  - `Agent` 冻结持有 `registry`/`cwd`/`workspace_root`/`system_prompt`，每回合 clone 进
-    `RuntimeContext`（`crates/ys-runtime/src/agent.rs:67-127`）。`AgentPorts` 只传
-    model/session/events/boundary/subagent ⇒ **cwd 与工具表都不在可换缝里** ⇒ 换工作区**只能重建 Agent**。
-  - 工具**构造期捕获** `workspace`（`tools-basic/src/read.rs:48`、`write.rs:41`、`edit.rs:166`、
-    `bash.rs:118`）⇒ 重建 Agent 即重建工具表。
-  - `ys-core`/`ys-event`/`ys-protocol` **零 tokio** ⇒ git 子进程只能落在 apps 层。
-  - 父表 = 基础 9 元 + 追加末位（`main.rs:1370-1373`）；子表 = 基础 9 元 ⇒ **追加末位的工具子 agent 拿不到**。
-  - `capabilities.rs` 绝不 print；输出走 `Outbound::Output`（`docs/architecture.md` §13 输出三分）。
-  - 全仓**零 git 调用**；`prompt::build_system_prompt` 从 cwd 逐级向上加载项目上下文
-    （`prompt.rs:277`）并把**路径写进文本**（`prompt.rs:60-64`）。
+## 2. 需求与约束
+
+用户裁定（不可改）：一个需求 ⇒ 一个 worktree；CLI 四动词；`attach` = 启动即绑定；
+需求内多 agent 共用同一树、**冲突靠 skill 协商（运行时不做机制兜底）**；**只隔离不回流**；
+非 git / git 不可用 / 目标不存在 ⇒ **显式报错并指出共享工作区的退路**；不做安全/沙箱；不做 Windows。
+
+设计约束（带指针）：
+
+- **零核心改动的前提**：workspace 是启动期单点量（`main.rs:1341-1342`），且四路扇出都从它派生
+  （`toolset.rs:88` / `AgentBuilder::working_dir` / `prompt.rs:28` / `main.rs:1362`）。
+  `attach` 只改**取值来源**，不触碰扇出。**这是本设计成立的全部理由。**
+- 工具**构造期捕获** workspace（`tools-basic/src/read.rs:48` 等）⇒ 工作区必须在建工具**之前**定死
+  —— 启动期解析恰好满足。
+- **参数解析是手写的** `parse_args`（`main.rs:161-222`），match 首 token。加 `"worktree"` 臂是纯增量；
+  ⚠️ 注意今天的 `_ =>` 兜底会**静默忽略**非 flag 首 token（`ys-coding-agent worktree` 现在会直接进交互模式）。
+- `ys-core`/`ys-event`/`ys-protocol` **零 tokio** ⇒ git 只在 apps 层调。
+- `capabilities.rs` 绝不 print；但 CLI 子命令走的是 **stdout/stderr**（非 transcript），与 `-p`/`--json` 同侧。
+- **prompt cache**：cwd 与 `<project_instructions path="…">` 都进提示词文本（`prompt.rs:60-64,69`）
+  ⇒ **每个 worktree 一份前缀**，首次 attach 首轮 cache miss。
+- 全仓**零 git 调用**；`.gitignore` 不含 `.worktrees/` / `.yushan/`。
 
 ## 3. 同类软件调研（Step 2）
 
-### 3.1 最有价值的一条先例 —— 逐字对应用户口径
+- **最有价值的先例** —— `tmp/deepseek-harness/.agents/notes/implemented/feature/2026-08-05-agent-teams.md`：
+  > "**Worktree isolation is not a harness runtime behavior.** A deployment or prompt may arrange
+  > separate worktrees, but the Team domain does not infer branches, merge changes, or silently
+  > change cwd."
 
-`tmp/deepseek-harness/.agents/notes/implemented/feature/2026-08-05-agent-teams.md`：
+  其「Alternatives considered」明确否决 **自动建 worktree**（「创建/命名/合并策略/清理都是部署决策」）
+  与 **把写范围当锁**（「外部写者绕过锁、崩溃持有者永久占位、路径前缀重叠无法证明语义独立，
+  **假互斥比显式警告更危险**」）。⇒ 支持「隔离交给部署（CLI/启动参数）、冲突交给 skill」。
+- **Claude Code**：`--worktree/-w` 启动即进树（本设计的直接对应物）；`.claude/worktrees/<name>/`、分支
+  `worktree-<name>`；另有 `EnterWorktree`/`ExitWorktree` 工具（**中途切换**）。
+  ⚠️ 那两个工具带来**两个已记录 bug**：#76250（会话级共享 CWD 槽 ⇒ 并发 subagent 跨树误改）、
+  #33（切换是会话级副作用 ⇒ 并行 agent 共享一树）。**本设计只取 `--worktree` 形态、不取工具，正是为了
+  绕开这两个 bug**（不切换，就不存在会话级 CWD 副作用）。
+- **`tmp/Codewhale/crates/lane/src/worktree.rs`**（Rust 554 行）：`git worktree add -b <branch> <path> <base>`；
+  清理前用 `git worktree list --porcelain` + `.git` 的 `gitdir:` 确认 git 认它是本仓托管的树；
+  删分支用 `-d` 不 `-D`（「a branch carrying unmerged commits is someone's work, and a TTL timer is not a
+  mandate to throw it away」）。**其 TTL 与安全闸不采纳**（本设计无自动清理，见 §5.3-c）。
+- **`tmp/pi/.../resource-loader.ts` 的 `findShadowedContextFile`**：嵌套 worktree 会**重复加载**主仓同名
+  上下文文件 ⇒ 直接支持「落仓库外」（§5.3-d）。
+- **生态编排器**（vmux/dmux/parallel-code/CLITrigger/Baton）一律「一任务 = 一分支 = 一 worktree、review
+  diff 再合并」；`pact` 自陈 file-claim coordination「not yet reliable under concurrency」。
 
-> "**Worktree isolation is not a harness runtime behavior.** A deployment or prompt may arrange
-> separate worktrees, but the Team domain does not infer branches, merge changes, or silently
-> change cwd."
+## 4. 候选方案（决策记录）
 
-其「Alternatives considered」明确否决两条，理由与本需求裁定一致：
+三个候选方案由并行 subagent 产出，**都假设了「运行中途切换工作区」**这一前提。
 
-- ❌ **Create isolated worktrees automatically** —— worktree 创建、分支命名、合并策略、忽略文件、
-  构建产物、清理**都是部署决策**；
-- ❌ **Treat task ownership or write scopes as locks** ——「外部写者会绕过锁、崩溃的持有者会永久占位、
-  路径前缀重叠**无法证明语义独立**；**假互斥比显式警告更危险**」。
-
-⇒ 支持「运行时不做冲突消解、下放给 skill」，且支持「不自动回收」。
-
-### 3.2 Claude Code —— 形态参照与两个反面 bug
-
-- 形态：`--worktree/-w`；默认落 `.claude/worktrees/<name>/`、分支 `worktree-<name>`；
-  `EnterWorktree`(`name` XOR `path`)/`ExitWorktree`；**同一时刻只允许一个活动 worktree**；
-  进入仓库外路径需审批；v2.1.198 起进入/退出**迁移会话转录**（类似 `/cd`）；**lazy isolation**
-  （后台会话首次写才迁入）；清理：无改动则自动删、有改动则询问。
-- ⚠️ **bug #76250**：会话级共享 CWD 槽 ⇒ 并发 subagent 的 `EnterWorktree` **静默改掉整棵会话树的 CWD**，
-  跨 worktree 误改。
-- ⚠️ **bug #33**：`EnterWorktree` 是**会话级副作用** ⇒ 并行 agent 共享同一 worktree。
-- **启示**：这两个 bug 的根因都是「切换是会话级全局副作用、且与子 agent 共享」。本设计用
-  **回合末才生效的进程级信元 + 子 agent 结构上拿不到该工具**绕开（§5.a / §5.e）。
-
-### 3.3 本仓两个同技术栈参考实现
-
-- `tmp/Codewhale/crates/lane/src/worktree.rs`（Rust 554 行）：
-  - 声明式 `WorktreeProvision{repo_root,branch,path,base_ref}`；`git worktree add -b <branch> <path> <base>`（base 默认 `HEAD`）；
-  - **捕获子进程输出而不继承终端** ——「Runtime callers include the raw-mode TUI launch screen,
-    where even one inherited progress/error line corrupts the alternate-screen buffer」；
-  - 清理前用 `git worktree list --porcelain` + `.git` 的 `gitdir:` **确认 git 认它是本仓托管的
-    worktree** 才删（防陈旧记录变无界递归删）；
-  - 删分支用 `-d` 不用 `-D` ——「a branch carrying unmerged commits is someone's work, and a TTL
-    timer is not a mandate to throw it away」。
-  - **不采纳其 TTL**（见 §5.c），**采纳**「捕获输出」「只动 git 认的树」。
-- `tmp/pi/packages/coding-agent/src/core/resource-loader.ts` 的 `findShadowedContextFile`：
-  嵌套 worktree 的上下文文件会**遮蔽/重复**主仓同名文件 ⇒ 直接支持「落仓库外」（§5.b）。
-
-### 3.4 生态编排器
-
-vmux / dmux / parallel-code / CLITrigger / ace-polyagent / Baton 一律「一任务 = 一分支 = 一 worktree、
-**review diff 再合并**」；`pact` 自陈「file-claim coordination is advisory/experimental,
-**not yet reliable under concurrency**」⇒ 同 §3.1。
-
-## 4. 三个候选方案与对比
-
-### 4.1 候选
+### 4.1 三者
 
 | | 骨架 | 上卷机制 | 落点 | 生命周期 |
 |---|---|---|---|---|
-| **A 最小复杂度** | `worktree.rs` + `assembly.rs`（2 文件，0 新 trait） | `RebindHandle`（`Arc<Mutex<Option<PathBuf>>>`） | 仓库外 `~/.yushan/worktrees/` | 只建不回收 |
-| **B 可扩展优先** | `worktree/{provider,ledger,service}.rs` + `workspace.rs`（2 新 trait） | `ToolContext` 第 4 挂载点 `WorkspaceController` | `<repo>/.yushan/worktrees/` | 状态机 + ledger.jsonl + TTL |
-| **C 资源/缓存效率** | `worktree.rs` + `assembly.rs` + `capabilities.rs` 扩（1 新 trait） | `ToolContext` 第 4 挂载点 `WorktreeController` | `<repo>/.worktrees/` | 不回收 |
+| **A 最小复杂度** | `worktree.rs`+`assembly.rs`（0 新 trait） | `RebindHandle`（`Arc<Mutex<Option<PathBuf>>>`） | 仓库外 | 只建不回收 |
+| **B 可扩展优先** | provider/ledger/service + 2 新 trait | `ToolContext` 第 4 挂载点 + 状态机 + TTL | 仓库内 | 状态机 + ledger + TTL |
+| **C 资源/缓存效率** | `worktree.rs`+`assembly.rs`+挂载点 | `ToolContext` 第 4 挂载点 | 仓库内 | 不回收 |
 
 ### 4.2 对比矩阵
 
-| 维度 | A 最小复杂度 | B 可扩展优先 | C 资源/缓存效率 |
+| 维度 | A | B | C |
 |---|---|---|---|
-| 新模块/文件 | **2** | 4+ | 3 |
+| 新模块 | 2 | 4+ | 3 |
 | 新增 trait | **0** | 2 | 1 |
-| 改核心 crate | **0** | `ys-tool`(+1 字段) + `ys-runtime`(AgentPorts) + `ys-loop`(透传) | 同 B |
-| 新增状态 | **1 个 Arc<Mutex>** | 状态机 + ledger.jsonl | 1 个 Arc<Mutex> |
-| 切换成本 | 重建工具表+prompt+agent；复用探测 | 同 + ledger 写 + 状态转换 | 显式核算：µs 重建 + 1 fork |
-| prompt cache | 首轮 miss | 首轮 miss | 首轮 miss（**低估了范围**，见 §5.f） |
-| 落点正确性 | **仓库外 ✅** | 仓库内 ❌（重复加载 + 搜索遍历） | 仓库内 ❌（同左） |
-| 扩展性 | 低（当前够用） | 高 | 中 |
-| 运维/排障 | 简单 | ledger 可查但面大 | 简单 |
-| 主要风险 | 同回合不生效（已明示） | 重建漏换 `SubagentSetup` 静默写旧树；ledger 一致性 | 缓存论断错误；落点隐患 |
+| 改核心 crate | **0** | 3（`ys-tool`/`ys-runtime`/`ys-loop`） | 3 |
+| 新增状态 | 1 个 `Arc<Mutex>` | 状态机 + `ledger.jsonl` | 1 个 `Arc<Mutex>` |
+| 落点正确性 | 仓库外 ✅ | 仓库内 ❌（重复加载 + 搜索遍历） | 仓库内 ❌ |
+| 主要风险 | 同回合不生效 | 重建漏换 `SubagentSetup`；ledger 一致性 | 缓存论断经核对**不成立** |
+
+### 4.3 最终形态不在三者之中（且更小）
+
+用户裁定 `attach` = **启动即绑定** ⇒ 「中途切换」这个前提消失了：
+
+- **上卷机制**（A 的信元 / B·C 的挂载点）**整块删掉** —— 没有中途意图要上卷；
+- **`assembly.rs` 重构整块删掉** —— 一个进程只有一个工作区，无需把四路扇出收成可重建的工厂；
+- **工具、`Request::Worktree`、命令表项全部删掉**；
+- ⇒ **净新增 = 一个 `worktree.rs` + `parse_args` 一个 match 臂 + `workspace` 取值改一处。**
+
+这也顺带删掉了候选 A/C 共同的、无法回避的**「同回合不生效」**问题 —— 不切换就没有生效延迟。
+**B/C 被否的理由**（穿核心 crate、仓库内落点）在 §5.3 保留。
 
 ## 5. 推荐方案
 
-**取 A 的骨架 + C 的成本纪律（修正其缓存论断）+ B 的显式降级枚举；否决 B 的状态机/ledger/TTL/双 trait，
-否决 C 的仓库内落点。**
+### 5.1 CLI 表面
 
-### 5.1 模块划分
-
-```mermaid
-graph TD
-  UI["ys-tui-coding<br/>commands.rs: /worktree 表项+parse"] -->|Request::Worktree| APP[app_loop]
-  TOOL["apps/coding-agent/worktree.rs<br/>WorktreeTool（父表追加末位）"] -->|写 RebindHandle| APP
-  APP -->|"provision()（唯一 git 调用点）"| GIT[git CLI]
-  APP -->|"assemble(ws, kit, rebind)"| ASM["assembly.rs<br/>收编四路扇出"]
-  ASM --> AG[Agent + SubagentSetup]
+```text
+ys-coding-agent worktree create <name>     # 建树：落 ys 目录、分支 worktree-<name>、base HEAD
+ys-coding-agent worktree attach <name>     # 启动/resume 会话，工作区 = 该树（可带 -p / --json / --resume）
+ys-coding-agent worktree list              # 列出 ys 目录下的工作树（含路径 / 分支 / 是否脏）
+ys-coding-agent worktree remove <name>     # 删树：直套 git worktree remove（留分支、脏则拒删）
 ```
 
-| 模块 | 位置 | 职责 |
-|------|------|------|
-| `worktree.rs`（新） | `apps/coding-agent` | **唯一 git 调用点**：`provision()`、`WorktreeTool`、`RebindHandle`、`WorktreeActivation`/`DegradeReason` |
-| `assembly.rs`（新） | `apps/coding-agent` | `assemble(ws, &BuildKit, rebind)`：把 `main.rs:1341-1375` 的四路扇出（`build_tools` / `working_dir` / `build_system_prompt` / `SubagentSetup`）收进一处；**启动与重绑共用** |
-| `request.rs`（改） | `ys-protocol` | 加 `Request::Worktree { #[serde(default)] name: Option<String> }` |
-| `commands.rs`（改） | `ys-tui-coding` | 命令表加 `/worktree` + `parse` 分支（命中内置 ⇒ 不走 skill 兜底，硬序不变） |
-| `app_loop.rs`（改） | `apps/coding-agent` | 处理 `Request::Worktree`；`Prompt` 臂末 `take()` 信元并按需重绑 |
-| skill（新，非代码） | `~/.yushan/skills` | 提示词层协商协议：需求内多 agent「改动前声明目标文件」的纪律 |
+`attach` **要求树已存在**（否则报错并指向 `create`）—— 与 `create` 分离是有意的：
+创建与绑定是两个动作，`create` 可脱离会话先跑。
 
-### 5.2 核心接口
+### 5.2 模块与接口
 
 ```rust
-// apps/coding-agent/src/worktree.rs
-pub struct Worktree { pub path: PathBuf, pub branch: String }
+// 新：apps/coding-agent/src/worktree.rs —— 唯一 git 调用点
+pub fn dir() -> PathBuf;                            // ~/.yushan/worktrees/（YUSHAN_WORKTREES_DIR 覆盖）
+pub fn path_for(repo: &Path, name: &str) -> PathBuf; // <dir>/<repo>-<name>
+pub fn repo_root(cwd: &Path) -> Result<PathBuf, WorktreeError>;  // git rev-parse --show-toplevel
+pub fn create(repo: &Path, name: &str) -> Result<Entry, WorktreeError>;
+pub fn list(repo: &Path) -> Result<Vec<Entry>, WorktreeError>;
+pub fn remove(repo: &Path, name: &str) -> Result<(), WorktreeError>;
+pub fn resolve(repo: &Path, name: &str) -> Result<PathBuf, WorktreeError>;  // attach 用
 
-pub enum DegradeReason { NotARepo, GitUnavailable, AddFailed(String) }
-
-/// 显式降级：绝不静默退回共享工作区。
-pub enum WorktreeActivation { Isolated(Worktree), Degraded(DegradeReason) }
-
-/// 唯一的 git 调用点。已登记同名 ⇒ 复用；否则 `add -b worktree-<name> <path> HEAD`。
-/// 子进程输出**捕获**、不继承终端（防 TUI raw mode 污染）。
-pub fn provision(repo: &Path, name: &str) -> Result<Worktree, DegradeReason>;
-
-/// 工具 → app 的上卷信元，照 `app_loop::SessionPathHandle`（`app_loop.rs:91`）的先例。
-pub type RebindHandle = Arc<Mutex<Option<PathBuf>>>;
-
-// apps/coding-agent/src/assembly.rs
-pub struct BuildKit { /* web / limits / child_limits / max_turn_duration / catalogue / 探测结果 */ }
-pub struct Assembly { pub agent: Agent, pub subagent: SubagentSetup }
-pub fn assemble(ws: &Path, kit: &BuildKit, rebind: Option<&RebindHandle>) -> Result<Assembly, BuildError>;
-
-// crates/ys-protocol/src/request.rs
-Request::Worktree { #[serde(default)] name: Option<String> }
+pub struct Entry { pub name: String, pub path: PathBuf, pub branch: Option<String>, pub dirty: bool }
+pub enum WorktreeError { NotARepo, GitUnavailable, AlreadyExists(String), NotFound(String), Git(String) }
 ```
 
-### 5.3 关键数据流
+```rust
+// 改：apps/coding-agent/src/main.rs
+struct Args { mode: Mode, stats: bool, resume: Resume, worktree: Option<WorktreeCmd> }
+enum WorktreeCmd { Create(String), Attach(String), List, Remove(String) }
+// parse_args：match 首 token 加 "worktree" 臂（纯增量，见 §2 的注意点）
+// main：workspace 取值改为「Attach ⇒ resolve()，否则 cwd」（§1 的 6 行）
+```
 
-- **用户口**：`/worktree <name>` → `commands.rs` `parse` → `Request::Worktree` → `app_loop` 臂 →
-  `provision()` + `assemble()`。
-- **模型口**：skill 正文指示模型调 `worktree` 工具 → 工具调**同一个** `provision()`，成功后把路径写进
-  `RebindHandle`，并把「自下一回合生效」写进 `ToolResult` → `app_loop` 在 `Prompt` 臂末 `take()` 后
-  `assemble()`。
-- **共用点 = `provision` + `assemble` 两个函数**（不是两个 trait、不是两份实现）。
-- **生效边界 = 下一回合**：`Agent` 的 `registry`/`system_prompt`/`cwd` 构造期冻结
-  （`agent.rs:67-75`），且回合中 `&mut Agent` 已借出，无法中途换 ⇒ 与 `/new`（换 Wiring）、
-  `/model`（换 model）同层同边界。
+**不改**：`ys-protocol` / `ys-tui-coding` / `ys-tool` / `ys-runtime` / `ys-loop` / `tools-basic`。
 
-### 5.4 关键决策与取舍
+### 5.3 关键决策
 
-#### a. 上卷 = 共享信元，**否决 `ToolContext` 第 4 挂载点**
+**a. CLI 而非工具或斜杠命令**（用户裁定）。产物存在 **ys 自己的目录**下 ⇒ 用户不该被迫去认识 git 的
+路径与命令；创建是**进程级副作用**，CLI 天生合适；覆盖面最广（**用户 shell / 模型经 `bash` 工具 /
+skill 文本 / CI 脚本**都能调）。且它消灭了「工具返回『下回合生效』」这个说不出实话的契约。
 
-`subagent`/`summarizer` 挂载点存在，是因为其 runner 持有 `Model`/`Session`/`Agent` 等**核心类型**，
-只能经 trait 借给 `ys-tool`。worktree 不同：**工具本身就在 `apps/coding-agent`**，`provision()` 是
-本地函数，工具直接调即可；它唯一需要交给外界的只有「请在下回合换工作区」这一个**意图**。
-加挂载点要把字段穿 `ys-runtime::AgentPorts` → `ys-loop` → `ys-tool` 三个 crate，而**工具终究无法
-重建 app 级 Agent**，收益为零。信元 `Arc<Mutex<Option<PathBuf>>>` 有现成先例
-（`app_loop::SessionPathHandle`，`app_loop.rs:91`）。
+**b. `attach` = 启动即绑定**（用户裁定）⇒ 无中途切换 ⇒ 零核心改动、无 deferred 语义、无 IPC。
+`attach` 是四个动词里**唯一没有 git 对应物**的，因为「绑定会话」不是 git 操作。
 
-> **信元须每回合新建或每回合清空** —— 与 `BoundarySource` 同理（`CLAUDE.md` 硬约束）：
-> 陈旧意图会污染下一回合。取「回合末 `take()`」的语义，天然自清。
+**c. `remove` 直套 `git worktree remove`，不写自定义安全闸。** 该命令**天然留分支、脏则拒删**
+—— 恰好就是「只隔离不回流」要的策略，免费获得。Codewhale 的 `is_managed_worktree` 安全闸是为了防
+**自动清理**误删陈旧记录，而本设计**不引入 TTL / ledger / 自动清理**，故无此前提。（若将来加自动清理，
+须回头补那道闸。）
 
-#### b. 落点 = **仓库外** `$HOME/.yushan/worktrees/<repo>-<name>/`（可选 `YUSHAN_WORKTREES_DIR`）
+**d. 落点仓库外** `~/.yushan/worktrees/<repo>-<name>/`。三条理由：① `EXCLUDED_DIRS`
+（`tools-basic/src/lib.rs:44`）不含 worktree 根 ⇒ 仓库内落点会被 `grep -r`/`find` 搜进完整副本；
+② `load_project_context` 逐级向上**全收**（`prompt.rs:277-305`）⇒ 仓库内落点时 worktree 自己的
+`AGENTS.md` 与主仓的会**两份都进上下文**（`tmp/pi` 专门修过）；③ 不污染主树 `git status`。
 
-三条独立理由，前两条是真的 bug：
+**e. 不自动回收、无 TTL。** 「只隔离不回流」⇒ 自动删会毁掉未 merge 的工作（deepseek-harness 的
+「清理是部署决策」同旨）。回收 = 用户显式 `remove`。
 
-1. **搜索遍历灾难**：降级 POSIX 路径的排除表 `EXCLUDED_DIRS`（`tools-basic/src/lib.rs:44`）只有
-   `.git/target/node_modules/dist/build/.venv`，**不含 worktree 根** ⇒ `grep -r`/`find` 会搜进 worktree
-   的完整副本。（`rg`/`fd` 靠 `.gitignore` 能挡，降级路径挡不住。）
-2. **重复加载项目上下文**：`load_project_context` 逐级向上**全收、按路径去重**（`prompt.rs:277-305`）。
-   落在 `<repo>/.worktrees/<name>` 时，worktree 自己 checkout 出的 `AGENTS.md` 与 `<repo>/AGENTS.md`
-   **两份都进上下文** —— 正是 `tmp/pi` 用 `findShadowedContextFile` 专门修的问题。
-3. **主树零污染**：`.gitignore` 不含 `.worktrees/` / `.yushan/` ⇒ 仓库内落点会让 `git status` 多出
-   未跟踪目录。
+**f. 不引入 ledger / 元数据存储。** `list` 从 `git worktree list --porcelain` 现算即可，
+ys 目录前缀天然把「我们的树」筛出来。
 
-放仓库外时，worktree 读的是**它自己那份**（跟踪文件，checkout 带来）`AGENTS.md`，单份加载。
+### 5.4 成本
 
-#### c. 生命周期 = **只建不回收，无 TTL**
-
-「只隔离不回流」⇒ 自动删会毁掉**尚未被 merge 的工作成果**。采纳 Codewhale 的分支纪律（`-d` 不 `-D`：
-未合并分支是人的工作）并**进一步不设 TTL**。回收留给用户显式动作（`/worktree rm` 属后续增量）。
-
-#### d. 降级显式
-
-`WorktreeActivation::Degraded(DegradeReason)` —— 命令路径经 `Outbound::Output` 进 transcript，
-工具路径写进 `ToolResult`，**两条路都不得静默**。判定：`git rev-parse --show-toplevel` 不识别
-（非 git 仓）⇒ `NotARepo`；git 不可执行 ⇒ `GitUnavailable`；`add` 非零 ⇒ `AddFailed(stderr)`。
-
-#### e. 子表结构上无此工具
-
-追加在 `subagent` 之后（`main.rs:1370-1373`）⇒ 子表仍是「基础 9 元」，**子 agent 拿不到
-`worktree` 工具**，结构上不可能自行换工作区。这也正是绕开 Claude Code bug #33 的机制。
-
-#### f. 缓存账要诚实：切换**必然** miss 更大一段
-
-候选 C 断言「树嵌仓内 ⇒ 只差末尾 cwd 一行」。**这不对**（两处已核对）：
-
-- `prompt.rs:60-64` 把路径写进文本：`<project_instructions path="{path}">`。**不论落点**，切换都会让
-  `project_context` 段字节改变 ⇒ 缓存分界不在末尾 cwd 行，而在 `Guidelines` 之后。
-- 落仓库内时该段还会**翻倍**（§5.b-2），更差。
-
-⇒ 诚实结论：**稳定前缀 = 工具清单 + Guidelines**；`project_context` 起（含 cwd 行、skill 目录段）
-每次切换首轮重计一次 —— 量级：无 skill ≈ 1 行；满 skill 目录（固定开销 ~9.6k、目录段 ~8k）⇒ 一次性
-~8k input 重计。**换取的诊断确定性远大于这点成本**，但必须记在案。
-
-### 5.5 成本账（back-of-envelope）
-
-| 项 | 值 | 依据 |
-|---|---|---|
-| 重建 9 个工具 | µs（9 次 `PathBuf` 克隆 + 装箱，**零 fork**） | 工具构造只存路径 |
-| 重建 system prompt | µs（新 cwd walk-up、若干 `stat`、拼串） | 无子进程 |
-| 重建 Agent | µs | `Agent::new` 只搬所有权 |
-| **复用（不重跑）** | `SearchBackends::detect` / `WebConfig` / 模型实例 / `model_cache` / skill catalogue | 存进 `BuildKit` |
-| git 冷启 | 1×`rev-parse` + 1×`worktree add` | 稳态仅 `add` 一次 fork |
-| `worktree add`（中仓） | ~0.5–2s，I/O bound | 建树即 checkout |
-
-⇒ **最坏路径 = 首次切换首回合**：`add` 0.5–2s + 重建 ~ms + `project_context` 起重计一次。
+| 项 | 值 |
+|---|---|
+| `create` | 一次 `git worktree add`（中仓 ~0.5–2s，I/O bound，建树即 checkout） |
+| `attach` | 一次 `git rev-parse` + `resolve` 路径拼接；**启动路径其余部分零变化** |
+| 子进程输出污染 | **自动满足** —— CLI 是独立进程，stdout/stderr 由终端或 `bash` 工具捕获，碰不到 TUI raw mode |
+| 首次 attach 的首轮 | 该树一份新 prompt 前缀 ⇒ 一次 cache miss（cwd + `project_instructions` 路径进文本） |
 
 ## 6. 分阶段落地
 
-- **P0（纯重构，行为逐字节不变）**：抽出 `assembly::assemble()` 收编四路扇出；`main` 改调它。
-  靠既有顺序/指纹测试守回归。**先做这一步，单独提交**。
-- **P1**：`worktree::provision()` + `Request::Worktree` + `/worktree` 命令 + `app_loop` 重绑。
-- **P2**：`WorktreeTool`（追加末位）+ 协商 skill 正文。
-- **P3（增量，可延后）**：`/worktree rm`（显式回收）、`/status` 显示当前树、`SessionMeta.workspace`
-  只读记录（供 `--resume` 提示错位，`#[serde(default)]` 向后兼容）。
+- **P0**：`worktree.rs` + `parse_args` 加 `worktree` 子命令；`create` / `list` / `remove`（三个 git 薄包装）
+  + 落点/命名/`YUSHAN_WORKTREES_DIR` + `WorktreeError` 三态降级文案。
+- **P1**：`attach` —— `main` 的 `workspace` 取值改点（§1 的 6 行）+ 树不存在/非 git 时的显式报错与退路提示。
+- **P2（增量）**：`SessionMeta.workspace` 只读记录（`#[serde(default)]`）⇒ `--resume` 时提示「本会话原在
+  工作树 X，当前在主树 Y」，避免**静默错位**。
+- **P3（可延后）**：`attach --create-if-missing`；`/status` 显示当前是否在树内。
 
 ## 7. 已知风险与待验证项
 
-- [ ] **同回合内切换未生效**（工具调用后本回合其余写仍落旧树）—— 靠 `ToolResult` 明示 + skill
-      「先建树再干活」缓解；运行时不做兜底（符合裁定）。**这是最大风险，须在 skill 与工具文案里写死。**
-- [ ] **项目级 `.yushan/` 在 worktree 缺席**（未跟踪 ⇒ `git worktree add` 不搬）：项目 skills 消失、
-      `.yushan/SYSTEM.md` 自定义 prompt 短路翻转 ⇒ **跨树行为漂移**。须在切换输出明示（同降级）。
-- [ ] **prompt cache 分界**实测（§5.f 是推算，需一次真实 token 读数验证）。
-- [ ] **`SubagentSetup` 重建漏换** ⇒ 子 agent 静默写旧树。用变异测试钉住（本项目既有做法）。
-- [ ] `git worktree` **共享 common repo 的 config/hooks**（deepseek-harness 有专治 `core.hooksPath`
-      被跨 worktree 改写的笔记）⇒ 若将来要做 worktree 级 git 配置，须走 `extensions.worktreeConfig`。
-- [ ] 落点 `<repo>-<name>` 在**同名仓库**（不同路径、同名目录）间会撞名 ⇒ 是否加短 hash（待定）。
+- [ ] **session ↔ worktree 无绑定**：`attach` 起的会话不记录工作区 ⇒ 之后裸 `--resume` 会落回**主树**，
+      历史与工作区错位。P2 的 `SessionMeta.workspace` 是缓解（提示而非自动切换）。
+- [ ] **项目级 `.yushan/`（skills / SYSTEM.md）在树内缺席**（未跟踪文件不随 checkout 搬）⇒ 同一 agent
+      在两棵树里**行为漂移**。P1 须在 `attach` 时**明示**。
+- [ ] **首次 attach 首轮 cache miss**（每树一份前缀）。
+- [ ] **同名仓库撞名**：`<repo>-<name>` 在「不同路径、同名目录」的两个仓库间会撞 ⇒ 是否加短 hash（待定）。
+- [ ] `attach` 时树不存在 ⇒ 报错（**暂定**；`--create-if-missing` 留 P3）。
+- [ ] **将来加自动清理时**须补回 Codewhale 的 `is_managed_worktree` 安全闸（防陈旧记录变无界递归删）。
+- [ ] **非 git 仓库**下四个动词都不可用 ⇒ 明确报错，并指出「不带子命令即共享工作区启动」的退路。
 - [ ] 建议用 `prototype` 验证：① worktree 内 `build_system_prompt` 的实际加载差异（尤其 `.yushan/`）；
-      ② 「下一回合生效」在 TUI / `-p` / `--json` 三模式的一致行为。
+      ② `attach` 与 `--resume` / `-p` / `--json` 的组合行为。
 
 ## 8. 相关文档
 
 - [`context.md`](./context.md) — 上下文与约束
-- [`../../adr/0034-worktree-command.md`](../../adr/0034-worktree-command.md) — 决策记录
+- [`../../adr/0034-worktree-cli.md`](../../adr/0034-worktree-cli.md) — 决策记录
 - [`../../design-final/coding-agent-tui.md`](../../design-final/coding-agent-tui.md) §13 — subagent 派发与 workspace 继承的 as-built
-- [`../commands/context.md`](../commands/context.md) — 命令体系（注意其 ADR 为过期稿，以 `crates/ys-tui-coding/src/commands.rs` 为准）

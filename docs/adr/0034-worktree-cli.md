@@ -49,8 +49,12 @@
 ### 理由
 
 1. **「启动即绑定」把「切换」从运行时问题变成装配问题。** 工作区在构造点（`main` 启动期）定死 ⇒
-   代码里原本就是单点量（`main.rs:1341-1342`）⇒ 四路扇出**原样不动**，只改取值来源一行。
-   **A/B/C 的上卷机制（信元或挂载点）与 `assembly.rs` 重构整块消失。**
+   四路扇出**原样不动**，只改取值来源。**A/B/C 的上卷机制（信元或挂载点）与 `assembly.rs` 重构整块消失。**
+   ⚠️ 质量分析修订：取值来源**不是** `main.rs:1341-1342` 的 `workspace` 一行 —— `cwd` 同时喂
+   「提示词」（`build_system_prompt(&cwd)`，:1352/:1375）与「skill 根」+「自定义 prompt」
+   （`default_skill_roots(&config.cwd)`，:1227），只改 `workspace` 会让**工具在树里、提示词却说主树**。
+   正确注入点是 `Config::from_env()` 之后、skill 扫描之前，且须**区分「工作区」与「项目根」两个量**
+   （design §1.1）。
 2. **它顺带删掉了 A/C 无法回避的「同回合不生效」问题** —— 不切换就没有生效延迟。
 3. **它绕开 Claude Code 的两个已记录 bug**（#76250 会话级共享 CWD 槽、#33 切换是会话级副作用）——
    那两个 bug 都源于**中途切换工具**；本设计没有那个工具。
@@ -84,8 +88,8 @@
 **正面**
 
 - 补上 ADR-0022/0029 的已知缺口：需求之间、需求与主树之间有机制隔离（同需求内仍是 skill 协商）。
-- **净新增最小**：一个 `worktree.rs` + `parse_args` 一个 match 臂 + `workspace` 取值一行；
-  **零核心 crate 改动**。
+- **净新增最小**：一个 `worktree.rs` + `parse_args` 一个 match 臂 + `attach` 注入
+  （`main.rs` / `config.rs` / `prompt.rs` 三个 **app** 文件）；**零核心 crate 改动**。
 - 结构上不可能出现 Claude Code 那两个并发 bug（无中途切换、无会话级 CWD 副作用）。
 - 覆盖面最广：用户、模型（经 `bash`）、skill、CI 同一套入口；`list`/`remove` 有 git 背书。
 
@@ -94,11 +98,25 @@
 - **没有任何中途切换能力**：同一会话要换需求 = 重开（这被视为反模式：一个会话混两个需求）。
 - **session ↔ worktree 无绑定**：`attach` 起的会话不记录工作区 ⇒ 裸 `--resume` 会落回主树。需 P2 的
   `SessionMeta.workspace` 只读记录来**提示**（非自动切换）。
-- **项目级 `.yushan/`（skills / SYSTEM.md）在树内缺席**（未跟踪文件不被 checkout）⇒ 跨树行为漂移，
-  须在 `attach` 时明示。
+- **项目级 `.yushan/`（skills / SYSTEM.md）在树内缺席**（未跟踪文件不被 checkout）—— 已由
+  「**项目根**指向主仓」解决（design §1.1）：worktree 只是同一项目的一个 checkout，项目级配置跟仓库走。
+  非 worktree 路径下两个量相等 ⇒ 行为逐字节不变。
 - **首次 attach 首轮 prompt cache miss**（cwd 与 `project_instructions` 路径都进提示词文本）。
 - **清理成本转嫁给用户**：不自动回收 ⇒ 须把落点约定文档化，并明确「分支永不自动删」。
 - `list`/`remove` 是薄包装 ⇒ git 版本过低/行为差异时，错误信息来自 git。
+
+## 质量分析后的修订（`docs/arch/worktree/review.md`）
+
+| review 风险 | 处置 |
+|---|---|
+| P0 注入点（`cwd` 同时喂提示词与 skill 根） | **拆「工作区 / 项目根」两量**；注入点上移至 `Config::from_env()` 之后、skill 扫描之前 |
+| P1 降级语义与用户裁定不符 | **`attach` 响亮警告 + 回退共享工作区继续启动**；`create`/`remove` 是显式动作 ⇒ 硬失败 |
+| P1 陈旧 registration（`rm -rf` 后 git 仍登记） | `create` 遇同名登记先 `git worktree prune` 重试，失败给指引 |
+| P1 项目级 `.yushan/` 缺席 | 由「项目根指向主仓」连带解决 |
+| P2 `name` 未校验（路径穿越） | 新增 `InvalidName`：非空、无 `/`/`\`、非 `.`/`..` |
+| P2 主仓名推导错 | 用 `git rev-parse --git-common-dir` 的**父目录**，不用 `--show-toplevel` |
+| P2 `remove` 脏则拒删的 UX | 透传 git 原因 + 「先 merge 或 `--force`」指引 |
+| P2 测试会真建目录/真调 git | 走 `crate::test_env::env_lock()` + `EnvRestore`，临时 git 仓内跑 |
 
 ## 关联
 

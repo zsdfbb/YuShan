@@ -1,7 +1,8 @@
 # git worktree 支持 — 架构设计
 
 > 上承 [`context.md`](./context.md)。决策记录见 [`docs/adr/0034-worktree-cli.md`](../../adr/0034-worktree-cli.md)。
-> §4 记录了并行 subagent 产出的三个候选方案；**最终形态经用户两轮裁定后，比三者都小**（见 §1 与 §4.3）。
+> 质量分析见 [`review.md`](./review.md)（本版已按其实施修订，见 §9 修订记录）。
+> §4 记录了并行 subagent 产出的三个候选方案；**最终形态比三者都小**（见 §1 与 §4.3）。
 
 ## 1. 结论先行
 
@@ -14,38 +15,64 @@
 | `remove <name>` | git 包装 | `git worktree remove <path>`（**天然留分支、脏则拒删**） |
 | **`attach <name>`** | **ys 特有** | **启动（或 resume）一个会话，工作区绑定到该树** —— git 里没有对应物 |
 
-⇒ **无工具、无斜杠命令、无中途切换、无 IPC、零核心改动。**
+⇒ **无工具、无斜杠命令、无中途切换、无 IPC、零核心 crate 改动。**
 
-**为什么这么小**：用户裁定 `attach` = 「**启动即绑定**」⇒ 一切「工作区切换」都发生在**构造点**
-（`main` 启动期）。而代码里 workspace **本来就是单点量、启动期冻结**
-（`apps/coding-agent/src/main.rs:1341-1342`：`let cwd = config.cwd.clone(); let workspace = cwd.clone();`）
-⇒ **四路扇出（`build_tools` / `working_dir` / `build_system_prompt` / `SubagentSetup`）原样不动**，
-只把「workspace 取什么值」从「恒等于 `cwd`」改成：
+### 1.1 「工作区」与「项目根」是两个量（本版新增，修订 review 的 P0）
+
+`cwd` 在启动序列里**同时喂三个消费者**，所以「工作区切到哪」不是一个自由参数：
+
+```text
+config.rs:176   cwd = current_dir()
+main.rs:1227    skill_roots = default_skill_roots(&config.cwd)   ← ① skill 根
+main.rs:1341    let cwd = config.cwd.clone();
+main.rs:1352    build_system_prompt(&cwd, …)                      ← ② 提示词（含 Current working directory
+main.rs:1375    build_system_prompt(&cwd, …)                         与 find_custom_prompt(cwd)）
+main.rs:1342    let workspace = cwd.clone()  →  build_tools(&workspace) / working_dir(...)  ← ③ 工具
+```
+
+只改 `workspace` 会让**工具在树里、提示词却说主树**；只改 `cwd` 又会让**项目级 skill 与 `.yushan/SYSTEM.md`
+全部消失**（树里没有未跟踪文件）。二者都不可接受，故本设计**显式区分两个量**：
+
+| 量 | 语义 | 取值 | 消费者 |
+|---|---|---|---|
+| **工作区（checkout）** | 当前读写发生在哪 | `attach` 时 = 树路径；否则 = `cwd` | 工具、`working_dir`、提示词的 `Current working directory` |
+| **项目根（repository）** | 这个项目是谁 | 主仓根 = `git rev-parse --git-common-dir` 的父目录；否则 = `cwd` | skill 根、`find_custom_prompt` |
+
+依据：**项目是仓库，不是某次 checkout**。worktree 只是同一个项目的一个工作副本，项目级配置应当跟着项目走。
+非 worktree 路径下两者相等 ⇒ **行为逐字节不变**。
+
+### 1.2 改动的真实位置（不是「一行」）
 
 ```rust
-let workspace = match args.worktree {
-    Some(Attach::Name(name)) => worktree::resolve(&cwd, &name)?,  // 解析到 ys 目录下的树
-    None => cwd.clone(),                                          // 现状：共享工作区
-};
+// main.rs：紧接 Config::from_env()、且在 skill 扫描（:1227）之前
+if let Some(WorktreeCmd::Attach(name)) = &args.worktree {
+    let (ws, project_root) = worktree::attach_target(&config.cwd, name)?;
+    config.cwd = ws;                    // ③ 工具 + ② 提示词 cwd 同源
+    config.project_root = project_root; // ① skill 根 + find_custom_prompt 同源
+}
 ```
+
+`Config` 新增一个 `project_root` 字段（默认 = `cwd`）；`default_skill_roots` 与 `find_custom_prompt` 改读它。
+**触及 3 个 app 文件（`main.rs` / `config.rs` / `prompt.rs`），0 个核心 crate。**
 
 ## 2. 需求与约束
 
 用户裁定（不可改）：一个需求 ⇒ 一个 worktree；CLI 四动词；`attach` = 启动即绑定；
 需求内多 agent 共用同一树、**冲突靠 skill 协商（运行时不做机制兜底）**；**只隔离不回流**；
-非 git / git 不可用 / 目标不存在 ⇒ **显式报错并指出共享工作区的退路**；不做安全/沙箱；不做 Windows。
+**非 git / git 不可用 / 目标不存在 ⇒ 显式降级**（`attach` 见 §5.3-b）；不做安全/沙箱；不做 Windows。
 
 设计约束（带指针）：
 
-- **零核心改动的前提**：workspace 是启动期单点量（`main.rs:1341-1342`），且四路扇出都从它派生
+- workspace 是启动期单点量（`main.rs:1341-1342`），四路扇出全从它派生
   （`toolset.rs:88` / `AgentBuilder::working_dir` / `prompt.rs:28` / `main.rs:1362`）。
-  `attach` 只改**取值来源**，不触碰扇出。**这是本设计成立的全部理由。**
-- 工具**构造期捕获** workspace（`tools-basic/src/read.rs:48` 等）⇒ 工作区必须在建工具**之前**定死
-  —— 启动期解析恰好满足。
+- 工具**构造期捕获** workspace（`tools-basic/src/read.rs:48` 等）⇒ 工作区必须在建工具**之前**定死。
+- 项目级 skill 根取 `config.cwd`（`main.rs:1227` → `config.rs:321-331`）；自定义 prompt 取
+  `cwd/.yushan/SYSTEM.md`（`prompt.rs:323-327`）⇒ 两者**都要跟项目根走**（§1.1）。
 - **参数解析是手写的** `parse_args`（`main.rs:161-222`），match 首 token。加 `"worktree"` 臂是纯增量；
-  ⚠️ 注意今天的 `_ =>` 兜底会**静默忽略**非 flag 首 token（`ys-coding-agent worktree` 现在会直接进交互模式）。
+  ⚠️ 今天的 `_ =>` 兜底会**静默忽略**非 flag 首 token（`ys-coding-agent worktree` 现在会直接进交互模式）。
+- `parse_args` 之后立刻是 `Config::from_env()`（`main.rs:1207`） ⇒ `worktree list/create/remove`
+  **在此前分流并早退**（它们不需要 model / session / TUI）；`attach` 继续走正常启动。
 - `ys-core`/`ys-event`/`ys-protocol` **零 tokio** ⇒ git 只在 apps 层调。
-- `capabilities.rs` 绝不 print；但 CLI 子命令走的是 **stdout/stderr**（非 transcript），与 `-p`/`--json` 同侧。
 - **prompt cache**：cwd 与 `<project_instructions path="…">` 都进提示词文本（`prompt.rs:60-64,69`）
   ⇒ **每个 worktree 一份前缀**，首次 attach 首轮 cache miss。
 - 全仓**零 git 调用**；`.gitignore` 不含 `.worktrees/` / `.yushan/`。
@@ -59,18 +86,17 @@ let workspace = match args.worktree {
 
   其「Alternatives considered」明确否决 **自动建 worktree**（「创建/命名/合并策略/清理都是部署决策」）
   与 **把写范围当锁**（「外部写者绕过锁、崩溃持有者永久占位、路径前缀重叠无法证明语义独立，
-  **假互斥比显式警告更危险**」）。⇒ 支持「隔离交给部署（CLI/启动参数）、冲突交给 skill」。
+  **假互斥比显式警告更危险**」）。
 - **Claude Code**：`--worktree/-w` 启动即进树（本设计的直接对应物）；`.claude/worktrees/<name>/`、分支
   `worktree-<name>`；另有 `EnterWorktree`/`ExitWorktree` 工具（**中途切换**）。
   ⚠️ 那两个工具带来**两个已记录 bug**：#76250（会话级共享 CWD 槽 ⇒ 并发 subagent 跨树误改）、
-  #33（切换是会话级副作用 ⇒ 并行 agent 共享一树）。**本设计只取 `--worktree` 形态、不取工具，正是为了
-  绕开这两个 bug**（不切换，就不存在会话级 CWD 副作用）。
+  #33（切换是会话级副作用 ⇒ 并行 agent 共享一树）。**本设计只取 `--worktree` 形态、不取工具**。
 - **`tmp/Codewhale/crates/lane/src/worktree.rs`**（Rust 554 行）：`git worktree add -b <branch> <path> <base>`；
   清理前用 `git worktree list --porcelain` + `.git` 的 `gitdir:` 确认 git 认它是本仓托管的树；
-  删分支用 `-d` 不 `-D`（「a branch carrying unmerged commits is someone's work, and a TTL timer is not a
-  mandate to throw it away」）。**其 TTL 与安全闸不采纳**（本设计无自动清理，见 §5.3-c）。
+  删分支用 `-d` 不 `-D`。**其 TTL 与安全闸不采纳**（本设计无自动清理）；**采纳**其「主仓根由
+  `worktree list` 首条给出」的思路（本设计用 `--git-common-dir`，见 §5.2）。
 - **`tmp/pi/.../resource-loader.ts` 的 `findShadowedContextFile`**：嵌套 worktree 会**重复加载**主仓同名
-  上下文文件 ⇒ 直接支持「落仓库外」（§5.3-d）。
+  上下文文件 ⇒ 支持「落仓库外」（§5.3-d）；其 `dirname(commonGitDir)` 也正是 §5.2 取的**主仓根**。
 - **生态编排器**（vmux/dmux/parallel-code/CLITrigger/Baton）一律「一任务 = 一分支 = 一 worktree、review
   diff 再合并」；`pact` 自陈 file-claim coordination「not yet reliable under concurrency」。
 
@@ -99,14 +125,9 @@ let workspace = match args.worktree {
 
 ### 4.3 最终形态不在三者之中（且更小）
 
-用户裁定 `attach` = **启动即绑定** ⇒ 「中途切换」这个前提消失了：
-
-- **上卷机制**（A 的信元 / B·C 的挂载点）**整块删掉** —— 没有中途意图要上卷；
-- **`assembly.rs` 重构整块删掉** —— 一个进程只有一个工作区，无需把四路扇出收成可重建的工厂；
-- **工具、`Request::Worktree`、命令表项全部删掉**；
-- ⇒ **净新增 = 一个 `worktree.rs` + `parse_args` 一个 match 臂 + `workspace` 取值改一处。**
-
-这也顺带删掉了候选 A/C 共同的、无法回避的**「同回合不生效」**问题 —— 不切换就没有生效延迟。
+用户裁定 `attach` = **启动即绑定** ⇒ 「中途切换」这个前提消失了：上卷机制（A 的信元 / B·C 的挂载点）
+与 `assembly.rs` 重构**整块删掉**；工具、`Request::Worktree`、命令表项也删掉。⇒ 净新增 =
+一个 `worktree.rs` + `parse_args` 一个 match 臂 + `attach` 的注入（§1.2，3 个 app 文件）。
 **B/C 被否的理由**（穿核心 crate、仓库内落点）在 §5.3 保留。
 
 ## 5. 推荐方案
@@ -120,31 +141,33 @@ ys-coding-agent worktree list              # 列出 ys 目录下的工作树（�
 ys-coding-agent worktree remove <name>     # 删树：直套 git worktree remove（留分支、脏则拒删）
 ```
 
-`attach` **要求树已存在**（否则报错并指向 `create`）—— 与 `create` 分离是有意的：
-创建与绑定是两个动作，`create` 可脱离会话先跑。
+`attach` **要求树已存在**（否则见 §5.3-b 的降级）。`create` / `attach` 分离是有意的：创建与绑定是两个动作。
 
 ### 5.2 模块与接口
 
 ```rust
 // 新：apps/coding-agent/src/worktree.rs —— 唯一 git 调用点
 pub fn dir() -> PathBuf;                            // ~/.yushan/worktrees/（YUSHAN_WORKTREES_DIR 覆盖）
-pub fn path_for(repo: &Path, name: &str) -> PathBuf; // <dir>/<repo>-<name>
-pub fn repo_root(cwd: &Path) -> Result<PathBuf, WorktreeError>;  // git rev-parse --show-toplevel
+pub fn main_repo(cwd: &Path) -> Result<RepoInfo, WorktreeError>;  // ← 主仓根 + 名
+pub fn path_for(repo_name: &str, name: &str) -> Result<PathBuf, WorktreeError>;  // 校验后拼接
 pub fn create(repo: &Path, name: &str) -> Result<Entry, WorktreeError>;
 pub fn list(repo: &Path) -> Result<Vec<Entry>, WorktreeError>;
 pub fn remove(repo: &Path, name: &str) -> Result<(), WorktreeError>;
-pub fn resolve(repo: &Path, name: &str) -> Result<PathBuf, WorktreeError>;  // attach 用
+pub fn attach_target(cwd: &Path, name: &str) -> Result<(PathBuf, PathBuf), WorktreeError>; // (工作区, 项目根)
 
+pub struct RepoInfo { pub root: PathBuf, pub name: String }
 pub struct Entry { pub name: String, pub path: PathBuf, pub branch: Option<String>, pub dirty: bool }
-pub enum WorktreeError { NotARepo, GitUnavailable, AlreadyExists(String), NotFound(String), Git(String) }
+pub enum WorktreeError { NotARepo, GitUnavailable, InvalidName(String), NotFound(String), Git(String) }
 ```
 
+**主仓根/名的取法**（修订 review 风险 6）：用 `git rev-parse --git-common-dir` 的**父目录**，
+**不是** `--show-toplevel` —— 后者在树内运行时返回的是**树根**，会派生出 `YuShan-feat-<name>` 这种错名。
+（`tmp/pi` 的 `dirname(commonGitDir)` 同款。）
+
 ```rust
-// 改：apps/coding-agent/src/main.rs
+// 改：apps/coding-agent/src/main.rs（§1.2）+ config.rs（新增 project_root 字段）+ prompt.rs
 struct Args { mode: Mode, stats: bool, resume: Resume, worktree: Option<WorktreeCmd> }
 enum WorktreeCmd { Create(String), Attach(String), List, Remove(String) }
-// parse_args：match 首 token 加 "worktree" 臂（纯增量，见 §2 的注意点）
-// main：workspace 取值改为「Attach ⇒ resolve()，否则 cwd」（§1 的 6 行）
 ```
 
 **不改**：`ys-protocol` / `ys-tui-coding` / `ys-tool` / `ys-runtime` / `ys-loop` / `tools-basic`。
@@ -155,13 +178,16 @@ enum WorktreeCmd { Create(String), Attach(String), List, Remove(String) }
 路径与命令；创建是**进程级副作用**，CLI 天生合适；覆盖面最广（**用户 shell / 模型经 `bash` 工具 /
 skill 文本 / CI 脚本**都能调）。且它消灭了「工具返回『下回合生效』」这个说不出实话的契约。
 
-**b. `attach` = 启动即绑定**（用户裁定）⇒ 无中途切换 ⇒ 零核心改动、无 deferred 语义、无 IPC。
-`attach` 是四个动词里**唯一没有 git 对应物**的，因为「绑定会话」不是 git 操作。
+**b. 降级：`attach` 回退、`create`/`remove` 硬失败**（修订 review 风险 2，与用户原裁定对齐）。
+- `attach` 在非 git / git 不可用 / 树不存在时 ⇒ **响亮警告 + 以共享工作区继续启动**（用户已明确要
+  「显式降级为共享工作区」；此处自动回退并继续，正是这个语义）。
+- `create` / `remove` 是**显式动作**，语义不该被静默改写 ⇒ **硬失败**（非零退出 + 明确原因 + 退路提示）。
 
-**c. `remove` 直套 `git worktree remove`，不写自定义安全闸。** 该命令**天然留分支、脏则拒删**
-—— 恰好就是「只隔离不回流」要的策略，免费获得。Codewhale 的 `is_managed_worktree` 安全闸是为了防
-**自动清理**误删陈旧记录，而本设计**不引入 TTL / ledger / 自动清理**，故无此前提。（若将来加自动清理，
-须回头补那道闸。）
+**c. `remove` 直套 `git worktree remove`，不写自定义安全闸。** 该命令**天然留分支、脏则拒删** ——
+恰好是「只隔离不回流」要的策略，免费获得。Codewhale 的 `is_managed_worktree` 安全闸是为防**自动清理**
+误删陈旧记录，而本设计**不引入 TTL / ledger / 自动清理**，故无此前提。（将来若加自动清理，须回头补。）
+⚠️ 需把 git 的**拒删原因透传给用户**（修订 review 风险 7）：提示「该树有未提交改动，先 merge 或
+`--force`」——否则用户只看到一句失败。
 
 **d. 落点仓库外** `~/.yushan/worktrees/<repo>-<name>/`。三条理由：① `EXCLUDED_DIRS`
 （`tools-basic/src/lib.rs:44`）不含 worktree 根 ⇒ 仓库内落点会被 `grep -r`/`find` 搜进完整副本；
@@ -169,45 +195,71 @@ skill 文本 / CI 脚本**都能调）。且它消灭了「工具返回『下回
 `AGENTS.md` 与主仓的会**两份都进上下文**（`tmp/pi` 专门修过）；③ 不污染主树 `git status`。
 
 **e. 不自动回收、无 TTL。** 「只隔离不回流」⇒ 自动删会毁掉未 merge 的工作（deepseek-harness 的
-「清理是部署决策」同旨）。回收 = 用户显式 `remove`。
+「清理是部署决策」同旨）。
 
-**f. 不引入 ledger / 元数据存储。** `list` 从 `git worktree list --porcelain` 现算即可，
-ys 目录前缀天然把「我们的树」筛出来。
+**f. 不引入 ledger / 元数据存储。** `list` 从 `git worktree list --porcelain` 现算。
+
+**g. 陈旧 registration 的处置**（修订 review 风险 3）：用户的 `rm -rf ~/.yushan/worktrees/…` 是常见动作，
+git 仍持有登记 ⇒ 同名 `create` 会报 `already registered`。⇒ `create` 在**同名路径不存在但 git 仍登记**时，
+先 `git worktree prune` 再重试一次；仍失败则错误信息直接给 `git worktree prune` 指引。
+
+**h. `name` 必须校验**（修订 review 风险 5）：非空、不含 `/` 与 `\`、不等于 `.` / `..`、不含路径分隔符。
+否则 `path_for` 可被 `../` 带出 ys 目录（`create` 会因此在任意位置建树）。违反 ⇒ `InvalidName`。
 
 ### 5.4 成本
 
 | 项 | 值 |
 |---|---|
 | `create` | 一次 `git worktree add`（中仓 ~0.5–2s，I/O bound，建树即 checkout） |
-| `attach` | 一次 `git rev-parse` + `resolve` 路径拼接；**启动路径其余部分零变化** |
+| `attach` | 一次 `rev-parse --git-common-dir` + 路径拼接；**启动路径其余部分零变化** |
 | 子进程输出污染 | **自动满足** —— CLI 是独立进程，stdout/stderr 由终端或 `bash` 工具捕获，碰不到 TUI raw mode |
 | 首次 attach 的首轮 | 该树一份新 prompt 前缀 ⇒ 一次 cache miss（cwd + `project_instructions` 路径进文本） |
+| `list` | `dirty` 每树一次 `git status --porcelain` ⇒ 树多时 N 次子进程（文档写明；必要时加 `--dirty` 开关） |
 
 ## 6. 分阶段落地
 
-- **P0**：`worktree.rs` + `parse_args` 加 `worktree` 子命令；`create` / `list` / `remove`（三个 git 薄包装）
-  + 落点/命名/`YUSHAN_WORKTREES_DIR` + `WorktreeError` 三态降级文案。
-- **P1**：`attach` —— `main` 的 `workspace` 取值改点（§1 的 6 行）+ 树不存在/非 git 时的显式报错与退路提示。
-- **P2（增量）**：`SessionMeta.workspace` 只读记录（`#[serde(default)]`）⇒ `--resume` 时提示「本会话原在
-  工作树 X，当前在主树 Y」，避免**静默错位**。
-- **P3（可延后）**：`attach --create-if-missing`；`/status` 显示当前是否在树内。
+- **P0**：`worktree.rs`（含 §5.3-g/h 与 §5.2 的主仓根取法）+ `parse_args` 加 `worktree` 子命令与
+  **早期分流早退**；`create` / `list` / `remove` 三个 git 薄包装 + `WorktreeError` 四态。
+- **P1**：`attach` + §1.2 的三文件注入（`project_root` 新字段）⇒ 工具 / 提示词 / 项目配置三者同源。
+  含 §5.3-b 的降级回退与项目级 `.yushan/` 缺席的**响亮警告**。
+- **P2**：`SessionMeta.workspace` 只读记录（`#[serde(default)]`）⇒ `--resume` 提示工作区错位
+  （**升为 P1 级重要性**：不做则 `--resume` 静默落回主树）。
+- **P3（可延后）**：`attach --create-if-missing`；`/status` 显示当前是否在树内；`list --dirty` 开关。
 
 ## 7. 已知风险与待验证项
 
-- [ ] **session ↔ worktree 无绑定**：`attach` 起的会话不记录工作区 ⇒ 之后裸 `--resume` 会落回**主树**，
-      历史与工作区错位。P2 的 `SessionMeta.workspace` 是缓解（提示而非自动切换）。
-- [ ] **项目级 `.yushan/`（skills / SYSTEM.md）在树内缺席**（未跟踪文件不随 checkout 搬）⇒ 同一 agent
-      在两棵树里**行为漂移**。P1 须在 `attach` 时**明示**。
-- [ ] **首次 attach 首轮 cache miss**（每树一份前缀）。
+- [x] ~~`attach` 的注入点未定~~ ⇒ 已定为 §1.1/§1.2 的「工作区 vs 项目根」双量。
+- [x] ~~降级语义与裁定不符~~ ⇒ 已定为 §5.3-b。
+- [x] ~~陈旧 registration~~ ⇒ 已定 §5.3-g。
+- [x] ~~`name` 未校验~~ ⇒ 已定 §5.3-h。
+- [x] ~~主仓名推导错~~ ⇒ 改用 `--git-common-dir`（§5.2）。
+- [ ] **`SessionMeta.workspace` 未落地前，`--resume` 会静默落回主树**（P2 缓解）。
+- [ ] **首次 attach 首轮 cache miss**（每树一份前缀）—— 已知代价，不可免。
+- [ ] **`build_system_prompt` / `default_skill_roots` 签名变更**会牵动既有 prompt/config 测试基线
+      ⇒ P1 须同步更新（避免「改了签名、测试却还在断言旧形参」）。
+- [ ] **测试纪律**：`create`/`remove` 会真调 git、真建目录 ⇒ 必须走 `crate::test_env::env_lock()` +
+      `EnvRestore` 改 `YUSHAN_WORKTREES_DIR`，并在临时 git 仓内跑（`test_env.rs:1-40` 的既有约定）。
 - [ ] **同名仓库撞名**：`<repo>-<name>` 在「不同路径、同名目录」的两个仓库间会撞 ⇒ 是否加短 hash（待定）。
-- [ ] `attach` 时树不存在 ⇒ 报错（**暂定**；`--create-if-missing` 留 P3）。
-- [ ] **将来加自动清理时**须补回 Codewhale 的 `is_managed_worktree` 安全闸（防陈旧记录变无界递归删）。
-- [ ] **非 git 仓库**下四个动词都不可用 ⇒ 明确报错，并指出「不带子命令即共享工作区启动」的退路。
-- [ ] 建议用 `prototype` 验证：① worktree 内 `build_system_prompt` 的实际加载差异（尤其 `.yushan/`）；
-      ② `attach` 与 `--resume` / `-p` / `--json` 的组合行为。
+- [ ] 建议用 `prototype` 验证：① worktree 内 `build_system_prompt` 的实际加载差异（`.yushan/` 缺席）；
+      ② `attach` 与 `-p` / `--json` / `--resume` 的组合行为。
 
 ## 8. 相关文档
 
 - [`context.md`](./context.md) — 上下文与约束
+- [`review.md`](./review.md) — 质量分析（本版的修订来源）
 - [`../../adr/0034-worktree-cli.md`](../../adr/0034-worktree-cli.md) — 决策记录
 - [`../../design-final/coding-agent-tui.md`](../../design-final/coding-agent-tui.md) §13 — subagent 派发与 workspace 继承的 as-built
+
+## 9. 修订记录（相对 `review.md`）
+
+| review 风险 | 级别 | 处置 |
+|---|---|---|
+| 1 注入点（`cwd` 同时喂提示词与 skill 根） | P0 | **§1.1/§1.2**：拆成「工作区」与「项目根」两量；注入点上移到 `Config::from_env` 之后、skill 扫描之前 |
+| 2 降级语义与裁定不符 | P1 | **§5.3-b**：`attach` 回退并继续；`create`/`remove` 硬失败 |
+| 3 陈旧 registration | P1 | **§5.3-g**：`create` 遇同名登记先 `prune` 重试，失败给指引 |
+| 4 项目级 `.yushan/` 缺席 | P1 | **§1.1**：项目根指向主仓 ⇒ 项目 skill / 自定义 prompt **照常可见**（连带解决） |
+| 5 `name` 未校验 | P2 | **§5.3-h**：`InvalidName` |
+| 6 主仓名推导错 | P2 | **§5.2**：`--git-common-dir` 的父目录 |
+| 7 `remove` 脏则拒删的 UX | P2 | **§5.3-c**：透传原因 + merge/`--force` 指引 |
+| 8 测试会真建目录 | P2 | **§7**：`env_lock` + `EnvRestore` + 临时仓 |
+| 9 术语未入 `CONTEXT.md` | P3 | 待定（设计尚为「提议」；落地后再登记） |

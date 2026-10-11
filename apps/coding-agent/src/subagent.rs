@@ -238,13 +238,17 @@ impl SubagentSetup {
     /// 产物目录**由装配方显式给出**（不在构造期隐式读 `YUSHAN_SUBAGENTS_DIR` / `HOME`）——
     /// 落点决策与 `WebConfig::from_env` / `sweep_fetched` 同在装配点完成，且测试可注入
     /// 临时目录，不会写进用户的 `~/.yushan/subagents/`。
-    pub fn new(
+    ///
+    /// `dir` 以 `Arc` 传入、**跨重建共享**（供 [`crate::assembly::AgentFactory`] 用）：
+    /// 工作区切换时同一进程内会多次重建本结构，共享同一份产物目录描述（`Arc` 只复制
+    /// 指针），落点与 sweep 档位因此跨重建一致。
+    pub fn shared(
         child_prompt: String,
         child_limits: RunLimits,
         child_budget: Duration,
         workspace: PathBuf,
         web: WebConfig,
-        dir: SubagentsDir,
+        dir: Arc<SubagentsDir>,
     ) -> Self {
         Self {
             child_prompt,
@@ -252,7 +256,7 @@ impl SubagentSetup {
             child_budget,
             workspace,
             web,
-            dir: Arc::new(dir),
+            dir,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -260,11 +264,6 @@ impl SubagentSetup {
     /// 派发工具的外闸（子预算 + 宽限，构造期注入）。
     pub fn outer_timeout(&self) -> Duration {
         self.child_budget + OUTER_GRACE
-    }
-
-    /// 启动期清理产物目录（只对 Primary 档；`Override` 档只写不删）。
-    pub fn sweep_old_products(&self) {
-        self.dir.sweep_old();
     }
 
     /// 造一份 runner（每回合一次 ⇒ 派发计数器天然 per-turn）。

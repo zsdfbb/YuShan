@@ -41,6 +41,7 @@
 //! 的先后无关。
 
 mod app_loop;
+mod assembly;
 mod capabilities;
 mod channel;
 mod config;
@@ -56,6 +57,7 @@ mod subagent;
 mod toolset;
 mod view;
 mod wiring;
+mod worktree;
 
 /// 测试专用：进程级 env 互斥与恢复，供各模块测试复用。
 #[cfg(test)]
@@ -105,6 +107,22 @@ enum Resume {
     Id(String),
 }
 
+/// `worktree` 子命令（CLI 四动词）。
+///
+/// `create` / `attach` 的名参可省（`None` ⇒ 自动命名 / 列表选取）；`list` 无参；
+/// `remove` 必须有名字。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeCmd {
+    /// `worktree create [name]`：建树（`None` ⇒ `worktree::auto_name()`）。
+    Create(Option<String>),
+    /// `worktree attach [name]`：启动即绑定工作区（`None` ⇒ 列表选取）。
+    Attach(Option<String>),
+    /// `worktree list`：列出受管工作树。
+    List,
+    /// `worktree remove <name>`：删树（留分支、脏则拒删）。
+    Remove(String),
+}
+
 /// 解析后的命令行参数。
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -113,6 +131,8 @@ struct Args {
     stats: bool,
     /// 启动期会话形态。
     resume: Resume,
+    /// `worktree` 子命令；`None` = 未走该子命令。
+    worktree: Option<WorktreeCmd>,
 }
 
 /// 循环剥离「模式 flag 之后、任务文本之前」的 flag 区。
@@ -160,11 +180,7 @@ fn split_leading_flags(rest: &[String]) -> (bool, Resume, &[String]) {
 /// 歧义）。
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let Some(first) = argv.first().map(String::as_str) else {
-        return Ok(Args {
-            mode: Mode::Interactive,
-            stats: false,
-            resume: Resume::New,
-        });
+        return Ok(new_interactive());
     };
 
     if let Some(id) = first.strip_prefix("--resume=") {
@@ -172,6 +188,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             mode: Mode::Interactive,
             stats: false,
             resume: Resume::Id(id.to_string()),
+            worktree: None,
         });
     }
 
@@ -186,6 +203,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     mode: Mode::Print(task),
                     stats,
                     resume,
+                    worktree: None,
                 })
             }
         }
@@ -199,6 +217,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     mode: Mode::Json(task),
                     stats,
                     resume,
+                    worktree: None,
                 })
             }
         }
@@ -206,18 +225,132 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             mode: Mode::Interactive,
             stats: false,
             resume: Resume::Pick,
+            worktree: None,
         }),
+        "worktree" => parse_worktree(&argv[1..]),
         // 未知 flag：仅当它出现在**首个**位置时才算 flag（其余位置属任务文本）。
         // 单独的 `-` 视为普通参数（约定：读 stdin 的占位，本轮不支持）。
         f if f.starts_with('-') && f != "-" => Err(format!(
             "未知参数：{f}（可用：-p [--stats] [--resume[=<id>]] <任务> | --json ... | [--resume[=<id>]]）"
         )),
-        // 无 flag：交互式。
-        _ => Ok(Args {
-            mode: Mode::Interactive,
-            stats: false,
-            resume: Resume::New,
+        // 无 flag：交互式。**非 flag 首 token 的静默 Interactive 行为保持不变**
+        // （`worktree` 已由上面的臂截获，故此兜底只处理任务无关的裸词）。
+        _ => Ok(new_interactive()),
+    }
+}
+
+/// 默认的交互式 [`Args`]（无 worktree 子命令）。
+fn new_interactive() -> Args {
+    Args {
+        mode: Mode::Interactive,
+        stats: false,
+        resume: Resume::New,
+        worktree: None,
+    }
+}
+
+/// 解析 `worktree` 子命令（`argv` 为 `worktree` 之后的 token）。
+///
+/// 未知动词 ⇒ `Err`。`create` / `attach` 的名参可选（`create` 多参 / `remove` 缺名 ⇒ `Err`）。
+fn parse_worktree(argv: &[String]) -> Result<Args, String> {
+    let Some(verb) = argv.first().map(String::as_str) else {
+        return Err(
+            "worktree 需要一个动词：create [name] | attach [name] | list | remove <name>".into(),
+        );
+    };
+    match verb {
+        "create" => Ok(Args {
+            worktree: Some(WorktreeCmd::Create(optional_name(&argv[1..], "create")?)),
+            ..new_interactive()
         }),
+        "list" => {
+            if argv.len() > 1 {
+                return Err("worktree list 不接受参数".into());
+            }
+            Ok(Args {
+                worktree: Some(WorktreeCmd::List),
+                ..new_interactive()
+            })
+        }
+        "remove" => {
+            let Some(name) = argv.get(1).filter(|_| argv.len() == 2) else {
+                return Err("worktree remove 需要一个名字：worktree remove <name>".into());
+            };
+            Ok(Args {
+                worktree: Some(WorktreeCmd::Remove(name.clone())),
+                ..new_interactive()
+            })
+        }
+        "attach" => parse_worktree_attach(&argv[1..]),
+        other => Err(format!(
+            "未知的 worktree 动词：{other}（可用：create / attach / list / remove）"
+        )),
+    }
+}
+
+/// `create [name]` 的可选名参：0 参 ⇒ `None`（自动命名），1 参 ⇒ `Some`，更多 ⇒ `Err`。
+///
+/// **以 `-` 开头的名参一律报错**：名参与模式 flag 在语法上无从区分，若不拦，单独一个
+/// token（如 `worktree create -p`）会被当成名字、建出一棵名为 `-p` 的树。要自动命名就省略名字。
+fn optional_name(rest: &[String], verb: &str) -> Result<Option<String>, String> {
+    match rest {
+        [] => Ok(None),
+        [name] if name.starts_with('-') => Err(format!(
+            "worktree {verb} 的名字不能以 `-` 开头；如需自动命名请省略名字"
+        )),
+        [name] => Ok(Some(name.clone())),
+        _ => Err(format!("worktree {verb} 至多接受一个名字参数")),
+    }
+}
+
+/// `attach [name] [模式 flag...]`：名参可选（首 token 是 flag 则无名），其后按顶层模式解析
+/// ——`attach` 可带 `-p` / `--json` / `--resume[=<id>]`（设计 §5.1）。
+fn parse_worktree_attach(rest: &[String]) -> Result<Args, String> {
+    let (name, tail) = match rest.first().map(String::as_str) {
+        None => (None, &rest[0..]),
+        Some(s) if s.starts_with('-') && s != "-" => (None, rest),
+        Some(_) => (Some(rest[0].clone()), &rest[1..]),
+    };
+    let (mode, stats, resume) = parse_mode_tail(tail)?;
+    Ok(Args {
+        mode,
+        stats,
+        resume,
+        worktree: Some(WorktreeCmd::Attach(name)),
+    })
+}
+
+/// 解析 `worktree attach` 名参之后的模式 flag 区（照顶层 `parse_args` 的形态）。
+fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, Resume), String> {
+    let Some(first) = tail.first().map(String::as_str) else {
+        return Ok((Mode::Interactive, false, Resume::New));
+    };
+    if let Some(id) = first.strip_prefix("--resume=") {
+        return Ok((Mode::Interactive, false, Resume::Id(id.to_string())));
+    }
+    match first {
+        "-p" => {
+            let (stats, resume, rest) = split_leading_flags(&tail[1..]);
+            let task = rest.join(" ");
+            if task.is_empty() {
+                Err("-p 需要一个任务参数".into())
+            } else {
+                Ok((Mode::Print(task), stats, resume))
+            }
+        }
+        "--json" => {
+            let (stats, resume, rest) = split_leading_flags(&tail[1..]);
+            let task = rest.join(" ");
+            if task.is_empty() {
+                Err("--json 需要一个任务参数".into())
+            } else {
+                Ok((Mode::Json(task), stats, resume))
+            }
+        }
+        "--resume" => Ok((Mode::Interactive, false, Resume::Pick)),
+        other => Err(format!(
+            "worktree attach 只接受 -p / --json / --resume[=<id>] 与可选名字；未知参数：{other}"
+        )),
     }
 }
 
@@ -331,7 +464,7 @@ where
 /// 这正是「1M 模型在 11 万 token 就被压缩」的根因。传给 `build_agent` 的
 /// `context_window` 只是**启动时初值**：TUI 模式下 `app_loop` 每回合按当前 model
 /// 重算（`/login` / `/model` 能在运行中换到 16 倍窗口的模型）。
-fn build_agent(
+pub(crate) fn build_agent(
     system_prompt: String,
     workspace: PathBuf,
     tools: Vec<Box<dyn Tool>>,
@@ -379,7 +512,7 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
 /// **估算器不引额外依赖**：复用 `ys_loop::token`（全仓唯一的估算实现）。
 /// `serde_json::to_string` 失败（不可能：`ToolSpec` 是可序列化的纯数据）时按
 /// 空串计 —— 宁可低估，也不要让启动失败。
-fn fixed_prompt_tokens(system_prompt: &str, specs: &[ys_tool::ToolSpec]) -> usize {
+pub(crate) fn fixed_prompt_tokens(system_prompt: &str, specs: &[ys_tool::ToolSpec]) -> usize {
     ys_loop::token::estimate_text_tokens(system_prompt)
         + ys_loop::token::estimate_text_tokens(&serde_json::to_string(specs).unwrap_or_default())
 }
@@ -495,13 +628,18 @@ pub(crate) fn seed_stats(wiring: &Wiring) -> status::TurnStats {
 ///   恒为 `None`，无条件写会把 `/login` 落到 meta 的 provider 清空 —— 设计 D10
 ///   第 2 级恢复（`meta.provider` + `registry.auth_for`）便永久失效。
 /// - `thinking`：仅 `Some` 时写（`-p`/`--json` 不参与 thinking 开关）。
+/// - `workspace`：**仅某种 attach 状态时写**（`Some` = 本次工作区绑定到该树路径）。
+///   `None`（共享工作区）**不写** —— 把共享工作区（= 启动 cwd）记进 meta 是无用噪声，
+///   且下次 `--resume` 会据此做一次无意义的「恢复」。
 /// - tokens / turns：无条件写 `stats`。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_turn_meta(
     wiring: &mut Wiring,
     raw_user_text: Option<&str>,
     provider: Option<&str>,
     model: Option<&str>,
     thinking_visible: Option<bool>,
+    workspace: Option<&Path>,
     stats: &status::TurnStats,
 ) -> Result<(), SessionError> {
     let title = raw_user_text
@@ -522,6 +660,9 @@ pub(crate) async fn finalize_turn_meta(
             }
             if let Some(tv) = thinking_visible {
                 meta.thinking_visible = tv;
+            }
+            if let Some(w) = workspace {
+                meta.workspace = Some(w.to_path_buf());
             }
             meta.input_tokens = stats.total_input_tokens;
             meta.output_tokens = stats.total_output_tokens;
@@ -549,6 +690,24 @@ fn session_id_of(path: &Path) -> Option<String> {
 fn session_exit_line(path: Option<&Path>) -> Option<String> {
     let path = path.filter(|p| p.is_file())?;
     Some(format!("session: {}", session_id_of(path)?))
+}
+
+/// 退出时的工作树提示行：`worktree: <name>`（未绑定任何树时不打）。
+///
+/// 与 [`session_exit_line`] 并列、同落 **stderr**。名字取自
+/// [`app_loop::WorktreeHandle`] —— 工作区在**运行期可变**（会话内 `/resume` 可切换），
+/// 故退出行不能由启动期局部量给出，必须与回合末的 meta 写入同源。
+fn worktree_exit_line(name: &str) -> String {
+    format!("worktree: {name}")
+}
+
+/// 两路径是否指向**同一目录**：能 canonicalize 就按规范化结果比，否则按字面比。
+///
+/// 用于「显式 attach 的树」与「meta 记录的树」是否同一个 —— 二者来源不同
+/// （一者经 `path_for` 拼接、一者来自落盘 meta），字面可能差在符号链接 / `..` 上。
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    norm(a) == norm(b)
 }
 
 /// 抓取落盘文件的保留时长：超过即被启动期清理（**只对 Primary 档**生效）。
@@ -779,11 +938,16 @@ pub(crate) fn resolve_model_from_meta(
 }
 
 /// `-p` / `--json` 单回合收尾：由 meta 播种统计、`record(usage)` 后写穿 meta，
-/// 并把 `session: <id>` 打到 **stderr**（stdout 属数据流，不得污染）。
+/// 并把 `session: <id>`（以及 `worktree: <name>`，若在树内）打到 **stderr**
+/// （stdout 属数据流，不得污染）。
+///
+/// `binding` 由**工作区句柄**读出（`Some` = 绑定到某棵树），meta 的 `workspace` 与退出行
+/// 同源于它 —— 二者不可能各说一套。
 async fn persist_single_turn(
     wiring: &mut Wiring,
     raw_task: &str,
     provider: Option<&str>,
+    binding: Option<&app_loop::WorktreeBinding>,
     result: &RunResult,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stats = seed_stats(wiring);
@@ -795,11 +959,15 @@ async fn persist_single_turn(
         provider,
         model.as_deref(),
         None,
+        binding.map(|b| b.path.as_path()),
         &stats,
     )
     .await?;
     if let Some(line) = session_exit_line(wiring.session_path()) {
         eprintln!("{line}");
+    }
+    if let Some(b) = binding {
+        eprintln!("{}", worktree_exit_line(&b.name));
     }
     Ok(())
 }
@@ -1061,28 +1229,30 @@ fn resume_replay(wiring: &Wiring, resuming: bool) -> Option<Outbound<CodingView>
 /// **必须在非 async 线程上调用末尾的 UI 循环** —— 故这里只做「异步初始化 +
 /// spawn app 线程 + 跑 UI」这三件事，`rt` 由调用方持有。
 ///
-/// `limits` 是**启动时初值**（`main` 按 provider 恢复后的 model 算好）：挂到 agent
-/// 上之后由 `app_loop` 每回合覆盖 `context_window`。
+/// `agent` / `subagent` 是 [`assembly::AgentFactory`] 按启动工作区装配好的产物；
+/// `factory` 与 `default_workspace` 交给 `app_loop`，供会话内 `/resume` 换工作区时
+/// **重建** agent（[`app_loop::WorktreeHandle`] 承载运行期可变的工作区绑定，
+/// `main` 退出后读它打 `worktree:` 行）。
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     rt: tokio::runtime::Runtime,
     mut config: config::Config,
     state_store: state::StateStore,
-    system_prompt: String,
-    workspace: PathBuf,
-    tools: Vec<Box<dyn Tool>>,
-    limits: ys_component::RunLimits,
+    agent: Agent,
+    subagent: subagent::SubagentSetup,
+    factory: assembly::AgentFactory,
     startup_hint: Option<String>,
     sessions_dir: PathBuf,
     resume_path: Option<PathBuf>,
-    subagent: Option<subagent::SubagentSetup>,
+    worktree: app_loop::WorktreeHandle,
+    default_workspace: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
         ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
 
-    // 1（续）. agent（挂工具与系统提示；session/model/events 经端口传入）。
-    let agent = build_agent(system_prompt, workspace, tools, limits)?;
+    // agent 已由装配工厂按启动工作区建好（工具表 + working_dir + system prompt 三者同源）；
+    // session/model/events 经端口传入。
 
     // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
     //    有 resume 路径 ⇒ 恢复它；否则默认新会话（惰性落盘）。
@@ -1159,6 +1329,7 @@ fn run_interactive(
     // 5. app 线程（tokio worker）跑循环；当前线程跑**阻塞**的 UI 循环。
     //    app 循环唯一的失败是「UI 侧收摊」，不该惊动用户 —— 落日志即可。
     let app_session_path = session_path.clone();
+    let app_worktree = worktree.clone();
     rt.spawn(async move {
         if let Err(e) = app_loop::run(
             agent,
@@ -1171,8 +1342,11 @@ fn run_interactive(
             boundary_rx,
             out_tx,
             sink_rx,
-            subagent,
+            Some(subagent),
+            factory,
+            default_workspace,
             app_session_path,
+            app_worktree,
         )
         .await
         {
@@ -1185,7 +1359,7 @@ fn run_interactive(
 
     // UI 退出已把 `request_tx` / `boundary_tx` drop → app 线程 `recv()` 得 `None`。
     // 给一段宽限让它收摊（回合跑在半途时最多等这么久），超时连 runtime 一起丢。
-    // 宽限**先于**读快照：正在收尾的 `/new` 有机会把新路径写进来。
+    // 宽限**先于**读快照：正在收尾的 `/new` / `/resume` 有机会把新值写进来。
     rt.shutdown_timeout(APP_THREAD_GRACE);
 
     // 退出提示：`session: <id>` 落到**主屏**（alt-screen 已由 TUI 退出时恢复），
@@ -1194,9 +1368,118 @@ fn run_interactive(
     if let Some(line) = session_exit_line(session_path.get().as_deref()) {
         eprintln!("{line}");
     }
+    // `worktree:` 行取自**运行期可变**的工作区绑定快照（`/resume` 可能已切树）。
+    if let Some(b) = worktree.get() {
+        eprintln!("{}", worktree_exit_line(&b.name));
+    }
 
     tui_result?;
     Ok(())
+}
+
+/// 解析 `attach` 的目标树路径与名字。
+///
+/// 指名 ⇒ 直接用；无名 ⇒ 从受管工作树中选取（**恰一棵**则用它，否则报错并**列出候选**）。
+///
+/// 0 棵 / 多棵都用 [`worktree::WorktreeError::NoAttachTarget`]（`Display` 即完整提示）：
+/// 多棵时逐行给出**名字 + 路径**，用户可直接复制名字重试；0 棵时说明「本仓还没有工作树，
+/// 先 `worktree create`」。调用方（`main`）对这条错误**降级**为共享工作区启动。
+fn resolve_attach_target(
+    cwd: &Path,
+    name: Option<&str>,
+) -> Result<(PathBuf, String), worktree::WorktreeError> {
+    match name {
+        Some(n) => worktree::attach_target(cwd, n).map(|p| (p, n.to_string())),
+        None => {
+            let repo = worktree::main_repo(cwd)?;
+            let entries = worktree::list(&repo.root)?;
+            match entries.as_slice() {
+                [] => Err(worktree::WorktreeError::NoAttachTarget(
+                    "本仓还没有工作树（NoAttachTarget）；先用 `ys-coding-agent worktree create` 建一棵，\
+                     再 `worktree attach <名字>`（省略名字 = 从候选里选用唯一一棵）"
+                        .into(),
+                )),
+                [only] => Ok((only.path.clone(), only.name.clone())),
+                many => {
+                    let mut msg = format!(
+                        "本仓有 {} 个工作树（NoAttachTarget），请指名其一后重试：",
+                        many.len()
+                    );
+                    for e in many {
+                        msg.push_str(&format!("\n  {}  {}", e.name, e.path.display()));
+                    }
+                    Err(worktree::WorktreeError::NoAttachTarget(msg))
+                }
+            }
+        }
+    }
+}
+
+/// 执行 `worktree create` / `list` / `remove`：打印结果后**早退**（不建 runtime / 不建 agent）。
+///
+/// `create` / `remove` 是显式动作 ⇒ 失败即**硬失败**（stderr 写明原因 + 退路，退出码非零）。
+/// `list` 结果写 **stdout**（数据流），仓库头写到 **stderr**（诊断）。
+fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
+    match cmd {
+        WorktreeCmd::Create(name) => match worktree::main_repo(cwd)
+            .and_then(|repo| worktree::create(&repo.root, name.as_deref()))
+        {
+            Ok(entry) => {
+                // `worktree: <name>` 落 stderr（与 `session: <id>` 同侧同风格）。
+                eprintln!("{}", worktree_exit_line(&entry.name));
+                eprintln!("路径：{}", entry.path.display());
+                if let Some(branch) = &entry.branch {
+                    eprintln!("分支：{branch}（未合并）");
+                }
+                eprintln!("下一步：ys-coding-agent worktree attach {}", entry.name);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("创建 worktree 失败：{e}");
+                eprintln!(
+                    "退路：确认当前目录在 git 仓库内、已安装 git；若提示路径已被登记，可 `git worktree prune` 后重试。"
+                );
+                std::process::exit(1);
+            }
+        },
+        WorktreeCmd::List => {
+            let listed = worktree::main_repo(cwd).and_then(|repo| {
+                eprintln!("仓库：{}（{}）", repo.name, repo.root.display());
+                worktree::list(&repo.root)
+            });
+            match listed {
+                Ok(entries) => {
+                    for e in entries {
+                        let branch = e.branch.as_deref().unwrap_or("-");
+                        let state = if e.dirty { "dirty" } else { "clean" };
+                        println!("{}\t{}\t{}\t{}", e.name, e.path.display(), branch, state);
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("列出 worktree 失败：{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        WorktreeCmd::Remove(name) => match worktree::main_repo(cwd)
+            .and_then(|repo| worktree::remove(&repo.root, name))
+        {
+            Ok(()) => {
+                eprintln!("已删除 worktree：{name}（分支 worktree-{name} 保留）");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("删除 worktree 失败：{e}");
+                eprintln!(
+                    "退路：先 merge 该分支或清理未提交改动；确要丢弃可 `git worktree remove --force`。"
+                );
+                std::process::exit(1);
+            }
+        },
+        // `attach` 不早退（由 `main` 在进入本函数前单独处理）；此处不可达。
+        WorktreeCmd::Attach(_) => unreachable!("Attach 已由 main 提前处理，不应到达 run_worktree_early"),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1218,6 +1501,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.load_user_config(&path);
     }
 
+    // **共享工作区**：进程启动目录，在 `attach` 改写 `config.cwd` **之前**捕获。
+    // 会话内 `/resume` 到「无工作区记录」的会话时切回它（`app_loop::apply_resumed_workspace`
+    // 的第三种情形）—— 这是「绝不静默采用调用方 cwd」的落点：目标只可能是记录或此值。
+    let shared_workspace = config.cwd.clone();
+
+    // `worktree` 子命令分流（**必须早于 skill 扫描**：`attach` 改写 `config.cwd`，
+    // 而 skill 根 / 提示词 / 工具三者都从它派生，设计 §1.1/§1.2）。
+    //
+    // `create` / `list` / `remove` 是进程级动作 ⇒ 在此**执行并早退**，不建 runtime；
+    // `attach` 只把工作区换到树上（失败则响亮警告 + 保持共享工作区），随后走正常启动。
+    // 捕获的树名 / 树路径**只用于播种**启动期的绑定快照 —— 工作区在运行期可变
+    // （会话内 `/resume` 可切树），故后续读取一律走 `WorktreeHandle`（见 `app_loop`）。
+    let mut worktree_name: Option<String> = None;
+    // 本会话**当前绑定**的工作树路径（显式 attach 或从 meta 恢复时给出；否则共享工作区 ⇒ None）。
+    // 回合末据此写 `SessionMeta.workspace`：共享工作区写进去是无用噪声。
+    let mut worktree_path: Option<PathBuf> = None;
+    // 是否**显式**给了 `worktree attach`（含失败降级）。显式者优先于 meta 记录：
+    // 只要用户点名了 attach，就不再套用 meta 里的工作区（哪怕是回退到共享工作区）。
+    let explicit_attach = matches!(&args.worktree, Some(WorktreeCmd::Attach(_)));
+    match &args.worktree {
+        Some(WorktreeCmd::Attach(name)) => {
+            match resolve_attach_target(&config.cwd, name.as_deref()) {
+                Ok((path, resolved)) => {
+                    // 主仓根须在改写 `config.cwd` **之前**取（改后 cwd 已是树根）。
+                    let main_root = worktree::main_repo(&config.cwd).ok().map(|r| r.root);
+                    worktree_path = Some(path.clone());
+                    config.cwd = path;
+                    worktree_name = Some(resolved);
+                    // 项目级 `.yushan/`（skills / SYSTEM.md）是未跟踪文件，不随 `git worktree`
+                    // 迁入 ⇒ 树内不可见。主仓有则响亮告知；无则不打，免噪声。
+                    if let Some(root) = main_root
+                        && worktree::has_project_config(&root)
+                    {
+                        eprintln!(
+                            "警告：本仓有项目级配置 `.yushan/`（skills / SYSTEM.md），\
+                             但它不随 `git worktree` 迁入，本会话中不可见。"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // 显式降级（设计 §5.3-b）：响亮警告，保持共享工作区继续启动，不早退、不 panic。
+                    eprintln!("警告：无法绑定工作树（{e}）");
+                    eprintln!("将以共享工作区（{}）继续启动。", config.cwd.display());
+                }
+            }
+        }
+        Some(cmd) => run_worktree_early(cmd, &config.cwd),
+        None => {}
+    }
+
+    // 会话目录 + `--resume` 解析 —— 必须**在模型解析之前**（meta 参与模型选择），
+    // 且**在 skill 扫描之前**：meta 记录的工作区要与 `attach` 注入 `config.cwd`
+    // **同一时机**生效，而 skill 根 / 提示词 / 工具都从 `config.cwd` 派生。
+    let sessions_dir = sessions_dir();
+    let (resume_path, resume_meta) = resolve_resume(&args.resume, &sessions_dir);
+
+    // —— `--resume` 的工作区恢复（**代码在 `attach` 之后、skill 扫描之前**）——
+    //
+    // 铁律（Codex issue #4791 的教训）：`--resume` **必须**优先采用 meta 记录的工作区，
+    // **绝不**静默采用调用方的当前 cwd —— 那会扩大可写根。四情形：
+    //   · 显式 `attach` 已给定 ⇒ 显式者优先，此处不动作（仅在与记录不同时说明）；
+    //   · 有记录且树仍在 ⇒ 恢复到该树，并告知；
+    //   · 有记录但树已不在 ⇒ 明确告知后按共享工作区启动（`config.cwd` 不变）；
+    //   · 无记录 ⇒ 什么都不做、**不打任何东西**。
+    if explicit_attach {
+        if let (Some(explicit), Some(recorded)) = (
+            worktree_path.as_deref(),
+            resume_meta.as_ref().and_then(|m| m.workspace.as_deref()),
+        ) && !same_dir(explicit, recorded)
+        {
+            eprintln!(
+                "注意：本会话记录的工作树为 {}，但已按显式 attach 使用 {}。",
+                recorded.display(),
+                explicit.display()
+            );
+        }
+    } else if let Some(recorded) = resume_meta.as_ref().and_then(|m| m.workspace.clone()) {
+        if recorded.is_dir() {
+            let name = recorded
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| recorded.display().to_string());
+            eprintln!("已恢复到工作树：{name}（{}）", recorded.display());
+            config.cwd = recorded.clone();
+            worktree_name = Some(name);
+            worktree_path = Some(recorded);
+        } else {
+            eprintln!(
+                "记录的工作树已不存在（{}），本会话以共享工作区启动",
+                recorded.display()
+            );
+        }
+    }
+
     // 启动期扫描 skill（**紧跟用户配置**，设计 §关键数据流）：根顺序 = 优先级
     // （project 在前），由 `default_skill_roots` 唯一给出。诊断**不由本模块打印** ——
     // 它与 `toolset` 的降级提示合并成一条，走既有的启动期提示通道。
@@ -1232,10 +1609,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 从 state.json 加载已保存的会话状态
     let state_store = state::StateStore::new();
     let saved_state = state_store.load();
-
-    // 会话目录 + `--resume` 解析 —— 必须在**模型解析之前**：meta 参与模型选择。
-    let sessions_dir = sessions_dir();
-    let (resume_path, resume_meta) = resolve_resume(&args.resume, &sessions_dir);
 
     // 模型解析（优先级，设计 §5.6）：env 完整凭证 > resume meta（provider 须有凭证）
     // > state.json（last-active provider+model）> 第一个存有凭证的 provider。
@@ -1256,9 +1629,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // **启动时初值**：`-p`/`--json` 单次运行内不会换 provider，一次定死即可；
     // TUI 模式的窗口由 `app_loop` 每回合按当前 model 重算（见该文件）。
     //
-    // `mut` 是因为 `fixed_prompt_tokens` 只能在 system prompt 派生出来**之后**量
-    // （见下方 §压缩耦合修正）—— 本值不影响 `context_window` / `compaction`。
-    let mut limits = resolve_limits(&config);
+    // 这份是**基值**：`fixed_prompt_tokens` 由 [`assembly::AgentFactory::build`] 按每次
+    // 工作区派生出的 system prompt 量（见下方装配段），故本值不影响 `context_window`。
+    let limits = resolve_limits(&config);
 
     // 注册 model factory（适配器特有的构建逻辑）
     config.set_model_factory(|cfg| {
@@ -1332,61 +1705,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Box::new(model))
     });
 
-    // 构建工具表与 system prompt。
+    // ── 装配工厂 ──
     //
-    // 顺序即设计 §1.2「启动期」：**先探测装工具**（`toolset` 是唯一装配接缝，
-    // 探测只做一次），降级提示此刻打（TUI 未起屏 → stderr 是正确去处，见
-    // 「输出与诊断三分」）；**再由工具表派生提示词的工具清单** —— 同一份表，
-    // 清单顺序 == 注册顺序，不可能漂移。
-    let cwd = config.cwd.clone();
-    let workspace = cwd.clone();
+    // 工具表 / `working_dir` / system prompt 三者同源于 `workspace`；启动路径与会话内
+    // `/resume` 换工作区共用 [`assembly::AgentFactory`] 这一份装配序列（防漂移）。
+    // 顺序即设计 §1.2「启动期」：**先探测装工具**（`toolset` 是唯一装配接缝），
+    // **再由工具表派生提示词的工具清单** —— 同一份表，清单顺序 == 注册顺序。
+    let workspace = config.cwd.clone();
     // web 配置与模型配置**无关**（工具拿不到 `Model` 的正面利用）：`from_env()` 只读
     // env 一次并冻结，**无副作用到「清理」为止**。
     let web = WebConfig::from_env();
-    // 清理在此**显式**发生（不在 `build_tools` / `from_env` 里）：只对 Primary 档，
-    // 且必须在把 `web` 交给装配之前完成。
+    // 清理在此**显式**发生，且**只在启动期一次**：只对 Primary 档。**不进工厂** ——
+    // 工厂每次 `build`（含 `/resume` 重建）都会跑，清理塞进去会重复删用户数据。
     sweep_fetched(&web, FETCHED_MAX_AGE);
-    // 子 agent 的工具表 = 父表**去掉派发工具**（即这份 9 元基础表）—— 结构上不可能递归。
-    let (base_tools, hint) = toolset::build_tools(&workspace, web.clone());
-    let child_specs = base_tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
-    let child_prompt = prompt::build_system_prompt(&cwd, &child_specs, &catalogue);
-
-    // 子预算与主 agent **同源**（同一份 `Config`），但 `fixed_prompt_tokens` 必须填
-    // **子表**的值 —— 否则子会话会系统性晚触发压缩。
-    let mut child_limits = limits.clone();
-    child_limits.fixed_prompt_tokens = fixed_prompt_tokens(&child_prompt, &child_specs);
-    let subagent_setup = subagent::SubagentSetup::new(
-        child_prompt,
-        child_limits,
-        config.max_turn_duration(),
-        workspace.clone(),
-        web,
-        subagent::SubagentsDir::resolve(),
-    );
+    let subagents_dir = std::sync::Arc::new(subagent::SubagentsDir::resolve());
     // 产物目录清理：只清 Primary 档的超龄文件（`YUSHAN_SUBAGENTS_DIR` 只写不删）。
-    subagent_setup.sweep_old_products();
+    subagents_dir.sweep_old();
 
-    // 父表 = 基础 9 元 + 派发工具**追加末位**（子 tools JSON 仍是父的字节前缀 ⇒ 命中缓存）。
-    let mut tools = base_tools;
-    tools.push(Box::new(subagent::SubagentTool::new(
-        subagent_setup.outer_timeout(),
-    )));
-    let specs = tools.iter().map(|t| t.spec()).collect::<Vec<_>>();
-    let system_prompt = prompt::build_system_prompt(&cwd, &specs, &catalogue);
-
-    // **压缩耦合修正**（设计 §选择理由 E）：压缩触发只看 session 消息，system prompt
-    // 与工具表这**每轮固定开销**此前完全在盲区（skill 目录入场后 ~9.6k）。此处量一次
-    // 交给 `BasicLoop`，由它加在比较的**输入端**（`trigger_at` 的语义原样不动）。
-    limits.fixed_prompt_tokens = fixed_prompt_tokens(&system_prompt, &specs);
+    let factory = assembly::AgentFactory::new(
+        web,
+        catalogue,
+        limits,
+        config.max_turn_duration(),
+        subagents_dir,
+    );
+    // 一次装配：工具表 / working_dir / system prompt 三者同源于 `workspace`。
+    let assembly::BuiltAgent {
+        mut agent,
+        subagent,
+        limits: agent_limits,
+        hint: tool_hint,
+    } = factory.build(&workspace)?;
 
     // **启动期提示合并成一条**（多行、绝不互相覆盖）：工具降级 + skill 诊断
     // （遮蔽 / 非法值）+ 自定义 prompt 的代价说明 + R5 的窗口警告。
     // 去处由模式决定：TUI → `Outbound::Output`（transcript）；`-p` / `--json` → stderr。
     let hint = startup_hints(
-        hint,
+        tool_hint,
         &skill_diags,
-        custom_prompt_note(&cwd, config.skills.len()),
-        fixed_cost_note(&limits),
+        custom_prompt_note(&workspace, config.skills.len()),
+        fixed_cost_note(&agent_limits),
     );
 
     // 启动期可发现性：默认新会话且目录非空时，提示存在可恢复会话。
@@ -1394,6 +1752,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hint,
         matches!(args.resume, Resume::New) && sessions_dir_has_entries(&sessions_dir),
     );
+
+    // **工作区绑定快照**：名字 + 路径同源于启动期捕获的树名 / 树路径（attach 或 meta 恢复）。
+    // 工作区在运行期可变（会话内 `/resume` 切树），故退出行与回合末 meta 都经此句柄读，
+    // 不取固定局部量（见 `app_loop::WorktreeHandle`）。
+    let worktree_binding = worktree_name
+        .clone()
+        .zip(worktree_path.clone())
+        .map(|(name, path)| app_loop::WorktreeBinding { name, path });
+    let worktree_handle = app_loop::WorktreeHandle::new(worktree_binding);
 
     // 手工建 runtime（而非 `#[tokio::main]`）：TUI 模式的 UI 循环**必须在
     // 没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
@@ -1414,7 +1781,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
             let stats_handle = sink.stats_handle();
-            let mut agent = build_agent(system_prompt, workspace, tools, limits)?;
             let model = config.build_model();
             let mut wiring = rt.block_on(async {
                 match resume_path.clone() {
@@ -1433,12 +1799,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &stats_handle,
                 args.stats,
                 &config,
-                Some(&subagent_setup),
+                Some(&subagent),
             ))?;
+            // 单回合模式不换工作区，但退出行 / meta 仍从同一句柄读（与 TUI 路径同源）。
+            let binding = worktree_handle.get();
             rt.block_on(persist_single_turn(
                 &mut wiring,
                 &raw_task,
                 config.provider.as_deref(),
+                binding.as_ref(),
                 &result,
             ))?;
             // 预算到点 ⇒ 非零退出（正常完成路径退出码不变）。
@@ -1453,7 +1822,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (sink, rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
-            let mut agent = build_agent(system_prompt, workspace, tools, limits)?;
             let model = config.build_model();
             let mut wiring = rt.block_on(async {
                 match resume_path.clone() {
@@ -1472,12 +1840,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &stats_handle,
                 args.stats,
                 &config,
-                Some(&subagent_setup),
+                Some(&subagent),
             ))?;
+            let binding = worktree_handle.get();
             rt.block_on(persist_single_turn(
                 &mut wiring,
                 &raw_task,
                 config.provider.as_deref(),
+                binding.as_ref(),
                 &result,
             ))?;
             // 预算到点 ⇒ 非零退出（正常完成路径退出码不变）。
@@ -1490,14 +1860,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rt,
                 config,
                 state_store,
-                system_prompt,
-                workspace,
-                tools,
-                limits,
+                agent,
+                subagent,
+                factory,
                 hint,
                 sessions_dir,
                 resume_path,
-                Some(subagent_setup),
+                worktree_handle,
+                shared_workspace,
             )?;
         }
     }
@@ -1606,6 +1976,7 @@ mod tests {
                 mode: Mode::Print("hello".into()),
                 stats: false,
                 resume: Resume::New,
+                worktree: None,
             }
         );
     }
@@ -1619,6 +1990,7 @@ mod tests {
                 mode: Mode::Json("do x".into()),
                 stats: false,
                 resume: Resume::New,
+                worktree: None,
             }
         );
     }
@@ -1632,6 +2004,7 @@ mod tests {
                 mode: Mode::Interactive,
                 stats: false,
                 resume: Resume::New,
+                worktree: None,
             }
         );
     }
@@ -1670,6 +2043,7 @@ mod tests {
                 mode: Mode::Print("hi".into()),
                 stats: true,
                 resume: Resume::New,
+                worktree: None,
             }
         );
         assert_eq!(
@@ -1678,6 +2052,7 @@ mod tests {
                 mode: Mode::Json("do x".into()),
                 stats: true,
                 resume: Resume::New,
+                worktree: None,
             }
         );
     }
@@ -1692,6 +2067,7 @@ mod tests {
                 mode: Mode::Print("hi --stats".into()),
                 stats: false,
                 resume: Resume::New,
+                worktree: None,
             }
         );
         // 既有语义不破：`--help` 从来不是 flag（仅首位置判定，且此处非 `--stats`）。
@@ -1701,6 +2077,7 @@ mod tests {
                 mode: Mode::Print("--help me".into()),
                 stats: false,
                 resume: Resume::New,
+                worktree: None,
             }
         );
     }
@@ -1725,6 +2102,7 @@ mod tests {
                 mode: Mode::Interactive,
                 stats: false,
                 resume: Resume::Pick,
+                worktree: None,
             }
         );
         assert_eq!(
@@ -1733,6 +2111,7 @@ mod tests {
                 mode: Mode::Interactive,
                 stats: false,
                 resume: Resume::Id("abc".into()),
+                worktree: None,
             }
         );
         // TUI 形态下 `--resume <id>`（空格）不支持：其后参数忽略，仍为 Pick。
@@ -1742,6 +2121,7 @@ mod tests {
                 mode: Mode::Interactive,
                 stats: false,
                 resume: Resume::Pick,
+                worktree: None,
             }
         );
 
@@ -1755,6 +2135,7 @@ mod tests {
                 mode: Mode::Print("do it".into()),
                 stats: true,
                 resume: Resume::Id("x".into()),
+                worktree: None,
             }
         );
 
@@ -1765,6 +2146,7 @@ mod tests {
                 mode: Mode::Json("task".into()),
                 stats: false,
                 resume: Resume::Pick,
+                worktree: None,
             }
         );
 
@@ -1775,6 +2157,7 @@ mod tests {
                 mode: Mode::Print("hi --resume=x".into()),
                 stats: false,
                 resume: Resume::New,
+                worktree: None,
             }
         );
         assert_eq!(
@@ -1783,12 +2166,94 @@ mod tests {
                 mode: Mode::Print("abc task".into()),
                 stats: false,
                 resume: Resume::Pick,
+                worktree: None,
             }
         );
 
         // 拼错的 flag 仍报错。
         assert!(parse_args(&s(&["--nope"])).is_err());
         assert!(parse_args(&s(&["--resum=x"])).is_err());
+    }
+
+    /// `worktree` 子命令解析：四动词 + 名参可省 + 未知动词 / 缺名 ⇒ Err。
+    #[test]
+    fn parse_worktree_subcommands() {
+        assert_eq!(
+            parse_args(&s(&["worktree", "create", "x"])).unwrap(),
+            Args {
+                mode: Mode::Interactive,
+                stats: false,
+                resume: Resume::New,
+                worktree: Some(WorktreeCmd::Create(Some("x".into()))),
+            }
+        );
+        assert_eq!(
+            parse_args(&s(&["worktree", "create"])).unwrap().worktree,
+            Some(WorktreeCmd::Create(None))
+        );
+        assert_eq!(
+            parse_args(&s(&["worktree", "list"])).unwrap().worktree,
+            Some(WorktreeCmd::List)
+        );
+        assert_eq!(
+            parse_args(&s(&["worktree", "remove", "y"])).unwrap().worktree,
+            Some(WorktreeCmd::Remove("y".into()))
+        );
+        assert!(parse_args(&s(&["worktree", "explode"])).is_err());
+        assert!(parse_args(&s(&["worktree"])).is_err());
+        assert!(parse_args(&s(&["worktree", "remove"])).is_err());
+        assert!(parse_args(&s(&["worktree", "list", "extra"])).is_err());
+    }
+
+    /// `worktree create` 的名参**以 `-` 开头 ⇒ Err**（否则会把 `-p` 当名字建树）；
+    /// 省略名字仍表示自动命名。
+    ///
+    /// 变异：把 `optional_name` 的 `starts_with('-')` 守卫删掉 ⇒ `create -p` 变 `Ok`
+    /// （`Some("-p")`）⇒ 本测试红。
+    #[test]
+    fn parse_worktree_create_rejects_flag_like_name() {
+        let err = parse_args(&s(&["worktree", "create", "-p"])).unwrap_err();
+        assert!(
+            err.contains("不能以 `-` 开头"),
+            "以 `-` 开头的名字应被拒并给出提示：{err}"
+        );
+        assert!(parse_args(&s(&["worktree", "create", "--json"])).is_err());
+        // 省略名字 ⇒ 自动命名（不受守卫影响）。
+        assert_eq!(
+            parse_args(&s(&["worktree", "create"])).unwrap().worktree,
+            Some(WorktreeCmd::Create(None))
+        );
+    }
+
+    /// `attach` 名参可选，且可带 `-p` / `--json` / `--resume[=<id>]`（设计 §5.1）。
+    #[test]
+    fn parse_worktree_attach_modes() {
+        assert_eq!(
+            parse_args(&s(&["worktree", "attach", "feat"])).unwrap(),
+            Args {
+                mode: Mode::Interactive,
+                stats: false,
+                resume: Resume::New,
+                worktree: Some(WorktreeCmd::Attach(Some("feat".into()))),
+            }
+        );
+        assert_eq!(
+            parse_args(&s(&["worktree", "attach"])).unwrap().worktree,
+            Some(WorktreeCmd::Attach(None))
+        );
+        let p = parse_args(&s(&["worktree", "attach", "feat", "-p", "do it"])).unwrap();
+        assert_eq!(p.mode, Mode::Print("do it".into()));
+        assert_eq!(p.worktree, Some(WorktreeCmd::Attach(Some("feat".into()))));
+        let j = parse_args(&s(&["worktree", "attach", "--json", "--resume=x", "do"])).unwrap();
+        assert_eq!(j.mode, Mode::Json("do".into()));
+        assert_eq!(j.resume, Resume::Id("x".into()));
+        assert_eq!(j.worktree, Some(WorktreeCmd::Attach(None)));
+    }
+
+    /// N11 回归：**非 flag 首 token 的既有静默 Interactive 行为不变**。
+    #[test]
+    fn parse_non_flag_token_still_interactive() {
+        assert_eq!(parse_args(&s(&["whatever"])).unwrap(), new_interactive());
     }
 
     /// 6. `write_json_envelope`：合法 JSON、含 `event` 字段、以 `\n` 结尾；
@@ -2739,6 +3204,7 @@ mod tests {
             Some("deepseek"),
             Some("deepseek-chat"),
             None,
+            Some(Path::new("/tmp/yushan-tree")),
             &stats,
         )
         .await
@@ -2755,8 +3221,14 @@ mod tests {
         assert_eq!(meta.input_tokens, 11);
         assert_eq!(meta.output_tokens, 4);
         assert_eq!(meta.turns, 1);
+        assert_eq!(
+            meta.workspace.as_deref(),
+            Some(Path::new("/tmp/yushan-tree")),
+            "attach 状态应把工作树路径写进 meta"
+        );
 
-        // 第二次：title 幂等，tokens / turns 刷新。
+        // 第二次：title 幂等，tokens / turns 刷新；workspace 传 `None`（共享工作区）
+        // **不写**，故已落盘的记录**不得被清空**（与 provider/model 同语义）。
         stats.record(&Usage {
             input_tokens: 1,
             output_tokens: 1,
@@ -2767,6 +3239,7 @@ mod tests {
             Some("第二条"),
             Some("deepseek"),
             Some("deepseek-chat"),
+            None,
             None,
             &stats,
         )
@@ -2780,6 +3253,11 @@ mod tests {
         );
         assert_eq!(meta.turns, 2);
         assert_eq!(meta.input_tokens, 12);
+        assert_eq!(
+            meta.workspace.as_deref(),
+            Some(Path::new("/tmp/yushan-tree")),
+            "workspace 传 None 不得清空已记录的工作树"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2810,6 +3288,7 @@ mod tests {
             Some("deepseek"),
             Some("m1"),
             None,
+            None,
             &stats,
         )
         .await
@@ -2824,7 +3303,7 @@ mod tests {
             output_tokens: 1,
             ..Default::default()
         });
-        finalize_turn_meta(&mut wiring, Some("第二条"), None, None, None, &stats)
+        finalize_turn_meta(&mut wiring, Some("第二条"), None, None, None, None, &stats)
             .await
             .unwrap();
 
@@ -2903,9 +3382,15 @@ mod tests {
             final_message: None,
         };
 
-        persist_single_turn(&mut wiring, "展开前的原文", Some("deepseek"), &result)
-            .await
-            .unwrap();
+        persist_single_turn(
+            &mut wiring,
+            "展开前的原文",
+            Some("deepseek"),
+            None,
+            &result,
+        )
+        .await
+        .unwrap();
 
         let path = wiring.session_path().unwrap().to_path_buf();
         let content = std::fs::read_to_string(&path).unwrap();

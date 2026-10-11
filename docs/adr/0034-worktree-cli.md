@@ -54,8 +54,8 @@
    「提示词」（`build_system_prompt(&cwd)`，:1352/:1375）与「skill 根」+「自定义 prompt」
    （`default_skill_roots(&config.cwd)`，:1227），只改 `workspace` 会让**工具在树里、提示词却说主树**。
    正确注入点是 `Config::from_env()` 之后、skill 扫描之前，**改写单一量 `config.cwd`**；项目级配置
-   （skill 根 / `.yushan/SYSTEM.md`）在树内的一致性由 `create` 建的**软链 `.yushan`** 保证
-   （design §1.1 / §5.3-d′），**不引入第二量**。
+   （skill 根 / `.yushan/SYSTEM.md`）是未跟踪文件，不随 `git worktree` 迁入 ⇒ **树内不可见**，
+   `attach` 成功后若主仓有 `.yushan/` 则打缺失警告（design §1.1 / §5.3-d′）。**不引入第二量、不建软链。**
 2. **它顺带删掉了 A/C 无法回避的「同回合不生效」问题** —— 不切换就没有生效延迟。
 3. **它绕开 Claude Code 的两个已记录 bug**（#76250 会话级共享 CWD 槽、#33 切换是会话级副作用）——
    那两个 bug 都源于**中途切换工具**；本设计没有那个工具。
@@ -65,21 +65,28 @@
 5. **`remove` 直套 `git worktree remove`**：**天然留分支、脏则拒删** —— 恰好是「只隔离不回流」想要的策略，
    免费获得。Codewhale 的 `is_managed_worktree` 安全闸以「有自动清理」为前提，本设计不引入 TTL/ledger ⇒
    无此前提（将来若加自动清理须补回）。
-6. **落点仓库外** `$HOME/.yushan/worktrees/<仓库的 HOME 相对路径，`/`→`-`>-<name>/`
-   （如 `~/Develop/YuShan` ⇒ `~/.yushan/worktrees/Develop-YuShan-<name>/`；仓库在 HOME 外 ⇒ 绝对路径变换）：
+6. **落点仓库外** `$HOME/.yushan/worktrees/<仓库的 HOME 相对路径，逐分量作目录>/<name>`
+   （如 `~/Develop/YuShan` ⇒ `~/.yushan/worktrees/Develop/YuShan/<name>`；仓库在 HOME 外 ⇒ 用绝对路径的
+   各分量，逐分量嵌套）：
    ① 仓库内落点会被 `grep -r`/`find` 搜进完整副本
    （`EXCLUDED_DIRS`，`tools-basic/src/lib.rs:44` 不含 worktree 根）；② `load_project_context`
    （`prompt.rs:277-305`）逐级向上**全收** ⇒ 仓库内落点时 worktree 自己的 `AGENTS.md` 与主仓的会**两份都进
    上下文**（`tmp/pi` 的 `findShadowedContextFile` 专治此坑）；③ 不污染主树 `git status`。
-   HOME 相对路径前缀另使「不同路径、同名目录」的两个仓库**不再撞名**。
+   HOME 相对路径（逐分量作目录，而非拼成单个目录名）另使「不同路径、同名目录」的两个仓库**不再撞名**，
+   且 `~/a/b` 与 `~/a-b` 落点不同。
 
 7. **`create` 免起名 + 两处打印**（用户追加需求）。`create` 无参 ⇒ `auto_name()`，复用既有的
    `wiring::new_session_id()` 形态（`wiring.rs:235-240`，零新依赖、零碰撞）；`attach` 无参 ⇒ 从 `list`
    选取（照 `--resume` 无参 `Resume::Pick` 先例）。**不采纳可读名**（`bright-running-fox` 那类需要词表，
    本仓无先例；名字在可选取的前提下几乎不可见）。打印：`create` 成功打 `worktree: <name>` 到 **stderr**
    （与 **ADR-0032** 的 `session: <id>` 同侧同风格）；会话结束在既有退出行处追加同名行 + 「分支未合并」提示。
-   ⚠️ **不需要新句柄** —— 工作区在启动期定死、运行期不变，而 `SessionPathHandle` 的存在理由是会话会在
-   运行期被 `/new` 换掉（`app_loop.rs:91`）。
+   ⚠️ **（U4 修订）退出行需要新句柄** —— 原判「工作区在启动期定死、运行期不变 ⇒ 不需要
+   `SessionPathHandle` 式快照」被 U4 推翻：会话内 `/resume` 可切到一条记录了**别的**工作树的会话
+   （用户明确要求），工作区因此**运行期可变**。退出行与回合末 `SessionMeta.workspace` 改由
+   `app_loop::WorktreeHandle`（照 `SessionPathHandle` 范式）承载，`main` 在 `rt.shutdown_timeout`
+   之后读。会话内 `/resume` 换工作区**不是**「工具或斜杠命令式中途切换」（仍走既有 `/resume`
+   命令、仍在回合边界重建 Agent），故与下条「明确否决」不冲突。详见
+   [`docs/arch/worktree/design.md`](../arch/worktree/design.md) §5.3-k。
 
 ### 明确否决
 
@@ -94,6 +101,11 @@
 - ❌ **仓库内落点**（B/C）：见上。
 - ❌ **运行时做写冲突消解 / 锁**：deepseek-harness 的否决理由直接适用 ——「路径前缀重叠无法证明语义独立，
   **假互斥比显式警告更危险**」；用户也裁定下放给 skill。
+- ❌ **软链 `.yushan`（早期方案的「项目根」替代）**：git 2.54 实测 linked worktree **不读**
+  `<gitdir>/info/exclude` ⇒ 软链会把树弄脏，`remove` 需 `--force` 才能过。要消解只有两条路：
+  ① 改**用户仓库 common config**（`extensions.worktreeConfig` + `core.excludesFile`，把仓库格式升到 1），
+  ② 保留一条 `--force` 销毁路径。**均被否决** —— 用户裁定「暂时还没用到这种场景」，不为此付代价；
+  改由 `attach` 时的缺失警告承担告知。
 
 ## 后果
 
@@ -108,11 +120,13 @@
 **负面（诚实记录）**
 
 - **没有任何中途切换能力**：同一会话要换需求 = 重开（这被视为反模式：一个会话混两个需求）。
+  （U4 例外：既有 `/resume` 切到另一条会话时，工作区**随该会话记录的树**切换 —— 这是「切会话」
+  的副产物，不是「同一会话内换需求」，故与本条不矛盾。见上点 7 的 U4 修订。）
 - **session ↔ worktree 无绑定**：`attach` 起的会话不记录工作区 ⇒ 裸 `--resume` 会落回主树。需 P2 的
   `SessionMeta.workspace` 只读记录来**提示**（非自动切换）。
-- **项目级 `.yushan/`（skills / SYSTEM.md）在树内缺席**（未跟踪文件不被 checkout）—— 已由 `create` 建的
-  **软链 `<树>/.yushan` → 主仓 `.yushan`** 解决（design §5.3-d′）：项目级配置在树内**照常可见**。
-  非 worktree 路径下无软链、`cwd` 原样 ⇒ 行为逐字节不变。
+- **项目级 `.yushan/`（skills / SYSTEM.md）在树内缺席**（未跟踪文件不被 checkout）—— 裁定**不建软链**
+  （见「明确否决」），故项目级配置在树内**不可见**；`attach` 成功后若主仓有 `.yushan/` 则打一条响亮
+  警告告知用户（design §5.3-d′）。非 worktree 路径下 `cwd` 原样 ⇒ 行为逐字节不变。
 - **首次 attach 首轮 prompt cache miss**（cwd 与 `project_instructions` 路径都进提示词文本）。
 - **清理成本转嫁给用户**：不自动回收 ⇒ 须把落点约定文档化，并明确「分支永不自动删」。
 - `list`/`remove` 是薄包装 ⇒ git 版本过低/行为差异时，错误信息来自 git。
@@ -121,10 +135,10 @@
 
 | review 风险 | 处置 |
 |---|---|
-| P0 注入点（`cwd` 同时喂提示词与 skill 根） | **单量 `config.cwd`**；注入点上移至 `Config::from_env()` 之后、skill 扫描之前；一致性靠软链 |
+| P0 注入点（`cwd` 同时喂提示词与 skill 根） | **单量 `config.cwd`**；注入点上移至 `Config::from_env()` 之后、skill 扫描之前；项目级 `.yushan/` 不随树迁入 |
 | P1 降级语义与用户裁定不符 | **`attach` 响亮警告 + 回退共享工作区继续启动**；`create`/`remove` 是显式动作 ⇒ 硬失败 |
 | P1 陈旧 registration（`rm -rf` 后 git 仍登记） | `create` 遇同名登记先 `git worktree prune` 重试，失败给指引 |
-| P1 项目级 `.yushan/` 缺席 | `create` 建软链 `<树>/.yushan` → 主仓 `.yushan`（design §5.3-d′） |
+| P1 项目级 `.yushan/` 缺席 | **不建软链**；项目级 `.yushan/` 不随树迁入 ⇒ 树内不可见，`attach` 时主仓有则打缺失警告（design §5.3-d′） |
 | P2 `name` 未校验（路径穿越） | 新增 `InvalidName`：非空、无 `/`/`\`、非 `.`/`..` |
 | P2 主仓名推导错 | 用 `git rev-parse --git-common-dir` 的**父目录**，不用 `--show-toplevel` |
 | P2 `remove` 脏则拒删的 UX | 透传 git 原因 + 「先 merge 或 `--force`」指引 |

@@ -110,6 +110,10 @@ ys-coding-agent worktree attach <name>   ── main: workspace = worktree::reso
 - **CLI 子命令组**：`ys-coding-agent worktree {create, attach, list, remove}`。
   - `create` / `list` / `remove` = `git worktree {add, list, remove}` 的薄包装（`remove` 天然留分支、脏则拒删）；
   - **`attach` = 启动（或 resume）一个会话，工作区绑定到该树** —— 唯一的 ys 特有动词（git 无对应物）。
+- **`create` 可不给名字**（用户追加）：无参 ⇒ 自动命名（复用 `new_session_id` 形态）；`attach` 无参 ⇒ 列表选取。
+  避免起名麻烦，且名字不必好记。
+- **两处打印**（用户追加）：`create` 成功打 `worktree: <name>` 到 stderr（同 ADR-0032 的 `session: <id>`）；
+  会话结束在既有退出行处追加同名行 + 「分支未合并」提示。**不需要新句柄**（工作区运行期不变）。
 - **`attach` = 启动即绑定** ⇒ 无中途切换 ⇒ **零核心 crate 改动**（注入点在 `Config::from_env()`
   之后、skill 扫描之前，触及 `main.rs` / `config.rs` / `prompt.rs` 三个 **app** 文件）。
 - **需求内多 agent 共用同一 worktree**（父 + 子 agent，延续今天的继承行为）。

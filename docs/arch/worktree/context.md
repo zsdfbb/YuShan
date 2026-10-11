@@ -60,7 +60,7 @@
 ### 关键数据流（目标形态）
 
 ```
-ys-coding-agent worktree create <name>   ── git worktree add ──► $HOME/.yushan/worktrees/<仓库的 HOME 相对路径，/→->-<name>/
+ys-coding-agent worktree create <name>   ── git worktree add ──► $HOME/.yushan/worktrees/<仓库的 HOME 相对路径，逐分量作目录>/<name>
 ys-coding-agent worktree attach <name>   ── main: config.cwd = worktree::attach_target(...)
                                             └─► 四路扇出（build_tools / working_dir /
                                                 build_system_prompt / SubagentSetup）**原样不动**
@@ -70,8 +70,9 @@ ys-coding-agent worktree attach <name>   ── main: config.cwd = worktree::att
 ⚠️ 但取值来源**不是** `main.rs:1341-1342` 的 `workspace` 一行：`cwd` 同时喂
 「提示词」（`build_system_prompt(&cwd)`，:1352/:1375）与「skill 根 / 自定义 prompt」
 （`default_skill_roots(&config.cwd)`，:1227）。⇒ 注入点是**单一量 `config.cwd`**（见 `design.md` §1.1）：
-项目级配置（skill 根 / `.yushan/SYSTEM.md`）在树内的一致性，由 `create` 建的**软链 `<树>/.yushan` → 主仓 `.yushan`**
-（§5.3-d′）保证，**因此不引入第二量**。非 worktree 路径下无软链、`cwd` 原样。
+项目级 `.yushan/`（skill 根 / `.yushan/SYSTEM.md`）**不随 `git worktree` 迁入** ⇒ 树内不可见；
+`attach` 成功后若主仓有 `.yushan/` 则打缺失警告（§5.3-d′）。**不建软链、不引入第二量**；
+非 worktree 路径下 `cwd` 原样。
 
 ### 外部依赖
 
@@ -116,9 +117,9 @@ ys-coding-agent worktree attach <name>   ── main: config.cwd = worktree::att
   会话结束在既有退出行处追加同名行 + 「分支未合并」提示。**不需要新句柄**（工作区运行期不变）。
 - **`attach` = 启动即绑定** ⇒ 无中途切换 ⇒ **零核心 crate 改动**（注入点在 `Config::from_env()`
   之后、skill 扫描之前，**改写单一量 `config.cwd`**：一个 `worktree.rs` + `main.rs` 一处，`config.rs` / `prompt.rs` 不动）。
-- **落点 `$HOME/.yushan/worktrees/<仓库的 HOME 相对路径，`/`→`-`>-<name>/`**（仓库在 HOME 外 ⇒ 绝对路径变换）；
-  `create` 建树后于 `<树>/.yushan` 建**软链**指向主仓 `.yushan`（主仓无则跳过）⇒ 项目级 skill /
-  `.yushan/SYSTEM.md` 在树内照常可见。
+- **落点 `$HOME/.yushan/worktrees/<仓库的 HOME 相对路径，逐分量作目录>/<name>`**（仓库在 HOME 外 ⇒ 用绝对路径的各分量，逐分量嵌套）；
+  `create` 只做 `git worktree add`，**不建软链** ⇒ 项目级 skill / `.yushan/SYSTEM.md` 在树内**不可见**；
+  `attach` 成功后若主仓有 `.yushan/` 则向 stderr 打缺失警告。
 - **需求内多 agent 共用同一 worktree**（父 + 子 agent，延续今天的继承行为）。
 - **同工作树内的写冲突由 skill 协商**：提示词层协议，**运行时不做冲突检测/锁/合并**。
 - **只隔离不回流**：不自动合并回主树；分支保留（`git worktree remove` 默认留分支，与策略天然一致）。
@@ -153,7 +154,7 @@ ys-coding-agent worktree attach <name>   ── main: config.cwd = worktree::att
 - [x] ~~`attach` 时树不存在~~ ⇒ 已定：响亮警告 + 回退共享工作区启动（`design.md` §5.3-b）；
       是否再提供 `--create-if-missing` 仍留 P3。
 - [ ] **`SessionMeta.workspace`（只读记录）是否本轮就做**？不做则 `--resume` 会静默落回主树（P2 缓解项）。
-- [x] ~~同名仓库撞名~~ ⇒ 落点用**仓库的 HOME 相对路径**前缀（`design.md` §5.3-d），「不同路径、同名目录」不再撞。
+- [x] ~~同名仓库撞名~~ ⇒ 落点用**仓库的 HOME 相对路径**（逐分量作目录，`design.md` §5.3-d），「不同路径、同名目录」不再撞。
 - [ ] **`attach` 与 `--resume` 的组合语义**：`attach` 只定工作区、`--resume` 只定会话，两者独立可叠加？
 - [ ] **降级措辞与去处**：CLI 走 stdout/stderr（与 `-p`/`--json` 同侧），具体文案待定。
 - [ ] **skill 协商协议的边界**：只给「写目标不相交」的静态纪律，还是含「发现冲突如何让步」的动态协议？
@@ -163,6 +164,6 @@ ys-coding-agent worktree attach <name>   ── main: config.cwd = worktree::att
 
 - 设计见 [`design.md`](./design.md)（§4 保留了并行 subagent 产出的三个候选方案作决策记录）。
 - 建议用 `prototype` 验证两个假设：
-  1. 软链 `.yushan` 的实效：worktree 内 `build_system_prompt` 的项目上下文 / 项目级 skills 加载，
-     确认 `create` 建的软链使项目 skill / 自定义 prompt 在树内照常可见（含主仓无 `.yushan` 时的降级路径）。
+  1. 项目级 `.yushan/` 缺失的行为：确认 worktree 内 `build_system_prompt` 加载差异（项目 skill /
+     自定义 prompt **缺席**）与 `attach` 的缺失警告（含主仓无 `.yushan/` 时不打扰用户）。
   2. `attach` 与 `-p` / `--json` / `--resume` 的组合行为。

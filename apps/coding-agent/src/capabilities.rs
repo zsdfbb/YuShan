@@ -337,6 +337,11 @@ pub struct ResumedSession {
     pub summary: SessionSummary,
     /// 目标会话 meta 的 thinking 开关（`app_loop` 用它重设进程级镜像，见 I9）。
     pub thinking_visible: bool,
+    /// 目标会话 meta 记录的工作树路径（`app_loop` 据此**重建 agent** 切工作区）。
+    ///
+    /// `None` = 该会话未绑定工作树（回共享工作区）。**绝不**回退成调用方 cwd
+    /// —— 那会静默扩大可写根（Codex issue #4791 的教训）。
+    pub workspace: Option<PathBuf>,
     /// 目标会话的完整历史（`app_loop` 随 `SessionResumed` 交给 UI 回放）。
     pub history: Vec<Message>,
 }
@@ -409,12 +414,14 @@ pub async fn resume_session(
 
     let summary = session_summary(&path, meta.as_ref());
     let thinking_visible = meta.as_ref().map(|m| m.thinking_visible).unwrap_or(false);
+    let workspace = meta.as_ref().and_then(|m| m.workspace.clone());
     let history = wiring.session_messages().to_vec();
     (
         vec![format!("Resumed session: {}", summary.id)],
         Some(ResumedSession {
             summary,
             thinking_visible,
+            workspace,
             history,
         }),
     )

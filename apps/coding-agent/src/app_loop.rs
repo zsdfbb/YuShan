@@ -113,6 +113,63 @@ impl SessionPathHandle {
     }
 }
 
+/// 本会话**当前绑定**的工作树：名字（退出行用）+ 路径（回合末写 meta 用）。
+///
+/// 名字与路径成对出现在同一次绑定里，故合成一个值：分裂成两个 `Option` 会出现
+/// 「有名字没路径」这类不可能状态。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeBinding {
+    /// 树名（退出行 `worktree: <name>`）。
+    pub name: String,
+    /// 树绝对路径（回合末写 `SessionMeta.workspace`）。
+    pub path: PathBuf,
+}
+
+impl WorktreeBinding {
+    /// 由路径派生名字（`file_name`；无则退回整条路径的显示形态）。
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Self { name, path }
+    }
+}
+
+/// 工作区绑定的**跨生命周期快照**：`main` 启动期播种、app 循环在 `/resume` 后刷新、
+/// `main` 在 `rt.shutdown_timeout` 之后读（退出行）。
+///
+/// 形态照 [`SessionPathHandle`]：工作区在**运行期可变**（会话内 `/resume` 可切到另一棵
+/// 树的会话），故退出行不能由启动期的固定局部量给出。
+///
+/// `None` = 共享工作区（未绑定任何树）。读取失败（锁中毒）按「无绑定」处理 —— 只影响
+/// 退出行与回合末 meta 的 `workspace` 字段，不影响任何执行路径。
+#[derive(Clone, Debug, Default)]
+pub struct WorktreeHandle {
+    inner: Arc<Mutex<Option<WorktreeBinding>>>,
+}
+
+impl WorktreeHandle {
+    /// 以当前绑定播种（共享工作区给 `None`）。
+    pub fn new(binding: Option<WorktreeBinding>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(binding)),
+        }
+    }
+
+    /// 刷新快照（切换工作区后调用）。
+    fn record(&self, binding: Option<WorktreeBinding>) {
+        if let Ok(mut slot) = self.inner.lock() {
+            *slot = binding;
+        }
+    }
+
+    /// 当前绑定（`None` = 共享工作区）。
+    pub fn get(&self) -> Option<WorktreeBinding> {
+        self.inner.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
 /// app 循环的失败：只有「UI 侧已经收摊」这一种（`Outbound` 信道关闭）。
 ///
 /// 模型 / 工具失败不是循环的失败 —— `BasicLoop` 已发 `RunFailed`（UI 显示 Error
@@ -136,8 +193,16 @@ pub async fn run(
     mut boundary_rx: mpsc::Receiver<Boundary>,
     out_tx: mpsc::Sender<Outbound<CodingView>>,
     mut sink_rx: mpsc::Receiver<Envelope>,
-    subagent: Option<crate::subagent::SubagentSetup>,
+    mut subagent: Option<crate::subagent::SubagentSetup>,
+    // 装配工厂：会话内 `/resume` 换工作区时按新工作区**重建** agent（工具表 +
+    // `working_dir` + system prompt 三者一起换）。
+    factory: crate::assembly::AgentFactory,
+    // 共享工作区（进程启动目录）：`/resume` 到**无工作区记录**的会话时切回它。
+    default_workspace: PathBuf,
     session_path: SessionPathHandle,
+    // 本会话当前绑定的工作树（`None` = 共享工作区）。**运行期可变**（`/resume` 刷新）：
+    // 回合末据此写 `SessionMeta.workspace`，`main` 退出后据此打退出行。
+    worktree: WorktreeHandle,
 ) -> Result<(), AppLoopError> {
     // 回合号从 1 起（`Envelope.turn` 靠 `begin_turn` 携带）。
     let mut turns: u32 = 0;
@@ -215,12 +280,15 @@ pub async fn run(
                             ctx.stats.record(&result.usage);
                             // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
                             let model = ctx.wiring.model_id().map(str::to_string);
+                            // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
+                            let ws = worktree.get();
                             if let Err(e) = crate::finalize_turn_meta(
                                 ctx.wiring,
                                 raw,
                                 ctx.config.provider.as_deref(),
                                 model.as_deref(),
                                 Some(ctx.thinking_visible),
+                                ws.as_ref().map(|b| b.path.as_path()),
                                 ctx.stats,
                             )
                             .await
@@ -322,6 +390,19 @@ pub async fn run(
                     session_started = Instant::now();
                     // **I3：会话路径快照必须刷新** —— 否则退出提示仍指向旧会话。
                     session_path.record(wiring.session_path());
+                    // **工作区**：按目标 meta 记录重建 agent（工具表 + working_dir +
+                    // system prompt 一起换），并刷新工作区句柄。四情形见 helper 文档。
+                    if let Some(msg) = apply_resumed_workspace(
+                        &factory,
+                        &mut agent,
+                        &mut config,
+                        &mut subagent,
+                        &worktree,
+                        &default_workspace,
+                        r.workspace.as_deref(),
+                    ) {
+                        lines.push(msg);
+                    }
                     session_event = Some(Outbound::SessionResumed {
                         summary: r.summary,
                         thinking_visible: r.thinking_visible,
@@ -353,6 +434,75 @@ pub async fn run(
             session_started,
         );
         send(&out_tx, Outbound::View(view)).await?;
+    }
+}
+
+/// 会话内 `/resume` 之后，按目标 meta 的 `workspace` 决定是否**重建 agent** 切工作区。
+///
+/// 返回要附加到 `/resume` 输出里的一行（`None` = 无需/维持现状，不打）。重建成功后
+/// **工具表 / `working_dir` / system prompt / subagent** 一起换，`config.cwd` 同步刷新
+/// （UI 的 `/status` 从 `CodingView.cwd` 读到新值），工作区句柄刷新（回合末 meta 与退出行同源）。
+///
+/// # 四情形（对齐启动期 U3 的语义，但**绝不静默采用调用方 cwd**）
+///
+/// - **记录存在且树仍在** ⇒ 与当前**不同**才重建（相同则不动，不打扰用户）；
+/// - **记录存在但树已不在** ⇒ 明确告知、**保持当前工作区**（不重建）；
+/// - **无记录**且当前在工作树 ⇒ 切回共享工作区（重建），并告知；
+/// - **无记录**且当前已在共享工作区 ⇒ 不动。
+///
+/// 铁律（Codex issue #4791 的教训）：目标工作区**只**来自 meta 记录或共享工作区，
+/// 绝不回退成调用方 cwd —— 那会静默扩大可写根。
+fn apply_resumed_workspace(
+    factory: &crate::assembly::AgentFactory,
+    agent: &mut Agent,
+    config: &mut Config,
+    subagent: &mut Option<crate::subagent::SubagentSetup>,
+    handle: &WorktreeHandle,
+    default_workspace: &Path,
+    recorded: Option<&Path>,
+) -> Option<String> {
+    let current = handle.get();
+    let current_path = current
+        .as_ref()
+        .map(|b| b.path.clone())
+        .unwrap_or_else(|| default_workspace.to_path_buf());
+
+    // 目标绑定：`Some` = 记录的工作树（须存在）；`None` = 共享工作区。
+    let target: Option<WorktreeBinding> = match recorded {
+        Some(p) if p.is_dir() => Some(WorktreeBinding::from_path(p.to_path_buf())),
+        // 记录了但树已不在 ⇒ 告知并保持当前工作区，**不重建**。
+        Some(p) => {
+            return Some(format!(
+                "记录的工作树已不存在（{}），保持当前工作区不变",
+                p.display()
+            ));
+        }
+        None => None,
+    };
+    let target_path = target
+        .as_ref()
+        .map(|b| b.path.clone())
+        .unwrap_or_else(|| default_workspace.to_path_buf());
+
+    if crate::same_dir(&current_path, &target_path) {
+        return None; // 已在目标工作区（含「都在共享工作区」）⇒ 不重建。
+    }
+
+    match factory.build(&target_path) {
+        Ok(built) => {
+            *agent = built.agent;
+            *subagent = Some(built.subagent);
+            config.cwd = target_path;
+            let message = match &target {
+                Some(b) => format!("已恢复到工作树：{}（{}）", b.name, b.path.display()),
+                None => format!("已切回共享工作区（{}）", default_workspace.display()),
+            };
+            handle.record(target);
+            Some(message)
+        }
+        Err(e) => Some(format!(
+            "警告：无法切换到工作区（{e}），保持当前工作区不变"
+        )),
     }
 }
 
@@ -577,6 +727,7 @@ mod tests {
     };
 
     use crate::channel::ChannelSink;
+    use ys_tools_web::{FetchedDir, WebConfig};
 
     /// 所有跨任务 `await` 都套这个超时：死锁回归必须表现为**失败**，而不是把测试挂住。
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -628,6 +779,8 @@ mod tests {
         handle: tokio::task::JoinHandle<Result<(), AppLoopError>>,
         /// 与 app 循环共享的会话路径快照（退出提示行的取数口）。
         session_path: SessionPathHandle,
+        /// 与 app 循环共享的工作区绑定快照（退出行的取数口）。
+        worktree: WorktreeHandle,
         tmp: TempDir,
     }
 
@@ -660,12 +813,16 @@ mod tests {
         prefilled: Vec<Boundary>,
         tweak: impl FnOnce(&mut Config, &PathBuf),
     ) -> Harness {
-        spawn_app_loop_full(model, persistent, prefilled, tweak, |b| b, |_| None).await
+        spawn_app_loop_full(model, persistent, prefilled, tweak, |b| b, |_| None, None).await
     }
 
     /// 最底层起法：除 `Config` 外还允许改写 [`ys_runtime::AgentBuilder`]
     /// （例如把 [`ys_component::RunLimits::max_rounds`] 调到 app 产品默认的
     /// `u32::MAX`）—— 生产侧由 `resolve_limits` 装配的限制，测试在此显式重建。
+    ///
+    /// 最后一个参数是**启动期播种的工作区绑定**（`None` = 共享工作区）；换工作区的
+    /// 用例在此传一棵树，其余用例传 `None`。
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_app_loop_full(
         model: Box<dyn Model>,
         persistent: bool,
@@ -673,6 +830,7 @@ mod tests {
         tweak: impl FnOnce(&mut Config, &PathBuf),
         build_agent: impl FnOnce(ys_runtime::AgentBuilder) -> ys_runtime::AgentBuilder,
         subagent: impl FnOnce(&Path) -> Option<crate::subagent::SubagentSetup>,
+        worktree: Option<WorktreeBinding>,
     ) -> Harness {
         let tmp = TempDir::new("harness");
         let subagent = subagent(&tmp.0);
@@ -694,6 +852,12 @@ mod tests {
         config.api_base = None;
         config.api_key = None;
         config.provider = None;
+        // 与生产侧同规：绑定到树时启动 cwd 就是树根（`worktree attach` 改写 `config.cwd`）；
+        // 否则是共享工作区（`Config::from_env` 取 `current_dir()`，此处以临时目录顶替）。
+        config.cwd = worktree
+            .as_ref()
+            .map(|b| b.path.clone())
+            .unwrap_or_else(|| tmp.0.clone());
         tweak(&mut config, &tmp.0);
 
         let mut state_store = StateStore::new();
@@ -716,6 +880,22 @@ mod tests {
             SessionPathHandle::new(wiring.session_path().map(std::path::Path::to_path_buf));
         let app_session_path = session_path.clone();
 
+        // 与生产侧同规：启动期由 `main` 播种工作区绑定；`/resume` 后由循环刷新。
+        let worktree = WorktreeHandle::new(worktree);
+        let app_worktree = worktree.clone();
+
+        // 装配工厂（换工作区时重建 agent 用）：确定性 offline web、空 skill 目录、
+        // 临时产物目录 —— 绝不碰真实 `~/.yushan`。
+        let factory = crate::assembly::AgentFactory::new(
+            WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
+            crate::skills::catalogue(Vec::new(), crate::skills::Budget::default()),
+            ys_component::RunLimits::default(),
+            Duration::from_secs(30),
+            Arc::new(crate::subagent::SubagentsDir::at(tmp.join("subagents"), false)),
+        );
+        // 共享工作区 = harness 临时目录（生产侧是进程启动目录）。
+        let default_workspace = tmp.0.clone();
+
         for b in prefilled {
             boundaries.try_send(b).unwrap();
         }
@@ -732,7 +912,10 @@ mod tests {
             out_tx,
             sink_rx,
             subagent,
+            factory,
+            default_workspace,
             app_session_path,
+            app_worktree,
         ));
 
         Harness {
@@ -741,6 +924,7 @@ mod tests {
             outbound,
             handle,
             session_path,
+            worktree,
             tmp,
         }
     }
@@ -1471,6 +1655,7 @@ mod tests {
             outbound,
             mut handle,
             session_path: _,
+            worktree: _,
             tmp,
         } = h;
         drop(requests);
@@ -2140,8 +2325,6 @@ mod tests {
     /// `TurnCtx.subagent → make_runner → AgentPorts::with_subagent` 这条链。
     #[tokio::test]
     async fn subagent_runner_is_injected_each_turn() {
-        use ys_tools_web::{FetchedDir, WebConfig};
-
         let model = ys_model::MockModel::new("m");
         // 父第 1 轮：发一个 `subagent` 调用。
         model.push_tool_call(
@@ -2164,16 +2347,17 @@ mod tests {
                 ))])
             },
             |tmp| {
-                Some(crate::subagent::SubagentSetup::new(
+                Some(crate::subagent::SubagentSetup::shared(
                     "你是子 agent".to_string(),
                     ys_component::RunLimits::new(3),
                     std::time::Duration::from_secs(30),
                     tmp.to_path_buf(),
                     WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
                     // 产物目录注入临时路径 —— 不写进用户的 `~/.yushan/subagents/`。
-                    crate::subagent::SubagentsDir::at(tmp.join("subagents"), false),
+                    Arc::new(crate::subagent::SubagentsDir::at(tmp.join("subagents"), false)),
                 ))
             },
+            None,
         )
         .await;
 
@@ -2212,6 +2396,7 @@ mod tests {
             |_, _| {},
             |b| b.limits(ys_component::RunLimits::new(u32::MAX)),
             |_| None,
+            None,
         )
         .await;
 
@@ -2534,5 +2719,265 @@ mod tests {
         assert_eq!(v.turn_count, 2, "turns 是进程级回合序，不因切换归零");
         let turns: Vec<u32> = events_of(&msgs).iter().map(|e| e.turn).collect();
         assert!(turns.iter().all(|&t| t == 2), "{turns:?}");
+    }
+
+    // ─────────── 会话内 `/resume` 换工作区（U4）：工具 / 提示词 / meta / 退出行一致 ───────────
+
+    /// 落一条带 `workspace` 记录的目标会话（首行 meta + 一条历史）。
+    fn write_target_with_workspace(h: &Harness, id: &str, workspace: Option<PathBuf>) -> PathBuf {
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.workspace = workspace;
+        write_target_session(h, id, &meta, &[user_message("prior")])
+    }
+
+    /// 读会话文件首行 meta 的 `workspace`（测试专用）。
+    fn read_meta_workspace(path: &Path) -> Option<PathBuf> {
+        let content = std::fs::read_to_string(path).expect("会话文件应存在");
+        let first = content.lines().next().expect("应有首行 meta");
+        let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
+        meta.workspace
+    }
+
+    /// 把出站序列里的 `Output` 行拼起来（断言提示文案）。
+    fn output_text(msgs: &[Outbound<CodingView>]) -> String {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Outbound::Output(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `/resume` 能重建 model 的 harness：env 凭证齐备 + 一个「每次造全新 `MockModel`」的
+    /// factory；`script` 决定该 MockModel 的脚本化响应（切换后要跑的回合由它驱动）。
+    /// `binding` = 启动期工作区绑定。
+    async fn spawn_for_workspace(
+        binding: Option<WorktreeBinding>,
+        script: impl Fn(&MockModel) + Send + Sync + 'static,
+    ) -> Harness {
+        spawn_app_loop_full(
+            Box::new(MockModel::new("initial")),
+            true,
+            Vec::new(),
+            move |config, _tmp| {
+                config.api_base = Some("http://resume-base/v1".into());
+                config.api_key = Some("sk-resume".into());
+                config.set_model_factory(move |_| {
+                    let m = MockModel::new("resumed");
+                    script(&m);
+                    Some(Box::new(m))
+                });
+            },
+            |b| b,
+            |_| None,
+            binding,
+        )
+        .await
+    }
+
+    /// **① 记录存在且在 ⇒ 切过去**，且**工具工作区 / `CodingView.cwd` / meta / 句柄**四者一致。
+    ///
+    /// 工具工作区的观测：切换后跑一个回合，让模型发一个 `write` 相对路径调用 —— 落点由
+    /// **工具构造期捕获的工作区**决定，故文件只会落在新树里。
+    ///
+    /// 变异：删掉 `Request::ResumeSession` 臂里的 `apply_resumed_workspace` 调用 ⇒
+    /// `view.cwd` 仍是共享工作区、`probe.txt` 落错地方 ⇒ 多条断言变红。
+    #[tokio::test]
+    async fn resume_switches_to_recorded_workspace_consistently() {
+        let mut h = spawn_for_workspace(None, |m| {
+            m.push_tool_call(
+                "write",
+                serde_json::json!({"path": "probe.txt", "content": "hello"}),
+            );
+            m.push_text("done");
+        })
+        .await;
+
+        let shared = h.tmp.0.clone();
+        let tree = make_tree(&h, "tree-b");
+        let target = write_target_with_workspace(&h, "target-b", Some(tree.clone()));
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-b".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        // I2：SessionResumed 在最前；告知切树在 Output 里。
+        assert!(
+            matches!(msgs.first(), Some(Outbound::SessionResumed { .. })),
+            "SessionResumed 必须排在最前（I2）：{msgs:?}"
+        );
+        let out = output_text(&msgs);
+        assert!(
+            out.contains("已恢复到工作树：tree-b"),
+            "应告知恢复到工作树：{out}"
+        );
+        // system prompt 的 cwd（经视图透出）已是新树。
+        assert_eq!(view.cwd, tree, "视图 cwd 应切到新工作树");
+        // 工作区句柄刷成新树（退出行 / 回合末 meta 的取数口）。
+        let binding = h.worktree.get().expect("应绑定到 tree-b");
+        assert_eq!(binding.path, tree);
+        assert_eq!(binding.name, "tree-b");
+
+        // 工具的工作区：跑一个回合，`write` 相对落点只可能在新树里。
+        h.requests.send(prompt("go")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        assert!(
+            tree.join("probe.txt").is_file(),
+            "write 应落在新工作区：{tree:?}"
+        );
+        assert!(
+            !shared.join("probe.txt").exists(),
+            "不得落在共享工作区：{shared:?}"
+        );
+
+        // meta 记录新工作区（与句柄同源）。
+        assert_eq!(
+            read_meta_workspace(&target).as_deref(),
+            Some(tree.as_path()),
+            "回合末 meta.workspace 应记录新工作树"
+        );
+    }
+
+    /// **② 记录存在但树已不在 ⇒ 告知 + 保持当前工作区**（不重建）。
+    ///
+    /// 变异：把 `Some(p)` 缺失分支也当成「切到 p」⇒ 重建会失败、`view.cwd` 变成不存在的
+    /// 路径、且会打「已恢复到工作树」⇒ 断言变红。
+    #[tokio::test]
+    async fn resume_missing_recorded_workspace_keeps_current() {
+        let mut h = spawn_for_workspace(None, |m| m.push_text("done")).await;
+        let shared = h.tmp.0.clone();
+        // 记录一棵**不存在**的树。
+        let ghost = h.tmp.join("gone-tree");
+        let _ = write_target_with_workspace(&h, "target-ghost", Some(ghost.clone()));
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-ghost".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        let out = output_text(&msgs);
+        assert!(
+            out.contains("记录的工作树已不存在"),
+            "应明确告知记录的工作树不存在：{out}"
+        );
+        assert!(
+            !out.contains("已恢复到工作树"),
+            "缺失树不得声称已恢复：{out}"
+        );
+        assert_eq!(view.cwd, shared, "缺失树时保持当前（共享）工作区");
+        assert!(h.worktree.get().is_none(), "缺失树时绑定不变（仍为共享）");
+    }
+
+    /// **③ 无记录 + 当前在工作树 ⇒ 切回共享工作区**并告知。
+    ///
+    /// 变异：`None` 分支也当成「不动」⇒ `view.cwd` 仍是旧树 ⇒ 断言变红。
+    #[tokio::test]
+    async fn resume_without_recorded_workspace_returns_to_shared() {
+        let tree_dir = TempDir::new("tree_a");
+        let binding = WorktreeBinding {
+            name: "tree-a".into(),
+            path: tree_dir.0.clone(),
+        };
+        let mut h = spawn_for_workspace(Some(binding), |m| m.push_text("done")).await;
+        // 目标会话**无**工作区记录。
+        let _ = write_target_with_workspace(&h, "no-ws", None);
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "no-ws".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        let out = output_text(&msgs);
+        assert!(
+            out.contains("已切回共享工作区"),
+            "应告知切回共享工作区：{out}"
+        );
+        assert_eq!(view.cwd, h.tmp.0, "应切回共享工作区");
+        assert!(
+            h.worktree.get().is_none(),
+            "共享工作区 ⇒ 绑定清空（退出行不再打 worktree:）"
+        );
+    }
+
+    /// **④ 无记录 + 当前已在共享工作区 ⇒ 不动、不提示**（不制造噪声）。
+    ///
+    /// 变异：`None` 分支无条件重建 / 提示 ⇒ 断言变红。
+    #[tokio::test]
+    async fn resume_without_workspace_stays_in_shared_silently() {
+        let mut h = spawn_for_workspace(None, |m| m.push_text("done")).await;
+        let _ = write_target_with_workspace(&h, "no-ws", None);
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "no-ws".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        let out = output_text(&msgs);
+        assert!(
+            !out.contains("工作树") && !out.contains("共享工作区"),
+            "无记录且已在共享 ⇒ 不得打工作区切换提示：{out}"
+        );
+        assert_eq!(view.cwd, h.tmp.0);
+        assert!(h.worktree.get().is_none());
+    }
+
+    /// **⑤ 记录与当前是同一棵树 ⇒ 不重建、不提示**（`/resume` 到同一棵树的会话）。
+    ///
+    /// 变异：去掉 `same_dir` 短路 ⇒ 无条件重建并打「已恢复到工作树」⇒ 断言变红。
+    #[tokio::test]
+    async fn resume_same_recorded_workspace_is_a_noop() {
+        let tree_dir = TempDir::new("tree_a_same");
+        let binding = WorktreeBinding {
+            name: "tree-a".into(),
+            path: tree_dir.0.clone(),
+        };
+        let mut h = spawn_for_workspace(Some(binding), |m| m.push_text("done")).await;
+        let _ = write_target_with_workspace(&h, "same-ws", Some(tree_dir.0.clone()));
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "same-ws".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        let out = output_text(&msgs);
+        assert!(
+            !out.contains("已恢复到工作树"),
+            "同一棵树不得重复提示：{out}"
+        );
+        assert_eq!(view.cwd, tree_dir.0, "cwd 保持在该树");
+        assert_eq!(
+            h.worktree.get().expect("绑定应保持").path,
+            tree_dir.0,
+            "绑定保持在该树"
+        );
+    }
+
+    /// 建一个真实子目录当「工作树」（在 harness 临时目录之下）。
+    fn make_tree(h: &Harness, name: &str) -> PathBuf {
+        let dir = h.tmp.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

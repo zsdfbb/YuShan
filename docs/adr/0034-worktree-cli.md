@@ -69,6 +69,14 @@
    （`prompt.rs:277-305`）逐级向上**全收** ⇒ 仓库内落点时 worktree 自己的 `AGENTS.md` 与主仓的会**两份都进
    上下文**（`tmp/pi` 的 `findShadowedContextFile` 专治此坑）；③ 不污染主树 `git status`。
 
+7. **`create` 免起名 + 两处打印**（用户追加需求）。`create` 无参 ⇒ `auto_name()`，复用既有的
+   `wiring::new_session_id()` 形态（`wiring.rs:235-240`，零新依赖、零碰撞）；`attach` 无参 ⇒ 从 `list`
+   选取（照 `--resume` 无参 `Resume::Pick` 先例）。**不采纳可读名**（`bright-running-fox` 那类需要词表，
+   本仓无先例；名字在可选取的前提下几乎不可见）。打印：`create` 成功打 `worktree: <name>` 到 **stderr**
+   （与 **ADR-0032** 的 `session: <id>` 同侧同风格）；会话结束在既有退出行处追加同名行 + 「分支未合并」提示。
+   ⚠️ **不需要新句柄** —— 工作区在启动期定死、运行期不变，而 `SessionPathHandle` 的存在理由是会话会在
+   运行期被 `/new` 换掉（`app_loop.rs:91`）。
+
 ### 明确否决
 
 - ❌ **`ToolContext` 第 4 挂载点**（B/C）：要么把字段穿 `ys-runtime::AgentPorts`→`ys-loop`→`ys-tool` 三个

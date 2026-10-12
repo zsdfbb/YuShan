@@ -45,6 +45,15 @@ const INPUT_MAX_LINES: usize = 5;
 /// 它计入 `chat_block` 的 padding，故 `chat_block().inner(area)` 自动把它扣掉：
 /// 内区几何的取用方（`max_scroll_offset` / `draw_transcript`）不必各自记得减它。
 const INPUT_GAP_ROWS: u16 = 1;
+/// 每条**非首条可见** `User` 条目之前保留的**空白行数** —— transcript **内部**的问答边界。
+///
+/// 上一回合的产出（assistant 文本 / 工具行 / 回合摘要）与本轮提问之间留白，多轮对话里
+/// 一眼看得到「这一轮从哪开始」。与 [`INPUT_GAP_ROWS`] 正交：那个在 transcript **外部**
+/// （Chat 内区底 → Input 顶边框），只保证末行不贴输入框，管不到问答边界。
+///
+/// 只有 `User` 之前留白 —— assistant / tool / summary 之间保持紧密，一屏能看更多内容。
+/// 空行同样不添视觉噪音、拷贝不留痕（同 [`INPUT_GAP_ROWS`] 的取向）。
+const USER_GAP_ROWS: usize = 2;
 /// 窗口小于此尺寸直接不渲染（留给「终端太小」）。
 const MIN_WIDTH: u16 = 10;
 const MIN_HEIGHT: u16 = 5;
@@ -468,9 +477,30 @@ fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (idx, item) in app.transcript.iter().enumerate() {
+        // 先算再借：`user_gap_rows` 要读 `lines` 的当前长度，而紧接着要可变借它。
+        let gap = user_gap_rows(item, !lines.is_empty());
+        lines.extend((0..gap).map(|_| Line::from("")));
         push_transcript_line(&mut lines, item, width, thinking_visible, app, idx, now);
     }
     Text::from(lines)
+}
+
+/// `User` 条目之前应插入的空白行数 —— 见 [`USER_GAP_ROWS`]。
+///
+/// **除了**「该条目之前尚无任何可见行」时取 `0`：会话首条提问不留白，免得开局白占两行。
+/// 以「已有可见行」而非「下标 > 0」为判据 —— 首条若是 `/thinking off` 下不产出行
+/// 的 `Thinking`，按下标会误判成非首条，顶部凭空多两行。
+///
+/// 只返回**计数**、不代插入：两个渲染循环的目标容器不同（TUI 是 `Vec<Line>`、
+/// 退出回放是 `Vec<String>`），共享的是规则而不是插入动作。**不得**把本判断下沉进
+/// [`push_non_assistant`]：退出回放（[`transcript_plain_lines`]）每条都新开一个局部
+/// `Vec<Line>` 再 extend，在那个 vec 上判空恒为真 ⇒ 会给**每条**用户行都加空行。
+fn user_gap_rows(item: &TranscriptLine, has_visible_before: bool) -> usize {
+    if has_visible_before && matches!(item, TranscriptLine::User(_)) {
+        USER_GAP_ROWS
+    } else {
+        0
+    }
 }
 
 fn push_transcript_line(
@@ -624,10 +654,17 @@ pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
     for item in &app.transcript {
+        let has_visible_before = !out.is_empty();
         if let TranscriptLine::Assistant(s) = item {
             out.extend(s.split('\n').map(str::to_string));
             continue;
         }
+        // 问答边界与 TUI 内一致：空白行必须在 `wrap_plain` **之前**落到 `out` 上
+        // （空行经 wrap 仍是 1 行空串，但顺序必须是「先空行、后内容」）。
+        out.extend(std::iter::repeat_n(
+            String::new(),
+            user_gap_rows(item, has_visible_before),
+        ));
         let mut lines: Vec<Line<'static>> = Vec::new();
         push_non_assistant(&mut lines, item, width, app.thinking_visible);
         for line in &lines {
@@ -887,6 +924,91 @@ mod tests {
             rows[input_top].contains("Input"),
             "Input 顶边框应在间距之后：{:?}",
             rows[input_top]
+        );
+    }
+
+    /// 问答边界：每条**非首条可见** `User` 之前恒 [`USER_GAP_ROWS`] 行空白，首条不留白。
+    ///
+    /// 相邻两条 `User`（回合中插话 / 排队回声）之间**同样留白** —— 规则统一为
+    /// 「非首条可见即留」，不按「上一条是不是 User」特判。
+    ///
+    /// **变异**：`user_gap_rows` 令 `has_visible_before` 恒假（本次改动回退）⇒ 空白行断言红；
+    /// 去掉该参数的判断（对首条也留白）⇒ `lines[0]` 断言红。
+    #[test]
+    fn test_user_gap_rows_before_each_user_but_not_the_first() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("q1".into()));
+        app.transcript.push(TranscriptLine::Assistant("a1".into()));
+        app.transcript.push(TranscriptLine::User("q2".into()));
+        app.transcript.push(TranscriptLine::User("q3".into()));
+
+        let lines = transcript_plain_lines(&app, 80);
+        assert_eq!(
+            lines,
+            vec!["> q1", "a1", "", "", "> q2", "", "", "> q3"],
+            "q1 首条不留白；q2 / q3 之前各 2 行空白"
+        );
+    }
+
+    /// 空白行必须计入**滚动数学** —— `max_scroll_offset` 用同一份 `build_text` 数视觉行。
+    ///
+    /// 精确钉死数值：20 条用户行 + 19 处 × [`USER_GAP_ROWS`] = 58 视觉行。
+    /// **变异**：只往渲染路径加空行、`build_text` 里不加（两条路径分叉）⇒ 算出 0（20 − 34）⇒ 红。
+    #[test]
+    fn test_user_gap_is_counted_in_scroll_math() {
+        const W: u16 = 40;
+        const H: u16 = 40;
+        let mut app = app_with(CodingView::for_test());
+        for i in 0..20 {
+            app.transcript
+                .push(TranscriptLine::User(format!("m{i:02}")));
+        }
+
+        let chat = chat_area(&app, Rect::new(0, 0, W, H));
+        let inner = chat_block().inner(chat);
+        assert_eq!(inner.height as usize, 34, "推导前提：内区高");
+
+        // 20 条用户行 + 19 处 × 2 行空白 = 58 视觉行。**写死 58**（不写成含
+        // `USER_GAP_ROWS` 的算式）：算式跟着常量走，常量被改成 0 时本用例会一起
+        // 变成「0 = 0」而照样绿 —— 那就钉不住「两条空白行」这个契约了。
+        assert_eq!(
+            max_scroll_offset(&app, W, H),
+            58 - inner.height as usize,
+            "滚动上限必须含空白行（不含则为 0：20 − 34）"
+        );
+    }
+
+    /// 屏上形状（TUI 渲染路径，不只是 `build_text` 的数据）：第 2 条用户行上方真的空两行。
+    #[test]
+    fn test_rendered_screen_shows_blank_rows_above_second_user_line() {
+        const W: u16 = 40;
+        const H: u16 = 12;
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("q1".into()));
+        app.transcript.push(TranscriptLine::Assistant("a1".into()));
+        app.transcript.push(TranscriptLine::User("q2".into()));
+
+        let chat = chat_area(&app, Rect::new(0, 0, W, H));
+        let inner = chat_block().inner(chat);
+        let rows = rows_of(&mut app, W, H);
+
+        assert!(
+            rows[inner.y as usize].contains("> q1"),
+            "首条贴顶不留白：{:?}",
+            rows[inner.y as usize]
+        );
+        // 从 `a1` 所在行往下数：紧邻两行必须空白，第三行才是新的用户行。
+        let a1 = rows
+            .iter()
+            .position(|r| r.contains("a1"))
+            .expect("assistant 行应可见");
+        for (i, row) in rows[a1 + 1..a1 + 1 + USER_GAP_ROWS].iter().enumerate() {
+            assert!(row.trim().is_empty(), "第 {} 行空白被占：{row:?}", i + 1);
+        }
+        assert!(
+            rows[a1 + 1 + USER_GAP_ROWS].contains("> q2"),
+            "第 2 条用户行应在 2 行空白之后：{:?}",
+            rows[a1 + 1 + USER_GAP_ROWS]
         );
     }
 

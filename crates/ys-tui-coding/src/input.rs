@@ -55,6 +55,42 @@ impl InputBuffer {
         self.cursor -= 1;
     }
 
+    /// 用补全候选项的 `replacement`（形如 `/{name} `，尾随空格）替换缓冲的
+    /// **首个词**，其后的内容（正文 / 参数）**原样保留**。
+    ///
+    /// 补全浮层只对**开头的命令词**生效（`completion::open_with_skills` 只看首个词），
+    /// 故这里也只动首个词 —— 用户先把正文敲好、再跳到行首补命令前缀时，正文是
+    /// skill 的参数，绝不能连它一起被覆写（那正是「前面输入的内容被覆盖」这个 bug）。
+    ///
+    /// 光标落在**命令词与保留正文之间**（正文前若有空白一并越过），而不是整段末尾 ——
+    /// 用户接着敲的应当是参数 / 正文，不是被推到最右边。
+    ///
+    /// 前提：`text` 以首个词开头（补全只在 `/` 开头时打开，见
+    /// [`crate::completion::open_with_skills`]）。首个词之后的剩余串若存在，必以空白
+    /// 开头（`split_whitespace` 给出的是**极大**词）。
+    pub fn complete_leading_token(&mut self, replacement: &str) {
+        let token_len = self
+            .text
+            .split_whitespace()
+            .next()
+            .map(str::len)
+            .unwrap_or(0);
+        // 先取成自有串：随后要可变借用 `self.text` 写回。
+        let rest = self.text[token_len..].to_string();
+        if rest.is_empty() {
+            // 没有正文：整段写入 replacement（含尾随空格），光标到末尾。
+            self.text = replacement.to_string();
+            self.cursor = self.text.chars().count();
+        } else {
+            // 有正文：去掉 replacement 的尾随空格，复用正文自带的空白作分隔，
+            // 避免出现两个并排空格。
+            let head = replacement.trim_end();
+            let lead_ws = rest.chars().take_while(|c| c.is_whitespace()).count();
+            self.text = format!("{head}{rest}");
+            self.cursor = head.chars().count() + lead_ws;
+        }
+    }
+
     /// 取走内容（提交用）；光标归零，缓冲清空。
     pub fn take(&mut self) -> String {
         self.cursor = 0;
@@ -280,6 +316,53 @@ mod tests {
         b.backspace();
         assert_eq!(b.text, "中文");
         assert_eq!(b.cursor, 1);
+    }
+
+    /// 补全只替换**首个词**，其后正文原样保留；光标停在命令词与正文之间。
+    ///
+    /// 变异：改回整段覆写 ⇒ 正文丢失，本测试变红。
+    #[test]
+    fn test_complete_leading_token_keeps_trailing_body() {
+        let mut b = InputBuffer::new();
+        b.insert_str("看看代码");
+        b.cursor = 0;
+        b.insert_str("/comm ");
+        assert_eq!(b.text, "/comm 看看代码");
+        assert_eq!(b.cursor, 6, "光标停在「/comm 」之后");
+
+        b.complete_leading_token("/commit ");
+        assert_eq!(b.text, "/commit 看看代码", "正文不被吃掉");
+        assert_eq!(b.cursor, 8, "光标停在「/commit 」之后、正文之前");
+    }
+
+    /// 没有正文时照旧：写入整段 `replacement`（含尾随空格），光标到末尾。
+    #[test]
+    fn test_complete_leading_token_without_body_keeps_trailing_space() {
+        let mut b = InputBuffer::new();
+        b.insert_str("/mo");
+        b.complete_leading_token("/model ");
+        assert_eq!(b.text, "/model ");
+        assert_eq!(b.cursor, 7);
+    }
+
+    /// 正文以换行开头：换行与正文都保留，光标越过换行停在正文行首。
+    #[test]
+    fn test_complete_leading_token_preserves_newline_separator() {
+        let mut b = InputBuffer::new();
+        b.insert_str("/comm\n看看代码");
+        b.complete_leading_token("/commit ");
+        assert_eq!(b.text, "/commit\n看看代码");
+        assert_eq!(b.cursor, 8, "越过换行，停在「看」之前");
+    }
+
+    /// 首个词后的剩余串全是空白也算「有正文」：不追加第二个尾随空格。
+    #[test]
+    fn test_complete_leading_token_whitespace_only_body() {
+        let mut b = InputBuffer::new();
+        b.insert_str("/mo  ");
+        b.complete_leading_token("/model ");
+        assert_eq!(b.text, "/model  ", "只保留原有空白，不叠一个");
+        assert_eq!(b.cursor, 8);
     }
 
     #[test]

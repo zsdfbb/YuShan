@@ -213,8 +213,8 @@ fn handle_completion_key(app: &mut App, code: KeyCode) -> bool {
                 .and_then(|s| s.current())
                 .map(|item| item.replacement.clone());
             if let Some(text) = replacement {
-                app.input.text = text;
-                app.input.cursor = app.input.text.chars().count();
+                // 只替换**开头那个命令词**，保留其后正文（正文往往是 skill 的参数）。
+                app.input.complete_leading_token(&text);
             }
             app.completion = None;
             true
@@ -1040,6 +1040,36 @@ mod tests {
         key(&mut a, &ch, KeyCode::Down); // → /status
         key(&mut a, &ch, KeyCode::Enter);
         assert_eq!(a.input.text, "/status ");
+    }
+
+    /// 回归：先把正文敲好、再跳到行首补命令前缀，**接受补全不得吃掉正文**。
+    ///
+    /// 用户的正文既是 skill 的参数（`/commit 看看代码`），也可能只是命令后的任意
+    /// 文本。补全只该替换**开头那个命令词**，其余原样保留。
+    ///
+    /// 变异：把接受分支改回整段覆写（`app.input.text = replacement`）⇒ 正文丢失，
+    /// 本测试变红。
+    #[test]
+    fn test_completion_accept_keeps_text_after_command() {
+        let ch = channels();
+        let mut a = app();
+        // 先敲正文
+        a.input.insert_str("看看代码");
+        // 跳到行首补 skill 前缀 + 空格（光标停在「前缀 + 空格」之后、正文之前）
+        a.input.cursor = 0;
+        a.input.insert_str("/comm ");
+        assert_eq!(a.input.text, "/comm 看看代码");
+        assert_eq!(a.input.cursor, 6);
+
+        key(&mut a, &ch, KeyCode::Tab);
+        assert!(a.completion.is_some(), "skill 前缀命中即开浮层");
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(a.input.text, "/commit 看看代码", "正文必须原样保留");
+        assert_eq!(a.input.cursor, 8, "光标停在命令词与正文之间");
+        assert!(a.completion.is_none(), "接受后关浮层");
+        assert!(!a.is_turning, "接受补全不是提交");
+        assert!(ch.next_request().is_none());
     }
 
     #[test]

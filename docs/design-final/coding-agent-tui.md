@@ -229,6 +229,17 @@ impl QueueBoundarySource {
 thinking 默认隐藏，`/thinking on` 后以暗色渲染。
 provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoning>` 标签里时，由适配器剥离并转成同样的 Thinking 行（见 `docs/adr/0025-hide-inline-thinking-tags.md`）。
 
+**问答边界（`USER_GAP_ROWS = 2`）**：每条**非首条可见** `User` 条目之前恒留 **2 行空白**，把上一回合的产出
+（assistant 文本 / 工具行 / 回合摘要）与本轮提问分开 —— 多轮对话里一眼看得到「这一轮从哪开始」。
+与上面的 `INPUT_GAP_ROWS` 正交：那个在 transcript **外部**（内区底 → Input 顶边框），管不到问答边界。
+判据是「该条目之前**已有可见行**」而**不是**「下标 > 0」：`/thinking off` 时首条若是 `Thinking`，
+它不产出行，按下标会把紧接的首条提问误判成非首条、顶部凭空多两行。
+相邻两条 `User`（回合中插话 / 排队回声）之间**同样留白** —— 规则统一为「非首条可见即留」，不按上一条是不是 `User` 特判。
+`user_gap_rows` **只返回计数**，两个渲染循环各自落到自己那层容器（TUI 的 `Vec<Line>` / 退出回放的 `Vec<String>`）；
+**不得**把判断下沉进 `push_non_assistant` —— 回放每条都新开一个局部 `Vec<Line>` 再 extend，在其上判空恒真，
+会给**每条**用户行都加空行。空白行经 `build_text` 进入那份唯一的 `Text`，故 `max_scroll_offset` 的
+视觉行数**自动含它**（TUI 画面与滚动数学无分叉可能）。
+
 **状态行**：`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**（时长 → 轮数 → tokens → model）；
 turn 中把 model 段换成 `⏳ Working·`（300ms 节拍前进，宽字符占两格）。四档宽度各有测试。
 

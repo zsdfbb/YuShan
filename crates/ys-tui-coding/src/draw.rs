@@ -77,9 +77,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     let now = Instant::now();
 
     let chunks = Layout::vertical([
-        Constraint::Min(3),                    // Chat
-        Constraint::Length(input_height(app)), // Input（1..=N 自适应）
-        Constraint::Length(1),                 // Status（最底，常驻）
+        Constraint::Min(3),                                // Chat
+        Constraint::Length(input_height(app, area.width)), // Input（1..=N 自适应）
+        Constraint::Length(1),                             // Status（最底，常驻）
     ])
     .split(area);
 
@@ -95,15 +95,26 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 }
 
 /// 输入区 pane 高度（**含**上下两条边框）。
-pub fn input_height(app: &App) -> u16 {
-    (app.input.lines().clamp(1, INPUT_MAX_LINES) + 2) as u16
+///
+/// 行数按**软换行后的视觉行**算（[`wrap_input`]，与渲染、光标同源），不再只数 `\n`
+/// —— 否则一行长文本折成多行后会被 pane 裁掉尾部。夹到 [`INPUT_MAX_LINES`]，超过则
+/// 由 [`draw_input`] 滚动露出光标所在行。
+pub fn input_height(app: &App, total_width: u16) -> u16 {
+    let inner_w = input_inner_width(total_width);
+    let rows = wrap_input(&app.input.text, app.input.cursor, inner_w).0;
+    (rows.len().clamp(1, INPUT_MAX_LINES) + 2) as u16
+}
+
+/// 输入区内区宽度（总宽减左右两条边框）；不为 0。
+fn input_inner_width(total_width: u16) -> usize {
+    total_width.saturating_sub(2).max(1) as usize
 }
 
 /// Chat 区（含边框）—— 与 [`ui`] 的布局同源，供滚动算术复用。
 fn chat_area(app: &App, area: Rect) -> Rect {
     Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(input_height(app)),
+        Constraint::Length(input_height(app, area.width)),
         Constraint::Length(1),
     ])
     .split(area)[0]
@@ -187,27 +198,27 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(" Input ");
     let inner = block.inner(area);
+    let inner_w = input_inner_width(area.width);
+    let inner_h = inner.height as usize;
+
+    // 软换行 + 光标定位**同源**（[`wrap_input`]）：先折成视觉行，再画、再摆光标。
+    // 于是「一行长文本」会折到后续视觉行显示，而不是被 pane 裁掉尾部。
+    let (rows, cursor_row, cursor_col) = wrap_input(&app.input.text, app.input.cursor, inner_w);
 
     // turn 进行中也照常渲染输入缓冲与光标：`Working` 心跳只由状态行承担。
-    frame.render_widget(Paragraph::new(app.input.text.clone()).block(block), area);
+    // 视觉行超过 pane 时滚动，让光标所在行可见（贴住窗口底部）。
+    let offset = cursor_row.saturating_sub(inner_h.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(rows.join("\n"))
+            .block(block)
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        area,
+    );
 
-    // 光标：**行号**取 char 语义的 `cursor_row_col`（`\n` 计数），
-    // **列**按**显示宽度**算（不能按字节、也不能按 char 数 —— 中文占 2 列）。
-    let (logical_row, _col_chars) = app.input.cursor_row_col();
-    let last_row = app
-        .input
-        .text_before_cursor()
-        .rsplit('\n')
-        .next()
-        .unwrap_or("");
-    let inner_w = inner.width.max(1) as usize;
-    let disp_col = display_width(last_row);
-    // 软换行：本行显示宽度超过 inner_w 时，光标落到被折出的下一视觉行
-    let row = logical_row + disp_col / inner_w;
-    let col = disp_col % inner_w;
-    if row < inner.height as usize && col < inner_w {
+    let row = cursor_row - offset;
+    if row < inner_h && cursor_col < inner_w {
         frame.set_cursor_position(ratatui::layout::Position::new(
-            inner.x + col as u16,
+            inner.x + cursor_col as u16,
             inner.y + row as u16,
         ));
     }
@@ -728,6 +739,59 @@ fn wrap_plain(s: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// 输入区软换行：把输入文本按**显示宽度**折成视觉行（`\n` 强制换行），
+/// 并给出光标落在哪一视觉行的哪一显示列。
+///
+/// 渲染（[`draw_input`]）、高度（[`input_height`]）与光标定位**共用**本函数 ——
+/// 三者必须基于同一份折行结果，否则会「画在一行、光标在另一行」。折行规则与退出
+/// 回放 [`wrap_plain`] 同源：按列贪心、不断词。
+///
+/// 光标恰好停在「填满一行的行尾」时，会多折出一个空行把光标放到它的行首，免得
+/// 光标列 `== width` 越界。故在那一处，行数依赖光标位置 —— 这是有意的：行数要
+/// 够放得下光标。
+fn wrap_input(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut cursor_pos: Option<(usize, usize)> = None;
+
+    for (i, ch) in text.chars().enumerate() {
+        if i == cursor {
+            cursor_pos = Some((rows.len(), cur_w));
+        }
+        if ch == '\n' {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            continue;
+        }
+        let cw = display_width(&ch.to_string());
+        if cur_w + cw > width && !cur.is_empty() {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            if i == cursor {
+                cursor_pos = Some((rows.len(), 0));
+            }
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+
+    // 光标在缓冲末尾时循环没机会记 —— 补记到当前行尾（下一行即待 push 的 `cur`）。
+    let (mut row, mut col) = cursor_pos.unwrap_or((rows.len(), cur_w));
+    rows.push(cur);
+
+    // 光标落在「填满一行的行尾」：折出一个空行放它，避免列越界。
+    if col >= width {
+        row += 1;
+        col = 0;
+        if row >= rows.len() {
+            rows.push(String::new());
+        }
+    }
+    (rows, row, col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,7 +892,7 @@ mod tests {
         const H: u16 = 40;
 
         let probe = app_with(CodingView::for_test());
-        assert_eq!(input_height(&probe), 3, "推导前提：空输入占 3 行");
+        assert_eq!(input_height(&probe, W), 3, "推导前提：空输入占 3 行");
 
         // 从布局推：避免硬编码「h-3-1-1」这类随 spacing / 边框策略变化的魔法数字。
         let chat = chat_area(&probe, Rect::new(0, 0, W, H));
@@ -1249,14 +1313,14 @@ mod tests {
     #[test]
     fn test_input_height_grows_with_lines_and_caps() {
         let mut app = app_with(CodingView::for_test());
-        assert_eq!(input_height(&app), 3, "1 行内容 + 2 边框");
+        assert_eq!(input_height(&app, 120), 3, "1 行内容 + 2 边框");
 
         app.input.insert_str("a\nb\nc");
-        assert_eq!(input_height(&app), 5, "3 行内容 + 2 边框");
+        assert_eq!(input_height(&app, 120), 5, "3 行内容 + 2 边框");
 
         app.input.insert_str(&"\n".repeat(20));
         assert_eq!(
-            input_height(&app),
+            input_height(&app, 120),
             (INPUT_MAX_LINES + 2) as u16,
             "上限 5 行内容"
         );
@@ -1269,7 +1333,7 @@ mod tests {
     #[test]
     fn test_input_height_grows_with_shift_enter_newlines() {
         let mut app = app_with(CodingView::for_test());
-        assert_eq!(input_height(&app), 3);
+        assert_eq!(input_height(&app, 120), 3);
 
         for (n, expect) in [(1usize, 4u16), (2, 5), (3, 6), (10, 7)] {
             app.input = crate::input::InputBuffer::new();
@@ -1278,7 +1342,7 @@ mod tests {
                 app.input.insert_char('\n');
             }
             assert_eq!(
-                input_height(&app),
+                input_height(&app, 120),
                 expect,
                 "{n} 个换行 → {} 行内容 + 2",
                 n + 1
@@ -1323,7 +1387,7 @@ mod tests {
     fn test_input_cursor_row_follows_logical_lines() {
         let mut app = app_with(CodingView::for_test());
         app.input.insert_str("ab\ncd");
-        assert_eq!(input_height(&app), 4, "2 行内容 + 2 边框");
+        assert_eq!(input_height(&app, 120), 4, "2 行内容 + 2 边框");
 
         // 第 1 行中间：cursor = 1（"a|b"）
         app.input.cursor = 1;
@@ -1356,22 +1420,60 @@ mod tests {
         );
     }
 
-    /// 超宽单行：输入区**不做软换行**（高度只按 `\n` 数、`Paragraph` 也没开 wrap），
-    /// 光标若落在 pane 之外就**不显示** —— 但绝不画到别的 pane 上。
+    /// 超宽单行**软换行**：折到后续视觉行，尾部内容可见、输入区随之撑高。
     ///
-    /// 这条钉住的是「不越界」这个不变量（`row < inner.height` 守卫），
-    /// 不是「超宽行有光标」。
+    /// 变异：把 `input_height` 改回只数 `\n`（或 `draw_input` 关掉折行）⇒ 高度仍为
+    /// 3、超出首行的内容被裁掉，本测试变红。
     #[test]
-    fn test_long_single_line_never_draws_cursor_outside_input_pane() {
+    fn test_long_single_line_soft_wraps_and_tail_is_visible() {
         let mut app = app_with(CodingView::for_test());
-        app.input.insert_str(&"a".repeat(300));
-        assert_eq!(input_height(&app), 3, "无 \\n → 仍是 1 内容行（不软换行）");
+        // 120 列下内区宽 118：写 3 行多一点，第三行留在末尾。
+        app.input.insert_str(&"a".repeat(118 * 2 + 10));
+        assert_eq!(input_height(&app, 120), 5, "3 视觉行（118×2 + 10）+ 2 边框");
 
-        // 内区高 1、光标折到第 2 视觉行 → 守卫拦下，光标不显示（停在原点）
+        let rows = rows_of(&mut app, 120, 40);
+        // 输入区 = 3 内容行 + 上下边框，紧邻状态行之上：内容在 y=35/36/37。
+        for y in [35usize, 36, 37] {
+            assert!(rows[y].contains('a'), "第 {y} 行应有折行内容：{}", rows[y]);
+        }
+        assert!(!rows[38].contains('a'), "y=38 是输入区底边框：{}", rows[38]);
+    }
+
+    /// 光标跟随软换行：长单行的光标落在**被折出的视觉行**上，而不是只停在首行。
+    ///
+    /// 变异：光标行仍旧用「逻辑行号 + `display_width / inner_w`」之外的其他算法、
+    /// 或与渲染折行不同步 ⇒ 光标不在末尾列上，本测试变红。
+    #[test]
+    fn test_cursor_follows_soft_wrap_on_long_line() {
+        let mut app = app_with(CodingView::for_test());
+        // 118 列内区：写满一整行 + 5 个字符 ⇒ 光标应在第 2 视觉行、第 5 列。
+        app.input.insert_str(&"a".repeat(118 + 5));
+        // 内区 x=1、y=36；第 2 视觉行 y=37、列 5 → x=6。
         assert_eq!(
             cursor_pos(&mut app, 120, 40),
-            ratatui::layout::Position::new(0, 0),
-            "越界的光标不显示，但也不落到 Status 行上"
+            ratatui::layout::Position::new(6, 37),
+            "光标落在折出的第 2 视觉行行内第 5 列"
+        );
+    }
+
+    /// 视觉行超过上限时**滚动**，光标所在行始终可见（贴住窗口底部）。
+    #[test]
+    fn test_input_scrolls_to_keep_cursor_visible_past_cap() {
+        let mut app = app_with(CodingView::for_test());
+        // 10 个逻辑行、每行都短 ⇒ 10 视觉行 > 上限 5。
+        let text: Vec<String> = (0..10).map(|i| format!("L{i}")).collect();
+        app.input.insert_str(&text.join("\n"));
+        assert_eq!(input_height(&app, 120), (INPUT_MAX_LINES + 2) as u16);
+
+        let rows = rows_of(&mut app, 120, 40);
+        let joined = rows.join("\n");
+        assert!(joined.contains("L9"), "光标所在末行必须可见：{joined}");
+        assert!(!joined.contains("L0"), "顶部行应滚出窗口：{joined}");
+
+        // 光标落在窗口底行（内区 y=33..37 的第 5 行 = y=37），行内列 2 → x=3。
+        assert_eq!(
+            cursor_pos(&mut app, 120, 40),
+            ratatui::layout::Position::new(3, 37)
         );
     }
 
@@ -1448,6 +1550,45 @@ mod tests {
     #[test]
     fn test_wrap_plain_empty_line_preserved() {
         assert_eq!(wrap_plain("", 10), vec![String::new()]);
+    }
+
+    /// `wrap_input`：空串 → 一行空、光标 (0,0)。
+    #[test]
+    fn test_wrap_input_empty() {
+        assert_eq!(wrap_input("", 0, 10), (vec![String::new()], 0, 0));
+    }
+
+    /// `\n` 强制换行；光标按逻辑行定位（这里是 `c|d` 之间）。
+    #[test]
+    fn test_wrap_input_newlines_split_rows() {
+        assert_eq!(
+            wrap_input("ab\ncd", 4, 10),
+            (vec!["ab".to_string(), "cd".to_string()], 1, 1)
+        );
+    }
+
+    /// 超宽按**显示宽度**折行（CJK 每字 2 列），光标跟随折行。
+    ///
+    /// 变异：按 char 数而非显示宽度折 ⇒ 每行放 4 个汉字、行数变 2，本测试变红。
+    #[test]
+    fn test_wrap_input_wraps_cjk_by_display_width() {
+        // 宽 4 ⇒ 每行 2 个汉字（每个 2 列）。
+        let (rows, row, col) = wrap_input("中文中文中", 5, 4);
+        assert_eq!(
+            rows,
+            vec!["中文".to_string(), "中文".to_string(), "中".to_string()]
+        );
+        assert_eq!((row, col), (2, 2), "光标在末行「中」之后 = 第 2 列");
+    }
+
+    /// 光标恰好停在「填满一行的行尾」：折出一个空行放它，列不越界。
+    #[test]
+    fn test_wrap_input_cursor_at_full_row_end_gets_virtual_row() {
+        assert_eq!(
+            wrap_input("abcd", 4, 4),
+            (vec!["abcd".to_string(), String::new()], 1, 0),
+            "光标落到下一（虚拟）空行行首"
+        );
     }
 
     // -----------------------------------------------------------------------

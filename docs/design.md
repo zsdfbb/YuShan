@@ -216,6 +216,7 @@ pub trait AgentLoop: Send + Sync {
 ToolError（工具无法产出可回喂的结果）   → 终止回合，返回 LoopError
 达到最大轮数                            → 正常结束，StopReason = MaxRounds
 模型输出被截断（含被作废的工具批）      → 正常结束，StopReason = Truncated
+模型本轮无可见产出（无正文、无工具调用）→ 正常结束，StopReason = NoOutput
 取消（步骤边界检查）                    → 正常结束，StopReason = Cancelled
 EventSink 发送失败                      → 终止回合（观察者不阻断属于后续 Hook 阶段的语义）
 ```
@@ -519,14 +520,14 @@ let agent = AgentBuilder::new()
 
 | 模块  | 重点测试 |
 | --- | --- |
-| `ys-core` | 消息、Tool Call、事件和序列化 |
-| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致、截断保护；**工具超时闸（工具声明 → `bash_timeout` → 300s）**；**并行批闸门与保序**（默认串行 `C1,R1,C2,R2` 不变；全 safe 才并行 `C1,C2,R1,R2`；混合退回串行；`max_parallel_tools` 限流） |
+| `ys-core` | 消息、Tool Call、事件和序列化；**终止原因（含 `NoOutput`）的序列化字面量契约** |
+| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致、截断保护；**工具超时闸（工具声明 → `bash_timeout` → 300s）**；**并行批闸门与保序**（默认串行 `C1,R1,C2,R2` 不变；全 safe 才并行 `C1,C2,R1,R2`；混合退回串行；`max_parallel_tools` 限流）；**空 / 纯思考响应 ⇒ `NoOutput`**（不再静默当 `Completed`，空白字符同样算空） |
 | `Registry` | 注册、查找、重复名称和缺失组件 |
 | `Session` | 追加消息、保存恢复、空会话和损坏数据 |
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |
 | `HookDispatcher` | Hook 顺序、Observer 错误、Transform 修改和 Control 决策 |
 | 动态插件 | Manifest、ABI 版本、组件注册、Hook 注册、初始化失败和生命周期 |
-| Coding Agent | 项目上下文发现、四个默认工具、Print 模式、JSON 事件和会话恢复；会话默认新会话（零目录扫描）、`--resume`（pick / 指定 / 非 TTY 与空列表的两种收场）、meta 首行（title/provider/model/tokens）与 resume 的模型恢复优先级（env > meta > state.json > 首个有凭证）；**退出时三模式都打 `session: <id>`**（TUI 退出回放后 / 一次性收尾，仅对已落盘会话，见 ADR-0032）；**工具调用效率**：bash 描述写明 cwd 契约（每次从工作区根起新 shell、`cd` 不跨调用）、`read` 描述点明 `offset`/`limit` 区间读、只读工具（`read`/`grep`/`find`/`ls`）声明 `is_concurrency_safe`（批内全只读才并行，混入 bash/write/edit 自动退回串行，见 `apps/coding-agent/src/toolset.rs` 的准入表测试）；TUI：turn 活渲染（提交即见 + Working 动画 + Turn 行）、事件路径取消、slash 命令时 TUI 让位（真实终端执行）、退出回放按 thinking 开关打印对话、单键退出、默认仅对话窗口（status/footer 可选面板）；**subagent 派发**：P0 前缀指纹（父 10 元 / 子 9 元 / 同表构造两次逐字节相同）、`subagent` 工具（子失败不拖垮父 + `is_error`）、usage 上卷、**每回合派发总量上限**、产物目录 sweep 与 `YUSHAN_SUBAGENTS_DIR`、`model` 名解析失败 fail-closed、父子提示词的能力边界声明 |
+| Coding Agent | 项目上下文发现、四个默认工具、Print 模式、JSON 事件和会话恢复；会话默认新会话（零目录扫描）、`--resume`（pick / 指定 / 非 TTY 与空列表的两种收场）、meta 首行（title/provider/model/tokens）与 resume 的模型恢复优先级（env > meta > state.json > 首个有凭证）；**退出时三模式都打 `session: <id>`**（TUI 退出回放后 / 一次性收尾，仅对已落盘会话，见 ADR-0032）；**工具调用效率**：bash 描述写明 cwd 契约（每次从工作区根起新 shell、`cd` 不跨调用）、`read` 描述点明 `offset`/`limit` 区间读、只读工具（`read`/`grep`/`find`/`ls`）声明 `is_concurrency_safe`（批内全只读才并行，混入 bash/write/edit 自动退回串行，见 `apps/coding-agent/src/toolset.rs` 的准入表测试）；**单回合输出收窄**：`grep` 专用结果预算（单条 ≤ 16 KiB，截断 notice 带收窄指引）、软阈值提示（≥8 KiB）、`context` 上限（≤5）、`read` 大结果软阈值提示、「先窄后宽」guideline；**空产出（`NoOutput`）三处可见**：TUI 一行 System 提示 + `-p`/`--json` 退出码 1 + stderr 一行；TUI：turn 活渲染（提交即见 + Working 动画 + Turn 行）、事件路径取消、slash 命令时 TUI 让位（真实终端执行）、退出回放按 thinking 开关打印对话、单键退出、默认仅对话窗口（status/footer 可选面板）；**subagent 派发**：P0 前缀指纹（父 10 元 / 子 9 元 / 同表构造两次逐字节相同）、`subagent` 工具（子失败不拖垮父 + `is_error`）、usage 上卷、**每回合派发总量上限**、产物目录 sweep 与 `YUSHAN_SUBAGENTS_DIR`、`model` 名解析失败 fail-closed、父子提示词的能力边界声明 |
 
 ## 13. 总结
 

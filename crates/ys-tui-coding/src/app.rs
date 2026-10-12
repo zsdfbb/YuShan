@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use ys_core::{ContentBlock, Message, ToolCallId};
+use ys_core::{ContentBlock, Message, StopReason, ToolCallId};
 use ys_event::AgentEvent;
 use ys_protocol::{Envelope, Outbound, SessionSummary};
 
@@ -265,6 +265,12 @@ impl App {
                 rounds,
                 ..
             } => {
+                // 「空产出」要给**可见**说明：单靠 Summary 行的 ∅ 符号用户看不懂（实测会继续追问）。
+                if stop_reason == StopReason::NoOutput {
+                    self.transcript.push(TranscriptLine::System(
+                        "模型本轮没有返回可见内容（可能只输出了思考）。可重试或换个说法。".into(),
+                    ));
+                }
                 self.transcript.push(TranscriptLine::Summary {
                     rounds,
                     stop: stop_reason,
@@ -712,6 +718,62 @@ mod tests {
             error: "boom".into(),
         }));
         assert!(a.tool_index.is_empty(), "RunFailed 也清空");
+    }
+
+    /// **N7**：`RunFinished{NoOutput}` ⇒ transcript 出现一条**可见的 System 说明**（不是只给符号），
+    /// 且回合正常收尾（`is_turning` 复位）。
+    ///
+    /// 变异：删掉 `app.rs` 里对 `NoOutput` 的 System 推送 ⇒ 本用例变红。
+    #[test]
+    fn test_no_output_turn_pushes_visible_system_note() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        a.apply_event(env(AgentEvent::RunFinished {
+            stop_reason: StopReason::NoOutput,
+            usage: Usage::default(),
+            rounds: 1,
+        }));
+        assert!(!a.is_turning, "终局事件必须复位 turn 态");
+        let note = a.transcript.iter().find_map(|l| match l {
+            TranscriptLine::System(s) => Some(s.clone()),
+            _ => None,
+        });
+        assert!(
+            note.as_deref().is_some_and(|s| s.contains("可见内容")),
+            "NoOutput 必须推一条可见 System 说明；transcript={:?}",
+            a.transcript
+        );
+        assert!(
+            a.transcript.iter().any(|l| matches!(
+                l,
+                TranscriptLine::Summary {
+                    stop: StopReason::NoOutput,
+                    ..
+                }
+            )),
+            "Summary 行应记录 NoOutput"
+        );
+    }
+
+    /// 反向：正常 `Completed` **不得**多出「空产出」提示。
+    ///
+    /// 变异：把 `if stop_reason == StopReason::NoOutput` 写成恒真 ⇒ 本用例变红。
+    #[test]
+    fn completed_turn_does_not_push_no_output_note() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        a.apply_event(env(AgentEvent::RunFinished {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            rounds: 1,
+        }));
+        assert!(
+            !a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::System(s) if s.contains("可见内容"))),
+            "Completed 不得带空产出提示；transcript={:?}",
+            a.transcript
+        );
     }
 
     /// 清空之后迟到的（跨回合）`ToolResult` 只被静默忽略：不 panic、不写错行。

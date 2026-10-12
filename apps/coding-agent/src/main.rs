@@ -1046,6 +1046,13 @@ async fn run_single_turn(
     match outcome {
         Ok(mut r) => {
             r.usage = r.usage + totals.drain();
+            // 空产出在**一次性模式**下必须留一行可见说明（`-p` 只打文本增量，否则 stderr
+            // 与 stdout 都为空 = 静默）。退出码由 [`single_turn_exit_code`] 给 `1`。
+            if r.stop_reason == StopReason::NoOutput {
+                eprintln!(
+                    "model returned no visible output this turn (nothing to print) — retry or rephrase"
+                );
+            }
             Ok(r)
         }
         Err(e) => Err(e),
@@ -1162,16 +1169,18 @@ async fn run_json_mode(
     Ok(result)
 }
 
-/// 一次性模式的退出码：wall-clock 预算到点（回合以 `Cancelled` 收场）⇒ `1`；
-/// 其余（`Completed` / `MaxRounds` / `Truncated`…）⇒ `0`。
+/// 一次性模式的退出码：**没有可用产出**或**预算用尽** ⇒ `1`，否则 `0`。
 ///
-/// `Cancelled` 是这条路径唯一的「预算用尽」信号 —— 一次性模式没有别的 `Abort`
-/// 来源（无 UI、无 Ctrl+C 处理）。
+/// - `Cancelled`（wall-clock 预算到点）、`NoOutput`（模型没给出可见内容）⇒ `1`；
+/// - `Completed` / `MaxRounds` / `Truncated`（有可交差的输出，或正常收尾）⇒ `0`。
+///
+/// 判据是「**有没有输出能交差**」：`Truncated` 至少有一段（可能不完整的）输出，故为 `0`；
+/// `NoOutput` 什么都没有 —— 若报 `0` 就是**静默装作成功**。
+/// `Cancelled` 是这条路径上「预算用尽」的唯一信号（一次性模式没有别的 `Abort` 来源）。
 fn single_turn_exit_code(result: &RunResult) -> i32 {
-    if result.stop_reason == StopReason::Cancelled {
-        1
-    } else {
-        0
+    match result.stop_reason {
+        StopReason::Cancelled | StopReason::NoOutput => 1,
+        _ => 0,
     }
 }
 
@@ -2646,6 +2655,12 @@ mod tests {
             rounds: 1,
             final_message: None,
         };
+        let no_output = RunResult {
+            stop_reason: StopReason::NoOutput,
+            usage: Usage::default(),
+            rounds: 1,
+            final_message: None,
+        };
         assert_eq!(
             single_turn_exit_code(&cancelled),
             1,
@@ -2655,6 +2670,13 @@ mod tests {
             single_turn_exit_code(&completed),
             0,
             "正常完成路径退出码不变（回归护栏）"
+        );
+        // 空产出**没有可交差的输出**，与预算到点同档 ⇒ 非零退出（不可静默装作成功）。
+        // 变异：把 `StopReason::NoOutput` 从匹配臂里删掉 ⇒ 本断言变红。
+        assert_eq!(
+            single_turn_exit_code(&no_output),
+            1,
+            "空产出（NoOutput）须非零退出"
         );
     }
 

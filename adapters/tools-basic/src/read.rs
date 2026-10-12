@@ -82,6 +82,9 @@ impl Tool for ReadTool {
 
         let truncated = ys_tool::head_lines(&formatted, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
 
+        // 软阈值（**仅未硬截断时**）：整段结果偏大就提示模型「用 offset/limit 读更窄的区间」。
+        // 与下方「Showing lines …」互斥 —— 后者只在被截断时出现，故不会出现两个方括号块。
+        let rendered_bytes: usize = formatted.iter().map(|l| l.len()).sum();
         let mut output = truncated.content;
         let shown_end = start + truncated.shown_lines;
 
@@ -94,6 +97,8 @@ impl Tool for ReadTool {
                 total_lines,
                 next_offset
             ));
+        } else if rendered_bytes >= ys_tool::SOFT_RESULT_BYTES {
+            ys_tool::append_notices(&mut output, &[ys_tool::size_notice(rendered_bytes, None)]);
         }
 
         Ok(ToolResult {
@@ -300,6 +305,42 @@ mod tests {
                 .chars()
                 .rev()
                 .collect::<String>()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// **N4**：整段结果 ≥ 软阈值且**未被硬截断** ⇒ 附一条软阈值提示（`offset`/`limit` 措辞）。
+    ///
+    /// 变异：去掉 `else if rendered_bytes >= ys_tool::SOFT_RESULT_BYTES` 分支 → 本用例变红。
+    /// 变异：把该分支写在 `if shown_end < total_lines` 之前（恒附）→ 「未截断时不得出现续读通知」
+    /// 与本用例的 `contains("result is large")` 组合会暴露两个块并存的形态。
+    #[tokio::test]
+    async fn test_read_large_range_gets_soft_size_notice() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file = dir.join("big.txt");
+        // 40 行 × ~307 B（6 位行号 + Tab + 300 字符）≈ 12 KiB ∈ [8 KiB, 50 KiB)：
+        // **未**触发硬截断，应出软提示。
+        let content = format!("{}\n", "x".repeat(300)).repeat(40);
+        tokio::fs::write(&file, &content).await.unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let result = tool
+            .call(json!({ "path": "big.txt" }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("result is large"),
+            "大结果应带软阈值提示：{}",
+            result.content.chars().take(120).collect::<String>()
+        );
+        assert!(
+            !result.content.contains("Showing lines"),
+            "未截断时不应出现续读通知：{}",
+            result.content.chars().rev().take(120).collect::<String>()
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

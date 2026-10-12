@@ -197,6 +197,16 @@ fn tool_guidelines(tools: &[&str]) -> String {
                 .to_string(),
         );
     }
+    // 「先窄后宽」：大范围搜索 / 整文件读会把预算挤满，且很少比精确命中更有用。措辞给出可执行的
+    // 下一步（先 grep 定位、再 read 区间），而非仅劝阻。
+    if tools.iter().any(|t| matches!(*t, "read" | "grep")) {
+        guidelines.push(
+            "Explore narrow before broad: locate with grep, then read a specific line range \
+             (offset/limit). Avoid whole-file reads and large grep context — oversized results \
+             crowd out the context budget and rarely help"
+                .to_string(),
+        );
+    }
     if tools.contains(&"websearch") {
         guidelines.push(
             "Use websearch for information outside the repository (API docs, error meanings)"
@@ -650,6 +660,38 @@ mod tests {
         let bash_only = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
         assert!(
             !bash_only.contains("send several tool calls in one message"),
+            "只有 bash 时不得出现该指引；prompt = {bash_only}"
+        );
+    }
+
+    /// 「先窄后宽」这条 guideline **只在 `read` / `grep` 在场时**出现。
+    ///
+    /// 它对应的真实成本：大范围搜索 / 整文件读会把上下文预算挤满（会话实测单条 grep 45KB ≈ 11k token），
+    /// 而精确命中几乎总是更省也更准。反向断言（只有 `bash` 时不得出现）同样承重。
+    ///
+    /// 变异：把守卫从 `any(read|grep)` 改成无条件 push ⇒ 第二条断言变红。
+    #[test]
+    fn narrow_before_broad_guideline_appears_only_with_read_or_grep() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_tools = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("grep"), spec("bash")],
+            &no_skills(),
+        );
+        assert!(
+            with_tools.contains("- Explore narrow before broad: locate with grep"),
+            "有 read/grep 时应给「先窄后宽」指引；prompt = {with_tools}"
+        );
+        assert!(
+            with_tools.contains("Avoid whole-file reads and large grep context"),
+            "指引应点出代价（整文件读 / 大 context）；prompt = {with_tools}"
+        );
+
+        let bash_only = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
+        assert!(
+            !bash_only.contains("Explore narrow before broad"),
             "只有 bash 时不得出现该指引；prompt = {bash_only}"
         );
     }

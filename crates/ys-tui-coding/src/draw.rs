@@ -608,6 +608,8 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
         StopReason::MaxRounds => "⚠",
         StopReason::Cancelled => "✗",
         StopReason::Truncated => "✂",
+        // 「空产出」不是错误也不是完成：用 ∅ 表示「回合结束了，但模型什么也没给出」。
+        StopReason::NoOutput => "∅",
         _ => "?",
     }
 }
@@ -934,6 +936,7 @@ mod tests {
             (StopReason::MaxRounds, "⚠"),
             (StopReason::Cancelled, "✗"),
             (StopReason::Truncated, "✂"),
+            (StopReason::NoOutput, "∅"),
         ] {
             let mut app = app_with(CodingView::for_test());
             app.transcript.push(TranscriptLine::Summary {

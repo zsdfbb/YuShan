@@ -1,5 +1,10 @@
 # LLM API 不可用 — 架构上下文
 
+> **交叉引用（2026-10-12）**：`docs/arch/turn-output-and-feedback/`（已实现）**有意收窄**本文「场景 4
+> （合法空回复 = 正常）」的判定 —— 它把「无内容、无工具、`finish_reason=stop`」判为可见的非正常收尾
+> （`StopReason::NoOutput`），并声明了**顺序依赖**：传输层空（本文管辖，应为 `Err`）在该上游落地前
+> 也会先显示为 `NoOutput`，待本文落地后由其接管成 `RunFailed`。
+
 ## 概述
 
 需求：**`ys-coding-agent` 在 LLM API 不可用时必须报错并终止执行。**

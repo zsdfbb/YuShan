@@ -446,8 +446,18 @@ impl AgentLoop for BasicLoop {
             }
 
             if tool_calls.is_empty() {
-                // 无 tool call -> 完成
-                let final_msg = if text_content.is_empty() {
+                // 无 tool call -> 收场。
+                //
+                // **空 / 纯思考响应**（无正文、无工具调用）**不**当作 `Completed`：那会让「模型什么
+                // 也没说」看起来像正常收尾（用户实测会以为卡住）。改判 `NoOutput` —— UI 据此给一行
+                // 可见说明，一次性模式据此返回非零退出码。空白字符（如 `" "`）同样算空。
+                let empty_output = text_content.trim().is_empty();
+                let stop_reason = if empty_output {
+                    StopReason::NoOutput
+                } else {
+                    StopReason::Completed
+                };
+                let final_msg = if empty_output {
                     None
                 } else {
                     Some(assistant_message)
@@ -455,7 +465,7 @@ impl AgentLoop for BasicLoop {
                 emit(
                     ctx.events,
                     AgentEvent::RunFinished {
-                        stop_reason: StopReason::Completed,
+                        stop_reason: stop_reason.clone(),
                         usage: total_usage.clone(),
                         rounds,
                     },
@@ -463,7 +473,7 @@ impl AgentLoop for BasicLoop {
                 .await
                 .map_err(LoopError::Event)?;
                 return Ok(RunResult {
-                    stop_reason: StopReason::Completed,
+                    stop_reason,
                     usage: total_usage,
                     rounds,
                     final_message: final_msg,
@@ -1881,5 +1891,56 @@ mod tests {
                 .all(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. })),
             "作废的结果必须全是 is_error：{result_blocks:?}"
         );
+    }
+
+    // ==================== 空 / 纯思考响应 ⇒ NoOutput ====================
+
+    /// **N6**：模型返回「无正文、无工具调用」⇒ 回合以 `StopReason::NoOutput` 收场（**不是**
+    /// `Completed`），**终局事件同值**；空白字符响应同样算空。
+    ///
+    /// 变异：把分支改回 `StopReason::Completed` ⇒ 两个断言同时变红。
+    /// 变异：把 `text_content.trim().is_empty()` 换回 `text_content.is_empty()` ⇒ 空白用例（payload `"   "`）变红。
+    #[tokio::test]
+    async fn empty_response_ends_with_no_output_not_completed() {
+        for payload in ["", "   "] {
+            let registry = ToolRegistry::build(vec![]).unwrap();
+            let model = MockModel::new("m");
+            model.push_text(payload);
+            let mut session = MemorySession::new();
+            let mut events = CollectingSink::new();
+            let result = {
+                let mut ctx = make_ctx(
+                    &model,
+                    &registry,
+                    &mut session,
+                    &mut events,
+                    RunLimits::new(5),
+                );
+                BasicLoop
+                    .run_turn(AgentInput::text("go"), &mut ctx)
+                    .await
+                    .unwrap()
+            };
+
+            assert_eq!(
+                result.stop_reason,
+                StopReason::NoOutput,
+                "payload={payload:?} 必须收为 NoOutput"
+            );
+            assert!(
+                result.final_message.is_none(),
+                "空产出不得有 final_message（payload={payload:?}）"
+            );
+
+            let finished = events.events().iter().find_map(|e| match e {
+                AgentEvent::RunFinished { stop_reason, .. } => Some(stop_reason.clone()),
+                _ => None,
+            });
+            assert_eq!(
+                finished,
+                Some(StopReason::NoOutput),
+                "终局事件的 stop_reason 必须同值（payload={payload:?}）"
+            );
+        }
     }
 }

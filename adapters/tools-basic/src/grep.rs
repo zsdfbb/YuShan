@@ -47,6 +47,15 @@ const DEFAULT_LIMIT: usize = 100;
 /// 命中行上下文的行数（`rg --context` / `grep -C`）。
 const DEFAULT_CONTEXT: usize = 0;
 
+/// `grep` 单条结果的**专用字节预算**（比通用 `ys_tool::MAX_BYTES` 更紧）。
+///
+/// 收紧是刻意的：搜索结果一旦偏大，回喂给模型的 token 就是主要成本，而模型很少用得上全部命中。
+/// 超预算即截断，并在截断 notice 里给出**可执行的收窄指引**（否则「截断而无指针」是最坏形态）。
+const GREP_MAX_RESULT_BYTES: usize = 16 * 1024;
+
+/// `context` 参数上限：`context=N` 把每条命中扩成 `2N+1` 行，是输出爆炸的主因之一，故设硬上限。
+const MAX_CONTEXT: usize = 5;
+
 pub struct GrepTool {
     workspace: PathBuf,
     /// **注入**的探测结果（不在工具内部调 `detect()` 读进程 env，否则降级路径无法确定性测试）。
@@ -119,7 +128,10 @@ impl Tool for GrepTool {
         let glob = input["glob"].as_str();
         let ignore_case = input["ignoreCase"].as_bool().unwrap_or(false);
         let literal = input["literal"].as_bool().unwrap_or(false);
-        let context = input["context"].as_u64().unwrap_or(DEFAULT_CONTEXT as u64) as usize;
+        let requested_context =
+            input["context"].as_u64().unwrap_or(DEFAULT_CONTEXT as u64) as usize;
+        let context = requested_context.min(MAX_CONTEXT);
+        let context_clamped = requested_context > MAX_CONTEXT;
         // `limit` 至少为 1：0 会让「已截断」判定恒真、并产出 `Use limit=0 for more` 这类废话。
         let limit = (input["limit"].as_u64().unwrap_or(DEFAULT_LIMIT as u64) as usize).max(1);
 
@@ -182,7 +194,7 @@ impl Tool for GrepTool {
 
         let entries = parse(&bounded.stdout, native.is_some(), &search_root);
 
-        Ok(self.build_result(&bounded, &entries, limit, context, label))
+        Ok(self.build_result(&bounded, &entries, limit, context, context_clamped, label))
     }
 }
 
@@ -194,6 +206,7 @@ impl GrepTool {
         entries: &[Entry],
         limit: usize,
         context: usize,
+        context_clamped: bool,
         label: &str,
     ) -> ToolResult {
         let killed_by_us = bounded.stop != Stop::Eof;
@@ -228,9 +241,17 @@ impl GrepTool {
         }
 
         let (lines, limit_reached, lines_truncated) = render_entries(entries, limit, context);
-        let truncated = ys_tool::head_lines(&lines, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
+        // ★ 专用预算（收紧）：grep 单条结果按 `GREP_MAX_RESULT_BYTES` 截断，低于通用 `MAX_BYTES`。
+        let truncated = ys_tool::head_lines(&lines, ys_tool::MAX_LINES, GREP_MAX_RESULT_BYTES);
+        let rendered_bytes: usize = lines.iter().map(|l| l.len()).sum();
 
         let mut notices: Vec<String> = Vec::new();
+        if context_clamped {
+            notices.push(format!(
+                "context capped to {MAX_CONTEXT} (you asked for more). Use a tighter pattern to see \
+                 more surrounding lines"
+            ));
+        }
         if limit_reached {
             notices.push(format!(
                 "{limit} matches limit reached. Use limit={} for more",
@@ -246,7 +267,8 @@ impl GrepTool {
         }
         if truncated.hit.is_some() {
             notices.push(format!(
-                "Truncated {} lines, showing first {}",
+                "Truncated {} lines, showing first {}. Narrow the search (smaller context, \
+                 tighter pattern/path, or add a `glob`) to see the rest",
                 truncated.total_lines - truncated.shown_lines,
                 truncated.shown_lines
             ));
@@ -256,6 +278,12 @@ impl GrepTool {
                 "Some lines truncated to {} chars. Use the read tool to see full lines",
                 ys_tool::GREP_MAX_LINE_CHARS
             ));
+        }
+        // 软阈值（**仅未硬截断时**）：提示模型「结果偏大、下次收窄」，内容不变。
+        //
+        // 硬截断时不再重复软提示 —— 截断 notice 已带收窄指引。
+        if truncated.hit.is_none() && rendered_bytes >= ys_tool::SOFT_RESULT_BYTES {
+            notices.push(ys_tool::size_notice(rendered_bytes, Some(matches)));
         }
         match bounded.stop {
             Stop::Aborted => notices.push("Search aborted".into()),
@@ -1203,6 +1231,155 @@ mod tests {
             result.content.contains("cannot express"),
             "实际：{}",
             brief(&result.content)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 结果规模：专用预算（真收窄）+ 软阈值 + context 上限 ──────────────
+
+    /// **N1**：渲染超 `GREP_MAX_RESULT_BYTES`(16 KiB) ⇒ 正文被截到预算内，且截断 notice **带收窄指引**。
+    ///
+    /// 变异：把 `head_lines(.., GREP_MAX_RESULT_BYTES)` 换回 `ys_tool::MAX_BYTES`（50 KiB）
+    /// → 「正文字节 ≤ 预算」断言变红（100 行 × ~390 B ≈ 38 KiB 不再被截）。
+    /// 变异：删掉截断 notice 里的收窄措辞 → 「含 Narrow the search」断言变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_grep_truncates_to_result_budget_with_narrowing_hint() {
+        let dir = test_dir("grep_budget");
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("src/a.rs").to_string_lossy().into_owned();
+        let body: String = (1..=100)
+            .map(|i| {
+                format!(
+                    "printf '%s\\n' '{}'\n",
+                    rg_match_jsonl(&abs, i, &"y".repeat(300))
+                )
+            })
+            .collect();
+        let rg = fake_bin(&dir, "rg", &body);
+
+        let result = call(&rg_tool(&rg, &dir), json!({ "pattern": "y", "limit": 100 })).await;
+        assert!(!result.is_error, "{}", brief(&result.content));
+
+        let (body_text, notices) = result.content.rsplit_once("\n\n[").expect("应带 notice 块");
+        // 按 `head_lines` 的计数规则（单行成本 = len，不含换行）核对字节预算。
+        let body_bytes: usize = body_text.lines().map(|l| l.len()).sum();
+        assert!(
+            body_bytes <= GREP_MAX_RESULT_BYTES,
+            "正文必须被截到专用预算内：{body_bytes} > {GREP_MAX_RESULT_BYTES}"
+        );
+        assert!(
+            body_text.lines().count() < 100,
+            "应确实发生了截断，实际行数 {}",
+            body_text.lines().count()
+        );
+        assert!(
+            notices.contains("Truncated") && notices.contains("Narrow the search"),
+            "截断 notice 必须带收窄指引；实际：{notices}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **N2**：结果偏大但**未被截断** ⇒ 软阈值 notice；小结果 ⇒ 无。
+    ///
+    /// 变异：去掉软阈值分支 → 大结果断言变红；把阈值判断写成恒真 → 小结果断言变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_grep_soft_size_notice_only_when_large_and_not_truncated() {
+        // 大但未超预算：~30 行 × ~390 B ≈ 12 KiB ∈ [8 KiB, 16 KiB)
+        let big_dir = test_dir("grep_soft_big");
+        std::fs::create_dir_all(&big_dir).unwrap();
+        let big_abs = big_dir.join("src/a.rs").to_string_lossy().into_owned();
+        let big_body: String = (1..=30)
+            .map(|i| {
+                format!(
+                    "printf '%s\\n' '{}'\n",
+                    rg_match_jsonl(&big_abs, i, &"z".repeat(300))
+                )
+            })
+            .collect();
+        let rg_big = fake_bin(&big_dir, "rg", &big_body);
+        let big = call(
+            &rg_tool(&rg_big, &big_dir),
+            json!({ "pattern": "z", "limit": 100 }),
+        )
+        .await;
+        assert!(!big.is_error, "{}", brief(&big.content));
+        assert!(
+            big.content.contains("result is large"),
+            "大结果应带软阈值提示：{}",
+            brief(&big.content)
+        );
+        assert!(
+            !big.content.contains("Truncated"),
+            "软提示不应与硬截断共存：{}",
+            brief(&big.content)
+        );
+
+        // 小结果：3 行 ⇒ 无 size notice
+        let small_dir = test_dir("grep_soft_small");
+        std::fs::create_dir_all(&small_dir).unwrap();
+        let small_abs = small_dir.join("src/a.rs").to_string_lossy().into_owned();
+        let small_body: String = (1..=3)
+            .map(|i| {
+                format!(
+                    "printf '%s\\n' '{}'\n",
+                    rg_match_jsonl(&small_abs, i, "hit")
+                )
+            })
+            .collect();
+        let rg_small = fake_bin(&small_dir, "rg", &small_body);
+        let small = call(&rg_tool(&rg_small, &small_dir), json!({ "pattern": "hit" })).await;
+        assert!(
+            !small.content.contains("result is large"),
+            "小结果不得带软阈值提示：{}",
+            brief(&small.content)
+        );
+
+        let _ = std::fs::remove_dir_all(&big_dir);
+        let _ = std::fs::remove_dir_all(&small_dir);
+    }
+
+    /// **N3**：`context` 超 `MAX_CONTEXT`(5) ⇒ 被钳制 + notice；后置 context 行数 ≤ 5。
+    ///
+    /// 变异：去掉 `requested_context.min(MAX_CONTEXT)` → 上下文行数变 7，「≤ 5」断言变红。
+    /// 变异：去掉 `context_clamped` notice → 「context capped」断言变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_grep_context_is_capped_with_notice() {
+        let dir = test_dir("grep_ctxcap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("src/a.rs").to_string_lossy().into_owned();
+        let mut body = format!("printf '%s\\n' '{}'\n", rg_match_jsonl(&abs, 1, "hit"));
+        for i in 2..=8 {
+            body.push_str(&format!(
+                "printf '%s\\n' '{}'\n",
+                rg_event_json("context", &abs, i, "ctx")
+            ));
+        }
+        let rg = fake_bin(&dir, "rg", &body);
+
+        let result = call(
+            &rg_tool(&rg, &dir),
+            json!({ "pattern": "hit", "context": 999 }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", brief(&result.content));
+        assert!(
+            result.content.contains("context capped to 5"),
+            "应报出 context 被钳制：{}",
+            brief(&result.content)
+        );
+        let ctx_lines = result
+            .content
+            .lines()
+            .filter(|l| l.contains("- ctx"))
+            .count();
+        assert!(
+            ctx_lines <= MAX_CONTEXT,
+            "后置 context 行数必须 ≤ {MAX_CONTEXT}，实际 {ctx_lines}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

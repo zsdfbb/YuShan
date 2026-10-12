@@ -24,6 +24,11 @@ pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
 /// grep 单行渲染的最大字符数。
 pub const GREP_MAX_LINE_CHARS: usize = 500;
+/// **软阈值**：单条工具结果达到此字节数即值得提醒模型「结果偏大、建议收窄」。
+///
+/// 与 [`MAX_BYTES`]（硬闸门，超出即截断）刻意区分 —— 软阈值**不改变内容**，只影响是否附一条提示。
+/// 供 `grep` / `read` 复用（文案由 [`crate::notice::size_notice`] 统一）。
+pub const SOFT_RESULT_BYTES: usize = 8 * 1024;
 
 /// 撞上的上限种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +185,21 @@ mod tests {
     /// 生成 `n` 行、每行恰好 `width` 个 ASCII 字符，且逐行内容可辨识（便于断言起点）。
     fn lines_of(n: usize, width: usize) -> Vec<String> {
         (0..n).map(|i| format!("{i:0width$}")).collect()
+    }
+
+    /// 不变式：软阈值必须**小于**硬闸门 —— 否则「先提示、后截断」的两段语义会塌成一段。
+    ///
+    /// 钉住的变异：把 `SOFT_RESULT_BYTES` 调到 ≥ `MAX_BYTES` ⇒ 变红。
+    ///
+    /// 两个操作数都是编译期常量 ⇒ 断言在编译期即可判定（这正是我们要的：约束是常量级不变式），
+    /// 故显式关掉 `clippy::assertions_on_constants`。
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn soft_result_bytes_is_below_hard_cap() {
+        assert!(
+            SOFT_RESULT_BYTES < MAX_BYTES,
+            "软阈值({SOFT_RESULT_BYTES}) 必须小于硬闸门({MAX_BYTES})"
+        );
     }
 
     // ---------- head_lines / head：单行成本 = `line.len()`（不含换行），至少保留 1 行 ----------

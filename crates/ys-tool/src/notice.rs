@@ -23,9 +23,49 @@ pub fn append_notices(content: &mut String, notices: &[String]) {
     content.push(']');
 }
 
+/// 「结果偏大」提示的**统一文案**（供 `grep` / `read` 复用）。
+///
+/// 只拼文案；是否附由调用方决定（与本模块 [`append_notices`] 的分工一致）。
+/// `matches` 为 `None` 时表示「无命中数概念」的工具（如 `read`），走读区间措辞。
+pub fn size_notice(bytes: usize, matches: Option<usize>) -> String {
+    let kib = bytes.div_ceil(1024);
+    match matches {
+        Some(n) => format!(
+            "result is large (~{kib} KiB, {n} matches). Narrow it: use a smaller context, \
+             a tighter pattern/path, or read a specific line range"
+        ),
+        None => {
+            format!("result is large (~{kib} KiB). Read a narrower range with `offset` / `limit`")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `size_notice` 两种形态：带命中数（grep）/ 不带（read）。
+    ///
+    /// 钉住的变异：把 `div_ceil(1024)` 改成 `/ 1024`（8 KiB+1 字节 ⇒ 报「8 KiB」而非「9 KiB」）→ 变红；
+    /// 或让 `None` 分支也输出 "matches" → 变红。
+    #[test]
+    fn size_notice_reports_kib_and_narrowing() {
+        let with = size_notice(16 * 1024, Some(100));
+        assert!(
+            with.contains("16 KiB") && with.contains("100 matches"),
+            "{with}"
+        );
+
+        let without = size_notice(9 * 1024, None);
+        assert!(
+            without.contains("9 KiB") && !without.contains("matches"),
+            "{without}"
+        );
+
+        // 恰好 8 KiB ⇒ 8；多 1 字节 ⇒ 进位到 9（`div_ceil` 语义）。
+        assert!(size_notice(8 * 1024, None).contains("8 KiB"));
+        assert!(size_notice(8 * 1024 + 1, None).contains("9 KiB"));
+    }
 
     // `notice` 的既有测试全在工具层、且都是**单条**用例 —— `join` 不参与，`. ` 分隔符与
     // 「空正文守卫」**不可观测**（变异后全绿）。本模块把两处补齐：这里钉纯函数形态，

@@ -36,7 +36,7 @@ pub fn build_view(
 
     // `/model` 无参浮层的候选 = **所有已登录 provider** 的模型并集。
     //
-    // 每个 provider 的条目：优先启动期拉到的 `/v1/models` 目录（`refresh_models`
+    // 每个 provider 的条目：优先后台拉到的 `/v1/models` 目录（`apply_model_cache`
     // 写入的缓存），缺失则回退静态表中属于它的部分（`known_models_static` 的
     // `owned_by` 即 provider 名）。**未登录任何 provider** 时退回静态全表 —— 那时
     // 列出的模型本就点不动（无凭证），保留只为 `/model` 仍可浏览。
@@ -396,7 +396,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        // 启动期拉到的两个目录（真实路径是 `refresh_models` 写缓存）。
+        // 后台拉到的两个目录（真实路径是 `apply_model_cache` 写缓存）。
         cfg.registry
             .seed_cached_models("https://api.deepseek.com", &["deepseek-v4"]);
         cfg.registry.seed_cached_models(

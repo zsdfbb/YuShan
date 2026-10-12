@@ -42,10 +42,16 @@ pub struct ApiModel {
     pub owned_by: Option<String>,
 }
 
+/// `/v1/models` 目录缓存：`api_base → 该端点的模型目录`。
+///
+/// 后台拉取任务产出、经信道送回 app 循环，由
+/// [`ProviderRegistry::apply_model_cache`] 并入 [`ProviderRegistry::model_cache`]。
+pub type ModelCache = HashMap<String, Vec<ApiModel>>;
+
 /// 从 API 拉取 models 的结果，区分错误类型。
 ///
-/// 生产消费者：[`ProviderRegistry::refresh_models`]（启动期对每个已登录 provider
-/// 拉一次）。失败一律**静默** —— 不写缓存，`/model` 的候选回退静态表。
+/// 生产消费者：[`ProviderRegistry::fetch_all`]（后台对每个已登录 provider 拉一次）。
+/// 失败一律**静默** —— 不写缓存，`/model` 的候选回退静态表。
 pub enum FetchModelsResult {
     Success(Vec<ApiModel>),
     /// 401 —— 提示用户重新登录
@@ -68,9 +74,10 @@ pub struct ProviderRegistry {
     auth_store: AuthStore,
     /// `/v1/models` 拉取结果缓存（按 api_base 键）。
     ///
-    /// 启动期由 [`ProviderRegistry::refresh_models`] 填充；此后 `view::build_view`
-    /// 每回合从它读候选模型 —— **渲染路径一次 HTTP 都不发**（设计 M4）。
-    model_cache: HashMap<String, Vec<ApiModel>>,
+    /// 由 [`ProviderRegistry::apply_model_cache`] 填充（后台拉取的结果从 app 循环
+    /// 写回）；此后 `view::build_view` 每回合从它读候选模型 —— **渲染路径一次 HTTP
+    /// 都不发**（设计 M4）。
+    model_cache: ModelCache,
     /// auth 文件路径的覆盖项（测试用）。
     auth_override: Option<PathBuf>,
 }
@@ -262,10 +269,11 @@ impl ProviderRegistry {
 
     /// 从 provider 的 /v1/models endpoint 拉取 models。
     ///
-    /// **只在启动期调用**（[`ProviderRegistry::refresh_models`]，TUI 起屏**之前**的
-    /// 阻塞步骤）：起屏之后一次重绘都不该发 HTTP 请求，故拉到的目录缓存进
-    /// [`ProviderRegistry::model_cache`]，由 [`ProviderRegistry::models_for_provider`]
-    /// 读给 `/model` 浮层。
+    /// **只在后台拉取任务里调用**（[`ProviderRegistry::fetch_all`]，由 `main` 在 TUI
+    /// 起屏**之后** `rt.spawn`）：拉到的目录缓存进 [`ProviderRegistry::model_cache`]，
+    /// 由 [`ProviderRegistry::models_for_provider`] 读给 `/model` 浮层。**渲染路径
+    /// 一次 HTTP 都不发** —— 故写入走 [`ProviderRegistry::apply_model_cache`]，
+    /// 拉取本身绝不在 `build_view` 的调用栈上。
     pub async fn fetch_models(api_base: &str, api_key: &str) -> FetchModelsResult {
         let url = build_models_url(api_base);
         let client = match reqwest::Client::builder()
@@ -299,29 +307,36 @@ impl ProviderRegistry {
         }
     }
 
-    /// 启动期：对**每个已登录 provider** 拉一次 `/v1/models`，成功即写进
-    /// [`Self::model_cache`]（键为 api_base）。
+    /// 已登录 provider 的 `(api_base, api_key)` 列表 —— 后台拉取 `/v1/models` 的输入。
     ///
-    /// 唯一生产调用点：`main.rs::run_interactive` —— **TUI 起屏之前**的阻塞步骤
-    /// （`rt.block_on`）。之所以在启动期拉、而不是打开 `/model` 浮层时拉：起屏后
-    /// 一次重绘都不该发 HTTP（设计 M4）。此后 `build_view` 只读缓存。
-    ///
-    /// 各 provider **并发**拉（`JoinSet`），故总耗时 ≈ 单次超时（5s），不随
-    /// provider 数线性增长。**失败一律静默**（超时 / DNS / 401 → 不写缓存）：
-    /// [`Self::models_for_provider`] 会因此回退静态表 —— 网络问题绝不该让
-    /// `/model` 的候选变空，更不该让启动失败。
-    pub async fn refresh_models(&mut self) {
-        let targets: Vec<(String, String)> = self
-            .providers
+    /// 只取 `api_base` 非空的条目（空 base 无处可拉，如未配 URL 的 `custom`）。
+    /// 输入在**起屏前**从 registry 摘出，交给后台任务 —— 任务因此不借用 registry，
+    /// 与 app 循环的写（[`Self::apply_model_cache`]）不共享任何状态。
+    pub fn fetch_targets(&self) -> Vec<(String, String)> {
+        self.providers
             .iter()
             .filter_map(|p| {
                 self.auth_store
                     .get(&p.name)
+                    .filter(|e| !e.api_base.is_empty())
                     .map(|e| (e.api_base.clone(), e.api_key.clone()))
             })
-            .filter(|(base, _)| !base.is_empty())
-            .collect();
+            .collect()
+    }
 
+    /// 后台：对**每个已登录 provider** 拉一次 `/v1/models`，返回 `api_base → 目录`
+    /// （成功且非空才收进结果；供 [`Self::apply_model_cache`] 并入缓存）。
+    ///
+    /// **纯网络部分** —— 不触碰 `self`，故可在 TUI 起屏**之后** `rt.spawn` 到后台
+    /// 任务里跑：起屏不再等网络，开屏即用（`/model` 候选先取静态表，目录到手后由
+    /// app 循环刷新视图）。各 provider **并发**拉（`JoinSet`），故总耗时 ≈ 单次超时
+    /// （5s），不随 provider 数线性增长。
+    ///
+    /// **失败一律静默**（超时 / DNS / 401 → 不写缓存，仅落日志）：
+    /// [`Self::models_for_provider`] 会因此回退静态表 —— 网络问题绝不该让 `/model`
+    /// 的候选变空，更不该让启动失败。
+    pub async fn fetch_all(targets: Vec<(String, String)>) -> ModelCache {
+        let mut cache: ModelCache = HashMap::new();
         let mut set = tokio::task::JoinSet::new();
         for (base, key) in targets {
             set.spawn(async move {
@@ -336,7 +351,7 @@ impl ProviderRegistry {
                     // 空目录视同失败：不写缓存 ⇒ `models_for_provider` 回退静态表
                     // （写进去反而会让候选整体变空）。
                     if !models.is_empty() {
-                        self.model_cache.insert(base, models);
+                        cache.insert(base, models);
                     }
                 }
                 // 对用户静默（`/model` 照常有静态回退），但**落日志** —— 否则
@@ -350,9 +365,18 @@ impl ProviderRegistry {
                 Err(e) => crate::logging::log(&format!("model refresh task failed: {e}")),
             }
         }
+        cache
     }
 
-    /// 该 provider 的候选模型 id：优先启动期拉到的目录，缺失则回退静态表中
+    /// 把后台拉取到的目录并入缓存（键为 api_base）。
+    ///
+    /// 唯一生产调用点：`app_loop::run` —— 后台任务的结果经信道送回 app 循环，由它
+    /// 写入。registry 的**唯一写者仍是 app 循环**（与 `build_view` 的读同线程）。
+    pub fn apply_model_cache(&mut self, cache: ModelCache) {
+        self.model_cache.extend(cache);
+    }
+
+    /// 该 provider 的候选模型 id：优先后台拉到的目录，缺失则回退静态表中
     /// **属于它的**条目（[`Self::known_models_static`] 的 `owned_by` 即 provider 名）。
     ///
     /// 唯一消费者：`view::build_view`（`/model` 浮层的候选）。
@@ -786,7 +810,7 @@ mod tests {
             vec!["deepseek-v4".to_string()]
         );
 
-        // 空目录视同没拉到 → 回退静态表（`refresh_models` 不写空目录，这里直接构造）
+        // 空目录视同没拉到 → 回退静态表（`fetch_all` 不写空目录，这里直接构造）
         reg.seed_cached_models("https://api.deepseek.com", &[]);
         assert_eq!(
             reg.models_for_provider("deepseek"),

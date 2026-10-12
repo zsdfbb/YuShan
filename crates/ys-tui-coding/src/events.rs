@@ -648,7 +648,7 @@ mod tests {
     fn test_paste_inserts_multiline_at_once() {
         let ch = channels();
         let mut a = app();
-        assert_eq!(input_height(&a), 3, "空输入：1 行内容 + 2 边框");
+        assert_eq!(input_height(&a, 120), 3, "空输入：1 行内容 + 2 边框");
         handle_event(
             Event::Paste("line1\nline2\nline3".into()),
             &mut a,
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(a.input.text, "line1\nline2\nline3");
         assert_eq!(a.input.lines(), 3);
         assert!(!a.is_turning, "粘贴不得被当提交");
-        assert_eq!(input_height(&a), 5, "粘贴 3 行 → 输入区撑高到 5");
+        assert_eq!(input_height(&a, 120), 5, "粘贴 3 行 → 输入区撑高到 5");
         assert_eq!(a.input.cursor, a.input.text.chars().count(), "光标在末尾");
     }
 

@@ -1245,7 +1245,7 @@ fn resume_replay(wiring: &Wiring, resuming: bool) -> Option<Outbound<CodingView>
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     rt: tokio::runtime::Runtime,
-    mut config: config::Config,
+    config: config::Config,
     state_store: state::StateStore,
     agent: Agent,
     subagent: subagent::SubagentSetup,
@@ -1280,19 +1280,27 @@ fn run_interactive(
     let session_path =
         app_loop::SessionPathHandle::new(wiring.session_path().map(Path::to_path_buf));
 
-    // 2b.【阻塞】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
+    // 2b.【后台】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
     //
-    // 必须在**起屏之前**（此后一次重绘都不该发 HTTP，设计 M4）；5s 超时且并发，
-    // 失败静默回退静态表。提示**拉完即擦除** —— 它只为解释「这几秒在等什么」，
-    // 不该像降级提示那样留在屏幕上。
-    let pending = config.registry.logged_in_providers().len();
-    if pending > 0 {
-        eprint!("Fetching models for {pending} logged-in provider(s)…");
-        let _ = io::stderr().flush();
-        rt.block_on(config.registry.refresh_models());
-        eprint!("\r\x1b[2K");
-        let _ = io::stderr().flush();
-    }
+    // **不再阻塞起屏**：起屏前只摘出 `(api_base, api_key)` 目标，拉取在 TUI 起屏后
+    // `rt.spawn` 到后台；目录到手经信道送回 app 循环（`app_loop::run` 的 `models_rx`）
+    // 写进 registry 并刷新视图。渲染路径依旧一次 HTTP 都不发（设计 M4）—— 写与读同
+    // 在 app 循环那一线程，后台任务只负责网络、不碰 registry（唯一写者不分裂）。
+    //
+    // `/model` 候选在目录回来前取静态表，回来后由视图刷新切到真实目录。5s 超时且
+    // 并发，失败静默回退静态表。无已登录 provider 时不拉（`models_rx = None`）。
+    let fetch_targets = config.registry.fetch_targets();
+    let models_rx = if fetch_targets.is_empty() {
+        None
+    } else {
+        let (models_tx, models_rx) = mpsc::channel::<provider::ModelCache>(1);
+        rt.spawn(async move {
+            let cache = provider::ProviderRegistry::fetch_all(fetch_targets).await;
+            // app 循环已收摊（UI 退出）时无人接收 —— 静默丢弃即可。
+            let _ = models_tx.send(cache).await;
+        });
+        Some(models_rx)
+    };
 
     // 由 meta 播种累计统计（resume 后状态行的 tokens / turns 不归零）。
     // `session_started`（状态行时长）属展示、非执行状态，不恢复。
@@ -1351,6 +1359,7 @@ fn run_interactive(
             boundary_rx,
             out_tx,
             sink_rx,
+            models_rx,
             Some(subagent),
             factory,
             default_workspace,

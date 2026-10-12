@@ -176,6 +176,15 @@ impl WorktreeHandle {
 /// 行），循环继续等下一条 `Request`。
 pub type AppLoopError = Box<dyn std::error::Error + Send + Sync>;
 
+/// 主循环的一次唤醒：一条 UI 请求，或后台模型目录回来了。
+///
+/// 把两个来源收成一个枚举，是为了在 `select!` 结束后**先释放对 `models_rx` 的
+/// 借用**再改写它（收到目录即置 `None`、停用该分支）。
+enum Wake {
+    Request(Option<Request>),
+    Models(Option<crate::provider::ModelCache>),
+}
+
 /// 跑 app 侧循环，直到 UI 侧把所有发送端 drop 掉（= 正常收摊）。
 ///
 /// 参数里的三条信道方向见设计 §8：`request_rx` / `boundary_rx` 是 UI → app，
@@ -193,6 +202,9 @@ pub async fn run(
     mut boundary_rx: mpsc::Receiver<Boundary>,
     out_tx: mpsc::Sender<Outbound<CodingView>>,
     mut sink_rx: mpsc::Receiver<Envelope>,
+    // 后台模型目录信道：`main` 在起屏后并发拉 `/v1/models`，结果**一次性**投回
+    // （见下方循环开头的 `select!`）。`None` = 起屏时无已登录 provider，无需拉取。
+    mut models_rx: Option<mpsc::Receiver<crate::provider::ModelCache>>,
     mut subagent: Option<crate::subagent::SubagentSetup>,
     // 装配工厂：会话内 `/resume` 换工作区时按新工作区**重建** agent（工具表 +
     // `working_dir` + system prompt 三者一起换）。
@@ -213,8 +225,38 @@ pub async fn run(
     let mut thinking_visible = wiring.meta().map(|m| m.thinking_visible).unwrap_or(false);
 
     loop {
-        let Some(req) = request_rx.recv().await else {
-            return Ok(()); // UI 侧 drop 了发送端 → 正常退出
+        // 等一条 UI 请求；后台模型目录若尚未返回，则与之赛跑。目录**一次性**到达，
+        // 收到后把 `models_rx` 置 `None`，此后主循环只等 `Request`。
+        //
+        // 目录到手 ⇒ 并入 registry、刷新一次视图：`/model` 候选从静态表切到真实
+        // 目录（渲染路径依旧一次 HTTP 都不发，写与读同在这个线程）。
+        let wake = match models_rx.as_mut() {
+            Some(rx) => tokio::select! {
+                req = request_rx.recv() => Wake::Request(req),
+                cache = rx.recv() => Wake::Models(cache),
+            },
+            None => Wake::Request(request_rx.recv().await),
+        };
+        let req = match wake {
+            Wake::Request(Some(req)) => req,
+            Wake::Request(None) => return Ok(()), // UI 侧 drop 了发送端 → 正常退出
+            Wake::Models(cache) => {
+                models_rx = None; // 目录只投一次；此后不再参与 `select!`
+                if let Some(cache) = cache {
+                    config.registry.apply_model_cache(cache);
+                    let view = build_view(
+                        &config,
+                        &agent,
+                        &wiring,
+                        &config.registry,
+                        &state_store,
+                        &stats,
+                        session_started,
+                    );
+                    send(&out_tx, Outbound::View(view)).await?;
+                }
+                continue;
+            }
         };
 
         let mut lines: Vec<String> = Vec::new();
@@ -775,6 +817,8 @@ mod tests {
     struct Harness {
         requests: mpsc::Sender<Request>,
         boundaries: mpsc::Sender<Boundary>,
+        /// 后台模型目录信道（`main` 的角色）：投一条缓存 = 模拟拉取完成。
+        models: mpsc::Sender<crate::provider::ModelCache>,
         outbound: mpsc::Receiver<Outbound<CodingView>>,
         handle: tokio::task::JoinHandle<Result<(), AppLoopError>>,
         /// 与 app 循环共享的会话路径快照（退出提示行的取数口）。
@@ -874,6 +918,9 @@ mod tests {
         let (requests, request_rx) = mpsc::channel(8);
         let (boundaries, boundary_rx) = mpsc::channel(8);
         let (out_tx, outbound) = mpsc::channel(64);
+        // 后台模型目录信道：harness 自带一个发送端（生产侧是 `main` 的后台任务）。
+        // 测试不投时该分支恒挂起，行为与「无后台拉取」一致。
+        let (models, models_rx) = mpsc::channel(4);
 
         // 与生产侧同规：启动态由建 `Wiring` 的一方播种（`/new` 之后由循环刷新）。
         let session_path =
@@ -911,6 +958,7 @@ mod tests {
             boundary_rx,
             out_tx,
             sink_rx,
+            Some(models_rx),
             subagent,
             factory,
             default_workspace,
@@ -921,6 +969,7 @@ mod tests {
         Harness {
             requests,
             boundaries,
+            models,
             outbound,
             handle,
             session_path,
@@ -1283,6 +1332,67 @@ mod tests {
             }
             other => panic!("命令的出站序列应恰为 [Output]：{other:?}"),
         }
+    }
+
+    /// **后台模型目录**：`main` 在起屏后并发拉 `/v1/models`，目录到手经 `models`
+    /// 信道送回 app 循环 —— 循环把它并入 registry 并**自发**刷一次视图，`/model`
+    /// 候选随之从静态表切到真实目录。**全程无任何 `Request`**（不阻塞起屏的关键）。
+    ///
+    /// 变异：删掉循环开头 `Wake::Models` 分支里的 `apply_model_cache` + 视图刷新
+    /// ⇒ 第二次 `collect_until_view` 收不到视图（挂起）→ 本用例超时变红。
+    #[tokio::test]
+    async fn background_model_cache_refreshes_view_without_request() {
+        // 一个有凭证的 provider：候选才走 `models_for_provider`（无凭证走静态全表）。
+        let model = MockModel::new("mock");
+        let mut h = spawn_app_loop_with(Box::new(model), false, Vec::new(), |config, tmp| {
+            config
+                .registry
+                .save_auth(
+                    "deepseek",
+                    &crate::provider::AuthEntry {
+                        api_base: "https://fake.deepseek".into(),
+                        api_key: "sk-x".into(),
+                        model: "deepseek-chat".into(),
+                    },
+                )
+                .unwrap();
+            let _ = tmp;
+        })
+        .await;
+
+        // 目录到达之前：候选只有静态表里属于 deepseek 的条目。
+        // （循环不在起跑时自发发视图，故用一条无输出的 `SetThinking` 逼一份当前视图。）
+        h.requests
+            .send(Request::SetThinking { visible: true })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert!(
+            !view.available_models.contains(&"deepseek-v9".to_string()),
+            "拉取前不应有目录模型：{:?}",
+            view.available_models
+        );
+
+        // 模拟后台任务返回目录（键 = 该 provider 的 api_base）。
+        let mut cache = crate::provider::ModelCache::new();
+        cache.insert(
+            "https://fake.deepseek".into(),
+            vec![crate::provider::ApiModel {
+                id: "deepseek-v9".into(),
+                owned_by: None,
+            }],
+        );
+        h.models.send(cache).await.unwrap();
+
+        // 目录到达 ⇒ **无请求**也刷一次视图，候选含拉到的模型。
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert!(
+            view.available_models.contains(&"deepseek-v9".to_string()),
+            "后台目录应进入候选：{:?}",
+            view.available_models
+        );
     }
 
     /// 2. **回合驱动**：每来一条 `Prompt` 回合号 +1，且信封的 `turn` 与之同步。
@@ -1652,6 +1762,7 @@ mod tests {
         let Harness {
             requests,
             boundaries,
+            models: _,
             outbound,
             mut handle,
             session_path: _,

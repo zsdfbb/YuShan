@@ -34,6 +34,8 @@ apps/coding-agent/src/prompt.rs            guideline「先窄后宽」（read/gr
 **② 空响应判定用 `trim()`，且**不看** `finish_reason。** `text_content.trim().is_empty()` 才算空 ——
 空白字符（含 `" "`）同样落 `NoOutput`。传输层空（`llm-api-unavailable` 管辖）在上游落地前也会显示为
 `NoOutput`；待其接管后变为 `RunFailed`。这是**记录在案**的顺序依赖，不是缺陷。
+（第二批 `turn-budget-and-retry` 只给「是否**重试**」加了 `finish_reason == Stop` 闸，**不改**这里的
+`NoOutput` 判定 —— 详见 `docs/design-final/turn-budget-and-retry.md`。）
 
 **③ `grep` 专用预算低于通用闸门。** `head_lines(lines, MAX_LINES, GREP_MAX_RESULT_BYTES=16 KiB)`，
 且**截断 notice 必须带收窄指引**（「Truncated N lines, showing first M. Narrow the search …」）——

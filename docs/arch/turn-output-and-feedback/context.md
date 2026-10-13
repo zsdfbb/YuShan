@@ -172,18 +172,21 @@ grep.rs call → run_bounded(BYTE_CAP=1MiB, DEADLINE) → parse → build_result
    落点 `grep.rs::build_result` + `crates/ys-tool/src/notice.rs`（形态统一）。
 3. 给 `grep` 的 `context` 参数设**上限**（建议 `MAX_CONTEXT = 5`），超限时钳制并附 notice。
    **注意**：它**不覆盖**观察用例（`context=4`）；目的是防更宽的放大，**不是**主手段（主手段是 #1）。
-4. **（第二批）回合级工具输出总量闸门**：一个回合内累积工具结果超 N token 时，把**更早**的结果降级为
-   「头部 + 显式续读指针」。需要在 `ys-loop` 内新增判据 + 触发点。
+4. **回合级工具输出总量闸门**（第二批 · **已落地**，`crates/ys-loop/src/turn_budget.rs` + `basic.rs` Step 11）：
+   一个回合内累积工具结果超 `RunLimits::max_turn_tool_result_tokens` 时，把**更早**的结果降级为
+   「头部 + 显式续读指针」；最新一条永不降级，配对完整，`budget = 0` 逐字节不变。
 5. `apps/coding-agent/src/prompt.rs` 的 `tool_guidelines`（`:154`）补一条
    「先窄后宽：先 `grep` 定位再 `read` 指定区间，避免整文件 / 大 `context`」。**进 `fixed_prompt_tokens`**，按 token 计价。
 
 **子问题 B · 让回合输出与进展可见**
 
-6. **空 / 纯思考响应不再静默收场**：加 `StopReason::NoOutput`（判定用 `text.trim()`，覆盖空白响应），
+6. **空 / 纯思考响应不再静默收场**（第一批 · **已落地**）：加 `StopReason::NoOutput`（判定用 `text.trim()`，覆盖空白响应），
    TUI 在 `RunFinished` 臂推一条可见 System 行（`app.rs:263-274` 就近）；**一次性模式退出码 = 1**（无可用产出 ≠ 成功）、
    并在 stderr 写一行说明 —— **不可静默装作成功**。与 `llm-api-unavailable` 的边界见 `design.md`（谁负责把传输层空转成错误）。
-7. **（第二批）空响应重试一次**：无正文无工具调用时带一句催促重发一次，仍空才如实上报。
-8. **长循环过程叙述**：先加 `tool_guidelines`「多轮工具任务每批前用一句话说明正在做什么」（便宜、可测）；
+7. **空响应重试一次**（第二批 · **已落地**，`basic.rs` 空产出分支 + `RunLimits::retry_empty_response`）：
+   无正文无工具调用时带一句催促重发一次（消耗一个轮），仍空才如实上报；`false` 时与第一批逐字节一致。
+8. **长循环过程叙述**（第二批 · **已落地**，`apps/coding-agent/src/prompt.rs::tool_guidelines`）：
+   加「多轮工具任务每批前用一句话说明正在做什么」（便宜、可测），仅工作型工具在场时出现；
    （叠加）状态行补「当前工具」后置。
 
 ### 范围外（明确不做）

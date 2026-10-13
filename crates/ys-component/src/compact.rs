@@ -24,7 +24,8 @@ pub struct CompactPolicy {
     pub keep_min_ratio: f64,
     /// 保留比例上限
     pub keep_max_ratio: f64,
-    /// 为模型输出预留的 token 数（app 装配 `max_tokens = 4096`）
+    /// 为模型输出预留的 token 数 —— 触发点据此确保窗口还容得下一轮输出（保守取 4K；
+    /// 模型输出不再有人为上限，但压缩触发点在窗口过小时仍需给输出留余量）。
     pub output_reserve: usize,
     /// 生成摘要用的 system prompt（逐字交给摘要模型）
     pub summary_system_prompt: String,

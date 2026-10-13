@@ -215,9 +215,10 @@ Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生
    （会破坏「工具无事件出口」的结构不变式）。
 7. **注入面上升是净负面**：摘要把**不可信内容改写成同级模型口吻的段落**。全部防御 = 标题行来源标注 +
    系统提示词一条规则 —— **安慰剂级，不得被宣传为防护**。
-8. **`max_tokens` / `temperature` 在 coding-agent 装配下被静默覆盖**：`model-openai-compatible` 是
-   `config.X.or(request.X)`，app 侧写死 `Some(4096)` / `Some(0.7)` ⇒ **线上实际发出 4096 / 0.7**，
-   我们请求的 1024 **只在库路径生效**。
+8. **`temperature` 在 coding-agent 装配下被静默覆盖**：`model-openai-compatible` 是
+   `config.X.or(request.X)`，app 侧写死 config 级 `temperature = Some(0.7)` ⇒ 线上实际发出 0.7。
+   `max_tokens` **不再**被覆盖 —— app 的 config 级 `max_tokens` 已改为 `None`（ADR-0036），
+   故我们请求的 1024 **就是**线上生效值。
 9. **封顶常量值待实测**：机制已定（与显示头部同预算），但**那个数**要靠 `prototype` 用 `tests/golden/` 五页
    实测「封顶 vs 摘要质量 vs token」。实测后**可能只改一个常量**。
 10. **摘要产物进 session ⇒ 会成为 compaction 的输入**，而「不可信来源」的标注可能在**二次摘要中被洗掉** ——
@@ -241,7 +242,8 @@ Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生
 - `crates/ys-tool`（**38 条**全量）：新增的摘要用例挂在 `summarizer.rs` / `context.rs` —— `with_summarizer`
   挂载后**其余字段不变**。
 - `crates/ys-loop/src/summarize.rs`：自建 **`RecordingModel`**（记录**最后一次** `ModelRequest`）断言
-  `tools.is_empty()`、system **含 untrusted 框架**、`max_tokens == 1024`（注释写明**会被覆盖**）、空响应 ⇒ `Err`。
+  `tools.is_empty()`、system **含 untrusted 框架**、`max_tokens == 1024`（app 不再覆盖 config 级
+  `max_tokens` ⇒ 即为线上生效值）、空响应 ⇒ `Err`。
 - `crates/ys-loop/src/lib.rs`：**接线探针**（`ProbeTool` 读 `ctx.summarizer.is_some()`）——
   这是**唯一**能抓住「**删掉生产接线**」的用例。
 - `apps/coding-agent/src/toolset.rs` / `prompt.rs` / `main.rs`：9 工具顺序、两条 hint 合并、`sessions_dir` 回归、

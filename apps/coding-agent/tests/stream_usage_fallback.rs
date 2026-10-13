@@ -304,6 +304,35 @@ fn env_var_config_captures_stream_usage() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// app 不设输出上限：请求体**不含** `max_tokens` ⇒ 交给 provider 自身的模型上限
+/// （DeepSeek 单次可达 ~200k）。这是「绝不人为把模型掐断」的线上保证。
+///
+/// 变异：把 `apps/coding-agent/src/main.rs` 的 `max_tokens: None` 改回 `Some(4096)`
+/// ⇒ 请求体里出现 `"max_tokens":4096` ⇒ 本用例变红。
+#[test]
+fn request_omits_max_tokens_so_provider_uses_its_own_limit() {
+    let server = MockServer::start(MockConfig::default());
+    let home = isolate_home("no_max_tokens");
+
+    let out = run_json(&server.api_base(), "hi", &home);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit != 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let bodies = server.request_bodies();
+    assert_eq!(bodies.len(), 1, "预期一次请求，实际 {:?}", bodies.len());
+    assert!(
+        !bodies[0].contains("max_tokens"),
+        "app 不得写死输出上限：请求体应省略 max_tokens，body = {}",
+        bodies[0]
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// 2. env-var 配置＋对 `stream_options` 返回 400 的 mock：
 ///    剥掉该字段重试一次后成功；有回退警告；第二次请求不含 `stream_options`；
 ///    本次 `RunFinished.usage` 为 0。

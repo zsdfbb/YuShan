@@ -20,7 +20,7 @@
 //! 0. parse_args（含 --resume 形态）
 //! 1. Config::from_env → registry.load_auth → 用户配置（config.json）
 //!    → skill 扫描（default_skill_roots + load_skills + catalogue）
-//! 2. state.json → sessions_dir → resolve_resume（`--resume=id` 解析 / 裸 `--resume` 走 picker）
+//! 2. state.json → sessions_dir → resolve_resume（`--resume <id>` 解析 / 裸 `--resume` 走 picker）
 //! 3. 模型解析（env > meta > state.json > 首个有凭证）→ resolve_limits → set_model_factory
 //! 4. WebConfig::from_env → 启动期清理（仅 Primary 档）
 //!    → 装工具表（toolset 探测一次）→ 由工具表派生 system prompt → 合并启动期提示
@@ -103,7 +103,7 @@ enum Resume {
     New,
     /// `--resume`：交互式列表选择。
     Pick,
-    /// `--resume=<id>`：指定会话（id 或路径）。
+    /// `--resume <id>`：指定会话（id 或路径，空格形态）。
     Id(String),
 }
 
@@ -137,15 +137,19 @@ struct Args {
 
 /// 循环剥离「模式 flag 之后、任务文本之前」的 flag 区。
 ///
-/// 只认**紧邻**位置（`-p --stats --resume=x "任务"`）：任务文本一旦开始，后续
+/// 只认**紧邻**位置（`-p --stats --resume 2026-10-07-abc "任务"`）：任务文本一旦开始，后续
 /// `--stats` / `--resume` 就是文本的一部分（`-p "任务" --stats` → 文本
 /// `"任务 --stats"`），从而保住「任务文本逐字保留」的既有语义。
 ///
-/// 对 `--stats` 与 `--resume[=<id>]` **顺序无关**（循环剥离）。
+/// `--resume` 取**紧随其后**的 token 为 id（空格形态 `--resume <id>`）—— 但仅当其后**还留有
+/// 任务文本**（至少还有一个 token）；否则它是裸 `--resume`（列表选择），紧跟的 token 归任务。
+/// 理由：`-p` / `--json` 的任务文本**必需**，`--resume` 绝不能把它吃掉 ⇒ `--resume <id> <任务>`
+/// 取 id，`--resume <任务>`（其后无 token）是裸 flag + 任务文本。下一 token 不存在或以 `-`
+/// 开头同样 ⇒ 裸 `--resume`。`--resume=<id>`（`=` 形态）**已移除** ⇒ 报错。
 ///
-/// 重复 flag **last-wins 且静默丢弃**（`-p --resume=x --resume "任务"` ⇒ 后者把
-/// resume 改回 `Pick`）：这是有意保留的语义，不做冲突报错。
-fn split_leading_flags(rest: &[String]) -> (bool, Resume, &[String]) {
+/// 对 `--stats` 与 `--resume` **顺序无关**（循环剥离）。重复 flag **last-wins 且静默
+/// 丢弃**：这是有意保留的语义，不做冲突报错。
+fn split_leading_flags(rest: &[String]) -> Result<(bool, Resume, &[String]), String> {
     let mut stats = false;
     let mut resume = Resume::New;
     let mut idx = 0;
@@ -156,17 +160,33 @@ fn split_leading_flags(rest: &[String]) -> (bool, Resume, &[String]) {
                 idx += 1;
             }
             "--resume" => {
-                resume = Resume::Pick;
-                idx += 1;
+                // 空格形态 `--resume <id>`；id **可选**（缺省 ⇒ 裸 `--resume` = 列表选择）。
+                // `-p` / `--json` 的任务文本是**必需的** ⇒ 只有当 `--resume` 之后**还留着
+                // 任务文本**（至少还有一个 token）时，紧跟的那个 token 才当 id，绝不把任务
+                // 吃掉。于是 `--resume <id> <任务>` 取 id，`--resume <任务>`（其后无 token）
+                // 是裸 flag + 任务文本。
+                match rest.get(idx + 1).filter(|t| !t.starts_with('-')) {
+                    Some(id) if idx + 2 < rest.len() => {
+                        resume = Resume::Id(id.clone());
+                        idx += 2;
+                    }
+                    _ => {
+                        resume = Resume::Pick;
+                        idx += 1;
+                    }
+                }
             }
             s if s.starts_with("--resume=") => {
-                resume = Resume::Id(s["--resume=".len()..].to_string());
-                idx += 1;
+                return Err(
+                    "--resume 改为空格形态：`--resume <id>`（不再支持 `=`）。\
+                     例如：-p --resume 2026-10-07-abc \"任务\""
+                        .into(),
+                );
             }
             _ => break,
         }
     }
-    (stats, resume, &rest[idx..])
+    Ok((stats, resume, &rest[idx..]))
 }
 
 /// 解析 argv（不含 argv[0]）。
@@ -175,26 +195,16 @@ fn split_leading_flags(rest: &[String]) -> (bool, Resume, &[String]) {
 /// 例如 `-p --help me` 的任务文本就是 `--help me`。
 /// 例外是模式 flag 之后的 flag 区——见 [`split_leading_flags`]。
 ///
-/// TUI 形态：首个位置可为裸 `--resume`（列表选择）或 `--resume=<id>`（指定会话），
-/// 其后参数照旧忽略。`--resume <id>`（空格）**不支持**（`=` 形式消除与任务文本的
-/// 歧义）。
+/// TUI 形态：首个位置可为裸 `--resume`（列表选择）或 `--resume <id>`（指定会话，**空格形态**），
+/// 其后参数照旧忽略。`--resume=<id>`（`=` 形态）已移除 ⇒ 报错。
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let Some(first) = argv.first().map(String::as_str) else {
         return Ok(new_interactive());
     };
 
-    if let Some(id) = first.strip_prefix("--resume=") {
-        return Ok(Args {
-            mode: Mode::Interactive,
-            stats: false,
-            resume: Resume::Id(id.to_string()),
-            worktree: None,
-        });
-    }
-
     match first {
         "-p" => {
-            let (stats, resume, rest) = split_leading_flags(&argv[1..]);
+            let (stats, resume, rest) = split_leading_flags(&argv[1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("-p 需要一个任务参数，例如：ys-coding-agent -p \"修复这个 bug\"".into())
@@ -208,7 +218,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             }
         }
         "--json" => {
-            let (stats, resume, rest) = split_leading_flags(&argv[1..]);
+            let (stats, resume, rest) = split_leading_flags(&argv[1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("--json 需要一个任务参数，例如：ys-coding-agent --json \"修复这个 bug\"".into())
@@ -221,17 +231,25 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 })
             }
         }
+        // `--resume <id>`（空格形态）或裸 `--resume`（列表选择）。
         "--resume" => Ok(Args {
             mode: Mode::Interactive,
             stats: false,
-            resume: Resume::Pick,
+            resume: match argv.get(1).filter(|t| !t.starts_with('-')) {
+                Some(id) => Resume::Id(id.clone()),
+                None => Resume::Pick,
+            },
             worktree: None,
         }),
         "worktree" => parse_worktree(&argv[1..]),
+        // `=` 形态已移除：给出可操作的错误，而不是当成不认识的 flag。
+        f if f.starts_with("--resume=") => {
+            Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）".into())
+        }
         // 未知 flag：仅当它出现在**首个**位置时才算 flag（其余位置属任务文本）。
         // 单独的 `-` 视为普通参数（约定：读 stdin 的占位，本轮不支持）。
         f if f.starts_with('-') && f != "-" => Err(format!(
-            "未知参数：{f}（可用：-p [--stats] [--resume[=<id>]] <任务> | --json ... | [--resume[=<id>]]）"
+            "未知参数：{f}（可用：-p [--stats] [--resume <id>] <任务> | --json ... | [--resume [<id>]]）"
         )),
         // 无 flag：交互式。**非 flag 首 token 的静默 Interactive 行为保持不变**
         // （`worktree` 已由上面的臂截获，故此兜底只处理任务无关的裸词）。
@@ -304,7 +322,7 @@ fn optional_name(rest: &[String], verb: &str) -> Result<Option<String>, String> 
 }
 
 /// `attach [name] [模式 flag...]`：名参可选（首 token 是 flag 则无名），其后按顶层模式解析
-/// ——`attach` 可带 `-p` / `--json` / `--resume[=<id>]`（设计 §5.1）。
+/// ——`attach` 可带 `-p` / `--json` / `--resume [<id>]`（设计 §5.1）。
 fn parse_worktree_attach(rest: &[String]) -> Result<Args, String> {
     let (name, tail) = match rest.first().map(String::as_str) {
         None => (None, &rest[0..]),
@@ -325,12 +343,9 @@ fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, Resume), String> {
     let Some(first) = tail.first().map(String::as_str) else {
         return Ok((Mode::Interactive, false, Resume::New));
     };
-    if let Some(id) = first.strip_prefix("--resume=") {
-        return Ok((Mode::Interactive, false, Resume::Id(id.to_string())));
-    }
     match first {
         "-p" => {
-            let (stats, resume, rest) = split_leading_flags(&tail[1..]);
+            let (stats, resume, rest) = split_leading_flags(&tail[1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("-p 需要一个任务参数".into())
@@ -339,7 +354,7 @@ fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, Resume), String> {
             }
         }
         "--json" => {
-            let (stats, resume, rest) = split_leading_flags(&tail[1..]);
+            let (stats, resume, rest) = split_leading_flags(&tail[1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("--json 需要一个任务参数".into())
@@ -347,9 +362,19 @@ fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, Resume), String> {
                 Ok((Mode::Json(task), stats, resume))
             }
         }
-        "--resume" => Ok((Mode::Interactive, false, Resume::Pick)),
+        "--resume" => Ok((
+            Mode::Interactive,
+            false,
+            match tail.get(1).filter(|t| !t.starts_with('-')) {
+                Some(id) => Resume::Id(id.clone()),
+                None => Resume::Pick,
+            },
+        )),
+        f if f.starts_with("--resume=") => {
+            Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）".into())
+        }
         other => Err(format!(
-            "worktree attach 只接受 -p / --json / --resume[=<id>] 与可选名字；未知参数：{other}"
+            "worktree attach 只接受 -p / --json / --resume [<id>] 与可选名字；未知参数：{other}"
         )),
     }
 }
@@ -810,7 +835,7 @@ fn resolve_resume(
         Resume::New => None,
         Resume::Id(id) => {
             if id.is_empty() {
-                eprintln!("--resume= 需要一个会话 id（例如 --resume=2026-10-07-abc）");
+                eprintln!("--resume 需要一个会话 id（例如 --resume 2026-10-07-abc）");
                 std::process::exit(1);
             }
             match sessions::resolve(dir, id) {
@@ -2116,11 +2141,11 @@ mod tests {
         assert!(err.contains("--json"), "err = {err}");
     }
 
-    /// **解析矩阵**：三模式 × `--resume` / `--resume=id` / `--stats`，含**两种 flag
-    /// 顺序**；任务文本逐字保留；未知 flag 报错。
+    /// **解析矩阵**：三模式 × `--resume [<id>]` / `--stats`，含**两种 flag 顺序**；
+    /// 任务文本逐字保留；未知 flag 与旧 `=` 形态都报错。
     #[test]
     fn parse_resume_matrix_and_flag_order() {
-        // TUI 形态：裸 `--resume` = Pick；`--resume=id` = Id。
+        // TUI 形态：裸 `--resume` = Pick；`--resume <id>`（空格） = Id。
         assert_eq!(
             parse_args(&s(&["--resume"])).unwrap(),
             Args {
@@ -2131,7 +2156,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&s(&["--resume=abc"])).unwrap(),
+            parse_args(&s(&["--resume", "abc"])).unwrap(),
             Args {
                 mode: Mode::Interactive,
                 stats: false,
@@ -2139,20 +2164,12 @@ mod tests {
                 worktree: None,
             }
         );
-        // TUI 形态下 `--resume <id>`（空格）不支持：其后参数忽略，仍为 Pick。
-        assert_eq!(
-            parse_args(&s(&["--resume", "abc"])).unwrap(),
-            Args {
-                mode: Mode::Interactive,
-                stats: false,
-                resume: Resume::Pick,
-                worktree: None,
-            }
-        );
+        // `=` 形态已移除 ⇒ 报错（不再静默降级）。
+        assert!(parse_args(&s(&["--resume=abc"])).is_err());
 
-        // `-p`：`--stats` 与 `--resume=id` **顺序无关**。
-        let a = parse_args(&s(&["-p", "--stats", "--resume=x", "do", "it"])).unwrap();
-        let b = parse_args(&s(&["-p", "--resume=x", "--stats", "do", "it"])).unwrap();
+        // `-p`：`--stats` 与 `--resume <id>` **顺序无关**。
+        let a = parse_args(&s(&["-p", "--stats", "--resume", "x", "do", "it"])).unwrap();
+        let b = parse_args(&s(&["-p", "--resume", "x", "--stats", "do", "it"])).unwrap();
         assert_eq!(a, b, "两种 flag 顺序应等价");
         assert_eq!(
             a,
@@ -2164,11 +2181,31 @@ mod tests {
             }
         );
 
-        // `--json`：裸 `--resume` + 任务。
+        // `-p --resume <id> <任务>`：id 归 resume，任务文本保留。
+        assert_eq!(
+            parse_args(&s(&["-p", "--resume", "abc", "task"])).unwrap(),
+            Args {
+                mode: Mode::Print("task".into()),
+                stats: false,
+                resume: Resume::Id("abc".into()),
+                worktree: None,
+            }
+        );
+
+        // `--resume <任务>`（其后无 token）：任务文本必需 ⇒ 不当 id，裸 flag + 任务。
         assert_eq!(
             parse_args(&s(&["--json", "--resume", "task"])).unwrap(),
             Args {
                 mode: Mode::Json("task".into()),
+                stats: false,
+                resume: Resume::Pick,
+                worktree: None,
+            }
+        );
+        assert_eq!(
+            parse_args(&s(&["-p", "--resume", "solo"])).unwrap(),
+            Args {
+                mode: Mode::Print("solo".into()),
                 stats: false,
                 resume: Resume::Pick,
                 worktree: None,
@@ -2182,15 +2219,6 @@ mod tests {
                 mode: Mode::Print("hi --resume=x".into()),
                 stats: false,
                 resume: Resume::New,
-                worktree: None,
-            }
-        );
-        assert_eq!(
-            parse_args(&s(&["-p", "--resume", "abc", "task"])).unwrap(),
-            Args {
-                mode: Mode::Print("abc task".into()),
-                stats: false,
-                resume: Resume::Pick,
                 worktree: None,
             }
         );
@@ -2250,7 +2278,7 @@ mod tests {
         );
     }
 
-    /// `attach` 名参可选，且可带 `-p` / `--json` / `--resume[=<id>]`（设计 §5.1）。
+    /// `attach` 名参可选，且可带 `-p` / `--json` / `--resume [<id>]`（设计 §5.1）。
     #[test]
     fn parse_worktree_attach_modes() {
         assert_eq!(
@@ -2269,7 +2297,8 @@ mod tests {
         let p = parse_args(&s(&["worktree", "attach", "feat", "-p", "do it"])).unwrap();
         assert_eq!(p.mode, Mode::Print("do it".into()));
         assert_eq!(p.worktree, Some(WorktreeCmd::Attach(Some("feat".into()))));
-        let j = parse_args(&s(&["worktree", "attach", "--json", "--resume=x", "do"])).unwrap();
+        let j =
+            parse_args(&s(&["worktree", "attach", "--json", "--resume", "x", "do"])).unwrap();
         assert_eq!(j.mode, Mode::Json("do".into()));
         assert_eq!(j.resume, Resume::Id("x".into()));
         assert_eq!(j.worktree, Some(WorktreeCmd::Attach(None)));

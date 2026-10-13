@@ -18,7 +18,7 @@
 
 ## 一句话
 
-交互式启动从「无条件恢复最近会话」改为**默认新会话**；恢复收进显式 `--resume[=<id>]`
+交互式启动从「无条件恢复最近会话」改为**默认新会话**；恢复收进显式 `--resume [<id>]`
 （裸 flag = 列表选择，`=<id>` = 指定）。会话状态（title / provider / model / thinking /
 tokens / turns）写进**同一 JSONL 文件的首行 meta**（无 sidecar）—— `JsonlSession` 全量重写时
 先写 meta 再写消息，故 `/compact` 也不会丢。三模式（TUI / `-p` / `--json`）统一持久化，
@@ -62,16 +62,18 @@ crates/ys-tui-coding/src/events.rs（改）      /thinking 本地生效后单向
 ## CLI 契约
 
 ```text
-ys-coding-agent [--resume[=<id>]]                          # TUI
-ys-coding-agent -p     [--stats] [--resume[=<id>]] <task>  # Print
-ys-coding-agent --json [--stats] [--resume[=<id>]] <task>  # JSON
+ys-coding-agent [--resume [<id>]]                          # TUI
+ys-coding-agent -p     [--stats] [--resume [<id>]] <task>  # Print
+ys-coding-agent --json [--stats] [--resume [<id>]] <task>  # JSON
 ```
 
-- 裸 `--resume` = 列表选择；`--resume=<id>` = 指定会话（id 或路径）；`--resume <id>`（空格）**不支持**
-  （`=` 消除与任务文本的歧义）。
-- 模式 flag 之后的 flag 区**顺序无关**：`split_leading_flags` 循环剥离 `--stats` / `--resume[=<id>]`，
+- 裸 `--resume` = 列表选择；`--resume <id>` = 指定会话（id 或路径，**空格形态**）；`--resume=<id>`
+  （`=` 形态）**已移除** ⇒ 报错。
+- 模式 flag 之后的 flag 区**顺序无关**：`split_leading_flags` 循环剥离 `--stats` / `--resume [<id>]`，
   两者都只认「模式 flag 之后、任务文本之前」的位置；任务文本从第一个非 flag 起**逐字保留**。
   重复 flag last-wins 且静默丢弃。
+- `-p` / `--json` 下任务文本**必需** ⇒ `--resume` 只在**其后还留着任务文本**时才把紧跟的 token
+  当 id（`--resume <id> <任务>`）；`--resume <任务>`（其后无 token）是裸 flag + 任务文本。
 
 ## 启动期顺序（`main()`）
 
@@ -115,11 +117,11 @@ provider 无凭证时**降级而非失败**（不挡起屏）。四档以及「m
 
 ## 恢复的三条分支
 
-- `--resume=<id>`：`sessions::resolve(dir, id)` 先试 `dir/{id}.jsonl`、再按字面路径；未命中 ⇒
+- `--resume <id>`：`sessions::resolve(dir, id)` 先试 `dir/{id}.jsonl`、再按字面路径；未命中 ⇒
   stderr 报错 + `exit(1)`。
 - 裸 `--resume`：`sessions::list(dir)`（**mtime DESC**；只读首行、封顶 4 KiB）→
   - **空列表** ⇒ stderr 提示「没有可恢复的会话」+ **回落默认新会话**（不是报错）；
-  - **非 TTY** ⇒ stderr 打印列表 + 一行「非交互环境：请用 `--resume=<id>`」+ `Err`（起屏前 `exit(1)`）；
+  - **非 TTY** ⇒ stderr 打印列表 + 一行「非交互环境：请用 `--resume <id>`」+ `Err`（起屏前 `exit(1)`）；
   - **TTY** ⇒ `sessions::pick` 两列（编号 / 时间 / 标题 / id）读 stdin；列表与提示一律 stderr。
 
 `list` 的读法：字节级读取 + 换行切分 + **最后才解码**（流式/字节路径铁律）；不可读 / 首行超 4 KiB
@@ -164,7 +166,7 @@ provider 无凭证时**降级而非失败**（不挡起屏）。四档以及「m
 |---|---|
 | `crates/ys-session/src/jsonl.rs` + `meta.rs` 内联 | meta 往返；meta 在首行；`clear` 与 `replace_all` 后 meta 仍在；纯消息文件无 meta 不告警；坏行跳过；`Message` serde 形状不含 `type` 的快照 |
 | `apps/coding-agent/src/sessions.rs` 内联（12 例） | `list` mtime DESC / 只读首行与 4 KiB 封顶 / 不可读与 `.tmp` 跳过 / `resolve` 命中与未命中 / `pick` 非 TTY 注入式写者断言 / `derive_title` 与 `derive_stored_title` |
-| `apps/coding-agent/src/main.rs` 内联 | `parse_args` 解析矩阵（三模式 × `--resume`/`--resume=id`/`--stats`，含两种 flag 顺序）；`finalize_turn_meta_*`（title 幂等 + provider/model 不被清空）；`persist_single_turn_*`；`raw_and_expanded_task_*` |
+| `apps/coding-agent/src/main.rs` 内联 | `parse_args` 解析矩阵（三模式 × `--resume [<id>]`/`--stats`，含两种 flag 顺序）；`finalize_turn_meta_*`（title 幂等 + provider/model 不被清空）；`persist_single_turn_*`；`raw_and_expanded_task_*` |
 | `apps/coding-agent/src/app_loop.rs` 内联 | `title_uses_pre_expansion_user_text`（C3）；`thinking_cache_survives_new_session`（T7）；`every_request_variant_is_handled` 的 `SetThinking` 臂 |
 | `apps/coding-agent/tests/session_cli.rs`（新增 9 例，子进程 + 无凭证 + 回环 mock） | 非 TTY picker 不污染 stdout（退出码 ≠ 0 / stdout 空 / stderr 含表头+标题+id+非交互提示）；空列表回落（`没有可恢复的会话` 先于 `No model configured`）；模型恢复优先级端到端（读真实 HTTP 请求体的 `model` 字段）：env 胜出 → resume meta 胜出 → meta.model 为 `null` 回落 entry.model → meta.provider 无凭证降级 state.json → state.json 胜出，五例均断言路径含 `/chat/completions`；成功回合（回真实 SSE 的回环 mock，2 例）：`-p` / `--json` 的 stdout 保持纯数据流、`session: <id>` 走 stderr 且与落盘 stem 一致、落盘首行 meta 有 title / model / turns |
 | `crates/ys-tui-coding` | `App::new` 消费 `CodingView.thinking_visible` 初值；`Outbound::View` 快照不覆盖 thinking；`/thinking` 变化触发 `Request::SetThinking` |

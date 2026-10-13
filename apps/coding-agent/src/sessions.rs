@@ -106,7 +106,7 @@ pub fn resolve(dir: &Path, id_or_path: &str) -> Result<PathBuf, String> {
 /// 交互式选择会话（`--resume` 裸形态）。
 ///
 /// 列表与提示一律写 **stderr**（stdout 属数据流，不得污染）；非 TTY ⇒ 打印列表
-/// 后 `Err`（调用方提示改用 `--resume=<id>`）。
+/// 后 `Err`（调用方提示改用 `--resume <id>`）。
 pub fn pick(entries: &[SessionSummary]) -> Result<PathBuf, String> {
     let stdin = std::io::stdin();
     let stdin_is_tty = stdin.is_terminal();
@@ -116,7 +116,7 @@ pub fn pick(entries: &[SessionSummary]) -> Result<PathBuf, String> {
 }
 
 /// [`pick`] 的内核：一切提示与列表**只**写 `out`（绝无第二个写者）；非 TTY 时
-/// 写完列表 + 一行「请用 `--resume=<id>`」后返回 `Err`。
+/// 写完列表 + 一行「请用 `--resume <id>`」后返回 `Err`。
 ///
 /// 写者与「是否 TTY」由调用方注入，生产侧 `pick` 传真实 stdin / stderr。
 /// 这样测试能断言列表确实落在同一个写者上 —— 否则把 `writeln!` 换成 `println!`
@@ -139,7 +139,7 @@ fn pick_with(
         );
     }
     if !stdin_is_tty {
-        let _ = writeln!(out, "非交互环境：请用 --resume=<id> 指定会话");
+        let _ = writeln!(out, "非交互环境：请用 --resume <id> 指定会话");
         return Err("非 TTY，无法交互选择会话".into());
     }
     let _ = write!(out, "选择编号（回车取消）> ");
@@ -395,7 +395,7 @@ mod tests {
     }
 
     /// C8/T4：`pick` 的列表与提示**全走注入的写者**（生产侧是 stderr）。非 TTY 时
-    /// `pick_with` 返回 `Err`，且表头 / 会话标题 / 会话 id / `请用 --resume=<id>`
+    /// `pick_with` 返回 `Err`，且表头 / 会话标题 / 会话 id / `请用 --resume <id>`
     /// 提示都落在同一个 `buf` 上。
     ///
     /// 变异：把内核里的 `writeln!(out, …)` 换成 `println!`（写 stdout）⇒ `buf` 缺
@@ -417,7 +417,7 @@ mod tests {
         assert!(out.contains("可恢复的会话"), "缺表头：{out}");
         assert!(out.contains("我的标题"), "缺会话标题：{out}");
         assert!(out.contains("abc"), "缺会话 id：{out}");
-        assert!(out.contains("请用 --resume=<id>"), "缺提示：{out}");
+        assert!(out.contains("请用 --resume <id>"), "缺提示：{out}");
 
         let _ = fs::remove_dir_all(&dir);
     }

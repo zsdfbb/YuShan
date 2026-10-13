@@ -515,7 +515,7 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TB
-    ARGV["argv"] --> PARSE["parse_args()<br/>（含 --resume[=&lt;id&gt;]）"]
+    ARGV["argv"] --> PARSE["parse_args()<br/>（含 --resume [&lt;id&gt;]）"]
     PARSE --> M{"mode"}
 
     M -->|"（默认）"| TUI["Interactive"]
@@ -551,7 +551,7 @@ meta 写入点 `finalize_turn_meta`（title / model / provider / tokens / thinki
 `Wiring::ephemeral`（`MemorySession`）降为**测试专用**（`#[cfg(test)]`），生产路径不再用它。
 
 - **默认新会话**：启动不再隐式恢复「最近会话」；恢复只走显式 `--resume`——裸 flag = 列表选择，
-  `--resume=<id>` = 指定 id（或路径）；`--resume <id>`（空格）不支持。
+  `--resume <id>` = 指定 id（或路径，空格形态）；`--resume=<id>`（`=` 形态）已移除。
 - `resolve` / `pick` 在**起屏 / 建 runtime 之前**解析（meta 参与模型选择）；picker 的列表 / 提示 /
   错误**一律写 stderr**。列表为空 ⇒ **回落默认新会话**（stderr 一行提示，不报错）；非 TTY 且裸
   `--resume` ⇒ stderr 打印列表 + 报错退出。
@@ -606,7 +606,7 @@ flowchart TB
     START["启动：parse_args（含 --resume）"] --> R{"--resume ?"}
 
     R -->|无| NEW["默认新会话：persistent_new<br/>算出 {unix}_{纳秒}.jsonl<br/>惰性：零目录扫描、不预建"]
-    R -->|"--resume=&lt;id&gt;"| RES["sessions::resolve<br/>先 dir/{id}.jsonl，再按字面路径"]
+    R -->|"--resume &lt;id&gt;"| RES["sessions::resolve<br/>先 dir/{id}.jsonl，再按字面路径"]
     R -->|"裸 --resume"| LIST["sessions::list（mtime DESC）<br/>只读首行 + 4 KiB 封顶"]
 
     LIST --> EMPTY{"列表空？"}
@@ -635,9 +635,9 @@ transcript，`-p` / `--json` 走 stderr）。
 
 **启动期恢复走显式 `--resume`**：
 
-- `--resume=<id>` → `sessions::resolve`：先 `dir/{id}.jsonl`、再按字面路径；未命中 ⇒ stderr 报错 + `exit(1)`。
+- `--resume <id>` → `sessions::resolve`：先 `dir/{id}.jsonl`、再按字面路径；未命中 ⇒ stderr 报错 + `exit(1)`。
 - 裸 `--resume` → `sessions::list`（**mtime DESC**）+ `sessions::pick`。**空列表回落默认新会话**
-  （stderr 一行提示，不报错）；**非 TTY** ⇒ stderr 打印列表 + 提示改用 `--resume=<id>` 后报错退出。
+  （stderr 一行提示，不报错）；**非 TTY** ⇒ stderr 打印列表 + 提示改用 `--resume <id>` 后报错退出。
 - 解析与 pick 都在**起屏 / 建 runtime 之前**（读回的 meta 参与模型选择）；picker 的列表 / 提示 /
   错误**一律 stderr**（`-p` 的 stdout 是模型文本、`--json` 的 stdout 是逐行 `Envelope`）。
 

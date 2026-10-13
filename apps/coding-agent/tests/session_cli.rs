@@ -9,7 +9,7 @@
 //!
 //! `main()` 的顺序（`apps/coding-agent/src/main.rs`）：
 //!
-//! 1. `parse_args`（含 `--resume[=<id>]`）；
+//! 1. `parse_args`（含 `--resume [<id>]`）；
 //! 2. `resolve_resume` —— `sessions::resolve` / `sessions::pick`，**在
 //!    `ensure_configured` 之前**：picker 的列表 / 非 TTY 提示 / 空列表回落提示全部写
 //!    **stderr**，`--json` 的逐行 `Envelope` 走 stdout，两者绝不能混（C8/T4）；
@@ -739,13 +739,13 @@ fn json_success_keeps_stdout_pure_json_and_persists_meta() {
 // 组 1 —— T4/C8：picker 输出不得污染 stdout
 // ---------------------------------------------------------------------------
 
-/// **组 1**：会话目录里有 1 个会话，跑 `--json --resume "hi"`。
+/// **组 1**：会话目录里有 1 个会话，跑 `--json --resume "hi"`（裸 `--resume` + 任务）。
 ///
 /// `--json` 的 stdout 是逐行 `Envelope`，最容易被污染 —— 而 picker 在
 /// `resolve_resume`（`main.rs`）里、`ensure_configured` 之前跑；非 TTY ⇒
 /// `sessions::pick` 写列表 + 非交互提示后返回 `Err` ⇒ `eprintln!` + `exit(1)`。
 ///
-/// 断言：退出码 ≠ 0；**stdout 必须为空**；stderr 含表头（`可恢复的会话`）、该会话的
+/// 断言：退出码 ≠ 0；**stdout 必须为空**（picker 一律写 stderr）；stderr 含表头（`可恢复的会话`）、该会话的
 /// **标题**与 **id**、以及 `非交互环境`（非 TTY 提示）。
 ///
 /// 变异靶子：把 `pick` 的 `writeln!(err, …)` 改成 stdout ⇒ stdout 非空 ⇒ 红；
@@ -786,7 +786,7 @@ fn resume_picker_keeps_json_stdout_pure_and_reports_to_stderr() {
     );
     assert!(
         stderr.contains("非交互环境"),
-        "非 TTY 应提示改用 --resume=<id>（`sessions.rs::pick`）；stderr:\n{stderr}"
+        "非 TTY 应提示改用 --resume <id>（`sessions.rs::pick`）；stderr:\n{stderr}"
     );
 
     roots.cleanup();
@@ -796,7 +796,7 @@ fn resume_picker_keeps_json_stdout_pure_and_reports_to_stderr() {
 // 组 2 —— 空列表回落默认新会话
 // ---------------------------------------------------------------------------
 
-/// **组 2**：会话目录为空，跑 `-p --resume "hi"`（无凭证）。
+/// **组 2**：会话目录为空，跑 `-p --resume "hi"`（裸 `--resume` + 任务，无凭证）。
 ///
 /// 空列表**不是报错**：`resolve_resume` 写 `没有可恢复的会话` 到 stderr 后回落默认新会话。
 /// 随后无凭证在 `ensure_configured` 早退（exit 1）。
@@ -845,7 +845,7 @@ fn resume_picker_empty_dir_falls_back_to_new_session() {
 /// **组 3·C1 —— env 完整凭证胜出（env > resume meta > auth）。**
 ///
 /// `YUSHAN_API_BASE / KEY / MODEL` 齐备 ⇒ `config.is_configured()` 为真 ⇒ 模型解析
-/// **整段短路**。命令带 `--resume=s1`，故 `resume_meta` **确实非空**
+/// **整段短路**。命令带 `--resume s1`，故 `resume_meta` **确实非空**
 /// （`provider=deepseek, model=meta-model`，且该 provider 有 auth entry），
 /// 「env > resume meta」才真正被钉住；auth.json 指向**另一个不可达端口** —— env 若
 /// 没胜出，请求会打到 meta / auth 的端口，listener 什么都收不到。
@@ -873,7 +873,7 @@ fn model_recovery_env_wins_over_resume_meta_and_auth() {
 
     let api_base = server.api_base();
     let out = run_guarded_with_env(
-        &["-p", "--resume=s1", "hi"],
+        &["-p", "--resume", "s1", "hi"],
         &roots,
         &[
             ("YUSHAN_API_BASE", api_base.as_str()),
@@ -907,7 +907,7 @@ fn model_recovery_env_wins_over_resume_meta_and_auth() {
 /// 取 `meta-model`（`entry.model` 只作兜底）。
 ///
 /// **本用例同时写非空 `state.json`**（`last_active_provider=deepseek,
-/// last_active_model=state-model`）：`state.json` 非空 + `--resume=<id>` 是**实际使用
+/// last_active_model=state-model`）：`state.json` 非空 + `--resume <id>` 是**实际使用
 /// 后最常见**的场景 —— D10「resume 恢复会话记录的 model」正该守住它。若 state 分支
 /// 抢先于 meta 分支，`state-model` 会盖过 `meta-model` ⇒ 本用例必须变红。
 ///
@@ -934,7 +934,7 @@ fn model_recovery_resume_meta_wins_over_state_and_entry() {
     );
     write_state_json(&roots, "deepseek", "state-model");
 
-    let out = run_guarded(&["-p", "--resume=s2", "hi"], &roots);
+    let out = run_guarded(&["-p", "--resume", "s2", "hi"], &roots);
     let (_stdout, stderr) = streams(&out);
     let requests = server.requests();
 
@@ -976,7 +976,7 @@ fn model_recovery_resume_meta_null_model_falls_back_to_entry() {
     );
     write_session_file(&roots.sessions_dir, "s3", "会话三", "deepseek", None);
 
-    let out = run_guarded(&["-p", "--resume=s3", "hi"], &roots);
+    let out = run_guarded(&["-p", "--resume", "s3", "hi"], &roots);
     let (_stdout, stderr) = streams(&out);
     let requests = server.requests();
 
@@ -998,7 +998,7 @@ fn model_recovery_resume_meta_null_model_falls_back_to_entry() {
 
 /// **组 3·C2c —— 第 2 档降级：resume meta 的 provider 无 auth entry。**
 ///
-/// `--resume=s4` 的会话 meta 写 `provider=ghost`（auth.json 里**没有** ghost
+/// `--resume s4` 的会话 meta 写 `provider=ghost`（auth.json 里**没有** ghost
 /// entry）⇒ 第 2 档（resume meta）**降级而非失败**，落回第 3 档 `state.json`
 /// （`last_active_provider=deepseek` 有 entry）⇒ 取 `state-model`。
 ///
@@ -1025,7 +1025,7 @@ fn model_recovery_falls_back_to_state_when_meta_provider_unconfigured() {
     );
     write_state_json(&roots, "deepseek", "state-model");
 
-    let out = run_guarded(&["-p", "--resume=s4", "hi"], &roots);
+    let out = run_guarded(&["-p", "--resume", "s4", "hi"], &roots);
     let (_stdout, stderr) = streams(&out);
     let requests = server.requests();
 

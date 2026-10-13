@@ -27,7 +27,7 @@ YuShan/
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
 - `cargo test --workspace` — 全量测试（1147 passed / 9 ignored）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
-- `cargo run -p ys-coding-agent -- --resume[=<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume=<id>` 指定 id / 路径）
+- `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr

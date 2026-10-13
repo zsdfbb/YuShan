@@ -216,12 +216,15 @@ pub trait AgentLoop: Send + Sync {
 ToolError（工具无法产出可回喂的结果）   → 终止回合，返回 LoopError
 达到最大轮数                            → 正常结束，StopReason = MaxRounds
 模型输出被截断（含被作废的工具批）      → 正常结束，StopReason = Truncated
-模型本轮无可见产出（无正文、无工具调用）→ 正常结束，StopReason = NoOutput
+模型本轮无可见产出（无正文、无工具调用）→ 先催促重发一次（消耗一轮）；仍空 ⇒ StopReason = NoOutput
+本回合工具结果累积超预算                → 降级更早结果（头部 + 续读指针），不改变终止原因
 取消（步骤边界检查）                    → 正常结束，StopReason = Cancelled
 EventSink 发送失败                      → 终止回合（观察者不阻断属于后续 Hook 阶段的语义）
 ```
 
 `RunResult` 携带终止原因、累计 `Usage`、轮数和最终消息（仅 Completed 时为 Some）；错误路径经 `Err(LoopError)` 返回，不产生 `RunResult`。错误回喂与协作式取消的决策记录见 ADR-0001 与 ADR-0002，终局事件不变式见 ADR-0004。
+
+「空响应重试一次」由 `RunLimits::retry_empty_response`（默认 `true`）闸门控制，且只对 `finish_reason = stop` 的合法空回复生效（截断 / content-filter 不误催）；重试消耗一个轮，受 `max_rounds` 与轮边界 abort 约束，仍空才判 `NoOutput`。「回合级工具输出总量闸门」由 `RunLimits::max_turn_tool_result_tokens`（库默认 `0` = 关闭；app 侧取 `context_window / 4`）闸门控制，算法在 `crates/ys-loop/src/turn_budget.rs`。
 
 ## 6. Runtime Hook
 
@@ -521,7 +524,7 @@ let agent = AgentBuilder::new()
 | 模块  | 重点测试 |
 | --- | --- |
 | `ys-core` | 消息、Tool Call、事件和序列化；**终止原因（含 `NoOutput`）的序列化字面量契约** |
-| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致、截断保护；**工具超时闸（工具声明 → `bash_timeout` → 300s）**；**并行批闸门与保序**（默认串行 `C1,R1,C2,R2` 不变；全 safe 才并行 `C1,C2,R1,R2`；混合退回串行；`max_parallel_tools` 限流）；**空 / 纯思考响应 ⇒ `NoOutput`**（不再静默当 `Completed`，空白字符同样算空） |
+| `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致、截断保护；**工具超时闸（工具声明 → `bash_timeout` → 300s）**；**并行批闸门与保序**（默认串行 `C1,R1,C2,R2` 不变；全 safe 才并行 `C1,C2,R1,R2`；混合退回串行；`max_parallel_tools` 限流）；**空 / 纯思考响应 ⇒ `NoOutput`**（不再静默当 `Completed`，空白字符同样算空）；**空响应重试一次**（首轮空 + 次轮正常 ⇒ `Completed`、`rounds == 2`；两轮空 ⇒ `NoOutput`、`rounds == 2`；`retry_empty_response = false` ⇒ 首轮即 `NoOutput`、`rounds == 1`）；**回合级工具输出闸门**（超预算降最旧、保留最新、配对完整；`budget = 0` / 未超预算 ⇒ 会话逐字节不变）| 
 | `Registry` | 注册、查找、重复名称和缺失组件 |
 | `Session` | 追加消息、保存恢复、空会话和损坏数据 |
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |

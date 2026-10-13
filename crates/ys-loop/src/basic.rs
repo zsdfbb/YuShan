@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use super::{AgentInput, AgentLoop, LoopError, ModelSummarizer, RunResult};
 use crate::compact;
+use crate::turn_budget;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
 use ys_event::{AgentEvent, emit};
-use ys_model::{ModelEvent, ModelEventSink, ModelRequest};
+use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
 use ys_tool::{Tool, ToolContext, ToolError};
 
@@ -19,6 +20,13 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 const TRUNCATED_TOOL_NOTICE: &str = "tool call was NOT executed: the model response was truncated \
      (output token limit reached). Re-issue this call with a smaller payload, or split it into \
      several calls.";
+
+/// 空响应的**一次性催促**话术：直接点名缺失的两样产出，并要求「给答案或发工具调用」。
+///
+/// 只在模型「只有思考、没有正文也没有工具调用」且 `finish_reason == Stop` 时发一次；
+/// 仍空才收为 `NoOutput`。措辞刻意排除「只回思考」——那正是要治的形态。
+const EMPTY_RETRY_PROMPT: &str = "You produced no visible output (no text and no tool call). \
+     Respond now: either give your answer, or make a tool call — do not reply with only reasoning.";
 
 /// 一次工具调用的超时预算：**工具声明值优先** → 否则 `limits.bash_timeout` → 否则 300s。
 ///
@@ -103,6 +111,12 @@ impl AgentLoop for BasicLoop {
         let mut rounds: u32 = 0;
         let mut total_usage = Usage::default();
         let mut consecutive_errors: HashMap<String, u32> = HashMap::new();
+        // 空响应**只重试一次**；本回合内一旦重试过，再空就如实收场。
+        let mut empty_retried = false;
+
+        // 回合级工具输出闸门的**下界锚**：本回合新增消息的起点。必须在 Step 2 append
+        // 用户消息**之前**取，否则用户消息会被当成可降级对象。
+        let turn_start = ctx.session.messages().len();
 
         // Step 1：入口边界 —— 检查 abort（非破坏性探针）
         if ctx.boundary.is_some_and(|b| b.is_aborted()) {
@@ -452,6 +466,30 @@ impl AgentLoop for BasicLoop {
                 // 也没说」看起来像正常收尾（用户实测会以为卡住）。改判 `NoOutput` —— UI 据此给一行
                 // 可见说明，一次性模式据此返回非零退出码。空白字符（如 `" "`）同样算空。
                 let empty_output = text_content.trim().is_empty();
+
+                // 空产出**先催一次**（直接提升「有答复」的概率）：仅当本回合尚未重试过、
+                // `retry_empty_response` 开启、且是**合法空回复**（`finish_reason == Stop`；
+                // 截断 / content-filter 不走此路，避免误催）时，追加一条催促消息并 `continue`。
+                // 消耗一个 round ⇒ 自动受 `max_rounds` 与轮边界 abort 约束；仍空则按第一批
+                // 语义如实收为 `NoOutput`。
+                if empty_output
+                    && !empty_retried
+                    && ctx.limits.retry_empty_response
+                    && response.finish_reason == FinishReason::Stop
+                {
+                    empty_retried = true;
+                    ctx.session
+                        .append(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text {
+                                text: EMPTY_RETRY_PROMPT.to_string(),
+                            }],
+                        })
+                        .await
+                        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                    continue;
+                }
+
                 let stop_reason = if empty_output {
                     StopReason::NoOutput
                 } else {
@@ -659,6 +697,34 @@ impl AgentLoop for BasicLoop {
                 .append(tool_result_message)
                 .await
                 .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+
+            // Step 11：回合级工具输出总量闸门 —— 超预算时降级**更早**的结果（头部截断 +
+            // 续读指针），把当轮回喂 token 压下来。算法在 `crate::turn_budget`。
+            //
+            // 与压缩的关系：Step 4b 的压缩已 `replace_all` 缩短会话，故下界取
+            // `turn_start.min(len)`（保守：宁少降级，不误删更早历史）；降级只缩内容、
+            // 不删消息 ⇒ 不与压缩的窗口触发冲突。`budget == 0`（默认）时整段跳过。
+            //
+            // **不新增 `AgentEvent` 变体**：降级只影响模型侧下一轮请求；工具结果的原始
+            // 形态用户已在 transcript 实时看到。
+            let budget = ctx.limits.max_turn_tool_result_tokens;
+            if budget > 0 {
+                let len = ctx.session.messages().len();
+                let start = turn_start.min(len);
+                let plan = turn_budget::plan_elisions(ctx.session.messages(), start, budget);
+                if !plan.is_empty() {
+                    let mut messages = ctx.session.messages().to_vec();
+                    for &idx in &plan {
+                        if let Some(elided) = turn_budget::elide_message(&messages[idx]) {
+                            messages[idx] = elided;
+                        }
+                    }
+                    ctx.session
+                        .replace_all(messages)
+                        .await
+                        .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                }
+            }
         }
     }
 }
@@ -1898,13 +1964,19 @@ mod tests {
     /// **N6**：模型返回「无正文、无工具调用」⇒ 回合以 `StopReason::NoOutput` 收场（**不是**
     /// `Completed`），**终局事件同值**；空白字符响应同样算空。
     ///
+    /// 第二批起增加「空响应重试一次」：故这里喂**两次**空响应 —— 第一次触发催促，
+    /// 第二次仍空才收为 `NoOutput`（`rounds == 2`）。
+    ///
     /// 变异：把分支改回 `StopReason::Completed` ⇒ 两个断言同时变红。
     /// 变异：把 `text_content.trim().is_empty()` 换回 `text_content.is_empty()` ⇒ 空白用例（payload `"   "`）变红。
+    /// 变异：把空产出分支的催促重试整段删掉（首次空即收场）⇒ `rounds == 1` ⇒ 本用例变红。
     #[tokio::test]
     async fn empty_response_ends_with_no_output_not_completed() {
         for payload in ["", "   "] {
             let registry = ToolRegistry::build(vec![]).unwrap();
             let model = MockModel::new("m");
+            // 喂两次空 ⇒ 第一次催促、第二次仍空。
+            model.push_text(payload);
             model.push_text(payload);
             let mut session = MemorySession::new();
             let mut events = CollectingSink::new();
@@ -1922,6 +1994,10 @@ mod tests {
                     .unwrap()
             };
 
+            assert_eq!(
+                result.rounds, 2,
+                "空响应重试一次 ⇒ rounds == 2（payload={payload:?}）"
+            );
             assert_eq!(
                 result.stop_reason,
                 StopReason::NoOutput,
@@ -1942,5 +2018,213 @@ mod tests {
                 "终局事件的 stop_reason 必须同值（payload={payload:?}）"
             );
         }
+    }
+
+    // ==================== 空响应重试（第二批） ====================
+
+    /// N12：首轮空 + 次轮正常 ⇒ `Completed`，会话里出现催促文案，`rounds == 2`。
+    ///
+    /// 变异：把空产出分支的 `continue`（催促重试）删掉 ⇒ 首轮空即收场，`rounds == 1`、
+    /// `stop_reason == NoOutput` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn empty_then_normal_completes_after_one_retry() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = MockModel::new("m");
+        model.push_text("");
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        assert_eq!(result.rounds, 2, "重试消耗一个 round");
+        assert!(result.final_message.is_some(), "次轮有正文 ⇒ final_message");
+        // 会话里出现催促消息（Role::User + 文案含 "no visible output"）。
+        assert!(
+            session.messages().iter().any(|m| {
+                m.role == Role::User
+                    && m.content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("no visible output")))
+            }),
+            "应留下催促消息；session = {:?}",
+            session.messages()
+        );
+    }
+
+    /// N14：`retry_empty_response = false` ⇒ 首轮空即 `NoOutput`，`rounds == 1`
+    /// （与第一批行为逐字节一致）。
+    ///
+    /// 变异：忽略 `retry_empty_response` 开关、始终重试 ⇒ 本用例 `rounds == 2` ⇒ 变红。
+    #[tokio::test]
+    async fn empty_response_no_retry_when_disabled() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = MockModel::new("m");
+        model.push_text("");
+        // 故意再备一条：若实现错误地重试，会消费它并得到 Completed。
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.retry_empty_response = false;
+        let result = {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::NoOutput);
+        assert_eq!(result.rounds, 1, "关闭重试 ⇒ 一轮即收场");
+    }
+
+    // ==================== 回合级工具输出总量闸门（第二批） ====================
+
+    /// 逐字大结果：内容确定，便于逐字节断言（200 行）。
+    fn big_result_content() -> String {
+        (0..200)
+            .map(|i| format!("line {i:04} ................................................"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    struct BigResultTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BigResultTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new("big", "returns a large result", serde_json::json!({}))
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            Ok(CoreToolResult {
+                content: big_result_content(),
+                is_error: false,
+            })
+        }
+    }
+
+    /// 收集会话里所有 `ToolResult` 块的内容（按出现顺序）。
+    fn tool_result_contents(session: &MemorySession) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// N10（接线层）：本回合**多条**大工具结果超预算 ⇒ 降级更旧的、保留最新；
+    /// 消息条数不变，最新一条逐字原样。
+    ///
+    /// 变异：删掉 Step 11 的 `replace_all` 整段 ⇒ 旧结果不含指针标记 ⇒ 变红；
+    /// 把「最新一条永不降级」保护删掉 ⇒ 最新一条含标记 ⇒ 变红。
+    #[tokio::test]
+    async fn turn_budget_elides_older_results_in_wiring() {
+        let registry = ToolRegistry::build(vec![Box::new(BigResultTool)]).unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("big", serde_json::json!({}));
+        model.push_tool_call("big", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.max_turn_tool_result_tokens = 1; // 极小 ⇒ 必触发降级
+        let msg_count_before_turn = session.messages().len();
+        {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+
+        let contents = tool_result_contents(&session);
+        assert_eq!(
+            contents.len(),
+            2,
+            "本回合两条工具结果；contents = {contents:?}"
+        );
+        assert!(
+            contents[0].contains(crate::turn_budget::ELIDED_MARKER),
+            "更旧的一条应被降级（含指针标记）"
+        );
+        assert!(
+            contents[0].len() < big_result_content().len(),
+            "降级后应真的变小"
+        );
+        assert!(
+            !contents[1].contains(crate::turn_budget::ELIDED_MARKER),
+            "最新一条永不降级"
+        );
+        assert_eq!(contents[1], big_result_content(), "最新一条逐字原样");
+        // 消息条数 = 本轮新增（user + 2*(assistant+toolresult) + 收尾 assistant = 6），
+        // 不因降级增删。
+        assert_eq!(
+            session.messages().len(),
+            msg_count_before_turn + 6,
+            "降级只缩内容、不增删消息"
+        );
+    }
+
+    /// N11：`max_turn_tool_result_tokens = 0`（默认，闸门关闭）⇒ 会话逐字节不变 ——
+    /// 无指针标记、工具结果内容原样。
+    ///
+    /// 变异：让 Step 11 在 `budget == 0` 时也降级 ⇒ 内容含标记 / 变小 ⇒ 变红。
+    #[tokio::test]
+    async fn turn_budget_disabled_leaves_session_untouched() {
+        let registry = ToolRegistry::build(vec![Box::new(BigResultTool)]).unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("big", serde_json::json!({}));
+        model.push_tool_call("big", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        // RunLimits::new 保持默认 max_turn_tool_result_tokens = 0。
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+
+        let contents = tool_result_contents(&session);
+        assert_eq!(contents.len(), 2);
+        assert!(
+            contents
+                .iter()
+                .all(|c| !c.contains(crate::turn_budget::ELIDED_MARKER)),
+            "关闭闸门不得留下指针标记；contents = {contents:?}"
+        );
+        assert!(
+            contents.iter().all(|c| *c == big_result_content()),
+            "关闭闸门 ⇒ 内容逐字节原样"
+        );
     }
 }

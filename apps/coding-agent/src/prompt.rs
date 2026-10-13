@@ -207,6 +207,22 @@ fn tool_guidelines(tools: &[&str]) -> String {
                 .to_string(),
         );
     }
+    // 「过程叙述」：多轮工具任务中，用户看不到模型的思考，只能看到工具进出。让模型在**每批**
+    // 工具调用前给一句话说明正在做什么，把「改进过程迟迟没有回复」变成可见的进展。刻意限定
+    // 「一句话」而非一段 —— 只要工作型工具在场（`read` / `grep` / `find` / `ls` / `bash` /
+    // `edit` / `write` 任一）就值得提醒，否则（如纯检索类）不加，避免无谓增大固定前缀。
+    if tools.iter().any(|t| {
+        matches!(
+            *t,
+            "read" | "grep" | "find" | "ls" | "bash" | "edit" | "write"
+        )
+    }) {
+        guidelines.push(
+            "For multi-step tool work, briefly say what you are about to do before a batch of \
+             tool calls (one short sentence, not a paragraph)"
+                .to_string(),
+        );
+    }
     if tools.contains(&"websearch") {
         guidelines.push(
             "Use websearch for information outside the repository (API docs, error meanings)"
@@ -693,6 +709,43 @@ mod tests {
         assert!(
             !bash_only.contains("Explore narrow before broad"),
             "只有 bash 时不得出现该指引；prompt = {bash_only}"
+        );
+    }
+
+    /// N18：「过程叙述」guideline 在工作型工具在场时出现、空工具表时不出现。
+    ///
+    /// 反向断言（空工具表不得出现）是关键：少了它，「无条件 push」的实现也能过 ——
+    /// 而那会让固定前缀无谓变大（该句进 `fixed_prompt_tokens`）。
+    ///
+    /// 变异：把守卫从 `any(read|grep|find|ls|bash|edit|write)` 改成无条件 push ⇒
+    /// 第三条断言变红；把 `bash` 从匹配集合里删掉 ⇒ 第二条断言变红。
+    #[test]
+    fn narration_guideline_appears_only_with_working_tools() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let sentence = "- For multi-step tool work, briefly say what you are about to do before";
+
+        let with_read = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
+        assert!(
+            with_read.contains(sentence),
+            "含 read 时应给「过程叙述」指引；prompt = {with_read}"
+        );
+        assert!(
+            with_read.contains("one short sentence, not a paragraph"),
+            "指引应限定「一句话」；prompt = {with_read}"
+        );
+
+        let with_bash = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
+        assert!(
+            with_bash.contains(sentence),
+            "含 bash 时应给「过程叙述」指引；prompt = {with_bash}"
+        );
+
+        let no_tools = build_system_prompt(Path::new("/tmp"), &[], &no_skills());
+        assert!(
+            !no_tools.contains("multi-step tool work"),
+            "空工具表时不得出现该指引；prompt = {no_tools}"
         );
     }
 

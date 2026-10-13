@@ -114,7 +114,7 @@
 
 ## 验证清单
 
-- [ ] 所有 (impl, test) 配对均 completed
-- [ ] `cargo test --workspace` 通过、不降级
-- [ ] `cargo clippy --all-targets` / `cargo fmt --check`（本批改动文件）干净
-- [ ] 文档同步：`docs/CONTEXT.md`、`docs/design.md` §5/§12、`docs/design-final/`、上游 `context.md`
+- [x] 所有 (impl, test) 配对均 completed（T1–T10；由**主 agent 逐步实现** —— 本环境 subagent 消息投递不稳定）
+- [x] `cargo test --workspace` 通过、不降级（1147 passed / 0 failed / 9 ignored；基线 1135/0/9）
+- [x] `cargo clippy --all-targets` / `cargo fmt --check`（本批改动文件）干净（基线既有无关 fmt 漂移未触碰）
+- [x] 文档同步：`docs/CONTEXT.md`、`docs/design.md` §5/§12、`docs/design-final/turn-budget-and-retry.md`、上游 `context.md`

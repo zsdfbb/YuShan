@@ -33,6 +33,19 @@ pub struct RunLimits {
     ///
     /// 只有 `BasicLoop` Step 9 的并行分支读它；默认值取自常量 ⇒ 既有行为不变。
     pub max_parallel_tools: usize,
+    /// **回合级**工具结果 token 总预算：一个回合内所有工具结果估算 token 之和的上限，
+    /// 超预算时由 `ys-loop` 降级（头部截断 + 续读指针）**更早**的结果。
+    ///
+    /// 与第一批的**单条**上限（grep 专用预算、`MAX_BYTES`）互补：单条封顶后，
+    /// 一个回合里的**多条**结果仍可累积放大。默认 `0` ⇒ 关闭，既有消费者 / 测试
+    /// 逐字节不变（沿用 [`fixed_prompt_tokens`](Self::fixed_prompt_tokens) 的承重默认惯例）。
+    pub max_turn_tool_result_tokens: usize,
+    /// 空响应是否**重试一次**：模型只产出思考、无正文也无工具调用时，先催促重发；
+    /// 仍空才收为 `NoOutput`。
+    ///
+    /// 默认 `true`（直接提升「有答复」的概率）；置 `false` ⇒ 与既有行为逐字节一致
+    /// （首轮空响应当即收场）。重试消耗一个 round，受 `max_rounds` 与轮边界 abort 约束。
+    pub retry_empty_response: bool,
 }
 
 impl RunLimits {
@@ -54,6 +67,10 @@ impl Default for RunLimits {
             // 0 是**承重**默认值：老调用方（不设该字段）的压缩行为逐字节不变。
             fixed_prompt_tokens: 0,
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            // 0 = 关闭回合级闸门 ⇒ 老调用方逐字节不变。
+            max_turn_tool_result_tokens: 0,
+            // true = 启用一次空响应重试；置 false 时行为与旧版一致。
+            retry_empty_response: true,
         }
     }
 }
@@ -88,5 +105,39 @@ mod tests {
         let mut assigned = RunLimits::new(5);
         assigned.fixed_prompt_tokens = 42;
         assert_eq!(assigned.fixed_prompt_tokens, 42);
+    }
+
+    /// N17：两个新字段的默认值必须钉死 —— `max_turn_tool_result_tokens == 0`（闸门关闭）、
+    /// `retry_empty_response == true`（启用重试）。
+    ///
+    /// 变异自检：把 `Default` 里的 `max_turn_tool_result_tokens: 0` 改成任何非零值 ⇒
+    /// 本用例变红，且既有「预算内逐字节不变」的用例会整体偏移；把 `retry_empty_response`
+    /// 改成 `false` ⇒ 本用例变红，且首轮空响应会被提前收场。
+    #[test]
+    fn new_budget_fields_default_values() {
+        assert_eq!(RunLimits::default().max_turn_tool_result_tokens, 0);
+        assert_eq!(RunLimits::new(5).max_turn_tool_result_tokens, 0);
+        assert!(RunLimits::default().retry_empty_response);
+        assert!(RunLimits::new(5).retry_empty_response);
+    }
+
+    /// 两个新字段是**普通可写字段**：调用方能显式设成非默认值，别被默认值绑死。
+    ///
+    /// 变异自检：把 `Default` 里的字段名写错（编译不过）或让字段不可写 ⇒ 本用例变红。
+    #[test]
+    fn new_budget_fields_are_settable() {
+        let limits = RunLimits {
+            max_turn_tool_result_tokens: 32_000,
+            retry_empty_response: false,
+            ..Default::default()
+        };
+        assert_eq!(limits.max_turn_tool_result_tokens, 32_000);
+        assert!(!limits.retry_empty_response);
+
+        let mut assigned = RunLimits::new(5);
+        assigned.max_turn_tool_result_tokens = 1;
+        assigned.retry_empty_response = false;
+        assert_eq!(assigned.max_turn_tool_result_tokens, 1);
+        assert!(!assigned.retry_empty_response);
     }
 }

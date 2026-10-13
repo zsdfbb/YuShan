@@ -501,6 +501,9 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     limits.context_window = config.context_window();
     limits.compaction = config.compact_policy();
     limits.max_rounds = config.max_rounds();
+    // 回合级工具结果预算：取窗口的 1/4（128k → 32k）。不新增 config 字段 —— 初值即可，
+    // 真实会话再校准；`0` 会关闭闸门，故必须显式设非零。
+    limits.max_turn_tool_result_tokens = config.context_window() / 4;
     limits
 }
 
@@ -2945,6 +2948,37 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir_default);
+    }
+
+    /// **N16**：`resolve_limits` 把回合级工具结果预算设为 `context_window / 4`。
+    ///
+    /// 断言选与默认值不同的窗口（`262_144` ⇒ `65_536`），且预算非零（`0` 会关闭闸门）。
+    ///
+    /// 变异：把 `limits.max_turn_tool_result_tokens = config.context_window() / 4;` 这行
+    /// 删掉 ⇒ 落回默认 `0` ⇒ 变红；把 `/ 4` 改成别的比例 ⇒ 变红。
+    #[test]
+    fn resolve_limits_sets_turn_budget_from_window() {
+        let _guard = crate::test_env::env_lock();
+
+        let dir = unique_tmp_dir("resolve_limits_budget");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{ "context_window": { "budget-model": 262144 } }"#).unwrap();
+        let mut config = config::Config::from_env().unwrap();
+        config.model = "budget-model".into();
+        config.load_user_config(&path);
+
+        let limits = resolve_limits(&config);
+        assert_eq!(limits.context_window, 262_144, "前置：窗口取自 config");
+        assert_eq!(
+            limits.max_turn_tool_result_tokens, 65_536,
+            "回合级预算必须 == context_window / 4"
+        );
+        assert_ne!(
+            limits.max_turn_tool_result_tokens, 0,
+            "预算不得为 0（0 = 关闭闸门）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **两组默认常数不许漂移**（跨 crate 守卫）。

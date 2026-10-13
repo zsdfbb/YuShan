@@ -28,6 +28,18 @@ const TRUNCATED_TOOL_NOTICE: &str = "tool call was NOT executed: the model respo
 const EMPTY_RETRY_PROMPT: &str = "You produced no visible output (no text and no tool call). \
      Respond now: either give your answer, or make a tool call — do not reply with only reasoning.";
 
+/// 纯文本被截断后**续写一次**的催促话术。截断只代表「这一轮没说完」，不是回合结束，
+/// 故回喂这条提示并 `continue`，让模型从断点接着把任务做完 —— 而不是把回合终结在半个
+/// 回答上（那正是「一撞截断就停、任务没做完」的故障）。
+///
+/// 与 `TRUNCATED_TOOL_NOTICE` 同源但**不同形态**：工具批被作废时回喂的是一条 `ToolResult`
+/// 错误；纯文本截断时没有工具可配对，回喂的是一条 `User` 催促消息。措辞点明「没说完」、
+/// 要求接着做，并提示「正要发工具调用就用更小的 payload」。
+const TRUNCATED_CONTINUE_PROMPT: &str = "Your previous response was cut off by the output token \
+     limit before it finished — this was not the end of your turn. Continue from exactly where \
+     you left off; do not repeat what you already said. If you were about to make a tool call, \
+     make it now (use a smaller payload if it is large).";
+
 /// 一次工具调用的超时预算：**工具声明值优先** → 否则 `limits.bash_timeout` → 否则 300s。
 ///
 /// 「优先」而非取 min：`bash_timeout` 管的是「shell 命令多久算卡死」，不该成为长任务
@@ -113,6 +125,9 @@ impl AgentLoop for BasicLoop {
         let mut consecutive_errors: HashMap<String, u32> = HashMap::new();
         // 空响应**只重试一次**；本回合内一旦重试过，再空就如实收场。
         let mut empty_retried = false;
+        // 纯文本截断后**只续写一次**（Step 8b）：截断没有工具那样的自愈回喂，一个总触顶的
+        // 模型无限续写只会空烧 token，故以一次性标志封顶；仍被截断就如实收场。
+        let mut truncated_continued = false;
 
         // 回合级工具输出闸门的**下界锚**：本回合新增消息的起点。必须在 Step 2 append
         // 用户消息**之前**取，否则用户消息会被当成可降级对象。
@@ -386,7 +401,29 @@ impl AgentLoop for BasicLoop {
                 .map_err(LoopError::Event)?;
 
                 if tool_calls.is_empty() {
-                    // 纯文本被截断：诚实收场，**不得**伪装成 Completed（那是静默的谎）。
+                    // 纯文本被截断 ⇒ 模型**这一轮没说完**。先回喂一条「续写」提示、
+                    // `continue` 让它在下一轮接着把任务做完 —— 而不是把回合终结在半个回答上。
+                    // （截断的文本已在本轮 Step 7 作为 assistant 消息落进会话，故模型看得到
+                    // 自己说到一半的样子。）
+                    //
+                    // **只续一次**：截断没有工具批那样的自愈回喂，一个总触顶的模型无限续写
+                    // 只会空烧 token（app 默认 `max_rounds = u32::MAX`，不是可靠的阀 ⇒ 必须
+                    // 自带上限）。已经续过一次仍被截断 ⇒ 落下去如实收场。
+                    if !truncated_continued {
+                        truncated_continued = true;
+                        ctx.session
+                            .append(Message {
+                                role: Role::User,
+                                content: vec![ContentBlock::Text {
+                                    text: TRUNCATED_CONTINUE_PROMPT.to_string(),
+                                }],
+                            })
+                            .await
+                            .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                        continue;
+                    }
+
+                    // 续写一次仍被截断：诚实收场，**不得**伪装成 Completed（那是静默的谎）。
                     let final_msg = if text_content.is_empty() {
                         None
                     } else {
@@ -1622,16 +1659,22 @@ mod tests {
         );
     }
 
-    /// N2：纯文本被截断 ⇒ 回合以 `StopReason::Truncated` **诚实**收场（不是 `Completed`）。
+    /// N2：**续写一次仍被截断** ⇒ 回合以 `StopReason::Truncated` **诚实**收场（不是 `Completed`）。
+    ///
+    /// 第一次纯文本截断会触发 Step 8b 的续写（见 N2b）；本用例给两次截断，验证「只续一次」
+    /// 的封顶：第二次截断落下去如实收场，绝不伪装成 `Completed`。
     ///
     /// 变异自检（已实测）：把分支里两处 `StopReason::Truncated` 改回 `Completed`
     /// ⇒ `result.stop_reason` 与 `RunFinished.stop_reason` 两条断言同时变红；
     /// 把 `ResponseTruncated` 的 emit 挪到 `RunFinished` **之后** ⇒ 顺序断言变红。
+    /// 把「只续一次」的一次性标志去掉（无条件续写）⇒ 本用例因 `MockModel` 空队列 panic
+    /// （第 3 次调用无响应）而变红。
     #[tokio::test]
-    async fn truncated_text_ends_turn_as_truncated() {
+    async fn truncated_text_twice_ends_turn_as_truncated() {
         let registry = ToolRegistry::build(vec![]).unwrap();
         let model = MockModel::new("m");
         model.push_truncated_text("half an answer");
+        model.push_truncated_text("still too long");
         let mut session = MemorySession::new();
         let mut events = CollectingSink::new();
 
@@ -1652,15 +1695,18 @@ mod tests {
         assert_eq!(
             result.stop_reason,
             StopReason::Truncated,
-            "被截断的纯文本**不得**伪装成 Completed"
+            "续写一次仍被截断**不得**伪装成 Completed"
         );
-        assert_eq!(result.rounds, 1);
+        assert_eq!(
+            result.rounds, 2,
+            "第一次截断续写一轮、第二次截断收场 ⇒ 共 2 轮"
+        );
         // 截断的文本仍作为 final_message 交出去（半句答案总比没有好，但不能标成完成）
         assert!(
             result
                 .final_message
                 .as_ref()
-                .is_some_and(|m| content_has_text(m, "half an answer")),
+                .is_some_and(|m| content_has_text(m, "still too long")),
             "被截断的文本应仍带出，实际 = {:?}",
             result.final_message
         );
@@ -1715,6 +1761,75 @@ mod tests {
             "顺序不变量：ResponseTruncated（下标 {truncated_at}）必须先于 RunFinished\
              （下标 {finished_at}）—— 先告知「被截断了」，再收场：{:?}",
             events.events()
+        );
+    }
+
+    /// N2b（核心回归）：纯文本被截断 ⇒ 回合**继续**（回喂续写提示），而不是就地终结。
+    ///
+    /// 场景：第 1 轮模型吐半句回答即触顶（`finish_reason = Length`）；循环回喂一条续写催促，
+    /// 第 2 轮（`push_text("second half")`）被消费并把任务做完。
+    ///
+    /// 这是用户报告故障的锁：「一撞截断就停、没完成预期任务」。变异自检（已实测）：
+    /// 把 Step 8b 的空 `tool_calls` 分支改回**无条件** `return StopReason::Truncated`
+    /// ⇒ `rounds == 1`、`stop_reason == Truncated` ⇒ 本用例三条断言全部变红。
+    #[tokio::test]
+    async fn truncated_text_continues_once_then_completes() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = MockModel::new("m");
+        model.push_truncated_text("first half");
+        model.push_text("second half"); // 只有循环继续才会被消费
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        let all_text: String = session
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        assert_eq!(
+            result.rounds, 2,
+            "截断后应继续调模型一轮：session={all_text:?}"
+        );
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Completed,
+            "续写完成后应判 Completed：session={all_text:?}"
+        );
+        assert!(
+            all_text.contains("second half"),
+            "续写必须落地：session={all_text:?}"
+        );
+        assert!(
+            session.messages().iter().any(|m| {
+                m.role == Role::User
+                    && m.content.iter().any(|b| {
+                        matches!(
+                            b,
+                            ContentBlock::Text { text } if text == TRUNCATED_CONTINUE_PROMPT
+                        )
+                    })
+            }),
+            "会话里必须有续写催促消息（模型据此知道要接着做）：{all_text:?}"
         );
     }
 

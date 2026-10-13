@@ -173,6 +173,17 @@ fn recovered_round() -> String {
     sse
 }
 
+/// 轮 1（纯文本截断场景）：只吐半句文本，终止原因 `length`。
+fn truncated_text_round() -> String {
+    let mut sse = String::new();
+    sse.push_str(&frame(&json!({
+        "choices": [{ "index": 0, "delta": { "content": "first half" } }]
+    })));
+    sse.push_str(&frame(&finish_chunk("length")));
+    sse.push_str("data: [DONE]\n\n");
+    sse
+}
+
 // ---------------------------------------------------------------------------
 // 回环 mock HTTP 服务（每个连接处理一个请求，按请求号取脚本）
 // ---------------------------------------------------------------------------
@@ -236,6 +247,12 @@ impl MockServer {
 
     fn request_count(&self) -> usize {
         self.bodies.lock().unwrap().len()
+    }
+
+    /// 第 `n` 次（0 基）请求的原始 body —— 用来断言「回喂给模型的消息里确实带了
+    /// 续写催促」。
+    fn request_body(&self, n: usize) -> String {
+        self.bodies.lock().unwrap()[n].clone()
     }
 }
 
@@ -466,6 +483,86 @@ fn truncated_tool_batch_is_never_executed() {
             content.to_lowercase().contains("truncated")
         }),
         "被作废的工具结果应说明是截断所致，实得：{error_results:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// **纯文本截断 ⇒ 续写一次并跑完**（端到端，经真实适配器 + 真实 CLI + 真实循环）。
+///
+/// 复现用户报告的故障：第 1 轮模型吐半句文本即触顶（`finish_reason: "length"`、
+/// 无工具调用）—— 旧行为在此**直接终结回合**、任务烂尾。修法（ADR-0035）是回喂一条
+/// 续写催促并 `continue`，让模型接着把任务做完。
+///
+/// 变异：把 `crates/ys-loop/src/basic.rs` Step 8b 的空 `tool_calls` 分支改回
+/// **无条件** `return StopReason::Truncated` ⇒ 只发生 1 次模型调用、终局是
+/// `Truncated` ⇒ 断言 2/3/4 全部变红。
+#[test]
+fn truncated_text_turn_continues_to_completion() {
+    let work = unique_dir("work_text");
+    let home = unique_dir("home_text");
+
+    let server = MockServer::start(vec![truncated_text_round(), recovered_round()]);
+
+    let out = run_json(&server.api_base(), "answer the question", &home);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // ── 断言 1：截断不是失败，进程正常退出，且广播了 dropped == 0 的 ResponseTruncated ──
+    assert!(
+        out.status.success(),
+        "截断不是失败：进程应正常退出\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let truncated = event_payloads(&stdout, "ResponseTruncated");
+    assert_eq!(
+        truncated.len(),
+        1,
+        "纯文本截断应恰有一条 ResponseTruncated\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        truncated[0]["dropped_tool_calls"], 0,
+        "纯文本截断的 dropped_tool_calls 必须是 0（没有工具批）\nstdout:\n{stdout}"
+    );
+    assert!(
+        event_payloads(&stdout, "RunFailed").is_empty(),
+        "截断不得以 RunFailed 收场\nstdout:\n{stdout}"
+    );
+
+    // ── 断言 2：循环**继续**到第 2 轮 —— 恰两次模型调用，两段文本都出现 ─────────
+    assert_eq!(
+        server.request_count(),
+        2,
+        "截断后应回喂续写提示并再调一次模型：轮 1（截断）+ 轮 2（收尾）\nstdout:\n{stdout}"
+    );
+    let deltas = event_payloads(&stdout, "ModelTextDelta");
+    assert!(
+        deltas.iter().any(|d| d["text"] == "first half"),
+        "第 1 轮被截断的半句应出现在事件流\nstdout:\n{stdout}"
+    );
+    assert!(
+        deltas.iter().any(|d| d["text"] == "recovered"),
+        "第 2 轮的文本应出现（证明循环真的走到了下一轮）\nstdout:\n{stdout}"
+    );
+
+    // ── 断言 3：终局是 Completed（不是 Truncated）──────────────────────────
+    let finished = event_payloads(&stdout, "RunFinished");
+    assert_eq!(
+        finished.len(),
+        1,
+        "应恰有一条 RunFinished\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        finished[0]["stop_reason"], "Completed",
+        "续写完成后应正常收尾，而不是 Truncated\nstdout:\n{stdout}"
+    );
+
+    // ── 断言 4：第 2 次请求确实带上了续写催促（回喂生效，不是靠别的路径巧合续跑）──
+    let second_body = server.request_body(1);
+    assert!(
+        second_body.contains("cut off by the output token limit"),
+        "第 2 次请求应含续写催促文案（证明 TRUNCATED_CONTINUE_PROMPT 回喂给了模型）\n\
+         第二次请求 body:\n{second_body}"
     );
 
     let _ = std::fs::remove_dir_all(&work);

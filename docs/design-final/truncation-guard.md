@@ -119,3 +119,17 @@ N4 用「恰好 2」钉住这条。
   `request_count == 2`（证明循环真的继续到第二轮）。
 
 **变异证据**：8 条注入全部被对应用例抓到并已还原（详见报告）。
+
+## 后续修订（ADR-0035，2026-10-13）—— 纯文本截断改为「续写一次」
+
+上文「关键行为 ④」把纯文本截断收为 `StopReason::Truncated` 并**立刻结束回合**；实测暴露出故障：
+模型在半句回答处停住、多步任务烂尾（提示行「model response was truncated (output limit reached)」）。
+**ADR-0035 修订此点**：纯文本被截断时，先回喂一条续写催促（`crates/ys-loop/src/basic.rs` 的
+`TRUNCATED_CONTINUE_PROMPT`）、`continue` 让模型接着做；**只续一次**（循环内一次性标志 `truncated_continued`，
+照 `empty_retried` 的形状），第二次截断才以此收场。
+
+- **不变**：带工具调用的截断仍**整批作废 + 错误结果回喂 + 循环继续**（决策 3）；`ResponseTruncated` 事件
+  （决策 5）与 `StopReason::Truncated`（决策 4 的词汇）都不变；诚实性仍由「绝不因截断判 `Completed`」保证。
+- **测试资产变更**：`truncated_text_ends_turn_as_truncated`（N2）→ `truncated_text_twice_ends_turn_as_truncated`
+  （两次截断才收场）；新增 `truncated_text_continues_once_then_completes`（首次截断续写后完成，`rounds == 2`、`Completed`）。
+  其余 3 条 ys-loop 截断用例、`apps/coding-agent/tests/truncation_guard.rs`（工具批）**逐字节不变**。

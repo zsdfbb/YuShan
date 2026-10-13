@@ -243,8 +243,10 @@ provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoni
 **状态行**：`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**（时长 → 轮数 → tokens → model）；
 turn 中把 model 段换成 `⏳ Working·`（300ms 节拍前进，宽字符占两格）。四档宽度各有测试。
 
-**输入区**：多行（`Shift/Alt+Enter` 换行、`Enter` 提交）；启用 bracketed paste（`Event::Paste` 原样
-`insert_str`，不被当多次提交）；启用 `PushKeyboardEnhancementFlags`。
+**输入区**：多行（`Enter` 提交；`Shift`/`Alt` + Enter 换行，另加 **`Ctrl-J` 普适兜底** ——
+`Shift+Enter` 依赖终端的 Kitty 键盘增强协议，Termux 等不支持的终端下它与 `Enter` 发出**同一个
+字节 `\r`**、无从区分，见 ADR-0037）；启用 bracketed paste（`Event::Paste` 原样 `insert_str`，
+不被当多次提交）；启用 `PushKeyboardEnhancementFlags`（尽力而为，不支持的终端静默降级）。
 turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` 排队到下一回合）；
 **`Working` 心跳只出现在状态行**。
 `InputBuffer.cursor` 是 **char 索引**，退格走字节边界求区间再 `replace_range` —— 修掉了旧

@@ -104,7 +104,8 @@ trigger_at(w)  = min( floor(w*trigger_ratio), w - effective_reserve ).max(keep +
 解析结构（详见「偏离」8）。
 **摘要调用刻意仍是「独立 `ModelRequest` + `policy.summary_system_prompt`、`tools: vec![]`、`max_tokens` 不设」**：
 「复用活对话前缀 + `tool_choice`（K-1）」是**片 2** 的事（有单测 `summary_request_shape_is_unchanged_in_this_slice` 钉住本片没越界）。
-`max_tokens` 不设是因为 app 侧写死 `config.max_tokens.or(request.max_tokens) = Some(4096)`，设了会被静默覆盖，是假话。
+`max_tokens` 不设是因为摘要交由 provider 自身的模型上限（app 的 config 级 `max_tokens` 为 `None`，
+见 ADR-0036）—— 不设比设一个偏小的值更稳：摘要若被截断会丢失被压缩的历史，反而违背压缩的目的。
 
 **事件只有两个终局、不发「开始」**：`ContextCompacted`（含 `estimated_tokens_* / summarized / kept`）与
 `ContextCompactionFailed { reason }`。**不发 `Started`** —— 它会引入悬挂状态：压缩中途被 `Abort`

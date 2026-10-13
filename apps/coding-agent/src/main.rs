@@ -1667,7 +1667,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             api_base: base.clone(),
             api_key: key.clone(),
             model: cfg.model.clone(),
-            max_tokens: Some(4096),
+            // 不设输出上限：交由 **provider 自身的模型上限**（DeepSeek 单次可达 ~200k）。
+            // 主循环的 `ModelRequest.max_tokens` 也是 `None` ⇒ 适配器**整个字段不序列化**，
+            // 绝不人为把模型掐断。辅助调用（摘要）在各自的请求里自带上限。
+            max_tokens: None,
             temperature: Some(0.7),
             compat,
         })
@@ -1706,7 +1709,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             api_base: base.clone(),
             api_key: key.clone(),
             model: name.to_string(),
-            max_tokens: Some(4096),
+            // 同主工厂：不设输出上限，交由 provider 自身的模型上限。
+            max_tokens: None,
             temperature: Some(0.7),
             compat,
         })

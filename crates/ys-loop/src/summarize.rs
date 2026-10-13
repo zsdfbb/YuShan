@@ -31,11 +31,12 @@ never fill the gap from your own knowledge.
 - Be concise: under 200 words. No preamble, no meta-commentary, no restating the request.
 - Quote exact identifiers, flags, code and URLs when they are the answer.";
 
-/// 摘要调用请求的 `max_tokens`（与 compaction 同值，`basic.rs` 的 `generate_summary`）。
+/// 工具侧摘要调用（`ModelSummarizer`：webfetch / subagent）请求的 `max_tokens`。
 ///
-/// ⚠️ **这不是线上行为的保证**：coding-agent 装配下 `model-openai-compatible/src/lib.rs`
-/// 的 `config.max_tokens.or(request.max_tokens)` 会被 app 侧 `main.rs` 写死的 `Some(4096)`
-/// 覆盖 ⇒ 线上实际发出的是 **4096**。本值只在无 config 的宿主（库路径）生效。
+/// app 侧 `main.rs` 不再写死 config 级 `max_tokens`（`None`）⇒ 适配器的
+/// `config.max_tokens.or(request.max_tokens)` 取到的**就是本值**，线上确实按 1024 发。
+/// 与压缩摘要（`compact.rs::generate_summary`，**不设**上限）刻意分开：工具摘要要短，
+/// 压缩摘要要完整。
 const SUMMARIZE_MAX_TOKENS: u32 = 1024;
 
 /// 丢弃一切 `ModelEvent` 的 sink —— 摘要调用没有事件出口（工具侧不通事件）。
@@ -68,13 +69,11 @@ impl ys_tool::Summarizer for ModelSummarizer<'_> {
             // （它拿不到工具结果，吐了只会污染这一次调用）。
             tools: vec![],
             system: Some(SUMMARIZE_SYSTEM.into()),
-            // ⚠️ `max_tokens` 同样会被 provider config 静默覆盖（见 `SUMMARIZE_MAX_TOKENS`
-            // 的注释）：这里写的是「我们请求的值」，线上实际由 app 侧决定。
+            // 工具侧摘要的固定上限（见 `SUMMARIZE_MAX_TOKENS`）：app 不再有 config 级
+            // 覆盖，故这里就是线上生效值。
             max_tokens: Some(SUMMARIZE_MAX_TOKENS),
-            // ⚠️ `temperature` 刻意**不设**：`adapters/model-openai-compatible/src/lib.rs:415-416`
-            // 是 `config.X.or(request.X)` 形状，而 app 侧 `main.rs:610-611` 写死
-            // `Some(4096)` / `Some(0.7)` ⇒ 线上实际发出的是 4096 / 0.7。
-            // 在这里设值会被静默覆盖 —— 那是句假话，故不设。
+            // ⚠️ `temperature` 刻意**不设**：适配器是 `config.X.or(request.X)` 形状，而
+            // app 侧写死 `config.temperature = Some(0.7)` ⇒ 在这里设值会被静默覆盖。
             temperature: None,
         };
 
@@ -229,13 +228,11 @@ mod tests {
         );
         assert_eq!(system, SUMMARIZE_SYSTEM, "系统提示词应逐字等于固定常量");
 
-        // ⚠️ 1024 是**我们请求的值**，不是线上行为的保证：coding-agent 装配下
-        // `model-openai-compatible` 的 `config.max_tokens.or(request.max_tokens)` 会被
-        // app 侧 `main.rs:610-611` 写死的 4096 静默覆盖 ⇒ 线上真实发出的是 4096。
-        // 本断言只钉住「库路径请求了 1024」，**不得**当成线上保证。
+        // 1024 是工具侧摘要的上限，且 app 装配下**就是**线上生效值（config 级
+        // `max_tokens` 已不再是覆盖源，见 `SUMMARIZE_MAX_TOKENS` 注释）。
         assert_eq!(req.max_tokens, Some(1024));
 
-        // temperature 同理：设了必被覆盖（app 侧写死 0.7），故刻意不设。
+        // temperature 设了必被覆盖（app 侧写死 0.7），故刻意不设。
         assert_eq!(
             req.temperature, None,
             "temperature 不得设置（会被静默覆盖）"

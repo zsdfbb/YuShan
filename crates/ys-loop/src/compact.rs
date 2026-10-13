@@ -303,9 +303,9 @@ async fn generate_summary(
         messages: messages.to_vec(),
         tools: vec![],
         system: Some(system_prompt.to_string()),
-        // ⚠️ `max_tokens` **刻意不设**：coding-agent 装配下 `config.max_tokens.or(request.max_tokens)`
-        // 会被 app 侧写死的 `Some(4096)` 静默覆盖（见 `summarize::SUMMARIZE_MAX_TOKENS` 的注释），
-        // 设了是假话。
+        // `max_tokens` **刻意不设**：摘要只受 system prompt 的长度约束，不额外掐上限 ——
+        // 交由 provider 自身的模型上限。**不设**比设一个偏小的值更稳：摘要若被截断会丢失
+        // 被压缩的历史，反而违背压缩的目的。
         ..Default::default()
     };
     let response = model
@@ -934,8 +934,8 @@ mod tests {
     /// 摘要请求的形状：不带工具表、带 `policy.summary_system_prompt`、**不设 `max_tokens`**。
     ///
     /// ⚠️ 本片**有意不做**「复用活对话前缀 + `tool_choice`」（那片 2 的事）——
-    /// 这条测试正是为了钉住「本片没越界」，同时钉住 `max_tokens` 不设（设了会被
-    /// app 侧 config 静默覆盖，是假话）。
+    /// 这条测试正是为了钉住「本片没越界」，同时钉住 `max_tokens` **不设**
+    /// （摘要交由 provider 的上限，避免被截断而丢失被压缩的历史）。
     #[tokio::test]
     async fn summary_request_shape_is_unchanged_in_this_slice() {
         use std::sync::Mutex;
@@ -991,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             req.max_tokens, None,
-            "max_tokens 刻意不设（设了会被静默覆盖）"
+            "max_tokens 刻意不设（摘要交由 provider 上限，不被截断）"
         );
         assert_eq!(req.temperature, None, "temperature 刻意不设");
     }

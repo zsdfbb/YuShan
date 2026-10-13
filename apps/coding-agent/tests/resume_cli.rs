@@ -1,4 +1,4 @@
-//! **`--resume=<id>` 子进程端到端**：恢复既有会话、续写同一文件、退出提示的 id。
+//! **`--resume <id>` 子进程端到端**：恢复既有会话、续写同一文件、退出提示的 id。
 //!
 //! 钉住设计 `docs/arch/runtime-resume/design.md` 的 D3/§9（`--resume` 加载既有历史）
 //! 与 §5 的 I3（会话路径快照必须指向目标会话）。本文件覆盖执行计划的 T13：
@@ -316,7 +316,7 @@ fn body_contains(requests: &[String], needle: &str) -> bool {
 // T13 e2e —— N5 / N12
 // ---------------------------------------------------------------------------
 
-/// **T13 —— `--resume=<id>` 续写目标会话 + 回放既有历史 + 退出提示 id**。
+/// **T13 —— `--resume <id>` 续写目标会话 + 回放既有历史 + 退出提示 id**。
 ///
 /// 变异的靶子：
 /// - M1 把 `-p` 的 `session_exit_line` 改成写 stdout ⇒ stdout 混入人读文本（本用例
@@ -334,9 +334,8 @@ fn resume_continues_target_session_and_replays_history() {
     write_resumable_session(&roots.sessions_dir, id, "历史会话", hist);
 
     let api_base = server.api_base();
-    let resume_arg = format!("--resume={id}");
     let out = run_guarded_with_env(
-        &["-p", resume_arg.as_str(), new_task],
+        &["-p", "--resume", id, new_task],
         &roots,
         &[
             ("YUSHAN_API_BASE", api_base.as_str()),

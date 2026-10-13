@@ -795,7 +795,7 @@ fn attach_and_run(sb: &Sandbox, name: &str, api_base: &str) -> (String, PathBuf)
 }
 
 /// **U3-①②**：attach 会话成功回合后 meta **记录**了树路径；随后不带 attach 的
-/// `--resume=<id>` **回到该树**并告知。
+/// `--resume <id>` **回到该树**并告知。
 ///
 /// 变异靶子：`finalize_turn_meta` 不写 `workspace` ⇒ ① 红；启动期不读 meta 工作区 ⇒ ② 红。
 #[test]
@@ -821,12 +821,11 @@ fn u3_resume_restores_recorded_worktree() {
         tree.display()
     );
 
-    // ② 不带 attach 的 `--resume=<id>` ⇒ 恢复回该树（cwd 从共享仓出发，证明是恢复而非沿用 cwd）。
-    let resume_flag = format!("--resume={id}");
+    // ② 不带 attach 的 `--resume <id>` ⇒ 恢复回该树（cwd 从共享仓出发，证明是恢复而非沿用 cwd）。
     let mut cmd = command(&sb, &sb.repo);
-    cmd.args(["-p", &resume_flag, "hi"]);
+    cmd.args(["-p", "--resume", &id, "hi"]);
     with_mock(&mut cmd, &api_base);
-    let out = run_cmd(cmd, &["-p", &resume_flag, "hi"]);
+    let out = run_cmd(cmd, &["-p", "--resume", &id, "hi"]);
     let (_, stderr) = streams(&out);
     assert_eq!(out.status.code(), Some(0), "恢复回合应 exit(0)；stderr:\n{stderr}");
     assert!(
@@ -839,7 +838,7 @@ fn u3_resume_restores_recorded_worktree() {
     );
 }
 
-/// **U3-③**：记录的工作树被删除后 `--resume=<id>` ⇒ 明确告知「已不存在」，不崩，
+/// **U3-③**：记录的工作树被删除后 `--resume <id>` ⇒ 明确告知「已不存在」，不崩，
 /// 且按共享工作区继续把回合跑完（退出码 0）。
 #[test]
 fn u3_resume_reports_missing_recorded_worktree() {
@@ -854,11 +853,10 @@ fn u3_resume_reports_missing_recorded_worktree() {
     std::fs::remove_dir_all(&tree).expect("删树应成功");
     assert!(!tree.is_dir(), "树应已删除：{tree:?}");
 
-    let resume_flag = format!("--resume={id}");
     let mut cmd = command(&sb, &sb.repo);
-    cmd.args(["-p", &resume_flag, "hi"]);
+    cmd.args(["-p", "--resume", &id, "hi"]);
     with_mock(&mut cmd, &api_base);
-    let out = run_cmd(cmd, &["-p", &resume_flag, "hi"]);
+    let out = run_cmd(cmd, &["-p", "--resume", &id, "hi"]);
     let (_, stderr) = streams(&out);
     assert!(!stderr.contains("panicked"), "缺失树不得 panic：\n{stderr}");
     assert_ne!(out.status.code(), Some(101), "缺失树不得以 panic 收场：\n{stderr}");
@@ -886,11 +884,10 @@ fn u3_explicit_attach_wins_over_recorded_worktree() {
 
     // 再显式 attach 到另一棵树 `bug` 并 resume 同一会话。
     let _ = create(&sb, "bug");
-    let resume_flag = format!("--resume={id}");
     let mut cmd = command(&sb, &sb.repo);
-    cmd.args(["worktree", "attach", "bug", "-p", &resume_flag, "hi"]);
+    cmd.args(["worktree", "attach", "bug", "-p", "--resume", &id, "hi"]);
     with_mock(&mut cmd, &api_base);
-    let out = run_cmd(cmd, &["worktree", "attach", "bug", "-p", &resume_flag, "hi"]);
+    let out = run_cmd(cmd, &["worktree", "attach", "bug", "-p", "--resume", &id, "hi"]);
     let (_, stderr) = streams(&out);
     assert_eq!(out.status.code(), Some(0), "成功回合应 exit(0)；stderr:\n{stderr}");
     assert!(

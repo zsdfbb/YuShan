@@ -1,8 +1,25 @@
 //! crossterm 事件 → [`App`] 状态迁移 + 对 app 线程的请求（`Request` / `Boundary`）。
 //!
-//! 键位集：**Enter 提交或填入补全 / Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 /
-//! Esc 取消或清空输入 / 上下翻页滚动 / 左右与 Home·Delete 归输入光标
-//! （`Ctrl`·`⌥` + 左右 = 按词移动）/ Ctrl-A·Ctrl-E 输入行首·行尾 / Tab 开补全浮层**。
+//! 键位集：**Enter 提交或填入补全（`Shift`/`Alt` + Enter 换行，`Ctrl-J` 亦可，见下）/
+//! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / Esc 取消或清空输入 / 上下翻页滚动 /
+//! 左右与 Home·Delete 归输入光标（`Ctrl`·`⌥` + 左右 = 按词移动）/ Ctrl-A·Ctrl-E
+//! 输入行首·行尾 / Tab 开补全浮层**。
+//!
+//! # 换行键：为什么除了 `Shift`/`Alt` + Enter 还要 `Ctrl-J`
+//!
+//! 输入区多行编辑要一个「换行但不提交」的键。三个候选的**可移植性**不同：
+//!
+//! | 键 | 终端发出的字节 | 依赖 |
+//! |---|---|---|
+//! | `Enter` | `\r` | —（提交） |
+//! | `Shift` + `Enter` | 支持键盘增强协议时是 `CSI 13;2u`；**不支持时与 `Enter` 同为 `\r`** | 终端 |
+//! | `Alt` + `Enter` | `\x1b\r`（Alt = ESC 前缀） | 几乎所有终端 |
+//! | `Ctrl-J` | `\x0a`（终止控制符；raw 下 crossterm 解成 `Char('j')+CONTROL`） | 无 |
+//!
+//! `Shift` + `Enter` **不是**可依赖的键：它要求终端实现 Kitty 键盘增强协议；Termux 等
+//! 终端**根本不实现**（`KeyHandler` 把 `Shift+Enter` 与 `Enter` 都映射成 `\r`），应用拿到的
+//! 字节一模一样，无从区分。故 `Alt` + `Enter` 是终端无关的换行键，`Ctrl-J` 是普适兜底
+//! （终止控制符，任何终端都能发）。三者都插入换行、都不提交。
 //!
 //! # 命令分发（T10）
 //!
@@ -151,6 +168,10 @@ pub fn handle_key(
         // Shift/Alt+Enter 换行（Alt 是 macOS Terminal.app 的兜底，设计 §2.3）
         KeyCode::Enter if shift || alt => app.input.insert_char('\n'),
         KeyCode::Enter => submit(app, requests, boundaries),
+        // Ctrl+J 换行。不支持键盘增强协议的终端（Termux 等）里 `Shift+Enter` 与 `Enter`
+        // 发**同一个字节** `\r`，无法区分 —— 故补一个通用的「不提交换行」键。raw 模式下
+        // crossterm 把终止控制符 0x0A 解成 `Char('j') + CONTROL`（实测，非 `Char('\n')`）。
+        KeyCode::Char('j') if ctrl => app.input.insert_char('\n'),
         KeyCode::Backspace => app.input.backspace(),
         KeyCode::Delete => app.input.delete_forward(),
         // 左右归**输入光标**（上下归聊天滚动 —— 见模块文档的取舍表）。
@@ -448,6 +469,31 @@ mod tests {
             40,
         );
         assert_eq!(a.input.text, "\n");
+    }
+
+    /// Ctrl+J（终止控制符 0x0A）：raw 模式下 crossterm 解成 `Char('j') + CONTROL`
+    /// （实测，**不是** `Char('\n')`）。这是**不支持键盘增强协议的终端**（如 Termux）
+    /// 里唯一可用的「不提交换行」键 —— 那些终端的 `Shift+Enter` 与 `Enter` 发同一个
+    /// 字节 `\r`，无法区分（见模块文档的键位说明）。
+    ///
+    /// 变异：删掉处理里的 `KeyCode::Char('j') if ctrl` 臂 ⇒ Ctrl+J 变 no-op ⇒ 本用例红。
+    #[test]
+    fn test_ctrl_j_inserts_newline_not_submit() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("a");
+        handle_key(
+            with_mod(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.text, "a\n");
+        assert_eq!(a.input.lines(), 2);
+        assert!(!a.is_turning);
+        assert!(ch.next_request().is_none());
     }
 
     /// 中文退格：走 `InputBuffer` 的 char 边界实现，绝不 panic。

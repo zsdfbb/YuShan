@@ -172,7 +172,9 @@ impl Config {
         let api_key = std::env::var("YUSHAN_API_KEY")
             .or_else(|_| std::env::var("OPENAI_API_KEY"))
             .ok();
-        let model = std::env::var("YUSHAN_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+        // **不写死模型名**：没给就留空，由 `main` 从该端点的 `/v1/models` 目录取
+        // （`YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连时）。
+        let model = std::env::var("YUSHAN_MODEL").unwrap_or_default();
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
 
         Ok(Self {
@@ -194,11 +196,12 @@ impl Config {
         self.api_base.is_some() && self.api_key.is_some()
     }
 
-    /// 解析当前 model 的 context window（三级）：
+    /// 解析当前 model 的 context window（四级）：
     ///
     /// ① `~/.yushan/config.json` 里该 model 的覆盖（最具体，用户说了算）
-    /// ② 内置表 [`crate::provider::builtin_context_window`]
-    /// ③ `RunLimits::default().context_window` = 128_000（兜底）
+    /// ② **provider 目录里的 `context_window`**（厂商在 `/v1/models` 里自己报的）
+    /// ③ 内置兜底表 [`crate::provider::builtin_context_window`]（仅目录报不出窗口的模型）
+    /// ④ `RunLimits::default().context_window` = 128_000（兜底）
     ///
     /// **每回合都要重算**：`/login`、`/model` 会在运行中换 model，只在启动时算一次
     /// 会让「登到 1M 模型后仍按 128k 压缩」的 bug 复活。
@@ -208,13 +211,16 @@ impl Config {
         self.context_window_for(&self.model)
     }
 
-    /// 按**给定模型名**解析 context window（同 [`Self::context_window`] 的三级）：
-    /// ① `config.json` 覆盖 > ② 内置表 > ③ `RunLimits::default().context_window`。
+    /// 按**给定模型名**解析 context window（同 [`Self::context_window`] 的四级）：
+    /// ① `config.json` 覆盖 > ② 目录 > ③ 内置兜底表 > ④ `RunLimits::default().context_window`。
     ///
     /// 供 subagent 按 `model` 参数取子模型窗口用 —— 子 agent 换模型却继承父窗口是
     /// **静默错**（32k 模型按 1M 判 ⇒ 不压缩 ⇒ 撞窗）。
     pub fn context_window_for(&self, model: &str) -> usize {
         if let Some(&window) = self.user_config.windows.get(model) {
+            return window;
+        }
+        if let Some(window) = self.registry.catalog_context_window(model) {
             return window;
         }
         if let Some(window) = crate::provider::builtin_context_window(model) {

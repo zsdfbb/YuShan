@@ -177,11 +177,9 @@ fn split_leading_flags(rest: &[String]) -> Result<(bool, Resume, &[String]), Str
                 }
             }
             s if s.starts_with("--resume=") => {
-                return Err(
-                    "--resume 改为空格形态：`--resume <id>`（不再支持 `=`）。\
+                return Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）。\
                      例如：-p --resume 2026-10-07-abc \"任务\""
-                        .into(),
-                );
+                    .into());
             }
             _ => break,
         }
@@ -965,6 +963,34 @@ pub(crate) fn resolve_model_from_meta(
     None
 }
 
+/// 起屏前拉不到模型目录时的统一说法：**点名要求**（不再有内置默认名）。
+fn catalog_unavailable(base: &str, reason: &str) -> String {
+    format!(
+        "无法从 {base} 读取模型目录（{reason}）；模型名不再有内置默认值 —— \
+         请显式设置 YUSHAN_MODEL，或在 TUI 里用 `/model <provider>/<name>` 指定"
+    )
+}
+
+/// 把目录里的**第一条**当起始模型：写进 `config.model`，并把整份目录并入 registry
+/// 的目录缓存 —— `/model` 候选（`models_for_provider`）与 `context_window_for` 的
+/// ② 级（目录里厂商自己报的窗口）立刻可用。
+///
+/// 空目录 ⇒ `Err(原因)`：**不猜**（既不改 `config.model`，也不动端点）。
+fn adopt_first_catalog_model(
+    config: &mut config::Config,
+    base: &str,
+    models: Vec<provider::ApiModel>,
+) -> Result<(), &'static str> {
+    let Some(first) = models.first() else {
+        return Err("端点返回了空目录");
+    };
+    config.model = first.id.clone();
+    let mut cache = provider::ModelCache::new();
+    cache.insert(base.trim_end_matches('/').to_string(), models);
+    config.registry.apply_model_cache(cache);
+    Ok(())
+}
+
 /// `-p` / `--json` 单回合收尾：由 meta 播种统计、`record(usage)` 后写穿 meta，
 /// 并把 `session: <id>`（以及 `worktree: <name>`，若在树内）打到 **stderr**
 /// （stdout 属数据流，不得污染）。
@@ -1011,7 +1037,7 @@ fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> 
     eprintln!("Set environment variables:");
     eprintln!("  YUSHAN_API_BASE  — API endpoint URL");
     eprintln!("  YUSHAN_API_KEY   — API authentication key");
-    eprintln!("  YUSHAN_MODEL     — Model name (optional, default: deepseek-chat)");
+    eprintln!("  YUSHAN_MODEL     — Model name (unset: 取该端点 /v1/models 的第一条)");
     eprintln!("Or run in interactive mode and use /login to configure.");
     std::process::exit(1);
 }
@@ -1315,9 +1341,17 @@ fn run_interactive(
     // 写进 registry 并刷新视图。渲染路径依旧一次 HTTP 都不发（设计 M4）—— 写与读同
     // 在 app 循环那一线程，后台任务只负责网络、不碰 registry（唯一写者不分裂）。
     //
-    // `/model` 候选在目录回来前取静态表，回来后由视图刷新切到真实目录。5s 超时且
-    // 并发，失败静默回退静态表。无已登录 provider 时不拉（`models_rx = None`）。
-    let fetch_targets = config.registry.fetch_targets();
+    // `/model` 候选在目录回来前只有当前在跑的那条模型，回来后由视图刷新补上目录。
+    // 5s 超时且并发；某一家拉不到就**没有**那一家（不再拿写死的名字充数）。
+    // 无任何可拉目标时不拉（`models_rx = None`）。
+    // env 直连（`provider` 无名）的端点也要拉：那条路径的 `/model` 候选与窗口查询
+    // 同样只有「目录」一个来源，registry 里没有它的名字，只能按 base 认。
+    let env_direct = if config.provider.is_none() {
+        config.api_base.clone().zip(config.api_key.clone())
+    } else {
+        None
+    };
+    let fetch_targets = config.registry.fetch_targets(env_direct);
     let models_rx = if fetch_targets.is_empty() {
         None
     } else {
@@ -1508,23 +1542,25 @@ fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
                 }
             }
         }
-        WorktreeCmd::Remove(name) => match worktree::main_repo(cwd)
-            .and_then(|repo| worktree::remove(&repo.root, name))
-        {
-            Ok(()) => {
-                eprintln!("已删除 worktree：{name}（分支 worktree-{name} 保留）");
-                std::process::exit(0);
+        WorktreeCmd::Remove(name) => {
+            match worktree::main_repo(cwd).and_then(|repo| worktree::remove(&repo.root, name)) {
+                Ok(()) => {
+                    eprintln!("已删除 worktree：{name}（分支 worktree-{name} 保留）");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("删除 worktree 失败：{e}");
+                    eprintln!(
+                        "退路：先 merge 该分支或清理未提交改动；确要丢弃可 `git worktree remove --force`。"
+                    );
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("删除 worktree 失败：{e}");
-                eprintln!(
-                    "退路：先 merge 该分支或清理未提交改动；确要丢弃可 `git worktree remove --force`。"
-                );
-                std::process::exit(1);
-            }
-        },
+        }
         // `attach` 不早退（由 `main` 在进入本函数前单独处理）；此处不可达。
-        WorktreeCmd::Attach(_) => unreachable!("Attach 已由 main 提前处理，不应到达 run_worktree_early"),
+        WorktreeCmd::Attach(_) => {
+            unreachable!("Attach 已由 main 提前处理，不应到达 run_worktree_early")
+        }
     }
 }
 
@@ -1660,12 +1696,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // > state.json（last-active provider+model）> 第一个存有凭证的 provider。
     // provider 无凭证时**降级而非失败**。整条链抽成**纯函数** `resolve_model_from_meta`
     // —— 启动期与运行期 `/resume` 共用，杜绝两处漂移。
+    //
+    // runtime 在此**之前**建：下面「模型名缺失 ⇒ 问端点要一个」那一步可能要同步拉一次
+    // `/v1/models`。手工建（而非 `#[tokio::main]`）的理由不变 —— TUI 模式的 UI 循环
+    // **必须在没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
     if let Some(choice) = resolve_model_from_meta(&config, resume_meta.as_ref(), Some(&saved_state))
     {
         config.provider = choice.provider;
         config.api_base = Some(choice.api_base);
         config.api_key = Some(choice.api_key);
         config.model = choice.model;
+    }
+
+    // 走到这里**仍没有模型名**、而端点与凭证齐全 ⇒ 同步拉一次该端点的 `/v1/models`，
+    // 取**第一条**当起始模型。两种情形落在这里：
+    //   · `YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连、但没给 `YUSHAN_MODEL`；
+    //   · auth 里有凭证、但 `model` 是空的（上次 `/login` 时没能读到目录）。
+    // 这是启动期**唯一**可能等网络的路径，且只在「用户没点名模型」时发生。
+    // 拉不到 ⇒ **明确失败**（提示显式给名字）：名字写死在代码里只会过时，猜一个
+    // 不存在/不兼容的模型名更糟。
+    if config.model.is_empty() && config.is_configured() {
+        let base = config.api_base.clone().unwrap_or_default();
+        let key = config.api_key.clone().unwrap_or_default();
+        match rt.block_on(provider::ProviderRegistry::fetch_models(&base, &key)) {
+            provider::FetchModelsResult::Success(models) => {
+                if let Err(reason) = adopt_first_catalog_model(&mut config, &base, models) {
+                    return Err(catalog_unavailable(base.as_str(), reason).into());
+                }
+            }
+            provider::FetchModelsResult::AuthError(_) => {
+                return Err(catalog_unavailable(base.as_str(), "鉴权失败").into());
+            }
+            provider::FetchModelsResult::NetworkError(_) => {
+                return Err(catalog_unavailable(base.as_str(), "网络不可达").into());
+            }
+        }
     }
 
     // 窗口配置接线（U6b）—— 必须在 **provider 恢复之后**：`context_window()` 按
@@ -1811,12 +1880,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .zip(worktree_path.clone())
         .map(|(name, path)| app_loop::WorktreeBinding { name, path });
     let worktree_handle = app_loop::WorktreeHandle::new(worktree_binding);
-
-    // 手工建 runtime（而非 `#[tokio::main]`）：TUI 模式的 UI 循环**必须在
-    // 没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
 
     match args.mode {
         Mode::Print(task) => {
@@ -2249,7 +2312,9 @@ mod tests {
             Some(WorktreeCmd::List)
         );
         assert_eq!(
-            parse_args(&s(&["worktree", "remove", "y"])).unwrap().worktree,
+            parse_args(&s(&["worktree", "remove", "y"]))
+                .unwrap()
+                .worktree,
             Some(WorktreeCmd::Remove("y".into()))
         );
         assert!(parse_args(&s(&["worktree", "explode"])).is_err());
@@ -2297,8 +2362,7 @@ mod tests {
         let p = parse_args(&s(&["worktree", "attach", "feat", "-p", "do it"])).unwrap();
         assert_eq!(p.mode, Mode::Print("do it".into()));
         assert_eq!(p.worktree, Some(WorktreeCmd::Attach(Some("feat".into()))));
-        let j =
-            parse_args(&s(&["worktree", "attach", "--json", "--resume", "x", "do"])).unwrap();
+        let j = parse_args(&s(&["worktree", "attach", "--json", "--resume", "x", "do"])).unwrap();
         assert_eq!(j.mode, Mode::Json("do".into()));
         assert_eq!(j.resume, Resume::Id("x".into()));
         assert_eq!(j.worktree, Some(WorktreeCmd::Attach(None)));
@@ -3480,15 +3544,9 @@ mod tests {
             final_message: None,
         };
 
-        persist_single_turn(
-            &mut wiring,
-            "展开前的原文",
-            Some("deepseek"),
-            None,
-            &result,
-        )
-        .await
-        .unwrap();
+        persist_single_turn(&mut wiring, "展开前的原文", Some("deepseek"), None, &result)
+            .await
+            .unwrap();
 
         let path = wiring.session_path().unwrap().to_path_buf();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -3566,9 +3624,12 @@ mod tests {
         cfg.registry
             .save_auth("minimax", &auth("http://minimax/v1", "sk-mm", "mm-default"))
             .unwrap();
-        let choice =
-            resolve_model_from_meta(&cfg, Some(&meta_with(Some("minimax"), Some("meta-model"))), None)
-                .expect("meta 档");
+        let choice = resolve_model_from_meta(
+            &cfg,
+            Some(&meta_with(Some("minimax"), Some("meta-model"))),
+            None,
+        )
+        .expect("meta 档");
         assert_eq!(choice.provider.as_deref(), Some("minimax"));
         assert_eq!(choice.api_base, "http://minimax/v1");
         assert_eq!(choice.api_key, "sk-mm");
@@ -3577,16 +3638,22 @@ mod tests {
         // 档 2b：meta.model 为 None ⇒ 回落 entry.model。
         let choice =
             resolve_model_from_meta(&cfg, Some(&meta_with(Some("minimax"), None)), None).unwrap();
-        assert_eq!(choice.model, "mm-default", "meta.model 为空应回落 entry.model");
+        assert_eq!(
+            choice.model, "mm-default",
+            "meta.model 为空应回落 entry.model"
+        );
 
         // 档 2c：meta 的 provider **无凭证** ⇒ 降级（不失败）到下一档。
         cfg.registry
             .save_auth("deepseek", &auth("http://ds/v1", "sk-ds", "ds-default"))
             .unwrap();
         // 无 state ⇒ 落到档 4（首个有凭证者，注册序 deepseek 在前）。
-        let choice =
-            resolve_model_from_meta(&cfg, Some(&meta_with(Some("ghost"), Some("ghost-model"))), None)
-                .expect("降级到档 4");
+        let choice = resolve_model_from_meta(
+            &cfg,
+            Some(&meta_with(Some("ghost"), Some("ghost-model"))),
+            None,
+        )
+        .expect("降级到档 4");
         assert_eq!(
             choice.provider.as_deref(),
             Some("deepseek"),
@@ -3748,5 +3815,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **模型名没有内置默认值**：缺失时把目录第一条当起始模型 —— 并**同时**把目录
+    /// 并入缓存，于是窗口解析的 ② 级（厂商自己在目录里报的 `context_window`）立刻生效。
+    ///
+    /// 变异：取 `models.last()`、或只写 `config.model` 而不 `apply_model_cache`
+    /// ⇒ 下面两条断言分别变红。
+    #[test]
+    fn adopt_first_catalog_model_takes_first_and_seeds_catalog() {
+        let _guard = crate::test_env::env_lock();
+        let mut cfg = config::Config::from_env().unwrap();
+        cfg.model = String::new();
+
+        let models = vec![
+            provider::ApiModel {
+                id: "deepseek-flash".into(),
+                owned_by: Some("deepseek".into()),
+                name: None,
+                context_window: Some(1_048_576),
+            },
+            provider::ApiModel {
+                id: "deepseek-v4-pro".into(),
+                owned_by: Some("deepseek".into()),
+                name: None,
+                context_window: Some(1_048_576),
+            },
+        ];
+        adopt_first_catalog_model(&mut cfg, "https://api.deepseek.com/", models).unwrap();
+
+        assert_eq!(cfg.model, "deepseek-flash", "起始模型 = 目录第一条");
+        assert_eq!(
+            cfg.context_window_for("deepseek-flash"),
+            1_048_576,
+            "窗口取自目录（② 级），不再落到 128K 兜底"
+        );
+        assert_eq!(
+            cfg.registry.models_for_base("https://api.deepseek.com"),
+            vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()],
+            "目录同时进缓存（`/model` 候选）—— 尾斜杠归一"
+        );
+    }
+
+    /// 空目录 ⇒ `Err` 且**什么都不改**：宁可失败，也不猜一个可能不存在的模型名。
+    #[test]
+    fn adopt_first_catalog_model_refuses_empty_catalog() {
+        let _guard = crate::test_env::env_lock();
+        let mut cfg = config::Config::from_env().unwrap();
+        cfg.model = String::new();
+
+        assert!(adopt_first_catalog_model(&mut cfg, "https://x/v1", Vec::new()).is_err());
+        assert!(cfg.model.is_empty(), "不得写入任何模型名");
+        assert!(cfg.registry.models_for_base("https://x/v1").is_empty());
     }
 }

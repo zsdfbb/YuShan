@@ -5,9 +5,10 @@
 
 ## 一句话
 
-新增内置 provider `opencode-go`（`https://opencode.ai/zen/go/v1`，默认模型
-`deepseek-flash`），并给适配器补上**额外请求头**这一个传输层能力 —— 网关要求每个
-模型请求带 `x-opencode-session`，缺了直接 `400 MissingSessionID`。
+新增内置 provider `opencode-go`（`https://opencode.ai/zen/go/v1`），并给适配器补上
+**额外请求头**这一个传输层能力 —— 网关要求每个模型请求带 `x-opencode-session`，
+缺了直接 `400 MissingSessionID`。内置项只登记**端点与方言**：模型名一律来自该网关的
+`/v1/models`（`/login` 取目录第一条当起始模型，见 `login-model-behavior/design.md`）。
 
 ## 网关契约（实测，非推测）
 
@@ -51,12 +52,14 @@ model 先于 wiring）。网关只要求对话内稳定，故同一进程内 `/n
 
 **协议归属不按模型名猜**：`deepseek-flash` 一度被当作 `/responses` 模型，实测它在
 `/chat/completions` 上正常返回（终包含 `reasoning_content`）—— 名字带 `gpt-*`/`claude-*`
-不必然走别的端点，反之亦然。判定只认实测，故默认模型取 `deepseek-flash`（目录里另有
-`deepseek-v4-flash`、`deepseek-v4.1-flash` 等近名条目）。
+不必然走别的端点，反之亦然。判定只认实测：`/login` 取目录**第一条**（当前是
+`deepseek-v4-flash`，目录里另有 `deepseek-flash`、`deepseek-v4.1-flash` 等近名条目），
+选错协议的代价是一条 `400 ModelProtocolUnsupported`，用 `/model` 换一条即可。
 
-**context window 刻意留空**：网关不返回窗口，官方文档也没有 go 模型的窗口表，
-故 `builtin_context_window` 不收录 —— 宁可回退 128_000（提前压缩），也不编造一个可能
-让上下文溢出的值。需要更大窗口的模型（如 `deepseek-v4-pro`）请写 `~/.yushan/config.json` 覆盖。
+**context window 留空**：网关的 `/v1/models` **不返回** `context_window` 字段，
+`KNOWN_MODEL_WINDOWS` 也不收录 go 的模型（那是「端点报不出窗口」时的兜底表，且它与
+网关在售的模型名对不上）—— 宁可回退 128_000（提前压缩），也不编造一个可能让上下文
+溢出的值。需要更大窗口的模型（如 `deepseek-v4-pro`）请写 `~/.yushan/config.json` 覆盖。
 
 ## 两条配置路径（都已实测跑通）
 

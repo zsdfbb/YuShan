@@ -5,9 +5,9 @@
 //! [`Outbound::View`](ys_protocol::Outbound::View) 推给 UI。
 //! UI 侧不读 `Session`、不读 registry —— 数据/显示分离（设计 §4）。
 //!
-//! **无网络**：可用模型列表取 registry 的**静态**表（`known_models_static`）。
-//! TUI 路径不得因重绘而发起 HTTP 请求（`/v1/models` 拉取曾是登录路径的行为，
-//! 现在登录也不再拉取 —— 见 `capabilities::login`）。
+//! **无网络**：可用模型列表取 registry 里**已经拉到**的目录
+//! （`models_for_provider` / `models_for_base`，由启动期后台任务与 `/login` 填充）。
+//! TUI 路径不得因重绘而发起 HTTP 请求 —— 拉取只发生在启动期后台与 `/login`。
 
 use std::time::Instant;
 
@@ -34,27 +34,30 @@ pub fn build_view(
 ) -> CodingView {
     let logged_in = registry.logged_in_providers();
 
-    // `/model` 无参浮层的候选 = **所有已登录 provider** 的模型并集，每条带自己的归属。
+    // `/model` 无参浮层的候选 = **所有已登录 provider 已拉到的目录**，每条带自己的归属。
     //
-    // 每个 provider 的条目：优先后台拉到的 `/v1/models` 目录（`apply_model_cache`
-    // 写入的缓存），缺失则回退静态表中属于它的部分（`known_models_static` 的
-    // `owned_by` 即 provider 名）。**未登录任何 provider** 时退回静态全表（`owned_by`
-    // 就是它的归属）—— 那时列出的模型本就点不动（无凭证），保留只为 `/model` 仍可浏览。
+    // **没有静态回退**：模型名只有一个来源 —— 该端点的 `/v1/models`（启动期后台拉一次、
+    // `/login` 时再拉一次该 provider 的）。没拉到就是没拉到（`/model` 那时只剩当前在跑
+    // 的那一条），**绝不拿写死的名字充数** —— 写死的名字必然过时，选中即 400。
+    //
+    // env 直连（`YUSHAN_API_BASE` + `YUSHAN_API_KEY`）没有 provider 名，按 base 取目录，
+    // 归属记为「未知」（`None`，浮层里显示裸模型名）。
     //
     // **去重键是 `(provider, model)` 而非 `model`**：两个 provider 的目录里可能有**逐字
     // 同名**的 id（网关常转售别家品牌的模型名，如 opencode-go 的 `deepseek-*`），按 id
     // 去重会把其中一条**吃掉** —— 用户既看不到它、也选不到它。同名不同源各占一行，
     // 由 label 的 provider 前缀区分。
     let mut available_models: Vec<ModelEntry> = Vec::new();
-    if logged_in.is_empty() {
-        for m in ProviderRegistry::known_models_static() {
-            push_model(&mut available_models, m.owned_by, m.id, false);
+    for name in &logged_in {
+        for id in registry.models_for_provider(name) {
+            push_model(&mut available_models, Some(name.clone()), id, false);
         }
-    } else {
-        for name in &logged_in {
-            for id in registry.models_for_provider(name) {
-                push_model(&mut available_models, Some(name.clone()), id, false);
-            }
+    }
+    if cfg.provider.is_none()
+        && let Some(base) = cfg.api_base.as_deref()
+    {
+        for id in registry.models_for_base(base) {
+            push_model(&mut available_models, None, id, false);
         }
     }
 
@@ -68,7 +71,10 @@ pub fn build_view(
     // 刻意**不**用 `provider_for_model` 反查：它遍历 `model_cache`（`HashMap`，迭代顺序
     // 不确定），同名 id 会反查到任一家。
     let running = wiring.model_id().map(String::from);
-    for m in [running.clone(), Some(cfg.model.clone())].into_iter().flatten() {
+    for m in [running.clone(), Some(cfg.model.clone())]
+        .into_iter()
+        .flatten()
+    {
         let current = running.as_deref() == Some(m.as_str());
         push_model(&mut available_models, cfg.provider.clone(), m, current);
     }
@@ -232,6 +238,8 @@ mod tests {
             !view.provider_needs_api_base_url("deepseek"),
             "deepseek 有内置 base → /login 不该多问一句"
         );
+        // 无凭证、无目录：候选里只剩**当前在跑的**那条（`cfg.model`），
+        // 不再有写死的静态表条目。
         assert!(has_model(&view, "deepseek-chat"));
         assert_eq!(view.turn_count, 0);
         assert_eq!(view.message_count, 0);
@@ -287,7 +295,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 已登录 provider 的 auth model 被补进 `available_models`（即使不在静态表）。
+    /// 当前正在跑的模型被补进 `available_models`（即便所在 provider 的目录还没拉回来）。
     #[tokio::test]
     async fn test_build_view_includes_bound_provider_model() {
         use crate::provider::AuthEntry;
@@ -468,7 +476,7 @@ mod tests {
                 view.available_models
             );
         }
-        // 未拉到时才回退静态表；这里两个 provider 都拉到了，故不该混进静态条目。
+        // 模型名只有目录一个来源 ⇒ 拉到了就不该再出现别的（写死的）名字。
         assert!(
             !has_model(&view, "deepseek-chat"),
             "有目录时不得再掺静态条目：{:?}",
@@ -556,11 +564,8 @@ mod tests {
             );
         }
         // 「正在跑的那条」与目录里的同一条是**同一行**（不新增），且标记只落在它身上。
-        let current: Vec<&ModelEntry> = view
-            .available_models
-            .iter()
-            .filter(|c| c.current)
-            .collect();
+        let current: Vec<&ModelEntry> =
+            view.available_models.iter().filter(|c| c.current).collect();
         assert_eq!(current.len(), 1, "current 只该有一条：{current:?}");
         assert_eq!(current[0].provider.as_deref(), Some("deepseek"));
         assert!(

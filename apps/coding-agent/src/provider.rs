@@ -17,7 +17,6 @@ pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 pub struct ProviderInfo {
     pub name: String,
     pub api_base: String,
-    pub default_model: String,
     pub compat: ProviderCompat,
     /// 需要随**每个模型请求**发送的会话 id 头名（`None` = 无此要求）。
     ///
@@ -40,6 +39,15 @@ pub struct ApiModel {
     pub id: String,
     #[serde(default)]
     pub owned_by: Option<String>,
+    /// 厂商给的**展示名**（可选）。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 厂商声明的**上下文窗口**（token 总容量 = 输入 + 输出；可选）。
+    ///
+    /// 目录里报了就用它 —— 窗口的第一手来源（`Config::context_window_for` 的 ② 级）。
+    /// 厂商不报（如 opencode-go 网关）才回退默认值。
+    #[serde(default)]
+    pub context_window: Option<usize>,
 }
 
 /// `/v1/models` 目录缓存：`api_base → 该端点的模型目录`。
@@ -50,13 +58,14 @@ pub type ModelCache = HashMap<String, Vec<ApiModel>>;
 
 /// 从 API 拉取 models 的结果，区分错误类型。
 ///
-/// 生产消费者：[`ProviderRegistry::fetch_all`]（后台对每个已登录 provider 拉一次）。
-/// 失败一律**静默** —— 不写缓存，`/model` 的候选回退静态表。
+/// 生产消费者：[`ProviderRegistry::fetch_all`]（后台对每个已登录 provider 拉一次）、
+/// `app_loop` 的 `/login`（登录时拉该 provider 一次）。
+/// 失败一律**静默** —— 不写缓存，`/model` 候选就没有这一家的条目。
 pub enum FetchModelsResult {
     Success(Vec<ApiModel>),
-    /// 401 —— 提示用户重新登录
+    /// 401 —— 凭证被拒
     AuthError(String),
-    /// timeout/DNS —— 静默回退
+    /// timeout / DNS / 非 2xx —— 端点没答上来
     NetworkError(String),
 }
 
@@ -84,33 +93,32 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     /// 创建带内置 provider 的 registry。
+    ///
+    /// 内置项只登记**端点与方言**（`api_base` / `compat` / 会话头）—— 模型名一律来自
+    /// 该端点的 `/v1/models` 目录，**不在代码里写死**。
     pub fn new() -> Self {
         let providers = vec![
             ProviderInfo {
                 name: "deepseek".into(),
                 api_base: "https://api.deepseek.com".into(),
-                default_model: "deepseek-chat".into(),
                 compat: ProviderCompat::deepseek(),
                 session_header: None,
             },
             ProviderInfo {
                 name: "minimax".into(),
                 api_base: "https://api.minimax.chat/v1".into(),
-                default_model: "MiniMax-Text-01".into(),
                 compat: ProviderCompat::minimax(),
                 session_header: None,
             },
             ProviderInfo {
                 name: "opencode-go".into(),
                 api_base: "https://opencode.ai/zen/go/v1".into(),
-                default_model: "deepseek-flash".into(),
                 compat: ProviderCompat::opencode_go(),
                 session_header: Some(OPENCODE_SESSION_HEADER.into()),
             },
             ProviderInfo {
                 name: "custom".into(),
                 api_base: String::new(),
-                default_model: String::new(),
                 compat: ProviderCompat::standard(),
                 session_header: None,
             },
@@ -182,15 +190,24 @@ impl ProviderRegistry {
     /// 测试用：直接塞一份「启动期拉到的目录」，免去起本地 HTTP 服务。
     #[cfg(test)]
     pub(crate) fn seed_cached_models(&mut self, base: &str, ids: &[&str]) {
-        self.model_cache.insert(
-            base.to_string(),
-            ids.iter()
+        self.seed_cached_catalog(
+            base,
+            &ids.iter()
                 .map(|id| ApiModel {
                     id: (*id).into(),
                     owned_by: None,
+                    name: None,
+                    context_window: None,
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         );
+    }
+
+    /// 测试用：塞一份带窗口的目录（`context_window` 是 `/v1/models` 的第二手信息）。
+    #[cfg(test)]
+    pub(crate) fn seed_cached_catalog(&mut self, base: &str, models: &[ApiModel]) {
+        self.model_cache
+            .insert(cache_key(base).to_string(), models.to_vec());
     }
 
     /// 返回 auth.json 文件的路径。
@@ -307,13 +324,18 @@ impl ProviderRegistry {
         }
     }
 
-    /// 已登录 provider 的 `(api_base, api_key)` 列表 —— 后台拉取 `/v1/models` 的输入。
+    /// 需要拉 `/v1/models` 的 `(api_base, api_key)` 列表 —— 后台拉取的输入。
     ///
-    /// 只取 `api_base` 非空的条目（空 base 无处可拉，如未配 URL 的 `custom`）。
+    /// = **每个已登录 provider**（`api_base` 非空；空 base 无处可拉，如未配 URL 的
+    /// `custom`）+ **env 直连**（`env_direct` 给了且该 base 未被某个 auth 条目覆盖）。
+    /// 后者是 `/model` 候选与窗口在 `YUSHAN_API_BASE` 那条路径上的**唯一来源** ——
+    /// 那条路径 `provider` 恒为 `None`，registry 里没有它的名字。
+    ///
     /// 输入在**起屏前**从 registry 摘出，交给后台任务 —— 任务因此不借用 registry，
     /// 与 app 循环的写（[`Self::apply_model_cache`]）不共享任何状态。
-    pub fn fetch_targets(&self) -> Vec<(String, String)> {
-        self.providers
+    pub fn fetch_targets(&self, env_direct: Option<(String, String)>) -> Vec<(String, String)> {
+        let mut targets: Vec<(String, String)> = self
+            .providers
             .iter()
             .filter_map(|p| {
                 self.auth_store
@@ -321,20 +343,27 @@ impl ProviderRegistry {
                     .filter(|e| !e.api_base.is_empty())
                     .map(|e| (e.api_base.clone(), e.api_key.clone()))
             })
-            .collect()
+            .collect();
+        if let Some((base, key)) = env_direct.filter(|(b, _)| !b.is_empty())
+            && !targets
+                .iter()
+                .any(|(b, _)| cache_key(b) == cache_key(&base))
+        {
+            targets.push((base, key));
+        }
+        targets
     }
 
     /// 后台：对**每个已登录 provider** 拉一次 `/v1/models`，返回 `api_base → 目录`
     /// （成功且非空才收进结果；供 [`Self::apply_model_cache`] 并入缓存）。
     ///
     /// **纯网络部分** —— 不触碰 `self`，故可在 TUI 起屏**之后** `rt.spawn` 到后台
-    /// 任务里跑：起屏不再等网络，开屏即用（`/model` 候选先取静态表，目录到手后由
-    /// app 循环刷新视图）。各 provider **并发**拉（`JoinSet`），故总耗时 ≈ 单次超时
-    /// （5s），不随 provider 数线性增长。
+    /// 任务里跑：起屏不再等网络（`/model` 候选在目录到手前只有当前那条模型，到手后
+    /// 由 app 循环刷新视图）。各 provider **并发**拉（`JoinSet`），故总耗时 ≈ 单次
+    /// 超时（5s），不随 provider 数线性增长。
     ///
-    /// **失败一律静默**（超时 / DNS / 401 → 不写缓存，仅落日志）：
-    /// [`Self::models_for_provider`] 会因此回退静态表 —— 网络问题绝不该让 `/model`
-    /// 的候选变空，更不该让启动失败。
+    /// **失败一律静默**（超时 / DNS / 401 → 不写缓存，仅落日志）：那一家在 `/model`
+    /// 里就没有候选（模型名只有目录一个来源）。网络问题不该让启动失败。
     pub async fn fetch_all(targets: Vec<(String, String)>) -> ModelCache {
         let mut cache: ModelCache = HashMap::new();
         let mut set = tokio::task::JoinSet::new();
@@ -348,14 +377,14 @@ impl ProviderRegistry {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((base, FetchModelsResult::Success(models))) => {
-                    // 空目录视同失败：不写缓存 ⇒ `models_for_provider` 回退静态表
-                    // （写进去反而会让候选整体变空）。
+                    // 空目录视同失败：不写缓存（写进去会让候选整体变空，与"没拉到"
+                    // 在行为上等价，但会多占一条无意义的记录）。
                     if !models.is_empty() {
-                        cache.insert(base, models);
+                        cache.insert(cache_key(&base).to_string(), models);
                     }
                 }
-                // 对用户静默（`/model` 照常有静态回退），但**落日志** —— 否则
-                // 「候选怎么只有静态那几条」会成为一个无从排查的现象。
+                // 对用户静默，但**落日志** —— 否则「这家怎么一个候选都没有」
+                // 会成为一个无从排查的现象。
                 Ok((base, FetchModelsResult::AuthError(e))) => {
                     crate::logging::log(&format!("model refresh {base}: auth error: {e}"));
                 }
@@ -376,108 +405,92 @@ impl ProviderRegistry {
         self.model_cache.extend(cache);
     }
 
-    /// 该 provider 的候选模型 id：优先后台拉到的目录，缺失则回退静态表中
-    /// **属于它的**条目（[`Self::known_models_static`] 的 `owned_by` 即 provider 名）。
+    /// 该 provider **拉到的**候选模型 id（未拉到 ⇒ 空）。
     ///
-    /// 唯一消费者：`view::build_view`（`/model` 浮层的候选）。
+    /// 唯一消费者：`view::build_view`（`/model` 浮层的候选）。模型名只有这一个来源 ——
+    /// 拉不到就是没有，**不做静态回退**（写死的名字必然过时，且会与端点真正提供的
+    /// 模型对不上）。
     pub fn models_for_provider(&self, name: &str) -> Vec<String> {
         let base = self
             .auth_store
             .get(name)
-            .map(|e| e.api_base.as_str())
-            .or_else(|| self.find_provider(name).map(|p| p.api_base.as_str()));
-        if let Some(models) = base.and_then(|base| self.model_cache.get(base)) {
-            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
-            if !ids.is_empty() {
-                return ids;
-            }
-        }
-        Self::known_models_static()
-            .into_iter()
-            .filter(|m| m.owned_by.as_deref() == Some(name))
-            .map(|m| m.id)
-            .collect()
+            .map(|e| e.api_base.clone())
+            .or_else(|| self.find_provider(name).map(|p| p.api_base.clone()));
+        base.map(|base| self.models_for_base(&base))
+            .unwrap_or_default()
+    }
+
+    /// 某个 `api_base` 的目录（env 直连没有 provider 名，按 base 取）。
+    pub fn models_for_base(&self, api_base: &str) -> Vec<String> {
+        self.model_cache
+            .get(cache_key(api_base))
+            .map(|models| models.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// 目录里该 model 的上下文窗口（token）。**窗口的第一手来源**
+    /// （`Config::context_window_for` 的 ② 级）。
+    ///
+    /// 遍历所有已拉到的目录：同名 id 出现在两家的目录里时，各家报的窗口本就该一致。
+    /// 目录里没有该 id、或该条目没报窗口 ⇒ `None`（调用方回退默认值）。
+    pub fn catalog_context_window(&self, model: &str) -> Option<usize> {
+        self.model_cache
+            .values()
+            .flatten()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context_window)
     }
 
     /// 哪个 provider 提供该 model —— 跨 provider 选模型时据此切端点
     /// （`capabilities::set_model`）。
     ///
-    /// 先查启动期拉到的目录（api_base → provider 反查），再回退静态表的 `owned_by`。
-    /// 都查不到返回 `None`（调用方**保持当前 provider 不变** —— 手敲的自定义模型名
-    /// 不该把端点带跑）。
+    /// 只认启动期拉到的目录（api_base → provider 反查）。查不到返回 `None`
+    /// （调用方**保持当前 provider 不变** —— 手敲的自定义模型名不该把端点带跑；
+    /// 要显式指定归属就写 `provider/model` 限定名）。
     pub fn provider_for_model(&self, model: &str) -> Option<String> {
         for (base, models) in &self.model_cache {
             if models.iter().any(|m| m.id == model)
                 && let Some(p) = self.providers.iter().find(|p| {
                     self.auth_store
                         .get(&p.name)
-                        .is_some_and(|e| &e.api_base == base)
+                        .is_some_and(|e| cache_key(&e.api_base) == cache_key(base))
                 })
             {
                 return Some(p.name.clone());
             }
         }
-        Self::known_models_static()
-            .into_iter()
-            .find(|m| m.id == model)
-            .and_then(|m| m.owned_by)
-    }
-
-    /// API 不可达时硬编码的回退 models。
-    pub fn known_models_static() -> Vec<ApiModel> {
-        vec![
-            ApiModel {
-                id: "deepseek-chat".into(),
-                owned_by: Some("deepseek".into()),
-            },
-            ApiModel {
-                id: "deepseek-reasoner".into(),
-                owned_by: Some("deepseek".into()),
-            },
-            ApiModel {
-                id: "MiniMax-Text-01".into(),
-                owned_by: Some("minimax".into()),
-            },
-        ]
+        None
     }
 }
 
-/// 内置的 model → context window（token）表。
+/// 目录缓存的键：抹掉尾斜杠，令 `https://x/v1` 与 `https://x/v1/` 命中同一条目。
+fn cache_key(api_base: &str) -> &str {
+    api_base.trim_end_matches('/')
+}
+
+/// 内置的 model → context window（token）兜底表。
 ///
-/// **解析键是 `model`，不是 `provider`**：`ProviderInfo` 每个 provider 只有一个
-/// `default_model`，而同一 provider 下可以切多个模型（DeepSeek 至少
-/// `deepseek-chat` / `deepseek-reasoner`）；且窗口本就是**模型**的属性。
-///
-/// 来源：厂商公开的模型规格。**值会过时** —— 这正是必须保留
-/// `~/.yushan/config.json` 覆盖入口的原因（`Config::context_window` ② 级）。
-///
-/// 未收录的模型（含刻意留空的 MiniMax-Text-01，见下）一律返回 `None`，
-/// 由调用方回退默认值。
+/// **只收录端点的 `/v1/models` 报不出窗口的模型**。窗口的第一手来源是目录
+/// （[`ProviderRegistry::catalog_context_window`]，`Config::context_window_for` 的 ② 级）
+/// —— 厂商自己在目录里报的值永远比这里新，故本表是 ③ 级：只在目录给不出时用。
 ///
 /// | model | window | 依据 |
 /// |---|---|---|
-/// | `deepseek-chat` | 128K | DeepSeek 官方 API 文档（V3.1 起两个模型同为 128K） |
-/// | `deepseek-reasoner` | 128K | 同上 |
 /// | `MiniMax-M3` | 1M | MiniMax 官方 API 文档模型表 |
 /// | `MiniMax-M2.7` | 204,800 | 同上 |
 ///
-/// **刻意未收录**：`MiniMax-Text-01`（本仓库 minimax provider 的 default_model）。
-/// 官方口径是「训练 1M / 推理可达 4M」，两条数字差 4 倍，**API 实际放行哪个无法确证**，
-/// 故不填 —— 宁可回退 128_000（偏保守：提前压缩），也不编造一个可能让上下文溢出的值。
-/// 用该模型的用户请写 `~/.yushan/config.json` 覆盖。
+/// **刻意未收录**：MiniMax 其余模型（如 `MiniMax-Text-01`）。官方口径是「训练 1M /
+/// 推理可达 4M」，两条数字差 4 倍，**API 实际放行哪个无法确证** —— 宁可不填、回退
+/// 128_000（偏保守：提前压缩），也不编造一个可能让上下文溢出的值。用这些模型的用户
+/// 请写 `~/.yushan/config.json` 覆盖，或让端点自己在目录里报窗口。
 ///
-/// 另外收录 M3 / M2.7 还有一个工程理由：DeepSeek 两个模型都是 128K，
-/// 恰好等于兜底默认值，若表里全是 128K，「② 内置表」这一级就**测不出来**。
-const KNOWN_MODEL_WINDOWS: &[(&str, usize)] = &[
-    ("deepseek-chat", 128_000),
-    ("deepseek-reasoner", 128_000),
-    ("MiniMax-M3", 1_000_000),
-    ("MiniMax-M2.7", 204_800),
-];
+/// 表中值**刻意不取 128_000**：那恰好是兜底默认值，若表里全是它，这一级就**测不出来**。
+const KNOWN_MODEL_WINDOWS: &[(&str, usize)] =
+    &[("MiniMax-M3", 1_000_000), ("MiniMax-M2.7", 204_800)];
 
-/// 查内置表。未知 model 返回 `None`（调用方回退默认值）。
+/// 查兜底表。未知 model 返回 `None`（调用方回退默认值）。
 ///
-/// 生产调用点：`Config::context_window` 的 ② 级（`config.rs`）。
+/// 生产调用点：`Config::context_window_for` 的 ③ 级（`config.rs`）。
 pub fn builtin_context_window(model: &str) -> Option<usize> {
     KNOWN_MODEL_WINDOWS
         .iter()
@@ -640,26 +653,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_known_models_fallback() {
-        let models = ProviderRegistry::known_models_static();
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0].id, "deepseek-chat");
-        assert_eq!(models[0].owned_by.as_deref(), Some("deepseek"));
-        assert_eq!(models[1].id, "deepseek-reasoner");
-        assert_eq!(models[1].owned_by.as_deref(), Some("deepseek"));
-        assert_eq!(models[2].id, "MiniMax-Text-01");
-        assert_eq!(models[2].owned_by.as_deref(), Some("minimax"));
-    }
-
-    /// opencode-go 的内置元数据：网关 base、默认模型（**必须是 chat/completions
-    /// 协议的模型** —— 适配器只会打那个端点）与会话头。
+    /// opencode-go 的内置元数据：网关 base 与会话头（**模型名不在这里** —— 它只来自
+    /// 网关的 `/v1/models`）。
     #[test]
     fn test_opencode_go_provider_metadata() {
         let reg = ProviderRegistry::new();
         let provider = reg.find_provider("opencode-go").expect("已注册");
         assert_eq!(provider.api_base, "https://opencode.ai/zen/go/v1");
-        assert_eq!(provider.default_model, "deepseek-flash");
         assert_eq!(
             provider.session_header.as_deref(),
             Some(OPENCODE_SESSION_HEADER)
@@ -717,18 +717,21 @@ mod tests {
         assert!(session_id().starts_with("ys-"));
     }
 
+    /// 兜底表只覆盖**目录报不出窗口**的模型（MiniMax 那几个）。DeepSeek 的窗口由
+    /// 目录自己报（`catalog_context_window`），表里**不该**再有它的名字 ——
+    /// 那正是「写死的名字必然过时」的现场。
     #[test]
     fn test_builtin_context_window_known() {
-        assert_eq!(builtin_context_window("deepseek-chat"), Some(128_000));
-        assert_eq!(builtin_context_window("deepseek-reasoner"), Some(128_000));
         assert_eq!(builtin_context_window("MiniMax-M3"), Some(1_000_000));
         assert_eq!(builtin_context_window("MiniMax-M2.7"), Some(204_800));
+        assert_eq!(builtin_context_window("deepseek-chat"), None);
+        assert_eq!(builtin_context_window("deepseek-flash"), None);
     }
 
     /// 未知 model → `None`（由调用方回退默认值）。
     ///
-    /// 明列 `MiniMax-Text-01`：它是本仓库 minimax provider 的 default_model，
-    /// 但官方「训练 1M / 推理 4M」两条口径矛盾，**刻意不收录**（见表注释）。
+    /// 明列 `MiniMax-Text-01`：官方「训练 1M / 推理 4M」两条口径矛盾，**刻意不收录**
+    /// （见表注释）—— 它到底多大只能由端点自己报，或由用户写 config.json。
     #[test]
     fn test_builtin_context_window_unknown_is_none() {
         assert_eq!(builtin_context_window("MiniMax-Text-01"), None);
@@ -783,73 +786,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `models_for_provider`：**优先启动期拉到的目录**，缺失才回退静态表 ——
-    /// 且回退只给**该 provider 的**条目（不再把 deepseek 的名字塞给 minimax）。
+    /// `models_for_provider`：**只**返回拉到的目录，未拉到就是空 —— 不再有静态回退。
     ///
-    /// 变异：把 cache 分支删掉 → 第二条断言变红（拿到的仍是静态的 deepseek-chat）。
+    /// 变异：把 `models_for_base` 换成读静态表 ⇒ 第一条断言（未拉取 ⇒ 空）变红。
     #[test]
-    fn test_models_for_provider_prefers_fetched_catalog_over_static() {
+    fn test_models_for_provider_is_catalog_only() {
         let mut reg = ProviderRegistry::new();
         reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
 
-        // 未拉取 → 静态表中属于 deepseek 的那两条；minimax 的名字不得混进来。
-        assert_eq!(
-            reg.models_for_provider("deepseek"),
-            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
-        );
-        assert!(
-            !reg.models_for_provider("deepseek")
-                .contains(&"MiniMax-Text-01".to_string()),
-            "静态回退必须按 owned_by 过滤，不得跨 provider"
-        );
+        // 未拉取 → 空。写死的名字不再充数（它们端点可能早就不认了）。
+        assert!(reg.models_for_provider("deepseek").is_empty());
+        assert!(reg.models_for_provider("minimax").is_empty());
 
-        // 拉到了目录 → 用目录（静态表不再参与）
-        reg.seed_cached_models("https://api.deepseek.com", &["deepseek-v4"]);
+        // 拉到了目录 → 按 auth 条目的 base 取回该 provider 的目录
+        reg.seed_cached_models("https://api.deepseek.com", &["deepseek-flash"]);
         assert_eq!(
             reg.models_for_provider("deepseek"),
-            vec!["deepseek-v4".to_string()]
+            vec!["deepseek-flash".to_string()]
         );
+        // 目录不跨 provider 串味
+        assert!(reg.models_for_provider("minimax").is_empty());
 
-        // 空目录视同没拉到 → 回退静态表（`fetch_all` 不写空目录，这里直接构造）
-        reg.seed_cached_models("https://api.deepseek.com", &[]);
+        // 尾斜杠不影响命中（缓存键抹尾斜杠）
         assert_eq!(
-            reg.models_for_provider("deepseek"),
-            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
+            reg.models_for_base("https://api.deepseek.com/"),
+            vec!["deepseek-flash".to_string()]
         );
     }
 
-    /// `provider_for_model`：目录（经 auth 条目把 base 绑回 provider）优先，
-    /// 回退静态表的 `owned_by`；两处都没有 → `None`（调用方保持当前 provider）。
+    /// `provider_for_model`：只认目录（经 auth 条目把 base 绑回 provider）；查不到 →
+    /// `None`（调用方保持当前 provider，不猜端点）。
     #[test]
-    fn test_provider_for_model_resolves_catalog_then_static() {
+    fn test_provider_for_model_resolves_from_catalog() {
         let mut reg = ProviderRegistry::new();
         reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
 
-        // 静态表兜底
         assert_eq!(
-            reg.provider_for_model("deepseek-chat").as_deref(),
-            Some("deepseek")
+            reg.provider_for_model("deepseek-chat"),
+            None,
+            "没有目录 ⇒ None"
         );
-        assert_eq!(
-            reg.provider_for_model("MiniMax-Text-01").as_deref(),
-            Some("minimax")
-        );
-        assert_eq!(reg.provider_for_model("gpt-4o"), None, "两处都没有 → None");
+        assert_eq!(reg.provider_for_model("gpt-4o"), None);
 
-        // 目录优先：新模型名只存在于拉到的目录里
         reg.auth_store.insert(
             "minimax".into(),
             AuthEntry {
                 api_base: "https://api.minimax.chat/v1".into(),
                 api_key: "sk-mm".into(),
-                model: "MiniMax-Text-01".into(),
+                model: "MiniMax-M3".into(),
             },
         );
         reg.seed_cached_models("https://api.minimax.chat/v1", &["MiniMax-M3"]);
         assert_eq!(
             reg.provider_for_model("MiniMax-M3").as_deref(),
             Some("minimax"),
-            "目录里的新模型应能反查到 provider"
+            "目录里的模型应能反查到 provider"
         );
+        // 尾斜杠经缓存键归一化，不影响反查
+        reg.auth_store.get_mut("minimax").unwrap().api_base = "https://api.minimax.chat/v1/".into();
+        assert_eq!(
+            reg.provider_for_model("MiniMax-M3").as_deref(),
+            Some("minimax")
+        );
+    }
+
+    /// `catalog_context_window`：窗口取自目录里厂商自己报的值；没报 / 没这个 id ⇒ None。
+    #[test]
+    fn test_catalog_context_window() {
+        let mut reg = ProviderRegistry::new();
+        reg.seed_cached_catalog(
+            "https://api.deepseek.com",
+            &[
+                ApiModel {
+                    id: "deepseek-flash".into(),
+                    owned_by: Some("deepseek".into()),
+                    name: Some("DeepSeek-V4.1-Flash".into()),
+                    context_window: Some(1_048_576),
+                },
+                ApiModel {
+                    id: "no-window".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+            ],
+        );
+        assert_eq!(
+            reg.catalog_context_window("deepseek-flash"),
+            Some(1_048_576)
+        );
+        assert_eq!(reg.catalog_context_window("no-window"), None);
+        assert_eq!(reg.catalog_context_window("not-in-catalog"), None);
+    }
+
+    /// `fetch_targets`：已登录 provider + **env 直连**端点；env 的 base 已被某个
+    /// auth 条目覆盖时**不重复**（同一端点只拉一次）。
+    #[test]
+    fn test_fetch_targets_includes_env_direct_without_duplicating() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+        assert!(reg.fetch_targets(None).is_empty());
+
+        // env 直连：registry 里没有它的名字，也要拉 —— 否则那条路径的 `/model` 无候选。
+        let env = Some(("https://api.deepseek.com".to_string(), "sk-env".to_string()));
+        assert_eq!(
+            reg.fetch_targets(env.clone()),
+            vec![("https://api.deepseek.com".to_string(), "sk-env".to_string())]
+        );
+
+        // 同一 base 已有 auth 条目（尾斜杠视为同一个端点）⇒ 不再重复拉。
+        reg.auth_store.insert(
+            "deepseek".to_string(),
+            AuthEntry {
+                api_base: "https://api.deepseek.com/".into(),
+                api_key: "sk-auth".into(),
+                model: "deepseek-flash".into(),
+            },
+        );
+        let targets = reg.fetch_targets(env);
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].1, "sk-auth", "auth 条目的凭证优先");
     }
 }

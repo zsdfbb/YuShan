@@ -678,6 +678,13 @@ opencode-go 的**月度额度已耗尽**（本实验总共跑了 10 次真实会
   所以「删禁令是否安全」**没有测过**。故本轮**不动** `bash.rs` 的描述 ——
   现行描述里的 `do not prefix every command with cd` / `use absolute paths` /
   `or chain cd dir && cmd …` 三处命令式内容**保留**。若要删，需另做一轮实验。
+
+  > **后续（2026-10-14）：P1′ 已落地。** 三处命令式内容已删（`bash.rs:94-97`），只留事实
+  > ——跑在 `sh -c`、每次新 shell、相对路径的解析根、`cd` 不跨调用。描述里那处交叉引用
+  > 同时改指「system prompt **开头**的那行 `Current working directory`」（上面草案写的是
+  > 「末尾」，是 cwd 前置之前的位置，已过期）。**效果仍未测**（同「零数据」）：
+  > `spec_description_states_the_cwd_contract` 只新增一条「不得出现禁令/逃生口」的断言
+  > 守住它，cd 占比是否因此变化没有对照数据。
 - P2 的「cwd 那行补事实」已被 `cwd_section` 的吸收（同一条改动）。
 - P4（workspace 不存在 ⇒ 明确报错）、P5（bash 增加 `cwd` 参数）、P7（冗余 cd 的**事实**回显）：
   都**未做**。P4/P5 仍是「不依赖模型配合」的那一半，价值最高，建议下一轮先做。

@@ -131,13 +131,19 @@ build_model()                  → 使用 current_compat 构建
 Agent.set_model()
 ```
 
-**/model（无参数）：**
+**/model（无参数）—— 已按 as-built 修订（见 `docs/design-final/coding-agent-tui.md` M4/M9/M20）：**
 ```
-registry.available_models(base, key) → 先查缓存，miss 则 fetch，失败 fallback known_models()
-构建标签列表：当前模型标记 ✓，按 provider 过滤
-inquire::Select → 选择
-Config 设置 model → build_model() → Agent.set_model()
+registry.models_for_provider(每个已登录 provider) → 优先后台拉到的 /v1/models 目录，缺失回退静态表
+build_view：候选 = 各 provider 并集，**按 (provider, model) 去重**（同名 id 各占一行）+ 当前正在跑的模型
+浮层：每条显示 `provider/model`（归属未知则裸名，当前那条缀 `[current]`），**可输入筛选**
+Prompter::select → 选中项的显示串 → 用 ModelEntry::label 反解回条目
+Request::SetModel { model, provider }  → 归属显式带上，**不再反查**
+capabilities::set_model → 归属不同则连 api_base/api_key/provider 一起切 → build_model() → Wiring::set_model()
 ```
+
+> 原稿写的「`registry.available_models(base, key)`」「按 provider 过滤」「`inquire::Select`」
+> 都不是 as-built：候选**不按 provider 过滤**（是并集，靠标签区分），交互库也早已自实现
+> （`ys-tui-coding/src/run.rs` 的模态浮层，设计 §3 作废了外部库）。
 
 **/logout：**
 ```

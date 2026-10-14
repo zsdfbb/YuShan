@@ -393,7 +393,15 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
         }
     }
 
-    /// 选项选择器：↑↓ 移动（回卷）、Enter 确认、Esc 取消。
+    /// 选项选择器：**常驻筛选输入框** + ↑↓ 移动（回卷）、Enter 确认、Esc 取消。
+    ///
+    /// 一打开就能直接敲字筛选（大小写不敏感子串，见 [`filter_indices`]）—— 空格、`/`、
+    /// 字母数字都进筛选框，故**不需要**模式切换键，也不会与 ↑↓/Enter 抢语义。
+    /// 空查询时 `filter_indices` 返回全体 ⇒ 行为与「纯列表」逐字一致；四个模态命令
+    /// （provider / model / skill / session）共用本函数，故筛选对它们一并生效。
+    ///
+    /// **Enter 在无匹配时不动作**（既不确认也不取消）：常驻输入框下，敲到一半误按
+    /// Enter 不该把浮层关掉；取消的唯一出口是 Esc。
     fn select_modal(
         &mut self,
         prompt: &str,
@@ -403,6 +411,7 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
         if options.is_empty() {
             return Err(PromptError::Other(format!("{prompt}：没有可选项")));
         }
+        let mut query = InputBuffer::new();
         let mut selected = 0usize;
         loop {
             self.drain_outbound();
@@ -410,6 +419,11 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                 // app 线程没了 —— 问谁都没意义
                 return Err(PromptError::Cancelled);
             }
+            // 每帧现算：查询变了、候选被 app 侧刷过，都自动跟上。
+            // `selected` 必须跟着收敛 —— 它记的是**过滤后**的下标。
+            let filtered = filter_indices(options, &query.text);
+            selected = clamp_selection(selected, filtered.len());
+
             // 借位拆开：`terminal.draw(|f| …)` 的闭包要同时拿 app 与 terminal
             let app = &mut *self.app;
             let terminal = &mut *self.terminal;
@@ -420,7 +434,9 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                     draw::Modal::Select {
                         prompt,
                         options,
+                        filtered: &filtered,
                         selected,
+                        query: &query,
                         page_size,
                     },
                 )
@@ -429,17 +445,28 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
             if !crossterm::event::poll(POLL_INTERVAL)? {
                 continue;
             }
-            let Event::Key(key) = crossterm::event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Up => selected = modal_move(selected, options.len(), true),
-                KeyCode::Down => selected = modal_move(selected, options.len(), false),
-                KeyCode::Enter => return Ok(options[selected].clone()),
-                KeyCode::Esc => return Err(PromptError::Cancelled),
+            match crossterm::event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Up => selected = modal_move(selected, filtered.len(), true),
+                    KeyCode::Down => selected = modal_move(selected, filtered.len(), false),
+                    KeyCode::Enter if !filtered.is_empty() => {
+                        return Ok(options[filtered[selected]].clone());
+                    }
+                    KeyCode::Enter => {}
+                    KeyCode::Esc => return Err(PromptError::Cancelled),
+                    KeyCode::Backspace => query.backspace(),
+                    KeyCode::Delete => query.delete_forward(),
+                    KeyCode::Left => query.cursor_left(),
+                    KeyCode::Right => query.cursor_right(),
+                    KeyCode::Home => query.cursor_home(),
+                    KeyCode::End => query.cursor_end(),
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.insert_char(c)
+                    }
+                    _ => {}
+                },
+                // 粘贴进来的多行也只是一段筛选串（与 `text_modal` 同规，不与 Enter 混淆）
+                Event::Paste(text) => query.insert_str(&text),
                 _ => {}
             }
         }
@@ -632,6 +659,47 @@ fn modal_move(selected: usize, len: usize, up: bool) -> usize {
     }
 }
 
+/// 模态选择器的**筛选**：返回匹配项在 `options` 里的下标（保序）。空 `query` ⇒ 全选。
+///
+/// 匹配对象是**整条候选串**（`provider/model`、`/command  — description`、会话标签…），
+/// 大小写不敏感、**子串**匹配。故输 `deepseek` 会把 provider 前缀与模型名一起筛
+/// （同名跨 provider 的几条都留下），再输 `deepseek/` 就精确到官方那家。
+///
+/// 抽成自由函数的理由与 [`modal_move`] 相同：模态循环要真终端，只能靠纯函数把语义
+/// 钉进单测。`to_lowercase` / `contains` 都在 char 边界工作，CJK / emoji 不会 panic
+/// （与 `InputBuffer` 的 char 纪律一致）。
+///
+/// 变异：去掉 `query.to_lowercase()` —— 大写查询（`CHAT`）与候选（`chat`）不再匹配
+/// ⇒ `test_filter_indices_case_insensitive_substring` 变红。
+fn filter_indices(options: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..options.len()).collect();
+    }
+    let needle = query.to_lowercase();
+    options
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// 筛选结果变化后把高亮收敛进新范围 —— **防越界**。
+///
+/// 查询每敲一个字符，候选就少一批；`selected` 是从**过滤前**继承下来的下标，
+/// 不收敛的话 `filtered[selected]` 会在下一帧 panic（`len` 从 8 变 1 而 `selected`
+/// 仍是 7）。收敛到**最后一项**而不是 0：删字符（放宽筛选）时高亮停在附近，
+/// 不会跳回顶部。
+///
+/// 变异：直接返回 `selected` ⇒ `test_clamp_selection_converges` 变红。
+fn clamp_selection(selected: usize, filtered_len: usize) -> usize {
+    if filtered_len == 0 {
+        0
+    } else {
+        selected.min(filtered_len - 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +723,63 @@ mod tests {
     fn test_modal_move_single_option_stays() {
         assert_eq!(modal_move(0, 1, true), 0);
         assert_eq!(modal_move(0, 1, false), 0);
+    }
+
+    fn opts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 筛选：**不区分大小写**的子串匹配，空查询 = 全选，无命中 = 空。
+    ///
+    /// 变异：`filter_indices` 里去掉 `to_lowercase()` ⇒ 大写查询匹配不上 ⇒ 变红。
+    #[test]
+    fn test_filter_indices_case_insensitive_substring() {
+        let o = opts(&["deepseek/deepseek-chat", "opencode-go/FLASH", "minimax/MiniMax-M3"]);
+
+        assert_eq!(filter_indices(&o, ""), vec![0, 1, 2], "空查询 = 全选（保序）");
+        assert_eq!(filter_indices(&o, "opencode"), vec![1]);
+        assert_eq!(filter_indices(&o, "CHAT"), vec![0], "大小写不敏感");
+        assert_eq!(filter_indices(&o, "flash"), vec![1], "候选里是大写也命中");
+        assert_eq!(filter_indices(&o, "mini"), vec![2], "子串而非前缀");
+        assert_eq!(filter_indices(&o, "zzz"), Vec::<usize>::new(), "无命中");
+    }
+
+    /// **匹配对象是整条候选串** —— 故 provider 前缀与模型名都能筛：
+    /// 输 `deepseek` 留下两条（官方 + 网关转售的），再输 `deepseek/` 精确到官方那家。
+    /// 这正是「筛出 provider」这条需求的落点。
+    #[test]
+    fn test_filter_indices_matches_provider_prefix() {
+        let o = opts(&["deepseek/deepseek-chat", "opencode-go/deepseek-flash"]);
+
+        assert_eq!(
+            filter_indices(&o, "deepseek"),
+            vec![0, 1],
+            "provider 名与模型名一起筛"
+        );
+        assert_eq!(filter_indices(&o, "deepseek/"), vec![0], "加了斜杠即精确到官方");
+    }
+
+    /// CJK / emoji 候选不 panic 且能命中（`to_lowercase`/`contains` 按 char 边界工作）。
+    ///
+    /// 变异：把匹配换成字节切片（`as_bytes().windows(..)`）⇒ trait 不符或命中集错 ⇒ 变红。
+    #[test]
+    fn test_filter_indices_cjk_and_symbols() {
+        let o = opts(&["/commit  — 生成一条提交信息", "🔧 tools"]);
+
+        assert_eq!(filter_indices(&o, "提交"), vec![0]);
+        assert_eq!(filter_indices(&o, "🔧"), vec![1]);
+        assert_eq!(filter_indices(&o, "生成"), vec![0]);
+    }
+
+    /// 高亮收敛：查询收窄后 `selected` 必须落进新范围（否则 `filtered[selected]` 越界）。
+    ///
+    /// 变异：`clamp_selection` 直接返回 `selected` ⇒ 上层 `filtered[selected]` panic。
+    #[test]
+    fn test_clamp_selection_converges() {
+        assert_eq!(clamp_selection(5, 3), 2, "收窄到最后一顶");
+        assert_eq!(clamp_selection(2, 5), 2, "范围内不动");
+        assert_eq!(clamp_selection(0, 0), 0, "无命中不得 panic");
+        assert_eq!(clamp_selection(9, 1), 0);
     }
 
     /// 退出回放：逐行 `\r\x1b[2K` 清行 + 行间 `\r\n` + 末尾一个 `\r\n`，

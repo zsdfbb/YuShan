@@ -53,4 +53,4 @@ pub use input::InputBuffer;
 pub use prompter::{FakePrompter, PromptError, Prompter};
 pub use run::{TuiError, run};
 pub use transcript::{TranscriptLine, replay_lines, summarize_tool_args};
-pub use view::{CodingView, ProviderEntry, SkillEntry};
+pub use view::{CodingView, ModelEntry, ProviderEntry, SkillEntry};

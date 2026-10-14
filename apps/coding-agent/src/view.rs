@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use ys_runtime::Agent;
-use ys_tui_coding::{CodingView, ProviderEntry};
+use ys_tui_coding::{CodingView, ModelEntry, ProviderEntry};
 
 use crate::config::Config;
 use crate::provider::ProviderRegistry;
@@ -34,24 +34,26 @@ pub fn build_view(
 ) -> CodingView {
     let logged_in = registry.logged_in_providers();
 
-    // `/model` 无参浮层的候选 = **所有已登录 provider** 的模型并集。
+    // `/model` 无参浮层的候选 = **所有已登录 provider** 的模型并集，每条带自己的归属。
     //
     // 每个 provider 的条目：优先后台拉到的 `/v1/models` 目录（`apply_model_cache`
     // 写入的缓存），缺失则回退静态表中属于它的部分（`known_models_static` 的
-    // `owned_by` 即 provider 名）。**未登录任何 provider** 时退回静态全表 —— 那时
-    // 列出的模型本就点不动（无凭证），保留只为 `/model` 仍可浏览。
-    let mut available_models: Vec<String> = Vec::new();
+    // `owned_by` 即 provider 名）。**未登录任何 provider** 时退回静态全表（`owned_by`
+    // 就是它的归属）—— 那时列出的模型本就点不动（无凭证），保留只为 `/model` 仍可浏览。
+    //
+    // **去重键是 `(provider, model)` 而非 `model`**：两个 provider 的目录里可能有**逐字
+    // 同名**的 id（网关常转售别家品牌的模型名，如 opencode-go 的 `deepseek-*`），按 id
+    // 去重会把其中一条**吃掉** —— 用户既看不到它、也选不到它。同名不同源各占一行，
+    // 由 label 的 provider 前缀区分。
+    let mut available_models: Vec<ModelEntry> = Vec::new();
     if logged_in.is_empty() {
-        available_models = ProviderRegistry::known_models_static()
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
+        for m in ProviderRegistry::known_models_static() {
+            push_model(&mut available_models, m.owned_by, m.id, false);
+        }
     } else {
         for name in &logged_in {
             for id in registry.models_for_provider(name) {
-                if !available_models.contains(&id) {
-                    available_models.push(id);
-                }
+                push_model(&mut available_models, Some(name.clone()), id, false);
             }
         }
     }
@@ -61,11 +63,14 @@ pub fn build_view(
     // 取据是「**接线器实际持有的 model**」+ `config.model`，而**不是** auth entry
     // 里的 `model` —— 后者是 `/login` 当时的快照，`/model X` 只改 config/wiring、
     // 从不回头改 auth entry（拿它当「当前模型」会把正在跑的那个漏掉）。
+    //
+    // 归属取 `cfg.provider`（**权威**）——接线器里那个 model 就是用它这套凭证建出来的。
+    // 刻意**不**用 `provider_for_model` 反查：它遍历 `model_cache`（`HashMap`，迭代顺序
+    // 不确定），同名 id 会反查到任一家。
     let running = wiring.model_id().map(String::from);
-    for m in [running, Some(cfg.model.clone())].into_iter().flatten() {
-        if !m.is_empty() && !available_models.contains(&m) {
-            available_models.push(m);
-        }
+    for m in [running.clone(), Some(cfg.model.clone())].into_iter().flatten() {
+        let current = running.as_deref() == Some(m.as_str());
+        push_model(&mut available_models, cfg.provider.clone(), m, current);
     }
 
     CodingView {
@@ -125,6 +130,31 @@ pub fn build_view(
     }
 }
 
+/// 往 `/model` 候选里加一条：按 **`(provider, model)`** 判重。
+///
+/// 重复时**只升 `current` 标记**、不新增行 —— 「当前正在跑的模型」与某个 provider
+/// 目录里的同一条会被走到两次，那时它应当只有一行、且带上标记。
+///
+/// 变异：把判重换成只比 `model` ⇒ 同名跨 provider 的两条被合成一条
+/// （`test_build_view_same_model_id_under_two_providers_gets_two_rows` 变红）。
+fn push_model(out: &mut Vec<ModelEntry>, provider: Option<String>, model: String, current: bool) {
+    if model.is_empty() {
+        return;
+    }
+    if let Some(existing) = out
+        .iter_mut()
+        .find(|e| e.provider == provider && e.model == model)
+    {
+        existing.current |= current;
+        return;
+    }
+    out.push(ModelEntry {
+        provider,
+        model,
+        current,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +163,14 @@ mod tests {
 
     use ys_event::CollectingSink;
     use ys_model::MockModel;
+
+    /// 候选里是否含该模型 id。
+    ///
+    /// 断言多数只关心「这个 id 在不在」；**归属**另有专门用例
+    /// （`test_build_view_same_model_id_under_two_providers_gets_two_rows`）。
+    fn has_model(view: &CodingView, id: &str) -> bool {
+        view.available_models.iter().any(|c| c.model == id)
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -194,7 +232,7 @@ mod tests {
             !view.provider_needs_api_base_url("deepseek"),
             "deepseek 有内置 base → /login 不该多问一句"
         );
-        assert!(view.available_models.contains(&"deepseek-chat".to_string()));
+        assert!(has_model(&view, "deepseek-chat"));
         assert_eq!(view.turn_count, 0);
         assert_eq!(view.message_count, 0);
         assert!(view.session_path.is_none(), "一次性会话无文件");
@@ -292,8 +330,7 @@ mod tests {
         );
 
         assert!(
-            view.available_models
-                .contains(&"deepseek-reasoner".to_string()),
+            has_model(&view, "deepseek-reasoner"),
             "绑定的 auth model 应在选择器里：{:?}",
             view.available_models
         );
@@ -359,7 +396,7 @@ mod tests {
         );
 
         assert!(
-            view.available_models.contains(&"MiniMax-M3".to_string()),
+            has_model(&view, "MiniMax-M3"),
             "正在跑的模型必须在候选里：{:?}",
             view.available_models
         );
@@ -426,16 +463,163 @@ mod tests {
 
         for expected in ["deepseek-v4", "MiniMax-M3", "MiniMax-M2.7"] {
             assert!(
-                view.available_models.contains(&expected.to_string()),
+                has_model(&view, expected),
                 "候选里缺 `{expected}`（应含所有已登录 provider 的目录）：{:?}",
                 view.available_models
             );
         }
         // 未拉到时才回退静态表；这里两个 provider 都拉到了，故不该混进静态条目。
         assert!(
-            !view.available_models.contains(&"deepseek-chat".to_string()),
+            !has_model(&view, "deepseek-chat"),
             "有目录时不得再掺静态条目：{:?}",
             view.available_models
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **本需求的动机场景**：两个 provider 的目录里出现**逐字同名**的 id
+    /// （网关转售别家品牌的模型名时的真实形态 —— 如 opencode-go 目录里的 `deepseek-*`）。
+    ///
+    /// 候选必须**各占一行**：靠 label 的 provider 前缀区分，否则其中一条既看不到也选不到。
+    /// 且归属由条目自带，选中后不必再靠 `provider_for_model` 猜（那会遍历 `HashMap`，
+    /// 顺序不确定 ⇒ 可能把端点静默切到错的一家）。
+    ///
+    /// 变异：把 `push_model` 的判重键改回只比 `model` ⇒ 只剩一行 ⇒ 本用例变红
+    /// （这正是改动前 `build_view` 的旧行为：`available_models.contains(&id)`）。
+    #[tokio::test]
+    async fn test_build_view_same_model_id_under_two_providers_gets_two_rows() {
+        use crate::provider::AuthEntry;
+
+        let dir = temp_dir("same_id");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.provider = Some("deepseek".into());
+        cfg.model = "shared-flash".into();
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        for (name, base) in [
+            ("deepseek", "https://api.deepseek.com"),
+            ("opencode-go", "https://opencode.ai/zen/go/v1"),
+        ] {
+            cfg.registry
+                .save_auth(
+                    name,
+                    &AuthEntry {
+                        api_base: base.into(),
+                        api_key: format!("sk-{name}"),
+                        model: "shared-flash".into(),
+                    },
+                )
+                .unwrap();
+        }
+        // **同一个 id 挂在两个 base 下。**
+        cfg.registry
+            .seed_cached_models("https://api.deepseek.com", &["shared-flash"]);
+        cfg.registry
+            .seed_cached_models("https://opencode.ai/zen/go/v1", &["shared-flash"]);
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::persistent_new(
+            Some(Box::new(MockModel::new("shared-flash"))),
+            Box::new(CollectingSink::new()),
+            dir.join("sessions"),
+        )
+        .await
+        .unwrap();
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        let rows: Vec<_> = view
+            .available_models
+            .iter()
+            .filter(|c| c.model == "shared-flash")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "同名跨 provider 必须各占一行，否则有一条选不到：{:?}",
+            view.available_models
+        );
+        let providers: Vec<&str> = rows.iter().filter_map(|c| c.provider.as_deref()).collect();
+        for expected in ["deepseek", "opencode-go"] {
+            assert!(
+                providers.contains(&expected),
+                "缺 provider `{expected}`：{providers:?}"
+            );
+        }
+        // 「正在跑的那条」与目录里的同一条是**同一行**（不新增），且标记只落在它身上。
+        let current: Vec<&ModelEntry> = view
+            .available_models
+            .iter()
+            .filter(|c| c.current)
+            .collect();
+        assert_eq!(current.len(), 1, "current 只该有一条：{current:?}");
+        assert_eq!(current[0].provider.as_deref(), Some("deepseek"));
+        assert!(
+            current[0].label().ends_with(" [current]"),
+            "label 须带标记：{}",
+            current[0].label()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归属未知的模型（env 直连 / 目录里没有的手敲名）：`provider == None`，
+    /// label 退化为裸模型名 —— app 侧据此走反查（既有语义）。
+    ///
+    /// 变异：把 `push_model(…, cfg.provider.clone(), …)` 改成用 `provider_for_model`
+    /// 反查 ⇒ 目录里的 `my-local-model` 若恰好挂别家就会被错标 ⇒ 「provider == None」变红。
+    #[tokio::test]
+    async fn test_build_view_env_direct_running_model_has_no_provider() {
+        let dir = temp_dir("no_provider");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.provider = None;
+        cfg.model = "my-local-model".into();
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::persistent_new(
+            Some(Box::new(MockModel::new("my-local-model"))),
+            Box::new(CollectingSink::new()),
+            dir.join("sessions"),
+        )
+        .await
+        .unwrap();
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        let row = view
+            .available_models
+            .iter()
+            .find(|c| c.model == "my-local-model")
+            .expect("正在跑的模型必须在候选里");
+        assert_eq!(row.provider, None, "无 cfg.provider ⇒ 归属未知");
+        assert_eq!(
+            row.label(),
+            "my-local-model [current]",
+            "退化裸名（无 provider 前缀），正在跑故带标记"
+        );
+        assert!(
+            !row.label().contains('/'),
+            "无归属不得伪造 provider 前缀：{}",
+            row.label()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

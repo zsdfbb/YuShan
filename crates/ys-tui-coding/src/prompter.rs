@@ -21,7 +21,7 @@ use ys_protocol::{Request, SessionSummary};
 
 use crate::commands::{PROMPT_PAGE_SIZE, PromptKind};
 use crate::completion::{selectable_skills, skill_label};
-use crate::view::CodingView;
+use crate::view::{CodingView, ModelEntry};
 
 /// 一次问答的失败原因。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,16 +124,31 @@ pub fn resolve_prompt(
                 api_base,
             }))
         }
+        // 选模型 → `SetModel { model, provider }`（**带上归属**，见下）。
+        //
+        // 同 [`PickSkill`](Self::PickSkill)：`Prompter::select` 只回传**显示串**，
+        // 故用同一个 [`ModelEntry::label`] 反解回条目 —— 显示串必须唯一可辨，
+        // 这正是 `provider/model` 前缀的第二个用途（第一个是给用户看）。反解出
+        // provider 后再送进协议：app 侧因此**不必**从模型名猜归属（猜会猜错：
+        // 两个 provider 的目录里可能有逐字同名的 id）。
         PromptKind::PickModel => {
-            let model = prompter.select(
-                "Select model",
-                view.available_models.clone(),
-                PROMPT_PAGE_SIZE,
-            )?;
-            if model.trim().is_empty() {
+            let labels: Vec<String> = view.available_models.iter().map(ModelEntry::label).collect();
+            let picked = prompter.select("Select model", labels.clone(), PROMPT_PAGE_SIZE)?;
+            // 反解不出 ⇒ 视图在问答期间变了这类不可能情形：当作取消，什么都不改。
+            let Some(entry) = view
+                .available_models
+                .iter()
+                .find(|e| e.label() == picked)
+            else {
+                return Err(PromptError::Cancelled);
+            };
+            if entry.model.trim().is_empty() {
                 return Err(PromptError::Cancelled);
             }
-            Ok(PromptOutcome::Request(Request::SetModel { model }))
+            Ok(PromptOutcome::Request(Request::SetModel {
+                model: entry.model.clone(),
+                provider: entry.provider.clone(),
+            }))
         }
         // 选 skill → 回填 `/<command> `（**不发 Request**）。
         //
@@ -339,13 +354,24 @@ mod tests {
 
     /// 视图里的 provider **都有内置 base**（deepseek / minimax 这类）—— `/login`
     /// 不该多问 URL。
+    ///
+    /// 模型候选一律挂在**第一个** provider 名下（`provider/model` 标签要能反解，
+    /// 故归属必须确定）。
     fn view_with(providers: &[&str], models: &[&str]) -> CodingView {
+        let owner = providers.first().map(|n| n.to_string());
         CodingView {
             providers: providers
                 .iter()
                 .map(|n| provider(n, "https://builtin.example.com"))
                 .collect(),
-            available_models: models.iter().map(|s| s.to_string()).collect(),
+            available_models: models
+                .iter()
+                .map(|s| ModelEntry {
+                    provider: owner.clone(),
+                    model: s.to_string(),
+                    current: false,
+                })
+                .collect(),
             ..CodingView::for_test()
         }
     }
@@ -561,21 +587,51 @@ mod tests {
     // /model 无参 → 浮层
     // -----------------------------------------------------------------------
 
+    /// 浮层选中 ⇒ `SetModel { model, provider }`：**model 字段必须是裸模型名**，
+    /// provider 单独带出 —— 两者都钉住「显示串（`provider/model`）→ 条目」的反解两端。
+    ///
+    /// 变异：把 `model: entry.model` 换回 `model: picked`（显示串）⇒ model 字段带上
+    /// `deepseek/` 前缀 ⇒ 本用例变红；丢掉 `provider` ⇒ 同样变红。
     #[test]
     fn test_pick_model_selects_from_view_models() {
         let view = view_with(&["deepseek"], &["deepseek-chat", "gpt-4o"]);
-        let p = FakePrompter::with_answers(vec![Ok("gpt-4o".into())]);
+        let p = FakePrompter::with_answers(vec![Ok("deepseek/gpt-4o".into())]);
 
         let outcome = resolve_prompt(PromptKind::PickModel, &p, &view).expect("应产出 Request");
         assert_eq!(
             outcome,
             PromptOutcome::Request(Request::SetModel {
-                model: "gpt-4o".into()
+                model: "gpt-4o".into(),
+                provider: Some("deepseek".into()),
             })
         );
         assert_eq!(
             p.calls(),
-            vec!["select:Select model[deepseek-chat,gpt-4o]".to_string()]
+            vec!["select:Select model[deepseek/deepseek-chat,deepseek/gpt-4o]".to_string()]
+        );
+    }
+
+    /// 归属未知的条目（env 直连这类）：显示裸模型名，选中也不带 provider ——
+    /// app 侧因此会走反查（既有语义）。
+    #[test]
+    fn test_pick_model_without_provider_yields_none() {
+        let view = CodingView {
+            available_models: vec![ModelEntry {
+                provider: None,
+                model: "gw/model".into(),
+                current: true,
+            }],
+            ..CodingView::for_test()
+        };
+        let p = FakePrompter::with_answers(vec![Ok("gw/model [current]".into())]);
+
+        let outcome = resolve_prompt(PromptKind::PickModel, &p, &view).expect("应产出 Request");
+        assert_eq!(
+            outcome,
+            PromptOutcome::Request(Request::SetModel {
+                model: "gw/model".into(),
+                provider: None,
+            })
         );
     }
 

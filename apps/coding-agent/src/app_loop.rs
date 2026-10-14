@@ -355,8 +355,14 @@ pub async fn run(
                 thinking_visible = visible;
             }
 
-            Request::SetModel { model } => {
-                lines = capabilities::set_model(&mut config, &mut wiring, &state_store, &model);
+            Request::SetModel { model, provider } => {
+                lines = capabilities::set_model(
+                    &mut config,
+                    &mut wiring,
+                    &state_store,
+                    &model,
+                    provider.as_deref(),
+                );
             }
 
             Request::Login {
@@ -1369,7 +1375,7 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let view = take_view(&mut msgs);
         assert!(
-            !view.available_models.contains(&"deepseek-v9".to_string()),
+            !view.available_models.iter().any(|c| c.model == "deepseek-v9"),
             "拉取前不应有目录模型：{:?}",
             view.available_models
         );
@@ -1389,7 +1395,7 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let view = take_view(&mut msgs);
         assert!(
-            view.available_models.contains(&"deepseek-v9".to_string()),
+            view.available_models.iter().any(|c| c.model == "deepseek-v9"),
             "后台目录应进入候选：{:?}",
             view.available_models
         );
@@ -1695,6 +1701,7 @@ mod tests {
         let cases = vec![
             Request::SetModel {
                 model: "gpt-x".into(),
+                provider: None,
             },
             Request::Login {
                 provider: "custom".into(),
@@ -1896,6 +1903,7 @@ mod tests {
         h.requests
             .send(Request::SetModel {
                 model: "harness-narrow".into(),
+                provider: None,
             })
             .await
             .unwrap();

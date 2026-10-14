@@ -15,7 +15,21 @@ pub enum Request {
     /// agent 的输入（一条用户消息）。
     Prompt(Message),
     /// 切换当前模型。
-    SetModel { model: String },
+    ///
+    /// `provider` 是该模型条目的**归属**：`/model` 浮层选中时由 UI 带上、`/model
+    /// provider/model` 限定名由 app 侧拆出；**手敲裸模型名时为 `None`** —— 那时
+    /// 归属交 app 侧按模型目录反查（`ProviderRegistry::provider_for_model`）。
+    ///
+    /// 带上它是因为反查本身有歧义：两个 provider 的目录里可能有**逐字同名**的 id，
+    /// 反查遍历的 `HashMap` 迭代顺序不确定，会静默把端点切到任一家。
+    ///
+    /// `#[serde(default)]`：后加字段的既定约定（先例 `Login.api_base`）—— 无此键的
+    /// 旧 JSON（老日志 / 老 UI）必须仍能反序列化成 `None`。
+    SetModel {
+        model: String,
+        #[serde(default)]
+        provider: Option<String>,
+    },
     /// 同步内联思考标签的显示开关。
     ///
     /// UI 侧 `App.thinking_visible` 是**运行期真值**，本请求只是把它**单向**
@@ -138,10 +152,16 @@ mod tests {
         assert_roundtrip(&Request::Prompt(msg));
     }
 
+    /// 带 provider 与不带都要能往返（两者都是合法输入：后者来自手敲裸名）。
     #[test]
     fn test_request_set_model_roundtrip() {
         assert_roundtrip(&Request::SetModel {
             model: "gpt-4o".into(),
+            provider: Some("deepseek".into()),
+        });
+        assert_roundtrip(&Request::SetModel {
+            model: "gpt-4o".into(),
+            provider: None,
         });
     }
 
@@ -181,6 +201,23 @@ mod tests {
                 provider: "deepseek".into(),
                 api_key: "sk-1".into(),
                 api_base: None,
+            }
+        );
+    }
+
+    /// **向后兼容**：老形态的 JSON（没有 `provider` 键）必须仍能反序列化，且落为
+    /// `None` —— 否则一次协议加字段就会让老 UI / 老日志在 `serde_json::from_*` 处炸掉。
+    ///
+    /// 变异：删掉 `SetModel.provider` 上的 `#[serde(default)]` ⇒ 缺键即报错 ⇒ 本用例变红。
+    #[test]
+    fn test_request_set_model_without_provider_key_deserializes_to_none() {
+        let v = json!({ "SetModel": { "model": "gpt-4o" } });
+        let req: Request = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            req,
+            Request::SetModel {
+                model: "gpt-4o".into(),
+                provider: None,
             }
         );
     }
@@ -301,7 +338,8 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Request>(json!({ "SetModel": { "model": "gpt-4o" } })).unwrap(),
             Request::SetModel {
-                model: "gpt-4o".into()
+                model: "gpt-4o".into(),
+                provider: None,
             }
         );
         assert_eq!(

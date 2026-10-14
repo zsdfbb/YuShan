@@ -13,11 +13,16 @@ use crate::skills::Catalogue;
 /// `docs/design-plans/2026-09-16-search-tools.md` B1）保证，本函数不排序、
 /// 不查自己的名录：`tools` 里有什么就列什么。这样提示词与注册表**不可能漂移**。
 ///
-/// # skill 目录段（纯追加，设计 §选择理由 F）
+/// # 段序
 ///
-/// 段落在**整条提示的最末尾**（`Current working directory: …` 之后），故
-/// **空 `catalogue` 的输出是任何非空 `catalogue` 输出的逐字节前缀** ——
-/// 这是「同一台机器上先后两次启动的提示前缀稳定」的可测形式（严格前缀不变量）。
+/// ```text
+/// cwd 段（最前） → 角色段 → Available tools → Guidelines → <project_context> → skill 目录段（最末）
+/// ```
+///
+/// skill 目录段（纯追加，设计 §选择理由 F）在**最末**，故 **空 `catalogue` 的输出是任何非空
+/// `catalogue` 输出的逐字节前缀** —— 这是「同一台机器上先后两次启动的提示前缀稳定」的可测形式
+/// （严格前缀不变量）。cwd 段**在最前**是实测结论（理由见 [`cwd_section`]）；它在前不在后，
+/// **不影响**该不变量。
 ///
 /// 门控（照 pi）：仅当工具表里**有 `read`**（skill 正文靠它加载）且目录非空时追加。
 /// 空目录时**什么都不追加**（不留空行）。
@@ -41,46 +46,76 @@ pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogue
     let tool_list = tool_list.join("\n");
     let guidelines = tool_guidelines(&names);
 
-    let mut prompt = format!(
-        r#"You are a coding agent. You help users with software engineering tasks.
-
-Available tools:
-{tool_list}
-
-Guidelines:
-{guidelines}"#
+    let mut head = format!(
+        "You are a coding agent. You help users with software engineering tasks.\n\n\
+         Available tools:\n{tool_list}\n\nGuidelines:\n{guidelines}"
     );
 
     // 3. 追加项目上下文（AGENTS.md / YUSHAN.md）
     let context_files = load_project_context(cwd);
     if !context_files.is_empty() {
-        prompt.push_str("\n\n<project_context>\n\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
+        head.push_str("\n\n<project_context>\n\n");
+        head.push_str("Project-specific instructions and guidelines:\n\n");
         for ctx in &context_files {
-            prompt.push_str(&format!(
+            head.push_str(&format!(
                 "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
                 ctx.path.display(),
                 ctx.content
             ));
         }
-        prompt.push_str("</project_context>");
+        head.push_str("</project_context>");
     }
 
-    prompt.push_str(&format!("\n\nCurrent working directory: {}", cwd.display()));
+    let cwd_block = cwd_section(cwd);
 
-    // 4. 追加 skill 目录段 —— **必须留在最末尾**（见函数文档的严格前缀不变量）。
-    //    门控：有 `read`（skill 正文靠它加载）且目录非空；否则**一字不加**。
-    if tools.iter().any(|t| t.name == "read") && !catalogue.lines.is_empty() {
-        prompt.push_str("\n\n");
+    // 4. skill 目录段 —— 门控：有 `read`（skill 正文靠它加载）且目录非空；否则**一字不加**。
+    let skills_block = if tools.iter().any(|t| t.name == "read") && !catalogue.lines.is_empty() {
         // 能力边界声明**按工具表派生**：父表有派发工具 ⇒ 不说「no subagents」；
         // 子表没有 ⇒ 逐字保留（对子 agent 而言那句是真话）。
-        prompt.push_str(&skill_section(
+        Some(skill_section(
             &catalogue.lines,
             tools.iter().any(|t| t.name == "subagent"),
-        ));
+        ))
+    } else {
+        None
+    };
+
+    // 5. 拼装（段间一律 `\n\n`）：**cwd 段在最前**，skill 段在最末。
+    //
+    //    位置与措辞都是实测定的（`docs/arch/bash-cwd-contract/context.md` §实验）：
+    //    cwd 段**单独**挪位置（最末 / 最前）对模型行为毫无影响 —— 三种位置都仍是 100% 的
+    //    `cd <工作目录> &&` 前缀；只有在措辞把「相对路径的解析根」与「每次调用是新 shell」
+    //    说全**之后**，位置才开始起作用：说全 + 置顶 = 0%，说全但留在 `<project_context>`
+    //    之后 = 39%。合理解释是注意力（本仓的 `<project_context>` 是一整份 `AGENTS.md`）。
+    let mut segments: Vec<String> = vec![cwd_block, head];
+    if let Some(s) = skills_block {
+        segments.push(s);
     }
 
-    prompt
+    segments.join("\n\n")
+}
+
+/// cwd 段 —— **整条提示的第一段**。
+///
+/// # 只有事实，没有禁令
+///
+/// 刻意不写「不要 cd」：pi 的对应行也只有事实；且本轮的既定路线是「陈述事实 +
+/// 事实不成立时硬报错」（不是靠训话约束模型）。
+///
+/// # 为什么是两句，而不是一句
+///
+/// 实测（同一任务型、同一模型，见上面 §实验）：只写「当前工作目录是 X」时，这一段
+/// **放在哪里都一样** —— 最前、`<project_context>` 之后、最末，模型都以 `cd <工作目录> &&`
+/// 开头（100%）。补上后两条事实并置顶后降到 **0%**。缺的那两条正是模型真正需要知道的：
+/// **相对路径的解析根**（否则它自己钉一个绝对路径）、**每次调用是新 shell**
+/// （否则它以为 `cd` 能留到下一次调用）。
+fn cwd_section(cwd: &Path) -> String {
+    format!(
+        "Current working directory: {}\n\
+         Relative paths in every tool resolve against it, and each `bash` call starts \
+         there in a fresh shell.",
+        cwd.display()
+    )
 }
 
 /// 是否命中自定义 prompt（`.yushan/SYSTEM.md` 项目级，或 `~/.yushan/SYSTEM.md`
@@ -858,7 +893,11 @@ mod tests {
         // ② 有 `read` 但目录为空 ⇒ 输出与「完全不加 skill 段」逐字相同（无多余空行）。
         let empty = build_system_prompt(&dir, &[spec("read")], &no_skills());
         assert!(
-            empty.ends_with(&format!("Current working directory: {}", dir.display())),
+            empty.starts_with(&format!("Current working directory: {}", dir.display())),
+            "cwd 段须在整条提示最前（实测：见 prompt.rs::cwd_section）；prompt = {empty:?}"
+        );
+        assert!(
+            !empty.ends_with("\n\n"),
             "空目录时不得留下空行或空段；prompt = {empty:?}"
         );
         assert!(!empty.contains("available_skills"), "prompt = {empty:?}");

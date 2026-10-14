@@ -91,10 +91,10 @@ impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "bash",
-            "Execute shell commands. Supports timeout. Every call starts a fresh shell in the \
-             workspace root (the system prompt's `Current working directory`) — `cd` does NOT \
-             carry over between calls, so do not prefix every command with `cd`; use absolute \
-             paths, or chain `cd dir && cmd` inside the one call that needs it.",
+            "Execute shell commands via `sh -c` (POSIX sh, not the user's interactive shell). \
+             Supports timeout. Every call starts a fresh shell in the workspace root — the \
+             `Current working directory` at the start of the system prompt, which relative \
+             paths resolve against; `cd` does NOT carry over between calls.",
             json!({
                 "type": "object",
                 "properties": {
@@ -248,14 +248,16 @@ mod tests {
         ToolContext::new(None, PathBuf::from("."), PathBuf::from("."))
     }
 
-    /// **描述即契约**：`bash` 每次调用都在 `workspace` 起新 shell，`cd` 不跨调用 ——
-    /// 这句话必须留在模型读得到的 `description` 里。
+    /// **描述即契约，但只陈述事实**：`bash` 每次调用都在 `workspace` 起新 shell、
+    /// 相对路径按该目录解析、`cd` 不跨调用 —— 这三条事实必须留在模型读得到的
+    /// `description` 里（`ToolSpec` 随每轮请求发给模型，命中前缀缓存，零边际成本）。
     ///
-    /// 依据（实测）：本机 5 个会话里 69 次 bash 调用有 **68 次**以 `cd <绝对路径> &&` 开头，
-    /// 那 3128 字符是纯噪音；根因就是这条契约没写出来（`ToolSpec` 随每轮请求发给模型，
-    /// 命中前缀缓存，故这是零边际成本的通道）。
+    /// **刻意不写禁令**（不写「不要 cd」），也不给 `cd dir && cmd` 这类许可 ——
+    /// 禁令里夹一个许可会让模型把「这一条也需要」判给自己。实测依据见
+    /// `docs/arch/bash-cwd-contract/context.md`。
     ///
-    /// 变异：把描述改回一句 `Execute shell commands. Supports timeout.` ⇒ 本用例变红。
+    /// 变异：① 描述改回一句 `Execute shell commands. Supports timeout.` ⇒ 前两条断言变红；
+    /// ② 把旧文本的 `do not prefix … or chain \`cd dir && cmd\`` 加回来 ⇒ 第三条变红。
     #[test]
     fn spec_description_states_the_cwd_contract() {
         let tool = BashTool::new(PathBuf::from("."));
@@ -267,6 +269,10 @@ mod tests {
         assert!(
             d.contains("`cd` does NOT") && d.contains("carry over"),
             "描述须说明 `cd` 不跨调用保留（否则模型仍会防御性加前缀）；description = {d}"
+        );
+        assert!(
+            !d.contains("do not prefix") && !d.contains("or chain"),
+            "描述只陈述事实，不写禁令与逃生口；description = {d}"
         );
     }
 

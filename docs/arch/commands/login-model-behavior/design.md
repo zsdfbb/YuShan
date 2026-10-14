@@ -27,6 +27,13 @@
 
 **关键结论**：所有 provider 都返回 `data` 数组，`id` 字段可靠。路径构造需注意 base URL 是否已含 `/v1`。
 
+> **修订（模型名不再内置）**：`ProviderInfo.default_model` 已**删除** —— 写死的「这家默认
+> 叫什么」必然过时（DeepSeek 的目录已从 `deepseek-chat` 换成 `deepseek-flash` /
+> `deepseek-v4-pro`），且会与端点真正提供的东西对不上。模型名只有一个来源：该端点
+> `/v1/models` 的目录。`/login` 取目录第一条当起始模型；拿不到目录就**只存凭证、不切
+> 端点**，让用户用 `/model <provider>/<name>` 点名。目录里的 `context_window` 也一并
+> 取代了写死的窗口表（见 `docs/design-final/compaction.md`）。
+
 ## 候选方案
 
 ### 方案 A：最小改动（未选）
@@ -79,7 +86,6 @@ apps/coding-agent/src/
 pub struct ProviderInfo {
     pub name: String,
     pub api_base: String,
-    pub default_model: String,
     pub compat: ProviderCompat,
 }
 
@@ -133,13 +139,20 @@ Agent.set_model()
 
 **/model（无参数）—— 已按 as-built 修订（见 `docs/design-final/coding-agent-tui.md` M4/M9/M20）：**
 ```
-registry.models_for_provider(每个已登录 provider) → 优先后台拉到的 /v1/models 目录，缺失回退静态表
+registry.models_for_provider(每个已登录 provider) → 该 provider 拉到的 /v1/models 目录（拉不到就是空，无静态回退）
+env 直连（provider 无名）→ registry.models_for_base(YUSHAN_API_BASE) 的目录
 build_view：候选 = 各 provider 并集，**按 (provider, model) 去重**（同名 id 各占一行）+ 当前正在跑的模型
 浮层：每条显示 `provider/model`（归属未知则裸名，当前那条缀 `[current]`），**可输入筛选**
 Prompter::select → 选中项的显示串 → 用 ModelEntry::label 反解回条目
 Request::SetModel { model, provider }  → 归属显式带上，**不再反查**
 capabilities::set_model → 归属不同则连 api_base/api_key/provider 一起切 → build_model() → Wiring::set_model()
 ```
+
+**/login —— 已按 as-built 修订**：登录时**同步拉一次**该 provider 的 `/v1/models`
+（`app_loop` 按 `capabilities::resolve_login_base` 定出的 base 调
+`ProviderRegistry::fetch_models`，5s 超时；目录同时进 registry 缓存，`/model` 候选与
+窗口查询立刻可用）。起始模型 = 目录**第一条**；目录为空 / 拉不到 ⇒ 只存凭证、不动
+端点与模型，并提示用 `/model <provider>/<name>` 点名。
 
 > 原稿写的「`registry.available_models(base, key)`」「按 provider 过滤」「`inquire::Select`」
 > 都不是 as-built：候选**不按 provider 过滤**（是并集，靠标签区分），交互库也早已自实现

@@ -27,13 +27,11 @@ use ys_protocol::SessionSummary;
 use ys_session::SessionMeta;
 
 use crate::config::Config;
-use crate::provider::{AuthEntry, ProviderRegistry};
+use crate::provider::{ApiModel, AuthEntry, ProviderRegistry};
 use crate::state::{AppState, StateStore};
 use crate::wiring::Wiring;
 
-/// `/login` 的能力：按 provider 名 + api_key 登录，存 auth.json，重建 model。
-///
-/// # api_base 的来路（三级回退）
+/// `/login` 的 api_base 解析（三级回退）：
 ///
 /// 1. **用户显式给的** `requested_api_base`（`/login custom` 时 UI 追问到的 URL）
 /// 2. provider 目录里的 `api_base`（deepseek / minimax 有值）
@@ -44,6 +42,52 @@ use crate::wiring::Wiring;
 /// base** 的 provider 追问 URL），本函数只负责按上面的顺序解析 —— 空串一律视同
 /// 未提供（不能拿一个空 base 覆盖 config 里已有的值）。
 ///
+/// 单独成形（而不是埋在 [`login`] 里）的理由：调用方要**先拿这个 base 去拉
+/// `/v1/models`**，再把目录交给 [`login`] 定模型 —— 两处必须由同一条规则算出
+/// 同一个 base，否则会拿 A 端点的目录去配 B 端点。
+///
+/// [`Request::Login`]: ys_protocol::Request::Login
+pub fn resolve_login_base(
+    config: &Config,
+    provider_name: &str,
+    requested_api_base: Option<&str>,
+) -> Result<String, Vec<String>> {
+    let Some(provider) = config.registry.find_provider(provider_name) else {
+        let names: Vec<String> = config
+            .registry
+            .providers()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        return Err(vec![format!(
+            "Unknown provider: {provider_name}. Available: {}",
+            names.join(", ")
+        )]);
+    };
+
+    requested_api_base
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| Some(provider.api_base.clone()).filter(|b| !b.is_empty()))
+        .or_else(|| config.api_base.clone().filter(|b| !b.is_empty()))
+        .ok_or_else(|| {
+            vec![
+                format!("Provider `{provider_name}` has no API base."),
+                "Please provide the API base URL when logging in, or set YUSHAN_API_BASE and retry (deepseek / minimax have built-in bases).".to_string(),
+            ]
+        })
+}
+
+/// `/login` 的能力：按 provider 名 + api_key 登录，存 auth.json，重建 model。
+///
+/// **起始模型取自 `catalog`**（该端点 `/v1/models` 拉到的目录）里的**第一条**。
+/// 目录是模型名的唯一来源 —— 代码里不再有「这家默认叫什么」的写死项（写死的名字
+/// 必然过时，且会与端点真正提供的东西对不上）。
+///
+/// `catalog` 为 `None`（离线 / 401 / 端点没有 `/v1/models`）或为空时：**只存凭证、
+/// 不动端点与模型**，并明确告诉用户用 `/model <provider>/<name>` 点名。
+///
 /// [`Request::Login`]: ys_protocol::Request::Login
 pub fn login(
     config: &mut Config,
@@ -52,38 +96,37 @@ pub fn login(
     provider_name: &str,
     api_key: &str,
     requested_api_base: Option<&str>,
+    catalog: Option<&[ApiModel]>,
 ) -> Vec<String> {
-    let Some(provider) = config.registry.find_provider(provider_name).cloned() else {
-        let names: Vec<String> = config
-            .registry
-            .providers()
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
-        return vec![format!(
-            "Unknown provider: {provider_name}. Available: {}",
-            names.join(", ")
-        )];
+    let api_base = match resolve_login_base(config, provider_name, requested_api_base) {
+        Ok(base) => base,
+        Err(lines) => return lines,
     };
 
-    let api_base = requested_api_base
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| Some(provider.api_base.clone()).filter(|b| !b.is_empty()))
-        .or_else(|| config.api_base.clone().filter(|b| !b.is_empty()));
-
-    let Some(api_base) = api_base else {
-        return vec![
-            format!("Provider `{provider_name}` has no API base."),
-            "Please provide the API base URL when logging in, or set YUSHAN_API_BASE and retry (deepseek / minimax have built-in bases).".to_string(),
-        ];
-    };
-
-    let model_name = if provider.default_model.is_empty() {
-        config.model.clone()
-    } else {
-        provider.default_model.clone()
+    // **模型名只来自目录**（provider 自己报的第一条）。拿不到目录就**不切端点**：
+    // 沿用上一家的模型名发到这一家的 base 上只会换来一个 400 —— 宁可只存凭证、
+    // 让用户点名（`/model <provider>/<name>`）。
+    let model_name = catalog
+        .and_then(|models| models.first())
+        .map(|m| m.id.clone());
+    let Some(model_name) = model_name else {
+        let mut out = Vec::new();
+        if let Err(e) = config.registry.save_auth(
+            provider_name,
+            &AuthEntry {
+                api_base: api_base.clone(),
+                api_key: api_key.to_string(),
+                model: String::new(),
+            },
+        ) {
+            out.push(format!("Warning: Could not persist credentials: {e}"));
+        }
+        out.push(format!("✓ Saved credentials for {provider_name}."));
+        out.push(format!(
+            "Could not read the model list from {api_base} — model unchanged. \
+             Pick one with `/model {provider_name}/<name>`."
+        ));
+        return out;
     };
 
     let mut out = Vec::new();
@@ -187,10 +230,7 @@ pub fn set_model(
         Some(p) => (model.to_string(), Some(p.to_string())),
         None => match split_qualified_model(model, &config.registry) {
             Some((p, bare)) => (bare, Some(p)),
-            None => (
-                model.to_string(),
-                config.registry.provider_for_model(model),
-            ),
+            None => (model.to_string(), config.registry.provider_for_model(model)),
         },
     };
 
@@ -633,7 +673,21 @@ mod tests {
         Wiring::ephemeral(None, Box::new(CollectingSink::new()))
     }
 
+    /// 测试用目录：`id` 列表 ⇒ `ApiModel`（不带窗口）。
+    fn catalog(ids: &[&str]) -> Vec<ApiModel> {
+        ids.iter()
+            .map(|id| ApiModel {
+                id: (*id).into(),
+                owned_by: None,
+                name: None,
+                context_window: None,
+            })
+            .collect()
+    }
+
     /// `/login` 成功路径：config 三个字段被填、auth 落盘、接线器拿到 model。
+    ///
+    /// 起始模型**取自目录的第一条**（这里给 `deepseek-flash`）—— 不再是代码里写死的名字。
     #[test]
     fn test_login_success_sets_config_wiring_and_auth_file() {
         let (mut config, dir) = test_config();
@@ -648,12 +702,13 @@ mod tests {
             "deepseek",
             "sk-test",
             None,
+            Some(&catalog(&["deepseek-flash", "deepseek-v4-pro"])),
         );
 
         assert_eq!(config.provider.as_deref(), Some("deepseek"));
         assert_eq!(config.api_base.as_deref(), Some("https://api.deepseek.com"));
         assert_eq!(config.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.model, "deepseek-flash", "起始模型 = 目录第一条");
         assert_eq!(wiring.model_id(), Some("dummy"), "应经 factory 构建 model");
         assert!(
             out.iter().any(|l| l.contains("Logged in to deepseek")),
@@ -666,6 +721,55 @@ mod tests {
         reloaded.load_auth();
         let entry = reloaded.auth_for("deepseek").expect("应已落盘");
         assert_eq!(entry.api_key, "sk-test");
+        assert_eq!(entry.model, "deepseek-flash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// **拿不到目录 ⇒ 只存凭证、不动端点与模型**：把上一家的模型名发到这一家的 base
+    /// 上只会换来一个 400，宁可让用户点名。
+    ///
+    /// 变异：`catalog = None` 时仍照旧切 provider/model ⇒ 本用例变红。
+    #[test]
+    fn test_login_without_catalog_keeps_credentials_only() {
+        let (mut config, dir) = test_config();
+        config.provider = Some("minimax".into());
+        config.api_base = Some("https://api.minimax.chat/v1".into());
+        config.api_key = Some("sk-mm".into());
+        config.model = "MiniMax-M3".into();
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = login(
+            &mut config,
+            &mut wiring,
+            &state,
+            "deepseek",
+            "sk-test",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            config.provider.as_deref(),
+            Some("minimax"),
+            "未取到目录 ⇒ 不切端点：{out:?}"
+        );
+        assert_eq!(config.model, "MiniMax-M3", "未取到目录 ⇒ 不改模型");
+        assert!(
+            out.iter()
+                .any(|l| l.contains("Could not read the model list")),
+            "应明确告知并给出点名路径：{out:?}"
+        );
+        // 凭证照样落盘（key 是好的，只是这次读不到目录）
+        let mut reloaded = crate::provider::ProviderRegistry::new();
+        reloaded.set_auth_override(dir.join("auth.json"));
+        reloaded.load_auth();
+        assert_eq!(
+            reloaded.auth_for("deepseek").map(|e| e.api_key.as_str()),
+            Some("sk-test")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state_dir);
@@ -678,7 +782,15 @@ mod tests {
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = login(&mut config, &mut wiring, &state, "nope", "sk-test", None);
+        let out = login(
+            &mut config,
+            &mut wiring,
+            &state,
+            "nope",
+            "sk-test",
+            None,
+            None,
+        );
 
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("Unknown provider: nope"), "{out:?}");
@@ -699,7 +811,15 @@ mod tests {
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = login(&mut config, &mut wiring, &state, "custom", "sk-test", None);
+        let out = login(
+            &mut config,
+            &mut wiring,
+            &state,
+            "custom",
+            "sk-test",
+            None,
+            None,
+        );
 
         assert!(
             out.iter().any(|l| l.contains("YUSHAN_API_BASE")),
@@ -720,7 +840,15 @@ mod tests {
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = login(&mut config, &mut wiring, &state, "custom", "sk-test", None);
+        let out = login(
+            &mut config,
+            &mut wiring,
+            &state,
+            "custom",
+            "sk-test",
+            None,
+            Some(&catalog(&["custom-model"])),
+        );
 
         assert_eq!(
             config.api_base.as_deref(),
@@ -750,6 +878,7 @@ mod tests {
             "custom",
             "sk-test",
             Some("https://typed-in-tui.example.com/v1"),
+            Some(&catalog(&["custom-model"])),
         );
 
         assert_eq!(
@@ -787,6 +916,7 @@ mod tests {
             "deepseek",
             "sk-test",
             Some("   "),
+            Some(&catalog(&["deepseek-flash"])),
         );
 
         assert_eq!(
@@ -1226,10 +1356,14 @@ mod tests {
                 },
             )
             .unwrap();
+        // 归属来自**目录**（写死的名字表已删）：MiniMax-M3 只存在于这里。
+        config
+            .registry
+            .seed_cached_models("https://api.minimax.chat/v1", &["MiniMax-M3"]);
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = set_model(&mut config, &mut wiring, &state, "MiniMax-Text-01", None);
+        let out = set_model(&mut config, &mut wiring, &state, "MiniMax-M3", None);
 
         assert_eq!(config.provider.as_deref(), Some("minimax"), "{out:?}");
         assert_eq!(
@@ -1238,7 +1372,7 @@ mod tests {
             "端点必须跟着切，否则模型名会发到别家 base"
         );
         assert_eq!(config.api_key.as_deref(), Some("sk-mm"));
-        assert_eq!(config.model, "MiniMax-Text-01");
+        assert_eq!(config.model, "MiniMax-M3");
         assert!(
             out.iter()
                 .any(|l| l.contains("Provider switched: deepseek → minimax")),

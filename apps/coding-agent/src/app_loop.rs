@@ -69,6 +69,7 @@ use crate::capabilities;
 use crate::config::Config;
 use crate::follow_up::{TurnKind, should_review};
 use crate::logging;
+use crate::provider::{FetchModelsResult, ModelCache, ProviderRegistry};
 use crate::state::StateStore;
 use crate::status::TurnStats;
 use crate::view::build_view;
@@ -228,8 +229,8 @@ pub async fn run(
         // 等一条 UI 请求；后台模型目录若尚未返回，则与之赛跑。目录**一次性**到达，
         // 收到后把 `models_rx` 置 `None`，此后主循环只等 `Request`。
         //
-        // 目录到手 ⇒ 并入 registry、刷新一次视图：`/model` 候选从静态表切到真实
-        // 目录（渲染路径依旧一次 HTTP 都不发，写与读同在这个线程）。
+        // 目录到手 ⇒ 并入 registry、刷新一次视图：`/model` 候选此刻才拿到这两家的
+        // 模型名（渲染路径依旧一次 HTTP 都不发，写与读同在这个线程）。
         let wake = match models_rx.as_mut() {
             Some(rx) => tokio::select! {
                 req = request_rx.recv() => Wake::Request(req),
@@ -370,14 +371,47 @@ pub async fn run(
                 api_key,
                 api_base,
             } => {
-                lines = capabilities::login(
-                    &mut config,
-                    &mut wiring,
-                    &state_store,
-                    &provider,
-                    &api_key,
-                    api_base.as_deref(),
-                );
+                // 起始模型只能从端点来：先按 `/login` 的同一规则定出 base，再拉它的
+                // `/v1/models`，把目录交给 `capabilities::login` 定模型。
+                //
+                // 这是用户显式动作 ⇒ 这次网络值得等（`fetch_models` 自带 5s 超时）；
+                // 拉到的目录同时进 registry 缓存，`/model` 候选与窗口查询立刻可用。
+                match capabilities::resolve_login_base(&config, &provider, api_base.as_deref()) {
+                    Err(msg) => lines = msg,
+                    Ok(base) => {
+                        let catalog = match ProviderRegistry::fetch_models(&base, &api_key).await {
+                            FetchModelsResult::Success(models) if !models.is_empty() => {
+                                Some(models)
+                            }
+                            FetchModelsResult::Success(_) => {
+                                logging::log(&format!("login {base}: empty model list"));
+                                None
+                            }
+                            FetchModelsResult::AuthError(e) => {
+                                logging::log(&format!("login {base}: auth error: {e}"));
+                                None
+                            }
+                            FetchModelsResult::NetworkError(e) => {
+                                logging::log(&format!("login {base}: network error: {e}"));
+                                None
+                            }
+                        };
+                        lines = capabilities::login(
+                            &mut config,
+                            &mut wiring,
+                            &state_store,
+                            &provider,
+                            &api_key,
+                            api_base.as_deref(),
+                            catalog.as_deref(),
+                        );
+                        if let Some(models) = catalog {
+                            let mut cache = ModelCache::new();
+                            cache.insert(base.trim_end_matches('/').to_string(), models);
+                            config.registry.apply_model_cache(cache);
+                        }
+                    }
+                }
             }
 
             Request::Logout => {
@@ -413,7 +447,8 @@ pub async fn run(
                     }
                     // I4：**空列表也要发** —— UI 据此提示「没有可恢复的会话」。
                     Some(dir) => {
-                        session_event = Some(Outbound::SessionList(capabilities::list_sessions(dir)));
+                        session_event =
+                            Some(Outbound::SessionList(capabilities::list_sessions(dir)));
                     }
                 }
             }
@@ -548,9 +583,7 @@ fn apply_resumed_workspace(
             handle.record(target);
             Some(message)
         }
-        Err(e) => Some(format!(
-            "警告：无法切换到工作区（{e}），保持当前工作区不变"
-        )),
+        Err(e) => Some(format!("警告：无法切换到工作区（{e}），保持当前工作区不变")),
     }
 }
 
@@ -944,7 +977,10 @@ mod tests {
             crate::skills::catalogue(Vec::new(), crate::skills::Budget::default()),
             ys_component::RunLimits::default(),
             Duration::from_secs(30),
-            Arc::new(crate::subagent::SubagentsDir::at(tmp.join("subagents"), false)),
+            Arc::new(crate::subagent::SubagentsDir::at(
+                tmp.join("subagents"),
+                false,
+            )),
         );
         // 共享工作区 = harness 临时目录（生产侧是进程启动目录）。
         let default_workspace = tmp.0.clone();
@@ -1342,7 +1378,7 @@ mod tests {
 
     /// **后台模型目录**：`main` 在起屏后并发拉 `/v1/models`，目录到手经 `models`
     /// 信道送回 app 循环 —— 循环把它并入 registry 并**自发**刷一次视图，`/model`
-    /// 候选随之从静态表切到真实目录。**全程无任何 `Request`**（不阻塞起屏的关键）。
+    /// 候选随之出现这两家的条目。**全程无任何 `Request`**（不阻塞起屏的关键）。
     ///
     /// 变异：删掉循环开头 `Wake::Models` 分支里的 `apply_model_cache` + 视图刷新
     /// ⇒ 第二次 `collect_until_view` 收不到视图（挂起）→ 本用例超时变红。
@@ -1366,8 +1402,9 @@ mod tests {
         })
         .await;
 
-        // 目录到达之前：候选只有静态表里属于 deepseek 的条目。
-        // （循环不在起跑时自发发视图，故用一条无输出的 `SetThinking` 逼一份当前视图。）
+        // 目录到达之前：候选里**没有**任何目录模型（模型名只有目录一个来源，
+        // 不再有静态回退）。循环不在起跑时自发发视图，故用一条无输出的
+        // `SetThinking` 逼一份当前视图。
         h.requests
             .send(Request::SetThinking { visible: true })
             .await
@@ -1375,7 +1412,10 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let view = take_view(&mut msgs);
         assert!(
-            !view.available_models.iter().any(|c| c.model == "deepseek-v9"),
+            !view
+                .available_models
+                .iter()
+                .any(|c| c.model == "deepseek-v9"),
             "拉取前不应有目录模型：{:?}",
             view.available_models
         );
@@ -1387,6 +1427,8 @@ mod tests {
             vec![crate::provider::ApiModel {
                 id: "deepseek-v9".into(),
                 owned_by: None,
+                name: None,
+                context_window: None,
             }],
         );
         h.models.send(cache).await.unwrap();
@@ -1395,7 +1437,9 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let view = take_view(&mut msgs);
         assert!(
-            view.available_models.iter().any(|c| c.model == "deepseek-v9"),
+            view.available_models
+                .iter()
+                .any(|c| c.model == "deepseek-v9"),
             "后台目录应进入候选：{:?}",
             view.available_models
         );
@@ -2473,7 +2517,10 @@ mod tests {
                     tmp.to_path_buf(),
                     WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
                     // 产物目录注入临时路径 —— 不写进用户的 `~/.yushan/subagents/`。
-                    Arc::new(crate::subagent::SubagentsDir::at(tmp.join("subagents"), false)),
+                    Arc::new(crate::subagent::SubagentsDir::at(
+                        tmp.join("subagents"),
+                        false,
+                    )),
                 ))
             },
             None,
@@ -2578,22 +2625,17 @@ mod tests {
     async fn spawn_resumable(replies: usize) -> Harness {
         let initial = MockModel::new("initial");
         initial.push_text("initial");
-        spawn_app_loop_with(
-            Box::new(initial),
-            true,
-            Vec::new(),
-            move |config, _tmp| {
-                config.api_base = Some("http://resume-base/v1".into());
-                config.api_key = Some("sk-resume".into());
-                config.set_model_factory(move |_| {
-                    let m = MockModel::new("resumed");
-                    for _ in 0..replies {
-                        m.push_text("done");
-                    }
-                    Some(Box::new(m))
-                });
-            },
-        )
+        spawn_app_loop_with(Box::new(initial), true, Vec::new(), move |config, _tmp| {
+            config.api_base = Some("http://resume-base/v1".into());
+            config.api_key = Some("sk-resume".into());
+            config.set_model_factory(move |_| {
+                let m = MockModel::new("resumed");
+                for _ in 0..replies {
+                    m.push_text("done");
+                }
+                Some(Box::new(m))
+            });
+        })
         .await
     }
 
@@ -2704,7 +2746,10 @@ mod tests {
             matches!(msgs.first(), Some(Outbound::SessionResumed { .. })),
             "成功 /resume 必须发 SessionResumed：{msgs:?}"
         );
-        assert_eq!(view.turn_count, 7, "view.turn_count 应由目标 meta.turns 播种");
+        assert_eq!(
+            view.turn_count, 7,
+            "view.turn_count 应由目标 meta.turns 播种"
+        );
 
         // 回合 2：`turns` 不归零 ⇒ Envelope.turn = 2；`stats` 在 7 上 +1 ⇒ 8。
         h.requests.send(prompt("two")).await.unwrap();

@@ -132,9 +132,11 @@ emit 的事件会躺在 `sink_rx` 直到下个 `Prompt` 才转发 → 顺序错�
    - **P1-2 保留段首条不得含 `ToolResult`** —— 见上「关键行为」，ADR 决策 7 未涵盖。
 6. **`JsonlSession` 加了 `#[cfg(test)] flush_count: AtomicUsize` 字段** —— 为**可确定性地数落盘次数**，
    钉住 `replace_all` 只触发一次 `flush_to_file`（防 O(n²) 退化回归）。
-7. **`KNOWN_MODEL_WINDOWS` 只填了确实可查证的模型**：`deepseek-chat`/`deepseek-reasoner` = 128K、
-   `MiniMax-M3` = 1M、`MiniMax-M2.7` = 204,800。**`MiniMax-Text-01`（minimax provider 的 default_model）
-   有意不填** —— 厂商口径「训练 1M / 推理可达 4M」差 4 倍，**API 实际放行哪个无法确证**，
+7. **窗口的第一手来源是 provider 目录**：`ApiModel` 解析 `/v1/models` 里的 `context_window`
+   （`Config::context_window_for` 的 ② 级）—— 厂商自己报的值永远比仓库里的表新。
+   `KNOWN_MODEL_WINDOWS` 因此退成**兜底表**（③ 级），只留端点的目录报不出窗口的模型：
+   `MiniMax-M3` = 1M、`MiniMax-M2.7` = 204,800。**`MiniMax-Text-01` 有意不填** ——
+   厂商口径「训练 1M / 推理可达 4M」差 4 倍，**API 实际放行哪个无法确证**，
    宁可回退 128K（偏保守：提前压缩），也不编造一个可能让上下文溢出的值。
 8. **摘要 prompt 是 pi 骨架 × Codewhale 规则的合并版** —— ADR-0017 决策 2 与
    `design-compaction.md` §摘要内容策略 要的是 pi 的 Markdown 节骨架；**最初落地版曾是 Codewhale 的

@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -20,7 +20,16 @@ impl BashTool {
 }
 
 /// 把子进程输出组装成工具结果：stdout + stderr 合并、超限尾截断、非零退码标错。
-fn render_result(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> ToolResult {
+///
+/// `note` 是这次调用的一条**事实**（当前唯一来源：[`redundant_root_cd`]），追加在
+/// 正文之后、退码行之前。它**不影响** `is_error` —— 命令本身失败时，注记与
+/// `Command exited with code …` 并存，且退码行仍是最后一行。
+fn render_result(
+    stdout: &[u8],
+    stderr: &[u8],
+    exit_code: Option<i32>,
+    note: Option<&str>,
+) -> ToolResult {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
 
@@ -49,6 +58,16 @@ fn render_result(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> ToolRe
         );
     }
 
+    // 注记追加在**正文之后、退码行之前**（两条「关于本次执行」的元信息相邻）：
+    // 截断通知紧贴它要说明的正文、不被隔开，且既有不变量「失败结果的最后一行是
+    // 退码行」不发生位移。空输出（`cd <目录> && true`）时不前插空行。
+    if let Some(note) = note {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str(note);
+    }
+
     // 检查退出码（被信号杀死时 code 为 None，不视作「非零退码」）
     if let Some(code) = exit_code {
         if code != 0 {
@@ -62,6 +81,76 @@ fn render_result(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> ToolRe
     ToolResult {
         content,
         is_error: false,
+    }
+}
+
+/// 命令是否以「`cd` 到本工具 workspace 同一个目录」开头 —— 是即判为冗余。
+///
+/// 本工具每次调用都在 `self.workspace` 起 shell（见 `call` 里的 `current_dir`），
+/// 故这条 `cd` 不产生任何位移，判定的唯一用途是**在结果里回一行事实**（模型无从
+/// 核对「我在哪」，只能自己每轮钉一次位置）。
+///
+/// 只认**第一段**的 `cd <path> && 余下`：`<path>` 允许裸串 / 单引号 / 双引号；
+/// `余下` 必须非空（`cd <目录> &&` 是语法错误，不是零位移）。两侧 `canonicalize`
+/// 后比较，任一侧失败则退化为「相对路径按 `workspace` 拼接后字面比较」（此时
+/// `cd .` 一类判不出来，只是少一行注记，不影响正确性）。
+///
+/// **不认**：`cd ~/…`、`cd $VAR`、`cd -`、`;` 分隔，以及 `cd <目录>` 之后不带命令的
+/// 裸 `cd` —— 前几者要展开才知道指向何处，后者没有「下文命令」可省，报了没意义。
+/// 指向 workspace **子目录**的 `cd` 是有意义的位移，一律不认。
+fn redundant_root_cd(command: &str, workspace: &Path) -> bool {
+    let rest = command.trim_start();
+    let Some(after) = rest.strip_prefix("cd") else {
+        return false;
+    };
+    // `cd` 之后必须是空白，否则是 `cdrom` / `cdparanoia` 这类命令词的开头
+    if !after.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let Some((token, tail)) = take_shell_token(after.trim_start()) else {
+        return false;
+    };
+    // 只认 `&&` 分隔：`;` 后的命令与这条 `cd` 不在同一「若非成功则不执行」链上。
+    // 其后必须**真的有命令** —— `cd <目录> &&` 会被 `sh` 判为语法错误，不是零位移的 no-op。
+    let Some(rest) = tail.trim_start().strip_prefix("&&") else {
+        return false;
+    };
+    if rest.trim().is_empty() {
+        return false;
+    }
+
+    let target = Path::new(token);
+    // 空串（`cd "" && …`）在 `sh` 里是**失败**的切目录，不是 no-op；且
+    // `workspace.join("")` 会退化成 `workspace/`，若不加这道守卫会被误判成冗余。
+    if target.as_os_str().is_empty() {
+        return false;
+    }
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        workspace.join(target)
+    };
+    match (resolved.canonicalize(), workspace.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        // 任一侧解析不到（目录不存在等）⇒ 退化为字面比较：宁可少说一行，不说错一句
+        _ => resolved == workspace,
+    }
+}
+
+/// 从头切出一个 shell 词：裸串读到空白或 shell 元字符（`&;|<>()`），
+/// 引号串读到配对的同类引号。返回 `(词, 余下)`；引号未闭合时返回 `None`
+/// （判不出就不判）。元字符也要断词，否则 `cd /a&&ls` 会把 `&&ls` 吃进路径。
+fn take_shell_token(s: &str) -> Option<(&str, &str)> {
+    let first = s.chars().next()?;
+    if first == '\'' || first == '"' {
+        let body = &s[first.len_utf8()..];
+        let end = body.find(first)?;
+        Some((&body[..end], &body[end + first.len_utf8()..]))
+    } else {
+        let end = s
+            .find(|c: char| c.is_whitespace() || "&;|<>()".contains(c))
+            .unwrap_or(s.len());
+        (end > 0).then(|| (&s[..end], &s[end..]))
     }
 }
 
@@ -111,6 +200,35 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing 'command'".into()))?;
         let timeout_secs = input["timeout"].as_u64();
+
+        // 工作目录不成立 ⇒ 硬报错。放行到 `spawn` 只会得到一句
+        // `Failed to spawn command`，与「命令本身有问题」无法区分。
+        match tokio::fs::metadata(&self.workspace).await {
+            Ok(meta) if !meta.is_dir() => {
+                return Err(ToolError::Execution(format!(
+                    "Working directory is not a directory: {}",
+                    self.workspace.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolError::Execution(format!(
+                    "Working directory does not exist: {}",
+                    self.workspace.display()
+                )));
+            }
+            // 存在且是目录，或「读不到但不是 NotFound」⇒ 交给原有 spawn 路径报
+            _ => {}
+        }
+
+        // 命令以 `cd <本目录> && …` 开头 ⇒ 结果里回一行事实（判定规则见
+        // [`redundant_root_cd`]）。命令**照原样执行**，本变量只影响结果文案。
+        // `[bash: …]` 前缀标明这句是**工具说的**，不是命令输出（命令可以打印任意文本）。
+        let note = redundant_root_cd(command, &self.workspace).then(|| {
+            format!(
+                "[bash: this shell already started in {}; the leading cd changed nothing]",
+                self.workspace.display()
+            )
+        });
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -164,6 +282,7 @@ impl Tool for BashTool {
                 &output.stdout,
                 &output.stderr,
                 output.status.code(),
+                note.as_deref(),
             ));
         };
 
@@ -221,7 +340,12 @@ impl Tool for BashTool {
             Ok(status) => {
                 let stdout = out_task.await.unwrap_or_default();
                 let stderr = err_task.await.unwrap_or_default();
-                Ok(render_result(&stdout, &stderr, status.code()))
+                Ok(render_result(
+                    &stdout,
+                    &stderr,
+                    status.code(),
+                    note.as_deref(),
+                ))
             }
             Err(err) => {
                 // 中止 / 超时 / 等待失败：先杀进程组（含孙进程），再杀子进程兜底
@@ -544,5 +668,221 @@ mod tests {
             result.content.lines().skip(2).all(|l| l == "x".repeat(40)),
             "保留正文应全为 40 字节行"
         );
+    }
+
+    // ==================== 冗余 `cd` 的事实回显（见 `redundant_root_cd`） ====================
+
+    /// 判定只认「命令开头的 `cd` 落回 workspace 本身」= 零位移。纯函数用例，不起进程。
+    ///
+    /// 变异：① `(Ok(a), Ok(b)) => a == b` 改成恒真 ⇒ 下面「子目录不算冗余」那条变红；
+    /// ② 丢掉 canonicalize、直接比 `resolved == workspace` ⇒ `cd <ws>/.` 那条变红。
+    #[test]
+    fn test_redundant_root_cd_accepts_only_zero_displacement_forms() {
+        let dir = test_dir();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let ws = dir.canonicalize().unwrap();
+        let abs = ws.display().to_string();
+        let name = ws.file_name().unwrap().to_string_lossy().to_string();
+
+        for cmd in [
+            format!("cd {abs} && ls"),
+            format!("cd {abs}&&ls"),
+            format!("cd '{abs}' && ls"),
+            format!("cd \"{abs}\" && ls"),
+            format!("cd {abs}/. && ls"),
+            format!("cd {abs}/../{name} && ls"),
+            format!("  cd {abs} && ls"),
+            format!("\ncd {abs} && ls"),
+            "cd . && ls".to_string(),
+            format!("cd {abs} && cd sub && ls"),
+        ] {
+            assert!(redundant_root_cd(&cmd, &ws), "应判为冗余：{cmd}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 判定的**反例**：有真实位移的、不在开头的、静态判不出指向的，一律不判冗余。
+    ///
+    /// 变异：去掉 `after.starts_with(char::is_whitespace)` 词边界 ⇒ `cd<ws> …` 变红；
+    /// 去掉 `&&` 之后的非空检查 ⇒ `cd <ws> &&` 变红。
+    ///
+    /// `ls && cd <ws> && make` 那条**不具变异敏感性**：实现是 `strip_prefix` 在
+    /// `trim_start` 之后直接取首段，结构上就不可能匹配中段 —— 该用例只作意图记录。
+    #[test]
+    fn test_redundant_root_cd_rejects_everything_else() {
+        let dir = test_dir();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let ws = dir.canonicalize().unwrap();
+        let abs = ws.display().to_string();
+
+        for cmd in [
+            // 真实位移
+            format!("cd {abs}/sub && ls"),
+            "cd .. && ls".to_string(),
+            "cd /tmp && ls".to_string(),
+            // 不在开头：本模块只判开头的「开局钉位置」
+            format!("ls && cd {abs} && make"),
+            // 静态判不出指向何处，或语义不是路径
+            "cd ~/x && ls".to_string(),
+            "cd $ROOT && ls".to_string(),
+            "cd - && ls".to_string(),
+            "cd && ls".to_string(),
+            // 词边界与空输入
+            "cdx && ls".to_string(),
+            // ↑ 这条其实是被「路径不等于 ws」挡下的；**下面这条**才是词边界守卫
+            //   唯一的可观测点：没有守卫时 `cd<abs>` 会被切成 `cd` + `<abs>` ⇒ 误报。
+            format!("cd{abs} && ls"),
+            "cd".to_string(),
+            "echo hi".to_string(),
+            // 空串：`sh` 里 `cd ""` 是**失败**的切目录，不是 no-op
+            "cd \"\" && ls".to_string(),
+            // 没有下文命令可省 / 只认 `&&` 分隔
+            format!("cd {abs}"),
+            format!("cd {abs} ; ls"),
+            format!("cd {abs} &&"),
+        ] {
+            assert!(!redundant_root_cd(&cmd, &ws), "不应判为冗余：{cmd}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 走完整 `call` 路径：冗余 `cd` 的那一次在结果里回一行**工具自撰的事实**，
+    /// 其余调用一概没有；且命令自身的输出**逐字节不变**，`is_error` 语义不变。
+    ///
+    /// 变异：① 删掉 `render_result` 里的注记追加 ⇒ 第 ②③④ 段全红；
+    /// ② 把追加改成 `insert_str(0, …)` ⇒ 「退码行仍在最后一行」变红。
+    #[tokio::test]
+    async fn test_redundant_cd_note_is_added_only_when_the_cd_has_no_displacement() {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let ws = dir.canonicalize().unwrap();
+        let abs = ws.display().to_string();
+        let note =
+            format!("[bash: this shell already started in {abs}; the leading cd changed nothing]");
+        let tool = BashTool::new(ws.clone());
+
+        // ① 无前缀 ⇒ 无注记，输出就是命令输出
+        let plain = tool
+            .call(json!({ "command": "echo hi" }), make_ctx())
+            .await
+            .unwrap();
+        assert_eq!(plain.content, "hi\n");
+        assert!(!plain.content.contains("[bash:"));
+
+        // ② 有前缀 ⇒ 正文逐字节不变，注记追加其后
+        let prefixed = tool
+            .call(
+                json!({ "command": format!("cd {abs} && echo hi") }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!prefixed.is_error);
+        assert_eq!(prefixed.content, format!("hi\n\n\n{note}"));
+
+        // ③ 命令失败：注记在，退码行仍是**最后一行**（既有不变量）
+        let failed = tool
+            .call(
+                json!({ "command": format!("cd {abs} && exit 7") }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(failed.is_error);
+        assert!(failed.content.contains(&note));
+        assert_eq!(
+            failed.content.lines().last().unwrap(),
+            "Command exited with code 7"
+        );
+
+        // ④ 空输出：注记独占一行，前面不空行
+        let silent = tool
+            .call(
+                json!({ "command": format!("cd {abs} && true") }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(silent.content, note);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 注记与既有 `[Truncated N lines.]` 通知同时出现时的**相对顺序**：
+    /// 截断通知在最前（必须紧贴它说明的正文），注记在最后。
+    ///
+    /// 变异：把注记改成前插 ⇒ 本用例的前两条断言变红。
+    #[tokio::test]
+    async fn test_redundant_cd_note_does_not_displace_the_truncation_notice() {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let ws = dir.canonicalize().unwrap();
+        let abs = ws.display().to_string();
+        let tool = BashTool::new(ws.clone());
+
+        let input = json!({
+            "command": format!(
+                "cd {abs} && awk 'BEGIN {{ s=\"\"; for (i=0;i<40;i++) s=s \"x\"; \
+                 for (i=0;i<3000;i++) print s }}'"
+            )
+        });
+        let result = tool.call(input, make_ctx()).await.unwrap();
+
+        assert!(
+            result.content.starts_with("[Truncated 1752 lines.]\n\n"),
+            "截断通知仍须在最前；实际开头：{:?}",
+            result.content.chars().take(60).collect::<String>()
+        );
+        assert!(
+            result.content.ends_with(&format!(
+                "[bash: this shell already started in {abs}; the leading cd changed nothing]"
+            )),
+            "注记应在最末"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 工作目录不成立 ⇒ **硬报错**，而不是让 `spawn` 报一句与「命令本身有问题」
+    /// 无法区分的 `Failed to spawn command`（对齐 pi 的 `Working directory does not exist`）。
+    ///
+    /// 变异：删掉 `call` 里的前置校验 ⇒ 退回 spawn 失败路径 ⇒ 两条断言都变红。
+    #[tokio::test]
+    async fn test_missing_workspace_is_an_explicit_error() {
+        let dir = test_dir();
+        assert!(!dir.exists(), "本用例要求目录不存在");
+        let tool = BashTool::new(dir.clone());
+
+        let err = tool
+            .call(json!({ "command": "echo hi" }), make_ctx())
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Working directory does not exist"), "{msg}");
+        assert!(msg.contains(&dir.display().to_string()), "{msg}");
+    }
+
+    /// 工作目录**是文件**（不是目录）⇒ 文案必须与「不存在」区分开，否则用户查错方向。
+    #[tokio::test]
+    async fn test_workspace_that_is_not_a_directory_is_an_explicit_error() {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let file = dir.join("not-a-dir");
+        tokio::fs::write(&file, "x").await.unwrap();
+        let tool = BashTool::new(file.clone());
+
+        let err = tool
+            .call(json!({ "command": "echo hi" }), make_ctx())
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("is not a directory"), "{msg}");
+        assert!(msg.contains(&file.display().to_string()), "{msg}");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

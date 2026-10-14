@@ -27,7 +27,7 @@ use ys_protocol::SessionSummary;
 use ys_session::SessionMeta;
 
 use crate::config::Config;
-use crate::provider::AuthEntry;
+use crate::provider::{AuthEntry, ProviderRegistry};
 use crate::state::{AppState, StateStore};
 use crate::wiring::Wiring;
 
@@ -151,23 +151,50 @@ pub fn logout(config: &mut Config, wiring: &mut Wiring, state: &StateStore) -> V
 /// `/model <name>`：切模型并重建（经 factory）。带参数的那条路径 —— 无参的
 /// 「浮层选一个」在 TUI 里，选完照样发 [`Request::SetModel`]。
 ///
-/// **跨 provider 选模型**：`/model` 浮层的候选是**所有已登录 provider** 的并集，
-/// 选中别家的模型时必须连端点一起切 —— 只改 `config.model` 会把 A 家的模型名发到
-/// B 家的 base（换来一个 400）。归属由 [`ProviderRegistry::provider_for_model`]
-/// 定位（启动期拉到的目录，回退静态表）；目录里都没有的手敲名字**保持当前
-/// provider 不变**。
+/// **跨 provider 选模型**：候选是所有已登录 provider 的并集，选中别家的模型时必须连
+/// 端点一起切 —— 只改 `config.model` 会把 A 家的模型名发到 B 家的 base（换来一个 400）。
+///
+/// # 归属从哪来（`provider` 形参）
+///
+/// 三条来源，**优先级从高到低**：
+///
+/// 1. **`provider` 形参**（浮层选中时由 UI 带上）—— 权威，直接采用；
+/// 2. **限定名** `provider/model`（手敲）—— 仅当 `/` 前的部分**逐字命中一个已知
+///    provider 名**时才拆（见 [`ProviderRegistry::find_provider`]）。不这么做的话，
+///    目录里带 `/` 的网关模型（OpenRouter 风格的 `vendor/model`）会被误切；
+/// 3. **反查** [`ProviderRegistry::provider_for_model`]（裸模型名兜底）。
+///
+/// 为什么不让「反查」独自承担：它遍历 `model_cache`（`HashMap`，**迭代顺序不确定**）
+/// 返回第一个含该 id 的 provider —— 两个 provider 的目录里出现**逐字同名**的 id 时，
+/// 归属是任意的，会把端点静默切到错误的一家。1/2 都把归属**显式带过来**，绕开这个猜测。
+///
+/// 三条都没命中 ⇒ **保持当前 provider 不变**（既有语义：目录里都没有的手敲名字，
+/// 只改 `config.model` 而不动端点）。
 ///
 /// [`Request::SetModel`]: ys_protocol::Request::SetModel
 /// [`ProviderRegistry::provider_for_model`]: crate::provider::ProviderRegistry::provider_for_model
+/// [`ProviderRegistry::find_provider`]: crate::provider::ProviderRegistry::find_provider
 pub fn set_model(
     config: &mut Config,
     wiring: &mut Wiring,
     state: &StateStore,
     model: &str,
+    provider: Option<&str>,
 ) -> Vec<String> {
     let mut out = Vec::new();
 
-    if let Some(owner) = config.registry.provider_for_model(model)
+    let (model, owner) = match provider {
+        Some(p) => (model.to_string(), Some(p.to_string())),
+        None => match split_qualified_model(model, &config.registry) {
+            Some((p, bare)) => (bare, Some(p)),
+            None => (
+                model.to_string(),
+                config.registry.provider_for_model(model),
+            ),
+        },
+    };
+
+    if let Some(owner) = owner
         && config.provider.as_deref() != Some(owner.as_str())
         && let Some(entry) = config.registry.auth_for(&owner).cloned()
     {
@@ -181,11 +208,11 @@ pub fn set_model(
         out.push(format!("Provider switched: {from} → {owner}"));
     }
 
-    config.model = model.to_string();
+    config.model = model.clone();
 
     if let Err(e) = state.save(&AppState {
         last_active_provider: config.provider.clone(),
-        last_active_model: Some(model.to_string()),
+        last_active_model: Some(model.clone()),
     }) {
         out.push(format!("Warning: Could not persist state: {e}"));
     }
@@ -205,6 +232,22 @@ pub fn set_model(
         }
     }
     out
+}
+
+/// 拆 `/model` 的**限定名** `provider/model`：仅当 `/` 前那段逐字命中一个已知 provider
+/// 名时才拆，返回 `(provider, 裸模型名)`；否则 `None`（整串当模型 id）。
+///
+/// **判据必须是「命中已知 provider 名」而不是「含 `/`」**：网关的模型 id 本身可以带
+/// `/`（`vendor/model` 形态），见到 `/` 就拆会把它们误切成「provider=vendor」。
+///
+/// 变异：把 `registry.find_provider(prefix)?` 换成 `Some(())`（即任何 `/` 都拆）
+/// ⇒ `test_set_model_slash_model_not_split_when_prefix_unknown` 变红。
+fn split_qualified_model(model: &str, registry: &ProviderRegistry) -> Option<(String, String)> {
+    let (prefix, rest) = model.split_once('/')?;
+    if rest.is_empty() || registry.find_provider(prefix).is_none() {
+        return None;
+    }
+    Some((prefix.to_string(), rest.to_string()))
 }
 
 /// `/new`：换会话（`Wiring::new_session`）。一次性会话返回 `None`。
@@ -767,7 +810,7 @@ mod tests {
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = set_model(&mut config, &mut wiring, &state, "deepseek-reasoner");
+        let out = set_model(&mut config, &mut wiring, &state, "deepseek-reasoner", None);
 
         assert_eq!(config.model, "deepseek-reasoner");
         assert_eq!(wiring.model_id(), Some("dummy"), "应重建并交给接线器");
@@ -793,7 +836,7 @@ mod tests {
             Wiring::ephemeral(Some(Box::new(DummyModel)), Box::new(CollectingSink::new()));
         assert!(wiring.model_id().is_some());
 
-        let out = set_model(&mut config, &mut wiring, &state, "gpt-4o");
+        let out = set_model(&mut config, &mut wiring, &state, "gpt-4o", None);
 
         assert_eq!(config.model, "gpt-4o");
         assert!(
@@ -1186,7 +1229,7 @@ mod tests {
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = set_model(&mut config, &mut wiring, &state, "MiniMax-Text-01");
+        let out = set_model(&mut config, &mut wiring, &state, "MiniMax-Text-01", None);
 
         assert_eq!(config.provider.as_deref(), Some("minimax"), "{out:?}");
         assert_eq!(
@@ -1235,13 +1278,141 @@ mod tests {
         let (state, state_dir) = test_state();
         let mut wiring = test_wiring();
 
-        let out = set_model(&mut config, &mut wiring, &state, "my-local-model");
+        let out = set_model(&mut config, &mut wiring, &state, "my-local-model", None);
 
         assert_eq!(config.provider.as_deref(), Some("deepseek"), "{out:?}");
         assert_eq!(config.api_base.as_deref(), Some("https://api.deepseek.com"));
         assert!(
             !out.iter().any(|l| l.contains("Provider switched")),
             "未知名不该切 provider：{out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// **显式归属压倒反查**：两个 provider 的目录里出现**逐字同名**的 id 时，
+    /// `provider_for_model` 的答案是任意的（它遍历 `model_cache`，`HashMap` 迭代顺序
+    /// 不确定）—— 靠它定位会把端点**静默切到错的一家**。浮层选中时带上来的 provider
+    /// 必须直接采用。
+    ///
+    /// 变异：忽略 `provider` 形参、仍走 `provider_for_model` ⇒ 命中任一家（本用例里
+    /// 期望的是 opencode-go，而反查先撞到谁不由本用例决定，但**必然**不再保证是它）
+    /// ⇒ 端点/密钥断言变红。这正是「静默切错 base」的回归锚。
+    #[test]
+    fn test_set_model_prefers_explicit_provider_over_lookup() {
+        let (mut config, dir) = test_config();
+        config.provider = Some("deepseek".into());
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-ds".into());
+        for (name, base, key) in [
+            ("deepseek", "https://api.deepseek.com", "sk-ds"),
+            ("opencode-go", "https://opencode.ai/zen/go/v1", "sk-oc"),
+        ] {
+            config
+                .registry
+                .save_auth(
+                    name,
+                    &AuthEntry {
+                        api_base: base.into(),
+                        api_key: key.into(),
+                        model: "shared-flash".into(),
+                    },
+                )
+                .unwrap();
+            config.registry.seed_cached_models(base, &["shared-flash"]);
+        }
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(
+            &mut config,
+            &mut wiring,
+            &state,
+            "shared-flash",
+            Some("opencode-go"),
+        );
+
+        assert_eq!(config.provider.as_deref(), Some("opencode-go"), "{out:?}");
+        assert_eq!(
+            config.api_base.as_deref(),
+            Some("https://opencode.ai/zen/go/v1"),
+            "端点必须跟显式归属走，而不是反查挑中的那家"
+        );
+        assert_eq!(config.api_key.as_deref(), Some("sk-oc"));
+        assert_eq!(config.model, "shared-flash");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// `/model deepseek/deepseek-chat` 直发：`/` 前是**已知 provider 名** ⇒ 拆开，
+    /// `model` 落盘为**裸名**（前缀只用于定位端点）。
+    #[test]
+    fn test_set_model_qualified_name_splits_when_prefix_is_known_provider() {
+        let (mut config, dir) = test_config();
+        config.provider = Some("minimax".into());
+        config.api_base = Some("https://api.minimax.chat/v1".into());
+        config.api_key = Some("sk-mm".into());
+        config
+            .registry
+            .save_auth(
+                "deepseek",
+                &AuthEntry {
+                    api_base: "https://api.deepseek.com".into(),
+                    api_key: "sk-ds".into(),
+                    model: "deepseek-chat".into(),
+                },
+            )
+            .unwrap();
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(
+            &mut config,
+            &mut wiring,
+            &state,
+            "deepseek/deepseek-chat",
+            None,
+        );
+
+        assert_eq!(config.provider.as_deref(), Some("deepseek"), "{out:?}");
+        assert_eq!(config.model, "deepseek-chat", "model 必须是裸名，不带前缀");
+        assert!(
+            out.iter()
+                .any(|l| l.contains("Provider switched: minimax → deepseek")),
+            "切换应告知用户：{out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// **网关的模型 id 可以自带 `/`**（`vendor/model` 形态）⇒ 前缀**不是**已知 provider
+    /// 名时整串当模型 id —— 否则会被误切成「provider=vendor」，把端点带跑。
+    ///
+    /// 变异：`split_qualified_model` 去掉 `registry.find_provider(prefix).is_none()`
+    /// 这一判据（任何 `/` 都拆）⇒ `config.model` 变 `claude-3`、provider 变
+    /// `anthropic` ⇒ 本用例变红。
+    #[test]
+    fn test_set_model_slash_model_not_split_when_prefix_unknown() {
+        let (mut config, dir) = test_config();
+        config.provider = Some("deepseek".into());
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-ds".into());
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(&mut config, &mut wiring, &state, "anthropic/claude-3", None);
+
+        assert_eq!(
+            config.model, "anthropic/claude-3",
+            "前缀非已知 provider ⇒ 整串是模型 id：{out:?}"
+        );
+        assert_eq!(
+            config.provider.as_deref(),
+            Some("deepseek"),
+            "未知名不得改端点：{out:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

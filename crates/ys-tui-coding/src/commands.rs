@@ -232,12 +232,19 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
                 "用法：/thinking [on|off]（`{other}` 不是有效取值）"
             ))),
         },
-        // **无参不直发 SetModel** —— 先开浮层选（设计 §6）
+        // **无参不直发 SetModel** —— 先开浮层选（设计 §6）。
+        //
+        // 有参时**原样透传**（`provider: None`）：限定名 `provider/model` 的拆分
+        // **不在这里做** —— 本层拿不到 provider 名单（`parse` 是纯函数，签名里没有
+        // registry），见 `capabilities::set_model`。UI 只负责「发用户敲的那串」。
         "model" => {
             if args.is_empty() {
                 Action::Prompt(PromptKind::PickModel)
             } else {
-                Action::Request(Request::SetModel { model: arg() })
+                Action::Request(Request::SetModel {
+                    model: arg(),
+                    provider: None,
+                })
             }
         }
         "login" => Action::Prompt(PromptKind::Login),
@@ -494,6 +501,7 @@ mod tests {
                 "/model gpt-4o",
                 Action::Request(Request::SetModel {
                     model: "gpt-4o".into(),
+                    provider: None,
                 }),
             ),
             ("/login", Action::Prompt(PromptKind::Login)),
@@ -551,7 +559,15 @@ mod tests {
         .collect();
 
         let view = CodingView::for_test();
-        let fake = crate::prompter::FakePrompter::ok(["deepseek", "sk-1", "deepseek-chat"]);
+        // `/model` 浮层的答案必须是**显示串**（`Prompter::select` 的契约：回传候选里的一项）。
+        // 从视图派生而非写死 —— 本用例的题目是「每条命令都能产出请求」，
+        // 不该与标签格式耦合（格式另有 `ModelEntry::label` 的专门用例）。
+        let model_choice = crate::view::ModelEntry::label(&view.available_models[0]);
+        let fake = crate::prompter::FakePrompter::with_answers(vec![
+            Ok("deepseek".to_string()),
+            Ok("sk-1".to_string()),
+            Ok(model_choice),
+        ]);
         for input in ["/login", "/model"] {
             match parse(input) {
                 Action::Prompt(kind) => produced.push(

@@ -57,6 +57,15 @@ const USER_GAP_ROWS: usize = 2;
 /// 窗口小于此尺寸直接不渲染（留给「终端太小」）。
 const MIN_WIDTH: u16 = 10;
 const MIN_HEIGHT: u16 = 5;
+
+/// 筛选无命中时占位的那行（有候选但都不匹配）。中文全角括号，与既有提示同风格。
+const NO_MATCH: &str = "（无匹配）";
+
+/// 筛选框为空时的占位文案 —— **可筛选这件事在这里告诉用户**，不进标题。
+///
+/// 标题里塞「输入筛选」会把整框撑到 60+ 列（原有标题约 40 列），窄终端下反而被裁掉；
+/// 而提示放在输入框里，位置更对：正是用户要敲字的地方。
+const FILTER_PLACEHOLDER: &str = "输入以筛选…";
 /// 补全浮层的最大宽度（再宽也只是空荡荡的一行）。
 const COMPLETION_MAX_WIDTH: u16 = 64;
 /// 模态浮层的宽度夹取区间。
@@ -274,11 +283,18 @@ fn draw_completion(frame: &mut Frame, chat: Rect, state: &CompletionState) {
 
 /// 一帧里要额外盖上去的模态浮层。
 pub(crate) enum Modal<'a> {
-    /// 选项选择器（`/login` 选 provider、`/model` 无参选模型）。
+    /// 选项选择器（`/login` 选 provider、`/model` 无参选模型、`/skills`、`/resume`）。
     Select {
         prompt: &'a str,
+        /// 全量候选（`filtered` 里的下标指向它）。
         options: &'a [String],
+        /// 经筛选后**保序**的下标。空查询时即 `0..options.len()`。
+        filtered: &'a [usize],
+        /// 在 **`filtered`** 内的下标（不是 `options` 的下标 —— 两处语义不同，
+        /// 高亮/滚动/计数都用这一个）。
         selected: usize,
+        /// 常驻筛选输入框（内容 + 光标）。
+        query: &'a InputBuffer,
         page_size: usize,
     },
     /// 单行文本输入（`/login` 问 api_key）。
@@ -303,9 +319,11 @@ pub(crate) fn ui_with_modal(frame: &mut Frame, app: &mut App, modal: Modal<'_>) 
         Modal::Select {
             prompt,
             options,
+            filtered,
             selected,
+            query,
             page_size,
-        } => prompt_select(frame, prompt, options, selected, page_size),
+        } => prompt_select(frame, prompt, options, filtered, selected, query, page_size),
         Modal::Text {
             prompt,
             help,
@@ -317,60 +335,105 @@ pub(crate) fn ui_with_modal(frame: &mut Frame, app: &mut App, modal: Modal<'_>) 
 /// 模态选择器：`Clear` 后居中盖在整屏上 —— **同一套 alt-screen，不切屏、不让出终端**；
 /// 外部交互库与「切屏/恢复终端」那套机制按设计 §3 已作废。
 ///
+/// 首行是**常驻筛选输入框**（`> ` 前缀，光标由本函数落位），其下是过滤后的候选；
+/// 候选为空（有候选但都不匹配）时画一行「无匹配」—— **不早退**，否则用户看不到
+/// 自己敲的查询串，会以为浮层坏了。
+///
 /// 只画浮层本身；底下的界面由 [`ui_with_modal`] 先画好。
+#[allow(clippy::too_many_arguments)]
 fn prompt_select(
     frame: &mut Frame,
     prompt: &str,
     options: &[String],
+    filtered: &[usize],
     selected: usize,
+    query: &InputBuffer,
     page_size: usize,
 ) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT || options.is_empty() {
         return;
     }
-    let rows = (area.height - 2) as usize;
-    let visible = options.len().min(page_size.max(1)).min(rows).max(1);
-    let start = window_start(selected, options.len(), visible);
+    // 比原来少留一行：筛选行也要占一格。
+    let rows = area.height.saturating_sub(3) as usize;
+    let visible = filtered.len().min(page_size.max(1)).min(rows).max(1);
+    let start = window_start(selected, filtered.len(), visible);
 
     let hint = "↑↓ 选择 · Enter 确认 · Esc 取消";
     let title = format!(" {prompt} ({hint}) ");
-    // 宽度按「标题 / 最长选项」里更宽的那个算 —— 否则标题会被边框裁掉，
+    // 空查询时显示占位文案（光标仍落在 `> ` 之后）。
+    let (query_row, query_style) = if query.text.is_empty() {
+        (
+            format!("> {FILTER_PLACEHOLDER}"),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            format!("> {}", query.text),
+            Style::default().fg(Color::Cyan),
+        )
+    };
+    // 宽度按「标题 / 筛选行 / 最长候选」里更宽的那个算 —— 否则标题会被边框裁掉，
     // 用户就看不到「Esc 取消」这类唯一能学会操作的提示。
-    let content = options
+    let content = filtered
         .iter()
-        .map(|o| display_width(o))
+        .map(|i| display_width(&options[*i]))
         .max()
         .unwrap_or(0)
-        .max(display_width(&title));
+        .max(display_width(&query_row))
+        .max(display_width(&title))
+        .max(display_width(NO_MATCH));
     let w = modal_width(area, content);
-    let h = (visible + 2) as u16;
+    let h = (visible + 3) as u16; // 边框 2 + 筛选行 1 + 候选
     let rect = centered_rect(area, w, h);
 
     frame.render_widget(Clear, rect);
     let inner_w = (w.saturating_sub(2)) as usize;
-    let mut lines: Vec<Line<'static>> = options[start..start + visible]
-        .iter()
-        .enumerate()
-        .map(|(i, option)| {
-            let style = if start + i == selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Line::from(Span::styled(truncate_to_width(option, inner_w), style))
-        })
-        .collect();
-    if options.len() > visible {
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        truncate_to_width(&query_row, inner_w),
+        query_style,
+    ))];
+    if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("… {}/{}", selected + 1, options.len()),
+            truncate_to_width(NO_MATCH, inner_w),
             Style::default().fg(Color::DarkGray),
         )));
+    } else {
+        lines.extend(filtered[start..start + visible].iter().enumerate().map(
+            |(i, idx)| {
+                let style = if start + i == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(
+                    truncate_to_width(&options[*idx], inner_w),
+                    style,
+                ))
+            },
+        ));
+        if filtered.len() > visible {
+            lines.push(Line::from(Span::styled(
+                format!("… {}/{}", selected + 1, filtered.len()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(Block::bordered().title(title)),
-        rect,
-    );
+
+    let block = Block::bordered().title(title);
+    let inner = block.inner(rect);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
+
+    // 光标落在筛选行（按**显示宽度**定位，CJK 占 2 列 —— 同 `prompt_text`）；
+    // 与 `>` 前缀两列相加。
+    let col = 2 + display_width(query.text_before_cursor().rsplit('\n').next().unwrap_or(""));
+    if col < inner.width as usize {
+        frame.set_cursor_position(ratatui::layout::Position::new(
+            inner.x + col as u16,
+            inner.y,
+        ));
+    }
 }
 
 /// 模态单行输入（`/login` 问 api_key）。
@@ -1981,14 +2044,22 @@ mod tests {
     #[test]
     fn test_prompt_select_renders_options_and_highlight() {
         let options = vec!["deepseek".to_string(), "openai".to_string()];
+        let filtered = vec![0usize, 1];
+        let query = InputBuffer::new();
         let (rows, reversed) = render(60, 20, |f| {
-            prompt_select(f, "Select provider", &options, 1, 8)
+            prompt_select(f, "Select provider", &options, &filtered, 1, &query, 8)
         });
         let joined = rows.join("\n");
         assert!(joined.contains("Select provider"), "{joined}");
         assert!(joined.contains("deepseek"), "{joined}");
         assert!(joined.contains("openai"), "{joined}");
         assert!(joined.contains("Esc"), "应有取消提示：{joined}");
+        // CJK 是宽字符，占两格 ⇒ 行转字符串时第二格为空串，逐格拼出来是「输 入 以…」。
+        // 断言中文前先把空格去掉（ASCII 断言不受影响，仍按原样）。
+        assert!(
+            joined.replace(' ', "").contains("输入以筛选"),
+            "空查询时应显示占位文案（可筛选这件事在这里告诉用户）：{joined}"
+        );
 
         let highlighted: Vec<&String> = rows
             .iter()
@@ -2000,6 +2071,62 @@ mod tests {
         assert!(
             highlighted[0].contains("openai"),
             "selected=1 → {highlighted:?}"
+        );
+    }
+
+    /// 只有**过滤后**的候选被画出来，且高亮按 `filtered` 内的下标算 ——
+    /// 这是「高亮在 A、Enter 选中 B」错位的唯一防线（两处下标语义不同）。
+    ///
+    /// 变异：把 `options[*idx]` 换回 `options[i]` ⇒ 画出的是原列表的前两项
+    /// （`deepseek` / `opencode-go`）而不是被筛中的 ⇒ 变红。
+    #[test]
+    fn test_prompt_select_draws_only_filtered_rows() {
+        let options = vec![
+            "deepseek/deepseek-chat".to_string(),
+            "opencode-go/deepseek-flash".to_string(),
+            "minimax/MiniMax-M3".to_string(),
+        ];
+        let filtered = vec![2usize]; // 只筛中 minimax 那条
+        let query = InputBuffer::new();
+        let (rows, reversed) = render(60, 20, |f| {
+            prompt_select(f, "Select model", &options, &filtered, 0, &query, 8)
+        });
+        let joined = rows.join("\n");
+        assert!(joined.contains("minimax/MiniMax-M3"), "{joined}");
+        assert!(!joined.contains("deepseek/deepseek-chat"), "未筛中的不该画：{joined}");
+        assert!(!joined.contains("opencode-go"), "未筛中的不该画：{joined}");
+
+        let highlighted: Vec<&String> = rows
+            .iter()
+            .zip(&reversed)
+            .filter(|(_, rev)| **rev)
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(highlighted.len(), 1, "只高亮一项");
+        assert!(highlighted[0].contains("minimax"), "{highlighted:?}");
+    }
+
+    /// 筛选行画出查询串；**无匹配时画「无匹配」而不是空框** —— 否则用户看不到自己
+    /// 敲了什么，会以为浮层坏了。
+    ///
+    /// 变异：`if filtered.is_empty()` 分支删掉（直接画空列表）⇒ 变红。
+    #[test]
+    fn test_prompt_select_shows_query_and_no_match_line() {
+        let options = vec!["deepseek".to_string()];
+
+        let mut query = InputBuffer::new();
+        query.insert_str("mini");
+        let (rows, _) = render(60, 20, |f| {
+            prompt_select(f, "Select model", &options, &[], 0, &query, 8)
+        });
+        let joined = rows.join("\n");
+        // CJK 宽字符的空格问题同上一个用例。
+        let dense = joined.replace(' ', "");
+        assert!(joined.contains("> mini"), "筛选行应显示查询串：{joined}");
+        assert!(dense.contains("无匹配"), "{joined}");
+        assert!(
+            !dense.contains("输入以筛选"),
+            "有查询串时不该再显示占位：{joined}"
         );
     }
 
@@ -2058,6 +2185,8 @@ mod tests {
         let mut app = app_with(CodingView::for_test());
         app.transcript.push(TranscriptLine::User("hello".into()));
         let options = vec!["deepseek".to_string(), "openai".to_string()];
+        let filtered = vec![0usize, 1];
+        let query = InputBuffer::new();
 
         let rows = {
             let backend = TestBackend::new(80, 24);
@@ -2070,7 +2199,9 @@ mod tests {
                         Modal::Select {
                             prompt: "Select provider",
                             options: &options,
+                            filtered: &filtered,
                             selected: 0,
+                            query: &query,
                             page_size: 8,
                         },
                     )

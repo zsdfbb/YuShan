@@ -1189,7 +1189,8 @@ mod tests {
         assert_eq!(
             ch.next_request().unwrap(),
             Request::SetModel {
-                model: "gpt-4o".into()
+                model: "gpt-4o".into(),
+                provider: None,
             }
         );
         assert!(a.pending_prompt.is_none(), "有参不走浮层");

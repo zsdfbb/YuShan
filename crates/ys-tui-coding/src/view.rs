@@ -38,6 +38,43 @@ pub struct SkillEntry {
     pub description: String,
 }
 
+/// `/model` 浮层的一个候选：`model` 是 id，`provider` 是归属。
+///
+/// `provider == None` 表示**归属未知** —— 只可能出现在「当前正在跑 / `cfg.model` 补进候选」
+/// 那条路径上（无 `cfg.provider`，如 `YUSHAN_API_BASE` 直连的自定义端点）。那时显示退化为
+/// 裸模型名，选中也不带 provider（交 app 侧按目录反查）。
+///
+/// **为什么不并成 `provider/model` 一个字符串**：选中后要分别送进
+/// `Request::SetModel { model, provider }` —— 拼成一个串再在协议边界上拆，等于把
+/// 「哪个是 provider」这个判断推给下游去猜。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub provider: Option<String>,
+    pub model: String,
+    /// 当前正在跑的那一条。**唯一写者**是 app 侧的 `build_view`（据接线器持有的 model）。
+    pub current: bool,
+}
+
+impl ModelEntry {
+    /// 浮层里的显示串 —— **它同时是反解的契约**。
+    ///
+    /// `Prompter::select` 只回传显示串，调用方靠字符串相等找回条目（与 `skill_label` /
+    /// `session_label` 同一条纪律，见 `M10`）。故形状必须**唯一可辨**：
+    /// 有归属 → `provider/model`；无归属 → 裸 `model`；`current` → 追加 ` [current]`
+    /// （与 `session_label` 同形）。
+    pub fn label(&self) -> String {
+        let base = match &self.provider {
+            Some(p) => format!("{p}/{}", self.model),
+            None => self.model.clone(),
+        };
+        if self.current {
+            format!("{base} [current]")
+        } else {
+            base
+        }
+    }
+}
+
 /// coding agent 的显示快照。
 #[derive(Clone, Debug)]
 pub struct CodingView {
@@ -48,8 +85,8 @@ pub struct CodingView {
     pub logged_in_providers: Vec<String>,
     /// 已知 provider（供后续 `/login` 浮层选择器；同时供「要不要问 URL」判定）。
     pub providers: Vec<ProviderEntry>,
-    /// 可用模型名（供后续 `/model` 浮层选择器）。
-    pub available_models: Vec<String>,
+    /// `/model` 浮层的候选（带 provider 归属，见 [`ModelEntry`]）。
+    pub available_models: Vec<ModelEntry>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     pub turn_count: u32,
@@ -146,7 +183,11 @@ impl CodingView {
                     api_base: String::new(),
                 },
             ],
-            available_models: vec!["deepseek-chat".into()],
+            available_models: vec![ModelEntry {
+                provider: Some("deepseek".into()),
+                model: "deepseek-chat".into(),
+                current: true,
+            }],
             total_input_tokens: 0,
             total_output_tokens: 0,
             turn_count: 0,
@@ -276,5 +317,34 @@ mod tests {
             description: "d".into(),
         };
         assert_ne!(a, b, "label 不同即不等");
+    }
+
+    /// **`ModelEntry::label` 是浮层的显示串，同时是反解的契约** —— 三种形状各钉一遍。
+    ///
+    /// 变异：``Some(p) => format!("{p}/{}", …)`` 改成只返回 `model.clone()`
+    /// ⇒ 同名跨 provider 的两条 label 相同 ⇒ 反解只能找到第一条 ⇒ 本用例与
+    /// `prompter::tests::test_pick_model_selects_from_view_models` 一起变红。
+    #[test]
+    fn test_model_entry_label_shapes() {
+        let with_provider = ModelEntry {
+            provider: Some("deepseek".into()),
+            model: "deepseek-chat".into(),
+            current: false,
+        };
+        assert_eq!(with_provider.label(), "deepseek/deepseek-chat");
+
+        let unowned = ModelEntry {
+            provider: None,
+            model: "gw/model".into(),
+            current: false,
+        };
+        assert_eq!(unowned.label(), "gw/model", "归属未知 ⇒ 裸模型名");
+
+        let current = ModelEntry {
+            current: true,
+            ..with_provider.clone()
+        };
+        assert_eq!(current.label(), "deepseek/deepseek-chat [current]");
+        assert_ne!(current.label(), with_provider.label(), "[current] 必须可辨");
     }
 }

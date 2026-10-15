@@ -502,6 +502,10 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
 /// 状态行文案：**从尾部剥**（时长 → 轮数 → tokens → model）。
 ///
 /// `model` 最不可剥，故任何宽度下都至少显示它。
+///
+/// **回合进行中**首段换成 `⏳ Working…`，其后紧跟两个**进度段**（本回合轮号、已用秒数）
+/// —— 它们在剥除顺序里排在 tokens/轮数/时长**之前**，故「它在推进」这条信息在窄终端下
+/// 也保得住。回合结束后不再显示：那时轮号与耗时的权威形态是 transcript 里的 `Summary` 行。
 fn status_text(app: &App, width: usize) -> String {
     let model = if app.is_turning {
         format!("⏳ {}", app.working_text())
@@ -510,6 +514,12 @@ fn status_text(app: &App, width: usize) -> String {
     };
 
     let mut segs = vec![model];
+    if app.is_turning {
+        if let Some(round) = app.current_round {
+            segs.push(format!("第 {round} 轮"));
+        }
+        segs.push(format!("{:.0}s", app.turn_elapsed_secs()));
+    }
     if app.view.total_input_tokens > 0 || app.view.total_output_tokens > 0 {
         segs.push(format!(
             "↑{} ↓{}",
@@ -1351,6 +1361,50 @@ mod tests {
 
         let tiny = status_text(&app, 1);
         assert_eq!(tiny, "deepseek-chat", "极窄只剩 model");
+    }
+
+    /// 回合进行中：`⏳ Working…` 之后补两个**进度段**（本回合轮号、已用秒数）。
+    ///
+    /// 这是回合内唯一的进度刻度 —— 在此之前，一个跑 26 轮、六分钟的回合在界面上
+    /// 只有一个不动的动画。
+    ///
+    /// 变异：① 把进度段从 `segs` 里去掉 ⇒ 前两条断言变红；② 把进度段插到 `segs` **末尾**
+    /// ⇒ 剥段断言变红（窄屏会把轮号连同时长一起剥掉，而这正是最该留下的信息）。
+    #[test]
+    fn test_status_shows_round_and_elapsed_during_turn() {
+        let mut app = app_with(CodingView::for_test());
+        app.begin_local_turn("q".into());
+        app.current_round = Some(3);
+
+        let full = status_text(&app, 200);
+        assert!(full.contains("Working"), "回合中首段是 Working：{full}");
+        assert!(full.contains("第 3 轮"), "回合中要报轮号：{full}");
+        assert!(
+            !full.contains("deepseek-chat"),
+            "回合中不显示 model（被 Working 段替换）：{full}"
+        );
+
+        // 剥除顺序：秒数先于轮号被剥掉 ⇒ 宽度只够 [Working.. · 第 3 轮] 时，
+        // 「跑到第几轮」这条信息保得住。
+        let prefix = format!("⏳ {} · 第 3 轮", app.working_text());
+        assert_eq!(
+            status_text(&app, display_width(&prefix)),
+            prefix,
+            "秒数先被剥、轮号留住"
+        );
+    }
+
+    /// 回合结束后状态行不残留轮号 / 秒数 —— 那些信息的权威形态是 transcript 的 Summary 行。
+    ///
+    /// 变异：把 `status_text` 里 `if app.is_turning` 的闸去掉 ⇒ 本用例变红。
+    #[test]
+    fn test_status_has_no_progress_segments_outside_turn() {
+        let mut app = app_with(CodingView::for_test());
+        app.current_round = Some(5);
+
+        let txt = status_text(&app, 200);
+        assert!(!txt.contains("第 5 轮"), "回合外不得显示轮号：{txt}");
+        assert!(txt.contains("deepseek-chat"), "{txt}");
     }
 
     #[test]

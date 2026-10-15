@@ -60,6 +60,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 use ys_core::{ContentBlock, Message, Role};
+use ys_event::AgentEvent;
 use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
@@ -622,6 +623,34 @@ struct TurnCtx<'a> {
 /// [`AppLoopError`]（「UI 侧已收摊」）混为一谈 —— 后者才终止整个 app 循环。
 type TurnOutcome = Result<RunResult, LoopError>;
 
+/// 从事件流里累计**本回合已开始的轮数**（`RoundStarted` 每轮恰好一条）。
+///
+/// # 为什么不能只看 `RunResult.rounds`
+///
+/// `RunResult` 只在**成功**路径上被构造；模型调用失败时 `BasicLoop` 直接
+/// `return Err`，那份 `RunResult` 随栈丢弃 ⇒ 只看它会把失败回合一律记成 0 轮，
+/// 日志里的 `rounds=` 与实际跑过的轮数不符。事件流是成功与失败**两条路径共有**的
+/// 唯一来源（`RunFailed` 不带 rounds，`RunFinished` 只在成功时出现）。
+fn count_round(env: &Envelope, observed: &mut u32) {
+    if matches!(env.event, AgentEvent::RoundStarted { .. }) {
+        *observed += 1;
+    }
+}
+
+/// 本回合用于日志与 `cumulative_rounds` 的轮数：**成功取 `RunResult`，失败取事件流累计**。
+///
+/// 抽成纯函数只为可测 —— 内联在 `run_turn_once` 里时，「失败取 `observed`」这一步
+/// 没有任何用例够得着（日志去向是真实 HOME 下的文件，测试无法注入）。
+fn turn_rounds(outcome: &TurnOutcome, observed: u32) -> u32 {
+    match outcome {
+        Ok(result) => result.rounds,
+        Err(_) => observed,
+    }
+}
+
+/// 逐轮计时状态机 —— 定义在 [`crate::round_clock`]（两条入口共用同一套口径）。
+use crate::round_clock::{RoundClock, turn_cache, turn_line};
+
 /// 跑**一个回合**：排空残留边界 → `begin_turn` → 新建边界源 → `run_turn` 与事件
 /// 转发交错 → 回合末排空事件信道。**记账 / 写穿 meta 不在此处** —— 由调用方拿到
 /// [`TurnOutcome`] 后完成（复核判据也要用这份结果）。
@@ -653,6 +682,11 @@ async fn run_turn_once(
     // 放在回合**开头**（而非 login/set_model 各加一处）：命令的实现散在
     // `capabilities`，而窗口由 `config` 派生 —— 一处读取、不可能漂移。
     ctx.agent.set_context_window(ctx.config.context_window());
+    // 本回合**实际跑过的轮数**，从事件流累计（见 [`count_round`] 的理由）——
+    // 成功与失败两条路径都从这里取，不依赖 `RunResult` 是否存在。
+    let mut observed_rounds: u32 = 0;
+    // 逐轮读数（见 [`RoundClock`]）—— 与轮数累计共用同一个事件咽喉。
+    let mut clock = RoundClock::default();
     let outcome = {
         let ports = ctx.wiring.ports();
         ports.events.begin_turn(*ctx.turns);
@@ -680,6 +714,10 @@ async fn run_turn_once(
                 // （`env = … => match`）会让 select 每次都立刻选中它
                 // → 忙等。模式不匹配时 tokio 会**禁用**该分支。
                 Some(env) = ctx.sink_rx.recv() => {
+                    count_round(&env, &mut observed_rounds);
+                    if let Some(line) = clock.observe(&env, Instant::now()) {
+                        logging::log(&line);
+                    }
                     send(ctx.out_tx, Outbound::Event(env)).await?;
                 }
                 // 轮边界中途插话 / 中止：UI 写信道 ②，这里泵进
@@ -715,25 +753,32 @@ async fn run_turn_once(
     // 不复位、turn 摘要不显示），且会插到本条 `View` 之后。
     // 回合已结束 → 生产者不会再发，`try_recv` 排到 `Empty` 即止。
     while let Ok(env) = ctx.sink_rx.try_recv() {
+        count_round(&env, &mut observed_rounds);
+        if let Some(line) = clock.observe(&env, Instant::now()) {
+            logging::log(&line);
+        }
         send(ctx.out_tx, Outbound::Event(env)).await?;
+    }
+    // 兜底：`RoundStarted` 已开轮、终局事件却没跟到（失败路径理论上会发生）时，
+    // 仍为那一轮落一行 —— 排障时「跑了但没读数」比「读数为 0」更难查。
+    if let Some(line) = clock.take_line() {
+        logging::log(&line);
     }
 
     // §4.9 可观测性：每个回合边界经**日志**落一行（对 TUI 不可见，供排障）。
     // `elapsed` / `budget_remaining` 都取**整数秒**便于 grep；`budget_remaining`
     // 走 `saturating_duration_since` ⇒ 到点后为 0，绝不出现负数或 panic。
-    let rounds = match &outcome {
-        Ok(result) => result.rounds,
-        Err(_) => 0,
-    };
+    // 失败回合拿不到 `RunResult` ⇒ 用事件流里数到的轮数（见 [`turn_rounds`]）。
+    let rounds = turn_rounds(&outcome, observed_rounds);
     ctx.cumulative_rounds = ctx.cumulative_rounds.saturating_add(rounds);
     let remaining = ctx.deadline.saturating_duration_since(Instant::now());
-    logging::log(&format!(
-        "turn={} rounds={} elapsed={}s cumulative_rounds={} budget_remaining={}s",
+    logging::log(&turn_line(
         *ctx.turns,
         rounds,
-        ctx.request_started.elapsed().as_secs(),
+        ctx.request_started.elapsed(),
         ctx.cumulative_rounds,
-        remaining.as_secs(),
+        remaining,
+        turn_cache(&outcome),
     ));
 
     Ok(outcome)
@@ -800,7 +845,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId, Usage};
+    use ys_core::{ContentBlock, Message, Role, StopReason, ToolCall, ToolCallId, ToolResult, Usage};
     use ys_event::AgentEvent;
     use ys_model::{
         FinishReason, MockModel, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest,
@@ -1074,12 +1119,39 @@ mod tests {
             .collect()
     }
 
+    /// 失败回合的轮数取「事件流累计」—— 这条修复的全部意义。
+    ///
+    /// 背景（真实会话 `1791990139`）：一个回合跑了 26 轮、342 秒后模型流中断，
+    /// 日志记的却是 `rounds=0`，因为 `RunResult` 只在成功路径上被构造。
+    ///
+    /// 变异：把 `turn_rounds` 的 `Err` 分支改回 `0` ⇒ 第二条断言变红；
+    /// 把 `Ok` 分支改成也用 `observed` ⇒ 第一条断言变红。
+    #[test]
+    fn turn_rounds_prefers_result_then_observed() {
+        let ok: TurnOutcome = Ok(ys_loop::RunResult {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            rounds: 4,
+            final_message: None,
+        });
+        assert_eq!(turn_rounds(&ok, 9), 4, "成功时以 RunResult 为准");
+
+        let failed: TurnOutcome = Err(ys_loop::LoopError::Tool("boom".into()));
+        assert_eq!(turn_rounds(&failed, 26), 26, "失败时用事件流累计的轮数");
+        assert_eq!(
+            turn_rounds(&failed, 0),
+            0,
+            "首轮即失败 ⇒ 事件流一条都没收到，0 才是对的"
+        );
+    }
+
     /// 事件的**种类序列** —— 锁定顺序，而不只是集合。
     fn event_kinds(msgs: &[Outbound<CodingView>]) -> Vec<&'static str> {
         events_of(msgs)
             .iter()
             .map(|e| match &e.event {
                 AgentEvent::UserMessage { .. } => "UserMessage",
+                AgentEvent::RoundStarted { .. } => "RoundStarted",
                 AgentEvent::ModelTextDelta { .. } => "ModelTextDelta",
                 AgentEvent::RunFinished { .. } => "RunFinished",
                 AgentEvent::RunFailed { .. } => "RunFailed",
@@ -1348,7 +1420,12 @@ mod tests {
         );
         assert_eq!(
             event_kinds(&msgs),
-            vec!["UserMessage", "ModelTextDelta", "RunFinished"],
+            vec![
+                "UserMessage",
+                "RoundStarted",
+                "ModelTextDelta",
+                "RunFinished"
+            ],
             "事件顺序必须与循环产出顺序一致：{msgs:?}"
         );
         assert!(events_of(&msgs).iter().all(|e| e.turn == 1));

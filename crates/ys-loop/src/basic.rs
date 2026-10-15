@@ -324,6 +324,17 @@ impl AgentLoop for BasicLoop {
 
             // Step 5：组装 ModelRequest（ToolSpec 已在构建时缓存）
             rounds += 1;
+            // 轮开始的可见性事件：必须在模型调用**之前**发，消费者才能在本轮还在跑时
+            // 就知道「跑到第几轮」。走自由函数 `emit()`（异步慢路径）—— 循环内自产事件
+            // 不得走 `try_emit` 快路径（满了会被缓冲进 overflow，冲刷永不发生）。
+            //
+            // `round` 与终局 `RunFinished.rounds` 同口径（都在本行 `+= 1` 之后取值）。
+            emit(
+                ctx.events,
+                AgentEvent::RoundStarted { round: rounds },
+            )
+            .await
+            .map_err(LoopError::Event)?;
             let tools = ctx.registry.specs().to_vec();
             let request = ModelRequest {
                 messages: ctx.session.messages().to_vec(),

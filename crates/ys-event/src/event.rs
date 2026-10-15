@@ -8,6 +8,17 @@ pub enum AgentEvent {
     UserMessage {
         message: Message,
     },
+    /// 一轮开始：每轮**模型调用之前**发出一次。
+    ///
+    /// **非终局**：终局事件仍只有 `RunFinished` / `RunFailed`，本事件不影响
+    /// `-p` / `--json` 消费循环的退出条件。
+    ///
+    /// `round` 从 `1` 起，与该回合 `RunFinished.rounds` / `RunResult.rounds` **同口径**。
+    /// 存在的理由是**回合进行中的可见性**：一个回合可能跑几十轮、每轮数秒，此前消费者
+    /// 只能等终局事件才知道「跑到第几轮、还要多久」，UI 因此只能显示一个不动的进度点。
+    RoundStarted {
+        round: u32,
+    },
     ModelTextDelta {
         text: String,
     },

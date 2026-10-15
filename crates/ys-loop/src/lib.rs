@@ -128,9 +128,13 @@ mod tests {
         // 检查事件（纯文本路径）
         let evts = events.events();
         assert!(matches!(&evts[0], AgentEvent::UserMessage { .. }));
-        assert!(matches!(&evts[1], AgentEvent::ModelTextDelta { text } if text == "hello world"));
+        assert!(
+            matches!(&evts[1], AgentEvent::RoundStarted { round: 1 }),
+            "轮开始事件必须先于该轮的模型输出，且首轮为 1：{evts:?}"
+        );
+        assert!(matches!(&evts[2], AgentEvent::ModelTextDelta { text } if text == "hello world"));
         assert!(matches!(
-            &evts[2],
+            &evts[3],
             AgentEvent::RunFinished {
                 stop_reason: StopReason::Completed,
                 ..
@@ -655,13 +659,15 @@ mod tests {
         assert_eq!(result.rounds, 1);
         assert!(result.final_message.is_some());
 
-        // 事件序列与今日逐字节一致：UserMessage → ModelTextDelta → RunFinished
+        // 事件序列恰好是这四条（不得多也不得少）：
+        // UserMessage → RoundStarted → ModelTextDelta → RunFinished
         let evts = events.events();
-        assert_eq!(evts.len(), 3, "无 boundary 时不得多出任何事件");
+        assert_eq!(evts.len(), 4, "无 boundary 时不得多出任何事件");
         assert!(matches!(&evts[0], AgentEvent::UserMessage { .. }));
-        assert!(matches!(&evts[1], AgentEvent::ModelTextDelta { text } if text == "hello world"));
+        assert!(matches!(&evts[1], AgentEvent::RoundStarted { round: 1 }));
+        assert!(matches!(&evts[2], AgentEvent::ModelTextDelta { text } if text == "hello world"));
         assert!(matches!(
-            &evts[2],
+            &evts[3],
             AgentEvent::RunFinished {
                 stop_reason: StopReason::Completed,
                 ..

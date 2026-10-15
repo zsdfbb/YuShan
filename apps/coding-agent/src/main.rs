@@ -49,6 +49,7 @@ mod follow_up;
 mod logging;
 mod prompt;
 mod provider;
+mod round_clock;
 mod sessions;
 mod skills;
 mod state;
@@ -83,6 +84,7 @@ use ys_tools_web::WebConfig;
 use ys_tui_coding::CodingView;
 
 use channel::{ChannelSink, ChannelStatsHandle};
+use round_clock::RoundClock;
 use wiring::Wiring;
 
 /// 运行模式。
@@ -462,12 +464,25 @@ where
     W: Write,
     F: FnMut(&mut W, &Envelope) -> io::Result<()>,
 {
+    // 逐轮读数（`crate::round_clock`）：`-p` / `--json` 与 TUI 落同一套行，跨入口可比。
+    // 时钟建在**消费者**里，是因为两条入口的消费点不同（TUI 是 `app_loop` 的事件泵）。
+    let mut clock = RoundClock::default();
     while let Some(env) = rx.recv().await {
+        if let Some(line) = clock.observe(&env, Instant::now()) {
+            logging::log(&line);
+        }
         on_event(&mut w, &env)?;
         w.flush()?;
         if is_terminal(&env.event) {
+            // 兜底：终局事件没能关闭某轮（理论上不会）时仍落一行。
+            if let Some(line) = clock.take_line() {
+                logging::log(&line);
+            }
             return Ok(());
         }
+    }
+    if let Some(line) = clock.take_line() {
+        logging::log(&line);
     }
     // 信道关闭（正常路径不依赖此分支：agent 不 drop 信道）——不 panic，正常收尾。
     w.flush()
@@ -1060,8 +1075,10 @@ async fn run_single_turn(
     config: Option<&config::Config>,
     subagent: Option<&subagent::SubagentSetup>,
 ) -> Result<RunResult, LoopError> {
-    let deadline = Instant::now() + budget;
-
+    // 预算计时原点与本回合耗时原点**同一个** —— 两个 `Instant::now()` 会让
+    // `elapsed` 与 `budget_remaining` 对不上账。
+    let started = Instant::now();
+    let deadline = started + budget;
     // 本回合专属的边界源：`Abort` 的标志位随回合作废，绝不跨回合复用。
     let boundary = QueueBoundarySource::new();
     let ports = wiring.ports_with_boundary(Some(&boundary));
@@ -1097,7 +1114,7 @@ async fn run_single_turn(
         }
     };
     // 子 agent 的 usage **上卷**：预算独立、记账上卷（ADR-0029 决策）。
-    match outcome {
+    let outcome = match outcome {
         Ok(mut r) => {
             r.usage = r.usage + totals.drain();
             // 空产出在**一次性模式**下必须留一行可见说明（`-p` 只打文本增量，否则 stderr
@@ -1110,7 +1127,21 @@ async fn run_single_turn(
             Ok(r)
         }
         Err(e) => Err(e),
+    };
+    // 回合边界读数（与 TUI 入口同格式，跨入口可 grep 比对）。
+    // **只在成功路径落**：失败回合拿不到 `RunResult`，写 `rounds=0` 会把「没跑到」与
+    // 「跑了 N 轮才失败」混同 —— 那一回合的轮数由逐轮行给出（见 `crate::round_clock`）。
+    if let Ok(r) = &outcome {
+        logging::log(&round_clock::turn_line(
+            1,
+            r.rounds,
+            started.elapsed(),
+            r.rounds,
+            deadline.saturating_duration_since(Instant::now()),
+            round_clock::turn_cache(&outcome),
+        ));
     }
+    outcome
 }
 
 /// `-p` 模式的事件消费：只把 [`AgentEvent::ModelTextDelta`] 的文本增量写入 `w`

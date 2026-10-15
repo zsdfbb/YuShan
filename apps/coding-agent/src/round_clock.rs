@@ -1,0 +1,356 @@
+//! **逐轮读数**：把事件流按「首 token 延迟 / 生成 / 工具」三段计时，落进 `yushan.log`。
+//!
+//! 存在的理由：一次运行的墙钟 ≈ 轮数 × 每轮模型耗时，而工具执行是毫秒项
+//! （见 `docs/arch/explore-speed/cost-model.md`）。在此之前这两个数都不可见 ——
+//! 唯一的回合级读数只有 `turn=` 行里的整数秒，工具那半完全没有。
+//!
+//! # 为什么在消费者侧、而不是在循环里
+//!
+//! 段的边界全部取自**既有事件**，故不需要在 `ys-loop` 里插桩、也不新增事件变体
+//! （也不改 `--json` 的对外契约）：
+//!
+//! ```text
+//! RoundStarted ──ttft──▶ 首个模型增量 ──gen──▶ 末个模型增量
+//!              └────────────tools────────────▶ 首/末个 ToolResult
+//! ```
+//!
+//! 代价是时间戳取**消费者收到事件的时刻**，含信道传输 —— 信道是同进程内的有界
+//! 队列，相对秒级的模型往返可忽略。
+//!
+//! # 两条入口
+//!
+//! TUI 走 `app_loop` 的事件泵，`-p` / `--json` 走 `main::consume_events`；两者都在
+//! 本模块的同一套口径下落行，故跨入口可比。
+//!
+//! # 口径
+//!
+//! - `ttft` = 收到 `RoundStarted` → 收到首个模型增量，即**排队 + prefill**（缓存未命中的部分也在这里）。
+//! - `gen` = 首末模型增量之间，即**解码**。无增量但发起了工具调用的轮，取 `ToolCall`
+//!   到达时刻为生成终点（循环是先收完模型响应再 emit `ToolCall`）。
+//! - `tools` = 首末 `ToolResult` 之间。无工具调用的轮记 0。
+//! - 三者之外的余额（组装请求、落盘、事件转发）不计入任何一段 ⇒ **三段之和 ≤ total**。
+
+use std::time::{Duration, Instant};
+
+use ys_event::AgentEvent;
+use ys_loop::{LoopError, RunResult};
+use ys_protocol::Envelope;
+
+/// 两个时刻之间的毫秒数；任一缺失记 0（该段没有对应事件）。
+fn span_ms(from: Option<Instant>, to: Option<Instant>) -> u128 {
+    match (from, to) {
+        (Some(a), Some(b)) => b.saturating_duration_since(a).as_millis(),
+        _ => 0,
+    }
+}
+
+/// 逐轮计时状态机：吃事件、吐可观测行。
+#[derive(Default)]
+pub(crate) struct RoundClock {
+    round: Option<u32>,
+    started: Option<Instant>,
+    first_token: Option<Instant>,
+    last_model: Option<Instant>,
+    first_tool: Option<Instant>,
+    last_tool: Option<Instant>,
+}
+
+impl RoundClock {
+    /// 观察一条事件，返回**刚被它关闭的那一轮**的可观测行（没有则 `None`）。
+    pub(crate) fn observe(&mut self, env: &Envelope, now: Instant) -> Option<String> {
+        match &env.event {
+            AgentEvent::RoundStarted { round } => {
+                let closed = self.take_line();
+                self.round = Some(*round);
+                self.started = Some(now);
+                closed
+            }
+            AgentEvent::ModelTextDelta { .. } | AgentEvent::ModelThinkingDelta { .. } => {
+                self.first_token.get_or_insert(now);
+                self.last_model = Some(now);
+                None
+            }
+            AgentEvent::ToolCall { .. } => {
+                self.first_tool.get_or_insert(now);
+                None
+            }
+            AgentEvent::ToolResult { .. } => {
+                self.last_tool = Some(now);
+                None
+            }
+            // 终局事件之后不会再有本轮的增量/工具事件 ⇒ 就地收尾这一轮。
+            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. } => self.take_line(),
+            _ => None,
+        }
+    }
+
+    /// 关闭当前轮并返回其可观测行；无进行中的轮时为 `None`。
+    pub(crate) fn take_line(&mut self) -> Option<String> {
+        let round = self.round.take()?;
+        // 生成终点：末个模型增量与首个 `ToolCall` 取较晚者（正常是后者更晚）。
+        let model_end = match (self.last_model, self.first_tool) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let line = format!(
+            "round={round} ttft_ms={} gen_ms={} tools_ms={} total_ms={}",
+            span_ms(self.started, self.first_token),
+            span_ms(self.first_token, model_end),
+            span_ms(self.first_tool, self.last_tool),
+            span_ms(self.started, self.last_tool.or(model_end)),
+        );
+        self.started = None;
+        self.first_token = None;
+        self.last_model = None;
+        self.first_tool = None;
+        self.last_tool = None;
+        Some(line)
+    }
+}
+
+/// 本回合的 prompt 缓存读数 `(命中, 未命中)`；**读不到**时为 `None`。
+///
+/// 两种「没有」都要归为 `None`，否则会把排查引到错的方向：
+/// - **失败回合**压根拿不到 `RunResult`。
+/// - **provider 不上报**：用量存在（`input_tokens > 0`）但缓存两个字段时间为 0。
+///   这时「0 命中」与「没上报」在数值上完全一样 —— 一律记「没有读数」，
+///   而不是伪造成「缓存 0% 命中」。
+pub(crate) fn turn_cache(outcome: &Result<RunResult, LoopError>) -> Option<(u32, u32)> {
+    let usage = &outcome.as_ref().ok()?.usage;
+    if usage.prompt_cache_hit_tokens == 0
+        && usage.prompt_cache_miss_tokens == 0
+        && usage.input_tokens > 0
+    {
+        return None;
+    }
+    Some((
+        usage.prompt_cache_hit_tokens,
+        usage.prompt_cache_miss_tokens,
+    ))
+}
+
+/// 回合边界日志行 —— 两条入口**同格式**，便于跨入口 grep 比对。
+///
+/// 时间一律取**整数秒**（便于 grep）；`budget_remaining` 由调用方用
+/// `saturating_duration_since` 算好，绝不出现负数。
+pub(crate) fn turn_line(
+    turn: u32,
+    rounds: u32,
+    elapsed: Duration,
+    cumulative_rounds: u32,
+    budget_remaining: Duration,
+    cache: Option<(u32, u32)>,
+) -> String {
+    // 失败回合没有用量来源 ⇒ 用 `-` 与「服务端没报」的 0 区分开。
+    let (hit, miss) = match cache {
+        Some((hit, miss)) => (hit.to_string(), miss.to_string()),
+        None => ("-".to_string(), "-".to_string()),
+    };
+    format!(
+        "turn={turn} rounds={rounds} elapsed={}s cumulative_rounds={cumulative_rounds} \
+         budget_remaining={}s cache_hit={hit} cache_miss={miss}",
+        elapsed.as_secs(),
+        budget_remaining.as_secs(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use ys_core::{StopReason, ToolCall, ToolCallId, ToolResult, Usage};
+    use ys_protocol::Source;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    /// 造一个信封 —— [`RoundClock`] 只看事件**变体**，故载荷取最小可用值。
+    fn env_of(event: AgentEvent) -> Envelope {
+        Envelope::new(Source::default(), 1, event)
+    }
+
+    fn text_delta() -> AgentEvent {
+        AgentEvent::ModelTextDelta { text: "x".into() }
+    }
+
+    fn tool_call() -> AgentEvent {
+        AgentEvent::ToolCall {
+            call: ToolCall {
+                id: ToolCallId("c1".into()),
+                name: "read".into(),
+                arguments: serde_json::Value::Null,
+            },
+        }
+    }
+
+    fn tool_result() -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: ToolCallId("c1".into()),
+            result: ToolResult {
+                content: "ok".into(),
+                is_error: false,
+            },
+        }
+    }
+
+    fn usage(hit: u32, miss: u32) -> Usage {
+        Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: miss,
+        }
+    }
+
+    fn result_with(usage: Usage) -> Result<RunResult, LoopError> {
+        Ok(RunResult {
+            stop_reason: StopReason::Completed,
+            usage,
+            rounds: 1,
+            final_message: None,
+        })
+    }
+
+    /// 三段口径：`ttft`（排队 + prefill）/ `gen`（解码）/ `tools`。
+    ///
+    /// 变异：① `ttft` 的起点从 `started` 改成 `first_token` ⇒ 恒为 0；
+    /// ② `model_end` 的 `a.max(b)` 退化成 `a` ⇒ 有工具调用的轮 `gen` 短一截；
+    /// ③ `tools` 的起点从 `first_tool` 改成 `last_tool` ⇒ 恒为 0。
+    #[test]
+    fn round_clock_splits_ttft_gen_and_tools() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        assert!(
+            clock
+                .observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0)
+                .is_none(),
+            "开轮本身不落行"
+        );
+        clock.observe(&env_of(text_delta()), t0 + 100 * MS);
+        clock.observe(&env_of(text_delta()), t0 + 300 * MS);
+        // `ToolCall` **刻意晚于**末个增量 —— 两者取较晚者才是「解码结束」，
+        // 同刻会让 `max` 的退化不可观测。
+        clock.observe(&env_of(tool_call()), t0 + 320 * MS);
+        clock.observe(&env_of(tool_result()), t0 + 370 * MS);
+
+        let line = clock
+            .observe(
+                &env_of(AgentEvent::RoundStarted { round: 2 }),
+                t0 + 400 * MS,
+            )
+            .expect("下一轮开始时，上一轮应被关闭并落一行");
+        assert_eq!(
+            line, "round=1 ttft_ms=100 gen_ms=220 tools_ms=50 total_ms=370",
+            "三段口径：排队+prefill / 解码 / 工具"
+        );
+    }
+
+    /// 无工具调用的轮：`tools_ms` 记 0，`total` 以模型结束为准。
+    ///
+    /// 变异：把 `total` 的终点从 `last_tool.or(model_end)` 改成 `last_tool` ⇒ 本例变 0。
+    #[test]
+    fn round_clock_records_zero_tools_when_no_tool_calls() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        clock.observe(&env_of(text_delta()), t0 + 100 * MS);
+        clock.observe(&env_of(text_delta()), t0 + 300 * MS);
+
+        let line = clock
+            .observe(
+                &env_of(AgentEvent::RunFinished {
+                    stop_reason: StopReason::Completed,
+                    usage: Usage::default(),
+                    rounds: 1,
+                }),
+                t0 + 320 * MS,
+            )
+            .expect("终局事件须关闭最后一轮 —— 否则末轮永远不落行");
+        assert_eq!(line, "round=1 ttft_ms=100 gen_ms=200 tools_ms=0 total_ms=300");
+    }
+
+    /// 没有开轮时落不出行 —— 终局事件的 `take_line` 必须是 `None` 而不是空串。
+    ///
+    /// 变异：把 `take_line` 的 `self.round.take()?` 改成 `unwrap_or(0)` ⇒ 本例变红
+    /// （会凭空写出 `round=0` 的一行）。
+    #[test]
+    fn round_clock_silent_without_an_open_round() {
+        let mut clock = RoundClock::default();
+        assert!(
+            clock
+                .observe(
+                    &env_of(AgentEvent::RunFailed {
+                        error: "boom".into()
+                    }),
+                    Instant::now()
+                )
+                .is_none()
+        );
+    }
+
+    /// 缓存读数：**有 input 却缓存两栏全 0** ⇒ `None`（provider 没上报），
+    /// 不能被当成「缓存 0% 命中」—— 那会把排查引到错的方向。
+    ///
+    /// 变异：① 把 `input_tokens > 0` 那个条件去掉 ⇒ 第二条断言变红（真读数被伪装成 0% 命中）；
+    /// ② 把 `as_ref().ok()?` 改成 `Some(...)` 兜底 ⇒ 第三条断言变红。
+    #[test]
+    fn turn_cache_separates_unreported_from_zero_hit() {
+        assert_eq!(
+            turn_cache(&result_with(usage(900, 100))),
+            Some((900, 100)),
+            "正常上报"
+        );
+
+        let unreported = RunResult {
+            stop_reason: StopReason::Completed,
+            usage: Usage {
+                input_tokens: 29_993,
+                output_tokens: 149,
+                prompt_cache_hit_tokens: 0,
+                prompt_cache_miss_tokens: 0,
+            },
+            rounds: 2,
+            final_message: None,
+        };
+        assert_eq!(
+            turn_cache(&Ok(unreported)),
+            None,
+            "有 input 却缓存两栏全 0 ⇒ 服务端没上报，不是 0% 命中"
+        );
+
+        assert_eq!(
+            turn_cache(&Err(LoopError::Tool("boom".into()))),
+            None,
+            "失败回合没有用量来源"
+        );
+    }
+
+    /// 回合行恒为定形：五个计数键 + 两个缓存键，缺用量时用 `-` 而不是省略。
+    ///
+    /// 变异：把 `None` 分支的 `"-"` 改成 `"0"` ⇒ 前两条断言变红，且「没有用量来源」
+    /// 会伪装成「缓存全没命中」。
+    #[test]
+    fn turn_line_keeps_a_fixed_shape() {
+        let line = turn_line(
+            3,
+            7,
+            Duration::from_secs(42),
+            11,
+            Duration::from_secs(99),
+            Some((900, 100)),
+        );
+        assert_eq!(
+            line,
+            "turn=3 rounds=7 elapsed=42s cumulative_rounds=11 budget_remaining=99s \
+             cache_hit=900 cache_miss=100"
+        );
+
+        let unknown = turn_line(1, 1, Duration::ZERO, 1, Duration::ZERO, None);
+        assert!(
+            unknown.ends_with("cache_hit=- cache_miss=-"),
+            "缺用量来源时必须是 `-`：{unknown}"
+        );
+    }
+}

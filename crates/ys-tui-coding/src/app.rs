@@ -55,6 +55,14 @@ pub struct App {
     pub turn_started_at: Option<Instant>,
     /// Working 动画相位（0..WORKING_DOTS）。
     pub working_dot: u8,
+    /// 本回合**已开始的最新轮号**（`RoundStarted` 每轮推一次）。
+    ///
+    /// `None` = 本回合还没有任何一轮开始。生命周期与 turn 对齐（进入回合与
+    /// `finish_turn` 都清零）—— 否则上一回合的轮号会漏进下一回合的状态行。
+    ///
+    /// 它存在的唯一理由：一个回合可以跑几十轮、每轮数秒，而 `rounds` 此前只在
+    /// **回合结束**的摘要里出现 ⇒ 回合进行中界面只能显示一个不动的动画。
+    pub current_round: Option<u32>,
     /// assistant 渲染产物缓存 + 流式节流状态（设计 §2.5）。
     ///
     /// `RefCell`：`draw.rs` 的 `build_text_with` / `total_rows` 走 `&App`，而缓存需要
@@ -102,6 +110,7 @@ impl App {
             should_quit: false,
             turn_started_at: None,
             working_dot: 0,
+            current_round: None,
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
@@ -207,6 +216,7 @@ impl App {
                     self.is_turning = true;
                     self.abort_requested = false;
                     self.turn_started_at = Some(Instant::now());
+                    self.current_round = None;
                     return;
                 }
                 // ③④ 未本地回显、也不属于任何待回声提交的 `UserMessage` 有两种来源，
@@ -223,9 +233,13 @@ impl App {
                     self.is_turning = true;
                     self.abort_requested = false;
                     self.turn_started_at = Some(Instant::now());
+                    self.current_round = None;
                 }
                 self.follow = true;
             }
+            // 轮开始：回合进行中唯一的「进度刻度」。**不产生任何显示行** —— 只更新
+            // 状态行用的轮号（`draw.rs` 的 `status_text` 在回合中显示它）。
+            AgentEvent::RoundStarted { round } => self.current_round = Some(round),
             AgentEvent::ModelTextDelta { text } => self.append_stream(text, StreamKind::Assistant),
             AgentEvent::ModelThinkingDelta { text } => {
                 self.append_stream(text, StreamKind::Thinking)
@@ -338,6 +352,7 @@ impl App {
         self.is_turning = true;
         self.abort_requested = false;
         self.turn_started_at = Some(Instant::now());
+        self.current_round = None;
         self.working_dot = 0;
         self.follow = true;
         self.scroll_offset = 0;
@@ -358,7 +373,8 @@ impl App {
         crate::draw::max_scroll_offset(self, width, height)
     }
 
-    fn turn_elapsed_secs(&self) -> f32 {
+    /// 本回合已用秒数（回合未开始时为 0）。`draw.rs` 的状态行要用 ⇒ `pub(crate)`。
+    pub(crate) fn turn_elapsed_secs(&self) -> f32 {
         self.turn_started_at
             .map(|t| t.elapsed().as_secs_f32())
             .unwrap_or(0.0)
@@ -386,6 +402,7 @@ impl App {
         self.is_turning = false;
         self.abort_requested = false;
         self.turn_started_at = None;
+        self.current_round = None;
         self.suppress_user_echo = 0;
         self.tool_index.clear();
         self.follow = true;
@@ -1356,6 +1373,46 @@ mod tests {
         // **非终局**：回合可能还在继续，不得复位 turn 态
         assert!(a.is_turning, "ResponseTruncated 不得调 finish_turn");
         assert!(a.turn_started_at.is_some());
+    }
+
+    /// `RoundStarted` 是**非终局**事件：只更新状态行的轮号，**不产生显示行、不结束回合**。
+    ///
+    /// 变异：① 删掉 `apply_event` 的 `RoundStarted` 臂 ⇒ `current_round` 断言变红；
+    /// ② 在该臂里误调 `finish_turn()` ⇒ `is_turning` / `turn_started_at` 断言变红；
+    /// ③ 把它当成「新起一条显示行」⇒ transcript 长度断言变红。
+    #[test]
+    fn test_round_started_tracks_round_without_ending_turn() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        let before = a.transcript.len();
+        assert_eq!(a.current_round, None, "前置：回合刚开始，还没有轮");
+
+        a.apply_event(env(AgentEvent::RoundStarted { round: 1 }));
+        assert_eq!(a.current_round, Some(1));
+
+        a.apply_event(env(AgentEvent::RoundStarted { round: 3 }));
+        assert_eq!(a.current_round, Some(3), "轮号取最新值，不累加");
+
+        assert_eq!(a.transcript.len(), before, "轮事件不得产生显示行");
+        // **非终局**：本轮还没跑完，不得复位 turn 态
+        assert!(a.is_turning, "RoundStarted 不得调 finish_turn");
+        assert!(a.turn_started_at.is_some());
+    }
+
+    /// 轮号随回合结束清零。
+    ///
+    /// 生命周期不变量：`current_round` 与 `is_turning` / `turn_started_at` 同进退。
+    /// 变异：把 `finish_turn` 里的 `current_round = None` 删掉 ⇒ 本用例变红，
+    /// 且下一回合的状态行会显示**上一回合**的轮号。
+    #[test]
+    fn test_current_round_resets_at_turn_end() {
+        let mut a = app();
+        a.begin_local_turn("q".into());
+        a.apply_event(env(AgentEvent::RoundStarted { round: 7 }));
+        assert_eq!(a.current_round, Some(7));
+
+        a.apply_event(run_finished(1));
+        assert_eq!(a.current_round, None, "回合结束必须清零轮号");
     }
 
     /// 纯文本被截断（0 个工具调用）：文案同样警告，但**不**提工具调用。

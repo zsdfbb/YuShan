@@ -239,6 +239,40 @@ mod tests {
         );
     }
 
+    /// 当轮的大批量结果**只保住一轮**。
+    ///
+    /// 保护条件是「是**最新**一条消息」（`idx == last`），而最新那条恒为本轮刚追加的工具
+    /// 结果消息。故：一批结果在**紧随其后的那次决策**里是完整的，但下一轮再追加一条之后，
+    /// 它就不再是最新 ⇒ 被降级成头部 + 续读指针。一次要得越多，掉得越多。
+    ///
+    /// 变异自检：把 `plan_elisions` 的 `idx == last` 改成 `idx == messages.len()` ⇒ 最新一条
+    /// 也会被降级，第一条断言变红。
+    #[test]
+    fn plan_elisions_protects_only_the_newest_message() {
+        let msgs = vec![
+            plain_msg("hello"),                    // 0：非工具结果
+            tool_result_msg("c1", big_lines(200)), // 1：第一轮的大批量
+            tool_result_msg("c2", big_lines(200)), // 2：第二轮
+        ];
+        // 取总量的 1/4 ⇒ 即使只剩一条未降级也仍超预算，排除「本来就没超」的假绿。
+        let budget = tool_result_tokens(&msgs[1..]) / 4;
+
+        // 第一轮刚结束时：区间里只有刚追加的那条，它是最新 ⇒ 受保护，一条都不降。
+        let after_first = plan_elisions(&msgs[..2], 1, budget);
+        assert!(
+            after_first.is_empty(),
+            "当轮结果恒受最新保护，即便超预算也不降：{after_first:?}"
+        );
+
+        // 第二轮结束：第一轮那条已不再是最新 ⇒ 被降级。
+        let after_second = plan_elisions(&msgs, 1, budget);
+        assert_eq!(
+            after_second,
+            vec![1],
+            "上一轮的大批量此时才被削成头部 + 指针：{after_second:?}"
+        );
+    }
+
     /// N15 / 边界：`budget == 0`（闸门关闭）或未超预算 ⇒ 计划为空（会话逐字节不变）。
     ///
     /// 变异自检：把 `budget == 0` 的早退删掉 ⇒ 关闭闸门时仍会降级，本用例变红。

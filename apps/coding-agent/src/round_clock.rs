@@ -24,9 +24,10 @@
 //!
 //! # 口径
 //!
-//! - `ttft` = 收到 `RoundStarted` → 收到首个模型增量，即**排队 + prefill**（缓存未命中的部分也在这里）。
-//! - `gen` = 首末模型增量之间，即**解码**。无增量但发起了工具调用的轮，取 `ToolCall`
-//!   到达时刻为生成终点（循环是先收完模型响应再 emit `ToolCall`）。
+//! - `ttft` = 收到 `RoundStarted` → 收到**首个可观测输出**（模型增量**或**首个 `ToolCall`，
+//!   取更早者）。正常情况下是「排队 + prefill」；若该轮**完全不流式**（只给工具调用），
+//!   它还含上生成时间 —— 见 `take_line` 的注释，这是为了让那类轮**不被记成 0**。
+//! - `gen` = 首个可观测输出 → 生成终点（末个增量与首个 `ToolCall` 取更晚者）。
 //! - `tools` = 首末 `ToolResult` 之间。无工具调用的轮记 0。
 //! - 三者之外的余额（组装请求、落盘、事件转发）不计入任何一段 ⇒ **三段之和 ≤ total**。
 
@@ -87,6 +88,16 @@ impl RoundClock {
     /// 关闭当前轮并返回其可观测行；无进行中的轮时为 `None`。
     pub(crate) fn take_line(&mut self) -> Option<String> {
         let round = self.round.take()?;
+        // **首个可观测输出**：优先取模型增量，没有才取首个 `ToolCall`。
+        //
+        // 为什么用 `or` 而不是取更早者：**增量必然先于 `ToolCall` 到达** —— 增量在流式
+        // 期间发，`ToolCall` 在响应收完之后才发。所以两者都在时增量一定更早，取更早者
+        // 是个永远走不到的分支。
+        //
+        // 而这个 `or` 是承重的：模型可能**一个字符都不流式**、直接给工具调用（实测出现过），
+        // 只看增量会把整轮的等待记成 `ttft=0 gen=0`（时间只在 `total` 里露一下），
+        // 平均下来系统性拉低 `ttft` —— 并据此得出「缓存生效」这类错误结论。
+        let first_out = self.first_token.or(self.first_tool);
         // 生成终点：末个模型增量与首个 `ToolCall` 取较晚者（正常是后者更晚）。
         let model_end = match (self.last_model, self.first_tool) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -94,8 +105,8 @@ impl RoundClock {
         };
         let line = format!(
             "round={round} ttft_ms={} gen_ms={} tools_ms={} total_ms={}",
-            span_ms(self.started, self.first_token),
-            span_ms(self.first_token, model_end),
+            span_ms(self.started, first_out),
+            span_ms(first_out, model_end),
             span_ms(self.first_tool, self.last_tool),
             span_ms(self.started, self.last_tool.or(model_end)),
         );
@@ -269,6 +280,36 @@ mod tests {
             )
             .expect("终局事件须关闭最后一轮 —— 否则末轮永远不落行");
         assert_eq!(line, "round=1 ttft_ms=100 gen_ms=200 tools_ms=0 total_ms=300");
+    }
+
+    /// **完全不流式的轮**（模型一个字符都不吐、直接给工具调用）必须仍被计时。
+    ///
+    /// 实测出现过这种轮（`daily/1` 的 round=3）：若只看增量，它会记成 `ttft=0 gen=0`，
+    /// 整轮 1.8 秒只在 `total` 里露一下 —— 平均下来会**系统性拉低 ttft**，并据此得出
+    /// 「缓存生效」这类错误结论。
+    ///
+    /// 变异：把 `ttft` 的终点从 `first_out` 改回只用 `first_token` ⇒ 本条 `ttft_ms` 变 0
+    /// （已实际注入验证）。
+    #[test]
+    fn round_clock_times_a_round_with_no_streamed_deltas() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        // 没有任何 `Model*Delta`，直接就是工具调用。
+        clock.observe(&env_of(tool_call()), t0 + 1780 * MS);
+
+        let line = clock
+            .observe(
+                &env_of(AgentEvent::RunFinished {
+                    stop_reason: StopReason::Completed,
+                    usage: Usage::default(),
+                    rounds: 1,
+                }),
+                t0 + 1790 * MS,
+            )
+            .expect("终局事件关闭本轮");
+        assert_eq!(line, "round=1 ttft_ms=1780 gen_ms=0 tools_ms=0 total_ms=1780");
     }
 
     /// 没有开轮时落不出行 —— 终局事件的 `take_line` 必须是 `None` 而不是空串。

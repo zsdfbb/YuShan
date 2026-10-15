@@ -18,8 +18,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 默认日志文件：`~/.yushan/logs/yushan.log`（无 HOME 时为 `None`）。
+/// 日志**目录**覆盖的环境变量名（与 `YUSHAN_SESSIONS_DIR` 同形状：给目录，不给文件）。
+///
+/// 基准 / 端到端测试需要把日志与真实使用隔开，而模型凭证仍在 `$HOME`
+/// ⇒ 只改 `HOME` 会把凭证一起改没，故必须有一个独立的覆盖口。
+pub const LOG_DIR_ENV: &str = "YUSHAN_LOG_DIR";
+
+/// 默认日志文件：`$YUSHAN_LOG_DIR/yushan.log`，否则 `~/.yushan/logs/yushan.log`
+/// （两者都不可得时为 `None`）。
+///
+/// 空字符串视为**未设置** —— 否则会静默落到当前工作目录，比不覆盖更糟。
 pub fn default_log_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(LOG_DIR_ENV) {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("yushan.log"));
+        }
+    }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     Some(
         PathBuf::from(home)
@@ -148,6 +162,31 @@ mod tests {
 
         assert!(blocker.is_file(), "阻塞文件本身不受影响");
         assert!(!path.exists(), "不得在文件下造出日志");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `YUSHAN_LOG_DIR` 覆盖默认路径；**空值视为未设置**（不得落到 CWD）。
+    ///
+    /// 变异：① 去掉 `LOG_DIR_ENV` 分支 ⇒ 第一条断言变红；
+    /// ② 去掉 `!dir.is_empty()` 守卫 ⇒ 第三条断言变红（空值会静默落到 `./yushan.log`）。
+    #[test]
+    fn test_log_dir_env_overrides_default_path() {
+        let _guard = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvRestore::capture(&[LOG_DIR_ENV, "HOME", "USERPROFILE"]);
+        let dir = temp_dir("log_dir_env");
+
+        // SAFETY: 持有 env_lock，独占这几个变量的修改与恢复。
+        unsafe { std::env::set_var(LOG_DIR_ENV, &dir) };
+        assert_eq!(default_log_path(), Some(dir.join("yushan.log")));
+
+        // 覆盖优先于 HOME：即便 HOME 不可得也照样给出路径。
+        unsafe { std::env::remove_var("HOME") };
+        assert_eq!(default_log_path(), Some(dir.join("yushan.log")));
+
+        // 空值 = 未设置 ⇒ 回落到 HOME（此处 HOME 已移除 ⇒ 无路径），而不是 `./yushan.log`。
+        unsafe { std::env::set_var(LOG_DIR_ENV, "") };
+        assert_eq!(default_log_path(), None, "空值不得落到当前工作目录");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

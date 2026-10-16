@@ -45,7 +45,6 @@ mod assembly;
 mod capabilities;
 mod channel;
 mod config;
-mod follow_up;
 mod logging;
 mod prompt;
 mod provider;

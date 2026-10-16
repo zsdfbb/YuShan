@@ -119,9 +119,11 @@ apps/coding-agent/
 只在下列形状之外成立**；三条分叉有同一根源 —— 历史里没有 live 侧才有的状态（`is_turning`、提交原文、
 流式合并窗口）。每条由 `transcript.rs` 的 `p1_1_*` 用例**显式断言 `replay != live`**（任一侧改动立即变红）：
 
-1. **app 发起的复核回合**：主回合结束后 `is_turning == false`，此时到达的 `UserMessage` live 渲染
-   `System(text)`，回放只有 `role=User` ⇒ `User(text)`（可达）。
-   `p1_1_review_turn_diverges_system_vs_user`。
+1. **回合刚落幕时到达的 `UserMessage`**（`is_turning == false`）：live 渲染 `System(text)`，
+   回放只有 `role=User` ⇒ `User(text)`（可达）。
+   `p1_1_idle_user_message_diverges_system_vs_user`。
+   注：该分叉原先是「完工复核回合」的落点；复核已由 [ADR-0041](../adr/0041-remove-completion-review-turn.md)
+   撤除 ⇒ 现在只剩上述收尾竞态。
 2. **`/skill-name` 提交**：live 显本地回显的**展开前原文** `User("/myskill")`，回放显落盘的信封
    `User("<skill …>…</skill>")`（空闲提交即可达）。**第三种形态** —— **回合进行中**提交 skill 时，
    `pending_echo_texts` 登记的是展开前原文、回声却是信封文本 ⇒ 认领不到，且届时 `is_turning == false`

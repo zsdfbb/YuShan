@@ -540,13 +540,19 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 - `resolve_limits` 只注入三行：`context_window` / `compaction` / `max_rounds`（本轮新增最后一行）。**`model_retry` / `model_timeout` 不经 `resolve_limits`** —— 它们是适配器构造参数，经模型工厂 `Config::set_model_factory`（定义于 `config.rs`，由 `main.rs` 调用；`with_retry(cfg.model_retry())` / `with_timeouts(cfg.model_timeout())` 的调用在 `main.rs` 的工厂闭包内）显式传入（生产路径**总是**显式调用，故生效的是 app 侧常量）。
 - `resolve_limits` 是 TUI / `-p` / `--json` 三入口**唯一** limits 接线点，一处修复三模式。
 
-### 11.3 完工复核缝（`apps/coding-agent/src/follow_up.rs` + `app_loop`）
+### 11.3 完工复核缝 —— **已撤除**（ADR-0041）
 
-- `enum TurnKind { Initial, Review }`；`fn should_review(kind, &RunResult) -> Option<AgentInput>`；常量 `REVIEW_MIN_ROUNDS = 5`、`REVIEW_PROMPT`（纯常量、确定性字节）。
-- **「只问一次」由结构保证**：`should_review` 首个早退 `if kind != TurnKind::Initial { return None }`，且 `pending` 只在 `Initial` 时被填 ⇒ **每用户输入至多多出一个复核回合**；无计数上限、无停滞判据、无抢占、无逃生开关。
-- **三道门**（从左到右短路）：① `Initial`；② `stop_reason == Completed`（`Cancelled` / `Truncated` / `MaxRounds` 一律不续 —— 用户中止永远赢）；③ `rounds >= REVIEW_MIN_ROUNDS`（`5`）。门槛抬到 5 而非 2：把「读一个文件就答」这类短回合挡在复核之外。
-- **落点**：`app_loop` 的 `Request::Prompt` 臂包成 `while let Some((input, kind)) = pending.take()`；抽出 `run_turn_once`。复核消息经 `AgentInput::text(REVIEW_PROMPT)` 交给 `run_turn` ⇒ `BasicLoop` Step 2 append 为 `Role::User` + emit `UserMessage`。
-- **标题素材仅取 `Initial` 回合**：`Review` 回合交 `None`（绝不把复核文案写成会话标题）。
+原先这里是一个「模型自称完工后追问一次」的第二个回合（`follow_up.rs` 的 `should_review` +
+`app_loop` 的 `pending.take()` 循环，三道门 `Initial` / `Completed` / `rounds >= 5`）。
+
+**已整块删除**（`docs/adr/0041-remove-completion-review-turn.md`）。现状：
+
+- **一个 `Request::Prompt` 恰好跑一个回合** —— `app_loop` 的该臂直接 `run_turn_once` 一次，
+  随后写穿 meta；`follow_up.rs` 不再存在。
+- 撤除的两条理由：① 同类（codex / Pi）都只靠「模型不再发工具调用」收场，无追问回合；
+  ② **它只在 TUI 生效** —— `main.rs` 的 `run_single_turn` 里从来没有 `should_review`，
+  故基准（`-p`）度量的流程比真实使用少一环，而我们所有性能结论都出自基准。
+- **保留**：`run_turn_once` 开头的边界排空（挡的是**上一个请求**残留的 `Abort`，与回合数无关）。
 
 ### 11.4 wall-clock 预算（`app_loop` + `main.rs`）
 

@@ -219,13 +219,15 @@ impl App {
                     self.current_round = None;
                     return;
                 }
-                // ③④ 未本地回显、也不属于任何待回声提交的 `UserMessage` 有两种来源，
-                //     仅以 `is_turning` 的**真假**区分 —— 绝不按内容匹配（不嗅探文案里
-                //     是不是复核提示）。契约：
+                // ③④ 未本地回显、也不属于任何待回声提交的 `UserMessage`，仅以 `is_turning`
+                //     的**真假**区分 —— 绝不按内容匹配。契约：
                 // - `is_turning == true` ⇒ 回合进行中的轮边界 steering 插话，仍是用户行；
-                // - `is_turning == false` ⇒ app 发起的复核回合（主回合已 `RunFinished`，
-                //   `finish_turn` 已复位 `is_turning`），渲染成 System 行并点亮 Working ——
-                //   复核同样是一个回合，谁也不是谁的特例。
+                // - `is_turning == false` ⇒ 回合**刚落幕**时到达的那条（`RunFinished` 已让
+                //   `finish_turn` 复位 `is_turning`，而事件还在信道里排队），渲染成 System
+                //   行并点亮 Working —— 它同样属于一个回合，谁也不是谁的特例。
+                //
+                // 注：这个分支原先是「app 发起的完工复核回合」的落点；复核已于 ADR-0041
+                // 撤除，故它现在只覆盖上述那条**收尾竞态**。
                 if self.is_turning {
                     self.transcript.push(TranscriptLine::User(text));
                 } else {

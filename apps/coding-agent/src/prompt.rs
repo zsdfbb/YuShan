@@ -219,26 +219,34 @@ fn tool_guidelines(tools: &[&str]) -> String {
         guidelines
             .push("Use ls to list directories instead of running ls through bash".to_string());
     }
-    // 多目标探索走**多条工具调用**，而不是把若干命令拼进一条 bash：只有工具通道才保留
-    // `.gitignore` 语义与统一的截断 / notice 形态。只读批次真的并行（工具侧声明
-    // `is_concurrency_safe`，见 `adapters/tools-basic`），故这条不只是「更好看」。
+    // 多目标探索走**多条工具调用**：只有工具通道才保留 `.gitignore` 语义与统一的截断 /
+    // notice 形态；只读批次真的并行（工具侧声明 `is_concurrency_safe`），故这条不只是「更好看」。
+    //
+    // **但「面」操作要留出 shell 的口子**：`read` 只吃单个 `path`，故"读一个目录下全部
+    // markdown"这类**覆盖面**动作在结构化工具里**表达不出来**，只能靠 shell 通配 / 循环。
+    // 原先把整类 shell 串联一并禁掉，等于把面操作也禁了 —— 单点读取仍优先结构化工具。
     if tools
         .iter()
         .any(|t| matches!(*t, "read" | "grep" | "find" | "ls"))
     {
         guidelines.push(
             "To inspect several files or directories, send several tool calls in one message — \
-             read-only calls in a batch run in parallel; do not chain them through bash"
+             read-only calls in a batch run in parallel. For a whole directory or a glob, one \
+             shell loop is fine and beats enumerating paths by hand; keep single-file reads on \
+             the structured tools"
                 .to_string(),
         );
     }
-    // 「先窄后宽」：大范围搜索 / 整文件读会把预算挤满，且很少比精确命中更有用。措辞给出可执行的
-    // 下一步（先 grep 定位、再 read 区间），而非仅劝阻。
+    // 「先撒网、再下钻」：不知道答案在哪时，逐步试探会把**轮数**推高 —— 而每轮是一次完整的
+    // 模型往返，轮数又是墙钟与输入 token 的共同乘数；一次覆盖全域的调用则能把候选集一次拿全。
+    // 原先这里是「先窄后宽」，理由是省上下文预算；但实测里**工具执行只占墙钟 ~1%**，
+    // 而多一轮要付 ~2–3s 的首 token 延迟。整文件读的代价仍由末句约束（不是取消，是降为兜底）。
     if tools.iter().any(|t| matches!(*t, "read" | "grep")) {
         guidelines.push(
-            "Explore narrow before broad: locate with grep, then read a specific line range \
-             (offset/limit). Avoid whole-file reads and large grep context — oversized results \
-             crowd out the context budget and rarely help"
+            "Start wide when you don't know where the answer is: one sweeping call (a recursive \
+             file listing, or a single grep for what you're after) beats several probing ones — \
+             then read what you found several files at a time. Keep line ranges narrow to hold a \
+             result's size down, not as the default"
                 .to_string(),
         );
     }
@@ -715,14 +723,16 @@ mod tests {
         );
     }
 
-    /// 「先窄后宽」这条 guideline **只在 `read` / `grep` 在场时**出现。
+    /// 「先撒网」这条 guideline **只在 `read` / `grep` 在场时**出现。
     ///
-    /// 它对应的真实成本：大范围搜索 / 整文件读会把上下文预算挤满（会话实测单条 grep 45KB ≈ 11k token），
-    /// 而精确命中几乎总是更省也更准。反向断言（只有 `bash` 时不得出现）同样承重。
+    /// 它替换了原先的「先窄后宽」：窄探索省上下文，但把**轮数**推高，而轮数才是墙钟与
+    /// 输入 token 的乘数（实测工具执行只占墙钟 ~1%，而多一轮要付 ~2–3s 首 token 延迟）。
+    /// 窄区间**没有取消**，只是从默认降为兜底（末句）。
     ///
-    /// 变异：把守卫从 `any(read|grep)` 改成无条件 push ⇒ 第二条断言变红。
+    /// 变异：① 把守卫从 `any(read|grep)` 改成无条件 push ⇒ 第三条断言变红；
+    /// ② 去掉末句的 "not as the default" ⇒ 第二条断言变红（窄区间又变回默认）。
     #[test]
-    fn narrow_before_broad_guideline_appears_only_with_read_or_grep() {
+    fn wide_first_guideline_appears_only_with_read_or_grep() {
         let _guard = env_lock();
         let _env = no_global_prompt();
 
@@ -732,17 +742,21 @@ mod tests {
             &no_skills(),
         );
         assert!(
-            with_tools.contains("- Explore narrow before broad: locate with grep"),
-            "有 read/grep 时应给「先窄后宽」指引；prompt = {with_tools}"
+            with_tools.contains("- Start wide when you don't know where the answer is"),
+            "有 read/grep 时应给「先撒网」指引；prompt = {with_tools}"
         );
         assert!(
-            with_tools.contains("Avoid whole-file reads and large grep context"),
-            "指引应点出代价（整文件读 / 大 context）；prompt = {with_tools}"
+            with_tools.contains("not as the default"),
+            "窄区间须降为兜底而非默认 —— 这是本次改动的实质；prompt = {with_tools}"
+        );
+        assert!(
+            with_tools.contains("then read what you found several files at a time"),
+            "指引须给出下钻动作（一次读多个已知文件），而不只是劝阻；prompt = {with_tools}"
         );
 
         let bash_only = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
         assert!(
-            !bash_only.contains("Explore narrow before broad"),
+            !bash_only.contains("Start wide when you don't know"),
             "只有 bash 时不得出现该指引；prompt = {bash_only}"
         );
     }

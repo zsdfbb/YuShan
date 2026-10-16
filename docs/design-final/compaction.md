@@ -146,9 +146,11 @@ emit 的事件会躺在 `sink_rx` 直到下个 `Prompt` 才转发 → 顺序错�
    错误文本、「不描述 checkpoint 机制」）。比设计多出 `## Files` 一节 —— 它是**避免「凭印象重读/重写
    已改文件」的唯一直接入口**，承重，勿在「美化」时合并或删除；`test_summary_prompt_pins_structure_and_rules`
    钉住七节与两条规则。`summary_system_prompt` 仍是覆盖口子。
-9. **`config.rs` / `provider.rs` 的 `#[allow(dead_code)]` + 「尚未接线（U6b）」「当前尚无生产消费者」
-   注释已过时** —— `load_user_config` 在 `main.rs:575-576` 有生产调用点，`context_window()` /
-   `compact_policy()` 在 `main.rs:630-631` 与 `app_loop.rs:111` 有生产调用点。属性与注释没随接线清理，**读代码时别被误导**。
+9. **`config.rs` / `provider.rs` 的接线已完成，过时标记也已清理干净** ——
+   `load_user_config` 在 `main.rs:1614` 有生产调用点；`context_window()` / `compact_policy()`
+   在 `main.rs:539-540` 与 `app_loop.rs:433-434` 有生产调用点。
+   早先那批 `#[allow(dead_code)]` 与「尚未接线（U6b）」「当前尚无生产消费者」注释**已随接线一并删除**
+   （两个文件里 grep `allow(dead_code)` 计数为 0）⇒ **读代码时不必再去它们那里找这两样东西**。
 
 ## 已知遗留 / 后续
 

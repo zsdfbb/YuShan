@@ -600,7 +600,7 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 ### 12.B 设计层缺口
 
-- **预算管不住在途模型调用**（`apps/coding-agent/tests/budget_exit.rs` 实证）：`Boundary::Abort` **只在轮边界被 `BasicLoop` 读取** —— Step 1 入口（`crates/ys-loop/src/basic.rs:58`）、Step 3 模型调用前（`basic.rs:95`）、轮边界 `take()`（`basic.rs:213`）；而**模型调用发生在 Step 6**（`basic.rs:258`）。若该调用不返回，预算到点推入的 `Abort` **不会被观察** ⇒ 该调用实际由**适配器的流空闲超时**（`stream.rs:123` 的 `tokio::time::timeout(idle, …)`，默认 120s）界住。预算不打断在途模型调用；最坏 = **一次在途模型调用**（由该空闲超时界住）。
+- **预算管不住在途模型调用**（`apps/coding-agent/tests/budget_exit.rs` 实证）：`Boundary::Abort` **只在轮边界被 `BasicLoop` 读取** —— Step 1 入口（`crates/ys-loop/src/basic.rs:137`）、Step 3 模型调用前（`basic.rs:174`）、轮边界 `take()`（`basic.rs:292`，`Abort` 分支在 `:303`）；而**模型调用发生在 Step 6**（`basic.rs:348`）。若该调用不返回，预算到点推入的 `Abort` **不会被观察** ⇒ 该调用实际由**适配器的流空闲超时**（`stream.rs:123` 的 `tokio::time::timeout(idle, …)`，默认 120s）界住。预算不打断在途模型调用；最坏 = **一次在途模型调用**（由该空闲超时界住）。
 - **`-p` / `--json` 说明行落点与计划不符**：exec-plan 写 `Outbound::Output`，实际走 **stderr**（`main.rs::run_single_turn`）—— 因为该路径**无 outbound 信道**；这是「stdout 承载模型增量 / JSON 流必须保持干净」的必然结果（`tests/budget_exit.rs` 用例 2 钉住）。
 - **记账**（指向既有 ADR，不展开）：细阀换粗阀（`MAX_CONSECUTIVE_ERRORS` 空分支仍在 —— `basic.rs:14` 常量、`basic.rs:517` 空体只有注释）；`Cancelled` 三义（预算到点与 Ctrl+C 同态，靠一行说明区分）；退避不可中止（`Model::complete` 无取消入参）；重试治抖动不治停服（>~150s 故障仍终止回合）；会话 `append` 每次全量重写 JSONL（48h ≈ 10⁵ 次全文件重写）。
 

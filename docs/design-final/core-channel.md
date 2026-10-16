@@ -220,7 +220,7 @@ impl<'a> RuntimeContext<'a> { pub fn with_inbox(self, inbox: &'a Inbox) -> Self;
 |---|---|
 | 8 处 `ctx.events.emit(..)` → `emit(ctx.events, ..).await`（自由函数） | `basic.rs` |
 | `Forwarder::emit` → `let _ = self.sink.try_emit(..)`（同步，无背压） | `basic.rs` |
-| 轮边界 steering drain：**Step 4b 压缩之后、`rounds += 1` 之前** → `session.append` + emit `UserMessage`；**不增 rounds、不改 turn**；`inbox = None` 时零额外调用 | `basic.rs:134-146` |
+| 轮边界 steering drain：**Step 4b 压缩之后、`rounds += 1` 之前** → `session.append` + emit `UserMessage`；**不增 rounds、不改 turn**；`inbox = None` 时零额外调用 | `basic.rs:282-303`（`boundary.take()` 循环在 `:292`） |
 
 ### `ys-runtime`
 

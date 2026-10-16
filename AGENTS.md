@@ -33,7 +33,7 @@ YuShan/
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr
 - `cargo test -p ys-coding-agent e2e -- --ignored --nocapture` — 端到端（需 `YUSHAN_API_BASE` + `YUSHAN_API_KEY`）
 - `cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture` — **R8 对账**（skill 目录段的真实 input token 成本；`#[ignore]`，**尚未校准**，需同上凭证）
-- `cargo test -p ys-coding-agent --test e2e_bench -- --ignored --nocapture` — **基准**（同一任务的轮数 / 墙钟 / `ttft`·`gen`·`tools` 切分；`#[ignore]`，**只测量、不做任何内容判定**，需同上凭证；调参见 `YUSHAN_BENCH_REPEATS` / `YUSHAN_BENCH_ONLY` / `YUSHAN_BENCH_TIMEOUT_SECS` / `YUSHAN_BENCH_CLEAN` / `YUSHAN_BENCH_HEAVY`；**默认保留**逐轮日志等证据供回溯；**长跑项（如开放式提问 t4，实测 5 分钟起）默认跳过**，要跑用 `YUSHAN_BENCH_ONLY` 点名或 `YUSHAN_BENCH_HEAVY=1`）
+- `cargo test -p ys-coding-agent --test e2e_bench -- --ignored --nocapture` — **基准**（同一任务的轮数 / 墙钟 / `ttft`·`gen`·`tools` 切分；`#[ignore]`，**只测量、不做任何内容判定**，需同上凭证；调参见 `YUSHAN_BENCH_REPEATS` / `YUSHAN_BENCH_ONLY` / `YUSHAN_BENCH_TIMEOUT_SECS` / `YUSHAN_BENCH_CLEAN` / `YUSHAN_BENCH_HEAVY`；**默认保留**逐轮日志等证据供回溯；长跑项默认跳过（机制保留，当前无条目用它）。默认集 7 条 ≈ **2 分钟**；其中 `fact/1` 是**可判定**任务 —— 时间与质量同时可测，是唯一能做外部对照的提示）
 
 环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）；`YUSHAN_LOG_DIR`（日志目录覆盖，测试/基准用 —— 凭证仍在 `$HOME`，故隔离日志不能靠改 `HOME`）；`YUSHAN_SEARCH_SEARXNG_URL` / `YUSHAN_SEARCH_TAVILY_KEY`（Tavily 亦认生态通用名 `TAVILY_API_KEY`，命名空间名优先）/ `YUSHAN_SEARCH_BOCHA_KEY` / `YUSHAN_SEARCH_FIRECRAWL_KEY`（搜索后端，**各自配置才进链**）；`YUSHAN_FETCHED_DIR`（webfetch 落盘目录覆盖，须为**绝对路径**，测试用）。
 

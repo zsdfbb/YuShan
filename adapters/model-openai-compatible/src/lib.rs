@@ -682,11 +682,15 @@ impl<'s> StreamAccumulator<'s> {
 
                 // usage 尾包：累积最后一个非空值（末包覆盖前值即可）。
                 if let Some(usage) = usage {
+                    // 缓存字段**两种方言**都要认：DeepSeek 报 `prompt_cache_*`，
+                    // OpenAI 兼容网关报 `prompt_tokens_details.cached_tokens`。
+                    // 只认一家 ⇒ 另一家的读数恒为「无」，会把「缓存生效」误判成「测不到」。
+                    let (cache_hit, cache_miss) = usage.cache_tokens();
                     self.usage = Some(Usage {
                         input_tokens: usage.prompt_tokens,
                         output_tokens: usage.completion_tokens,
-                        prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
-                        prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
+                        prompt_cache_hit_tokens: cache_hit,
+                        prompt_cache_miss_tokens: cache_miss,
                     });
                 }
 

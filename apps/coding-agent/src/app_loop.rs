@@ -845,7 +845,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use ys_core::{ContentBlock, Message, Role, StopReason, ToolCall, ToolCallId, ToolResult, Usage};
+    use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId, Usage};
     use ys_event::AgentEvent;
     use ys_model::{
         FinishReason, MockModel, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest,

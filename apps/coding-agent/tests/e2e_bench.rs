@@ -38,6 +38,7 @@
 //! | `YUSHAN_BENCH_REPEATS` | `1` | 每条提示重复几次 |
 //! | `YUSHAN_BENCH_ONLY` | 空 | 只跑名字含该子串的提示（如 `t4`） |
 //! | `YUSHAN_BENCH_TIMEOUT_SECS` | `900` | 单次运行的墙钟上限，超时杀掉 |
+//! | `YUSHAN_BENCH_HEAVY` | 空 | 连**长跑项**一起跑（默认跳过，见 `PROMPTS`） |
 //! | `YUSHAN_BENCH_CLEAN` | 空 | 设了才删临时目录（**默认保留**，见下） |
 //!
 //! ⚠️ **默认保留证据**：临时目录里有每次运行的**逐轮日志**（`logs/yushan.log`）、
@@ -50,36 +51,62 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// 提示集：`(名字, 任务文本)`。见模块头「提示集」—— **只读**是硬约束。
-const PROMPTS: &[(&str, &str)] = &[
+/// 提示集：`(名字, 任务文本, 是否长跑)`。
+///
+/// 见模块头「提示集」—— **只读**是硬约束。
+///
+/// **长跑项默认不跑**：那些开放式提问实测 291–324 秒（我们）／128 秒（codex），
+/// 且轮数在 33–246 之间摆动 —— 默认带上会让每次基准都变成十分钟起步。
+/// 要跑得**显式点名**（`YUSHAN_BENCH_ONLY=t4`）或设 `YUSHAN_BENCH_HEAVY=1`。
+///
+/// ⚠️ **「数量固定」不是停止条件**。`fact/1`（"找出恰好 3 处不一致"）曾按「有界任务」设计，
+/// 实测 **348.7 秒 / 291 轮** —— 比它要替代的长跑项还长。原因是模型把"3 处"读成
+/// "**最好的** 3 处"，那需要无界搜索。现已加**显式预算**（"最多 15 次工具调用"）并标为长跑：
+/// **预算才是停止条件，数量不是**。预算是否真能收敛，待测。
+const PROMPTS: &[(&str, &str, bool)] = &[
     (
         "exp/t1",
         "统计 crates/ 下每个 crate 的 src 目录里的 .rs 文件数和总行数，输出一张表。",
+        false,
     ),
     (
         "exp/t2",
         "给出仓库 workspace 里有几个 crate；列出 docs/architecture.md 的一级标题；\
          统计 crates/ys-core/src 下所有 .rs 文件的总行数。三个结果一起给我。",
+        false,
     ),
     (
         "exp/t4",
         "这个仓库接下来该补什么？请基于代码与文档的实际状态给出建议。",
+        true,
     ),
     (
         "daily/1",
         "读 crates/ys-event/src/lib.rs，用三句话说明它对外导出什么。",
+        false,
     ),
     (
         "daily/2",
         "在仓库里找出 `is_concurrency_safe` 的所有实现与调用点，列出文件与行号。",
+        false,
     ),
     (
         "daily/3",
         "读 docs/CONTEXT.md，解释「回合（Turn）」与「轮（Round）」的区别。",
+        false,
     ),
     (
         "daily/4",
         "找出 apps/coding-agent/src 下所有模块文件，按职责各一句话归类。",
+        false,
+    ),
+    (
+        "fact/1",
+        "在仓库里找出 **3 处**「文档声称的状态与代码实际状态不一致」。每处给出：\
+         (a) 文档的 `文件:行号`，(b) 代码的 `文件:行号`，(c) 一句话说明为什么不一致。\
+         三处必须来自**不同文档**。**只报你亲眼核对过的。**\
+         **最多用 15 次工具调用，到第 15 次就必须交卷** —— 少报可以，超预算不行。",
+        true,
     ),
 ];
 
@@ -123,15 +150,20 @@ fn field(line: &str, key: &str) -> Option<u128> {
     rest[..end].parse().ok()
 }
 
-/// 解析一次运行的日志 → `(轮数, ttft 合计, gen 合计, tools 合计)`。
+/// 解析一次运行的日志文本 → `(轮数, ttft 合计, gen 合计, tools 合计)`。
 ///
-/// 每次运行独占一个日志目录（见 [`run_once`]），故这里不担心跨运行累积。
-fn parse_log(path: &Path) -> (u32, u128, u128, u128) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (0, 0, 0, 0);
-    };
+/// **读到第一行 `turn=` 就停。** 那是**本运行自己的回合终局行**，在它之后写进同一个文件的
+/// 一切都不属于这次运行 —— 因为 `YUSHAN_LOG_DIR` 只隔离**目录、不隔离进程**：
+/// 模型若自己起一个 `ys-coding-agent`（实测发生过：一次 291 轮的长跑里它自调用了 5 次，
+/// 会话目录里留下 `hi` / `write the file` 这些标题），子进程会继承同一个环境变量，
+/// 事件全灌进这份日志。不截断的话轮数会虚高数倍、读数直接不可用。
+fn parse_log_text(text: &str) -> (u32, u128, u128, u128) {
     let (mut rounds, mut ttft, mut gen_ms, mut tools) = (0u32, 0u128, 0u128, 0u128);
     for line in text.lines() {
+        // 本运行的终局行 —— 到此为止（它之后的都是别人写的）。
+        if line.contains(" turn=") {
+            break;
+        }
         // 只认逐轮行：`turn=` 行里也有 `rounds=`，靠 `ttft_ms=` 区分。
         let Some(ttft_one) = field(line, "ttft_ms=") else {
             continue;
@@ -142,6 +174,14 @@ fn parse_log(path: &Path) -> (u32, u128, u128, u128) {
         tools += field(line, "tools_ms=").unwrap_or(0);
     }
     (rounds, ttft, gen_ms, tools)
+}
+
+/// 读日志文件并解析；读不到时全 0（**如实报空，不编数**）。
+fn parse_log(path: &Path) -> (u32, u128, u128, u128) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_log_text(&text),
+        Err(_) => (0, 0, 0, 0),
+    }
 }
 
 /// 跑一次真实二进制，返回读数；超时或异常退出时返回 `None`（**如实报告，不编数**）。
@@ -258,6 +298,8 @@ fn bench_report() {
     let only = std::env::var("YUSHAN_BENCH_ONLY").unwrap_or_default();
     // **默认保留**：证据（逐轮日志 / 转录 / stdout）比磁盘金贵，见模块头。
     let clean = std::env::var("YUSHAN_BENCH_CLEAN").is_ok();
+    // 长跑项默认不跑（见 `PROMPTS` 的说明）；点名或显式开关才跑。
+    let heavy_enabled = std::env::var("YUSHAN_BENCH_HEAVY").is_ok();
     let root = temp_dir("bench");
 
     println!(
@@ -269,8 +311,15 @@ fn bench_report() {
 
     // (名字, 墙钟中位, 轮中位, ttft 中位, gen 中位, tools 中位)
     let mut summary: Vec<(String, u128, u128, u128, u128, u128)> = Vec::new();
-    for (name, task) in PROMPTS {
-        if !only.is_empty() && !name.contains(only.as_str()) {
+    let mut skipped_heavy: Vec<&str> = Vec::new();
+    for (name, task, heavy) in PROMPTS {
+        // 点名优先：`YUSHAN_BENCH_ONLY` 命中的项**即使标了长跑也跑**（那是显式要求）。
+        let named = !only.is_empty() && name.contains(only.as_str());
+        if !only.is_empty() && !named {
+            continue;
+        }
+        if *heavy && !named && !heavy_enabled {
+            skipped_heavy.push(name);
             continue;
         }
         println!("=== {name} ===");
@@ -334,6 +383,13 @@ fn bench_report() {
         );
     }
     println!();
+    if !skipped_heavy.is_empty() {
+        println!(
+            "跳过的长跑项（默认不跑，要跑用 YUSHAN_BENCH_ONLY=<名> 点名或 YUSHAN_BENCH_HEAVY=1）：{}",
+            skipped_heavy.join(", ")
+        );
+        println!();
+    }
 
     if clean {
         let _ = std::fs::remove_dir_all(&root);
@@ -342,4 +398,29 @@ fn bench_report() {
         println!("  逐轮读数：{}/<提示>-<序号>/logs/yushan.log", root.display());
         println!("  想删掉：设 YUSHAN_BENCH_CLEAN=1 重跑，或直接 rm -rf\n");
     }
+}
+
+/// `parse_log_text` 必须在**本运行的终局行**处截断。
+///
+/// 背景：模型可能自己起一个 `ys-coding-agent`（实测发生过 —— 一次 291 轮的长跑里它自调用了
+/// 5 次），子进程继承同一个 `YUSHAN_LOG_DIR`，其事件灌进同一份日志。不截断则轮数虚高、
+/// 读数不可用。
+///
+/// 变异：把 `if line.contains(" turn=") { break; }` 短路掉 ⇒ 第一条断言从 2 变成 4
+/// （已实际注入验证）。
+#[test]
+fn parse_log_stops_at_the_first_turn_line() {
+    let text = "\
+[1] round=1 ttft_ms=10 gen_ms=20 tools_ms=30 total_ms=60\n\
+[2] round=2 ttft_ms=11 gen_ms=21 tools_ms=31 total_ms=63\n\
+[3] turn=1 rounds=2 elapsed=5s cumulative_rounds=2 budget_remaining=1s cache_hit=0 cache_miss=0\n\
+[4] round=1 ttft_ms=999 gen_ms=999 tools_ms=999 total_ms=999\n\
+[5] round=2 ttft_ms=999 gen_ms=999 tools_ms=999 total_ms=999\n";
+    let (rounds, ttft, gen_ms, tools) = parse_log_text(text);
+    assert_eq!(rounds, 2, "只数本运行的轮；子进程写进来的必须忽略");
+    assert_eq!((ttft, gen_ms, tools), (21, 41, 61));
+
+    // 没有终局行（崩溃等）⇒ 全量计入，不丢数据。
+    let no_turn = "[1] round=1 ttft_ms=5 gen_ms=6 tools_ms=7 total_ms=18\n";
+    assert_eq!(parse_log_text(no_turn), (1, 5, 6, 7));
 }

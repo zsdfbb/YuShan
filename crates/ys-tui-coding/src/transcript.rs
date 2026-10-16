@@ -510,13 +510,16 @@ mod tests {
 
     // ---- 回放 ≠ 重演：已知形状分叉（P1-1） ----
 
-    /// **P1-1 分叉 ①**：app 发起的**复核回合**（`is_turning == false` 时到达的 `UserMessage`）。
+    /// **P1-1 分叉 ①**：`is_turning == false` 时到达的 `UserMessage`（回合刚落幕、事件还在
+    /// 信道里排队的那种收尾竞态）。
     ///
-    /// live 侧渲染成 `System(text)`（主回合 `RunFinished` 后 `is_turning` 已复位），回放侧
-    /// 只有「role = User」这一事实 ⇒ 渲染成 `User(text)`。历史里没有 `is_turning`，回放
-    /// **无法**复刻（有意不复刻，见函数文档与设计 §7）。本用例钉住该分叉：任一侧改动都暴露。
+    /// live 侧渲染成 `System(text)`（`RunFinished` 已让 `finish_turn` 复位 `is_turning`），
+    /// 回放侧只有「role = User」这一事实 ⇒ 渲染成 `User(text)`。历史里没有 `is_turning`，
+    /// 回放**无法**复刻（有意不复刻，见函数文档与设计 §7）。本用例钉住该分叉。
+    ///
+    /// 注：这个分叉原先是「完工复核回合」的落点，复核已由 ADR-0041 撤除 ⇒ 现在只剩上述竞态。
     #[test]
-    fn p1_1_review_turn_diverges_system_vs_user() {
+    fn p1_1_idle_user_message_diverges_system_vs_user() {
         let review = user_message("审查一下上面的改动");
         assert!(
             !App::new(CodingView::for_test()).is_turning,

@@ -74,12 +74,14 @@ mod tests {
             output_tokens: 20,
             prompt_cache_hit_tokens: 7,
             prompt_cache_miss_tokens: 3,
+            reasoning_tokens: None,
         };
         let b = Usage {
             input_tokens: 1,
             output_tokens: 2,
             prompt_cache_hit_tokens: 5,
             prompt_cache_miss_tokens: 4,
+            reasoning_tokens: None,
         };
         let c = a + b;
         assert_eq!(c.prompt_cache_hit_tokens, 12);

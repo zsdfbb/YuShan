@@ -662,15 +662,14 @@ impl<'s> StreamAccumulator<'s> {
                     }
                 }
 
-                if self.has_reasoning_content {
-                    if let Some(reasoning) = reasoning_content {
-                        if !reasoning.is_empty() {
-                            self.reasoning.push_str(&reasoning);
-                            let _ = self
-                                .sink
-                                .emit(ModelEvent::ThinkingDelta { text: reasoning });
-                        }
-                    }
+                if self.has_reasoning_content
+                    && let Some(reasoning) = reasoning_content
+                    && !reasoning.is_empty()
+                {
+                    self.reasoning.push_str(&reasoning);
+                    let _ = self
+                        .sink
+                        .emit(ModelEvent::ThinkingDelta { text: reasoning });
                 }
 
                 // 工具参数增量**不冒泡**：在适配器内按 index 组装。
@@ -691,6 +690,9 @@ impl<'s> StreamAccumulator<'s> {
                         output_tokens: usage.completion_tokens,
                         prompt_cache_hit_tokens: cache_hit,
                         prompt_cache_miss_tokens: cache_miss,
+                        // `None`（明细块缺失）与 `Some(0)`（显式报 0）原样保留，
+                        // 供上层决定是否写出该字段。
+                        reasoning_tokens: usage.reasoning_tokens(),
                     });
                 }
 
@@ -1402,7 +1404,7 @@ mod tests {
         drive(
             &mut buf,
             &mut acc,
-            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18,\"prompt_cache_hit_tokens\":9,\"prompt_cache_miss_tokens\":2}}\n",
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18,\"prompt_cache_hit_tokens\":9,\"prompt_cache_miss_tokens\":2,\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n",
         );
         drive(&mut buf, &mut acc, b"data: [DONE]\n");
 
@@ -1414,6 +1416,11 @@ mod tests {
             "缓存命中读数必须从 provider 尾包解析出来"
         );
         assert_eq!(response.usage.prompt_cache_miss_tokens, 2);
+        assert_eq!(
+            response.usage.reasoning_tokens,
+            Some(4),
+            "推理 token 必须从尾包的 completion_tokens_details 解析出来"
+        );
     }
 
     /// 未上报缓存字段的端点：`ChatUsage` 仍能反序列化（按 0），不失败。

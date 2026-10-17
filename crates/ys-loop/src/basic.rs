@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
-use ys_event::{AgentEvent, emit};
+use ys_event::{emit, AgentEvent, RoundPurpose};
 use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
 use ys_tool::{Tool, ToolContext, ToolError};
@@ -239,41 +239,55 @@ impl AgentLoop for BasicLoop {
                 // Step 6 的 `ctx.model.complete` **之前**。`apps/coding-agent/src/app_loop.rs`
                 // 的 `every_request_variant_is_handled` 会走到这里，它安全**只因为**
                 // 不触发 model 调用（`MockModel` 空队列 `remove(0)` 会 panic）。
-                if fixed < trigger && estimated + fixed > trigger {
-                    if let Some(plan) = compact::plan(messages, policy, window) {
-                        match compact::execute(messages, &plan, ctx.model, policy).await {
-                            Ok(outcome) => {
-                                // 写回由**调用方**做（`execute` 不持有 session，评审 R3）。
-                                ctx.session
-                                    .replace_all(outcome.messages)
-                                    .await
-                                    .map_err(|_| {
-                                        LoopError::Event(ys_core::EventError::SendFailed)
-                                    })?;
-                                emit(
-                                    ctx.events,
-                                    AgentEvent::ContextCompacted {
-                                        estimated_tokens_before: outcome.estimated_tokens_before,
-                                        estimated_tokens_after: outcome.estimated_tokens_after,
-                                        summarized: outcome.summarized,
-                                        kept: outcome.kept,
-                                    },
-                                )
+                if fixed < trigger
+                    && estimated + fixed > trigger
+                    && let Some(plan) = compact::plan(messages, policy, window)
+                {
+                    match compact::execute(messages, &plan, ctx.model, policy).await {
+                        Ok(outcome) => {
+                            // 成本口径必须先于写回上报：摘要调用的 token 已经真实消耗，
+                            // 若 `replace_all` 失败会提前 `?` 返回 —— 放在写回前，写回失败
+                            // 也不丢成本口径；顺序上仍在 `ContextCompacted` 之前。
+                            emit(
+                                ctx.events,
+                                AgentEvent::RoundUsage {
+                                    purpose: RoundPurpose::Compaction,
+                                    // 压缩发生在 `RoundStarted` **之前** ⇒ 记它正在准备的下一轮，
+                                    // 与随后发出的 `RoundStarted.round` 同口径（不差一）。
+                                    round: rounds.saturating_add(1),
+                                    usage: outcome.usage,
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
+                            // 写回由**调用方**做（`execute` 不持有 session，评审 R3）。
+                            ctx.session
+                                .replace_all(outcome.messages)
                                 .await
-                                .map_err(LoopError::Event)?;
-                            }
-                            Err(e) => {
-                                // B-3：失败 ⇒ **session 一个字节都不动**，本轮照常继续。
-                                // 旧实现会 `clear()` + 写一行占位符 —— 那是静默失忆，不是降级。
-                                emit(
-                                    ctx.events,
-                                    AgentEvent::ContextCompactionFailed {
-                                        reason: e.to_string(),
-                                    },
-                                )
-                                .await
-                                .map_err(LoopError::Event)?;
-                            }
+                                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                            emit(
+                                ctx.events,
+                                AgentEvent::ContextCompacted {
+                                    estimated_tokens_before: outcome.estimated_tokens_before,
+                                    estimated_tokens_after: outcome.estimated_tokens_after,
+                                    summarized: outcome.summarized,
+                                    kept: outcome.kept,
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
+                        }
+                        Err(e) => {
+                            // B-3：失败 ⇒ **session 一个字节都不动**，本轮照常继续。
+                            // 旧实现会 `clear()` + 写一行占位符 —— 那是静默失忆，不是降级。
+                            emit(
+                                ctx.events,
+                                AgentEvent::ContextCompactionFailed {
+                                    reason: e.to_string(),
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
                         }
                     }
                 }
@@ -364,7 +378,23 @@ impl AgentLoop for BasicLoop {
 
             // Step 7：追加 assistant 消息（调用中取消 -> 仍要追加）
             let assistant_message = response.message.clone();
+            // 先复制本轮 usage 再累加：`RoundUsage` 上报的是**单轮**消耗，
+            // 而 `total_usage` 是回合累计（会随终局事件一起发出）。
+            let round_usage = response.usage.clone();
             total_usage = total_usage + response.usage;
+            // 逐轮 usage 上报：位置固定在 `RoundStarted` 之后、`ToolCall` / `RunFinished`
+            // 之前 —— 每条模型轮恰好一条。走自由函数 `emit()`（异步慢路径），不得走
+            // `try_emit` 快路径（满了会被缓冲进 overflow，冲刷永不发生）。
+            emit(
+                ctx.events,
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Turn,
+                    round: rounds,
+                    usage: round_usage,
+                },
+            )
+            .await
+            .map_err(LoopError::Event)?;
             ctx.session
                 .append(assistant_message.clone())
                 .await
@@ -581,17 +611,17 @@ impl AgentLoop for BasicLoop {
             // 也不发 `ToolResult` 事件（既有形状），只在回喂消息里留一条 `is_error`。
             let mut pending: Vec<usize> = Vec::new();
             for (idx, (_, tool_name, tool_args)) in tool_calls.iter().enumerate() {
-                if let Some(approval) = &ctx.approval {
-                    if approval.needs_approval(tool_name, tool_args) {
-                        match approval.request_approval(tool_name, tool_args).await {
-                            ys_tool::ApprovalDecision::Approved => {}
-                            ys_tool::ApprovalDecision::Denied { reason } => {
-                                outcomes[idx] = Some(CoreToolResult {
-                                    content: format!("operation denied: {reason}"),
-                                    is_error: true,
-                                });
-                                continue;
-                            }
+                if let Some(approval) = &ctx.approval
+                    && approval.needs_approval(tool_name, tool_args)
+                {
+                    match approval.request_approval(tool_name, tool_args).await {
+                        ys_tool::ApprovalDecision::Approved => {}
+                        ys_tool::ApprovalDecision::Denied { reason } => {
+                            outcomes[idx] = Some(CoreToolResult {
+                                content: format!("operation denied: {reason}"),
+                                is_error: true,
+                            });
+                            continue;
                         }
                     }
                 }
@@ -786,7 +816,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use ys_component::RunLimits;
     use ys_event::{AgentEvent, CollectingSink, EventSink};
-    use ys_model::{FinishReason, MockModel, Model, ModelError, ModelResponse};
+    use ys_model::{FinishReason, MockModel, MockResponse, Model, ModelError, ModelResponse};
     use ys_session::{MemorySession, Session};
     use ys_tool::{Tool, ToolContext, ToolRegistry, ToolSpec};
 
@@ -923,6 +953,386 @@ mod tests {
                 |b| matches!(b, ContentBlock::Text { text } if text.contains("[Context Summary]")),
             )
         })
+    }
+
+    // ==================== RoundUsage：逐轮 usage 上报 ====================
+
+    fn usage_with_reasoning(reasoning_tokens: u32) -> Usage {
+        Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            reasoning_tokens: Some(reasoning_tokens),
+            ..Default::default()
+        }
+    }
+
+    /// 附带 `usage` 的预写响应 model。
+    ///
+    /// `MockModel` 的 `usage` 恒为 `Usage::default()`，无法表达「provider 上报了
+    /// `reasoning_tokens`」这条路径；本替身让每条响应自带 usage，才能断言**每轮单独上报**
+    /// 而非只断言「有事件」。
+    struct UsageModel {
+        responses: Mutex<Vec<(MockResponse, Usage)>>,
+    }
+
+    impl UsageModel {
+        fn new() -> Self {
+            Self {
+                responses: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn push_text(&self, text: &str, usage: Usage) {
+            self.responses
+                .lock()
+                .unwrap()
+                .push((MockResponse::Text(text.into()), usage));
+        }
+
+        fn push_tool_call(&self, name: &str, arguments: serde_json::Value, usage: Usage) {
+            self.responses.lock().unwrap().push((
+                MockResponse::ToolCall {
+                    name: name.into(),
+                    arguments,
+                },
+                usage,
+            ));
+        }
+
+        fn push_error(&self, msg: &str) {
+            self.responses
+                .lock()
+                .unwrap()
+                .push((MockResponse::Error(msg.into()), Usage::default()));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for UsageModel {
+        fn model_id(&self) -> &str {
+            "usage-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let (response, usage) = self.responses.lock().unwrap().remove(0);
+            match response {
+                MockResponse::Text(text) => {
+                    sink.emit(ModelEvent::TextDelta { text: text.clone() })?;
+                    Ok(ModelResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::Text { text }],
+                        },
+                        usage,
+                        finish_reason: FinishReason::Stop,
+                    })
+                }
+                MockResponse::ToolCall { name, arguments } => Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ys_core::ToolCallId(format!("usage-{name}")),
+                            name,
+                            arguments,
+                        }],
+                    },
+                    usage,
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+                MockResponse::Error(msg) => Err(ModelError::Provider(msg)),
+                _ => panic!("UsageModel 只支持 Text / ToolCall / Error"),
+            }
+        }
+    }
+
+    fn turn_usages(events: &CollectingSink) -> Vec<(u32, Usage)> {
+        events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Turn,
+                    round,
+                    usage,
+                } => Some((*round, usage.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn compaction_usages(events: &CollectingSink) -> Vec<(u32, Usage)> {
+        events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Compaction,
+                    round,
+                    usage,
+                } => Some((*round, usage.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Step 7：每个模型轮**恰好一条** `RoundUsage { purpose: Turn, round: N }`，且上报的是
+    /// **该轮单轮** usage（不是回合累计），顺序在 `RoundStarted` 之后、`ToolCall` /
+    /// `RunFinished` 之前。
+    ///
+    /// 变异说明：
+    /// - 删掉 Step 7 的 `emit` ⇒ 本用例红（`turn_usages` 为空）。
+    /// - 把 `round_usage` 换成 `total_usage.clone()` ⇒ 第 2 轮断言红（累计 `Some(14)` ≠
+    ///   单轮 `Some(7)`）。
+    /// - 把 emit 挪到 `RoundStarted` 之前 ⇒ 顺序断言红。
+    #[tokio::test]
+    async fn round_usage_emitted_once_per_turn_round() {
+        let (spy, calls) = SpyTool::new();
+        let registry = ToolRegistry::build(vec![Box::new(spy)]).unwrap();
+        let model = UsageModel::new();
+        let per_round = usage_with_reasoning(7);
+        model.push_tool_call("spy", serde_json::json!({}), per_round.clone());
+        model.push_text("done", per_round.clone());
+
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "前置：工具被真实执行");
+
+        let usages = turn_usages(&events);
+        assert_eq!(
+            usages.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![1, 2],
+            "两轮 ⇒ 恰好两条，轮号从 1 起：{:?}",
+            events.events()
+        );
+        for (round, usage) in &usages {
+            assert_eq!(
+                usage, &per_round,
+                "第 {round} 轮的 RoundUsage 必须是该轮的单轮 usage"
+            );
+        }
+
+        let evts = events.events();
+        let position = |pred: &dyn Fn(&AgentEvent) -> bool| {
+            evts.iter().position(pred).expect("事件应存在")
+        };
+        let started_1 = position(&|e| matches!(e, AgentEvent::RoundStarted { round: 1 }));
+        let usage_1 = position(&|e| {
+            matches!(
+                e,
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Turn,
+                    round: 1,
+                    ..
+                }
+            )
+        });
+        let first_tool_call = position(&|e| matches!(e, AgentEvent::ToolCall { .. }));
+        let started_2 = position(&|e| matches!(e, AgentEvent::RoundStarted { round: 2 }));
+        let usage_2 = position(&|e| {
+            matches!(
+                e,
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Turn,
+                    round: 2,
+                    ..
+                }
+            )
+        });
+        let finished = position(&|e| matches!(e, AgentEvent::RunFinished { .. }));
+        assert!(
+            started_1 < usage_1 && usage_1 < first_tool_call,
+            "第 1 轮 usage 必须在 RoundStarted 之后、ToolCall 之前：{evts:?}"
+        );
+        assert!(
+            started_2 < usage_2 && usage_2 < finished,
+            "第 2 轮 usage 必须在 RoundStarted 之后、RunFinished 之前：{evts:?}"
+        );
+
+        // 终局事件仍报**累计**值（14 = 7 + 7），与逐轮上报的单轮值互不混淆。
+        match &evts[finished] {
+            AgentEvent::RunFinished { usage, .. } => assert_eq!(
+                usage.reasoning_tokens,
+                Some(14),
+                "RunFinished 报回合累计，RoundUsage 报单轮"
+            ),
+            other => panic!("期望 RunFinished，实得 {other:?}"),
+        }
+    }
+
+    /// 重试路径同样服从「每个模型轮恰好一条 Turn usage」：首轮空响应先催一次，
+    /// 次轮正常收场 ⇒ 恰好两条，轮号 `[1, 2]`，各自等于该轮 `response.usage`。
+    ///
+    /// 变异说明：把 Step 7 的 emit 下移到空响应判断之后 ⇒ 首轮走 `continue` 前不会
+    /// 发 usage ⇒ 本用例红（只剩第 2 轮一条）。
+    #[tokio::test]
+    async fn round_usage_emitted_once_per_retried_empty_round() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = UsageModel::new();
+        let first_usage = usage_with_reasoning(3);
+        let second_usage = usage_with_reasoning(9);
+        model.push_text("", first_usage.clone());
+        model.push_text("done", second_usage.clone());
+
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        assert_eq!(result.rounds, 2, "空响应重试消耗一个 round");
+        assert_eq!(
+            turn_usages(&events),
+            vec![(1, first_usage), (2, second_usage)],
+            "重试路径每个模型轮恰好一条 Turn usage：{:?}",
+            events.events()
+        );
+    }
+
+    /// 自动压缩：事件流同时含 `purpose=Turn` 与 `purpose=Compaction`；后者 usage **等于
+    /// 摘要响应的 usage**、`round` 记它正在准备的下一轮（1），且排在 `ContextCompacted` 之前。
+    ///
+    /// 变异说明：
+    /// - 删掉压缩分支的 emit ⇒ 本用例红（`compaction_usages` 为空）。
+    /// - 把 purpose 写成 `Turn` ⇒ 本用例红（`compaction_usages` 为空，且 Turn 多一条）。
+    #[tokio::test]
+    async fn compaction_usage_has_compaction_purpose_and_summary_usage() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = UsageModel::new();
+        let summary_usage = Usage {
+            input_tokens: 60,
+            output_tokens: 11,
+            reasoning_tokens: Some(7),
+            ..Default::default()
+        };
+        let turn_usage = usage_with_reasoning(7);
+        model.push_text("SUMMARY", summary_usage.clone());
+        model.push_text("done", turn_usage.clone());
+
+        let mut session = MemorySession::new();
+        seed_large_session(&mut session).await;
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+
+        let compaction = compaction_usages(&events);
+        assert_eq!(
+            compaction,
+            vec![(1, summary_usage)],
+            "压缩 usage 必须等于摘要响应的 usage，轮号记下一轮：{:?}",
+            events.events()
+        );
+        assert_eq!(
+            turn_usages(&events),
+            vec![(1, turn_usage)],
+            "压缩后主对话仍只有一条 Turn usage"
+        );
+
+        let evts = events.events();
+        let compaction_at = evts
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::RoundUsage {
+                        purpose: RoundPurpose::Compaction,
+                        ..
+                    }
+                )
+            })
+            .expect("压缩必须发 RoundUsage");
+        let compacted_at = evts
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ContextCompacted { .. }))
+            .expect("必须发 ContextCompacted");
+        assert!(
+            compaction_at < compacted_at,
+            "RoundUsage(Compaction) 必须排在 ContextCompacted 之前：{evts:?}"
+        );
+    }
+
+    /// 压缩失败：只发 `ContextCompactionFailed`，**不发** `purpose=Compaction` 的 usage。
+    #[tokio::test]
+    async fn failed_compaction_emits_no_compaction_usage() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = UsageModel::new();
+        model.push_error("provider 挂了");
+        model.push_text("done", usage_with_reasoning(7));
+
+        let mut session = MemorySession::new();
+        seed_large_session(&mut session).await;
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            compaction_usages(&events).is_empty(),
+            "失败的压缩不得上报 Compaction usage：{:?}",
+            events.events()
+        );
+        assert_eq!(
+            turn_usages(&events).len(),
+            1,
+            "主对话那一轮仍要上报 Turn usage：{:?}",
+            events.events()
+        );
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextCompactionFailed { .. })),
+            "失败必须可见：{:?}",
+            events.events()
+        );
     }
 
     /// U1-1：**触发点被固定开销推前** —— 同样的消息量，`fixed > 0` 触发、`fixed = 0` 不触发。

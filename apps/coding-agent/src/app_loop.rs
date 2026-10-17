@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use ys_core::{ContentBlock, Message, Role};
+use ys_core::{ContentBlock, Message, Role, StopReason};
 use ys_event::AgentEvent;
 use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
@@ -65,6 +65,7 @@ use ys_tui_coding::CodingView;
 
 use crate::capabilities;
 use crate::config::Config;
+use crate::debug_log::{ArgsMode, DebugSink, debug_path_for};
 use crate::logging;
 use crate::provider::{FetchModelsResult, ModelCache, ProviderRegistry};
 use crate::state::StateStore;
@@ -213,9 +214,19 @@ pub async fn run(
     // 本会话当前绑定的工作树（`None` = 共享工作区）。**运行期可变**（`/resume` 刷新）：
     // 回合末据此写 `SessionMeta.workspace`，`main` 退出后据此打退出行。
     worktree: WorktreeHandle,
+    // 结构化执行日志（`--debug`）。`None` = 关闭（零文件、零线程）。
+    mut debug: Option<DebugSink>,
+    // `run_start` 的工具元数据（启动装配期量好；工具表不随 `/new` / `/resume` 变）。
+    debug_tools: Vec<(String, usize)>,
 ) -> Result<(), AppLoopError> {
     // 回合号从 1 起（`Envelope.turn` 靠 `begin_turn` 携带）。
     let mut turns: u32 = 0;
+    // 本 run 累计模型轮数（`run_end.rounds`；失败回合取事件流累计）。
+    let mut run_rounds: u32 = 0;
+    // debug 记录的会话 id（`/new` / `/resume` 后刷新）与本文件内的 run 序号
+    // （启动期 `main` 已写 run=0 的 `run_start`）。
+    let mut debug_session_id = crate::session_id_for(wiring.session_path());
+    let mut debug_run: u64 = 0;
 
     // `/thinking` 显示开关的**进程级缓存**：启动时由 meta 初始化，`Request::SetThinking`
     // 单向更新，回合末落 meta。UI 的 `App.thinking_visible` 才是运行期真值，本缓存只
@@ -237,7 +248,11 @@ pub async fn run(
         };
         let req = match wake {
             Wake::Request(Some(req)) => req,
-            Wake::Request(None) => return Ok(()), // UI 侧 drop 了发送端 → 正常退出
+            Wake::Request(None) => {
+                // UI 侧 drop 了发送端 → 正常退出前排空 debug 队列并写 `run_end`。
+                flush_debug(&mut debug, &stats, run_rounds, 0);
+                return Ok(());
+            }
             Wake::Models(cache) => {
                 models_rx = None; // 目录只投一次；此后不再参与 `select!`
                 if let Some(cache) = cache {
@@ -251,7 +266,8 @@ pub async fn run(
                         &stats,
                         session_started,
                     );
-                    send(&out_tx, Outbound::View(view)).await?;
+                    send_or_flush(&out_tx, Outbound::View(view), &mut debug, &stats, run_rounds)
+                        .await?;
                 }
                 continue;
             }
@@ -294,39 +310,59 @@ pub async fn run(
                     deadline,
                     request_started,
                     cumulative_rounds: 0,
+                    run_rounds: &mut run_rounds,
                     out_tx: &out_tx,
                     sink_rx: &mut sink_rx,
                     boundary_rx: &mut boundary_rx,
                     subagent: subagent.as_ref(),
                     subagent_totals,
+                    debug: debug.as_mut(),
+                    debug_session_id: &debug_session_id,
                 };
                 // **一个 `Request::Prompt` 恰好跑一个回合** —— 没有完工复核
                 // （ADR-0041 撤回 ADR-0027 决策 2）。
-                match run_turn_once(&mut ctx, AgentInput::new(message)).await? {
-                    Ok(result) => {
-                        ctx.stats.record(&result.usage);
-                        // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
-                        let model = ctx.wiring.model_id().map(str::to_string);
-                        // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
-                        let ws = worktree.get();
-                        if let Err(e) = crate::finalize_turn_meta(
-                            ctx.wiring,
-                            raw_user_text.as_deref(),
-                            ctx.config.provider.as_deref(),
-                            model.as_deref(),
-                            Some(ctx.thinking_visible),
-                            ws.as_ref().map(|b| b.path.as_path()),
-                            ctx.stats,
-                        )
-                        .await
-                        {
-                            logging::log(&format!("failed to persist session meta: {e}"));
+                // 外层 `Err` = UI 已收摊（出站失败）：先收尾 debug 再退出；
+                // 内层 `TurnOutcome` 的 `Err` 只是本回合模型/工具失败，app 继续。
+                match run_turn_once(&mut ctx, AgentInput::new(message)).await {
+                    Ok(outcome) => match outcome {
+                        Ok(result) => {
+                            ctx.stats.record(&result.usage);
+                            // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
+                            let model = ctx.wiring.model_id().map(str::to_string);
+                            // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
+                            let ws = worktree.get();
+                            if let Err(e) = crate::finalize_turn_meta(
+                                ctx.wiring,
+                                raw_user_text.as_deref(),
+                                ctx.config.provider.as_deref(),
+                                model.as_deref(),
+                                Some(ctx.thinking_visible),
+                                ws.as_ref().map(|b| b.path.as_path()),
+                                ctx.stats,
+                            )
+                            .await
+                            {
+                                logging::log(&format!("failed to persist session meta: {e}"));
+                            }
                         }
+                            // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
+                            // Error 行，这里不再往 transcript 重复刷一条，只落日志。
+                            // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
+                            Err(e) => logging::log(&format!("turn {} failed: {e}", ctx.turns)),
+                    },
+                    Err(e) => {
+                        let rounds = *ctx.run_rounds;
+                        let usage = ctx.stats.cumulative_usage();
+                        if let Some(sink) = ctx.debug.as_deref_mut() {
+                            sink.flush_run(crate::debug_log::RunEndMeta {
+                                stop_reason: "RunFailed",
+                                rounds,
+                                exit_code: 1,
+                                usage: Some(&usage),
+                            });
+                        }
+                        return Err(e);
                     }
-                    // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
-                    // Error 行，这里不再往 transcript 重复刷一条，只落日志。
-                    // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
-                    Err(e) => logging::log(&format!("turn {} failed: {e}", ctx.turns)),
                 }
             }
 
@@ -403,6 +439,22 @@ pub async fn run(
                 session_started = Instant::now();
                 // 换会话也换了文件 —— 刷新给 `main` 的退出提示快照。
                 session_path.record(wiring.session_path());
+                // `/new` **切新 debug 文件**（旧文件自然结束），并开一个新的 run。
+                if let Some(sink) = debug.as_mut() {
+                    if let Some(path) = debug_path_for(wiring.session_path()) {
+                        sink.switch_file(&path);
+                    }
+                    debug_run += 1;
+                    sink.begin_run(debug_run, crate::unix_now_ms());
+                    debug_session_id = crate::session_id_for(wiring.session_path());
+                    crate::emit_run_start(
+                        sink,
+                        &config,
+                        wiring.session_path(),
+                        &debug_session_id,
+                        &debug_tools,
+                    );
+                }
             }
 
             Request::Compact => {
@@ -433,6 +485,8 @@ pub async fn run(
             }
 
             Request::ResumeSession { target } => {
+                // `/resume` 前后的会话路径：相同 ⇒ 追加同一文件；不同 ⇒ 切文件。
+                let path_before = wiring.session_path().map(Path::to_path_buf);
                 let (out_lines, resumed) =
                     capabilities::resume_session(&mut config, &mut wiring, &state_store, &target)
                         .await;
@@ -465,6 +519,26 @@ pub async fn run(
                     ) {
                         lines.push(msg);
                     }
+                    // 同一 session ⇒ 追加同一文件（只开新 run）；跨 session ⇒ 切到
+                    // 目标会话的 debug 文件。两种情况都以一条新的 `run_start` 开头。
+                    if let Some(sink) = debug.as_mut() {
+                        let path_after = wiring.session_path().map(Path::to_path_buf);
+                        if path_after != path_before
+                            && let Some(path) = debug_path_for(path_after.as_deref())
+                        {
+                            sink.switch_file(&path);
+                        }
+                        debug_run += 1;
+                        sink.begin_run(debug_run, crate::unix_now_ms());
+                        debug_session_id = crate::session_id_for(path_after.as_deref());
+                        crate::emit_run_start(
+                            sink,
+                            &config,
+                            path_after.as_deref(),
+                            &debug_session_id,
+                            &debug_tools,
+                        );
+                    }
                     session_event = Some(Outbound::SessionResumed {
                         summary: r.summary,
                         thinking_visible: r.thinking_visible,
@@ -477,12 +551,19 @@ pub async fn run(
         // 会话出站必须抢在 `Output` 之前（I2）——`SessionResumed` 的清屏会吃掉
         // 其后紧跟的提示，故它排在最前。
         if let Some(msg) = session_event {
-            send(&out_tx, msg).await?;
+            send_or_flush(&out_tx, msg, &mut debug, &stats, run_rounds).await?;
         }
 
         // 命令输出走 transcript（设计 §5：命令期间的诊断 → `Outbound::Output`）。
         if !lines.is_empty() {
-            send(&out_tx, Outbound::Output(lines.join("\n"))).await?;
+            send_or_flush(
+                &out_tx,
+                Outbound::Output(lines.join("\n")),
+                &mut debug,
+                &stats,
+                run_rounds,
+            )
+            .await?;
         }
 
         // 每个请求处理完刷新快照 —— 状态行（provider / model / tokens）才不会滞后。
@@ -495,7 +576,7 @@ pub async fn run(
             &stats,
             session_started,
         );
-        send(&out_tx, Outbound::View(view)).await?;
+        send_or_flush(&out_tx, Outbound::View(view), &mut debug, &stats, run_rounds).await?;
     }
 }
 
@@ -587,6 +668,8 @@ struct TurnCtx<'a> {
     request_started: Instant,
     /// 本请求**累计**的模型调用轮数（主回合 + 复核回合的 `RunResult.rounds` 之和）。
     cumulative_rounds: u32,
+    /// 本**进程 run** 累计的模型轮数（跨请求；`run_end.rounds` 用）。
+    run_rounds: &'a mut u32,
     out_tx: &'a mpsc::Sender<Outbound<CodingView>>,
     sink_rx: &'a mut mpsc::Receiver<Envelope>,
     boundary_rx: &'a mut mpsc::Receiver<Boundary>,
@@ -594,6 +677,10 @@ struct TurnCtx<'a> {
     subagent: Option<&'a crate::subagent::SubagentSetup>,
     /// 本请求累计的子 agent usage（回合末 drain 进 `RunResult.usage`）。
     subagent_totals: Arc<crate::subagent::UsageTotals>,
+    /// debug sink（关闭时 `None`）：事件咽喉、回合边界与 Abort 记录共用。
+    debug: Option<&'a mut DebugSink>,
+    /// 当前会话 id（debug 记录的 `session_id`；`/new` / `/resume` 后由外层刷新）。
+    debug_session_id: &'a str,
 }
 
 /// 一个回合的结局：`Ok` 是本回合的 `RunResult`，`Err` 是模型 / 工具失败
@@ -626,6 +713,43 @@ fn turn_rounds(outcome: &TurnOutcome, observed: u32) -> u32 {
     }
 }
 
+/// 退出前收尾 debug sink：排空队列并写 `run_end`（best-effort，最多 2 s）。
+///
+/// `exit_code` 区分正常退出与「UI 已收摊」；两者的事件名都可能是 `RunFinished`
+/// （TUI 没有 `RunFailed` 终局事件）。
+fn flush_debug(debug: &mut Option<DebugSink>, stats: &TurnStats, rounds: u32, exit_code: i32) {
+    if let Some(sink) = debug.as_mut() {
+        let usage = stats.cumulative_usage();
+        sink.flush_run(crate::debug_log::RunEndMeta {
+            stop_reason: if exit_code == 0 {
+                "RunFinished"
+            } else {
+                "RunFailed"
+            },
+            rounds,
+            exit_code,
+            usage: Some(&usage),
+        });
+    }
+}
+
+/// 出站失败（UI 已收摊）时先收尾 debug，再向上传播 —— 与 [`flush_debug`] 同一出口。
+async fn send_or_flush(
+    tx: &mpsc::Sender<Outbound<CodingView>>,
+    out: Outbound<CodingView>,
+    debug: &mut Option<DebugSink>,
+    stats: &TurnStats,
+    rounds: u32,
+) -> Result<(), AppLoopError> {
+    match send(tx, out).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            flush_debug(debug, stats, rounds, 1);
+            Err(e)
+        }
+    }
+}
+
 /// 逐轮计时状态机 —— 定义在 [`crate::round_clock`]（两条入口共用同一套口径）。
 use crate::round_clock::{RoundClock, turn_cache, turn_line};
 
@@ -650,6 +774,16 @@ async fn run_turn_once(
 
     // 回合号从 1 起（`begin_turn` 把它带进 `Envelope.turn`）。
     *ctx.turns += 1;
+    // `turn_start` 必须在回合开跑前取输入规模（`input` 随后被移动进 `run_turn`）。
+    if let Some(sink) = ctx.debug.as_deref_mut() {
+        crate::record_turn_start(
+            sink,
+            ctx.debug_session_id,
+            *ctx.turns,
+            crate::message_bytes(&input.message),
+            ctx.config.max_turn_duration(),
+        );
+    }
     // **每回合刷新 context window**（唯一调用点，结构上不可能漏）。
     //
     // `/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍
@@ -664,7 +798,13 @@ async fn run_turn_once(
     // 成功与失败两条路径都从这里取，不依赖 `RunResult` 是否存在。
     let mut observed_rounds: u32 = 0;
     // 逐轮读数（见 [`RoundClock`]）—— 与轮数累计共用同一个事件咽喉。
-    let mut clock = RoundClock::default();
+    // 摘要档位只影响 debug 记录；关闭时取 `Default` 的同一取值（`Head`）。
+    let args_mode = ctx
+        .debug
+        .as_ref()
+        .map(|sink| sink.args_mode())
+        .unwrap_or(ArgsMode::Head);
+    let mut clock = RoundClock::new(args_mode);
     let outcome = {
         let ports = ctx.wiring.ports();
         ports.events.begin_turn(*ctx.turns);
@@ -693,14 +833,31 @@ async fn run_turn_once(
                 // → 忙等。模式不匹配时 tokio 会**禁用**该分支。
                 Some(env) = ctx.sink_rx.recv() => {
                     count_round(&env, &mut observed_rounds);
-                    for line in clock.observe(&env, Instant::now()) {
-                        logging::log(&line);
-                    }
+                    crate::observe_event(
+                        ctx.debug.as_deref_mut(),
+                        &mut clock,
+                        &env,
+                        ctx.debug_session_id,
+                    );
                     send(ctx.out_tx, Outbound::Event(env)).await?;
                 }
                 // 轮边界中途插话 / 中止：UI 写信道 ②，这里泵进
                 // `BoundarySource`，由 `BasicLoop` 在轮边界拉取。
-                Some(b) = ctx.boundary_rx.recv() => boundary.push(b),
+                Some(b) = ctx.boundary_rx.recv() => {
+                    if matches!(&b, Boundary::Abort)
+                        && let Some(sink) = ctx.debug.as_deref_mut()
+                    {
+                        crate::record_boundary(
+                            sink,
+                            ctx.debug_session_id,
+                            Some(*ctx.turns),
+                            "enqueued",
+                            "abort",
+                            Some("ui"),
+                        );
+                    }
+                    boundary.push(b)
+                }
                 // wall-clock 预算到点：**先**发一条说明行，**再**向本回合的边界源
                 // push `Abort`。该回合以 `Cancelled` 收场，请求到此结束。
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(ctx.deadline)),
@@ -711,6 +868,16 @@ async fn run_turn_once(
                         "budget exhausted: wall-clock budget of {secs}s elapsed — aborting this turn"
                     ))).await?;
                     boundary.push(Boundary::Abort);
+                    if let Some(sink) = ctx.debug.as_deref_mut() {
+                        crate::record_boundary(
+                            sink,
+                            ctx.debug_session_id,
+                            Some(*ctx.turns),
+                            "enqueued",
+                            "abort",
+                            Some("budget"),
+                        );
+                    }
                 }
             }
         }
@@ -731,9 +898,12 @@ async fn run_turn_once(
     // 回合已结束 → 生产者不会再发，`try_recv` 排到 `Empty` 即止。
     while let Ok(env) = ctx.sink_rx.try_recv() {
         count_round(&env, &mut observed_rounds);
-        for line in clock.observe(&env, Instant::now()) {
-            logging::log(&line);
-        }
+        crate::observe_event(
+            ctx.debug.as_deref_mut(),
+            &mut clock,
+            &env,
+            ctx.debug_session_id,
+        );
         send(ctx.out_tx, Outbound::Event(env)).await?;
     }
     // 兜底：`RoundStarted` 已开轮、终局事件却没跟到（失败路径理论上会发生）时，
@@ -747,6 +917,7 @@ async fn run_turn_once(
     // 走 `saturating_duration_since` ⇒ 到点后为 0，绝不出现负数或 panic。
     // 失败回合拿不到 `RunResult` ⇒ 用事件流里数到的轮数（见 [`turn_rounds`]）。
     let rounds = turn_rounds(&outcome, observed_rounds);
+    *ctx.run_rounds = ctx.run_rounds.saturating_add(rounds);
     ctx.cumulative_rounds = ctx.cumulative_rounds.saturating_add(rounds);
     let remaining = ctx.deadline.saturating_duration_since(Instant::now());
     logging::log(&turn_line(
@@ -757,6 +928,31 @@ async fn run_turn_once(
         remaining,
         turn_cache(&outcome),
     ));
+
+    // debug 侧的回合收尾（只进文件，绝不影响上面的文本行）。
+    // 以 `Cancelled` 收场 ⇒ 补一条 `observed`：`enqueued` 说明 Abort 已投递，
+    // `observed` 说明回合确实看到了它（两者都缺一不可）。
+    if let Some(sink) = ctx.debug.as_deref_mut() {
+        if matches!(&outcome, Ok(r) if r.stop_reason == StopReason::Cancelled) {
+            crate::record_boundary(
+                sink,
+                ctx.debug_session_id,
+                Some(*ctx.turns),
+                "observed",
+                "abort",
+                None,
+            );
+        }
+        crate::record_turn_end(
+            sink,
+            ctx.debug_session_id,
+            *ctx.turns,
+            rounds,
+            ctx.request_started.elapsed(),
+            remaining,
+            turn_cache(&outcome),
+        );
+    }
 
     Ok(outcome)
 }
@@ -918,7 +1114,39 @@ mod tests {
         prefilled: Vec<Boundary>,
         tweak: impl FnOnce(&mut Config, &PathBuf),
     ) -> Harness {
-        spawn_app_loop_full(model, persistent, prefilled, tweak, |b| b, |_| None, None).await
+        spawn_app_loop_full(
+            model,
+            persistent,
+            prefilled,
+            tweak,
+            |b| b,
+            |_| None,
+            None,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// 同上，但打开 debug sink（调用方**整段持有** `env_lock`，并把
+    /// `YUSHAN_LOG_DIR` 指向临时目录）。
+    async fn spawn_app_loop_debug(
+        model: Box<dyn Model>,
+        persistent: bool,
+        prefilled: Vec<Boundary>,
+    ) -> Harness {
+        spawn_app_loop_full(
+            model,
+            persistent,
+            prefilled,
+            |_, _| {},
+            |b| b,
+            |_| None,
+            None,
+            true,
+            true,
+        )
+        .await
     }
 
     /// 最底层起法：除 `Config` 外还允许改写 [`ys_runtime::AgentBuilder`]
@@ -936,6 +1164,10 @@ mod tests {
         build_agent: impl FnOnce(ys_runtime::AgentBuilder) -> ys_runtime::AgentBuilder,
         subagent: impl FnOnce(&Path) -> Option<crate::subagent::SubagentSetup>,
         worktree: Option<WorktreeBinding>,
+        debug_flag: bool,
+        // 调用方**已持有** `env_lock`（debug 测试整段持有，避免并行测试改环境）。
+        // 为 `true` 时不再自行加锁 —— 同线程重复加锁会死锁。
+        env_prelocked: bool,
     ) -> Harness {
         let tmp = TempDir::new("harness");
         let subagent = subagent(&tmp.0);
@@ -949,7 +1181,9 @@ mod tests {
         // `env_lock` 下 `set_var` / `remove_var` —— 只读也须串行。
         // 锁**只圈住这次 `getenv`**，不跨下方的 `.await`：`MutexGuard` 非 `Send`，
         // 跨 await 会让整个 future 失去 `Send`（且本就无故长持全局锁）。
-        let mut config = {
+        let mut config = if env_prelocked {
+            Config::from_env().unwrap()
+        } else {
             let _guard = crate::test_env::env_lock();
             Config::from_env().unwrap()
         };
@@ -975,6 +1209,14 @@ mod tests {
         } else {
             Wiring::ephemeral(Some(model), Box::new(sink))
         };
+
+        // 与生产侧同规：debug sink 在 `Wiring` 建好、会话路径已知之后打开，
+        // 并由「启动期一方」写第一条 `run_start`。关闭时 `open_enabled` 早退。
+        let mut debug = crate::debug_log::open_enabled(debug_flag, wiring.session_path());
+        if let Some(sink) = debug.as_mut() {
+            let session_id = crate::session_id_for(wiring.session_path());
+            crate::emit_run_start(sink, &config, wiring.session_path(), &session_id, &[]);
+        }
 
         let (requests, request_rx) = mpsc::channel(8);
         let (boundaries, boundary_rx) = mpsc::channel(8);
@@ -1028,6 +1270,8 @@ mod tests {
             default_workspace,
             app_session_path,
             app_worktree,
+            debug,
+            Vec::new(),
         ));
 
         Harness {
@@ -1130,6 +1374,8 @@ mod tests {
                 AgentEvent::UserMessage { .. } => "UserMessage",
                 AgentEvent::RoundStarted { .. } => "RoundStarted",
                 AgentEvent::ModelTextDelta { .. } => "ModelTextDelta",
+                // Step 7 的逐轮 usage 上报（每轮一条，在终局事件之前）。
+                AgentEvent::RoundUsage { .. } => "RoundUsage",
                 AgentEvent::RunFinished { .. } => "RunFinished",
                 AgentEvent::RunFailed { .. } => "RunFailed",
                 _ => "Other",
@@ -1339,6 +1585,8 @@ mod tests {
                 "UserMessage",
                 "RoundStarted",
                 "ModelTextDelta",
+                // 每条模型轮新增一条 `RoundUsage`（Step 7），位于终局事件之前。
+                "RoundUsage",
                 "RunFinished"
             ],
             "事件顺序必须与循环产出顺序一致：{msgs:?}"
@@ -2240,6 +2488,8 @@ mod tests {
                 ))
             },
             None,
+            false,
+            false,
         )
         .await;
 
@@ -2279,6 +2529,8 @@ mod tests {
             |b| b.limits(ys_component::RunLimits::new(u32::MAX)),
             |_| None,
             None,
+            false,
+            false,
         )
         .await;
 
@@ -2652,6 +2904,8 @@ mod tests {
             |b| b,
             |_| None,
             binding,
+            false,
+            false,
         )
         .await
     }
@@ -2859,5 +3113,323 @@ mod tests {
         let dir = h.tmp.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ───────────────────────── debug 接线（Task 16）─────────────────────────
+
+    /// 测试期 env 覆盖（`YUSHAN_LOG_DIR` + `YUSHAN_DEBUG`），**整段持有 `env_lock`**。
+    ///
+    /// 持有锁时必须把 harness 的 `env_prelocked` 传 `true` —— 它内部不再重复加锁
+    /// （`Mutex` 不可重入，同线程二次加锁会死锁）。
+    ///
+    /// 字段顺序即 drop 顺序：先恢复环境（此时锁仍活着），再释放锁。
+    struct DebugEnv {
+        _restore: crate::test_env::EnvRestore,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DebugEnv {
+        fn set(log_dir: &Path) -> Self {
+            let guard = crate::test_env::env_lock();
+            let restore = crate::test_env::EnvRestore::capture(&[
+                crate::logging::LOG_DIR_ENV,
+                crate::debug_log::DEBUG_ENV,
+            ]);
+            // SAFETY: 持有 env_lock。
+            unsafe {
+                std::env::set_var(crate::logging::LOG_DIR_ENV, log_dir);
+                std::env::remove_var(crate::debug_log::DEBUG_ENV);
+            }
+            Self {
+                _restore: restore,
+                _guard: guard,
+            }
+        }
+    }
+
+    /// 目录里的 `debug-*.jsonl`：返回 `(路径, 解析后的记录)`，按路径排序。
+    fn debug_files(dir: &Path) -> Vec<(PathBuf, Vec<serde_json::Value>)> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| {
+                        let name = name.to_string_lossy();
+                        name.starts_with("debug-") && name.ends_with(".jsonl")
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let content = std::fs::read_to_string(&path).unwrap();
+                let records = content
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                (path, records)
+            })
+            .collect()
+    }
+
+    fn record_evs(records: &[serde_json::Value]) -> Vec<&str> {
+        records
+            .iter()
+            .map(|record| record["ev"].as_str().expect("每条记录都有 ev"))
+            .collect()
+    }
+
+    /// 正常收摊：drop 请求发送端 → 等 app 循环返回（`flush` 在此路径上执行）。
+    async fn shutdown(mut h: Harness) {
+        drop(h.requests);
+        let joined = tokio::time::timeout(TIMEOUT, &mut h.handle)
+            .await
+            .expect("drop requests 后 app 循环应立即收摊")
+            .expect("app 循环任务不应 panic");
+        assert!(joined.is_ok(), "正常收摊应为 Ok：{joined:?}");
+    }
+
+    /// TUI 层：debug 开时一个回合落齐 `turn_start / round_start / tool_call /
+    /// round_end / turn_end`；`yushan.log` 的既有文本行形状不变。
+    ///
+    /// 变异：事件泵里跳过 `debug.record`（例如把 `observe_debug` 换回 `observe`）
+    /// ⇒ `round_start` / `tool_call` / `round_end` 缺失 ⇒ 红。
+    #[tokio::test]
+    async fn debug_tui_records_turn_round_and_tool_events() {
+        let logs = TempDir::new("debug_tui_logs");
+        let _env = DebugEnv::set(&logs.0);
+
+        let model = MockModel::new("m");
+        model.push_tool_call("bash", serde_json::json!({"command": "echo hi"}));
+        model.push_text("done");
+        let mut h = spawn_app_loop_debug(Box::new(model), true, Vec::new()).await;
+        h.requests.send(prompt("hi")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
+
+        let files = debug_files(&logs.0);
+        assert_eq!(files.len(), 1, "一个会话一个 debug 文件：{files:?}");
+        let records = &files[0].1;
+        let evs = record_evs(records);
+        for expected in [
+            "run_start",
+            "turn_start",
+            "round_start",
+            "tool_call",
+            "round_end",
+            "turn_end",
+            "run_end",
+        ] {
+            assert!(
+                evs.contains(&expected),
+                "缺少 `{expected}` 记录：{evs:?}"
+            );
+        }
+        assert_eq!(
+            evs.iter().filter(|ev| **ev == "turn_start").count(),
+            1,
+            "一个回合恰一条 `turn_start`"
+        );
+        assert_eq!(
+            evs.iter().filter(|ev| **ev == "turn_end").count(),
+            1,
+            "一个回合恰一条 `turn_end`"
+        );
+
+        // 既有文本行形状不变（逐字节口径由 `round_clock` 的单测钉住）。
+        let text_log = std::fs::read_to_string(logs.0.join("yushan.log")).unwrap();
+        assert!(
+            text_log.lines().any(|line| line.contains(" round=1 ")),
+            "逐轮文本行应照旧：{text_log}"
+        );
+        assert!(
+            text_log.lines().any(|line| line.contains(" turn=1 rounds=")),
+            "回合文本行应照旧：{text_log}"
+        );
+    }
+
+    /// `/new`：切到**新 debug 文件**；新文件以新 `run_start` 开头，旧文件不再收到
+    /// 新回合的记录。
+    ///
+    /// 变异：`/new` 臂里不调 `switch_file` ⇒ 只有一个文件、旧文件含 turn=2 ⇒ 红。
+    #[tokio::test]
+    async fn new_session_switches_debug_file() {
+        let logs = TempDir::new("debug_new_session_logs");
+        let _env = DebugEnv::set(&logs.0);
+
+        let model = MockModel::new("m");
+        model.push_text("first");
+        model.push_text("second");
+        let mut h = spawn_app_loop_debug(Box::new(model), true, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(Request::NewSession).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(prompt("again")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
+
+        let files = debug_files(&logs.0);
+        assert_eq!(files.len(), 2, "/new 后应有新旧两个 debug 文件：{files:?}");
+        let (old_path, old_records) = &files[0];
+        let (new_path, new_records) = &files[1];
+        assert_ne!(old_path, new_path);
+
+        assert!(
+            !old_records
+                .iter()
+                .any(|record| record["turn"].as_u64() == Some(2)),
+            "旧文件不得再收到新会话的记录：{old_path:?}"
+        );
+        assert!(
+            new_records.iter().any(|record| record["ev"] == "run_start"),
+            "新文件应以一条 `run_start` 开头"
+        );
+        assert!(
+            new_records
+                .iter()
+                .any(|record| record["turn"].as_u64() == Some(2)),
+            "新文件应包含新回合的记录"
+        );
+    }
+
+    /// `/resume` 同一 session：**追加同一文件**，`run_start` 的 `run` 递增。
+    ///
+    /// 变异：同 session 也调 `switch_file`（或 `begin_run` 不递增 run）⇒ 文件数 / run
+    /// 断言红。
+    #[tokio::test]
+    async fn resume_same_session_appends_and_increments_run() {
+        let logs = TempDir::new("debug_resume_logs");
+        let _env = DebugEnv::set(&logs.0);
+
+        let model = MockModel::new("m");
+        model.push_text("hello");
+        let mut h = spawn_app_loop_full(
+            Box::new(model),
+            true,
+            Vec::new(),
+            |config, _tmp| {
+                config.api_base = Some("http://resume-base/v1".into());
+                config.api_key = Some("sk-resume".into());
+                config.set_model_factory(|_| Some(Box::new(MockModel::new("resumed"))));
+            },
+            |b| b,
+            |_| None,
+            None,
+            true,
+            true,
+        )
+        .await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        let session = h.session_path.get().expect("持久会话应有路径");
+        let id = session
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        h.requests
+            .send(Request::ResumeSession { target: id })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
+
+        let files = debug_files(&logs.0);
+        assert_eq!(files.len(), 1, "同一 session 的 `/resume` 应追加同一文件");
+        let runs: Vec<u64> = files[0]
+            .1
+            .iter()
+            .filter(|record| record["ev"] == "run_start")
+            .map(|record| record["run"].as_u64().unwrap())
+            .collect();
+        assert_eq!(runs.len(), 2, "启动 + `/resume` 各一条 `run_start`：{runs:?}");
+        assert!(runs[1] > runs[0], "`/resume` 的 run 必须递增：{runs:?}");
+    }
+
+    /// Abort：UI 投递的 `Boundary::Abort` 同时留下 `enqueued` 与 `observed` 两条记录。
+    ///
+    /// 变异：删掉 boundary 分支里的 `record_boundary(enqueued)` ⇒ 第一条断言红；
+    /// 删掉回合末的 `Cancelled` 分支 ⇒ `observed` 缺失 ⇒ 红。
+    #[tokio::test]
+    async fn abort_records_enqueued_and_observed() {
+        let logs = TempDir::new("debug_abort_logs");
+        let _env = DebugEnv::set(&logs.0);
+
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop_debug(Box::new(model), false, Vec::new()).await;
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        h.boundaries.send(Boundary::Abort).await.unwrap();
+        probe.let_app_task_pump().await;
+        probe.release();
+
+        let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
+
+        let files = debug_files(&logs.0);
+        assert_eq!(files.len(), 1);
+        let boundaries: Vec<&serde_json::Value> = files[0]
+            .1
+            .iter()
+            .filter(|record| record["ev"] == "boundary")
+            .collect();
+        assert!(
+            boundaries.iter().any(|record| {
+                record["phase"] == "enqueued"
+                    && record["kind"] == "abort"
+                    && record["origin"] == "ui"
+            }),
+            "缺少 UI Abort 的 enqueued 记录：{boundaries:?}"
+        );
+        assert!(
+            boundaries
+                .iter()
+                .any(|record| record["phase"] == "observed" && record["kind"] == "abort"),
+            "缺少回合收场时的 observed 记录：{boundaries:?}"
+        );
+    }
+
+    /// TUI 层的 T1：debug 关时**零新文件**（`open_enabled` 早退）。
+    ///
+    /// 变异：去掉 `open_enabled` 的开关判断 ⇒ 出现 `debug-*.jsonl` ⇒ 红。
+    #[tokio::test]
+    async fn debug_off_tui_creates_no_files() {
+        let logs = TempDir::new("debug_off_tui_logs");
+        let _env = DebugEnv::set(&logs.0);
+
+        let model = MockModel::new("m");
+        model.push_text("hello");
+        // debug 关，但本测试仍持有 env_lock（`DebugEnv`）⇒ `env_prelocked = true`。
+        let mut h = spawn_app_loop_full(
+            Box::new(model),
+            false,
+            Vec::new(),
+            |_, _| {},
+            |b| b,
+            |_| None,
+            None,
+            false,
+            true,
+        )
+        .await;
+        h.requests.send(prompt("hi")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
+
+        assert!(
+            debug_files(&logs.0).is_empty(),
+            "debug 关时不得出现 debug 文件"
+        );
     }
 }

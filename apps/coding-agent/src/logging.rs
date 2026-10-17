@@ -24,23 +24,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// ⇒ 只改 `HOME` 会把凭证一起改没，故必须有一个独立的覆盖口。
 pub const LOG_DIR_ENV: &str = "YUSHAN_LOG_DIR";
 
-/// 默认日志文件：`$YUSHAN_LOG_DIR/yushan.log`，否则 `~/.yushan/logs/yushan.log`
-/// （两者都不可得时为 `None`）。
+/// 日志**目录**：`$YUSHAN_LOG_DIR`，否则 `~/.yushan/logs`（两者都不可得时为 `None`）。
 ///
 /// 空字符串视为**未设置** —— 否则会静默落到当前工作目录，比不覆盖更糟。
-pub fn default_log_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os(LOG_DIR_ENV) {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir).join("yushan.log"));
-        }
+///
+/// 这是诊断产物的统一父目录：`yushan.log` 与 `debug-*.jsonl` 都放在这里，
+/// 从而 `YUSHAN_LOG_DIR` 一次覆盖全部诊断输出。
+pub fn log_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(LOG_DIR_ENV)
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".yushan")
-            .join("logs")
-            .join("yushan.log"),
-    )
+    Some(PathBuf::from(home).join(".yushan").join("logs"))
+}
+
+/// 默认日志文件：`log_dir()/yushan.log`（目录不可得时为 `None`）。
+pub fn default_log_path() -> Option<PathBuf> {
+    Some(log_dir()?.join("yushan.log"))
 }
 
 /// 追加一条日志到默认路径。

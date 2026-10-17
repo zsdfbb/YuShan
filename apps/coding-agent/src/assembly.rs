@@ -67,6 +67,10 @@ pub struct BuiltAgent {
     pub limits: RunLimits,
     /// 工具表装配的降级提示（`rg`/`fd` 缺失等）—— **仅在启动期**消费。
     pub hint: Option<String>,
+    /// `debug` 的 `run_start` 用：工具名 + JSON spec 字节数（顺序即注册顺序）。
+    ///
+    /// 与提示词工具清单同源 —— 注册顺序、提示词顺序、这里的元数据三者不可能漂移。
+    pub tool_specs: Vec<(String, usize)>,
 }
 
 impl AgentFactory {
@@ -114,6 +118,16 @@ impl AgentFactory {
         let mut tools: Vec<Box<dyn Tool>> = base_tools;
         tools.push(Box::new(SubagentTool::new(subagent.outer_timeout())));
         let specs: Vec<_> = tools.iter().map(|t| t.spec()).collect();
+        // `run_start` 的工具元数据：名字 + spec 的 JSON 字节数（不记内容）。
+        let tool_specs: Vec<(String, usize)> = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name.clone(),
+                    serde_json::to_string(spec).map(|json| json.len()).unwrap_or(0),
+                )
+            })
+            .collect();
         let system_prompt = prompt::build_system_prompt(workspace, &specs, &self.catalogue);
 
         // **压缩耦合修正**（设计 §选择理由 E）：量一次每轮固定开销交给 `BasicLoop`。
@@ -127,6 +141,7 @@ impl AgentFactory {
             subagent,
             limits,
             hint,
+            tool_specs,
         })
     }
 }

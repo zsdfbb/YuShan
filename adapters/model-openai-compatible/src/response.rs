@@ -19,6 +19,11 @@ pub struct ChatUsage {
     /// （实测 `opencode-go`）只报这里。**只认一家会让另一家的缓存读数恒为「无」**。
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenAI 标准形状的完成侧明细：`{"reasoning_tokens": N}`。
+    ///
+    /// `None` = 整块明细缺失（provider 未上报）；`Some(..)` = 报了这一块。
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 /// `prompt_tokens_details` 的已知子集（其余字段忽略）。
@@ -26,6 +31,15 @@ pub struct ChatUsage {
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: u32,
+}
+
+/// `completion_tokens_details` 的已知子集（其余字段忽略）。
+///
+/// 明细块存在但 `reasoning_tokens` 缺失时按 0 计，仍视为「已上报」。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 impl ChatUsage {
@@ -47,6 +61,15 @@ impl ChatUsage {
             ),
             None => (0, 0),
         }
+    }
+
+    /// 推理 token 数：`None` = provider 未上报该明细块；`Some(0)` = 上报了真 0。
+    ///
+    /// 两者语义不同，**不得**把 `Some(0)` 折叠成 `None`。
+    pub fn reasoning_tokens(&self) -> Option<u32> {
+        self.completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
     }
 }
 
@@ -137,5 +160,44 @@ mod tests {
                 "prompt_tokens_details":{"cached_tokens":0}}"#,
         );
         assert_eq!(first.cache_tokens(), (0, 9760), "未命中应等于全部输入");
+    }
+
+    /// 推理 token：整块明细缺失 ⇒ `None`；显式 `0` ⇒ `Some(0)`。
+    ///
+    /// 两者语义不同（未上报 vs 上报了真 0），上层靠它决定是否把该字段写进 JSON。
+    ///
+    /// 变异说明：
+    /// - 删掉 `ChatUsage::completion_tokens_details` 字段 ⇒ 第一条断言变红
+    ///   （serde 忽略未知键，解析为 `None`）。
+    /// - 把 `reasoning_tokens()` 改成 `filter(|n| *n > 0)` 或把字段改成裸 `u32`
+    ///   ⇒ 第三条断言变红（`Some(0)` 被折叠成 `None`）。
+    #[test]
+    fn reasoning_tokens_distinguishes_missing_from_zero() {
+        let reported = parse(
+            r#"{"prompt_tokens":11,"completion_tokens":4,
+                "completion_tokens_details":{"reasoning_tokens":4}}"#,
+        );
+        assert_eq!(
+            reported.reasoning_tokens(),
+            Some(4),
+            "provider 上报了推理 token 数"
+        );
+
+        let missing = parse(r#"{"prompt_tokens":11,"completion_tokens":4}"#);
+        assert_eq!(
+            missing.reasoning_tokens(),
+            None,
+            "整块明细缺失 = 未上报，不能当成 0"
+        );
+
+        let zero = parse(
+            r#"{"prompt_tokens":11,"completion_tokens":4,
+                "completion_tokens_details":{"reasoning_tokens":0}}"#,
+        );
+        assert_eq!(
+            zero.reasoning_tokens(),
+            Some(0),
+            "显式报 0 是真 0，不得折叠成 None"
+        );
     }
 }

@@ -34,10 +34,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use serde_json::{Map, Value, json};
 use ys_core::ToolCallId;
 use ys_event::AgentEvent;
 use ys_loop::{LoopError, RunResult};
 use ys_protocol::Envelope;
+
+use crate::debug_log::{ArgsMode, DebugRecord, summarize_tool_args};
 
 /// 两个时刻之间的毫秒数；任一缺失记 0（该段没有对应事件）。
 fn span_ms(from: Option<Instant>, to: Option<Instant>) -> u128 {
@@ -47,8 +50,14 @@ fn span_ms(from: Option<Instant>, to: Option<Instant>) -> u128 {
     }
 }
 
-/// 逐轮计时状态机：吃事件、吐可观测行。
+/// 一轮关闭时的产物：文本行（两条入口共用）与 debug 记录（仅 debug 开着时）。
 #[derive(Default)]
+pub(crate) struct RoundObservation {
+    pub lines: Vec<String>,
+    pub records: Vec<DebugRecord>,
+}
+
+/// 逐轮计时状态机：吃事件、吐可观测行。
 pub(crate) struct RoundClock {
     round: Option<u32>,
     started: Option<Instant>,
@@ -56,6 +65,19 @@ pub(crate) struct RoundClock {
     last_model: Option<Instant>,
     first_tool: Option<Instant>,
     last_tool: Option<Instant>,
+    /// 本轮首个 / 末个思考增量（`ModelThinkingDelta`）。
+    first_thinking: Option<Instant>,
+    last_thinking: Option<Instant>,
+    /// 本轮首个 / 末个正文增量（`ModelTextDelta`）。
+    first_text: Option<Instant>,
+    last_text: Option<Instant>,
+    /// 逐增量**只计数**，不落记录：增量占事件量的 95% 以上。
+    thinking_deltas: u32,
+    text_deltas: u32,
+    /// 本轮 `ToolCall` 事件数（不是 `ToolResult` 数：调用可能失败而不回结果）。
+    tool_calls: u32,
+    /// 工具参数摘要档位；仅 `observe_debug` 读取。
+    args_mode: ArgsMode,
     /// 本轮**在飞**的调用：`id → (名字, 起点)`。
     ///
     /// 存在的理由：轮级的 `tools_ms` 是**首末之差**，它答不了"这一轮的 74 秒花在哪一个
@@ -65,48 +87,228 @@ pub(crate) struct RoundClock {
     calls: Vec<(String, u128)>,
 }
 
+impl Default for RoundClock {
+    /// 默认按 `head` 档摘要工具参数（关闭 debug 时不会走到摘要）。
+    fn default() -> Self {
+        Self::new(ArgsMode::Head)
+    }
+}
+
 impl RoundClock {
+    pub(crate) fn new(args_mode: ArgsMode) -> Self {
+        Self {
+            round: None,
+            started: None,
+            first_token: None,
+            last_model: None,
+            first_tool: None,
+            last_tool: None,
+            first_thinking: None,
+            last_thinking: None,
+            first_text: None,
+            last_text: None,
+            thinking_deltas: 0,
+            text_deltas: 0,
+            tool_calls: 0,
+            args_mode,
+            in_flight: HashMap::new(),
+            calls: Vec::new(),
+        }
+    }
+
     /// 观察一条事件，返回**刚被它关闭的那一轮**的可观测行（没有则空）。
     ///
     /// 至多两条：轮摘要行；若该轮有工具调用，再跟一条**逐调用**耗时行
     /// （`tools round=N name:ms name:ms …`）。
+    ///
+    /// **签名与输出是既有契约**：文本行逐字节不变，也不产生任何 debug 记录。
     pub(crate) fn observe(&mut self, env: &Envelope, now: Instant) -> Vec<String> {
+        self.observe_inner(env, now, false).lines
+    }
+
+    /// [`RoundClock::observe`] 的 debug 版本：文本行完全相同，另返回结构化记录。
+    ///
+    /// 每个事件只能走其中一条路径（共享同一套状态机）；关轮时文本行与
+    /// `round_end` 记录在同一次状态迁移里产出，二者因此不可能漂移。
+    ///
+    /// 关闭 debug 的生产路径走 [`RoundClock::observe`]。
+    pub(crate) fn observe_debug(&mut self, env: &Envelope, now: Instant) -> RoundObservation {
+        self.observe_inner(env, now, true)
+    }
+
+    fn observe_inner(&mut self, env: &Envelope, now: Instant, debug: bool) -> RoundObservation {
         match &env.event {
             AgentEvent::RoundStarted { round } => {
-                let closed = self.take_lines();
+                let mut observation = self.close_round(debug);
                 self.round = Some(*round);
                 self.started = Some(now);
-                closed
+                if debug {
+                    observation.records.push(DebugRecord {
+                        ev: "round_start",
+                        round: Some(*round),
+                        tool_call_id: None,
+                        fields: Map::new(),
+                    });
+                }
+                observation
             }
-            AgentEvent::ModelTextDelta { .. } | AgentEvent::ModelThinkingDelta { .. } => {
+            AgentEvent::ModelThinkingDelta { .. } => {
                 self.first_token.get_or_insert(now);
                 self.last_model = Some(now);
-                Vec::new()
+                self.first_thinking.get_or_insert(now);
+                self.last_thinking = Some(now);
+                self.thinking_deltas += 1;
+                RoundObservation::default()
+            }
+            AgentEvent::ModelTextDelta { .. } => {
+                self.first_token.get_or_insert(now);
+                self.last_model = Some(now);
+                self.first_text.get_or_insert(now);
+                self.last_text = Some(now);
+                self.text_deltas += 1;
+                RoundObservation::default()
             }
             AgentEvent::ToolCall { call } => {
                 self.first_tool.get_or_insert(now);
+                self.tool_calls += 1;
                 self.in_flight
                     .insert(call.id.clone(), (call.name.clone(), now));
-                Vec::new()
-            }
-            AgentEvent::ToolResult { id, .. } => {
-                self.last_tool = Some(now);
-                if let Some((name, start)) = self.in_flight.remove(id) {
-                    self.calls
-                        .push((name, now.saturating_duration_since(start).as_millis()));
+                let mut observation = RoundObservation::default();
+                if debug {
+                    let summary = summarize_tool_args(&call.name, &call.arguments, self.args_mode);
+                    let mut fields = Map::new();
+                    fields.insert("gen_ai.tool.name".to_string(), json!(call.name));
+                    fields.insert("gen_ai.tool.call.id".to_string(), json!(call.id.0));
+                    fields.insert("gen_ai.tool.call.arguments".to_string(), summary.arguments);
+                    fields.insert(
+                        "args_original_bytes".to_string(),
+                        json!(summary.original_bytes),
+                    );
+                    fields.insert("args_truncated".to_string(), json!(summary.truncated));
+                    fields.insert("args_keys".to_string(), json!(summary.keys));
+                    fields.insert(
+                        "args_redacted_keys".to_string(),
+                        json!(summary.redacted_keys),
+                    );
+                    observation.records.push(DebugRecord {
+                        ev: "tool_call",
+                        round: self.round,
+                        tool_call_id: Some(call.id.0.clone()),
+                        fields,
+                    });
                 }
-                Vec::new()
+                observation
+            }
+            AgentEvent::ToolResult { id, result } => {
+                self.last_tool = Some(now);
+                let duration_ms = self.in_flight.remove(id).map(|(name, start)| {
+                    let ms = now.saturating_duration_since(start).as_millis();
+                    self.calls.push((name, ms));
+                    ms
+                });
+                let mut observation = RoundObservation::default();
+                if debug {
+                    // **不记结果内容**：debug 是索引，内容以 session 为准。
+                    let mut fields = Map::new();
+                    fields.insert(
+                        "duration_ms".to_string(),
+                        json!(duration_ms.map(|ms| ms as u64)),
+                    );
+                    fields.insert("is_error".to_string(), json!(result.is_error));
+                    fields.insert("result_bytes".to_string(), json!(result.content.len()));
+                    fields.insert(
+                        "result_lines".to_string(),
+                        json!(result.content.lines().count()),
+                    );
+                    fields.insert("result_lines_exact".to_string(), json!(true));
+                    observation.records.push(DebugRecord {
+                        ev: "tool_result",
+                        round: self.round,
+                        tool_call_id: Some(id.0.clone()),
+                        fields,
+                    });
+                }
+                observation
+            }
+            AgentEvent::RoundUsage {
+                purpose,
+                round,
+                usage,
+            } => {
+                let mut observation = RoundObservation::default();
+                if debug {
+                    let mut fields = Map::new();
+                    fields.insert(
+                        "purpose".to_string(),
+                        serde_json::to_value(purpose).unwrap_or(Value::Null),
+                    );
+                    fields.insert(
+                        "gen_ai.usage.input_tokens".to_string(),
+                        json!(usage.input_tokens),
+                    );
+                    fields.insert(
+                        "gen_ai.usage.output_tokens".to_string(),
+                        json!(usage.output_tokens),
+                    );
+                    fields.insert(
+                        "gen_ai.usage.total_tokens".to_string(),
+                        json!(usage.input_tokens.saturating_add(usage.output_tokens)),
+                    );
+                    fields.insert(
+                        "gen_ai.usage.cache_read.input_tokens".to_string(),
+                        json!(usage.prompt_cache_hit_tokens),
+                    );
+                    // 「没上报」写 `null`，绝不伪装成 0：真 0 与缺失语义不同。
+                    fields.insert(
+                        "gen_ai.usage.reasoning.output_tokens".to_string(),
+                        match usage.reasoning_tokens {
+                            Some(tokens) => json!(tokens),
+                            None => Value::Null,
+                        },
+                    );
+                    // **代理判据**：非 Option 的计数栏没有独立的「在不在」信号，只能按
+                    // 「input/output 是否有读数」推断是否上报，故 `false` **不能**被读作
+                    // 「确定没上报」。以下情况都会误判成 `false`：
+                    // - 真实上报 `input = 0 && output = 0`（如空响应）；
+                    // - provider 只填 `total_tokens`，或只填缓存计数
+                    //   （`prompt_cache_hit/miss > 0` 而 input/output 为 0）。
+                    // 要判定「确实没上报」，需与 provider 的原始响应对照。
+                    fields.insert(
+                        "usage_reported".to_string(),
+                        json!(usage.input_tokens > 0 || usage.output_tokens > 0),
+                    );
+                    fields.insert(
+                        "reasoning_tokens_reported".to_string(),
+                        json!(usage.reasoning_tokens.is_some()),
+                    );
+                    observation.records.push(DebugRecord {
+                        ev: "round_usage",
+                        round: Some(*round),
+                        tool_call_id: None,
+                        fields,
+                    });
+                }
+                observation
             }
             // 终局事件之后不会再有本轮的增量/工具事件 ⇒ 就地收尾这一轮。
-            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. } => self.take_lines(),
-            _ => Vec::new(),
+            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. } => {
+                self.close_round(debug)
+            }
+            _ => RoundObservation::default(),
         }
     }
 
-    /// 关闭当前轮并返回它的可观测行；无进行中的轮时为空。
+    /// 关闭当前轮并返回它的可观测行；无进行中的轮时为空（也不产记录）。
     pub(crate) fn take_lines(&mut self) -> Vec<String> {
+        self.close_round(false).lines
+    }
+
+    /// 关闭当前轮：文本行与 `round_end` 记录来自同一次状态迁移。
+    ///
+    /// `with_records = false` 时跳过摘要与记录构造（关闭 debug 的路径）。
+    fn close_round(&mut self, with_records: bool) -> RoundObservation {
         let Some(round) = self.round.take() else {
-            return Vec::new();
+            return RoundObservation::default();
         };
         // **首个可观测输出**：优先取模型增量，没有才取首个 `ToolCall`。
         //
@@ -123,7 +325,7 @@ impl RoundClock {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        let mut out = vec![format!(
+        let mut lines = vec![format!(
             "round={round} ttft_ms={} gen_ms={} tools_ms={} total_ms={}",
             span_ms(self.started, first_out),
             span_ms(first_out, model_end),
@@ -136,16 +338,81 @@ impl RoundClock {
                 .iter()
                 .map(|(name, ms)| format!("{name}:{ms}"))
                 .collect();
-            out.push(format!("tools round={round} {}", parts.join(" ")));
+            lines.push(format!("tools round={round} {}", parts.join(" ")));
         }
+
+        let mut records = Vec::new();
+        if with_records {
+            // 首增量相对轮起点；该轮没有对应增量 ⇒ `null`（不是 0 —— 0 会伪装成
+            // 「第 0 毫秒就开始了」）。段长则是真实的观测值，无增量时确为 0。
+            let first_ms = |at: Option<Instant>| {
+                self.started.and_then(|started| {
+                    at.map(|instant| instant.saturating_duration_since(started).as_millis() as u64)
+                })
+            };
+            let mut fields = Map::new();
+            fields.insert(
+                "ttft_ms".to_string(),
+                json!(span_ms(self.started, first_out) as u64),
+            );
+            fields.insert(
+                "gen_ms".to_string(),
+                json!(span_ms(first_out, model_end) as u64),
+            );
+            fields.insert(
+                "tools_ms".to_string(),
+                json!(span_ms(self.first_tool, self.last_tool) as u64),
+            );
+            fields.insert(
+                "total_ms".to_string(),
+                json!(span_ms(self.started, self.last_tool.or(model_end)) as u64),
+            );
+            fields.insert(
+                "first_thinking_ms".to_string(),
+                json!(first_ms(self.first_thinking)),
+            );
+            fields.insert(
+                "first_text_ms".to_string(),
+                json!(first_ms(self.first_text)),
+            );
+            fields.insert(
+                "thinking_span_ms".to_string(),
+                json!(span_ms(self.first_thinking, self.last_thinking) as u64),
+            );
+            fields.insert(
+                "text_span_ms".to_string(),
+                json!(span_ms(self.first_text, self.last_text) as u64),
+            );
+            fields.insert("thinking_deltas".to_string(), json!(self.thinking_deltas));
+            fields.insert("text_deltas".to_string(), json!(self.text_deltas));
+            fields.insert("tool_calls".to_string(), json!(self.tool_calls));
+            records.push(DebugRecord {
+                ev: "round_end",
+                round: Some(round),
+                tool_call_id: None,
+                fields,
+            });
+        }
+
+        self.reset_round();
+        RoundObservation { lines, records }
+    }
+
+    fn reset_round(&mut self) {
         self.started = None;
         self.first_token = None;
         self.last_model = None;
         self.first_tool = None;
         self.last_tool = None;
+        self.first_thinking = None;
+        self.last_thinking = None;
+        self.first_text = None;
+        self.last_text = None;
+        self.thinking_deltas = 0;
+        self.text_deltas = 0;
+        self.tool_calls = 0;
         self.in_flight.clear();
         self.calls.clear();
-        out
     }
 }
 
@@ -200,7 +467,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use serde_json::json;
     use ys_core::{StopReason, ToolCall, ToolCallId, ToolResult, Usage};
+    use ys_event::RoundPurpose;
     use ys_protocol::Source;
 
     const MS: Duration = Duration::from_millis(1);
@@ -212,6 +481,10 @@ mod tests {
 
     fn text_delta() -> AgentEvent {
         AgentEvent::ModelTextDelta { text: "x".into() }
+    }
+
+    fn thinking_delta() -> AgentEvent {
+        AgentEvent::ModelThinkingDelta { text: "t".into() }
     }
 
     fn tool_call() -> AgentEvent {
@@ -248,6 +521,7 @@ mod tests {
             output_tokens: 0,
             prompt_cache_hit_tokens: hit,
             prompt_cache_miss_tokens: miss,
+            reasoning_tokens: None,
         }
     }
 
@@ -427,6 +701,7 @@ mod tests {
                 output_tokens: 149,
                 prompt_cache_hit_tokens: 0,
                 prompt_cache_miss_tokens: 0,
+                reasoning_tokens: None,
             },
             rounds: 2,
             final_message: None,
@@ -469,5 +744,393 @@ mod tests {
             unknown.ends_with("cache_hit=- cache_miss=-"),
             "缺用量来源时必须是 `-`：{unknown}"
         );
+    }
+
+    // ---- debug 富化：文本行契约不变 + 段/工具/usage 记录 ----
+
+    /// `observe` 与 `observe_debug` 必须共享同一套状态机：同一事件序列下
+    /// `lines` **逐字节一致**（既有 `yushan.log` 格式不变）。
+    ///
+    /// 变异：在任一路径多算/漏算一个时刻（例如只在 debug 分支里更新
+    /// `first_text`）⇒ 末行断言变红。
+    #[test]
+    fn observe_and_observe_debug_emit_identical_lines() {
+        let t0 = Instant::now();
+        let events = vec![
+            (AgentEvent::RoundStarted { round: 1 }, 0),
+            (thinking_delta(), 100),
+            (text_delta(), 150),
+            (tool_call(), 220),
+            (tool_result(), 280),
+            (
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Turn,
+                    round: 1,
+                    usage: usage(0, 0),
+                },
+                290,
+            ),
+            (AgentEvent::RoundStarted { round: 2 }, 400),
+            (text_delta(), 450),
+            (
+                AgentEvent::RunFinished {
+                    stop_reason: StopReason::Completed,
+                    usage: Usage::default(),
+                    rounds: 2,
+                },
+                500,
+            ),
+        ];
+
+        let mut plain = RoundClock::default();
+        let mut rich = RoundClock::default();
+        let mut plain_lines = Vec::new();
+        let mut rich_lines = Vec::new();
+        for (event, offset) in events {
+            let at = t0 + offset * MS;
+            plain_lines.extend(plain.observe(&env_of(event.clone()), at));
+            rich_lines.extend(rich.observe_debug(&env_of(event), at).lines);
+        }
+        plain_lines.extend(plain.take_lines());
+        rich_lines.extend(rich.take_lines());
+
+        assert_eq!(plain_lines, rich_lines, "两条路径的文本行必须逐字节一致");
+        assert_eq!(
+            plain_lines[0],
+            "round=1 ttft_ms=100 gen_ms=120 tools_ms=60 total_ms=280"
+        );
+    }
+
+    /// thinking / text 分段：首时刻相对轮起点，段长 = 同类末增量 − 首增量；
+    /// 计数只出现在 `round_end`，**没有任何逐增量记录**。
+    ///
+    /// 变异：① 交换 `first_thinking` / `first_text` 的更新 ⇒ 首时刻断言变红；
+    /// ② 把 `thinking_span_ms` 改成 `last_thinking - started` ⇒ 段长断言变红。
+    #[test]
+    fn round_end_splits_thinking_and_text_segments() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe_debug(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        clock.observe_debug(&env_of(thinking_delta()), t0 + 100 * MS);
+        clock.observe_debug(&env_of(text_delta()), t0 + 150 * MS);
+        clock.observe_debug(&env_of(thinking_delta()), t0 + 200 * MS);
+        clock.observe_debug(&env_of(text_delta()), t0 + 400 * MS);
+        clock.observe_debug(&env_of(tool_call()), t0 + 420 * MS);
+        clock.observe_debug(&env_of(tool_result()), t0 + 470 * MS);
+
+        let observation = clock.observe_debug(
+            &env_of(AgentEvent::RoundStarted { round: 2 }),
+            t0 + 500 * MS,
+        );
+        let evs: Vec<&str> = observation.records.iter().map(|r| r.ev).collect();
+        assert_eq!(evs, vec!["round_end", "round_start"], "{evs:?}");
+
+        let end = &observation.records[0];
+        assert_eq!(end.round, Some(1));
+        let fields = &end.fields;
+        assert_eq!(fields["ttft_ms"], json!(100), "首个可观测输出是思考增量");
+        assert_eq!(fields["gen_ms"], json!(320), "首输出 → 末增量/首工具较晚者");
+        assert_eq!(fields["tools_ms"], json!(50));
+        assert_eq!(fields["total_ms"], json!(470));
+        assert_eq!(fields["first_thinking_ms"], json!(100));
+        assert_eq!(fields["first_text_ms"], json!(150));
+        assert_eq!(fields["thinking_span_ms"], json!(100));
+        assert_eq!(fields["text_span_ms"], json!(250));
+        assert_eq!(fields["thinking_deltas"], json!(2));
+        assert_eq!(fields["text_deltas"], json!(2));
+        assert_eq!(fields["tool_calls"], json!(1));
+    }
+
+    /// 零增量记录：喂 10,000 条思考/正文增量，`records` 里只允许出现段记录，
+    /// **不得有任何以 `thinking` / `text` / `delta` 命名的逐增量记录**。
+    ///
+    /// 变异：给 `ModelTextDelta` 分支加一条记录 ⇒ 本用例的 `evs` 断言与
+    /// 逐事件 `records.is_empty()` 断言同时变红。
+    #[test]
+    fn model_deltas_only_count_and_produce_no_records() {
+        const PAIRS: u32 = 5_000;
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+        clock.observe_debug(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+
+        for index in 0..PAIRS {
+            let at = t0 + (index * 2) * MS;
+            let thinking = clock.observe_debug(&env_of(thinking_delta()), at);
+            assert!(thinking.lines.is_empty() && thinking.records.is_empty());
+            let text = clock.observe_debug(&env_of(text_delta()), at + MS);
+            assert!(text.lines.is_empty() && text.records.is_empty());
+        }
+
+        let observation = clock.observe_debug(
+            &env_of(AgentEvent::RoundStarted { round: 2 }),
+            t0 + PAIRS * 4 * MS,
+        );
+        let evs: Vec<&str> = observation.records.iter().map(|r| r.ev).collect();
+        assert_eq!(evs, vec!["round_end", "round_start"], "{evs:?}");
+        assert!(
+            !evs.iter()
+                .any(|ev| ev.contains("thinking") || ev.contains("text") || ev.contains("delta")),
+            "增量不得产出记录：{evs:?}"
+        );
+
+        let end = &observation.records[0];
+        assert_eq!(end.fields["thinking_deltas"], json!(PAIRS));
+        assert_eq!(end.fields["text_deltas"], json!(PAIRS));
+    }
+
+    /// `round_usage`：`reasoning_tokens` 的「上报了 0」与「没上报」必须可区分 ——
+    /// `Some(7)` ⇒ 值 7 + `reported=true`；`None` ⇒ JSON `null` + `reported=false`。
+    ///
+    /// 变异：把 `None` 分支写成 `json!(0)` ⇒ 第二组断言变红（0 会伪装成真 0）。
+    #[test]
+    fn round_usage_distinguishes_reasoning_tokens_none_from_zero() {
+        let t0 = Instant::now();
+        let mut reported = RoundClock::default();
+        let with = reported.observe_debug(
+            &env_of(AgentEvent::RoundUsage {
+                purpose: RoundPurpose::Turn,
+                round: 3,
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    prompt_cache_hit_tokens: 80,
+                    prompt_cache_miss_tokens: 20,
+                    reasoning_tokens: Some(7),
+                },
+            }),
+            t0,
+        );
+        let record = &with.records[0];
+        assert_eq!(record.ev, "round_usage");
+        assert_eq!(record.round, Some(3));
+        assert_eq!(record.fields["purpose"], json!("turn"));
+        assert_eq!(record.fields["gen_ai.usage.input_tokens"], json!(100));
+        assert_eq!(record.fields["gen_ai.usage.output_tokens"], json!(20));
+        assert_eq!(record.fields["gen_ai.usage.total_tokens"], json!(120));
+        assert_eq!(
+            record.fields["gen_ai.usage.cache_read.input_tokens"],
+            json!(80)
+        );
+        assert_eq!(
+            record.fields["gen_ai.usage.reasoning.output_tokens"],
+            json!(7)
+        );
+        assert_eq!(record.fields["usage_reported"], json!(true));
+        assert_eq!(record.fields["reasoning_tokens_reported"], json!(true));
+
+        let mut unreported = RoundClock::default();
+        let without = unreported.observe_debug(
+            &env_of(AgentEvent::RoundUsage {
+                purpose: RoundPurpose::Compaction,
+                round: 4,
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    reasoning_tokens: None,
+                    ..Default::default()
+                },
+            }),
+            t0,
+        );
+        let record = &without.records[0];
+        assert_eq!(record.fields["purpose"], json!("compaction"));
+        assert_eq!(
+            record.fields["gen_ai.usage.reasoning.output_tokens"],
+            Value::Null,
+            "未上报必须是 null"
+        );
+        assert_ne!(
+            record.fields["gen_ai.usage.reasoning.output_tokens"],
+            json!(0),
+            "未上报绝不能写成 0"
+        );
+        assert_eq!(record.fields["reasoning_tokens_reported"], json!(false));
+    }
+
+    /// `tool_call` 走 `summarize_tool_args`（`write` 正文零字节），`tool_result`
+    /// 只记尺寸与时长、**不记内容**；两者都带 `round` / `tool_call_id` 外键。
+    ///
+    /// 变异：① 跳过摘要直接写 `call.arguments` ⇒ `SECRET_BODY` 断言变红；
+    /// ② 删掉 `in_flight` 的逐调用耗时 ⇒ `duration_ms` 变 `null`；
+    /// ③ 把结果内容写进字段 ⇒ 内容泄漏断言变红。
+    #[test]
+    fn tool_records_summarize_args_and_only_sizes_for_results() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+        clock.observe_debug(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+
+        let call = AgentEvent::ToolCall {
+            call: ToolCall {
+                id: ToolCallId("c1".into()),
+                name: "write".into(),
+                arguments: json!({
+                    "path": "src/a.rs",
+                    "content": "SECRET_BODY",
+                    "api_key": "sk-live",
+                }),
+            },
+        };
+        let call_observation = clock.observe_debug(&env_of(call), t0 + 10 * MS);
+        let call_record = &call_observation.records[0];
+        assert_eq!(call_record.ev, "tool_call");
+        assert_eq!(call_record.round, Some(1));
+        assert_eq!(call_record.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(call_record.fields["gen_ai.tool.name"], json!("write"));
+        assert_eq!(call_record.fields["gen_ai.tool.call.id"], json!("c1"));
+        let arguments = &call_record.fields["gen_ai.tool.call.arguments"];
+        assert_eq!(arguments["path"], json!("src/a.rs"));
+        assert_eq!(arguments["content_bytes"], json!("SECRET_BODY".len()));
+        assert_eq!(arguments["content_lines"], json!(1));
+        assert_eq!(arguments["api_key"], json!("[REDACTED]"));
+        assert!(
+            !serde_json::to_string(&call_record.fields)
+                .unwrap()
+                .contains("SECRET_BODY"),
+            "正文一个字节都不得落进记录：{call_record:?}"
+        );
+        assert_eq!(call_record.fields["args_truncated"], json!(true));
+        assert!(
+            call_record.fields["args_keys"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("content"))
+        );
+        assert_eq!(call_record.fields["args_redacted_keys"], json!(["api_key"]));
+        assert!(call_record.fields["args_original_bytes"].as_u64().unwrap() > 0);
+
+        let result = AgentEvent::ToolResult {
+            id: ToolCallId("c1".into()),
+            result: ToolResult {
+                content: "line1\nline2\n".into(),
+                is_error: true,
+            },
+        };
+        let result_observation = clock.observe_debug(&env_of(result), t0 + 70 * MS);
+        let result_record = &result_observation.records[0];
+        assert_eq!(result_record.ev, "tool_result");
+        assert_eq!(result_record.round, Some(1));
+        assert_eq!(result_record.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(result_record.fields["duration_ms"], json!(60));
+        assert_eq!(result_record.fields["is_error"], json!(true));
+        assert_eq!(result_record.fields["result_bytes"], json!(12));
+        assert_eq!(result_record.fields["result_lines"], json!(2));
+        assert_eq!(result_record.fields["result_lines_exact"], json!(true));
+        assert!(
+            !serde_json::to_string(&result_record.fields)
+                .unwrap()
+                .contains("line1"),
+            "结果内容不得落进记录：{result_record:?}"
+        );
+    }
+
+    /// `usage_reported` 是**代理判据**：input/output 无读数时记 `false`，但这**不等于**
+    /// provider 确定没上报 —— 空响应、只填 `total_tokens`、只填缓存计数都会落到这里。
+    ///
+    /// 变异：把 `usage_reported` 改成恒 `true` ⇒ 本例全 0 与「只有缓存读数」两条断言变红。
+    #[test]
+    fn round_usage_all_zero_is_marked_unreported_by_proxy() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        let zero = clock.observe_debug(
+            &env_of(AgentEvent::RoundUsage {
+                purpose: RoundPurpose::Turn,
+                round: 5,
+                usage: Usage::default(),
+            }),
+            t0,
+        );
+        assert_eq!(
+            zero.records[0].fields["usage_reported"],
+            json!(false),
+            "全 0 读数按代理判据记 false"
+        );
+
+        // 只填缓存计数、input/output 为 0：同样是误判成 `false` 的已知情形。
+        let cache_only = clock.observe_debug(
+            &env_of(AgentEvent::RoundUsage {
+                purpose: RoundPurpose::Compaction,
+                round: 6,
+                usage: Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    prompt_cache_hit_tokens: 80,
+                    prompt_cache_miss_tokens: 20,
+                    reasoning_tokens: None,
+                },
+            }),
+            t0,
+        );
+        assert_eq!(
+            cache_only.records[0].fields["usage_reported"],
+            json!(false),
+            "代理判据只看 input/output，缓存计数不会被认作上报"
+        );
+    }
+
+    /// **无增量轮**：`first_thinking_ms` / `first_text_ms` 必须是 `null`，**不是 0**
+    /// （0 会伪装成「第 0 毫秒就开始了」）。
+    ///
+    /// 变异：把 `first_ms` 的缺失分支改成 `unwrap_or(0)` ⇒ 本例 `null` / `!= 0` 断言变红。
+    #[test]
+    fn round_end_marks_missing_first_deltas_as_null() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe_debug(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        // 没有任何 `Model*Delta`，直接收尾。
+        let observation = clock.observe_debug(
+            &env_of(AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 1,
+            }),
+            t0 + 500 * MS,
+        );
+        let end = &observation.records[0];
+        assert_eq!(end.fields["first_thinking_ms"], Value::Null);
+        assert_eq!(end.fields["first_text_ms"], Value::Null);
+        assert_ne!(end.fields["first_thinking_ms"], json!(0));
+        assert_ne!(end.fields["first_text_ms"], json!(0));
+    }
+
+    /// `RoundClock::new` 必须把 `args_mode` 透传下去：`None` 档把工具参数投影成空对象，
+    /// 与 `Default` 的 `Head` 档（保留 `path` 等）可区分。
+    ///
+    /// 变异：`new` 忽略入参、恒用 `ArgsMode::Head` ⇒ `None` 档的 `arguments == {}` 断言变红。
+    #[test]
+    fn new_honors_args_mode() {
+        fn read_call() -> AgentEvent {
+            AgentEvent::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId("c1".into()),
+                    name: "read".into(),
+                    arguments: json!({"path": "src/a.rs", "limit": 20}),
+                },
+            }
+        }
+
+        let t0 = Instant::now();
+
+        let mut head = RoundClock::default();
+        head.observe_debug(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        let head_observation = head.observe_debug(&env_of(read_call()), t0 + MS);
+        assert_eq!(
+            head_observation.records[0].fields["gen_ai.tool.call.arguments"]["path"],
+            json!("src/a.rs"),
+            "Default 走 Head 档：保留 path"
+        );
+
+        let mut none = RoundClock::new(ArgsMode::None);
+        none.observe_debug(&env_of(AgentEvent::RoundStarted { round: 2 }), t0);
+        let none_observation = none.observe_debug(&env_of(read_call()), t0 + MS);
+        let fields = &none_observation.records[0].fields;
+        assert_eq!(
+            fields["gen_ai.tool.call.arguments"],
+            json!({}),
+            "None 档只留 keys / bytes，参数投影为空对象"
+        );
+        assert_eq!(fields["args_truncated"], json!(true));
     }
 }

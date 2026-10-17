@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,6 +75,11 @@ pub struct UsageTotals {
     output: AtomicU64,
     hit: AtomicU64,
     miss: AtomicU64,
+    /// 推理 token 累计；仅当至少一次子调用上报了 `Some(_)` 时才有意义
+    /// （是否上报由 `reasoning_reported` 记录）。
+    reasoning: AtomicU64,
+    /// 是否有任一子调用上报了 `reasoning_tokens`（`Some(0)` 也算上报）。
+    reasoning_reported: AtomicBool,
 }
 
 impl UsageTotals {
@@ -87,15 +92,27 @@ impl UsageTotals {
             .fetch_add(u.prompt_cache_hit_tokens as u64, Ordering::Relaxed);
         self.miss
             .fetch_add(u.prompt_cache_miss_tokens as u64, Ordering::Relaxed);
+        // 只有上报了才累加并置位：`None` = 未上报，`Some(0)` = 真 0，两者不可折叠。
+        if let Some(v) = u.reasoning_tokens {
+            self.reasoning.fetch_add(v as u64, Ordering::Relaxed);
+            self.reasoning_reported.store(true, Ordering::Relaxed);
+        }
     }
 
     /// 取走累计值并清零（回合末一次）。
+    ///
+    /// `reasoning_tokens`：任何子调用报过 ⇒ `Some(累计)`（含累计为 0 的情形）；
+    /// 一次都没报过 ⇒ `None`。不能像其他字段那样恒写 0 —— 那会把「未上报」与「真 0」
+    /// 折叠，且会把已上报的推理 token 静默丢弃。
     pub fn drain(&self) -> Usage {
+        let reported = self.reasoning_reported.swap(false, Ordering::Relaxed);
+        let reasoning = self.reasoning.swap(0, Ordering::Relaxed) as u32;
         Usage {
             input_tokens: self.input.swap(0, Ordering::Relaxed) as u32,
             output_tokens: self.output.swap(0, Ordering::Relaxed) as u32,
             prompt_cache_hit_tokens: self.hit.swap(0, Ordering::Relaxed) as u32,
             prompt_cache_miss_tokens: self.miss.swap(0, Ordering::Relaxed) as u32,
+            reasoning_tokens: reported.then_some(reasoning),
         }
     }
 }
@@ -577,12 +594,14 @@ mod tests {
             output_tokens: 2,
             prompt_cache_hit_tokens: 1,
             prompt_cache_miss_tokens: 2,
+            reasoning_tokens: None,
         });
         t.add(&Usage {
             input_tokens: 4,
             output_tokens: 5,
             prompt_cache_hit_tokens: 6,
             prompt_cache_miss_tokens: 7,
+            reasoning_tokens: None,
         });
         let d = t.drain();
         assert_eq!((d.input_tokens, d.output_tokens), (7, 7));
@@ -591,6 +610,61 @@ mod tests {
             (7, 9)
         );
         assert_eq!(t.drain().input_tokens, 0, "drain 后清零");
+    }
+
+    /// 子调用全都不报 reasoning ⇒ 上卷为 `None`（未上报，不得伪造 0）。
+    ///
+    /// 变异说明：把 `drain` 的 `reasoning_tokens` 改成恒 `Some(reasoning)` ⇒ 本测试变红。
+    #[test]
+    fn usage_totals_reasoning_none_when_unreported() {
+        let t = UsageTotals::default();
+        t.add(&Usage {
+            input_tokens: 1,
+            ..Default::default()
+        });
+        t.add(&Usage {
+            input_tokens: 2,
+            ..Default::default()
+        });
+        assert_eq!(t.drain().reasoning_tokens, None);
+    }
+
+    /// 有一个子调用报 `Some(0)` ⇒ 上卷为 `Some(0)`（真 0 不能折叠成 `None`）。
+    ///
+    /// 变异说明：`add` 里按 `v > 0` 而非 `Some(_)` 置位 ⇒ 本测试变红；
+    /// `drain` 里写成 `(reasoning > 0).then_some(...)` ⇒ 本测试同样变红。
+    #[test]
+    fn usage_totals_reasoning_keeps_reported_zero() {
+        let t = UsageTotals::default();
+        t.add(&Usage {
+            reasoning_tokens: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(t.drain().reasoning_tokens, Some(0));
+    }
+
+    /// 多次上报 ⇒ 相加；`None` 不影响已上报的累计。
+    ///
+    /// 变异说明：把 `add` 的 `reasoning` 累加删掉 / 恒置 0 ⇒ 断言变红；
+    /// 把 `drain` 硬写 `None`（修复前的行为）⇒ 断言同样变红。
+    #[test]
+    fn usage_totals_reasoning_sums_reported_values() {
+        let t = UsageTotals::default();
+        t.add(&Usage {
+            reasoning_tokens: Some(3),
+            ..Default::default()
+        });
+        t.add(&Usage {
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        t.add(&Usage {
+            reasoning_tokens: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(t.drain().reasoning_tokens, Some(7));
+        // drain 后清零，且「是否上报」也复位。
+        assert_eq!(t.drain().reasoning_tokens, None);
     }
 
     #[test]
@@ -705,6 +779,7 @@ mod tests {
                         output_tokens: 7,
                         prompt_cache_hit_tokens: 9,
                         prompt_cache_miss_tokens: 2,
+                        reasoning_tokens: None,
                     },
                     finish_reason: FinishReason::Stop,
                 })

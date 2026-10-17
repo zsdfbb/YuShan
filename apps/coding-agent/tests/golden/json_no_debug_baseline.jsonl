@@ -1,0 +1,4 @@
+{"source":"agent","turn":1,"event":{"UserMessage":{"message":{"role":"User","content":[{"Text":{"text":"hi"}}]}}}}
+{"source":"agent","turn":1,"event":{"RoundStarted":{"round":1}}}
+{"source":"agent","turn":1,"event":{"ModelTextDelta":{"text":"hi"}}}
+{"source":"agent","turn":1,"event":{"RunFinished":{"stop_reason":"Completed","usage":{"input_tokens":11,"output_tokens":7,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":0},"rounds":1}}}

@@ -100,7 +100,7 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
 debug 已开、且已发出过模型请求，但整个 session 一条 `model_attempt` 都没有 ⇒ 在 `run_end`
 里写一条 `adapter_trace_missing` 警告。这样"忘了接"至少不再无声。
 
-> `Usage` 新增字段会让 34 处结构体字面量需要机械修补 —— 接受，一次性的。
+> `Usage` 新增字段会让 **既有 27 处** `Usage` 字面量（其中 **17 处带 `..Default::default()`** 自动兼容，**实际补字段 10 处**）需要机械修补 —— 接受，一次性的。
 
 ---
 
@@ -118,7 +118,7 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 | `adapters/model-openai-compatible/src/response.rs`（改） | `ChatUsage` 增 `completion_tokens_details.reasoning_tokens` |
 | `adapters/model-openai-compatible/src/lib.rs`（改） | attempt / 首字节 / 重试 trace（与既有 `with_logger` 并列） |
 | `crates/ys-core/src/usage.rs`（改） | `Usage` 增 **`reasoning_tokens: Option<u32>`**（`#[serde(default, skip_serializing_if = "Option::is_none")]`），纳入 `Add`。**必须是 `Option` 而非裸 `u32`**：裸写会让每条 `RunFinished.usage` 都多一个键，直接破坏 §8 验收 T2 的「过滤后逐字节不变」；`None` 同时精确表达 §4.2 的「没上报 ≠ 0」 |
-| `crates/ys-event/src/event.rs`（改） | 新增非终局 `RoundUsage { round, usage }` |
+| `crates/ys-event/src/event.rs`（改） | 新增非终局 `RoundUsage { purpose, round, usage }`（`purpose` ∈ `turn` / `compaction`，见 §4.8） |
 | `crates/ys-loop/src/basic.rs`（改） | Step 7 拿到 `response.usage` 后 emit `RoundUsage{purpose:"turn"}`；压缩分支 emit `purpose:"compaction"` |
 | `crates/ys-loop/src/compact.rs`（改） | `CompactOutcome` 增 `usage: Usage`（`execute` 手里已有响应，供调用方发 `RoundUsage`） |
 
@@ -137,7 +137,7 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 | `run_start`（一次） | `version`、`pid`、`os`/`arch`、`cwd`、`session_file`、`gen_ai.system`、`gen_ai.request.model`、`api_base`（**只 scheme+host**）、`limits{...}`、`tools[{name,spec_bytes}]`、`skills{count,budget}`、`env_names[]`（**只记名字不记值**）、`semconv` |
 | `turn_start` / `turn_end` | `turn`、`input_bytes`、`budget_ms`；结束时 `rounds`、`elapsed_ms`、`budget_remaining_ms`、`cache_hit/miss` |
 | `round_start` / `round_end` | 轮号；结束时 `ttft_ms`、`gen_ms`、`tools_ms`、`total_ms`、**`first_thinking_ms` / `first_text_ms`**、`thinking_span_ms` / `text_span_ms`、`thinking_deltas` / `text_deltas`（**只计数**）、`tool_calls` |
-| **`round_usage`** | **`purpose`**（`turn` / `compaction` / `summarize`，见 §4.8）、`round`（辅助调用可缺）、`gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`、**`gen_ai.usage.cache_read.input_tokens`**、**`gen_ai.usage.reasoning.output_tokens`**、`gen_ai.response.finish_reasons`、`usage_reported`、`reasoning_tokens_reported`（**区分"真 0"与"没上报"**） |
+| **`round_usage`** | **`purpose`**（`turn` / `compaction` / `summarize`，见 §4.8）、`round`（辅助调用可缺）、`gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`、**`gen_ai.usage.cache_read.input_tokens`**、**`gen_ai.usage.reasoning.output_tokens`**、`usage_reported`、`reasoning_tokens_reported`（**区分"真 0"与"没上报"**） |
 | `tool_call` | `gen_ai.tool.name`、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（**摘要**）、`args_original_bytes`、`args_truncated`、`args_keys`、`args_redacted_keys` |
 | `tool_result` | `duration_ms`、`is_error`、`result_bytes`、`result_lines`、`result_lines_exact`（**不记内容**） |
 | `model_attempt` | `attempt`/`max_attempts`、`outcome`、`reason_class`（`transport`/`idle_timeout`/`rate_limited`/`server_error`/`quota`/`fatal`）、`http_status`、`backoff_ms`、**`ttfb_ms`（真·首字节）** |
@@ -148,6 +148,15 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 
 **缺值约定**：字段适用但拿不到 ⇒ `null`；不适用 ⇒ 省略。**永不把"没上报"写成 0**（沿用
 `turn_line` 的 `-` 精神）。
+
+**两条已定的口径细节**：
+
+- `first_thinking_ms` / `first_text_ms`：该轮**没有对应增量** ⇒ 写 `null`（不是 `0`）。
+- `thinking_span_ms` / `text_span_ms`：是「末个减首个」，**无可减时为 `0`** —— 它与
+  `*_deltas == 0` 一起读才完整（`0 + 0 增量` = 该轮没有这类输出）。
+- `gen_ai.response.finish_reasons` **不在本轮记录里**：`RoundUsage` 事件不携带 finish reason
+  （它属 `ys-model` 的响应类型，放进 `ys-event` 会破坏分层）。截断由 `ResponseTruncated` 事件
+  体现，回合终局由 `RunFinished.stop_reason` 体现 ⇒ 逐轮 finish reason 是本轮的**已知缺口**。
 
 ### 4.3 Q1：写盘如何不扰动 `ttft` / `gen`
 
@@ -281,11 +290,11 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 
 | 阶段 | 内容 | 估计 |
 |---|---|---|
-| **P0** | 开关 + 独立文件 + 异步 sink + 段的富计时（thinking/text 拆分）+ 工具元数据 + `run_start`/`run_end` + `reasoning_tokens` + `RoundUsage`（含 `purpose` 与压缩覆盖）+ `exit_with_debug` 收敛 14 处退出 | **~900–1,100 行** |
-| **P1** | `model_attempt`（含 `ttfb_ms`、重试分类）+ 适配器自检 + 压缩/截断/boundary 记录 | ~300 行 |
-| **P2** | `/new` 轮转、文件上限与启动期 sweep、`state_change`、jq 配方文档 | ~250 行 |
+| **P0** | 开关 + 独立文件 + 异步 sink + 段的富计时（thinking/text 拆分）+ 工具元数据 + `run_start`/`run_end`（含 `rounds` / `duration_ms` / `exit_code` / 累计 usage）+ `/new` 切文件 + 64 MiB 文件上限 + `boundary` 记录 + `reasoning_tokens` + `RoundUsage`（含 `purpose` 与压缩覆盖）+ 退出原语收敛到 `exit_with_run_end` | **~900–1,100 行** |
+| **P1** | `model_attempt`（含 `ttfb_ms`、重试分类）+ 适配器自检 + 截断/压缩失败的专用记录 | ~300 行 |
+| **P2** | 启动期 sweep（旧 debug 文件清理）、`state_change`、jq 配方文档 | ~250 行 |
 
-> P0 的原估 ~700 行**偏乐观**（评审 R7）：它包含 `Usage` 加字段（**34 处字面量**，已核实）、
+> P0 的原估 ~700 行**偏乐观**（评审 R7）：它包含 `Usage` 加字段（**既有 27 处字面量（实际补 10 处）**，已核实）、
 > 新事件 + 两处 emit、`debug_log.rs`、两条入口接线、`RoundClock` 富化、14 处退出收敛。
 
 **P0 就能回答本轮悬着的两个问题**：`gen` 46 s vs 143 s 差在哪（思考 vs 正文），以及逐轮 usage/缓存走向。
@@ -307,7 +316,7 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 
 ## 7. 风险
 
-1. **`Usage` 加字段**会牵动 34 处结构体字面量（机械修补，一次性）。
+1. **`Usage` 加字段**会牵动 **既有 27 处** `Usage` 字面量（其中 **17 处带 `..Default::default()`** 自动兼容，**实际补字段 10 处**）（机械修补，一次性）。
 2. **`--json` 新增一类事件** —— 消费者必须忽略未知变体（`AgentEvent` 已 `#[non_exhaustive]`）。
 3. **`reasoning_tokens` 依赖 provider 上报** —— 不报时为 `null` 而非 0，并由
    `reasoning_tokens_reported` 显式区分。

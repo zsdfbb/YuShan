@@ -751,3 +751,62 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
   （仓库 `Cargo.toml` 无 `[profile]` 段，两侧同工具链、同 cargo 默认 release profile。）
 - 依赖：`Cargo.lock` 中 `ratatui-core` **只有 1 条**（v0.1.2 单版本）；`syntect` / `ansi-to-tui` / `onig` 均不出现；
   独立包数 194 → 201（+7）。
+
+---
+
+## 15. `--debug` 结构化执行日志（P0）— as-built
+
+设计见 `docs/arch/agent-observability/design.md` + `adr-debug-log.md`；执行计划
+`docs/exec-plans/2026-10-17-debug-log.md`。本节只记实际形态。
+
+### 15.1 开关与文件
+
+- `--debug` 在 TUI 首部 flag 区与 `-p` / `--json` 模式 flag 之后都可出现，与
+  `--stats` / `--resume` **顺序无关**（`split_leading_flags` 循环剥离，重复 last-wins）。
+  任务文本一旦开始就不再剥离（`-p "任务 --debug"` 的文本逐字保留）。
+- `YUSHAN_DEBUG` 非空时**优先于命令行**（`1/true/yes/on` 开，其余非空值关；空串视为未设置）。
+  `YUSHAN_DEBUG_ARGS` 控制工具参数摘要档位（`none` / `head` / `full`，默认 `head`）。
+- 文件：`logging::log_dir()/debug-<session stem>.jsonl`（`YUSHAN_LOG_DIR` 一次覆盖日志与
+  debug 两个产物）；会话尚未落盘时为 `debug-<pid>-<unix_ms>.jsonl`。追加写。
+- 关闭时 `Option<DebugSink>` 为 `None`：**零文件、零线程、零路径解析**。
+
+### 15.2 记录形状
+
+一行一条 JSON，信封含 `schema`（`yushan.debug/1`）/ `ev` / `t_ms` / `dt_ms` / `seq` /
+`run` / `session_id` / `turn` / `round` / `tool_call_id`（按需）。记录类型：
+
+| 段 | 记录 |
+|---|---|
+| 运行 | `run_start`（版本 / pid / os / cwd / session_file / model / api_base 只留 scheme+host / limits / tools / skills / env 变量名）、`run_end`（stop_reason + `debug{records_written,dropped,write_errors,bytes_written,hot_path_ms}`） |
+| 回合 | `turn_start`（input_bytes / budget_ms）、`turn_end`（rounds / elapsed_ms / budget_remaining_ms / cache 读数） |
+| 轮 | `round_start`、`round_end`（ttft/gen/tools/total、thinking/text 首时刻与段长、增量计数、tool_calls） |
+| 调用 | `round_usage`（`purpose=turn/compaction` + 逐轮 usage，含 `reasoning_tokens` 三态）、`tool_call`（参数摘要 + `args_*`）、`tool_result`（耗时 / 大小 / 错误位，**不记内容**） |
+| 边界 | `boundary {phase: enqueued/observed, kind, origin}`（CLI 的预算 Abort 在 `push` 同刻用可克隆 `DebugHandle` 写 `enqueued`） |
+
+`ModelTextDelta` / `ModelThinkingDelta` **零记录**（只累计计数）；`t_ms - dt_ms` 恒等于
+`run_start_unix_ms`。`run_end` 另带 `rounds` / `duration_ms` / `exit_code` / 累计 `usage`
+（`stop_reason` 是终局事件名，预算取消 / 无输出由 `exit_code` 区分）。
+
+`/new` 换文件；同一 session 的 `/resume`（含**跨进程** CLI `--resume`）追加并在打开时按文件里
+最大 `run` 递增；跨 session 的 `/resume` 切到目标会话的文件。
+
+### 15.3 退出与既有行为
+
+- `main.rs` 的 `process::exit` 收敛为 **1 处**（`exit_with_run_end`：`flush_run(meta)` →
+  `process::exit`；`exit_with_debug` 是它的简化入口）。`-p` / `--json` 的**模型错误 / 持久化
+  失败也走同一出口**，因此失败运行同样有 `run_end`。
+- TUI 正常退出 / 出站信道关闭（UI 已收摊）前都 flush；`APP_THREAD_GRACE`（3 s）大于
+  `FLUSH_TIMEOUT`（2 s），慢盘下 runtime 不会先掐掉 `run_end`。
+- `yushan.log` 的逐轮文本行**逐字节不变**（`RoundClock::observe` 与 `observe_debug` 共享状态机，
+  文本行由同一函数产出）；debug 内容**只进文件**，不占 stdout / stderr。
+
+### 15.4 落地数字
+
+- `cargo test --workspace`：**1247 passed / 0 failed / 11 ignored**。
+- 新增集成验收 `apps/coding-agent/tests/debug_log.rs`（7 个用例 + 1 个手动 golden 生成器）：
+  T1（debug 关零文件、既有诊断不变、stdout/stderr 不被污染）、T2（过滤 `RoundUsage` 后与
+  基线 golden 逐字节相同）、T5（flush 后文件完整、末行 `run_end`、run_end 字段齐全）、
+  T7（强制压缩时 `turn` 与 `compaction` 同时出现）、失败退出仍有 `run_end`、预算 Abort 的
+  `enqueued`/`observed`、跨进程 `--resume` 的 `run` 递增。子进程带 30 s 看门狗。
+- `cargo clippy --all-targets`：**无新增 warning**（当前 28 个站点，基线 34 个；差异为既有 warning
+  的行号漂移、5 处 `collapsible_if` 与 2 处 `too_many_arguments` 消失）。

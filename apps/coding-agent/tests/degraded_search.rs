@@ -75,7 +75,7 @@ fn run_guarded(path_dir: &Path, home: &Path) -> Output {
 ///
 /// ① **模型侧**（`API_BASE` / `API_KEY` / `MODEL` / `SESSIONS_DIR` / `CHANNEL_CAPACITY`）——
 ///    父进程若配了凭证，子进程就不会走到「无模型配置」的早退（本文件的两个早退断言失效）。
-/// ② **web 侧**（四个 `YUSHAN_SEARCH_*` + Tavily 通用名 `TAVILY_API_KEY` + `YUSHAN_FETCHED_DIR`）—— 这些后端键决定
+/// ② **web 侧**（五个 `YUSHAN_SEARCH_*` + 通用名 `TAVILY_API_KEY` / `DEEPSEEK_API_KEY` + `YUSHAN_FETCHED_DIR`）—— 这些后端键决定
 ///    `WebConfig::from_env` 解析出的链是否为空，进而决定
 ///    [`ys_tools_web::WebConfig::degraded_hint`] **有没有**「未配置任何搜索后端」那句；
 ///    `YUSHAN_FETCHED_DIR` 决定落盘目录的**档位**（`Override` vs `Primary`）与是否附带
@@ -97,6 +97,8 @@ fn isolate(cmd: &mut Command, home: &Path) {
         .env_remove("YUSHAN_SEARCH_TAVILY_KEY")
         // Tavily 的生态通用名：产品会作为回退读取，不清则开发机 shell 里配过它就漂移。
         .env_remove("TAVILY_API_KEY")
+        .env_remove("YUSHAN_SEARCH_DEEPSEEK_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("YUSHAN_FETCHED_DIR");
@@ -126,8 +128,8 @@ fn write_fake_backend(dir: &Path, name: &str) {
 ///    `eprintln!` → `println!` 变异直接撞在这条上，见下）。
 /// 2. **stderr 含搜索后端侧降级提示** —— 含 `rg` / `fd` / `.gitignore` 关键片段
 ///    （内容断言，而非 `is_some()`：硬编码文案或漏掉后果句都会红）。
-/// 3. **stderr 同时含 web 侧降级提示** —— `HOME` 指向空目录且四个 `YUSHAN_SEARCH_*`
-///    已清 → 链必空 → 「未配置任何搜索后端」必出现。它与 ②**在同一段 stderr 里
+/// 3. **stderr 同时含 web 侧降级提示** —— `HOME` 指向空目录且五个 `YUSHAN_SEARCH_*`
+///    与通用名 `TAVILY_API_KEY` / `DEEPSEEK_API_KEY` 已清 → 链必空 → 「未配置任何搜索后端」必出现。它与 ②**在同一段 stderr 里
 ///    并存**，这正是 `merge_hints` 的 `(Some, Some)` 分支不被「后者覆盖前者」的证明。
 ///
 /// 变异靶子：
@@ -169,7 +171,7 @@ fn cli_degraded_path_hints_to_stderr_not_stdout() {
     );
 
     // 3. stderr 里**同时**有 web 侧那句（逐字来自 `WebConfig::degraded_hint`）。
-    //    四个后端 env 已清 + client 正常 → 这是 web 侧**唯一**会出现的 issue。
+    //    五个后端 env 已清 + client 正常 → 这是 web 侧**唯一**会出现的 issue。
     assert!(
         stderr.contains("未配置任何搜索后端"),
         "stderr 应含 web 侧的「未配置任何搜索后端」（两条 hint 必须合并且都到 stderr）；\
@@ -225,7 +227,7 @@ fn cli_no_search_hint_when_backends_present_but_web_hint_stays() {
         !stderr.contains("not found on PATH"),
         "搜索后端齐全时不得出现后端侧降级提示；stderr:\n{stderr}"
     );
-    // ② web 侧：四个 `YUSHAN_SEARCH_*` 已被 `isolate()` 清掉 → 链必空 →
+    // ② web 侧：五个 `YUSHAN_SEARCH_*` 与通用名已被 `isolate()` 清掉 → 链必空 →
     //    「未配置任何搜索后端」**必须出现**。它证明「唯一被改的变量只有搜索后端」
     //    （web 侧的状态在主用例与本用例里完全相同，故它消失与否**不能**被归因于 PATH）。
     assert!(

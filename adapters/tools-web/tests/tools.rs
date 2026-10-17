@@ -61,13 +61,13 @@ use async_trait::async_trait;
 use common::{MockReply, MockServer, guarded, no_proxy_client, policy_client};
 use serde_json::json;
 use ys_protocol::{Boundary, BoundarySource, QueueBoundarySource};
-use ys_tool::{Summarizer, Tool, ToolContext, ToolError};
+use ys_tool::{Summarizer, Tool, ToolContext, ToolError, ToolResult};
 use ys_tools_basic::ReadTool;
 use ys_tools_web::{
-    Backend, ChainOutcome, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
-    ENV_TAVILY_KEY_ALIAS, FETCH_MAX_BYTES, FetchedDir, Kind, MIN_SLICE, Url, WebConfig,
-    WebFetchTool, WebSearchTool, fetched_file_name, resolve_backends, run_chain, slice_for,
-    vet_url,
+    Backend, ChainOutcome, ENV_BOCHA_KEY, ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS,
+    ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS, FETCH_MAX_BYTES,
+    FetchedDir, Kind, MIN_SLICE, Url, WebConfig, WebFetchTool, WebSearchTool, fetched_file_name,
+    resolve_backends, run_chain, slice_for, vet_url,
 };
 
 /// 落盘文件第 1 行 —— **字面量**（不是从 crate 里 import 常量）：它是给模型/人看的契约，
@@ -249,6 +249,8 @@ impl Drop for EnvRestore {
 /// 含 Tavily 的**通用别名**，否则开发机 shell 配了 `TAVILY_API_KEY` 时链的形状会漂移。
 const SEARCH_ENV_KEYS: &[&str] = &[
     ENV_SEARXNG_URL,
+    ENV_DEEPSEEK_KEY,
+    ENV_DEEPSEEK_KEY_ALIAS,
     ENV_TAVILY_KEY,
     ENV_TAVILY_KEY_ALIAS,
     ENV_BOCHA_KEY,
@@ -900,14 +902,16 @@ async fn test_websearch_accepts_a_loopback_backend_address_from_env() {
     // （clippy 的 `await_holding_lock` 指的就是这个），而本用例要 env 的只有
     // 「链怎么解析出来」这一步。
     //
-    // 真实 env 读取路径：清掉另外三家（本机若真配了 key，链首就不是 searxng，
-    // 用例会去真的打网络），只留自建实例地址。
+    // 真实 env 读取路径：清掉其余各家（含通用别名 —— 本机若真配了 key，链首就不是
+    // searxng，用例会去真的打网络），只留自建实例地址。
     let backends = {
         let _lock = env_lock();
         let _env = EnvRestore::capture(SEARCH_ENV_KEYS);
-        // SAFETY: 持有 `ENV_LOCK`，独占这四个变量的读写；`_env` 在本块内先于
-        // `_lock` 析构（声明逆序），恢复时仍持锁。
+        // SAFETY: 持有 `ENV_LOCK`，独占 `SEARCH_ENV_KEYS` 中这些变量的读写；`_env`
+        // 在本块内先于 `_lock` 析构（声明逆序），恢复时仍持锁。
         unsafe {
+            std::env::remove_var(ENV_DEEPSEEK_KEY);
+            std::env::remove_var(ENV_DEEPSEEK_KEY_ALIAS);
             std::env::remove_var(ENV_TAVILY_KEY);
             std::env::remove_var(ENV_TAVILY_KEY_ALIAS);
             std::env::remove_var(ENV_BOCHA_KEY);
@@ -953,6 +957,109 @@ async fn test_websearch_accepts_a_loopback_backend_address_from_env() {
         1,
         "链上请求应真的打到自建实例（没被守卫拦掉）"
     );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// **DeepSeek 后端（工具层）**：`summary` 优先、`snippet` 回退；请求走
+/// `POST /v1/tools/search`，体里带默认 `limit`（10）与 `need_content:false`。
+///
+/// 这条用例同时钉住两件事，缺一不可：
+///
+/// - **映射顺序**：响应同时给 `summary` 与 `snippet`，正文里只能出现前者。若映射
+///   反过来（`snippet` 优先），`SUMMARY-TEXT` 消失、`SNIPPET-TEXT` 出现 → 红；
+/// - **请求形状**：路径 / 方法 / `count`（默认 limit）与 `need_content`。只断结果
+///   不断请求的话，`plan` 里漏掉 `need_content` 或把 `count` 写成别的字段名都测不到。
+///
+/// 变异：`map_hits(items, "title", "url", &["snippet", "summary"])`（顺序颠倒）→
+/// 「不含 SNIPPET-TEXT」断言红；`plan` 的 DeepSeek 分支删掉 `need_content` 或
+/// 把 `count` 改名 → 请求体断言红。
+#[tokio::test]
+async fn test_chain_uses_deepseek_backend_and_renders_summary() {
+    let server = MockServer::start(vec![MockReply::json(
+        r#"{"results":[{"title":"T","url":"https://example.test/a","summary":"SUMMARY-TEXT","snippet":"SNIPPET-TEXT"}]}"#,
+    )]);
+
+    let tool = search_tool(
+        no_proxy_client(),
+        vec![backend(Kind::Deepseek, &server, Some("dk-test"))],
+    );
+    let ws = test_dir("search_deepseek");
+
+    let result = guarded(
+        "websearch::call(deepseek)",
+        tool.call(json!({ "query": "rust" }), ctx(None, &ws)),
+    )
+    .await
+    .expect("工具调用不应返回 Err");
+
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains('T')
+            && result.content.contains("https://example.test/a")
+            && result.content.contains("SUMMARY-TEXT"),
+        "标题 / URL / summary 都要进正文：{}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("SNIPPET-TEXT"),
+        "`summary` 必须优先于 `snippet`（两者都在响应里时只渲染 summary）：{}",
+        result.content
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "链上只有一家 ⇒ 恰好一次请求");
+    let req = &requests[0];
+    assert_eq!(req.method, "POST", "DeepSeek 用 POST");
+    assert_eq!(req.path, "/v1/tools/search", "路径必须是 /v1/tools/search");
+    assert!(
+        req.body.contains("\"need_content\":false"),
+        "请求体必须显式带 need_content:false（正文交给 webfetch）：{}",
+        req.body
+    );
+    assert!(
+        req.body.contains("\"count\":10"),
+        "默认 limit 10 必须作为 count 发出：{}",
+        req.body
+    );
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// **链为空 ⇒ 错误结果要点名所有能配置的 env**（零配置用户的第一份反馈）。
+///
+/// 这里用 [`WebConfig::with_client`]（链为空）而不是 `from_env`：不改进程级 env，
+/// 结果与开发机 shell 里配了什么完全无关。
+///
+/// 变异：降级文案漏掉任何一个键（例如只写 DeepSeek 的项目命名空间、漏掉通用别名，
+/// 或漏掉 SearXNG 的实例地址）→ 对应的 `contains` 断言红。
+#[tokio::test]
+async fn test_call_without_backends_names_the_envs() {
+    let tool = WebSearchTool::new(WebConfig::with_client(no_proxy_client(), FetchedDir::None));
+    let ws = test_dir("search_no_backends");
+
+    let result = tool
+        .call(json!({ "query": "x" }), ctx(None, &ws))
+        .await
+        .expect("链为空是 is_error 结果，不是 ToolError");
+
+    assert!(
+        matches!(&result, ToolResult { is_error: true, .. }),
+        "链为空必须是模型可见的错误结果：{}",
+        result.content
+    );
+    for key in [
+        ENV_DEEPSEEK_KEY,
+        ENV_DEEPSEEK_KEY_ALIAS,
+        ENV_TAVILY_KEY,
+        ENV_SEARXNG_URL,
+    ] {
+        assert!(
+            result.content.contains(key),
+            "降级文案必须点名 {key}（否则用户不知道下一步配什么）：{}",
+            result.content
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&ws);
 }

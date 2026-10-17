@@ -1,10 +1,10 @@
-//! T10（设计 S6）：`backends.rs` 的 **mapper 三态 + 容错** —— 四家 × `ok`/`empty`/`error`，
+//! T10（设计 S6）：`backends.rs` 的 **mapper 三态 + 容错** —— 五家 × `ok`/`empty`/`error`，
 //! 外加 `plan` 的请求构造（纯函数，不碰网络）。
 //!
 //! # 这份测试与 `backends.rs` 单元测试的分工
 //!
 //! `backends.rs` 的 `mod tests` 考的是 **`join` 的路径规则**（粘贴事故、子路径、后缀去重），
-//! 本文件考的是**响应映射**：14 份 fixture 直接喂给 `parse`，断言 **`Ok`/`Err` 的语义**
+//! 本文件考的是**响应映射**：17 份 fixture 直接喂给 `parse`，断言 **`Ok`/`Err` 的语义**
 //! 与**逐条的字段内容**。fixture 用 [`include_str!`] 编译期嵌入 —— 永久离线、不读盘。
 //!
 //! # 为什么必须断言「内容」而不只是「条数」
@@ -34,12 +34,18 @@ use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde_json::{Map, Value, json};
 use ys_tools_web::{
-    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY, Kind, MAX_LIMIT,
-    MIN_LIMIT, SearchHit, kind_slug, parse, plan,
+    Backend, ENV_BOCHA_KEY, ENV_DEEPSEEK_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
+    Kind, MAX_LIMIT, MIN_LIMIT, SearchHit, kind_slug, parse, plan,
 };
 
-/// 四家 —— 「每家都要过」的用例直接遍历它（漏掉一家是这类测试最常见的疏忽）。
-const ALL_KINDS: [Kind; 4] = [Kind::Searxng, Kind::Tavily, Kind::Bocha, Kind::Firecrawl];
+/// 五家 —— 「每家都要过」的用例直接遍历它（漏掉一家是这类测试最常见的疏忽）。
+const ALL_KINDS: [Kind; 5] = [
+    Kind::Deepseek,
+    Kind::Searxng,
+    Kind::Tavily,
+    Kind::Bocha,
+    Kind::Firecrawl,
+];
 
 // ════════════════════ fixture 读取 ════════════════════
 
@@ -135,13 +141,14 @@ fn parse_json_body_err(kind: Kind, body: &str) -> String {
 
 // ════════════════════ 合成正文的小工具 ════════════════════
 
-/// 各家 `title` / `url` / `snippet` 对应的**字段名**（`backends.rs` 里那三处 `map_hits` 调用）。
+/// 各家 `title` / `url` / `snippet` 对应的**字段名**（`backends.rs` 里那 5 处 `map_hits` 调用）。
 ///
 /// ⚠️ 这里写死的是**我们对各家文档的理解**（`tests/fixtures/README.md` §三 的置信度表）：
 /// SearXNG / Tavily / Firecrawl 的字段路径已核；Bocha 的**路径已核、错误体未核**。
 /// 一旦 `harvest` 用真实响应覆写了 fixture，这张表要跟着改。
 fn keys(kind: Kind) -> (&'static str, &'static str, &'static str) {
     match kind {
+        Kind::Deepseek => ("title", "url", "summary"),
         Kind::Searxng | Kind::Tavily => ("title", "url", "content"),
         Kind::Bocha => ("name", "url", "snippet"),
         Kind::Firecrawl => ("title", "url", "description"),
@@ -170,7 +177,7 @@ fn item(kind: Kind, title: Option<&str>, url: Option<Value>, snippet: Option<&st
 /// 按 `kind` 把条目列表塞进这一家的**信封**里（对应 `take_array` 的候选路径）。
 fn envelope(kind: Kind, items: Value) -> String {
     match kind {
-        Kind::Searxng | Kind::Tavily => json!({ "results": items }).to_string(),
+        Kind::Deepseek | Kind::Searxng | Kind::Tavily => json!({ "results": items }).to_string(),
         Kind::Bocha => {
             json!({ "code": 200, "data": { "webPages": { "value": items } } }).to_string()
         }
@@ -178,7 +185,104 @@ fn envelope(kind: Kind, items: Value) -> String {
     }
 }
 
-// ════════════════════ S6.1 四家 × 三态 ════════════════════
+// ════════════════════ S6.1 五家 × 三态 ════════════════════
+
+// ---------- DeepSeek ----------
+
+/// `deepseek_ok`：`results[]{title, url, snippet, summary}` 逐字段落位。
+///
+/// 整表断言同时钉住四件事：
+/// - **`summary` 优先**（第一条两者都有且文本不同）；
+/// - **`snippet` 兜底**（第二条 `summary: null`）；
+/// - **空 `url` 跳过**（第三条）；
+/// - **未知字段不渗入**（`rerank_score` / `content` / `site_name` / `date` / `authority`）。
+#[test]
+fn test_deepseek_ok_maps_each_hit_verbatim() {
+    assert_eq!(
+        parsed(Kind::Deepseek, include_str!("fixtures/deepseek_ok.json")),
+        hits_of(&[
+            (
+                "Rust 错误处理 - 官方文档",
+                "https://doc.rust-lang.org/book/ch09-00-error-handling.html",
+                "摘要优先：错误分为可恢复与不可恢复两类。",
+            ),
+            (
+                "anyhow - Rust",
+                "https://docs.rs/anyhow/latest/anyhow/",
+                "来自 snippet 的兜底片段。",
+            ),
+        ]),
+        "summary 优先、snippet 兜底、空 url 跳过、未知字段不渗入"
+    );
+}
+
+/// `deepseek_empty`：`results: []` ⇒ **`Ok(0)`**（真空结果 —— 链在**这里停**）。
+#[test]
+fn test_deepseek_empty_is_ok_zero() {
+    assert_eq!(
+        parsed(Kind::Deepseek, include_str!("fixtures/deepseek_empty.json")),
+        Vec::<SearchHit>::new(),
+        "空数组是「真没结果」⇒ Ok(0)（链停），与「形状不对」的 Err（链继续）是两回事"
+    );
+}
+
+/// `deepseek_error`：官方 OpenAI 兼容错误信封 `{"error":{"message",…}}`。
+///
+/// `status` 是 **400**（请求体不合法），但 `parse` 看不到它（非 2xx 在 `fetch_capped`
+/// 就被拦下、不读体）；这里断言 `status` 只为标明「这份 fixture 是错误态」。
+#[test]
+fn test_deepseek_error_envelope_is_err_not_empty_result() {
+    let f = load(include_str!("fixtures/deepseek_error.json"));
+    assert_eq!(f.status, 400, "该 fixture 是错误态（parse 看不到状态码）");
+
+    let err = parse(Kind::Deepseek, f.ctype.as_deref(), &f.body).expect_err("error 信封必须报错");
+    assert!(err.contains("deepseek"), "要点名是哪一家：{err}");
+    assert!(err.contains("count"), "要把 message 带出来：{err}");
+}
+
+/// ★ **「形状不对」≠「空结果」**：缺 `results` 数组必须 `Err`（链**继续**试下一家），
+/// **绝不能**是 `Ok(0)`（链**停**）。
+///
+/// 变异：把 `deepseek_hits` 的 `ok_or_else(…)` 换成 `unwrap_or_default()` ⇒ 本用例红。
+#[test]
+fn test_deepseek_missing_results_is_err() {
+    let err = parse_json_body_err(Kind::Deepseek, r#"{"foo":1}"#);
+    assert!(err.contains("results"), "文案要说清缺的是什么：{err}");
+    assert!(err.contains("deepseek"), "要点名是哪一家：{err}");
+}
+
+/// `summary` 优先、`snippet` 兜底 —— 合成正文把两条路径各钉一次。
+///
+/// fixture 的整表断言已覆盖同一事实；这条单独拎出来，是为了让「`summary` 缺失 /
+/// 是 `null` 时回退」在失败信息里一眼可见（而不是混在整表 diff 里）。
+#[test]
+fn test_deepseek_summary_preferred_and_snippet_falls_back() {
+    let body = json!({
+        "results": [
+            {
+                "title": "两者都有",
+                "url": "https://both.example/",
+                "summary": "来自 summary",
+                "snippet": "来自 snippet",
+            },
+            {
+                "title": "summary 为 null",
+                "url": "https://null.example/",
+                "summary": null,
+                "snippet": "回退到 snippet",
+            },
+        ]
+    })
+    .to_string();
+
+    assert_eq!(
+        parsed_json_body(Kind::Deepseek, &body),
+        hits_of(&[
+            ("两者都有", "https://both.example/", "来自 summary"),
+            ("summary 为 null", "https://null.example/", "回退到 snippet"),
+        ])
+    );
+}
 
 // ---------- SearXNG ----------
 
@@ -380,9 +484,9 @@ fn test_tavily_missing_results_is_err_not_empty() {
     assert!(err.contains("results"), "文案要说清缺的是什么：{err}");
 }
 
-/// 「缺失 / 是 `null` / 不是数组」三兄弟走**同一条**路径 ⇒ 四家一律 `Err`。
+/// 「缺失 / 是 `null` / 不是数组」三兄弟走**同一条**路径 ⇒ 五家一律 `Err`。
 ///
-/// 这条刻意遍历 **四家**：链的语义是全局的，只钉一家会漏掉另外三处的
+/// 这条刻意遍历 **五家**：链的语义是全局的，只钉一家会漏掉另外四处的
 /// `unwrap_or_default()` 式漂移。
 #[test]
 fn test_missing_or_non_array_results_is_err_not_empty_for_every_backend() {
@@ -750,6 +854,43 @@ fn test_plan_searxng_rejects_illegal_instance_url_naming_the_env() {
     }
 }
 
+/// DeepSeek：POST `/v1/tools/search`、`Bearer` 鉴权、体是
+/// `{query, count, need_content:false}`；`limit` 同样 clamp 到契约边界。
+#[test]
+fn test_plan_deepseek_method_path_auth_and_body() {
+    let b = backend(Kind::Deepseek, "https://api.deepseek.com", Some("dk-test"));
+    let req = built(&b, "rust error handling", 3);
+
+    assert_eq!(req.method(), Method::POST);
+    assert_eq!(
+        req.url().as_str(),
+        "https://api.deepseek.com/v1/tools/search"
+    );
+    assert_eq!(
+        req.headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer dk-test")
+    );
+    assert_eq!(
+        query_body(&req),
+        json!({
+            "query": "rust error handling",
+            "count": 3,
+            "need_content": false,
+        }),
+        "正文交给 webfetch，搜索不请求网页正文"
+    );
+
+    for (asked, want) in [(0usize, MIN_LIMIT), (MAX_LIMIT + 80, MAX_LIMIT)] {
+        assert_eq!(
+            query_body(&built(&b, "q", asked))["count"],
+            json!(want),
+            "[deepseek] 要 {asked} 条 → 应 clamp 成 {want}"
+        );
+    }
+}
+
 /// Tavily：POST `/search`、`Bearer` 鉴权、体是 `{query, max_results, search_depth}`。
 #[test]
 fn test_plan_tavily_method_path_auth_and_body() {
@@ -833,9 +974,10 @@ fn test_plan_firecrawl_method_path_auth_and_body() {
     );
 }
 
-/// `limit` 的字段名（三家的键名不同，取值规则必须**同一套**）。
+/// `limit` 的字段名（四家的键名不同，取值规则必须**同一套**）。
 fn limit_field(kind: Kind) -> &'static str {
     match kind {
+        Kind::Deepseek => "count",
         Kind::Tavily => "max_results",
         Kind::Bocha => "count",
         Kind::Firecrawl => "limit",
@@ -891,13 +1033,14 @@ fn test_plan_searxng_ignores_limit_without_error() {
     }
 }
 
-/// 需要 key 的三家：手工构造的无 key 后端必须在**构造期**报错，且点名改哪个 env。
+/// 需要 key 的四家：手工构造的无 key 后端必须在**构造期**报错，且点名改哪个 env。
 ///
 /// 这不是「多试一次」那么轻：一次静默不带凭证的请求换回的是 401，
 /// 而文案里只有「builder error」时用户不知道该改什么。
 #[test]
 fn test_plan_without_key_is_err_naming_the_env() {
     for (kind, endpoint, env) in [
+        (Kind::Deepseek, "https://api.deepseek.com", ENV_DEEPSEEK_KEY),
         (Kind::Tavily, "https://api.tavily.com", ENV_TAVILY_KEY),
         (Kind::Bocha, "https://api.bochaai.com", ENV_BOCHA_KEY),
         (
@@ -944,6 +1087,11 @@ fn test_plan_keeps_endpoint_path_shape() {
             Kind::Searxng,
             "https://example.com/searxng/",
             "https://example.com/searxng/search",
+        ),
+        (
+            Kind::Deepseek,
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/v1/tools/search",
         ),
         (
             Kind::Tavily,

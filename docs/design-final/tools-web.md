@@ -41,9 +41,11 @@ apps/coding-agent/src/main.rs        WebConfig::from_env() + sweep_fetched(&web,
 Cargo.toml（workspace）/ apps/coding-agent/Cargo.toml
 ```
 
-`tests/` 布局：`common/mod.rs`（假服务器：脚本化应答 + delay + 超时护栏）、`fixtures/*.json`（**14 个**四家后端冻结响应，
+`tests/` 布局：`common/mod.rs`（假服务器：脚本化应答 + delay + 超时护栏）、`fixtures/*.json`（**17 个**五家后端冻结响应，
 `include_str!`）、`golden/*.html`（**5 类**真实页面）、`contracts.rs`（★契约）、`convert_store.rs`、`mapper.rs`、
 `network.rs`、`tools.rs`、`harvest.rs`（**人工采集工具，不进 CI**）。
+DeepSeek 的三份 fixture：`deepseek_ok.json`（正常 `results`）、`deepseek_empty.json`（`results: []` ⇒ 空结果停链）、
+`deepseek_error.json`（OpenAI 兼容错误信封 ⇒ 换下一家）。
 
 ## 关键行为（实现期定死，勿凭直觉改）
 
@@ -71,15 +73,17 @@ Cargo.toml（workspace）/ apps/coding-agent/Cargo.toml
 代码里**无任何动态选择**（不按延迟、不按成功率、不随机、不并行竞速）。顺序：
 
 ```
-Tavily → Bocha → Firecrawl → Searxng
+Deepseek → Tavily → Bocha → Firecrawl → Searxng
 ```
 
-**Tavily / Bocha / Firecrawl 需 key**（Firecrawl 已从初稿的「keyless」**订正为需 key**，见 ADR-0016 修订记录）：
+**DeepSeek / Tavily / Bocha / Firecrawl 需 key**（Firecrawl 已从初稿的「keyless」**订正为需 key**，见 ADR-0016 修订记录）：
 官方 API 要求 `Authorization: Bearer`，无 key 回 401「The API key was not provided」。未配 key 的行在**构造期**剔除
 ⇒ **零配置用户的链为空** ⇒ `degraded_hint` 那句「未配置任何搜索后端」**可达**（初稿的 keyless 会让它不可达，
-Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生态通用名 `TAVILY_API_KEY` 作**回退**，命名空间名
-`YUSHAN_SEARCH_TAVILY_KEY` 优先 —— 故「零配置」指这些键**全部**未设（shell 里为别的 Tavily 工具配过的通用 key
-会让 Tavily 进链，这正是别名想要的效果）。SearXNG 的「凭证」是实例地址（`YUSHAN_SEARCH_SEARXNG_URL`），
+Firecrawl 一家撑起一条用户从没选过的链）。DeepSeek 与 Tavily 额外接受生态通用名作**回退**：
+`YUSHAN_SEARCH_DEEPSEEK_KEY` 优先于 `DEEPSEEK_API_KEY`，`YUSHAN_SEARCH_TAVILY_KEY` 优先于 `TAVILY_API_KEY`
+—— 故「零配置」指这些键**全部**未设（shell 里为别的工具配过的通用 key 会让对应后端进链，这正是别名想要的效果）。
+两者都**不读** `YUSHAN_API_KEY`：那是模型网关的凭证，发给搜索厂商会越权。SearXNG 的「凭证」是实例地址
+（`YUSHAN_SEARCH_SEARXNG_URL`），
 它排末位的理由是**元搜索**：自己再转发给上游引擎，多一跳、质量取决于实例配置与上游限流，**我们无法评估**。
 
 **降级只认错误/限额，空结果停链**（设计 §1.2 的核心区分）：一次尝试 `Ok(hits)` —— **有结果与空结果都停**，
@@ -198,7 +202,7 @@ Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生
 
 1. `sessions_dir()` 第 1 档相对路径不对称（见「偏离 4」）。
 2. `FETCHED_MAX_AGE` 未上提为 pub 常量（见「偏离 2」）。
-3. `harvest.rs` 是**人工采集工具**（4 条 `#[ignore]`，需要真实 key 与网络、会写仓库文件），**不进 CI**；
+3. `harvest.rs` 是**人工采集工具**（5 条 `#[ignore]`，需要真实 key 与网络、会写仓库文件），**不进 CI**；
    fixtures 的时效性靠人工重跑保证。
 
 **摘要切片的已知缺口（2026-09-19）**：
@@ -224,18 +228,44 @@ Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生
 10. **摘要产物进 session ⇒ 会成为 compaction 的输入**，而「不可信来源」的标注可能在**二次摘要中被洗掉** ——
     本切片**不改**（那是 ADR-0017 的领地），已记入 ADR-0018。
 
+## 2026-10-17 增补：DeepSeek 搜索后端
+
+**位置与顺序**：`TABLE` 的第一行是 `Kind::Deepseek`，链序为
+`Deepseek → Tavily → Bocha → Firecrawl → Searxng`。该行与其他托管后端同组：未配置 key 时在
+`resolve_backends` **构造期**剔除，因此既有用户的链序不变，零配置用户的链仍为空。
+
+**凭证**：`YUSHAN_SEARCH_DEEPSEEK_KEY` 优先，未设时回退生态通用名 `DEEPSEEK_API_KEY`；两者都是空串 /
+纯空白视作未配置。**不读 `YUSHAN_API_KEY`**：那是模型网关的凭证，发给 DeepSeek 搜索端点等于把它交给第三方。
+
+**请求**：`POST https://api.deepseek.com/v1/tools/search`，`Authorization: Bearer <key>`，body 为
+`{query, count, need_content:false}`。`count` 走统一 `limit` 的 `1..=20` clamp（未给 `limit` 时为默认 10）。
+`need_content:false` 是因为搜索只取短片段，正文由 `webfetch` 按需抓取；若置为 `true` 会增大响应体与耗时，
+而本工具的映射并不使用正文。不传 `ori_question` / `localization`：工具拿不到对话上下文与用户 IP，
+也不应把这类信息隐式发给搜索厂商。
+
+**响应**：`results[]{title,url,snippet,summary}`。`title` / `url` 直接映射；正文取 `summary`，缺失时回退
+`snippet`。`rerank_score` / `authority` / `site_name` / `date` / `content` 忽略 —— 跨后端不可比的排序分
+不参与过滤或重排。`results: []` 是 `Ok(0)`（真没结果，**停链**）；缺少 `results` 数组或
+`{"error":{...}}` 错误信封是 `Err`（记理由，**换下一家**）。
+
+**语义不变**：空结果停链；错误换下一家；**不做自动重试**（一次调用中每家至多尝试一次）；
+`Abort` 立即停整条链且不计为失败。预算切片、`[via x]` 与 `[fell back after: ...]` 的渲染规则与其他后端一致。
+
+**明确不做**：不接入 DeepSeek Fetch API，`webfetch` 仍是本地抓取 → 转换 → 落盘；不为 DeepSeek 增加
+端点覆盖 env（端点冻结在 `TABLE`，与其他托管后端一致）。
+
 ## 测试资产
 
-- `tests/tools.rs`：**35 条**（链降级 + 逐条理由、空结果停链、全败逐条、Aborted 停链、预算切片表、去重、limit/snippet、
+- `tests/tools.rs`：**37 条**（链降级 + 逐条理由、空结果停链、全败逐条、Aborted 停链、预算切片表、去重、limit/snippet、
   回环后端地址可用、抓取落盘 + 2 行头 + 绝对路径、重定向回显、超 cap、二进制拒收、charset、无 Content-Type、
   落盘目录降级、工具层拒回环、不写 workspace、`head` 行号与 `read` 续读对齐）。
   **新增 12 条**（全在摘要）：W4 不变量（无 `prompt` ⇒ 模型调用计数 **0**）、空 / 全空白 `prompt`、`Ok` 腿、
   `Failed` 腿、`Skipped` 腿、`Aborted` 腿**两条路径**、**判别用例**、无 summarizer 腿、字节覆盖率、行数覆盖率、
-  `prompt` 类型错误。
-- `tests/mapper.rs`：**33 条**（四家 fixtures 三态 → 纯函数断言；未知/缺/`null`/非对象字段不 panic；SearXNG `200+text/html` → `Err`）。
+  `prompt` 类型错误。**本轮 +2**：DeepSeek 链胜出与 `summary` 渲染；链为空时降级文案点名 DeepSeek 的项目名与通用名。
+- `tests/mapper.rs`：**39 条**（五家 fixtures 三态 → 纯函数断言；未知/缺/`null`/非对象字段不 panic；SearXNG `200+text/html` → `Err`；DeepSeek 的 `summary` 优先 / `snippet` 回退、缺 `results` 为 `Err`、`results: []` 为 `Ok(0)`、请求体 `count` clamp）。
 - `tests/convert_store.rs`：**17 条**（`skip_tags` 移除子树；5 类 golden 页面；命名形状/原子写/sweep 闸）。
 - `tests/network.rs`：**12 条**（超时、每跳重跑 vet、`Content-Length: 4GiB` 不预分配、越界即停不排空）。
-- `tests/contracts.rs`：**5 条**（env 名冻结、工具名、描述语义、不 print 扫描）。描述短语**逐字**钉死：
+- `tests/contracts.rs`：**8 条**（env 名冻结、工具名、描述语义、不 print 扫描；本轮新增 DeepSeek 通用名回退与链序逐字断言）。描述短语**逐字**钉死：
   `saved`/`path` **保留**、`prompt`/`summary` **新增**；schema 里 `prompt` **可选**且
   `required == ["url"]`。
 - `src/` 单元：**20 条**（`WebConfig`/`FetchedDir`/`resolve_fetched_dir` 各档 + 绝对性 + `degraded_hint`）。
@@ -248,7 +278,7 @@ Firecrawl 一家撑起一条用户从没选过的链）。Tavily 额外接受生
   这是**唯一**能抓住「**删掉生产接线**」的用例。
 - `apps/coding-agent/src/toolset.rs` / `prompt.rs` / `main.rs`：9 工具顺序、两条 hint 合并、`sessions_dir` 回归、
   `sweep_fetched` 只清 `Primary` 且保留新文件、prompt snippet 逐字断言。
-- `tests/harvest.rs`：**4 条 `#[ignore]`**（真实端点人工采集，写盘前断言 key 不出现在响应里）。
+- `tests/harvest.rs`：**5 条 `#[ignore]`**（真实端点人工采集，写盘前断言 key 不出现在响应里；含 DeepSeek）。
 - **全局**：`cargo test --workspace` **659 passed / 0 failed**（上切片基线 636 → 摘要切片 **+23**，
   其中 tools-web 自身 **122 条**，即 +13）；
   `cargo clippy --all-targets` 0 warning；`cargo fmt --check` 通过。

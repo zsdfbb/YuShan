@@ -447,6 +447,8 @@ fn run_bin(bin: &Path, api_base: &str, sandbox: &Sandbox, args: &[&str]) -> Outp
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("TAVILY_API_KEY")
+        .env_remove("YUSHAN_SEARCH_DEEPSEEK_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("ALL_PROXY")

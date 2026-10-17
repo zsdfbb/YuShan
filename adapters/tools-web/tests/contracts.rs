@@ -22,9 +22,9 @@
 
 use ys_tool::Tool;
 use ys_tools_web::{
-    ENV_BOCHA_KEY, ENV_FETCHED_DIR, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
-    ENV_TAVILY_KEY_ALIAS, FetchedDir, Kind, WebConfig, WebFetchTool, WebSearchTool,
-    resolve_backends,
+    ENV_BOCHA_KEY, ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS, ENV_FETCHED_DIR, ENV_FIRECRAWL_KEY,
+    ENV_SEARXNG_URL, ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS, FetchedDir, Kind, WebConfig,
+    WebFetchTool, WebSearchTool, resolve_backends,
 };
 
 /// 确定性配置：无 HTTP 栈、无后端、不落盘。
@@ -66,6 +66,14 @@ fn env_var_names_are_a_frozen_release_contract() {
         "Firecrawl key 的 env 名是发布契约，改名 = 破坏兼容"
     );
     assert_eq!(
+        ENV_DEEPSEEK_KEY, "YUSHAN_SEARCH_DEEPSEEK_KEY",
+        "DeepSeek key 的 env 名是发布契约，改名 = 破坏兼容"
+    );
+    assert_eq!(
+        ENV_DEEPSEEK_KEY_ALIAS, "DEEPSEEK_API_KEY",
+        "DeepSeek 通用别名同样是发布契约：改名 = 已按通用名配好的用户静默失效"
+    );
+    assert_eq!(
         ENV_FETCHED_DIR, "YUSHAN_FETCHED_DIR",
         "落盘目录覆盖的 env 名是发布契约，改名 = 破坏兼容（且测试隔离会静默失效）"
     );
@@ -104,6 +112,76 @@ fn tavily_generic_env_is_a_fallback_and_project_name_wins() {
     assert!(
         chain(&[]).is_empty(),
         "两个名字都没配 ⇒ Tavily 按无 key 剔除（别名不得变成「无 key 也进链」）"
+    );
+}
+
+/// **契约：DeepSeek 的通用名是回退，不是替代** —— 只配 `DEEPSEEK_API_KEY` 也能进链；
+/// 两个都配时 [`ENV_DEEPSEEK_KEY`]（项目命名空间）优先；两个都不配仍被剔除。
+///
+/// 与 Tavily 同款结构（`tavily_generic_env_is_a_fallback_and_project_name_wins`）。
+///
+/// 变异：把 `DEEPSEEK_KEY_ENVS` 的顺序反过来 → 「项目名优先」那条红；把
+/// `ENV_DEEPSEEK_KEY_ALIAS` 从表里去掉 → 第一条红；把 `keyless` 打开 → 第三条红。
+#[test]
+fn deepseek_generic_env_is_a_fallback_and_project_name_wins() {
+    let chain = |env: &[(&str, &str)]| {
+        let map: std::collections::HashMap<&str, &str> = env.iter().copied().collect();
+        resolve_backends(|k| map.get(k).map(|v| v.to_string()))
+    };
+
+    let only_generic = chain(&[(ENV_DEEPSEEK_KEY_ALIAS, "dk-generic")]);
+    assert_eq!(only_generic.len(), 1, "{only_generic:?}");
+    assert_eq!(only_generic[0].kind, Kind::Deepseek);
+    assert_eq!(only_generic[0].key.as_deref(), Some("dk-generic"));
+
+    let both = chain(&[
+        (ENV_DEEPSEEK_KEY, "dk-project"),
+        (ENV_DEEPSEEK_KEY_ALIAS, "dk-generic"),
+    ]);
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert_eq!(
+        both[0].key.as_deref(),
+        Some("dk-project"),
+        "项目命名空间必须压过通用名"
+    );
+
+    assert!(
+        chain(&[]).is_empty(),
+        "两个名字都没配 ⇒ DeepSeek 按无 key 剔除（别名不得变成「无 key 也进链」）"
+    );
+}
+
+/// **契约：链序逐字** —— DeepSeek → Tavily → Bocha → Firecrawl → SearXNG。
+///
+/// 顺序完全由 `TABLE` 决定（不按延迟、不按成功率、不随机）。这条用注入式 env
+/// 同时配置五家，把**完整链**的形状钉死：任何一行被移动或漏掉都会红。
+///
+/// 变异：把 DeepSeek 行移到 Tavily 之后 → 本用例红；删掉任一行 → 红。
+#[test]
+fn chain_order_puts_deepseek_first() {
+    let env = [
+        (ENV_SEARXNG_URL, "https://searx.example/"),
+        (ENV_DEEPSEEK_KEY, "dk-test"),
+        (ENV_TAVILY_KEY, "tvly-test"),
+        (ENV_BOCHA_KEY, "sk-test"),
+        (ENV_FIRECRAWL_KEY, "fc-test"),
+    ];
+    let map: std::collections::HashMap<&str, &str> = env.iter().copied().collect();
+
+    let kinds: Vec<Kind> = resolve_backends(|k| map.get(k).map(|v| v.to_string()))
+        .into_iter()
+        .map(|b| b.kind)
+        .collect();
+
+    assert_eq!(
+        kinds,
+        [
+            Kind::Deepseek,
+            Kind::Tavily,
+            Kind::Bocha,
+            Kind::Firecrawl,
+            Kind::Searxng,
+        ]
     );
 }
 

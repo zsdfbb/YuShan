@@ -3,9 +3,10 @@
 //! # 这是人工采集工具，**不进 CI**
 //!
 //! 每个测试都带 `#[ignore]` —— 它们要真实 key、真实实例、真实网络，而且**会写仓库里的文件**。
-//! `cargo test --workspace` 只会看到它们被跳过（`ignored` 计数 +4）。
+//! `cargo test --workspace` 只会看到它们被跳过（`ignored` 计数 +5）。
 //!
 //! ```bash
+//! export YUSHAN_SEARCH_DEEPSEEK_KEY=sk-…   # 亦可 export DEEPSEEK_API_KEY（通用名，作为回退）
 //! export YUSHAN_SEARCH_TAVILY_KEY=tvly-…
 //! export YUSHAN_SEARCH_BOCHA_KEY=sk-…
 //! export YUSHAN_SEARCH_FIRECRAWL_KEY=fc-…                  # 必需（ADR-0016 修订：它不免 key）
@@ -46,8 +47,9 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value};
 use ys_tools_web::{
-    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
-    ENV_TAVILY_KEY_ALIAS, Kind, build_client, kind_slug, parse, plan, resolve_backends,
+    Backend, ENV_BOCHA_KEY, ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS, ENV_FIRECRAWL_KEY,
+    ENV_SEARXNG_URL, ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS, Kind, build_client, kind_slug, parse,
+    plan, resolve_backends,
 };
 
 /// 单次请求的超时。比产品里的预算宽（这是人跑的，宁可等也不愿意少采一份）。
@@ -257,7 +259,37 @@ async fn harvest_empty(client: &Client, backend: &Backend, secrets: &[&str]) {
     freeze(backend.kind, "empty", status, &headers, &body, secrets);
 }
 
-// ---------- 四家各一个采集测试 ----------
+// ---------- 五家各一个采集测试 ----------
+
+/// DeepSeek：`POST /v1/tools/search`，`Authorization: Bearer`。
+///
+/// 端点**不硬编码**：由 [`backend_of`] 从产品那份 `TABLE` 经 [`resolve_backends`] 取，
+/// 与 `plan` / `harvest_ok_like` 走的是同一条地址真值。
+#[tokio::test]
+#[ignore = "人工采集：需真实 key + 真实网络，不进 CI"]
+async fn harvest_deepseek() {
+    let key = require_env_any(&[ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS]);
+    let backend = backend_of(Kind::Deepseek, Some(key.clone()));
+    let client = client();
+
+    harvest_ok_like(&client, &backend, &[&key]).await;
+    harvest_empty(&client, &backend, &[&key]).await;
+
+    // error 用例：坏 key（真 key 加后缀）。采的是「这家怎么报鉴权失败」。
+    // ⚠️ 卫生断言仍传**真 key** —— 坏 key 以它为前缀，回显里可能带出来。
+    let bad = Backend {
+        key: Some(format!("{key}-invalid")),
+        ..backend.clone()
+    };
+    let req = plan(&client, &bad, "rust", 3).expect("plan");
+    let (status, headers, body) = fire(req, "deepseek/error").await;
+    if status == 200 {
+        println!(
+            "[harvest] ⚠ deepseek/error：坏 key 竟然 200 —— 正文里的 `error` 才是判据（parse 会读它）"
+        );
+    }
+    freeze(Kind::Deepseek, "error", status, &headers, &body, &[&key]);
+}
 
 /// Tavily：`POST /search`，`Authorization: Bearer`。
 #[tokio::test]

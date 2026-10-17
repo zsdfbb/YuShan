@@ -181,9 +181,8 @@ impl Tool for BashTool {
         ToolSpec::new(
             "bash",
             "Execute shell commands via `sh -c` (POSIX sh, not the user's interactive shell). \
-             Supports timeout. Every call starts a fresh shell in the workspace root — the \
-             `Current working directory` at the start of the system prompt, which relative \
-             paths resolve against; `cd` does NOT carry over between calls.",
+             Supports timeout. Every call starts a fresh shell in the workspace root; relative \
+             paths resolve against it, and `cd` does NOT carry over between calls.",
             json!({
                 "type": "object",
                 "properties": {
@@ -393,6 +392,10 @@ mod tests {
         assert!(
             d.contains("`cd` does NOT") && d.contains("carry over"),
             "描述须说明 `cd` 不跨调用保留（否则模型仍会防御性加前缀）；description = {d}"
+        );
+        assert!(
+            !d.contains("system prompt"),
+            "描述不得依赖可能被 SYSTEM.md 短路掉的系统提示文本；description = {d}"
         );
         assert!(
             !d.contains("do not prefix") && !d.contains("or chain"),

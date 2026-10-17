@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 
+use crate::workspace_path::{absolute_notice, attach_notice};
+
 /// 一次调用返回的条目数上限（可被 `limit` 覆盖）。
 const DEFAULT_LIMIT: usize = 500;
 
@@ -39,7 +41,7 @@ impl Tool for LsTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Directory to list (default: current directory)" },
+                    "path": { "type": "string", "description": "Directory to list (default: the workspace root). Relative paths resolve against the workspace root." },
                     "limit": { "type": "number", "description": "Maximum number of entries to return (default: 500)" }
                 }
             }),
@@ -54,6 +56,7 @@ impl Tool for LsTool {
 
     async fn call(&self, input: Value, _ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let path = input["path"].as_str().unwrap_or(".");
+        let path_notice = absolute_notice("ls", path, &self.workspace);
         // `limit` 至少为 1：0 会让「已截断」判定恒真、并产出 `Use limit=0 for more` 这类废话。
         let limit = (input["limit"].as_u64().unwrap_or(DEFAULT_LIMIT as u64) as usize).max(1);
         let dir = self.workspace.join(path);
@@ -63,23 +66,26 @@ impl Tool for LsTool {
         let meta = match tokio::fs::metadata(&dir).await {
             Ok(meta) => meta,
             Err(e) => {
-                return Ok(error_result(format!(
-                    "Path not found: {} ({e})",
-                    dir.display()
-                )));
+                return Ok(attach_notice(
+                    error_result(format!("Path not found: {} ({e})", dir.display())),
+                    path_notice.as_deref(),
+                ));
             }
         };
         if !meta.is_dir() {
-            return Ok(error_result(format!("Not a directory: {}", dir.display())));
+            return Ok(attach_notice(
+                error_result(format!("Not a directory: {}", dir.display())),
+                path_notice.as_deref(),
+            ));
         }
 
         let (mut entries, scan_capped) = match read_entries(&dir).await {
             Ok(entries) => entries,
             Err(e) => {
-                return Ok(error_result(format!(
-                    "Cannot read directory {}: {e}",
-                    dir.display()
-                )));
+                return Ok(attach_notice(
+                    error_result(format!("Cannot read directory {}: {e}", dir.display())),
+                    path_notice.as_deref(),
+                ));
             }
         };
 
@@ -132,10 +138,13 @@ impl Tool for LsTool {
         }
         append_notices(&mut content, &notices);
 
-        Ok(ToolResult {
-            content,
-            is_error: false,
-        })
+        Ok(attach_notice(
+            ToolResult {
+                content,
+                is_error: false,
+            },
+            path_notice.as_deref(),
+        ))
     }
 }
 
@@ -227,6 +236,35 @@ mod tests {
             vec![".hidden", "A.txt", "adir/", "b.txt", "DirB/"],
             "实际：{}",
             brief(&result.content)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// workspace 内绝对目录路径追加相对路径事实；相对路径不追加。
+    ///
+    /// 变异：删掉 `absolute_notice` 或调用点的 `attach_notice` ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn absolute_workspace_path_adds_relative_hint() {
+        let dir = test_dir("ls_absolute_hint");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let tool = LsTool::new(dir.clone());
+
+        let absolute = call(&tool, json!({ "path": dir.join("sub").to_string_lossy() })).await;
+        assert!(
+            absolute
+                .content
+                .contains("ls: this path is inside the workspace root"),
+            "content = {}",
+            brief(&absolute.content)
+        );
+        assert!(absolute.content.contains("`sub`"));
+
+        let relative = call(&tool, json!({ "path": "sub" })).await;
+        assert!(
+            !relative.content.contains("workspace root"),
+            "相对路径不应触发注记；content = {}",
+            brief(&relative.content)
         );
 
         let _ = std::fs::remove_dir_all(&dir);

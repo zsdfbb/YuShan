@@ -15,6 +15,166 @@ pub use ls::LsTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 
+/// `read` / `write` / `edit` / `grep` / `find` / `ls` 共用的 workspace 路径提示。
+///
+/// 这些工具的相对路径都以 workspace 根为解析根。模型若仍传入 workspace 内的绝对路径，
+/// 结果里追加一条**事实**，说明同一个位置可以用相对路径表达。提示只在违规时出现，
+/// 不占正常调用的常驻成本；workspace 外的绝对路径（如 skill 文件）不提示。
+pub(crate) mod workspace_path {
+    use std::path::{Component, Path};
+
+    use ys_core::ToolResult;
+
+    /// 判断 `path` 是否为 workspace 内的绝对路径，并返回一条可追加到结果末尾的事实。
+    ///
+    /// `canonicalize` 能处理符号链接与 `..`；路径不存在时（例如 `write` 的新文件）
+    /// 退化为字面比较。任何一侧解析失败都只可能导致少提示，不会影响工具执行。
+    pub fn absolute_notice(tool: &str, path: &str, workspace: &Path) -> Option<String> {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return None;
+        }
+
+        let workspace_canonical = workspace.canonicalize().ok();
+        let relative = match path.canonicalize() {
+            // 存在的路径按真实路径比较：符号链接指向 workspace 外时不误报。
+            Ok(resolved) => {
+                let base = workspace_canonical.as_deref().unwrap_or(workspace);
+                resolved.strip_prefix(base).ok()?.to_path_buf()
+            }
+            // 不存在的路径（如 write 新文件）只能字面比较。含 `..` 时可能逃出
+            // workspace，宁可少提示也不误报。
+            Err(_) => {
+                let relative = if let Ok(relative) = path.strip_prefix(workspace) {
+                    relative
+                } else {
+                    let base = workspace_canonical.as_deref()?;
+                    path.strip_prefix(base).ok()?
+                };
+                if relative
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                {
+                    return None;
+                }
+                relative.to_path_buf()
+            }
+        };
+        let relative = if relative.as_os_str().is_empty() {
+            "."
+        } else {
+            relative.to_str()?
+        };
+
+        Some(format!(
+            "{tool}: this path is inside the workspace root; `{relative}` resolves to the same location"
+        ))
+    }
+
+    /// 把路径事实附到非空结果后；空结果保持为空（`read` 空文件的 `NoOutput` 语义不变）。
+    pub fn attach_notice(mut result: ToolResult, notice: Option<&str>) -> ToolResult {
+        if let Some(notice) = notice
+            && !result.content.is_empty()
+        {
+            ys_tool::append_notices(&mut result.content, &[notice.to_string()]);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::test_support::test_dir;
+
+        #[test]
+        fn relative_paths_are_not_reported() {
+            let dir = test_dir("workspace_path_relative");
+            assert!(absolute_notice("read", "docs/TODO.md", &dir).is_none());
+        }
+
+        #[test]
+        fn absolute_inside_path_reports_relative_form() {
+            let dir = test_dir("workspace_path_inside");
+            std::fs::create_dir_all(dir.join("docs")).unwrap();
+            let file = dir.join("docs/TODO.md");
+            std::fs::write(&file, "x").unwrap();
+
+            let notice = absolute_notice("read", &file.to_string_lossy(), &dir).unwrap();
+            assert!(notice.contains("read: this path is inside the workspace root"));
+            assert!(notice.contains("`docs/TODO.md`"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn absolute_outside_path_is_not_reported() {
+            let dir = test_dir("workspace_path_outside");
+            let outside = std::env::temp_dir().join("workspace_path_outside_file");
+            assert!(absolute_notice("read", &outside.to_string_lossy(), &dir).is_none());
+        }
+
+        #[test]
+        fn workspace_root_is_reported_as_dot() {
+            let dir = test_dir("workspace_path_root");
+            let notice = absolute_notice("ls", &dir.to_string_lossy(), &dir).unwrap();
+            assert!(notice.contains("`.` resolves to the same location"));
+        }
+
+        #[test]
+        fn nonexistent_inside_path_is_still_reported() {
+            let dir = test_dir("workspace_path_new_file");
+            let file = dir.join("new.txt");
+            let notice = absolute_notice("write", &file.to_string_lossy(), &dir).unwrap();
+            assert!(notice.contains("`new.txt`"));
+        }
+
+        #[test]
+        fn nonexistent_parent_path_is_not_reported() {
+            let dir = test_dir("workspace_path_parent");
+            let file = dir.join("../outside.txt");
+            assert!(absolute_notice("write", &file.to_string_lossy(), &dir).is_none());
+        }
+
+        #[test]
+        fn sibling_with_shared_prefix_is_not_inside() {
+            let dir = test_dir("workspace_path_sibling");
+            let sibling = dir.with_file_name(format!(
+                "{}-sibling",
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::create_dir_all(&sibling).unwrap();
+            let file = sibling.join("x.txt");
+
+            assert!(absolute_notice("read", &file.to_string_lossy(), &dir).is_none());
+            let _ = std::fs::remove_dir_all(&sibling);
+        }
+
+        #[test]
+        fn attach_notice_preserves_empty_content() {
+            let result = attach_notice(
+                ToolResult {
+                    content: String::new(),
+                    is_error: false,
+                },
+                Some("read: note"),
+            );
+            assert_eq!(result.content, "");
+        }
+
+        #[test]
+        fn attach_notice_appends_fact_to_nonempty_content() {
+            let result = attach_notice(
+                ToolResult {
+                    content: "body".into(),
+                    is_error: false,
+                },
+                Some("read: note"),
+            );
+            assert_eq!(result.content, "body\n\n[read: note]");
+        }
+    }
+}
+
 /// `grep` / `find` / `ls` 共用的常量与路径归一。
 ///
 /// 三个工具的后端不同（`rg`/`grep`、`fd`/`find`、纯 Rust），但**上限口径与显示路径口径

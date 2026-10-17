@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
+use crate::workspace_path::{absolute_notice, attach_notice};
+
 pub struct WriteTool {
     workspace: PathBuf,
 }
@@ -22,7 +24,7 @@ impl Tool for WriteTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to write" },
+                    "path": { "type": "string", "description": "Path to the file to write. Relative paths resolve against the workspace root; use an absolute path only for files outside it." },
                     "content": { "type": "string", "description": "Content to write to the file" }
                 },
                 "required": ["path", "content"]
@@ -37,6 +39,7 @@ impl Tool for WriteTool {
         let content = input["content"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing 'content'".into()))?;
+        let path_notice = absolute_notice("write", path, &self.workspace);
 
         let abs_path = self.workspace.join(path);
 
@@ -51,10 +54,13 @@ impl Tool for WriteTool {
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to write {path}: {e}")))?;
 
-        Ok(ToolResult {
-            content: format!("Successfully wrote to {path}"),
-            is_error: false,
-        })
+        Ok(attach_notice(
+            ToolResult {
+                content: format!("Successfully wrote to {path}"),
+                is_error: false,
+            },
+            path_notice.as_deref(),
+        ))
     }
 }
 
@@ -96,6 +102,48 @@ mod tests {
 
         let written = tokio::fs::read_to_string(&file).await.unwrap();
         assert_eq!(written, "hello world");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 绝对路径写入成功后追加相对路径事实；相对路径不追加。
+    ///
+    /// 变异：删掉 `absolute_notice` 或 `attach_notice` ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn absolute_workspace_path_adds_relative_hint() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file = dir.join("absolute.txt");
+        let tool = WriteTool::new(dir.clone());
+
+        let result = tool
+            .call(
+                json!({ "path": file.to_string_lossy(), "content": "x" }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result
+                .content
+                .contains("write: this path is inside the workspace root"),
+            "content = {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("`absolute.txt`"),
+            "注记应给出可替代的相对路径；content = {}",
+            result.content
+        );
+
+        let relative = tool
+            .call(
+                json!({ "path": "relative.txt", "content": "x" }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!relative.content.contains("workspace root"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

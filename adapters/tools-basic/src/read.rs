@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
+use crate::workspace_path::{absolute_notice, attach_notice};
+
 pub struct ReadTool {
     workspace: PathBuf,
 }
@@ -23,7 +25,7 @@ impl Tool for ReadTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read" },
+                    "path": { "type": "string", "description": "Path to the file to read. Relative paths resolve against the workspace root; use an absolute path only for files outside it." },
                     "offset": { "type": "number", "description": "Line number to start reading from (1-indexed)" },
                     "limit": { "type": "number", "description": "Maximum number of lines to read" }
                 },
@@ -44,6 +46,7 @@ impl Tool for ReadTool {
             .ok_or_else(|| ToolError::InvalidInput("missing 'path'".into()))?;
         let offset = input["offset"].as_u64().map(|v| v as usize);
         let limit = input["limit"].as_u64().map(|v| v as usize);
+        let path_notice = absolute_notice("read", path, &self.workspace);
 
         let abs_path = self.workspace.join(path);
 
@@ -55,10 +58,13 @@ impl Tool for ReadTool {
         let total_lines = lines.len();
 
         if total_lines == 0 {
-            return Ok(ToolResult {
-                content: String::new(),
-                is_error: false,
-            });
+            return Ok(attach_notice(
+                ToolResult {
+                    content: String::new(),
+                    is_error: false,
+                },
+                path_notice.as_deref(),
+            ));
         }
 
         let start = offset.unwrap_or(1).saturating_sub(1).min(total_lines);
@@ -101,10 +107,13 @@ impl Tool for ReadTool {
             ys_tool::append_notices(&mut output, &[ys_tool::size_notice(rendered_bytes, None)]);
         }
 
-        Ok(ToolResult {
-            content: output,
-            is_error: false,
-        })
+        Ok(attach_notice(
+            ToolResult {
+                content: output,
+                is_error: false,
+            },
+            path_notice.as_deref(),
+        ))
     }
 }
 
@@ -131,6 +140,73 @@ mod tests {
             d.contains("`offset`") && d.contains("`limit`") && d.contains("line range"),
             "描述须提示用 offset/limit 读区间（替代 sed/cat）；description = {d}"
         );
+    }
+
+    /// workspace 内绝对路径只追加事实注记；相对路径保持原结果。
+    ///
+    /// 变异：删掉 `absolute_notice` 的 `is_absolute` 守卫 ⇒ 相对路径也会被误报；
+    /// 删掉工具调用里的 `attach_notice` ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn absolute_workspace_path_adds_relative_hint() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "body").unwrap();
+        let tool = ReadTool::new(dir.clone());
+
+        let absolute = tool
+            .call(json!({ "path": file.to_string_lossy() }), make_ctx())
+            .await
+            .unwrap();
+        assert!(
+            absolute
+                .content
+                .contains("read: this path is inside the workspace root"),
+            "content = {}",
+            absolute.content
+        );
+        assert!(
+            absolute.content.contains("`note.txt`"),
+            "注记应给出可替代的相对路径；content = {}",
+            absolute.content
+        );
+
+        let relative = tool
+            .call(json!({ "path": "note.txt" }), make_ctx())
+            .await
+            .unwrap();
+        assert!(
+            !relative.content.contains("workspace root"),
+            "相对路径不应触发注记；content = {}",
+            relative.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空文件用绝对路径读取时仍返回空内容：路径注记不得把 `NoOutput` 变成有输出。
+    ///
+    /// 变异：让 `attach_notice` 对空正文也追加注记 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn absolute_empty_file_keeps_empty_result() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("empty.txt");
+        std::fs::write(&file, "").unwrap();
+
+        let result = ReadTool::new(dir.clone())
+            .call(json!({ "path": file.to_string_lossy() }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.is_empty(),
+            "空文件不得因路径注记变为有输出；content = {:?}",
+            result.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_dir() -> PathBuf {

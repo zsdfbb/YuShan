@@ -557,6 +557,33 @@ mod tests {
     /// 守卫的是 prompt cache 相干性：任何让「工具清单或系统提示的字节」漂移的改动
     /// （重排、新增字段、动态表）都会让此处的指纹变化。
     ///
+    /// 所有带 `path` 参数的文件工具都必须说明**相对路径的解析根**。
+    ///
+    /// 变异：删掉任一工具 `path.description` 里的 `workspace root` ⇒ 本用例变红。
+    /// 这是「参数即契约」的守卫：系统提示里的 cwd 段可能被 `SYSTEM.md` 短路，
+    /// 但工具 schema 始终随每次请求发给模型。
+    #[test]
+    fn path_parameters_state_workspace_relative_resolution() {
+        let dir = unique_dir("path-contract");
+        let (tools, _) = build_tools(&dir, offline_web());
+
+        for tool in tools {
+            let spec = tool.spec();
+            let Some(path_description) =
+                spec.parameters["properties"]["path"]["description"].as_str()
+            else {
+                continue;
+            };
+            assert!(
+                path_description.contains("workspace root"),
+                "{} 的 path 描述须说明相对 workspace 根解析；description = {path_description}",
+                spec.name
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 断言三件：
     ///  1. 工具表恰 9 个、顺序 == [`EXPECTED_ORDER`]；
     ///  2. **同一份工具表构造两次，序列化后逐字节相同**（ADR-0022 决策 19 的抖动面：
@@ -628,7 +655,7 @@ mod tests {
         assert_ne!(fp_tools, 0);
         assert_ne!(fp_prompt, 0);
         // 当前锚点（漂移时这两个数字会变 —— 变化本身即是信号；本模块禁止 print 宏，故用注释记录）：
-        //   tools = 0x505fa9711a7adcbc
+        //   tools = 0xeced4483ff29ef22
         // 只为**工具表**记值：`fp_tools` 与运行环境无关（`ToolSpec` 里不含任何路径）。
         // `fp_prompt` **不入锚** —— 它含 `Current working directory: <临时目录>`，逐次运行都不同，
         // 只由上一条「同一目录两次构建一致」的断言守卫。

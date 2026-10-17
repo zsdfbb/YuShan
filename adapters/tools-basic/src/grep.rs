@@ -40,6 +40,7 @@ use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 
 use crate::exec::{Bounded, SearchBackends, Stop, run_bounded};
 use crate::search::{BYTE_CAP, DEADLINE, EXCLUDED_DIRS, relativize};
+use crate::workspace_path::{absolute_notice, attach_notice};
 
 /// 一次调用返回的命中**条数**上限（与 `byte_cap` / `head` 是三个不同单位的上限）。
 const DEFAULT_LIMIT: usize = 100;
@@ -102,7 +103,7 @@ impl Tool for GrepTool {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Search pattern (regex or literal string)" },
-                    "path": { "type": "string", "description": "Directory or file to search (default: current directory)" },
+                    "path": { "type": "string", "description": "Directory or file to search (default: the workspace root). Relative paths resolve against the workspace root." },
                     "glob": { "type": "string", "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" },
                     "ignoreCase": { "type": "boolean", "description": "Case-insensitive search (default: false)" },
                     "literal": { "type": "boolean", "description": "Treat pattern as literal string instead of regex (default: false)" },
@@ -125,6 +126,7 @@ impl Tool for GrepTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing 'pattern'".into()))?;
         let path = input["path"].as_str().unwrap_or(".");
+        let path_notice = absolute_notice("grep", path, &self.workspace);
         let glob = input["glob"].as_str();
         let ignore_case = input["ignoreCase"].as_bool().unwrap_or(false);
         let literal = input["literal"].as_bool().unwrap_or(false);
@@ -144,14 +146,17 @@ impl Tool for GrepTool {
                 // `<workspace>/src/` 而非 `apps/src/`。rg 的 glob 无法表达「锚定搜索根」，
                 // 故**明确报错**（与降级路径同款处理），绝不静默给错答案。
                 if let Some(g) = glob.filter(|g| g.starts_with('/')) {
-                    return Ok(ToolResult {
-                        content: format!(
-                            "glob '{g}' starts with '/' — ripgrep anchors such globs to the \
-                             working directory, not to the search root. Drop the leading '/' \
-                             (e.g. 'src/*.rs') to match at any depth under the search root."
-                        ),
-                        is_error: true,
-                    });
+                    return Ok(attach_notice(
+                        ToolResult {
+                            content: format!(
+                                "glob '{g}' starts with '/' — ripgrep anchors such globs to the \
+                                 working directory, not to the search root. Drop the leading '/' \
+                                 (e.g. 'src/*.rs') to match at any depth under the search root."
+                            ),
+                            is_error: true,
+                        },
+                        path_notice.as_deref(),
+                    ));
                 }
                 (
                     "ripgrep",
@@ -163,15 +168,18 @@ impl Tool for GrepTool {
                 // `grep --include=GLOB` 只按 **basename** 匹配，含 `/` 的 glob（如 `src/*.rs`）
                 // 会一条都匹配不到。**不能静默给错答案** —— 返回明确的错误结果。
                 if glob.is_some_and(|g| g.contains('/')) {
-                    return Ok(ToolResult {
-                        content: format!(
-                            "glob '{g}' contains '/' which the POSIX fallback (grep --include) \
-                             cannot express — it matches basenames only. Retry with a basename \
-                             glob (e.g. '*.rs'), or install ripgrep (rg) for path-aware globs.",
-                            g = glob.unwrap_or_default()
-                        ),
-                        is_error: true,
-                    });
+                    return Ok(attach_notice(
+                        ToolResult {
+                            content: format!(
+                                "glob '{g}' contains '/' which the POSIX fallback (grep --include) \
+                                 cannot express — it matches basenames only. Retry with a basename \
+                                 glob (e.g. '*.rs'), or install ripgrep (rg) for path-aware globs.",
+                                g = glob.unwrap_or_default()
+                            ),
+                            is_error: true,
+                        },
+                        path_notice.as_deref(),
+                    ));
                 }
                 (
                     "grep",
@@ -194,7 +202,10 @@ impl Tool for GrepTool {
 
         let entries = parse(&bounded.stdout, native.is_some(), &search_root);
 
-        Ok(self.build_result(&bounded, &entries, limit, context, context_clamped, label))
+        Ok(attach_notice(
+            self.build_result(&bounded, &entries, limit, context, context_clamped, label),
+            path_notice.as_deref(),
+        ))
     }
 }
 
@@ -653,6 +664,44 @@ mod tests {
             brief(&result.content)
         );
         assert_eq!(result.content.trim(), "No matches found");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// workspace 内绝对搜索路径追加相对路径事实；相对路径不追加。
+    ///
+    /// 变异：删掉 `absolute_notice` 或 `build_result` 里的 `attach_notice` ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn absolute_workspace_path_adds_relative_hint() {
+        let dir = test_dir("grep_absolute_hint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "needle\n").unwrap();
+        let tool = posix_tool(&dir);
+
+        let absolute = call(
+            &tool,
+            json!({
+                "pattern": "needle",
+                "path": file.to_string_lossy()
+            }),
+        )
+        .await;
+        assert!(
+            absolute
+                .content
+                .contains("grep: this path is inside the workspace root"),
+            "content = {}",
+            brief(&absolute.content)
+        );
+        assert!(absolute.content.contains("`a.txt`"));
+
+        let relative = call(&tool, json!({ "pattern": "needle", "path": "a.txt" })).await;
+        assert!(
+            !relative.content.contains("workspace root"),
+            "相对路径不应触发注记；content = {}",
+            brief(&relative.content)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

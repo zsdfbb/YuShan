@@ -17,6 +17,7 @@ use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 
 use crate::exec::{Bounded, SearchBackends, Stop, run_bounded};
 use crate::search::{BYTE_CAP, DEADLINE, EXCLUDED_DIRS, relativize};
+use crate::workspace_path::{absolute_notice, attach_notice};
 
 /// 一次调用返回的**结果条数**上限。
 const DEFAULT_LIMIT: usize = 1000;
@@ -49,7 +50,7 @@ impl Tool for FindTool {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'" },
-                    "path": { "type": "string", "description": "Directory to search in (default: current directory)" },
+                    "path": { "type": "string", "description": "Directory to search in (default: the workspace root). Relative paths resolve against the workspace root." },
                     "limit": { "type": "number", "description": "Maximum number of results (default: 1000)" }
                 },
                 "required": ["pattern"]
@@ -68,6 +69,7 @@ impl Tool for FindTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing 'pattern'".into()))?;
         let path = input["path"].as_str().unwrap_or(".");
+        let path_notice = absolute_notice("find", path, &self.workspace);
         // `limit` 至少为 1：0 会让「已截断」判定恒真、并产出 `Use limit=0 for more` 这类废话。
         let limit = (input["limit"].as_u64().unwrap_or(DEFAULT_LIMIT as u64) as usize).max(1);
 
@@ -92,7 +94,10 @@ impl Tool for FindTool {
         )
         .await?;
 
-        Ok(build_result(&bounded, &search_root, limit, label))
+        Ok(attach_notice(
+            build_result(&bounded, &search_root, limit, label),
+            path_notice.as_deref(),
+        ))
     }
 }
 
@@ -318,6 +323,43 @@ mod tests {
             !result.content.contains("b.txt"),
             "非 *.rs 不该出现；实际：{}",
             brief(&result.content)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// workspace 内绝对搜索路径追加相对路径事实；相对路径不追加。
+    ///
+    /// 变异：删掉 `absolute_notice` 或调用点的 `attach_notice` ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn absolute_workspace_path_adds_relative_hint() {
+        let dir = test_dir("find_absolute_hint");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "").unwrap();
+        let tool = posix_tool(&dir);
+
+        let absolute = call(
+            &tool,
+            json!({
+                "pattern": "*.rs",
+                "path": dir.join("src").to_string_lossy()
+            }),
+        )
+        .await;
+        assert!(
+            absolute
+                .content
+                .contains("find: this path is inside the workspace root"),
+            "content = {}",
+            brief(&absolute.content)
+        );
+        assert!(absolute.content.contains("`src`"));
+
+        let relative = call(&tool, json!({ "pattern": "*.rs", "path": "src" })).await;
+        assert!(
+            !relative.content.contains("workspace root"),
+            "相对路径不应触发注记；content = {}",
+            brief(&relative.content)
         );
 
         let _ = std::fs::remove_dir_all(&dir);

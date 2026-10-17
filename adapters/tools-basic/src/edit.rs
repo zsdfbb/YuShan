@@ -4,6 +4,8 @@ use unicode_normalization::UnicodeNormalization;
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
+use crate::workspace_path::{absolute_notice, attach_notice};
+
 pub struct EditTool {
     workspace: PathBuf,
 }
@@ -124,7 +126,7 @@ impl Tool for EditTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to edit" },
+                    "path": { "type": "string", "description": "Path to the file to edit. Relative paths resolve against the workspace root; use an absolute path only for files outside it." },
                     "edits": {
                         "description": "Array of edit operations, each with oldText and newText",
                         "oneOf": [
@@ -157,6 +159,7 @@ impl Tool for EditTool {
 
     async fn call(&self, input: Value, _ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let path = resolve_path(&input, "path")?;
+        let path_notice = absolute_notice("edit", &path, &self.workspace);
         let edits = parse_edits(&input)?;
 
         if edits.is_empty() {
@@ -224,10 +227,13 @@ impl Tool for EditTool {
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to write {path}: {e}")))?;
 
-        Ok(ToolResult {
-            content: format!("Successfully replaced {replaced_count} block(s) in {path}."),
-            is_error: false,
-        })
+        Ok(attach_notice(
+            ToolResult {
+                content: format!("Successfully replaced {replaced_count} block(s) in {path}."),
+                is_error: false,
+            },
+            path_notice.as_deref(),
+        ))
     }
 }
 
@@ -305,6 +311,41 @@ mod tests {
         assert!(result.content.contains("1 block"));
         let written = std::fs::read_to_string(&file).unwrap();
         assert_eq!(written, "hello rust");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// workspace 内绝对路径成功替换后追加相对路径事实。
+    ///
+    /// 变异：删掉 `absolute_notice` 或 `attach_notice` ⇒ 断言变红。
+    #[tokio::test]
+    async fn absolute_workspace_path_adds_relative_hint() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("absolute.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let result = tool
+            .call(
+                json!({
+                    "path": file.to_string_lossy(),
+                    "edits": [{ "oldText": "world", "newText": "rust" }]
+                }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result
+                .content
+                .contains("edit: this path is inside the workspace root"),
+            "content = {}",
+            result.content
+        );
+        assert!(result.content.contains("`absolute.txt`"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -45,6 +45,7 @@ mod assembly;
 mod capabilities;
 mod channel;
 mod config;
+mod debug_log;
 mod logging;
 mod prompt;
 mod provider;
@@ -65,8 +66,9 @@ mod test_env;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use ys_core::StopReason;
@@ -83,8 +85,12 @@ use ys_tools_web::WebConfig;
 use ys_tui_coding::CodingView;
 
 use channel::{ChannelSink, ChannelStatsHandle};
+use debug_log::{ArgsMode, DebugIds, DebugRecord, DebugSink};
 use round_clock::RoundClock;
 use wiring::Wiring;
+
+/// OTel GenAI semconv 版本：与 `SCHEMA_VERSION` 一起钉死并写进 `run_start`。
+const SEMCONV_VERSION: &str = "otel-genai/1.36.0";
 
 /// 运行模式。
 #[derive(Debug, PartialEq, Eq)]
@@ -130,6 +136,8 @@ struct Args {
     mode: Mode,
     /// `--stats`：显式要求把背压读数摘要写到 stderr（无论有无背压）。
     stats: bool,
+    /// `--debug`：打开结构化执行日志（`YUSHAN_DEBUG` 优先于本 flag）。
+    debug: bool,
     /// 启动期会话形态。
     resume: Resume,
     /// `worktree` 子命令；`None` = 未走该子命令。
@@ -148,16 +156,24 @@ struct Args {
 /// 取 id，`--resume <任务>`（其后无 token）是裸 flag + 任务文本。下一 token 不存在或以 `-`
 /// 开头同样 ⇒ 裸 `--resume`。`--resume=<id>`（`=` 形态）**已移除** ⇒ 报错。
 ///
-/// 对 `--stats` 与 `--resume` **顺序无关**（循环剥离）。重复 flag **last-wins 且静默
-/// 丢弃**：这是有意保留的语义，不做冲突报错。
-fn split_leading_flags(rest: &[String]) -> Result<(bool, Resume, &[String]), String> {
+/// 对 `--stats` / `--debug` 与 `--resume` **顺序无关**（循环剥离）。重复 flag **last-wins
+/// 且静默丢弃**：这是有意保留的语义，不做冲突报错。
+///
+/// `--debug` 只认 flag 区：任务文本一旦开始就不再剥离（`-p "任务 --debug"` 的任务文本
+/// 逐字保留 `--debug`）。
+fn split_leading_flags(rest: &[String]) -> Result<(bool, bool, Resume, &[String]), String> {
     let mut stats = false;
+    let mut debug = false;
     let mut resume = Resume::New;
     let mut idx = 0;
     while idx < rest.len() {
         match rest[idx].as_str() {
             "--stats" => {
                 stats = true;
+                idx += 1;
+            }
+            "--debug" => {
+                debug = true;
                 idx += 1;
             }
             "--resume" => {
@@ -185,7 +201,7 @@ fn split_leading_flags(rest: &[String]) -> Result<(bool, Resume, &[String]), Str
             _ => break,
         }
     }
-    Ok((stats, resume, &rest[idx..]))
+    Ok((stats, debug, resume, &rest[idx..]))
 }
 
 /// 解析 argv（不含 argv[0]）。
@@ -197,62 +213,114 @@ fn split_leading_flags(rest: &[String]) -> Result<(bool, Resume, &[String]), Str
 /// TUI 形态：首个位置可为裸 `--resume`（列表选择）或 `--resume <id>`（指定会话，**空格形态**），
 /// 其后参数照旧忽略。`--resume=<id>`（`=` 形态）已移除 ⇒ 报错。
 fn parse_args(argv: &[String]) -> Result<Args, String> {
-    let Some(first) = argv.first().map(String::as_str) else {
-        return Ok(new_interactive());
+    // TUI 首部的 flag 区：`--debug`（可重复）与 `--resume [<id>]`，**顺序无关**。
+    // 与 `split_leading_flags` 同一套循环语义：一旦遇到非 flag（模式 flag / 子命令 /
+    // 裸词）就停止剥离。`--resume=<id>` 的旧形态在这里也给出同样的可操作错误。
+    let mut debug = false;
+    let mut resume = Resume::New;
+    let mut idx = 0;
+    while idx < argv.len() {
+        match argv[idx].as_str() {
+            "--debug" => {
+                debug = true;
+                idx += 1;
+            }
+            "--resume" => {
+                match argv.get(idx + 1).filter(|t| !t.starts_with('-')) {
+                    Some(id) => {
+                        resume = Resume::Id(id.clone());
+                        idx += 2;
+                    }
+                    None => {
+                        resume = Resume::Pick;
+                        idx += 1;
+                    }
+                }
+            }
+            f if f.starts_with("--resume=") => {
+                return Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）".into());
+            }
+            _ => break,
+        }
+    }
+
+    // 模式 flag 之后的 flag 区（`-p` / `--json` / `worktree attach`）在下方解析；
+    // 其中的 `--resume` 若出现，按 last-wins 覆盖首部（重复 flag 静默丢弃）。
+    let merge = |args: &mut Args, flag_stats: bool, flag_debug: bool, flag_resume: Resume| {
+        args.stats |= flag_stats;
+        args.debug |= debug || flag_debug;
+        if flag_resume != Resume::New {
+            args.resume = flag_resume;
+        } else if args.resume == Resume::New {
+            args.resume = resume.clone();
+        }
+    };
+
+    let Some(first) = argv.get(idx).map(String::as_str) else {
+        return Ok(Args {
+            mode: Mode::Interactive,
+            stats: false,
+            debug,
+            resume,
+            worktree: None,
+        });
     };
 
     match first {
         "-p" => {
-            let (stats, resume, rest) = split_leading_flags(&argv[1..])?;
+            let (stats, flag_debug, flag_resume, rest) = split_leading_flags(&argv[idx + 1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("-p 需要一个任务参数，例如：ys-coding-agent -p \"修复这个 bug\"".into())
             } else {
-                Ok(Args {
+                let mut args = Args {
                     mode: Mode::Print(task),
-                    stats,
-                    resume,
+                    stats: false,
+                    debug: false,
+                    resume: Resume::New,
                     worktree: None,
-                })
+                };
+                merge(&mut args, stats, flag_debug, flag_resume);
+                Ok(args)
             }
         }
         "--json" => {
-            let (stats, resume, rest) = split_leading_flags(&argv[1..])?;
+            let (stats, flag_debug, flag_resume, rest) = split_leading_flags(&argv[idx + 1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("--json 需要一个任务参数，例如：ys-coding-agent --json \"修复这个 bug\"".into())
             } else {
-                Ok(Args {
+                let mut args = Args {
                     mode: Mode::Json(task),
-                    stats,
-                    resume,
+                    stats: false,
+                    debug: false,
+                    resume: Resume::New,
                     worktree: None,
-                })
+                };
+                merge(&mut args, stats, flag_debug, flag_resume);
+                Ok(args)
             }
         }
-        // `--resume <id>`（空格形态）或裸 `--resume`（列表选择）。
-        "--resume" => Ok(Args {
-            mode: Mode::Interactive,
-            stats: false,
-            resume: match argv.get(1).filter(|t| !t.starts_with('-')) {
-                Some(id) => Resume::Id(id.clone()),
-                None => Resume::Pick,
-            },
-            worktree: None,
-        }),
-        "worktree" => parse_worktree(&argv[1..]),
-        // `=` 形态已移除：给出可操作的错误，而不是当成不认识的 flag。
-        f if f.starts_with("--resume=") => {
-            Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）".into())
+        "worktree" => {
+            let mut args = parse_worktree(&argv[idx + 1..])?;
+            args.debug |= debug;
+            Ok(args)
         }
         // 未知 flag：仅当它出现在**首个**位置时才算 flag（其余位置属任务文本）。
         // 单独的 `-` 视为普通参数（约定：读 stdin 的占位，本轮不支持）。
         f if f.starts_with('-') && f != "-" => Err(format!(
-            "未知参数：{f}（可用：-p [--stats] [--resume <id>] <任务> | --json ... | [--resume [<id>]]）"
+            "未知参数：{f}（可用：-p [--stats] [--debug] [--resume <id>] <任务> | --json ... | \
+             [--debug] [--resume [<id>]]）"
         )),
         // 无 flag：交互式。**非 flag 首 token 的静默 Interactive 行为保持不变**
         // （`worktree` 已由上面的臂截获，故此兜底只处理任务无关的裸词）。
-        _ => Ok(new_interactive()),
+        _ => Ok(Args {
+            mode: Mode::Interactive,
+            stats: false,
+            debug,
+            resume,
+            worktree: None,
+        }),
     }
 }
 
@@ -261,6 +329,7 @@ fn new_interactive() -> Args {
     Args {
         mode: Mode::Interactive,
         stats: false,
+        debug: false,
         resume: Resume::New,
         worktree: None,
     }
@@ -328,52 +397,55 @@ fn parse_worktree_attach(rest: &[String]) -> Result<Args, String> {
         Some(s) if s.starts_with('-') && s != "-" => (None, rest),
         Some(_) => (Some(rest[0].clone()), &rest[1..]),
     };
-    let (mode, stats, resume) = parse_mode_tail(tail)?;
+    let (mode, stats, debug, resume) = parse_mode_tail(tail)?;
     Ok(Args {
         mode,
         stats,
+        debug,
         resume,
         worktree: Some(WorktreeCmd::Attach(name)),
     })
 }
 
 /// 解析 `worktree attach` 名参之后的模式 flag 区（照顶层 `parse_args` 的形态）。
-fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, Resume), String> {
+fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, bool, Resume), String> {
     let Some(first) = tail.first().map(String::as_str) else {
-        return Ok((Mode::Interactive, false, Resume::New));
+        return Ok((Mode::Interactive, false, false, Resume::New));
     };
     match first {
         "-p" => {
-            let (stats, resume, rest) = split_leading_flags(&tail[1..])?;
+            let (stats, debug, resume, rest) = split_leading_flags(&tail[1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("-p 需要一个任务参数".into())
             } else {
-                Ok((Mode::Print(task), stats, resume))
+                Ok((Mode::Print(task), stats, debug, resume))
             }
         }
         "--json" => {
-            let (stats, resume, rest) = split_leading_flags(&tail[1..])?;
+            let (stats, debug, resume, rest) = split_leading_flags(&tail[1..])?;
             let task = rest.join(" ");
             if task.is_empty() {
                 Err("--json 需要一个任务参数".into())
             } else {
-                Ok((Mode::Json(task), stats, resume))
+                Ok((Mode::Json(task), stats, debug, resume))
             }
         }
-        "--resume" => Ok((
-            Mode::Interactive,
-            false,
-            match tail.get(1).filter(|t| !t.starts_with('-')) {
-                Some(id) => Resume::Id(id.clone()),
-                None => Resume::Pick,
-            },
-        )),
-        f if f.starts_with("--resume=") => {
-            Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）".into())
+        // 交互式 flag 区与 `-p` / `--json` 共用同一套循环：`--debug` 可出现在
+        // `--resume` 之前或之后（顺序无关），`--resume=<id>` 同样给出可操作错误。
+        f if f == "--resume" || f.starts_with("--resume=") => {
+            let (stats, debug, resume, rest) = split_leading_flags(tail)?;
+            if !rest.is_empty() {
+                return Err(format!(
+                    "worktree attach 的交互式 flag 之后不能再跟任务文本：{}",
+                    rest.join(" ")
+                ));
+            }
+            Ok((Mode::Interactive, stats, debug, resume))
         }
         other => Err(format!(
-            "worktree attach 只接受 -p / --json / --resume [<id>] 与可选名字；未知参数：{other}"
+            "worktree attach 只接受 -p / --json / --resume [<id>] / --debug 与可选名字；\
+             未知参数：{other}"
         )),
     }
 }
@@ -395,7 +467,9 @@ const REQUEST_CAPACITY: usize = 64;
 /// Boundary（UI → `BasicLoop`）信道容量。回合结束后的残留由 app 侧清空。
 const BOUNDARY_CAPACITY: usize = 64;
 /// UI 退出后，给 app 线程收摊的宽限时长（超时即连 runtime 一起丢弃）。
-const APP_THREAD_GRACE: Duration = Duration::from_secs(1);
+// 必须大于 `debug_log::FLUSH_TIMEOUT`（2 s）：app 线程退出前要排空 debug
+// 队列并写 `run_end`，宽限更短会让慢盘上的 `run_end` 被 runtime 直接掐掉。
+const APP_THREAD_GRACE: Duration = Duration::from_secs(3);
 
 /// 把请求容量 clamp 到 [`MIN_CHANNEL_CAPACITY`]。
 ///
@@ -448,6 +522,311 @@ fn is_terminal(event: &AgentEvent) -> bool {
     )
 }
 
+// ─────────────────────────────── debug 日志接线 ───────────────────────────────
+//
+// 关闭时调用方持有 `None`：不解析路径、不建文件、不起线程（`open_enabled` 早退）。
+// 打开时本模块只负责**把事件翻成记录**；写盘、序列化与排队都在 `debug_log` 的
+// 独立 writer 线程里（消费侧绝不碰文件 IO）。
+
+/// 消费侧持有的 debug 上下文：sink + 当前会话 id（记录的 `session_id` 字段）。
+///
+/// 会话在运行期可变（TUI 的 `/new` / `/resume`），故 id 由调用方随时刷新后传入。
+pub(crate) struct DebugTap<'a> {
+    pub sink: &'a mut DebugSink,
+    pub session_id: &'a str,
+}
+
+/// 从 `Option<&mut DebugSink>` 重新借出 sink。
+///
+/// `Option::as_deref_mut` 在这里是恒等操作（clippy `needless_option_as_deref`），
+/// 而 `if let Some(sink) = debug` 会移动整个 `Option`、后续无法再用 —— 故显式再借。
+fn reborrow_sink<'a, 'b>(
+    debug: &'a mut Option<&'b mut DebugSink>,
+) -> Option<&'a mut DebugSink>
+where
+    'b: 'a,
+{
+    debug.as_mut().map(|sink| &mut **sink)
+}
+
+/// 会话 id：与 session 文件 stem 同源；无文件（一次性会话）时退回进程级稳定值。
+pub(crate) fn session_id_for(path: Option<&Path>) -> String {
+    path.and_then(Path::file_stem)
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ephemeral-{}", std::process::id()))
+}
+
+/// unix 毫秒（`DebugSink::begin_run` 的原点参数）。
+pub(crate) fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 回合输入的字节数（仅正文块；用于 `turn_start.input_bytes`）。
+pub(crate) fn message_bytes(message: &ys_core::Message) -> usize {
+    message
+        .content
+        .iter()
+        .map(|block| match block {
+            ys_core::ContentBlock::Text { text } => text.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// 记录一条 debug 事件（统一构造 [`DebugIds`]）。
+pub(crate) fn debug_record(
+    sink: &mut DebugSink,
+    session_id: &str,
+    ev: &'static str,
+    turn: Option<u32>,
+    round: Option<u32>,
+    fields: Map<String, Value>,
+) {
+    sink.record(
+        ev,
+        DebugIds {
+            session_id,
+            turn,
+            round,
+            tool_call_id: None,
+        },
+        fields,
+    );
+}
+
+/// 与 [`record_boundary`] 同形，但走可克隆句柄（回合执行侧并发写记录用）。
+fn record_boundary_handle(
+    handle: &debug_log::DebugHandle,
+    session_id: &str,
+    turn: Option<u32>,
+    phase: &str,
+    kind: &str,
+    origin: Option<&str>,
+) {
+    let mut fields = Map::new();
+    fields.insert("phase".into(), json!(phase));
+    fields.insert("kind".into(), json!(kind));
+    if let Some(origin) = origin {
+        fields.insert("origin".into(), json!(origin));
+    }
+    handle.record(
+        "boundary",
+        debug_log::DebugIds {
+            session_id,
+            turn,
+            round: None,
+            tool_call_id: None,
+        },
+        fields,
+    );
+}
+
+/// 把 [`round_clock::RoundObservation`] 一分为二：文本行进 `yushan.log`，记录进 sink。
+///
+/// 两条路径（`observe` / `observe_debug`）的文本行逐字节相同 —— 分流只影响 debug
+/// 文件，不影响既有日志。
+pub(crate) fn emit_observation(
+    sink: &mut DebugSink,
+    session_id: &str,
+    turn: Option<u32>,
+    observation: round_clock::RoundObservation,
+) {
+    let round_clock::RoundObservation { lines, records } = observation;
+    for line in lines {
+        logging::log(&line);
+    }
+    for record in records {
+        let DebugRecord {
+            ev,
+            round,
+            tool_call_id,
+            fields,
+        } = record;
+        sink.record(
+            ev,
+            DebugIds {
+                session_id,
+                turn,
+                round,
+                tool_call_id: tool_call_id.as_deref(),
+            },
+            fields,
+        );
+    }
+}
+
+/// 观察一条事件：debug 开走富化路径，关走既有只读路径。
+pub(crate) fn observe_event(
+    debug: Option<&mut DebugSink>,
+    clock: &mut RoundClock,
+    env: &Envelope,
+    session_id: &str,
+) {
+    match debug {
+        Some(sink) => {
+            let observation = clock.observe_debug(env, Instant::now());
+            emit_observation(sink, session_id, Some(env.turn), observation);
+        }
+        None => {
+            for line in clock.observe(env, Instant::now()) {
+                logging::log(&line);
+            }
+        }
+    }
+}
+
+/// `api_base` 只留 **scheme + host**：路径 / query 可能含租户信息。
+fn api_origin(base: &str) -> String {
+    let (scheme, rest) = match base.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, base),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    match scheme {
+        Some(scheme) => format!("{scheme}://{authority}"),
+        None => authority.to_string(),
+    }
+}
+
+/// `run_start` 的字段：一次运行的环境事实（只记名字，不记值）。
+pub(crate) fn run_start_fields(
+    config: &config::Config,
+    session_path: Option<&Path>,
+    tools: &[(String, usize)],
+) -> Map<String, Value> {
+    let limits = resolve_limits(config);
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|(name, spec_bytes)| json!({"name": name, "spec_bytes": spec_bytes}))
+        .collect();
+    // 只列 `YUSHAN_*` 的**名字**：这些是配置面，名字本身不泄露凭证。
+    let mut env_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.to_str().map(str::to_string))
+        .filter(|name| name.starts_with("YUSHAN_"))
+        .collect();
+    env_names.sort();
+
+    let mut fields = Map::new();
+    fields.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+    fields.insert("pid".into(), json!(std::process::id()));
+    fields.insert("os".into(), json!(std::env::consts::OS));
+    fields.insert("arch".into(), json!(std::env::consts::ARCH));
+    fields.insert("cwd".into(), json!(config.cwd.display().to_string()));
+    fields.insert(
+        "session_file".into(),
+        match session_path {
+            Some(path) => json!(path.display().to_string()),
+            None => Value::Null,
+        },
+    );
+    fields.insert(
+        "gen_ai.system".into(),
+        json!(config.provider.as_deref().unwrap_or("custom")),
+    );
+    fields.insert("gen_ai.request.model".into(), json!(config.model));
+    fields.insert(
+        "api_base".into(),
+        match config.api_base.as_deref() {
+            Some(base) => json!(api_origin(base)),
+            None => Value::Null,
+        },
+    );
+    fields.insert(
+        "limits".into(),
+        json!({
+            "max_rounds": limits.max_rounds,
+            "wall_clock_ms": config.max_turn_duration().as_millis() as u64,
+            "context_window": limits.context_window,
+        }),
+    );
+    fields.insert("tools".into(), Value::Array(tools));
+    fields.insert(
+        "skills".into(),
+        json!({
+            "count": config.skills.len(),
+            "budget": skills::Budget::default().total_bytes,
+        }),
+    );
+    fields.insert("env_names".into(), json!(env_names));
+    fields.insert("semconv".into(), json!(SEMCONV_VERSION));
+    fields
+}
+
+/// 写一条 `run_start`（初次启动、TUI 的 `/new` / `/resume` 共用）。
+pub(crate) fn emit_run_start(
+    sink: &mut DebugSink,
+    config: &config::Config,
+    session_path: Option<&Path>,
+    session_id: &str,
+    tools: &[(String, usize)],
+) {
+    let fields = run_start_fields(config, session_path, tools);
+    debug_record(sink, session_id, "run_start", None, None, fields);
+}
+
+/// `turn_start`：输入规模与回合预算。
+pub(crate) fn record_turn_start(
+    sink: &mut DebugSink,
+    session_id: &str,
+    turn: u32,
+    input_bytes: usize,
+    budget: Duration,
+) {
+    let mut fields = Map::new();
+    fields.insert("input_bytes".into(), json!(input_bytes));
+    fields.insert("budget_ms".into(), json!(budget.as_millis() as u64));
+    debug_record(sink, session_id, "turn_start", Some(turn), None, fields);
+}
+
+/// `turn_end`：轮数、耗时与回合末缓存读数（读不到时写 `null`，不伪造成 0）。
+pub(crate) fn record_turn_end(
+    sink: &mut DebugSink,
+    session_id: &str,
+    turn: u32,
+    rounds: u32,
+    elapsed: Duration,
+    budget_remaining: Duration,
+    cache: Option<(u32, u32)>,
+) {
+    let mut fields = Map::new();
+    fields.insert("rounds".into(), json!(rounds));
+    fields.insert("elapsed_ms".into(), json!(elapsed.as_millis() as u64));
+    fields.insert(
+        "budget_remaining_ms".into(),
+        json!(budget_remaining.as_millis() as u64),
+    );
+    fields.insert("cache_hit".into(), json!(cache.map(|(hit, _)| hit)));
+    fields.insert("cache_miss".into(), json!(cache.map(|(_, miss)| miss)));
+    debug_record(sink, session_id, "turn_end", Some(turn), None, fields);
+}
+
+/// `boundary` 记录：`phase` ∈ `enqueued` / `observed`，`kind` ∈ `abort` / `steer`。
+pub(crate) fn record_boundary(
+    sink: &mut DebugSink,
+    session_id: &str,
+    turn: Option<u32>,
+    phase: &str,
+    kind: &str,
+    origin: Option<&str>,
+) {
+    let mut fields = Map::new();
+    fields.insert("phase".into(), json!(phase));
+    fields.insert("kind".into(), json!(kind));
+    if let Some(origin) = origin {
+        fields.insert("origin".into(), json!(origin));
+    }
+    debug_record(sink, session_id, "boundary", turn, None, fields);
+}
+
 /// 消费事件流，直到收到终局事件（`RunFinished` / `RunFailed`）。
 ///
 /// **终止条件是终局事件，不是信道关闭** —— sender 在 Agent 里，
@@ -458,18 +837,40 @@ async fn consume_events<W, F>(
     mut rx: mpsc::Receiver<Envelope>,
     mut w: W,
     mut on_event: F,
-) -> io::Result<()>
+    mut debug: Option<DebugTap<'_>>,
+) -> io::Result<u32>
 where
     W: Write,
     F: FnMut(&mut W, &Envelope) -> io::Result<()>,
 {
     // 逐轮读数（`crate::round_clock`）：`-p` / `--json` 与 TUI 落同一套行，跨入口可比。
     // 时钟建在**消费者**里，是因为两条入口的消费点不同（TUI 是 `app_loop` 的事件泵）。
-    let mut clock = RoundClock::default();
+    //
+    // 摘要档位只影响 debug 记录；关闭时 `Head` 是 `Default` 的同一取值。
+    let args_mode = debug
+        .as_ref()
+        .map(|tap| tap.sink.args_mode())
+        .unwrap_or(ArgsMode::Head);
+    let mut clock = RoundClock::new(args_mode);
+    // 本回合已开始的轮数：成功路径最终以 `RunResult.rounds` 为准，但**失败路径**
+    // 没有 `RunResult` —— 事件流是两条路径共有的唯一来源。
+    let mut observed_rounds: u32 = 0;
     while let Some(env) = rx.recv().await {
-        for line in clock.observe(&env, Instant::now()) {
-            logging::log(&line);
+        if matches!(env.event, AgentEvent::RoundStarted { .. }) {
+            observed_rounds = observed_rounds.saturating_add(1);
         }
+        match debug.as_mut() {
+            Some(tap) => {
+                let observation = clock.observe_debug(&env, Instant::now());
+                emit_observation(tap.sink, tap.session_id, Some(env.turn), observation);
+            }
+            None => {
+                for line in clock.observe(&env, Instant::now()) {
+                    logging::log(&line);
+                }
+            }
+        }
+        // `RoundUsage` 等服务所有消费者：**原样**交给 `on_event`（`--json` 序列化它）。
         on_event(&mut w, &env)?;
         w.flush()?;
         if is_terminal(&env.event) {
@@ -477,14 +878,15 @@ where
             for line in clock.take_lines() {
                 logging::log(&line);
             }
-            return Ok(());
+            return Ok(observed_rounds);
         }
     }
     for line in clock.take_lines() {
         logging::log(&line);
     }
     // 信道关闭（正常路径不依赖此分支：agent 不 drop 信道）——不 panic，正常收尾。
-    w.flush()
+    w.flush()?;
+    Ok(observed_rounds)
 }
 
 /// 组装 agent（无状态执行器）。
@@ -848,13 +1250,13 @@ fn resolve_resume(
         Resume::Id(id) => {
             if id.is_empty() {
                 eprintln!("--resume 需要一个会话 id（例如 --resume 2026-10-07-abc）");
-                std::process::exit(1);
+                exit_with_debug(&mut None, 1);
             }
             match sessions::resolve(dir, id) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     eprintln!("{e}");
-                    std::process::exit(1);
+                    exit_with_debug(&mut None, 1);
                 }
             }
         }
@@ -868,7 +1270,7 @@ fn resolve_resume(
                     Ok(p) => Some(p),
                     Err(e) => {
                         eprintln!("{e}");
-                        std::process::exit(1);
+                        exit_with_debug(&mut None, 1);
                     }
                 }
             }
@@ -1043,7 +1445,10 @@ async fn persist_single_turn(
 /// print / json 模式的前置检查：无 model 时给出可操作提示并退出。
 ///
 /// **启动期诊断 → stderr**（设计 §5）：此刻 TUI 还没起屏，stderr 是正确去处。
-fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_configured(
+    wiring: &Wiring,
+    mut debug: Option<&mut DebugSink>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if wiring.is_configured() {
         return Ok(());
     }
@@ -1053,7 +1458,11 @@ fn ensure_configured(wiring: &Wiring) -> Result<(), Box<dyn std::error::Error>> 
     eprintln!("  YUSHAN_API_KEY   — API authentication key");
     eprintln!("  YUSHAN_MODEL     — Model name (unset: 取该端点 /v1/models 的第一条)");
     eprintln!("Or run in interactive mode and use /login to configure.");
-    std::process::exit(1);
+    // 已打开的 debug 文件也必须收尾（`run_end`），再走统一退出路径。
+    if let Some(sink) = debug.as_mut() {
+        sink.flush("RunFailed");
+    }
+    exit_with_debug(&mut None, 1);
 }
 
 /// `-p` / `--json` 的驱动：跑**一个** turn。
@@ -1073,6 +1482,8 @@ async fn run_single_turn(
     budget: Duration,
     config: Option<&config::Config>,
     subagent: Option<&subagent::SubagentSetup>,
+    debug: Option<&crate::debug_log::DebugHandle>,
+    session_id: &str,
 ) -> Result<RunResult, LoopError> {
     // 预算计时原点与本回合耗时原点**同一个** —— 两个 `Instant::now()` 会让
     // `elapsed` 与 `budget_remaining` 对不上账。
@@ -1109,6 +1520,18 @@ async fn run_single_turn(
                     "budget exhausted: wall-clock budget of {secs}s elapsed — aborting this turn"
                 );
                 boundary.push(Boundary::Abort);
+                // 记录必须与 `push` 同刻：此刻回合仍在 await 模型，消费者线程
+                // 持有 `&mut DebugSink`，故用可克隆句柄写记录（共享 seq/order）。
+                if let Some(handle) = debug {
+                    record_boundary_handle(
+                        handle,
+                        session_id,
+                        Some(1),
+                        "enqueued",
+                        "abort",
+                        Some("budget"),
+                    );
+                }
             }
         }
     };
@@ -1149,17 +1572,28 @@ async fn run_single_turn(
 /// 写出目标参数化为 `W: Write`：生产传 `io::stdout()`，测试传 `Vec<u8>`，
 /// 保证被测的就是生产消费路径（`consume_events` + `print_delta_text`）。
 /// 终止由 `consume_events` 依**终局事件**判定，不依赖信道关闭。
-async fn consume_print_events<W: Write>(rx: mpsc::Receiver<Envelope>, w: W) -> io::Result<bool> {
+async fn consume_print_events<W: Write>(
+    rx: mpsc::Receiver<Envelope>,
+    w: W,
+    debug: Option<&mut DebugSink>,
+    session_id: &str,
+) -> io::Result<(bool, u32)> {
     let mut printed_any = false;
-    consume_events(rx, w, |w, env| {
-        if let Some(text) = print_delta_text(env) {
-            w.write_all(text.as_bytes())?;
-            printed_any = true;
-        }
-        Ok(())
-    })
+    let tap = debug.map(|sink| DebugTap { sink, session_id });
+    let rounds = consume_events(
+        rx,
+        w,
+        |w, env| {
+            if let Some(text) = print_delta_text(env) {
+                w.write_all(text.as_bytes())?;
+                printed_any = true;
+            }
+            Ok(())
+        },
+        tap,
+    )
     .await?;
-    Ok(printed_any)
+    Ok((printed_any, rounds))
 }
 
 /// 把背压读数摘要写到 **stderr**（固定不污染 stdout 的 JSON / 文本流）。
@@ -1182,6 +1616,7 @@ fn report_channel_stats(handle: &ChannelStatsHandle, force: bool) {
 ///
 /// 收尾补一个换行，与旧实现（`println!` final_message）的输出保持一致。
 /// turn 结束、消费排空后，把背压读数写到 stderr（见 [`report_channel_stats`]）。
+#[allow(clippy::too_many_arguments)]
 async fn run_print_mode(
     agent: &mut Agent,
     wiring: &mut Wiring,
@@ -1192,8 +1627,22 @@ async fn run_print_mode(
     force_stats: bool,
     config: &config::Config,
     subagent: Option<&subagent::SubagentSetup>,
+    mut debug: Option<&mut DebugSink>,
+    session_id: &str,
+    observed_rounds: &mut u32,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
-    ensure_configured(wiring)?;
+    ensure_configured(wiring, debug.as_deref_mut())?;
+
+    // 回合边界记录在 `join` **之前 / 之后**写：`consume_events` 与跑回合必须并发，
+    // 二者不可能同时持有同一个 `&mut DebugSink`（有界信道若无并发消费者即死锁）。
+    // 故 sink 在回合执行期间归消费者；回合执行侧只拿一个可克隆句柄（`DebugHandle`），
+    // 用于在预算 `push` 的同刻写 `boundary`。
+    let turn_started = Instant::now();
+    let deadline = turn_started + budget;
+    if let Some(sink) = reborrow_sink(&mut debug) {
+        record_turn_start(sink, session_id, 1, task.len(), budget);
+    }
+    let debug_handle = debug.as_ref().map(|sink| sink.handle());
 
     // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
     let (run_result, consume_result) = tokio::join!(
@@ -1204,14 +1653,41 @@ async fn run_print_mode(
             budget,
             Some(config),
             subagent,
+            debug_handle.as_ref(),
+            session_id,
         ),
-        consume_print_events(rx, io::stdout()),
+        consume_print_events(rx, io::stdout(), debug.as_deref_mut(), session_id),
     );
+
+    // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计（成功时仍以 `RunResult` 为准）。
+    if let Ok((_, observed)) = &consume_result {
+        *observed_rounds = *observed;
+    }
+    if let Some(sink) = reborrow_sink(&mut debug) {
+        // `Cancelled` ⇒ 补 `observed`：`enqueued` 说明 Abort 已投递（在
+        // `run_single_turn` 内与 `push` 同刻写），`observed` 说明回合确实看到了它。
+        if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
+            record_boundary(sink, session_id, Some(1), "observed", "abort", None);
+        }
+        record_turn_end(
+            sink,
+            session_id,
+            1,
+            run_result
+                .as_ref()
+                .map(|r| r.rounds)
+                .unwrap_or(*observed_rounds),
+            turn_started.elapsed(),
+            deadline.saturating_duration_since(Instant::now()),
+            round_clock::turn_cache(&run_result),
+        );
+    }
 
     // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
     report_channel_stats(stats, force_stats);
     let result = run_result?;
-    let printed_any = consume_result?;
+    let (printed_any, observed) = consume_result?;
+    *observed_rounds = observed;
 
     if printed_any {
         println!();
@@ -1222,6 +1698,7 @@ async fn run_print_mode(
 /// `--json` 模式：并发消费事件流，逐行输出 `Envelope` 的 JSON。
 ///
 /// 背压读数走 stderr（[`report_channel_stats`]），不混入 stdout 的 JSON 流。
+#[allow(clippy::too_many_arguments)]
 async fn run_json_mode(
     agent: &mut Agent,
     wiring: &mut Wiring,
@@ -1232,8 +1709,19 @@ async fn run_json_mode(
     force_stats: bool,
     config: &config::Config,
     subagent: Option<&subagent::SubagentSetup>,
+    mut debug: Option<&mut DebugSink>,
+    session_id: &str,
+    observed_rounds: &mut u32,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
-    ensure_configured(wiring)?;
+    ensure_configured(wiring, debug.as_deref_mut())?;
+
+    // 同 `run_print_mode`：sink 在 join 期间归消费者，回合执行侧只拿可克隆句柄。
+    let turn_started = Instant::now();
+    let deadline = turn_started + budget;
+    if let Some(sink) = reborrow_sink(&mut debug) {
+        record_turn_start(sink, session_id, 1, task.len(), budget);
+    }
+    let debug_handle = debug.as_ref().map(|sink| sink.handle());
 
     let (run_result, consume_result) = tokio::join!(
         run_single_turn(
@@ -1243,13 +1731,42 @@ async fn run_json_mode(
             budget,
             Some(config),
             subagent,
+            debug_handle.as_ref(),
+            session_id,
         ),
-        consume_events(rx, io::stdout(), write_json_envelope),
+        consume_events(
+            rx,
+            io::stdout(),
+            write_json_envelope,
+            debug.as_deref_mut().map(|sink| DebugTap { sink, session_id }),
+        ),
     );
+
+    // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计。
+    if let Ok(observed) = &consume_result {
+        *observed_rounds = *observed;
+    }
+    if let Some(sink) = reborrow_sink(&mut debug) {
+        if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
+            record_boundary(sink, session_id, Some(1), "observed", "abort", None);
+        }
+        record_turn_end(
+            sink,
+            session_id,
+            1,
+            run_result
+                .as_ref()
+                .map(|r| r.rounds)
+                .unwrap_or(*observed_rounds),
+            turn_started.elapsed(),
+            deadline.saturating_duration_since(Instant::now()),
+            round_clock::turn_cache(&run_result),
+        );
+    }
 
     report_channel_stats(stats, force_stats);
     let result = run_result?;
-    consume_result?;
+    *observed_rounds = consume_result?;
     Ok(result)
 }
 
@@ -1268,18 +1785,52 @@ fn single_turn_exit_code(result: &RunResult) -> i32 {
     }
 }
 
-/// 预算兜底退出的落地：非零退出码时**先 `flush` 再 `exit`**。
+/// 进程退出的**唯一**落点：先收尾 debug sink，再走进程退出原语。
 ///
-/// `-p` 的文本增量是直写 stdout 的（不带换行）。`process::exit` 会经 `rt::cleanup`
-/// 冲刷 stdout（std 的 `process::exit` → `rt::cleanup` → `io::stdio`），故此处显式
-/// `flush` **不是**补救缺陷，而是把「退出前 stdout 已排空」这一语义写显、并对未来
-/// 的缓冲实现保持保守。说明行已由 [`run_single_turn`] 写到 stderr，这里**不打印
-/// `Error:` 噪声**。
-fn exit_with_code(code: i32) {
+/// 非零退出码时**先冲刷 stdout**：`-p` 的文本增量是直写 stdout 的（不带换行），
+/// 退出原语虽会经 `rt::cleanup` 冲刷 stdio，此处仍显式 `flush` 把「退出前 stdout
+/// 已排空」写显，并对未来的缓冲实现保持保守。说明行已由 [`run_single_turn`] 写到
+/// stderr，这里**不打印 `Error:` 噪声**。
+///
+/// `debug` 为 `None` 时零副作用；打开时 `flush` 会排空队列并写 `run_end`（best-effort，
+/// 最多等 2 s）。**任何新退出路径都必须走本函数** —— 裸调用退出原语会丢掉队列尾部。
+fn exit_with_debug(debug: &mut Option<DebugSink>, code: i32) -> ! {
+    exit_with_run_end(
+        debug,
+        if code == 0 {
+            "RunFinished"
+        } else {
+            "RunFailed"
+        },
+        0,
+        code,
+        None,
+    );
+}
+
+/// 带完整 `run_end` 元数据的退出路径（`rounds` / `exit_code` / 累计 usage）。
+///
+/// `stop_reason` 是**终局事件名**：预算取消 / 无输出仍属 `RunFinished`，
+/// 由 `exit_code` 区分（design §4.2 的 `run_end` 字段）。
+fn exit_with_run_end(
+    debug: &mut Option<DebugSink>,
+    stop_reason: &str,
+    rounds: u32,
+    code: i32,
+    usage: Option<&ys_core::Usage>,
+) -> ! {
     if code != 0 {
         let _ = io::stdout().flush();
-        std::process::exit(code);
     }
+    if let Some(sink) = debug.as_mut() {
+        sink.flush_run(debug_log::RunEndMeta {
+            stop_reason,
+            rounds,
+            exit_code: code,
+            usage,
+        });
+    }
+    std::process::exit(code);
 }
 
 /// 启动期要入队的出站序列，按**入队顺序**排列。
@@ -1339,6 +1890,8 @@ fn run_interactive(
     resume_path: Option<PathBuf>,
     worktree: app_loop::WorktreeHandle,
     default_workspace: PathBuf,
+    debug_flag: bool,
+    tool_specs: Vec<(String, usize)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
     let (sink, sink_rx) =
@@ -1363,6 +1916,20 @@ fn run_interactive(
     // 这里知道 `persistent_new` 算出的文件名），`/new` 之后由 app 循环刷新。
     let session_path =
         app_loop::SessionPathHandle::new(wiring.session_path().map(Path::to_path_buf));
+
+    // debug sink：**必须在 `Wiring` 建好、会话路径已知之后**打开（文件名取自它）。
+    // 关闭时 `open_enabled` 早退 ⇒ 不建文件、不起线程；`run_start` 是文件里的第一条。
+    let mut debug = debug_log::open_enabled(debug_flag, wiring.session_path());
+    if let Some(sink) = debug.as_mut() {
+        let session_id = session_id_for(wiring.session_path());
+        emit_run_start(
+            sink,
+            &config,
+            wiring.session_path(),
+            &session_id,
+            &tool_specs,
+        );
+    }
 
     // 2b.【后台】拉每个已登录 provider 的 `/v1/models`，缓存供 `/model` 浮层用。
     //
@@ -1457,6 +2024,8 @@ fn run_interactive(
             default_workspace,
             app_session_path,
             app_worktree,
+            debug,
+            tool_specs,
         )
         .await
         {
@@ -1542,14 +2111,14 @@ fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
                     eprintln!("分支：{branch}（未合并）");
                 }
                 eprintln!("下一步：ys-coding-agent worktree attach {}", entry.name);
-                std::process::exit(0);
+                exit_with_debug(&mut None, 0);
             }
             Err(e) => {
                 eprintln!("创建 worktree 失败：{e}");
                 eprintln!(
                     "退路：确认当前目录在 git 仓库内、已安装 git；若提示路径已被登记，可 `git worktree prune` 后重试。"
                 );
-                std::process::exit(1);
+                exit_with_debug(&mut None, 1);
             }
         },
         WorktreeCmd::List => {
@@ -1564,11 +2133,11 @@ fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
                         let state = if e.dirty { "dirty" } else { "clean" };
                         println!("{}\t{}\t{}\t{}", e.name, e.path.display(), branch, state);
                     }
-                    std::process::exit(0);
+                    exit_with_debug(&mut None, 0);
                 }
                 Err(e) => {
                     eprintln!("列出 worktree 失败：{e}");
-                    std::process::exit(1);
+                    exit_with_debug(&mut None, 1);
                 }
             }
         }
@@ -1576,14 +2145,14 @@ fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
             match worktree::main_repo(cwd).and_then(|repo| worktree::remove(&repo.root, name)) {
                 Ok(()) => {
                     eprintln!("已删除 worktree：{name}（分支 worktree-{name} 保留）");
-                    std::process::exit(0);
+                    exit_with_debug(&mut None, 0);
                 }
                 Err(e) => {
                     eprintln!("删除 worktree 失败：{e}");
                     eprintln!(
                         "退路：先 merge 该分支或清理未提交改动；确要丢弃可 `git worktree remove --force`。"
                     );
-                    std::process::exit(1);
+                    exit_with_debug(&mut None, 1);
                 }
             }
         }
@@ -1884,6 +2453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         subagent,
         limits: agent_limits,
         hint: tool_hint,
+        tool_specs,
     } = factory.build(&workspace)?;
 
     // **启动期提示合并成一条**（多行、绝不互相覆盖）：工具降级 + skill 诊断
@@ -1933,7 +2503,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })?;
-            let result = rt.block_on(run_print_mode(
+            let debug_session_id = session_id_for(wiring.session_path());
+            let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
+            if let Some(sink) = debug.as_mut() {
+                emit_run_start(
+                    sink,
+                    &config,
+                    wiring.session_path(),
+                    &debug_session_id,
+                    &tool_specs,
+                );
+            }
+            let mut observed_rounds = 0u32;
+            let result = match rt.block_on(run_print_mode(
                 &mut agent,
                 &mut wiring,
                 rx,
@@ -1943,18 +2525,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.stats,
                 &config,
                 Some(&subagent),
-            ))?;
+                debug.as_mut(),
+                &debug_session_id,
+                &mut observed_rounds,
+            )) {
+                Ok(result) => result,
+                // 失败路径的退出也必须经过收尾：否则队列尾部与 `run_end` 会丢。
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    exit_with_run_end(&mut debug, "RunFailed", observed_rounds, 1, None);
+                }
+            };
             // 单回合模式不换工作区，但退出行 / meta 仍从同一句柄读（与 TUI 路径同源）。
             let binding = worktree_handle.get();
-            rt.block_on(persist_single_turn(
+            if let Err(e) = rt.block_on(persist_single_turn(
                 &mut wiring,
                 &raw_task,
                 config.provider.as_deref(),
                 binding.as_ref(),
                 &result,
-            ))?;
+            )) {
+                eprintln!("Error: {e:?}");
+                exit_with_run_end(
+                    &mut debug,
+                    "RunFailed",
+                    result.rounds,
+                    1,
+                    Some(&result.usage),
+                );
+            }
             // 预算到点 ⇒ 非零退出（正常完成路径退出码不变）。
-            exit_with_code(single_turn_exit_code(&result));
+            let code = single_turn_exit_code(&result);
+            exit_with_run_end(
+                &mut debug,
+                "RunFinished",
+                result.rounds,
+                code,
+                Some(&result.usage),
+            );
         }
         Mode::Json(task) => {
             // 同 `-p`：无 TUI → stderr（**绝不能**混进 stdout 的逐行 Envelope）。
@@ -1974,7 +2582,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })?;
-            let result = rt.block_on(run_json_mode(
+            let debug_session_id = session_id_for(wiring.session_path());
+            let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
+            if let Some(sink) = debug.as_mut() {
+                emit_run_start(
+                    sink,
+                    &config,
+                    wiring.session_path(),
+                    &debug_session_id,
+                    &tool_specs,
+                );
+            }
+            let mut observed_rounds = 0u32;
+            let result = match rt.block_on(run_json_mode(
                 &mut agent,
                 &mut wiring,
                 rx,
@@ -1984,17 +2604,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.stats,
                 &config,
                 Some(&subagent),
-            ))?;
+                debug.as_mut(),
+                &debug_session_id,
+                &mut observed_rounds,
+            )) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    exit_with_run_end(&mut debug, "RunFailed", observed_rounds, 1, None);
+                }
+            };
             let binding = worktree_handle.get();
-            rt.block_on(persist_single_turn(
+            if let Err(e) = rt.block_on(persist_single_turn(
                 &mut wiring,
                 &raw_task,
                 config.provider.as_deref(),
                 binding.as_ref(),
                 &result,
-            ))?;
+            )) {
+                eprintln!("Error: {e:?}");
+                exit_with_run_end(
+                    &mut debug,
+                    "RunFailed",
+                    result.rounds,
+                    1,
+                    Some(&result.usage),
+                );
+            }
             // 预算到点 ⇒ 非零退出（正常完成路径退出码不变）。
-            exit_with_code(single_turn_exit_code(&result));
+            let code = single_turn_exit_code(&result);
+            exit_with_run_end(
+                &mut debug,
+                "RunFinished",
+                result.rounds,
+                code,
+                Some(&result.usage),
+            );
         }
         Mode::Interactive => {
             // TUI 模式下提示**不进 stderr**，改走 transcript（`Outbound::Output`）——
@@ -2011,6 +2656,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resume_path,
                 worktree_handle,
                 shared_workspace,
+                args.debug,
+                tool_specs,
             )?;
         }
     }
@@ -2118,6 +2765,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hello".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2132,6 +2780,7 @@ mod tests {
             Args {
                 mode: Mode::Json("do x".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2146,6 +2795,7 @@ mod tests {
             Args {
                 mode: Mode::Interactive,
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2185,6 +2835,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hi".into()),
                 stats: true,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2194,6 +2845,7 @@ mod tests {
             Args {
                 mode: Mode::Json("do x".into()),
                 stats: true,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2209,6 +2861,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hi --stats".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2219,6 +2872,7 @@ mod tests {
             Args {
                 mode: Mode::Print("--help me".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2244,6 +2898,7 @@ mod tests {
             Args {
                 mode: Mode::Interactive,
                 stats: false,
+                debug: false,
                 resume: Resume::Pick,
                 worktree: None,
             }
@@ -2253,6 +2908,7 @@ mod tests {
             Args {
                 mode: Mode::Interactive,
                 stats: false,
+                debug: false,
                 resume: Resume::Id("abc".into()),
                 worktree: None,
             }
@@ -2269,6 +2925,7 @@ mod tests {
             Args {
                 mode: Mode::Print("do it".into()),
                 stats: true,
+                debug: false,
                 resume: Resume::Id("x".into()),
                 worktree: None,
             }
@@ -2280,6 +2937,7 @@ mod tests {
             Args {
                 mode: Mode::Print("task".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::Id("abc".into()),
                 worktree: None,
             }
@@ -2291,6 +2949,7 @@ mod tests {
             Args {
                 mode: Mode::Json("task".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::Pick,
                 worktree: None,
             }
@@ -2300,6 +2959,7 @@ mod tests {
             Args {
                 mode: Mode::Print("solo".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::Pick,
                 worktree: None,
             }
@@ -2311,6 +2971,7 @@ mod tests {
             Args {
                 mode: Mode::Print("hi --resume=x".into()),
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: None,
             }
@@ -2329,6 +2990,7 @@ mod tests {
             Args {
                 mode: Mode::Interactive,
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: Some(WorktreeCmd::Create(Some("x".into()))),
             }
@@ -2381,6 +3043,7 @@ mod tests {
             Args {
                 mode: Mode::Interactive,
                 stats: false,
+                debug: false,
                 resume: Resume::New,
                 worktree: Some(WorktreeCmd::Attach(Some("feat".into()))),
             }
@@ -2456,7 +3119,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_events(rx, &mut out, write_json_envelope),
+            consume_events(rx, &mut out, write_json_envelope, None),
         )
         .await;
 
@@ -2503,9 +3166,11 @@ mod tests {
                     AgentInput::text("hi"),
                     Duration::from_secs(60),
                     None,
-                    None
+                    None,
+                    None,
+                    "test-session"
                 ),
-                consume_events(rx, &mut out, write_json_envelope),
+                consume_events(rx, &mut out, write_json_envelope, None),
             )
         })
         .await;
@@ -2576,13 +3241,17 @@ mod tests {
 
         let mut out = CountingWriter::default();
         let result =
-            tokio::time::timeout(Duration::from_secs(5), consume_print_events(rx, &mut out)).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                consume_print_events(rx, &mut out, None, "test-session"),
+            )
+            .await;
 
         assert!(
             result.is_ok(),
             "收到 RunFinished 应即返回，而非等待信道关闭"
         );
-        let printed_any = result.unwrap().unwrap();
+        let (printed_any, _rounds) = result.unwrap().unwrap();
         assert!(printed_any, "应写出过文本增量");
 
         // 顺序正确、无非文本事件输出、无多余换行：恰为 "Hello world"。
@@ -2631,9 +3300,11 @@ mod tests {
                 AgentInput::text("hi"),
                 Duration::from_secs(60),
                 None,
-                None
+                None,
+                None,
+                "test-session"
             ),
-            consume_events(rx, &mut out, write_json_envelope),
+            consume_events(rx, &mut out, write_json_envelope, None),
         );
         run_result.expect("run_turn 应成功");
         consume_result.expect("consume 应成功");
@@ -2756,8 +3427,10 @@ mod tests {
                     config.max_turn_duration(),
                     None,
                     None,
+                    None,
+                    "test-session",
                 ),
-                consume_events(rx, &mut out, write_json_envelope),
+                consume_events(rx, &mut out, write_json_envelope, None),
             )
         })
         .await;
@@ -2777,7 +3450,7 @@ mod tests {
 
     /// 13c. **预算到点 ⇒ 非零退出码**（`-p` / `--json` 的退出契约）。
     ///
-    /// 钉住退出码**判定**：`Cancelled` ⇒ 1，正常完成 ⇒ 0。`process::exit` 本身
+    /// 钉住退出码**判定**：`Cancelled` ⇒ 1，正常完成 ⇒ 0。进程退出原语本身
     /// 只能在进程级验证（留给 T10），但「按什么退出」由 [`single_turn_exit_code`]
     /// 决定，故此处直接覆盖：变异「去掉 `Cancelled` 判定 ⇒ 恒 0」会让第一条断言变红。
     #[test]
@@ -3897,5 +4570,357 @@ mod tests {
         assert!(adopt_first_catalog_model(&mut cfg, "https://x/v1", Vec::new()).is_err());
         assert!(cfg.model.is_empty(), "不得写入任何模型名");
         assert!(cfg.registry.models_for_base("https://x/v1").is_empty());
+    }
+
+    // ───────────────────────── debug 接线（Task 14）─────────────────────────
+
+    /// T1（负向验收）：debug 关时消费路径**零 `debug-*.jsonl`**，且 `yushan.log`
+    /// 逐字节不变。
+    ///
+    /// 只喂「文本增量 + 终局事件」——没有 `RoundStarted`，故逐轮文本行也不会写
+    /// `yushan.log`；这样「逐字节不变」检验的正是 debug 开关，而不是日志内容。
+    ///
+    /// 变异：把 `open_enabled` 的开关判断删掉（总是建 sink）⇒ 目录出现
+    /// `debug-*.jsonl` ⇒ 第一条断言红。
+    // 整段持有 `env_lock` 是测试隔离的要求；`#[tokio::test]` 是 current-thread
+    // 运行时，guard 不会被跨线程发送（clippy 的通用提醒在此不适用）。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn debug_off_writes_no_file_and_leaves_existing_log_byte_identical() {
+        let dir = unique_tmp_dir("debug_off");
+        let log = dir.join("yushan.log");
+        let original = b"pre-existing log line\n";
+        std::fs::write(&log, original).unwrap();
+
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV, debug_log::DEBUG_ENV]);
+        // SAFETY: 持有 env_lock，独占这两个变量。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
+            std::env::remove_var(debug_log::DEBUG_ENV);
+        }
+
+        // 关闭 ⇒ `None`（不解析路径、不建文件、不起线程）。
+        let debug = debug_log::open_enabled(false, Some(&dir.join("session.jsonl")));
+        assert!(debug.is_none(), "debug 关时不得创建 sink");
+
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(env(delta("a"))).await.unwrap();
+        tx.send(env(finished())).await.unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        consume_events(rx, &mut out, write_json_envelope, None)
+            .await
+            .unwrap();
+
+        let debug_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("debug-") && name.ends_with(".jsonl"))
+            .collect();
+        assert!(
+            debug_files.is_empty(),
+            "debug 关时不得出现 debug 文件：{debug_files:?}"
+        );
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            original,
+            "yushan.log 必须逐字节不变"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2：`--json` 下的 `RoundUsage` 是**加法**事件 —— 每个模型轮恰好多一行；
+    /// 删掉这些行后与不含 `RoundUsage` 的基线逐字节相同。
+    ///
+    /// 同时钉住 `RunFinished.usage` 的 `reasoning_tokens: None` **不出现**该键
+    /// （`skip_serializing_if` 的承重契约）。
+    ///
+    /// 变异：在 `consume_events` 里过滤掉 `RoundUsage` ⇒ 「轮数 × 1 行」变红；
+    /// 把 debug 记录也写进 stdout ⇒ 过滤后与基线不再逐字节相同。
+    // 同 T1：整段持有 `env_lock`，current-thread 运行时不会发送该 guard。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn json_round_usage_is_additive_and_filtered_output_is_byte_identical() {
+        let dir = unique_tmp_dir("debug_json_round_usage");
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV, debug_log::DEBUG_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
+            std::env::remove_var(debug_log::DEBUG_ENV);
+        }
+
+        let usage = ys_core::Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            ..Default::default()
+        };
+        let round_usage = |round: u32| AgentEvent::RoundUsage {
+            purpose: ys_event::RoundPurpose::Turn,
+            round,
+            usage: usage.clone(),
+        };
+        let base = vec![
+            AgentEvent::RoundStarted { round: 1 },
+            delta("a"),
+            AgentEvent::RoundStarted { round: 2 },
+            delta("b"),
+            finished(),
+        ];
+        let with_usage = vec![
+            AgentEvent::RoundStarted { round: 1 },
+            delta("a"),
+            round_usage(1),
+            AgentEvent::RoundStarted { round: 2 },
+            delta("b"),
+            round_usage(2),
+            finished(),
+        ];
+
+        let capture = |events: Vec<AgentEvent>| async move {
+            let (tx, rx) = mpsc::channel(16);
+            for event in events {
+                tx.send(env(event)).await.unwrap();
+            }
+            drop(tx);
+            let mut out: Vec<u8> = Vec::new();
+            consume_events(rx, &mut out, write_json_envelope, None)
+                .await
+                .unwrap();
+            out
+        };
+        let baseline = capture(base).await;
+        let actual = capture(with_usage).await;
+
+        let filtered: Vec<u8> = String::from_utf8(actual.clone())
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                value
+                    .get("event")
+                    .and_then(|event| event.get("RoundUsage"))
+                    .is_none()
+            })
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+            .into_bytes();
+        assert_eq!(
+            filtered, baseline,
+            "过滤 `RoundUsage` 后必须与基线逐字节相同"
+        );
+
+        let round_usage_lines = String::from_utf8(actual)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                value
+                    .get("event")
+                    .and_then(|event| event.get("RoundUsage"))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            round_usage_lines, 2,
+            "每个模型轮恰好一条 `RoundUsage`（加法契约）"
+        );
+
+        // `RunFinished` 的 usage 不含 `reasoning_tokens`（`None` 不序列化）。
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(env(finished())).await.unwrap();
+        drop(tx);
+        let mut out: Vec<u8> = Vec::new();
+        consume_events(rx, &mut out, write_json_envelope, None)
+            .await
+            .unwrap();
+        let finished_line = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .find(|line| line.contains("RunFinished"))
+            .unwrap()
+            .to_string();
+        let value: Value = serde_json::from_str(&finished_line).unwrap();
+        assert!(
+            value["event"]["RunFinished"]["usage"]
+                .get("reasoning_tokens")
+                .is_none(),
+            "`None` 不得序列化该键：{finished_line}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6：`process` + `::` + `exit` 在 `main.rs` 里**恰好出现一次**，且位于
+    /// [`exit_with_run_end`] 的函数体内（`exit_with_debug` 只是它的简化入口）。
+    ///
+    /// 断言用的 needle 在运行时拼接 —— 否则 `include_str!` 会把本测试自己的字面量
+    /// 也算进去（永远 > 1）。
+    ///
+    /// 变异：把任意一处 `exit_with_debug` 改回裸退出原语 ⇒ 计数变 2 ⇒ 红。
+    #[test]
+    fn bare_process_exit_appears_only_inside_exit_with_debug() {
+        let needle = ["process", "::", "exit"].concat();
+        let source = include_str!("main.rs");
+        assert_eq!(
+            source.matches(&needle).count(),
+            1,
+            "裸退出原语只允许出现在 `exit_with_run_end` 内"
+        );
+        let at = source.find(&needle).expect("必须存在唯一一处");
+        let fn_start = source.find("fn exit_with_run_end").expect("函数必须存在");
+        let fn_end = source[fn_start..]
+            .find("\n}\n")
+            .map(|offset| fn_start + offset + 3)
+            .expect("函数体必须闭合");
+        assert!(
+            fn_start < at && at < fn_end,
+            "唯一一处裸退出原语必须在 `exit_with_run_end` 函数体内"
+        );
+    }
+
+    /// `RoundUsage` 是非终局事件：消费循环不得在它之后提前返回。
+    ///
+    /// 变异：把 `RoundUsage` 加进 [`is_terminal`] ⇒ 消费循环在每轮 usage 后提前
+    /// 退出 ⇒ 本用例红（T2 的「多一行」也会随之消失）。
+    #[test]
+    fn round_usage_is_not_terminal() {
+        let event = AgentEvent::RoundUsage {
+            purpose: ys_event::RoundPurpose::Turn,
+            round: 1,
+            usage: ys_core::Usage::default(),
+        };
+        assert!(!is_terminal(&event), "`RoundUsage` 不得被当作终局事件");
+    }
+
+    /// T5（部分）：`flush` 之后文件末尾是**完整 JSON 行**且以 `\n` 结尾。
+    ///
+    /// 进程被 kill 的场景按设计推迟到 P1。
+    ///
+    /// 变异：`record` 入队前不拼 `\n`（或 `flush` 跳过排空）⇒ 末行不完整 /
+    /// 不以换行结尾 ⇒ 红。
+    #[test]
+    fn flush_leaves_complete_json_lines() {
+        let dir = unique_tmp_dir("debug_flush");
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV, debug_log::DEBUG_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
+            std::env::remove_var(debug_log::DEBUG_ENV);
+        }
+
+        let session = dir.join("2026-10-17-abc.jsonl");
+        let path = debug_log::debug_path_for(Some(&session)).unwrap();
+        let mut sink = debug_log::open_enabled(true, Some(&session)).expect("sink 应打开");
+        let mut fields = Map::new();
+        fields.insert("probe".into(), json!(1));
+        sink.record(
+            "probe",
+            DebugIds {
+                session_id: "2026-10-17-abc",
+                turn: None,
+                round: None,
+                tool_call_id: None,
+            },
+            fields,
+        );
+        sink.flush("RunFinished");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.ends_with('\n'), "文件必须以换行结尾：{content:?}");
+        for line in content.lines() {
+            serde_json::from_str::<Value>(line).expect("每行必须是一个完整 JSON 对象");
+        }
+        assert!(
+            content.lines().any(|line| line.contains("\"ev\":\"probe\"")),
+            "flush 前的记录必须已落盘：{content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--debug` 的解析：模式 flag 之后的 flag 区、TUI 首部、顺序无关；
+    /// **任务文本里出现的 `--debug` 不得被吃掉**（既有 `--stats` 语义）。
+    ///
+    /// 变异：把剥离条件从「仅 flag 区」改成「全文扫描」⇒ 任务文本断言红。
+    #[test]
+    fn parse_debug_flag_in_all_positions() {
+        let print = parse_args(&s(&["-p", "--debug", "hi"])).unwrap();
+        assert_eq!(print.mode, Mode::Print("hi".into()));
+        assert!(print.debug);
+
+        let json = parse_args(&s(&["--json", "--debug", "do", "x"])).unwrap();
+        assert_eq!(json.mode, Mode::Json("do x".into()));
+        assert!(json.debug);
+
+        // 与 `--stats` / `--resume` 顺序无关。
+        let a = parse_args(&s(&[
+            "-p", "--debug", "--stats", "--resume", "x", "do", "it",
+        ]))
+        .unwrap();
+        let b = parse_args(&s(&[
+            "-p", "--stats", "--resume", "x", "--debug", "do", "it",
+        ]))
+        .unwrap();
+        assert_eq!(a, b, "flag 顺序不影响结果");
+        assert!(a.debug && a.stats);
+        assert_eq!(a.mode, Mode::Print("do it".into()));
+        assert_eq!(a.resume, Resume::Id("x".into()));
+
+        // TUI 首部：`--debug` 可先于 `--resume`。
+        let tui = parse_args(&s(&["--debug", "--resume", "abc"])).unwrap();
+        assert!(tui.debug);
+        assert_eq!(tui.mode, Mode::Interactive);
+        assert_eq!(tui.resume, Resume::Id("abc".into()));
+
+        let bare = parse_args(&s(&["--debug"])).unwrap();
+        assert!(bare.debug);
+        assert_eq!(bare.mode, Mode::Interactive);
+
+        // 任务文本一旦开始，`--debug` 就是文本。
+        let text = parse_args(&s(&["-p", "hi", "--debug"])).unwrap();
+        assert!(!text.debug, "任务文本里的 `--debug` 不得被吃掉");
+        assert_eq!(text.mode, Mode::Print("hi --debug".into()));
+        let text_json = parse_args(&s(&["--json", "do", "--debug", "x"])).unwrap();
+        assert!(!text_json.debug);
+        assert_eq!(text_json.mode, Mode::Json("do --debug x".into()));
+    }
+
+    /// `YUSHAN_DEBUG` **优先于** `--debug`；`0/false/no/off` 一律关；空串回落 flag。
+    ///
+    /// 变异：去掉 `debug_enabled` 的环境变量分支（只看 flag）⇒ 前两组断言红；
+    /// 把空串当成「非空值」⇒ 最后一组断言红。
+    #[test]
+    fn debug_env_overrides_cli_flag() {
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[debug_log::DEBUG_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::remove_var(debug_log::DEBUG_ENV) };
+        assert!(debug_log::debug_enabled(true));
+        assert!(!debug_log::debug_enabled(false));
+
+        for on in ["1", "true", "yes", "on", "TRUE", " On "] {
+            // SAFETY: 持有 env_lock。
+            unsafe { std::env::set_var(debug_log::DEBUG_ENV, on) };
+            assert!(
+                debug_log::debug_enabled(false),
+                "{on:?} 应视为开（env 优先）"
+            );
+        }
+        for off in ["0", "false", "no", "off"] {
+            // SAFETY: 持有 env_lock。
+            unsafe { std::env::set_var(debug_log::DEBUG_ENV, off) };
+            assert!(
+                !debug_log::debug_enabled(true),
+                "{off:?} 应视为关（env 优先）"
+            );
+        }
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var(debug_log::DEBUG_ENV, "") };
+        assert!(!debug_log::debug_enabled(false), "空串应回落 flag=false");
+        assert!(debug_log::debug_enabled(true), "空串应回落 flag=true");
     }
 }

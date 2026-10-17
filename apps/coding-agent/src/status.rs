@@ -6,6 +6,12 @@ pub struct TurnStats {
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     pub turn_count: u32,
+    /// 缓存命中的 prompt token 累计（debug `run_end.usage` 用）。
+    pub total_cache_hit_tokens: u32,
+    /// 缓存未命中的 prompt token 累计。
+    pub total_cache_miss_tokens: u32,
+    /// 推理 token 累计；`None` = 本 run 内没有任何一轮上报过。
+    pub total_reasoning_tokens: Option<u32>,
 }
 
 impl TurnStats {
@@ -13,7 +19,30 @@ impl TurnStats {
     pub fn record(&mut self, usage: &Usage) {
         self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
+        self.total_cache_hit_tokens = self
+            .total_cache_hit_tokens
+            .saturating_add(usage.prompt_cache_hit_tokens);
+        self.total_cache_miss_tokens = self
+            .total_cache_miss_tokens
+            .saturating_add(usage.prompt_cache_miss_tokens);
+        self.total_reasoning_tokens = match (self.total_reasoning_tokens, usage.reasoning_tokens)
+        {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (a, None) => a,
+            (None, b) => b,
+        };
         self.turn_count = self.turn_count.saturating_add(1);
+    }
+
+    /// 本 run 的累计 usage（`run_end` 用）。
+    pub fn cumulative_usage(&self) -> Usage {
+        Usage {
+            input_tokens: self.total_input_tokens,
+            output_tokens: self.total_output_tokens,
+            prompt_cache_hit_tokens: self.total_cache_hit_tokens,
+            prompt_cache_miss_tokens: self.total_cache_miss_tokens,
+            reasoning_tokens: self.total_reasoning_tokens,
+        }
     }
 }
 

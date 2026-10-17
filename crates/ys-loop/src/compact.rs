@@ -27,7 +27,7 @@
 use std::ops::Range;
 
 use ys_component::CompactPolicy;
-use ys_core::{ContentBlock, Message, Role};
+use ys_core::{ContentBlock, Message, Role, Usage};
 use ys_model::{Model, ModelRequest};
 
 use crate::summarize::NoopModelEventSink;
@@ -147,6 +147,8 @@ pub struct CompactOutcome {
     pub summarized: usize,
     /// 原样保留的消息条数
     pub kept: usize,
+    /// 摘要模型调用消耗的 **provider 真实 usage**（供 `RoundUsage { purpose: Compaction }` 上报）
+    pub usage: Usage,
 }
 
 /// 压缩失败的原因。
@@ -230,7 +232,8 @@ pub async fn execute(
 
     // B-3：**先摘要，成功之后才构造新消息表** —— 任何失败都在 `?` 处返回，
     // 此时本函数尚未产出任何可变状态，调用方的 session 自然一个字节未动。
-    let summary = generate_summary(model, to_summarize, &policy.summary_system_prompt).await?;
+    let (summary, usage) =
+        generate_summary(model, to_summarize, &policy.summary_system_prompt).await?;
     let summary_text = format!("{SUMMARY_OPEN}\n{summary}\n{SUMMARY_CLOSE}");
 
     // R7：删掉伪造的 assistant ack（`"I have the context summary. Continuing."`）。
@@ -260,6 +263,7 @@ pub async fn execute(
         estimated_tokens_after,
         summarized: to_summarize.len(),
         kept: to_keep.len(),
+        usage,
     })
 }
 
@@ -296,7 +300,7 @@ async fn generate_summary(
     model: &dyn Model,
     messages: &[Message],
     system_prompt: &str,
-) -> Result<String, CompactError> {
+) -> Result<(String, Usage), CompactError> {
     // sink 与 `summarize::ModelSummarizer` 共用同一份（R9：同 crate 内不该有两份相同 impl）。
     let mut sink = NoopModelEventSink;
     let request = ModelRequest {
@@ -313,6 +317,10 @@ async fn generate_summary(
         .await
         .map_err(|e| CompactError::Summarize(e.to_string()))?;
 
+    // 先取 `usage`（消费 `response.message` 之前），成功时与摘要文本一起返回 ——
+    // 压缩调用的 token 成本必须可上报，不能因为只关心文本而丢掉。
+    let usage = response.usage;
+
     // 拼接**全部** `Text` block —— 有的 provider 会把一次回答拆成多块。
     let mut text = String::new();
     for block in &response.message.content {
@@ -326,7 +334,7 @@ async fn generate_summary(
     if text.trim().is_empty() {
         return Err(CompactError::Summarize("the model returned no text".into()));
     }
-    Ok(text)
+    Ok((text, usage))
 }
 
 #[cfg(test)]
@@ -753,6 +761,53 @@ mod tests {
             assert_eq!(m, &messages[1 + i], "保留段必须逐字等于输入的对应切片");
         }
         assert!(text_of(&out.messages[0]).contains("简短摘要"));
+    }
+
+    /// `CompactOutcome.usage` 上报摘要模型的**真实 usage**（在消费 `response.message`
+    /// 之前取出，成功路径与摘要文本一起返回）。
+    ///
+    /// 变异说明：把 `generate_summary` 的返回值改回只带文本（或 `execute` 漏填
+    /// `usage`）⇒ 本用例红。
+    #[tokio::test]
+    async fn outcome_carries_summary_usage() {
+        struct UsageModel(Usage);
+
+        #[async_trait::async_trait]
+        impl Model for UsageModel {
+            fn model_id(&self) -> &str {
+                "usage"
+            }
+            async fn complete(
+                &self,
+                _request: ModelRequest,
+                _sink: &mut dyn ModelEventSink,
+            ) -> Result<ModelResponse, ModelError> {
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "摘要".into(),
+                        }],
+                    },
+                    usage: self.0.clone(),
+                    finish_reason: FinishReason::Stop,
+                })
+            }
+        }
+
+        let policy = CompactPolicy::default();
+        let messages = conversation(4, 100);
+        let p = plan(&messages, &policy, 3000).unwrap();
+        let usage = Usage {
+            input_tokens: 42,
+            output_tokens: 7,
+            reasoning_tokens: Some(3),
+            ..Default::default()
+        };
+        let model = UsageModel(usage.clone());
+
+        let out = execute(&messages, &p, &model, &policy).await.unwrap();
+        assert_eq!(out.usage, usage, "outcome 必须带回摘要调用的 usage");
     }
 
     // ==================== B-2：空摘要 ====================

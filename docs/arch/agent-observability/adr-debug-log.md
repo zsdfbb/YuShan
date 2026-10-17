@@ -54,8 +54,10 @@ proposed（2026-10-17）
 ### 4. **逐轮 usage 走事件流**，不走旁路回调
 
 新增非终局 `AgentEvent::RoundUsage { purpose, round, usage }`，`ys-loop` 在拿到
-`response.usage` 后发一次；`ys_core::Usage` 增 `reasoning_tokens: u32`
-（`#[serde(default)]`，纳入 `Add`）。
+`response.usage` 后发一次；`ys_core::Usage` 增 **`reasoning_tokens: Option<u32>`**
+（`#[serde(default, skip_serializing_if = "Option::is_none")]`，纳入 `Add`）。
+**必须是 `Option`**：`None` = 未上报、`Some(0)` = 真 0；且 `None` 时不序列化该键 ——
+这是「过滤 `RoundUsage` 后 `--json` 逐字节不变」的前提。
 
 **为什么不走 observer 回调**（三个候选的共同倾向）：
 
@@ -105,7 +107,8 @@ cache 与 reasoning 都带 `*_reported` 布尔。
   `gen` 可以拆成「思考 / 正文」两条（`thinking_span_ms` / `text_span_ms` +
   `reasoning_tokens` 交叉验证）；一次运行可复现（`run_start` 记全 limits/工具表/配置来源）。
 - **负面**：
-  - `Usage` 加字段牵动 **34 处结构体字面量**（机械修补，一次性）；
+  - `Usage` 加字段牵动**既有 27 处** `Usage` 字面量（其中 **17 处带 `..Default::default()`** 自动兼容，
+    **实际补字段 10 处**）—— 机械修补，一次性；
   - `--json` 多一类事件，消费者须忽略未知变体（`AgentEvent` 已 `#[non_exhaustive]`）；
   - debug 文件是**新的敏感产物**（命令头、路径、pattern 会落盘）—— 默认 `head` 已最小化，
     但**没有默认保留期清理**（留作后续）；

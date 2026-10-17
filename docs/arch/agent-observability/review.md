@@ -92,7 +92,7 @@ RAII guard），把 14 处收敛到 1–2 个入口。这是**易修复但必须
 
 ### R7 · P0 的 700 行估计**偏乐观**（影响 低 / 可能性 中）
 
-P0 含：`Usage` 加字段（**34 处字面量**，已核实）、新事件 + `ys-loop` emit、`debug_log.rs`、
+P0 含：`Usage` 加字段（**既有 27 处字面量（实际补 10 处）**，已核实）、新事件 + `ys-loop` emit、`debug_log.rs`、
 两条入口接线、`RoundClock` 富化。按 B/C 的估算方法，接近 **900–1,100 行**。
 不影响方案，只影响排期。
 
@@ -104,7 +104,7 @@ P0 含：`Usage` 加字段（**34 处字面量**，已核实）、新事件 + `y
 |---|---|
 | `AgentEvent` 是 `#[non_exhaustive]` | ✅ `event.rs:5` ⇒ 加变体对消费者是加法 |
 | 消费循环只认 `RunFinished`/`RunFailed` 为终局 | ✅ `main.rs:444-449` ⇒ `RoundUsage` 非终局可行 |
-| `Usage` **不是** `#[non_exhaustive]` | ✅ 加字段会破坏全部字面量；实测 **34 处** |
+| `Usage` **不是** `#[non_exhaustive]` | ✅ 加字段会破坏全部字面量；实测**既有 27 处 `Usage` 字面量**（17 处带 `Default` 自动兼容），**实际需补字段 10 处** |
 | `split_leading_flags` 已存在 | ✅ `main.rs:153` ⇒ `--debug` 可复用同一套 flag 解析 |
 | `ys-loop` 在 Step 7 能拿到 `ctx.events` 与 `response.usage` | ✅ `basic.rs:367` |
 | 适配器不上报事件 | ✅ `adapters/.../lib.rs` 中 `AgentEvent::` **0 次** ⇒ 模型层事实只能旁路 |

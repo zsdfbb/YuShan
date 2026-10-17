@@ -79,6 +79,7 @@ mod tests {
                     output_tokens: 3,
                     prompt_cache_hit_tokens: 4,
                     prompt_cache_miss_tokens: 1,
+                    reasoning_tokens: None,
                 },
             })
         }

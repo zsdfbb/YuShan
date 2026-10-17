@@ -125,7 +125,9 @@ mod tests {
         assert!(result.final_message.is_some());
         assert_eq!(result.rounds, 1);
 
-        // 检查事件（纯文本路径）
+        // 检查事件（纯文本路径）。Step 7 新增一条逐轮 `RoundUsage`（在模型返回后、
+        // 终局事件前），故序列是：UserMessage → RoundStarted → ModelTextDelta →
+        // RoundUsage → RunFinished。
         let evts = events.events();
         assert!(matches!(&evts[0], AgentEvent::UserMessage { .. }));
         assert!(
@@ -133,8 +135,19 @@ mod tests {
             "轮开始事件必须先于该轮的模型输出，且首轮为 1：{evts:?}"
         );
         assert!(matches!(&evts[2], AgentEvent::ModelTextDelta { text } if text == "hello world"));
+        assert!(
+            matches!(
+                &evts[3],
+                AgentEvent::RoundUsage {
+                    purpose: ys_event::RoundPurpose::Turn,
+                    round: 1,
+                    ..
+                }
+            ),
+            "每轮追加一条 RoundUsage：{evts:?}"
+        );
         assert!(matches!(
-            &evts[3],
+            &evts[4],
             AgentEvent::RunFinished {
                 stop_reason: StopReason::Completed,
                 ..
@@ -659,15 +672,24 @@ mod tests {
         assert_eq!(result.rounds, 1);
         assert!(result.final_message.is_some());
 
-        // 事件序列恰好是这四条（不得多也不得少）：
-        // UserMessage → RoundStarted → ModelTextDelta → RunFinished
+        // 事件序列恰好是这五条（不得多也不得少）：
+        // UserMessage → RoundStarted → ModelTextDelta → RoundUsage → RunFinished
+        // Step 7 新增的 `RoundUsage` 每轮一条，位置在模型返回后、终局事件之前。
         let evts = events.events();
-        assert_eq!(evts.len(), 4, "无 boundary 时不得多出任何事件");
+        assert_eq!(evts.len(), 5, "无 boundary 时不得多出这五条以外的事件");
         assert!(matches!(&evts[0], AgentEvent::UserMessage { .. }));
         assert!(matches!(&evts[1], AgentEvent::RoundStarted { round: 1 }));
         assert!(matches!(&evts[2], AgentEvent::ModelTextDelta { text } if text == "hello world"));
         assert!(matches!(
             &evts[3],
+            AgentEvent::RoundUsage {
+                purpose: ys_event::RoundPurpose::Turn,
+                round: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &evts[4],
             AgentEvent::RunFinished {
                 stop_reason: StopReason::Completed,
                 ..

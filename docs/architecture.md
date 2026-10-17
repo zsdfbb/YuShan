@@ -691,6 +691,7 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
 | **退出时** | `session: <id>`（TUI 退出回放**之后**写主屏；`-p` / `--json` 收尾） | **stderr** |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
+| **`--debug` 运行期间** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
 
 **退出时**是第三类时机：TUI 已退 alt-screen（`restore_terminal` 把对话回放到 stdout），此刻写 stderr
 的字节落在主屏、不会被冲掉，也不污染 `-p` 的模型文本 / `--json` 的逐行 `Envelope`。内容由
@@ -703,6 +704,17 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 
 > **只有 2 处（`provider.rs` / `state.rs`）严格需要日志文件** —— 其余靠「启动期 stderr / 命令期
 > `Output`」就够。日志文件的价值是**通用兜底**：TUI 应用没有「历史输出」可看。
+
+**`--debug` 的结构化记录**（`apps/coding-agent/src/debug_log.rs`）：与 `yushan.log` 同目录、独立文件，
+一行一条 JSON（`schema: yushan.debug/1`）。契约：
+
+- **关闭时零开销**：`Option<DebugSink>` 为 `None` —— 不解析路径、不建文件、不起线程。
+- **异步单写者**：调用线程只做「取时间/序号 → 序列化 → `try_send`」；有界队列满时**丢当前记录并计数**
+  （`dropped`），绝不阻塞 agent。一行一次 `write_all`：**正常 flush / 排空时**末行完整；
+  SIGKILL 等不可捕获退出仍可能截断末行（T5 的 P1 项）。
+- **只记段，不记增量**：`ModelTextDelta` / `ModelThinkingDelta` 只累计计数，不产生记录（长回答不会撑爆文件）。
+- **不占输出通道**：debug 内容只进文件；`-p` 的 stdout 与 `--json` 的逐行 `Envelope` 保持原契约。
+- **退出收敛**：`main.rs` 的裸退出原语只允许出现在 `exit_with_debug`（先 `flush` 再 `exit`）。
 
 **`capabilities.rs` 绝不 print** —— 命令期间的失败也走 `Output`。
 `--stats` 的背压读数**只在非 TUI 模式**出现，写 stderr，不污染 stdout 的 JSON / 文本流。

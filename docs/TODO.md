@@ -53,12 +53,13 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 | 缺什么 | 状态依据（核实于 `e6f5f13`） |
 |---|---|
-| 角色概念 / 只读开关 | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（`toolset.rs:515`、`prompt.rs:699` 的 `read_only` 命中是**并发安全**测试名，非角色定义） |
-| `build_tools` 无法按角色换表 | 签名零策略参数（`toolset.rs:88`）；全仓**仅两处**构建工具表：装配期 `assembly.rs:100`（子表）与派发期 `subagent.rs:378`（每次派发重建） |
+| 角色概念 / 只读开关 | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（`apps/coding-agent/src/toolset.rs:515`、`apps/coding-agent/src/prompt.rs:699` 的 `read_only` 命中是**并发安全**测试名，非角色定义） |
+| `build_tools` 无法按角色换表 | 签名零策略参数（`apps/coding-agent/src/toolset.rs:88`）；全仓**仅两处**构建工具表：装配期 `apps/coding-agent/src/assembly.rs:100`（子表）与派发期 `apps/coding-agent/src/subagent.rs:378`（每次派发重建） |
 
 > ⚠️ **落地约束**：不可把角色做成 `subagent` 工具入参 —— 那会改 `ToolSpec`，动
-> `toolset.rs:568` 的**前缀指纹锚**，且破掉「子表 JSON 是父表字节前缀」这条缓存优化
-> （`assembly.rs:119` 派发工具追加末位即为此）。宜做成**装配期多张预建表**（指纹只增不改）。
+> `apps/coding-agent/src/toolset.rs:568` 的**前缀指纹锚**，且破掉「子表 JSON 是父表字节前缀」
+> 这条缓存优化（`apps/coding-agent/src/assembly.rs:119` 派发工具追加末位即为此）。
+> 宜做成**装配期多张预建表**（指纹只增不改）。
 >
 > **边界**：同表 `:835`「按任务类型动态裁剪子工具表」是**另一项**（R > 5 才回本，且破前缀），
 > 不随本项一起做。

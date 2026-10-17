@@ -467,20 +467,20 @@ where
     // 时钟建在**消费者**里，是因为两条入口的消费点不同（TUI 是 `app_loop` 的事件泵）。
     let mut clock = RoundClock::default();
     while let Some(env) = rx.recv().await {
-        if let Some(line) = clock.observe(&env, Instant::now()) {
+        for line in clock.observe(&env, Instant::now()) {
             logging::log(&line);
         }
         on_event(&mut w, &env)?;
         w.flush()?;
         if is_terminal(&env.event) {
             // 兜底：终局事件没能关闭某轮（理论上不会）时仍落一行。
-            if let Some(line) = clock.take_line() {
+            for line in clock.take_lines() {
                 logging::log(&line);
             }
             return Ok(());
         }
     }
-    if let Some(line) = clock.take_line() {
+    for line in clock.take_lines() {
         logging::log(&line);
     }
     // 信道关闭（正常路径不依赖此分支：agent 不 drop 信道）——不 panic，正常收尾。

@@ -69,11 +69,36 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
 1. **旁路回调会静默退化。** trait 带默认空实现 ⇒ 新增一个 `Model` 适配器忘了接 observer，
    debug 文件里模型侧就是空的，**没有任何报错**。这与本仓「漏实现是编译错误、不会静默漂移」的
    既有纪律（`Request` 的穷尽 `match`）正好相反。
-2. **单一真相。** 事件流经同一条信道、同一套顺序，TUI / `-p` / `--json` 三种消费者都能看到；
-   **子 agent 的 usage 也自然可见**（B 的自评指出旁路方案要靠 `agent_id` 手工透传）。
+2. **与 `Model` 实现解耦。** usage 由**主循环**从 `response.usage` 直接发出，不依赖适配器
+   是否实现某个 trait；换模型后端不会让 usage 记录静默消失。三种消费者
+   （TUI / `-p` / `--json`）经同一条信道、同一套顺序看到同一份数据。
 3. **代价可控。** 新增一个非终局事件 + `Usage` 加一个 `#[serde(default)]` 字段。
    `--json` 是**加法**变更（与已有的 `RoundStarted` 同形）；关闭 debug 时每轮只多一条事件，
    相对每轮 1k–10k 个增量可以忽略。
+
+> ⚠️ **曾被误列为理由的一条（已撤回）**：「子 agent 的 usage 自然可见」—— **不成立**。
+> 子 agent 的事件出口是 `NoopEventSink`（`apps/coding-agent/src/subagent.rs:4`、`:371`），
+> 其 `RoundUsage` **会被丢弃**；父侧只在回合末看到上卷后的总 usage。
+> 子 agent 的逐轮可见性是**另一个需求**，不在本设计内（见 §4.8）。
+
+---
+
+## 3.1 通道边界：事件 vs 旁路（R2）
+
+「旁路会静默退化」否掉的是**把主循环已经握有的事实交给适配器去报**。
+但有些事实**只在适配器里存在**，事件流里根本没有（实测：适配器里 `AgentEvent::` 出现 **0 次**）。
+故真实边界是：
+
+| 事实 | 产生地 | 走哪 | 理由 |
+|---|---|---|---|
+| 逐轮 usage | 主循环（`basic.rs` Step 7 拿到 `response.usage`） | **事件** | 主循环已有，无需适配器配合 |
+| 首 token / 思考与正文分段 | 消费侧（`RoundClock` 看事件） | **事件** | 同上 |
+| **每次 HTTP 尝试、`ttfb`、重试分类、退避** | **适配器内部** | **旁路** | 事件里不存在；只能由适配器上报 |
+| 压缩 / 摘要的 usage | 各自调用点 | **事件**（`purpose` 区分，见 §4.8） | 调用点在 `ys-loop` 内，有 `ctx.events` |
+
+**旁路的静默退化风险只落在 P1 的适配器记录上。** 缓解：P1 上线时加一条**启动期自检** ——
+debug 已开、且已发出过模型请求，但整个 session 一条 `model_attempt` 都没有 ⇒ 在 `run_end`
+里写一条 `adapter_trace_missing` 警告。这样"忘了接"至少不再无声。
 
 > `Usage` 新增字段会让 34 处结构体字面量需要机械修补 —— 接受，一次性的。
 
@@ -94,7 +119,8 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
 | `adapters/model-openai-compatible/src/lib.rs`（改） | attempt / 首字节 / 重试 trace（与既有 `with_logger` 并列） |
 | `crates/ys-core/src/usage.rs`（改） | `Usage` 增 `reasoning_tokens: u32`（`#[serde(default)]`），纳入 `Add` |
 | `crates/ys-event/src/event.rs`（改） | 新增非终局 `RoundUsage { round, usage }` |
-| `crates/ys-loop/src/basic.rs`（改） | Step 7 拿到 `response.usage` 后 emit `RoundUsage` |
+| `crates/ys-loop/src/basic.rs`（改） | Step 7 拿到 `response.usage` 后 emit `RoundUsage{purpose:"turn"}`；压缩分支 emit `purpose:"compaction"` |
+| `crates/ys-loop/src/compact.rs`（改） | `CompactOutcome` 增 `usage: Usage`（`execute` 手里已有响应，供调用方发 `RoundUsage`） |
 
 **不动**：`--json` 的输出格式（只增一类事件）、`capabilities.rs`、`ys-tui-coding`、`ys-protocol`。
 
@@ -111,7 +137,7 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
 | `run_start`（一次） | `version`、`pid`、`os`/`arch`、`cwd`、`session_file`、`gen_ai.system`、`gen_ai.request.model`、`api_base`（**只 scheme+host**）、`limits{...}`、`tools[{name,spec_bytes}]`、`skills{count,budget}`、`env_names[]`（**只记名字不记值**）、`semconv` |
 | `turn_start` / `turn_end` | `turn`、`input_bytes`、`budget_ms`；结束时 `rounds`、`elapsed_ms`、`budget_remaining_ms`、`cache_hit/miss` |
 | `round_start` / `round_end` | 轮号；结束时 `ttft_ms`、`gen_ms`、`tools_ms`、`total_ms`、**`first_thinking_ms` / `first_text_ms`**、`thinking_span_ms` / `text_span_ms`、`thinking_deltas` / `text_deltas`（**只计数**）、`tool_calls` |
-| **`round_usage`** | `gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`、**`gen_ai.usage.cache_read.input_tokens`**、**`gen_ai.usage.reasoning.output_tokens`**、`gen_ai.response.finish_reasons`、`usage_reported`、`reasoning_tokens_reported`（**区分"真 0"与"没上报"**） |
+| **`round_usage`** | **`purpose`**（`turn` / `compaction` / `summarize`，见 §4.8）、`round`（辅助调用可缺）、`gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`、**`gen_ai.usage.cache_read.input_tokens`**、**`gen_ai.usage.reasoning.output_tokens`**、`gen_ai.response.finish_reasons`、`usage_reported`、`reasoning_tokens_reported`（**区分"真 0"与"没上报"**） |
 | `tool_call` | `gen_ai.tool.name`、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（**摘要**）、`args_original_bytes`、`args_truncated`、`args_keys`、`args_redacted_keys` |
 | `tool_result` | `duration_ms`、`is_error`、`result_bytes`、`result_lines`、`result_lines_exact`（**不记内容**） |
 | `model_attempt` | `attempt`/`max_attempts`、`outcome`、`reason_class`（`transport`/`idle_timeout`/`rate_limited`/`server_error`/`quota`/`fatal`）、`http_status`、`backoff_ms`、**`ttfb_ms`（真·首字节）** |
@@ -179,12 +205,43 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
 | IO 错误 | 计数并继续；连续失败 8 次停写线程 |
 | 退出 | `flush`：发 Stop → 排空 → 写收尾行；最多等 2 s，超时放弃（best-effort） |
 
+**R4 · 退出必须由结构保证，不能靠"记得调"。**
+`main.rs` 里 `std::process::exit` 有 **14 处**，而它**不跑析构** —— 任何一处漏 flush 就丢队列尾部。
+做法：把 14 处收敛到一个 `fn exit_with_debug(code: i32) -> !`（先 `debug.flush()` 再 `process::exit`），
+新代码只准走它。**验收时用 `grep process::exit` 检查只剩这一处。**
+
+**R5 · `dropped > 0` 的语义必须写明。**
+队列满只在 writer 被磁盘卡住时发生，且**无优先级** ⇒ `round_end` 与 `round_start` 一样有风险。
+故文档与 `run_end` 都要写清：**`dropped > 0` 时，不能据「某条记录不存在」作否定推断**
+（"这轮没有工具调用" ≠ "工具调用记录被丢了"）。
+
+**R6 · 文件保留。**
+一 session 一文件、`/resume` 追加 ⇒ 会累积。**P2 加启动期 sweep**：按 mtime 保留最近 N 天
+（默认 7）或最多 M 份，删前不提示（debug 文件是可再生证据）。在那之前，文档明说"会累积、需手动清理"。
+
 ### 4.6 `/resume` 与轮转
 
 - **`/resume` 追加同一 session 的 debug 文件**，新 run 以一条 `run_start` 开头（`run` 字段区分）。
 - **`/new` 切新文件**（`debug-<新 session>.jsonl`），旧文件自然结束。
 
 ---
+
+### 4.8 逐轮 usage 的覆盖面（R3）
+
+`RoundUsage` 只在 `basic.rs` Step 7 发会**系统性漏掉辅助模型调用** —— 而"压缩是一次完整模型调用"
+正是要看见的。故 `RoundUsage` 带 `purpose`，覆盖面如下：
+
+| 模型调用 | 发出点 | 覆盖 | 说明 |
+|---|---|---|---|
+| 主循环每轮 | `basic.rs` Step 7（拿到 `response.usage`） | ✅ `purpose="turn"`、带 `round` | |
+| **压缩摘要** | `basic.rs` 的 `compact::execute` 分支 | ✅ `purpose="compaction"`、带 `round` | 需给 `CompactOutcome` 加 `usage: Usage`（`execute` 手里已有响应） |
+| **工具侧摘要**（webfetch / subagent 的 `ModelSummarizer`） | —— | ❌ | 工具上下文**没有事件出口**（`summarize.rs:42`：工具侧不通事件）；要覆盖需另立需求 |
+| **子 agent 的逐轮调用** | —— | ❌ | 子事件进 `NoopEventSink`（`subagent.rs:4`）；父侧只在回合末看到上卷总量 |
+
+**兜底**：`run_end` 记回合**累计** usage（含子 agent 上卷），因此"总量对不对"始终可核；
+缺的只是"哪一次辅助调用花了多少"。
+
+> 这两处 ❌ 是**有意的范围边界**，不是遗漏。写在这里是为了让后来者不必重新发现。
 
 ### 4.7 与 session 文件如何对照
 
@@ -224,9 +281,12 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 
 | 阶段 | 内容 | 估计 |
 |---|---|---|
-| **P0** | 开关 + 独立文件 + 异步 sink + 段的富计时（thinking/text 拆分）+ 工具元数据 + `run_start`/`run_end` + `reasoning_tokens` + `RoundUsage` | ~700 行 |
-| **P1** | `model_attempt`（含 `ttfb_ms`、重试分类）+ 压缩/截断/boundary 记录 | ~300 行 |
-| **P2** | `/new` 轮转、文件上限、`state_change`、jq 配方文档 | ~200 行 |
+| **P0** | 开关 + 独立文件 + 异步 sink + 段的富计时（thinking/text 拆分）+ 工具元数据 + `run_start`/`run_end` + `reasoning_tokens` + `RoundUsage`（含 `purpose` 与压缩覆盖）+ `exit_with_debug` 收敛 14 处退出 | **~900–1,100 行** |
+| **P1** | `model_attempt`（含 `ttfb_ms`、重试分类）+ 适配器自检 + 压缩/截断/boundary 记录 | ~300 行 |
+| **P2** | `/new` 轮转、文件上限与启动期 sweep、`state_change`、jq 配方文档 | ~250 行 |
+
+> P0 的原估 ~700 行**偏乐观**（评审 R7）：它包含 `Usage` 加字段（**34 处字面量**，已核实）、
+> 新事件 + 两处 emit、`debug_log.rs`、两条入口接线、`RoundClock` 富化、14 处退出收敛。
 
 **P0 就能回答本轮悬着的两个问题**：`gen` 46 s vs 143 s 差在哪（思考 vs 正文），以及逐轮 usage/缓存走向。
 
@@ -258,10 +318,25 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 
 ## 8. 验收
 
-1. **关闭 debug**：目标目录零新文件；`yushan.log` 与 `--json` 输出与今天**逐字节相同**。
-2. **打开 debug + 一次 10k 增量的运行**：debug 文件 < 200 KiB；**零** `ModelTextDelta` 记录；
-   每行是合法 JSON、`seq` 严格 +1、`t_ms - dt_ms` 恒定。
-3. **队列满**（注入慢 writer）：`dropped > 0`，已写行完整。
-4. **不调 flush 直接退出**：文件末尾仍是完整行。
-5. **设计直击**：用一次真实运行回答「`gen` 里思考占多少」——`round_end.thinking_span_ms` 与
+1. **关闭 debug（负向验收）**：目标目录零新文件；`yushan.log` 文本行逐字节不变；
+   **`--json` 输出也必须逐字节相同** —— 注意 `RoundUsage` 在 debug 关闭时**仍会发**，
+   这是设计的选择（它服务于所有消费者），**必须被本条钉住**，否则将来有人会以为"关 debug 就等于零变化"。
+2. **打开 debug + 一次 10k 增量的运行**：debug 文件 < 200 KiB；**零** `ModelTextDelta` /
+   `ModelThinkingDelta` 记录；每行是合法 JSON、`seq` 严格 +1、`t_ms - dt_ms` 恒定。
+3. **队列满**（注入慢 writer）：`dropped > 0`，已写行完整；`run_end` 报出该数。
+4. **不调 flush 直接退出**：文件末尾仍是完整行；且 `grep -c process::exit` 只剩
+   `exit_with_debug` 内部那一处。
+5. **覆盖面**：一次含压缩的运行里，`round_usage` 同时出现 `purpose=turn` 与 `purpose=compaction`；
+   子 agent / 工具摘要**不出现**是有意为之（§4.8）。
+6. **设计直击**：用一次真实运行回答「`gen` 里思考占多少」——`round_end.thinking_span_ms` 与
    `round_usage.reasoning_output_tokens` 交叉验证。
+
+### 变异测试（本仓要求关键逻辑可变异）
+
+| 变异 | 应变红的用例 |
+|---|---|
+| 在 `RoundClock` 里给 `ModelTextDelta` 加一条记录 | 验收 2（零增量记录） |
+| 把摘要/序列化挪到时间戳**之前** | 计时用例 + `hot_path_ms` 上界 |
+| 队列满改成 `send().await` | 慢 writer 注入用例（会挂住） |
+| `exit_with_debug` 改回裸 `process::exit` | 验收 4 |
+| 脱敏匹配删掉 | `[REDACTED]` 断言 |

@@ -53,17 +53,34 @@ proposed（2026-10-17）
 
 ### 4. **逐轮 usage 走事件流**，不走旁路回调
 
-新增非终局 `AgentEvent::RoundUsage { round, usage }`，`ys-loop` 在拿到 `response.usage` 后
-发一次；`ys_core::Usage` 增 `reasoning_tokens: u32`（`#[serde(default)]`，纳入 `Add`）。
+新增非终局 `AgentEvent::RoundUsage { purpose, round, usage }`，`ys-loop` 在拿到
+`response.usage` 后发一次；`ys_core::Usage` 增 `reasoning_tokens: u32`
+（`#[serde(default)]`，纳入 `Add`）。
 
 **为什么不走 observer 回调**（三个候选的共同倾向）：
 
 - **旁路会静默退化** —— trait 带默认空实现，新 `Model` 适配器忘了接 observer，debug 里模型侧
   就是空的，**无任何报错**。这与本仓「漏实现是编译错误」的既有纪律相反。
-- **单一真相** —— 事件流经同一信道、同一顺序；TUI / `-p` / `--json` 三种消费者都看得到，
-  **子 agent 的 usage 也自然可见**（旁路要靠 `agent_id` 手工透传）。
+- **与 `Model` 实现解耦** —— usage 由**主循环**从 `response.usage` 直接发出，不依赖适配器
+  是否实现某个 trait；换模型后端不会让 usage 记录静默消失。三种消费者经同一信道看到同一份数据。
 - **代价可控** —— `--json` 是加法变更（与 `RoundStarted` 同形）；关闭 debug 时每轮多一条事件，
   相对每轮 1k–10k 个增量可忽略。
+
+> ⚠️ **撤回一条曾用过的理由**：「子 agent 的 usage 自然可见」—— **不成立**。
+> 子 agent 的事件出口是 `NoopEventSink`（`apps/coding-agent/src/subagent.rs:4,371`），
+> 其 `RoundUsage` 会被丢弃；父侧只在回合末看到上卷总量。子 agent 的逐轮可见性是**另一个需求**。
+
+**覆盖面（有意为之的边界）**：主循环每轮（`purpose=turn`）与**压缩摘要**（`purpose=compaction`，
+需给 `CompactOutcome` 加 `usage`）覆盖；**工具侧摘要**与**子 agent 逐轮**不覆盖 ——
+前者所在工具上下文没有事件出口（`summarize.rs:42`），后者事件被 `NoopEventSink` 丢弃。
+`run_end` 记回合累计 usage 兜底，总量始终可核。
+
+### 4b. 通道边界：事件 vs 旁路
+
+「旁路会静默退化」否掉的是**把主循环已握有的事实交给适配器去报**。但**只在适配器里存在的事实**
+（每次 HTTP 尝试、`ttfb`、重试分类、退避）事件流里没有（实测适配器里 `AgentEvent::` 出现 **0 次**），
+只能旁路。**旁路的静默退化风险只落在 P1 的适配器记录上**，缓解是 P1 加启动期自检：
+debug 已开、已发过模型请求，却一条 `model_attempt` 都没有 ⇒ `run_end` 写 `adapter_trace_missing`。
 
 ### 5. 工具参数：索引，不是副本
 

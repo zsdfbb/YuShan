@@ -91,12 +91,20 @@ pub const ENV_BOCHA_KEY: &str = "YUSHAN_SEARCH_BOCHA_KEY";
 /// 「The API key was not provided」）。**修订（2026-09-18）**：初稿把它当作 keyless
 /// （据一篇第三方对比文），后果见 `backends::Row::keyless` 的修订记录与 ADR-0016。
 pub const ENV_FIRECRAWL_KEY: &str = "YUSHAN_SEARCH_FIRECRAWL_KEY";
+/// DeepSeek Search API key。
+pub const ENV_DEEPSEEK_KEY: &str = "YUSHAN_SEARCH_DEEPSEEK_KEY";
+/// DeepSeek 的**生态通用** API key 环境变量名。
+///
+/// 作为 [`ENV_DEEPSEEK_KEY`] 的**回退**读取：已为别的 DeepSeek 工具配过 key 的用户
+/// 不必再复制一份到本项目命名空间。两者都设时 [`ENV_DEEPSEEK_KEY`] 优先。
+pub const ENV_DEEPSEEK_KEY_ALIAS: &str = "DEEPSEEK_API_KEY";
 /// 抓取结果落盘目录的**显式覆盖**（测试靠它隔离）。
 pub const ENV_FETCHED_DIR: &str = "YUSHAN_FETCHED_DIR";
 
 /// 搜索后端的身份。`plan` / `parse` 按它**穷尽分派**（漏改编译报错，不静默漂移）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    Deepseek,
     Searxng,
     Tavily,
     Bocha,
@@ -263,7 +271,8 @@ impl WebConfig {
         if self.backends.is_empty() {
             issues.push(format!(
                 "未配置任何搜索后端：websearch 不可用。请设置 {ENV_SEARXNG_URL}，\
-                 或 {ENV_TAVILY_KEY}（或通用名 {ENV_TAVILY_KEY_ALIAS}）/ {ENV_BOCHA_KEY} / \
+                 或 {ENV_DEEPSEEK_KEY}（或通用名 {ENV_DEEPSEEK_KEY_ALIAS}）/ \
+                 {ENV_TAVILY_KEY}（或通用名 {ENV_TAVILY_KEY_ALIAS}）/ {ENV_BOCHA_KEY} / \
                  {ENV_FIRECRAWL_KEY} 之一"
             ));
         }
@@ -421,18 +430,20 @@ mod tests {
     /// 本模块会读写的全部 env 键（恢复集合；`USERPROFILE` 是 `HOME` 的后备）。
     const TEST_KEYS: &[&str] = &[ENV_FETCHED_DIR, "HOME", "TMPDIR", "USERPROFILE"];
 
-    /// 搜索后端的四个 env 键 —— `from_env` 经 `backends::resolve_backends` **真的会消费它们**，
-    /// 故凡是要断言链的**形状**的测试都必须先把这四个键清掉（否则本机配了 key 就会变红），
+    /// 搜索后端的全部 env 键 —— `from_env` 经 `backends::resolve_backends` **真的会消费它们**，
+    /// 故凡是要断言链的**形状**的测试都必须先把这些键清掉（否则本机配了 key 就会变红），
     /// 并用 `EnvRestore::capture(BACKEND_KEYS)` 把清掉的动作在同一测试内**复原**。
     const BACKEND_KEYS: &[&str] = &[
         ENV_SEARXNG_URL,
+        ENV_DEEPSEEK_KEY,
+        ENV_DEEPSEEK_KEY_ALIAS,
         ENV_TAVILY_KEY,
         ENV_TAVILY_KEY_ALIAS,
         ENV_BOCHA_KEY,
         ENV_FIRECRAWL_KEY,
     ];
 
-    /// 清空四个后端 env 键（调用方须持有 `ENV_LOCK` 且已 `capture(BACKEND_KEYS)`）。
+    /// 清空全部后端 env 键（调用方须持有 `ENV_LOCK` 且已 `capture(BACKEND_KEYS)`）。
     fn clear_backend_keys() {
         // SAFETY: 调用方持有 `ENV_LOCK`。
         unsafe {
@@ -490,7 +501,7 @@ mod tests {
 
     // ---------- S9：WebConfig 的构造器与降级提示 ----------
 
-    /// **四个后端 env 全空**时 `from_env` 的链形状 —— **链为空**，且**有一句提示**。
+    /// **五个后端 env 全空**时 `from_env` 的链形状 —— **链为空**，且**有一句提示**。
     ///
     /// ⚠️ 这条断言**改过两次**，两次都是「文档/事实对不上」被抓出来的：
     ///
@@ -525,10 +536,10 @@ mod tests {
         );
         assert!(web.client().is_some(), "正常环境下 HTTP 栈应可初始化");
 
-        // 四行都被剔除：三家托管要 key、searxng 要实例地址 —— **一个都没配 ⇒ 什么都不猜**。
+        // 五行都被剔除：四家托管要 key、searxng 要实例地址 —— **一个都没配 ⇒ 什么都不猜**。
         assert!(
             web.backends().is_empty(),
-            "零配置（四个 `YUSHAN_SEARCH_*` 全空）⇒ 链为空：{:?}",
+            "零配置（五个 `YUSHAN_SEARCH_*` 全空）⇒ 链为空：{:?}",
             web.backends()
         );
 
@@ -538,8 +549,11 @@ mod tests {
             .expect("零配置 ⇒ 链为空 ⇒ 必须有提示（否则用户一句提示都看不到）");
         assert!(hint.contains("未配置任何搜索后端"), "{hint}");
         assert!(
-            hint.contains(ENV_SEARXNG_URL) && hint.contains(ENV_TAVILY_KEY),
-            "提示要能回答「下一步配什么」：{hint}"
+            hint.contains(ENV_SEARXNG_URL)
+                && hint.contains(ENV_DEEPSEEK_KEY)
+                && hint.contains(ENV_DEEPSEEK_KEY_ALIAS)
+                && hint.contains(ENV_TAVILY_KEY),
+            "提示要能回答「下一步配什么」（含 DeepSeek 及其通用名）：{hint}"
         );
         assert!(
             !hint.contains("HTTP 客户端未初始化"),
@@ -772,7 +786,7 @@ mod tests {
         let web = WebConfig::from_env();
 
         assert!(matches!(web.fetched(), FetchedDir::Primary(_)));
-        assert!(web.backends().is_empty(), "四个后端 env 已清空 ⇒ 链为空");
+        assert!(web.backends().is_empty(), "五个后端 env 已清空 ⇒ 链为空");
 
         let hint = web
             .degraded_hint()

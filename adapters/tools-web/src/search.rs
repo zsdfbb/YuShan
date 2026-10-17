@@ -20,11 +20,11 @@
 //!
 //! 1. **降级只认错误/限额，空结果不降级** —— 这是链的**核心区分**。把 `parse` 的
 //!    `Err`（形状不对 / 非 JSON / 业务错误码）当空结果，一家改个字段名整条链就再也不
-//!    会去试别人；反过来把空结果当错误，一个真没结果的查询会在 4 家上各跑一遍白等。
+//!    会去试别人；反过来把空结果当错误，一个真没结果的查询会在五家上各跑一遍白等。
 //! 2. **所有网络族失败都是 `is_error` 结果，不是工具失败**（ADR-0001）：对端 429 /
 //!    超时 / 404 是**世界的事实**，模型换一个查询词或后端就能解决，判成「工具坏了」
 //!    只会让它放弃。故本模块里 **`?` 只用于参数缺失**，`FetchError` 一律**降级成理由**。
-//! 3. **`Aborted` 立刻停链**（不是记理由继续）：用户已经取消，再去试后面三家既无意义
+//! 3. **`Aborted` 立刻停链**（不是记理由继续）：用户已经取消，再去试后面几家既无意义
 //!    又违背取消的语义（`fetch_capped` 的 abort 分支只在 `is_aborted()` 命中时返回）。
 //!
 //! # 为什么预算与切片是**公开纯函数**（`slice_for`）+ **可注入的 `run_chain`**
@@ -57,11 +57,11 @@ use ys_tool::{Tool, ToolContext, ToolError, ToolSpec, append_notices};
 use crate::backends::{kind_slug, parse, plan};
 use crate::net::{FetchError, fetch_capped};
 use crate::{
-    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
-    ENV_TAVILY_KEY_ALIAS, Kind, SearchHit, WebConfig,
+    Backend, ENV_BOCHA_KEY, ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS, ENV_FIRECRAWL_KEY,
+    ENV_SEARXNG_URL, ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS, Kind, SearchHit, WebConfig,
 };
 
-/// 整条链的**总预算**（设计 §1.7）。4 家各 60s = 最坏 4 分钟，而 `-p` / `--json`
+/// 整条链的**总预算**（设计 §1.7）。5 家各 60s = 最坏 5 分钟，而 `-p` / `--json`
 /// 下没有中止通道（`boundary` 恒为 `None`）→ 超时是唯一的刹车。
 pub const CHAIN_BUDGET: Duration = Duration::from_secs(30);
 
@@ -144,7 +144,8 @@ impl Tool for WebSearchTool {
         if self.cfg.backends().is_empty() {
             return Ok(error_result(format!(
                 "Web search is unavailable: no search backend is configured. Set {ENV_SEARXNG_URL} \
-                 to a SearXNG instance address, or one of {ENV_TAVILY_KEY} (or the generic \
+                 to a SearXNG instance address, or one of {ENV_DEEPSEEK_KEY} (or the generic \
+                 {ENV_DEEPSEEK_KEY_ALIAS}) / {ENV_TAVILY_KEY} (or the generic \
                  {ENV_TAVILY_KEY_ALIAS}) / {ENV_BOCHA_KEY} / {ENV_FIRECRAWL_KEY} to an API key."
             )));
         }

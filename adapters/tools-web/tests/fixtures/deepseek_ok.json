@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"results\":[{\"rerank_score\":2.4,\"title\":\"Rust 错误处理 - 官方文档\",\"url\":\"https://doc.rust-lang.org/book/ch09-00-error-handling.html\",\"snippet\":\"来自 snippet 的短片段：Rust 把错误分为可恢复与不可恢复两类。\",\"summary\":\"摘要优先：错误分为可恢复与不可恢复两类。\",\"content\":\"\",\"site_name\":\"doc.rust-lang.org\",\"site_icon\":\"https://doc.rust-lang.org/favicon.ico\",\"date\":\"2026-09-20\",\"authority\":\"high\"},{\"rerank_score\":1.1,\"title\":\"anyhow - Rust\",\"url\":\"https://docs.rs/anyhow/latest/anyhow/\",\"snippet\":\"来自 snippet 的兜底片段。\",\"summary\":null,\"content\":\"\",\"site_name\":\"docs.rs\",\"site_icon\":null,\"date\":null,\"authority\":null},{\"rerank_score\":0.5,\"title\":\"空 url 条目\",\"url\":\"\",\"snippet\":\"这条必须被跳过\",\"summary\":\"这条必须被跳过\",\"content\":\"\",\"site_name\":\"example.com\",\"site_icon\":null,\"date\":null,\"authority\":null}]}"
+}

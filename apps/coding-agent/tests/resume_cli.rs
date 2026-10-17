@@ -89,6 +89,8 @@ fn isolate(cmd: &mut Command, roots: &Roots) {
         .env_remove("YUSHAN_SEARCH_SEARXNG_URL")
         .env_remove("YUSHAN_SEARCH_TAVILY_KEY")
         .env_remove("TAVILY_API_KEY")
+        .env_remove("YUSHAN_SEARCH_DEEPSEEK_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("YUSHAN_FETCHED_DIR")

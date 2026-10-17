@@ -1,4 +1,4 @@
-# `tests/fixtures/` —— 四家搜索后端的冻结响应
+# `tests/fixtures/` —— 五家搜索后端的冻结响应
 
 > **状态：按官方文档手写，未经真实响应校验。**
 > 采集脚本 `tests/harvest.rs` 存在的唯一目的，就是把它们**替换成真的**
@@ -28,10 +28,13 @@
 `headers` 只保留解析用得上的那些（手写件里只有 `content-type`）。
 `harvest` 会写入**对端真实返回的响应头**，但**排除 `set-cookie`**（唯一会带会话信息的一项）。
 
-## 二、14 份 fixture 与各自覆盖的解析分支
+## 二、17 份 fixture 与各自覆盖的解析分支
 
 | 文件 | 模拟的响应 | 覆盖的解析分支 | `parse()` 期望 |
 |---|---|---|---|
+| `deepseek_ok.json` | `200 + application/json` | `results[]{title,url,snippet,summary,...}`；`summary` 优先、`snippet` 回退；空 url 条目跳过；`rerank_score`/`authority`/`site_name` 等忽略 | `Ok(2 条)` |
+| `deepseek_empty.json` | `200`，`results: []` | 空结果 | `Ok(0 条)` |
+| `deepseek_error.json` | **`400`** + OpenAI 兼容 `{"error":{"message",...}}` | 错误信封识别（`error.message`）；**状态码这一层 `parse` 看不到**（`fetch_capped` 已拦 4xx） | `Err`，文案含 message |
 | `searxng_ok.json` | `200 + application/json` | 正常映射；中文 UTF-8；未知字段（`engine`/`positions`/`timings`）；`publishedDate: null`；`unresponsive_engines`（**故意忽略**，设计 R11） | `Ok(2 条)` |
 | `searxng_empty.json` | `200 + application/json`，`results: []` | **空结果**（链在此**停**，不白跑后面的后端） | `Ok(0 条)` |
 | `searxng_error.json` | **`200 + text/html`**（`format=json` 时 JSON 未开） | ★ **静默失败**：`Content-Type` 检查（设计 §1.5 的核心） | `Err`，且文案含 `settings.yml` |
@@ -57,10 +60,11 @@
 > （见 `tavily_missing_results.json`）—— 它**不是**空结果：`Err` 让链**继续**试下一家，
 > 「空结果」会让链**停**（设计 §1.2）。
 
-## 三、四家响应形状的置信度（诚实标注）
+## 三、五家响应形状的置信度（诚实标注）
 
 | backend | 字段路径 | 结论 | 依据 |
 |---|---|---|---|
+| DeepSeek | `results[]{title, url, snippet, summary}` | **响应字段已核、错误信封未核** | 响应字段来自官方 Search API 文档给出的完整响应样例（含 `rerank_score`/`content`/`site_name`/`date`/`authority` 等）；错误信封按官方 OpenAI 兼容格式 `{"error":{"message",...}}` 书写，**未经真实响应校验** |
 | SearXNG | `results[]{title, url, content}` | **已核** | 官方 `docs.searxng.org/dev/search_api.html` 的字段表；`200 + text/html` 静默失败由 litellm / n8n 的接入文档与官方 `settings.yml`（`search.formats`）印证 |
 | Bocha | `data.webPages.value[]{name, url, snippet, summary}` | **路径已核、错误体未核** | 路径逐字来自 Bocha 官方组织在 GitHub 的 `Bocha-Labs/bocha-skills`（`bocha-web-search/SKILL.md`：「搜索结果位于 `data.webPages.value[]`」）；开放平台首页与第三方实测给的是**不带 `data` 信封**的扁平形态（`bocha_flat_ok.json` 就是这一形），故 `parse` 两条路径都试。`code != 200` 的错误体形状**未核**（官方只列了 HTTP 错误码 400/401/403/429/500） |
 | Tavily | `results[]{title, url, content}` | **已核** | 官方文档与 SDK 示例一致（`response["results"]` 的 `title`/`url`/`content`）。**错误体 `{"detail": {...}}` 未核**：文档没给错误 schema，依据是 SDK 与社区报错样例 |
@@ -70,6 +74,7 @@
 
 ```bash
 # 一条命令跑全部（缺哪个 env 就红哪一条，红的文案告诉你要 export 什么）
+export YUSHAN_SEARCH_DEEPSEEK_KEY=sk-…   # 亦可 export DEEPSEEK_API_KEY（通用名，作为回退）
 export YUSHAN_SEARCH_TAVILY_KEY=tvly-…    # 亦可 export TAVILY_API_KEY（通用名，作为回退）
 export YUSHAN_SEARCH_BOCHA_KEY=sk-…
 export YUSHAN_SEARCH_FIRECRAWL_KEY=fc-…                 # 必需（ADR-0016 修订：它不免 key）

@@ -106,7 +106,8 @@ impl Roots {
 ///    它决定**项目级** skill 根）；
 /// ③ **模型侧** `YUSHAN_*` 全清 —— 不清则进程带着开发机的凭证跑到真 turn，早退断言失效
 ///    （进而整个文件失去意义）；
-/// ④ **web 侧**四个 `YUSHAN_SEARCH_*` + `YUSHAN_FETCHED_DIR` 全清 —— 决定
+/// ④ **web 侧**五个 `YUSHAN_SEARCH_*`、通用名 `TAVILY_API_KEY` / `DEEPSEEK_API_KEY`、
+///    `YUSHAN_FETCHED_DIR` 全清 —— 决定
 ///    `WebConfig::degraded_hint` 的那句话出不出现（键名逐字取自 `adapters/tools-web` 的 `ENV_*`）；
 /// ⑤ `PATH` → 空目录 —— 决定 `toolset` 侧降级提示恒定出现。
 ///
@@ -127,6 +128,8 @@ fn isolate(cmd: &mut Command, roots: &Roots) {
         .env_remove("YUSHAN_SEARCH_TAVILY_KEY")
         // Tavily 的生态通用名：产品会作为回退读取，不清则随开发机 shell 漂移。
         .env_remove("TAVILY_API_KEY")
+        .env_remove("YUSHAN_SEARCH_DEEPSEEK_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("YUSHAN_FETCHED_DIR");

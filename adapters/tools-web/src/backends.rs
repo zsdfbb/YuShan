@@ -2,7 +2,7 @@
 //!
 //! # 为什么是表 + 两个 `match`，而不是 `SearchBackend` trait
 //!
-//! 四家的差异只有 6 个轴 —— 方法 / URL / 鉴权头 / 请求体 / 响应路径 / 字段名 ——
+//! 五家的差异只有 6 个轴 —— 方法 / URL / 鉴权头 / 请求体 / 响应路径 / 字段名 ——
 //! **全是数据**，不是算法。一张 `const TABLE` + 两个**穷尽** `match` 就够了，且
 //! 将来加一家时漏改某个臂是**编译错误**，不会静默漂移（设计 §1.3 / §3 裁决一）。
 //!
@@ -13,7 +13,7 @@
 //!
 //! | 读法 | 谁读 | 用来干什么 |
 //! |---|---|---|
-//! | [`TABLE`] 的**顺序** | [`resolve_backends`] | 链序：`已配 key 的 provider（tavily → bocha → firecrawl）→ searxng` |
+//! | [`TABLE`] 的**顺序** | [`resolve_backends`] | 链序：`已配 key 的 provider（deepseek → tavily → bocha → firecrawl）→ searxng` |
 //! | `Row.endpoint` / `endpoint_env` | [`resolve_backends`] + [`plan`] | 请求地址（SearXNG 的地址天然是用户配置） |
 //! | `Row.key_envs` / `keyless` | [`resolve_backends`] | 未配 key 的行在**构造期**就被剔除 |
 //!
@@ -37,12 +37,14 @@ use reqwest::{Client, RequestBuilder, Url};
 use serde_json::{Value, json};
 
 use crate::{
-    Backend, ENV_BOCHA_KEY, ENV_FIRECRAWL_KEY, ENV_SEARXNG_URL, ENV_TAVILY_KEY,
-    ENV_TAVILY_KEY_ALIAS, Kind,
+    Backend, ENV_BOCHA_KEY, ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS, ENV_FIRECRAWL_KEY,
+    ENV_SEARXNG_URL, ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS, Kind,
 };
 
 // ---------- 常量：端点与上限 ----------
 
+/// DeepSeek 服务根（`plan` 追加 `/v1/tools/search`）。
+const DEEPSEEK_ROOT: &str = "https://api.deepseek.com";
 /// Tavily 服务根（`plan` 追加 `/search`）。
 const TAVILY_ROOT: &str = "https://api.tavily.com";
 /// 博查服务根（`plan` 追加 `/v1/web-search`）。
@@ -55,6 +57,10 @@ const FIRECRAWL_ROOT: &str = "https://api.firecrawl.dev";
 /// 项目级名在前，是为了让「特意为本项目配的 key」压过 shell 里为别的 Tavily 工具
 /// 配的通用 key —— 同一台机器上两者常常指向不同的额度或套餐。
 const TAVILY_KEY_ENVS: &[&str] = &[ENV_TAVILY_KEY, ENV_TAVILY_KEY_ALIAS];
+
+/// DeepSeek 密钥的**接受名**，规则与 [`TAVILY_KEY_ENVS`] 同源：项目命名空间在前，
+/// 生态通用名 `DEEPSEEK_API_KEY` 兜底。
+const DEEPSEEK_KEY_ENVS: &[&str] = &[ENV_DEEPSEEK_KEY, ENV_DEEPSEEK_KEY_ALIAS];
 
 /// `limit` 的**契约上限**（设计 §4「搜索 `limit` 默认 10（clamp 1..=20）」）。
 ///
@@ -90,7 +96,7 @@ struct Row {
     key_envs: &'static [&'static str],
     /// **没有密钥时是否仍留在链上**。
     ///
-    /// - `false`（tavily / bocha / firecrawl）：没配 key = 用户没打算用这一家 → **构造期**剔除；
+    /// - `false`（deepseek / tavily / bocha / firecrawl）：没配 key = 用户没打算用这一家 → **构造期**剔除；
     /// - `true`（**只剩 searxng**）：这一家**本来就没有密钥这个概念** —— 它的「凭证」是
     ///   实例地址（由 [`Row::endpoint_env`] 保证，地址缺席时走另一条剔除路径）。
     ///
@@ -108,26 +114,23 @@ struct Row {
 /// 后端链的**唯一真值**。**顺序即链序**。
 ///
 /// ```text
-/// 已配 key 的 provider（tavily → bocha → firecrawl） → searxng
+/// 已配 key 的 provider（deepseek → tavily → bocha → firecrawl） → searxng
 /// ```
 ///
-/// # 为什么是这个序（设计 §1.8①，2026-09-18 修订）
+/// # 为什么是这个序（设计 §1.8①）
 ///
 /// 分界线是「**用户有没有显式配置**」，不是「免费 / 收费」：
 ///
-/// - **前三家都是托管搜索 API**（用户配 key ⇒ 想要那一家的质量），且**返回的就是搜索结果
-///   本身** —— 一家一问，没有中间层；
+/// - **deepseek / tavily / bocha / firecrawl 都是托管搜索 API**（用户配 key ⇒ 想要那一家的
+///   质量），且**返回的就是搜索结果本身** —— 一家一问，没有中间层；
 /// - **searxng 是元搜索**：它自己还要再转发给上游引擎（`unresponsive_engines` 是**部分引擎
 ///   挂掉**的常态，见自家 fixture），多一跳、结果质量取决于该实例开了哪些引擎与有没有被上游
 ///   限流，**我们无法评估** → 排最后。
 ///
-/// ⚠️ **旧理由已失效**：初稿写的是「用户自建的 SearXNG 比第三方**免费额度**可靠，故 searxng
-/// 排在 firecrawl 之前」。Firecrawl 转入「需 key 的托管服务」组后**不再是免费额度**，那条比较
-/// 的另一个对象消失了 —— 留 searxng 在它前面就只是「自建比收费可靠」这一条**未经验证**的断言，
-/// 且与「配了 key 说明用户想要那一家的质量」自相矛盾（同一理由会让 searxng 该排 tavily 前面）。
-/// 故 searxng 退到**末位**。
+/// DeepSeek 排在托管组首位：用户显式配置 DeepSeek 搜索 key 即视为想要这一家的结果；
+/// 该行未配置时在构造期剔除，故对既有用户的链序无影响。
 ///
-/// **零配置用户的链与旧稿一致地「什么都不猜」**：无地址的 searxng 与无 key 的三家**全被剔除**
+/// **零配置用户「什么都不猜」**：无地址的 searxng 与无 key 的四家**全被剔除**
 /// ⇒ 链为空 ⇒ [`crate::WebConfig::degraded_hint`] 明确报「未配置任何搜索后端」。
 ///
 /// 顺序**完全由这张表决定** —— 不按延迟、不按成功率、不随机、不做并行竞速。
@@ -135,6 +138,13 @@ struct Row {
 /// ⚠️ 诚实边界：表能定死**尝试顺序**，定不死「**谁成功**」（网络随机）。目标是让
 /// 不确定性**留在外部**并**可见**（`search.rs` 用 `[via x]` 明示、全败时逐条列理由）。
 const TABLE: &[Row] = &[
+    Row {
+        kind: Kind::Deepseek,
+        endpoint: DEEPSEEK_ROOT,
+        endpoint_env: None,
+        key_envs: DEEPSEEK_KEY_ENVS,
+        keyless: false,
+    },
     Row {
         kind: Kind::Tavily,
         endpoint: TAVILY_ROOT,
@@ -194,7 +204,7 @@ fn non_empty(raw: Option<String>) -> Option<String> {
 ///
 /// # 一条**推论**：零配置 ⇒ 这条链**为空**
 ///
-/// 四行**都可能被剔除**：tavily / bocha / firecrawl 要 key，searxng 要地址。于是
+/// 五行**都可能被剔除**：deepseek / tavily / bocha / firecrawl 要 key，searxng 要地址。于是
 /// 「**一个 `YUSHAN_SEARCH_*` 都没配**」得到一个空链，[`crate::WebConfig::degraded_hint`]
 /// 里那句「未配置任何搜索后端」因此**在 `from_env` 路径上可达** —— 零配置的用户
 /// 一定能看到一句提示，而不是带着一条**自己没选过**的链去撞 401（见 `Row::keyless` 的修订记录）。
@@ -235,6 +245,7 @@ pub fn resolve_backends(env: impl Fn(&str) -> Option<String>) -> Vec<Backend> {
 /// 用户 / 模型 / 采集脚本，`Searxng` 与 `searxng` 混用会让 fixture 文件名两处对不上。
 pub fn kind_slug(kind: Kind) -> &'static str {
     match kind {
+        Kind::Deepseek => "deepseek",
         Kind::Searxng => "searxng",
         Kind::Tavily => "tavily",
         Kind::Bocha => "bocha",
@@ -286,6 +297,7 @@ fn join(root: &str, path: &str) -> String {
 /// 请求地址（`plan` 与采集脚本共用的一份真值）。
 fn request_url(b: &Backend) -> String {
     match b.kind {
+        Kind::Deepseek => join(&b.endpoint, "/v1/tools/search"),
         // SearXNG 的 API 路径固定是 `/search`（自建实例常在 http://127.0.0.1:8888）。
         Kind::Searxng => join(&b.endpoint, "/search"),
         Kind::Tavily => join(&b.endpoint, "/search"),
@@ -346,11 +358,12 @@ fn bearer(req: RequestBuilder, key: &str) -> Result<RequestBuilder, String> {
 /// | backend | 方法 | 路径 | 鉴权 | 请求体 |
 /// |---|---|---|---|---|
 /// | SearXNG | GET | `/search?q=&format=json` | 无 | — |
+/// | DeepSeek | POST | `/v1/tools/search` | `Authorization: Bearer` | `{query, count, need_content}` |
 /// | Tavily | POST | `/search` | `Authorization: Bearer` | `{query, max_results, search_depth}` |
 /// | Bocha | POST | `/v1/web-search` | `Authorization: Bearer` | `{query, count, summary}` |
 /// | Firecrawl | POST | `/v2/search` | `Authorization: Bearer`（**必需**） | `{query, limit}` |
 ///
-/// 三处**有意为之**的取舍：
+/// 四处**有意为之**的取舍：
 ///
 /// - **SearXNG 没有 `limit` 参数**（API 只有 `q/categories/engines/language/pageno/
 ///   time_range/format/safesearch`），故这一家**忽略 `limit`** —— 裁剪由 `search.rs`
@@ -359,6 +372,8 @@ fn bearer(req: RequestBuilder, key: &str) -> Result<RequestBuilder, String> {
 ///   任何理由去覆盖自建实例主人的选择。
 /// - **Bocha 传 `summary: false`**：`true` 会额外让对端生成一段 AI 摘要（更慢、更贵），
 ///   而我们的映射只取短片段（`snippet`）—— 花了钱却丢掉，不如不要。
+/// - **DeepSeek 传 `need_content: false`**：正文交给 `webfetch`，搜索只要短片段；
+///   不传 `ori_question` / `localization` —— 工具拿不到对话上下文与用户 IP。
 pub fn plan(
     client: &Client,
     b: &Backend,
@@ -378,6 +393,14 @@ pub fn plan(
                 .append_pair("format", "json");
             Ok(client.get(url))
         }
+        Kind::Deepseek => bearer(
+            client.post(url).json(&json!({
+                "query": query,
+                "count": limit,
+                "need_content": false,
+            })),
+            require_key(b)?,
+        ),
         Kind::Tavily => bearer(
             client.post(url).json(&json!({
                 "query": query,
@@ -410,7 +433,7 @@ pub fn plan(
 
 // ---------- 响应映射 ----------
 
-/// 一条搜索命中 —— 四家的响应**最终都收敛到这三个字段**。
+/// 一条搜索命中 —— 五家的响应**最终都收敛到这三个字段**。
 ///
 /// 刻意只有这三个：`score` / `engine` / `datePublished` 之类各家不一（有的一家有一家
 /// 没有），把它们塞进来就要解释「SearXNG 的 score 与 Tavily 的 score 能不能比」——
@@ -557,8 +580,8 @@ fn ensure_json_ctype(ctype: Option<&str>) -> Result<(), String> {
 /// 非 2xx 在 [`crate::fetch_capped`] 里就已经是 [`crate::FetchError::Status`] 了
 /// （那一层**不读体**）。于是 `parse` 面对的永远是 2xx 正文 —— **但 2xx 也可能是失败**：
 /// SearXNG 的静默失败（上面那条），以及各家把自己家的错误塞进 200 正文的形态
-/// （Bocha 的 `code` / Firecrawl 的 `success` / Tavily 的 `detail`）。
-/// 故这三家在下面各自**认领自己的错误字段** —— 它们是「正文里的事实」，
+/// （Bocha 的 `code` / Firecrawl 的 `success` / Tavily 的 `detail` / DeepSeek 的 `error`）。
+/// 故这几家在下面各自**认领自己的错误字段** —— 它们是「正文里的事实」，
 /// 不归状态码管。
 ///
 /// # 错误文案是给**模型/用户**看的
@@ -577,11 +600,34 @@ pub fn parse(kind: Kind, ctype: Option<&str>, body: &str) -> Result<Vec<SearchHi
         .map_err(|e| format!("{} 返回的不是合法 JSON：{e}", kind_slug(kind)))?;
 
     match kind {
+        Kind::Deepseek => deepseek_hits(&value),
         Kind::Searxng => searxng_hits(&value),
         Kind::Tavily => tavily_hits(&value),
         Kind::Bocha => bocha_hits(&value),
         Kind::Firecrawl => firecrawl_hits(&value),
     }
+}
+
+/// DeepSeek：`results[]{title, url, snippet, summary}`。
+///
+/// **已核**（官方 Search API 文档的响应样例：`results[]` 逐条给出 `title` / `url` /
+/// `snippet` / `summary`，另有 `rerank_score` / `content` / `site_name` / `date` /
+/// `authority` 等）。`summary` 优先、`snippet` 兜底 —— `need_content:false` 时不请求正文，
+/// 短片段是模型真正用得上的部分。`rerank_score` / `authority` **不参与过滤或重排**：
+/// 跨家不可比的分数不该改变链的语义。
+///
+/// 错误形态：官方 OpenAI 兼容错误信封 `{"error":{"message","type","param","code"}}`。
+///
+/// ⚠️ **数组缺失 ⇒ `Err`（链继续试下一家），`results: []` ⇒ `Ok(0)`（链停）**：
+/// 前者说明响应形状不对，后者是「真没结果」——两种语义的差别是**链还会不会去试别人**。
+fn deepseek_hits(v: &Value) -> Result<Vec<SearchHit>, String> {
+    if let Some(items) = take_array(v, &[&["results"]]) {
+        return Ok(map_hits(items, "title", "url", &["summary", "snippet"]));
+    }
+    if let Some(error) = v.get("error") {
+        return Err(format!("deepseek error: {}", brief(error)));
+    }
+    Err("deepseek 响应缺少 results 数组".to_string())
 }
 
 /// SearXNG：`results[]{title, url, content}`。
@@ -666,7 +712,7 @@ fn firecrawl_hits(v: &Value) -> Result<Vec<SearchHit>, String> {
 mod tests {
     use super::*;
 
-    /// 常量根（`TABLE` 里的三行）：追加路径。
+    /// 常量根（`TABLE` 里的行）：追加路径。
     #[test]
     fn test_join_appends_path_to_bare_root() {
         assert_eq!(

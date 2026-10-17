@@ -723,7 +723,7 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 
 ## 14. `ys-tui-coding` 形态与命令分工
 
-**表在 TUI 侧**（`crates/ys-tui-coding/src/commands.rs`，13 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`crates/ys-tui-coding/src/commands.rs`，14 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app（`capabilities.rs`）。二者唯一契约是 `Request` ——
 漏实现是**编译错误**（app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -746,6 +746,7 @@ flowchart TB
 | `/copy` | 本地（最后一条 assistant 回复写进 transcript，**无剪贴板依赖**） | — |
 | `/quit` | 本地 | — |
 | `/thinking [on\|off]` | 本地开关（thinking 默认隐藏，开启后暗色渲染） | — |
+| `/effort [level]` | 无参本地显示当前档位与用法；有参直发（`default` 清除设置） | `SetEffort` |
 | `/model [name]` | 无参时**浮层选择**（`available_models`） | `SetModel` |
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
@@ -759,7 +760,7 @@ flowchart TB
 `TuiPrompter` 把同一套问答画成嵌套事件循环的模态浮层。任一问答步骤取消 → **不产生任何 `Request`**。
 
 **app 侧能力**（`apps/coding-agent/src/capabilities.rs`）：`login` / `logout` / `set_model` /
-`new_session` / `compact` / `export` 每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
+`set_effort` / `new_session` / `compact` / `export` 每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
 `Outbound::Output`；`list_sessions` 返回 `Vec<SessionSummary>`（走 `Outbound::SessionList`）；
 `resume_session` 返回「文本行 + 可选 `ResumedSession`」（成功后由 `app_loop` 组装
 `Outbound::SessionResumed`）。

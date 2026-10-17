@@ -43,6 +43,7 @@ async fn e2e_four_tools_calculator() {
         max_tokens: Some(4096),
         temperature: Some(0.0),
         compat: ProviderCompat::deepseek(),
+        effort: None,
     });
 
     let task = format!(

@@ -42,10 +42,12 @@ must_not_have() {
     fi
 }
 
-# 1. architecture.md §14 命令表含 /resume，且「11 条」这一过期计数已消失。
+# 1. architecture.md §14 命令表含 /resume 与 /effort，且过期计数已消失。
 must_have     "$ARCH" '/resume' "architecture.md 命令表含 /resume"
+must_have     "$ARCH" '/effort' "architecture.md 命令表含 /effort"
 must_not_have "$ARCH" '11 条'   "architecture.md 不再出现「11 条」"
-must_have     "$ARCH" '13 条'   "architecture.md 命令计数为 13 条"
+must_not_have "$ARCH" '13 条'   "architecture.md 不再出现「13 条」"
+must_have     "$ARCH" '14 条'   "architecture.md 命令计数为 14 条"
 
 # 2. CONTEXT.md 有 resume 术语条目，且写明「替换而非合并」。
 must_have "$CONTEXT" 'resume'       "CONTEXT.md 含 resume 术语条目"

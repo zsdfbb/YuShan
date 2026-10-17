@@ -152,7 +152,7 @@ impl Session for JsonlSession {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use ys_core::{ContentBlock, Role};
+    use ys_core::{ContentBlock, EffortLevel, Role};
 
     /// 唯一临时路径：进程内原子序号 + `process::id()`，避免并行测试撞名互删文件。
     fn temp_path(tag: &str) -> PathBuf {
@@ -352,6 +352,7 @@ mod tests {
         meta.provider = Some("deepseek".into());
         meta.model = Some("deepseek-chat".into());
         meta.thinking_visible = true;
+        meta.effort = Some(EffortLevel::High);
         meta.input_tokens = 12345;
         meta.output_tokens = 678;
         meta.turns = 4;
@@ -429,6 +430,8 @@ mod tests {
             );
         }
 
+        // 重新打开后 meta 精确相等：`sample_meta()` 含 `effort`，故这里同时覆盖
+        // effort 在磁盘层的保留。
         let reopened = JsonlSession::open(&path).await.unwrap();
         assert_eq!(reopened.meta(), Some(&meta), "落盘后 meta 仍在");
         assert_eq!(reopened.messages(), [text_msg(Role::Assistant, "summary")]);

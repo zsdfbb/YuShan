@@ -71,7 +71,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
-use ys_core::StopReason;
+use ys_core::{EffortLevel, StopReason};
 use ys_event::AgentEvent;
 use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_model_openai_compat::{
@@ -1070,6 +1070,8 @@ pub(crate) fn seed_stats(wiring: &Wiring) -> status::TurnStats {
 ///   恒为 `None`，无条件写会把 `/login` 落到 meta 的 provider 清空 —— 设计 D10
 ///   第 2 级恢复（`meta.provider` + `registry.auth_for`）便永久失效。
 /// - `thinking`：仅 `Some` 时写（`-p`/`--json` 不参与 thinking 开关）。
+/// - `effort`：外层 `None` = **不写**（`-p`/`--json`）；`Some(v)` = 写入
+///   `meta.effort = v`（`v = None` 即清除已持久化的档位）。
 /// - `workspace`：**仅某种 attach 状态时写**（`Some` = 本次工作区绑定到该树路径）。
 ///   `None`（共享工作区）**不写** —— 把共享工作区（= 启动 cwd）记进 meta 是无用噪声，
 ///   且下次 `--resume` 会据此做一次无意义的「恢复」。
@@ -1081,6 +1083,7 @@ pub(crate) async fn finalize_turn_meta(
     provider: Option<&str>,
     model: Option<&str>,
     thinking_visible: Option<bool>,
+    effort: Option<Option<EffortLevel>>,
     workspace: Option<&Path>,
     stats: &status::TurnStats,
 ) -> Result<(), SessionError> {
@@ -1102,6 +1105,9 @@ pub(crate) async fn finalize_turn_meta(
             }
             if let Some(tv) = thinking_visible {
                 meta.thinking_visible = tv;
+            }
+            if let Some(e) = effort {
+                meta.effort = e;
             }
             if let Some(w) = workspace {
                 meta.workspace = Some(w.to_path_buf());
@@ -1379,6 +1385,17 @@ pub(crate) fn resolve_model_from_meta(
     None
 }
 
+/// 按会话 meta 恢复思考档位：`None` meta / meta 未记录 ⇒ 未设置（provider 默认）。
+///
+/// **调用点顺序**：必须在 model factory 注册与首次 `build_model()` **之前** ——
+/// factory 在构建实例时读 `cfg.effort`；晚于首次构建则第一个模型不带恢复的档位。
+pub(crate) fn restore_effort_from_meta(
+    cfg: &mut config::Config,
+    meta: Option<&ys_session::SessionMeta>,
+) {
+    cfg.effort = meta.and_then(|m| m.effort);
+}
+
 /// 起屏前拉不到模型目录时的统一说法：**点名要求**（不再有内置默认名）。
 fn catalog_unavailable(base: &str, reason: &str) -> String {
     format!(
@@ -1428,6 +1445,8 @@ async fn persist_single_turn(
         Some(raw_task),
         provider,
         model.as_deref(),
+        None,
+        // `-p` / `--json` 不写档位（不改变既有会话 meta 里的值）。
         None,
         binding.map(|b| b.path.as_path()),
         &stats,
@@ -2310,6 +2329,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.api_key = Some(choice.api_key);
         config.model = choice.model;
     }
+    // 思考档位随会话恢复；无 resume meta ⇒ 保持未设置（provider 默认）。
+    // 必须在下方注册 model factory 与首次 `build_model()` **之前**。
+    restore_effort_from_meta(&mut config, resume_meta.as_ref());
 
     // 走到这里**仍没有模型名**、而端点与凭证齐全 ⇒ 同步拉一次该端点的 `/v1/models`，
     // 取**第一条**当起始模型。两种情形落在这里：
@@ -2366,6 +2388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_tokens: None,
             temperature: Some(0.7),
             compat,
+            effort: cfg.effort,
         })
         .with_retry(RetryConfig {
             max_attempts: retry.max_attempts,
@@ -2406,6 +2429,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_tokens: None,
             temperature: Some(0.7),
             compat,
+            effort: cfg.effort,
         })
         .with_retry(RetryConfig {
             max_attempts: retry.max_attempts,
@@ -4069,6 +4093,7 @@ mod tests {
             Some("deepseek"),
             Some("deepseek-chat"),
             None,
+            None,
             Some(Path::new("/tmp/yushan-tree")),
             &stats,
         )
@@ -4104,6 +4129,7 @@ mod tests {
             Some("第二条"),
             Some("deepseek"),
             Some("deepseek-chat"),
+            None,
             None,
             None,
             &stats,
@@ -4154,6 +4180,7 @@ mod tests {
             Some("m1"),
             None,
             None,
+            None,
             &stats,
         )
         .await
@@ -4168,7 +4195,16 @@ mod tests {
             output_tokens: 1,
             ..Default::default()
         });
-        finalize_turn_meta(&mut wiring, Some("第二条"), None, None, None, None, &stats)
+        finalize_turn_meta(
+            &mut wiring,
+            Some("第二条"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &stats,
+        )
             .await
             .unwrap();
 
@@ -4187,6 +4223,81 @@ mod tests {
         assert_eq!(meta.turns, 2, "turns 照常刷新");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finalize_turn_meta` 的 effort 三态：`Some(Some(..))` 写入、`Some(None)` 清除、
+    /// 外层 `None` 不改动既有值。
+    ///
+    /// 变异：把 `if let Some(e) = effort` 改成无条件 `meta.effort = effort.unwrap_or(None)`
+    /// ⇒ 第三条断言的「不写」部分变红（既有 High 被清成 None）。
+    #[tokio::test]
+    async fn finalize_turn_meta_effort_three_states() {
+        let dir = unique_tmp_dir("finalize_effort");
+        let mut wiring =
+            Wiring::persistent_new(None, Box::new(ys_event::CollectingSink::new()), dir.clone())
+                .await
+                .unwrap();
+        let stats = status::TurnStats::default();
+
+        // 1) Some(Some(High)) ⇒ 写入。
+        finalize_turn_meta(
+            &mut wiring,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(EffortLevel::High)),
+            None,
+            &stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wiring.meta().unwrap().effort, Some(EffortLevel::High));
+
+        // 2) 外层 None ⇒ 不改动（仍是 High）。
+        finalize_turn_meta(&mut wiring, None, None, None, None, None, None, &stats)
+            .await
+            .unwrap();
+        assert_eq!(
+            wiring.meta().unwrap().effort,
+            Some(EffortLevel::High),
+            "外层 None 不得改动既有档位"
+        );
+
+        // 3) Some(None) ⇒ 清除。
+        finalize_turn_meta(&mut wiring, None, None, None, None, Some(None), None, &stats)
+            .await
+            .unwrap();
+        assert_eq!(wiring.meta().unwrap().effort, None, "Some(None) 应清除");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动期档位恢复的三态：`meta = None` ⇒ 未设置；meta 未记录 ⇒ 未设置；
+    /// meta 记录 `Some(High)` ⇒ 恢复为 `Some(High)`。
+    ///
+    /// 变异：函数体改成恒 `None` ⇒ 第三条断言变红；恒用 `meta.effort.unwrap_or(High)`
+    /// ⇒ 前两条变红。
+    #[test]
+    fn restore_effort_from_meta_three_states() {
+        let mut cfg = {
+            let _guard = env_lock();
+            config::Config::from_env().unwrap()
+        };
+        cfg.effort = Some(EffortLevel::Low); // 旧值，必须被覆盖
+
+        restore_effort_from_meta(&mut cfg, None);
+        assert_eq!(cfg.effort, None, "无 resume meta ⇒ 未设置");
+
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.effort = None;
+        cfg.effort = Some(EffortLevel::Low);
+        restore_effort_from_meta(&mut cfg, Some(&meta));
+        assert_eq!(cfg.effort, None, "meta 未记录档位 ⇒ 未设置");
+
+        meta.effort = Some(EffortLevel::High);
+        restore_effort_from_meta(&mut cfg, Some(&meta));
+        assert_eq!(cfg.effort, Some(EffortLevel::High), "应恢复记录的档位");
     }
 
     /// `raw_and_expanded_task`（`-p` / `--json` 共用）：`expanded` 是带 `<skill …>`

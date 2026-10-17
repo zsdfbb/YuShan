@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use ys_core::EffortLevel;
 use ys_model::Model;
 
 use crate::provider::ProviderRegistry;
@@ -141,6 +142,9 @@ pub struct Config {
     pub model: String,
     pub cwd: PathBuf,
     pub provider: Option<String>,
+    /// 当前思考档位（`/effort`）。`None` = 未设置 ⇒ 请求里不发思考参数
+    /// （provider 默认）。随会话 meta 恢复与持久化，但**不**进 `config.json`。
+    pub effort: Option<EffortLevel>,
     pub registry: ProviderRegistry,
     /// 启动期扫描到的 skill（**已去重、已按 `command` 升序**）。
     ///
@@ -183,6 +187,7 @@ impl Config {
             model,
             cwd,
             provider: None,
+            effort: None,
             registry: ProviderRegistry::new(),
             skills: Vec::new(),
             skills_omitted: 0,
@@ -389,6 +394,15 @@ impl Config {
         self.registry.compat_for(name)
     }
 
+    /// 当前 provider 是否接受思考参数（`minimax` 等方言为 `None`）。
+    ///
+    /// 设置档位照常保存（切到支持的 provider 后立即生效），此处只决定是否给
+    /// 用户一条「本次请求不会发送思考字段」的提示。
+    pub fn supports_reasoning_effort(&self) -> bool {
+        self.current_compat().reasoning_dialect
+            != ys_model_openai_compat::compat::ReasoningDialect::None
+    }
+
     /// 当前 provider / api_base 要求的额外请求头（透传给适配器）。
     ///
     /// 生产消费者：`main.rs` 的两个 model factory —— 每次 `build_model` 都重取，
@@ -527,6 +541,7 @@ mod tests {
             model: model.to_string(),
             cwd: PathBuf::from("/tmp"),
             provider: None,
+            effort: None,
             registry: ProviderRegistry::new(),
             skills: Vec::new(),
             skills_omitted: 0,

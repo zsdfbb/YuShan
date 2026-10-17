@@ -1,9 +1,29 @@
+/// 思考参数的 provider wire 方言。
+///
+/// 各 provider 对「如何要求模型思考」的字段组合不同，且**互斥性**不同：
+/// 有的只认 `reasoning_effort`，有的要求 `thinking` 开关与档位同发，
+/// 有的网关则拒绝两者同时出现。翻译规则见 `lib.rs::reasoning_params`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningDialect {
+    /// 不发送任何思考参数（如 MiniMax）。
+    None,
+    /// OpenAI 风格：只发 `reasoning_effort`；`off` → `"none"`。
+    OpenAiEffort,
+    /// DeepSeek 官方：`reasoning_effort` + `thinking:{type}` 同发；`off` → 只发 disabled。
+    DeepSeek,
+    /// OpenCode Go 网关：`off` → 只发 `thinking:disabled`；档位 → 只发 `reasoning_effort`。
+    /// **绝不同时发送两个字段**（网关会 400）。
+    OpenCodeGo,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderCompat {
     /// DeepSeek: reasoning_content 字段
     pub has_reasoning_content: bool,
     /// MiniMax: tool_calls 可能作为 text 返回
     pub tool_calls_as_text: bool,
+    /// 思考参数的 wire 方言。
+    pub reasoning_dialect: ReasoningDialect,
     /// 是否在流式请求里发送 `stream_options.include_usage` 以获取 token 统计。
     ///
     /// 默认开启（见 [`ProviderCompat::standard`]）。OpenAI 兼容端点普遍容忍
@@ -23,6 +43,7 @@ impl Default for ProviderCompat {
         Self {
             has_reasoning_content: false,
             tool_calls_as_text: false,
+            reasoning_dialect: ReasoningDialect::OpenAiEffort,
             supports_stream_usage: true,
         }
     }
@@ -32,6 +53,7 @@ impl ProviderCompat {
     pub fn deepseek() -> Self {
         Self {
             has_reasoning_content: true,
+            reasoning_dialect: ReasoningDialect::DeepSeek,
             // DeepSeek 兼容 OpenAI 的 stream_options.include_usage，流式末包带 usage。
             supports_stream_usage: true,
             ..Default::default()
@@ -41,6 +63,7 @@ impl ProviderCompat {
     pub fn minimax() -> Self {
         Self {
             tool_calls_as_text: true,
+            reasoning_dialect: ReasoningDialect::None,
             // MiniMax 兼容层对未知顶层字段是否放行未经验证，保守关闭：
             // 宁可 token 统计为 0，也不冒 400 的风险。（若实测放行，可改为 true。）
             supports_stream_usage: false,
@@ -60,6 +83,7 @@ impl ProviderCompat {
     pub fn opencode_go() -> Self {
         Self {
             has_reasoning_content: true,
+            reasoning_dialect: ReasoningDialect::OpenCodeGo,
             ..Default::default()
         }
     }
@@ -100,13 +124,40 @@ mod tests {
         assert!(ProviderCompat::deepseek().has_reasoning_content);
     }
 
-    /// opencode go 的推理模型用 `reasoning_content`（同 DeepSeek 方言），
-    /// 且放行 `stream_options.include_usage`。
+    /// opencode go 的推理模型在**响应侧**用 `reasoning_content`（同 DeepSeek 的
+    /// 解析形状），且放行 `stream_options.include_usage`。
     #[test]
-    fn opencode_go_uses_deepseek_thinking_dialect_and_stream_usage() {
+    fn opencode_go_parses_deepseek_reasoning_content_and_stream_usage() {
         let compat = ProviderCompat::opencode_go();
         assert!(compat.has_reasoning_content);
         assert!(compat.supports_stream_usage);
         assert!(!compat.tool_calls_as_text);
+        assert_eq!(compat.reasoning_dialect, ReasoningDialect::OpenCodeGo);
+    }
+
+    /// 每个构造器都必须显式钉住自己的思考方言；
+    /// `default()` / `standard()` 落到 `OpenAiEffort`。
+    #[test]
+    fn constructors_pin_reasoning_dialect() {
+        assert_eq!(
+            ProviderCompat::default().reasoning_dialect,
+            ReasoningDialect::OpenAiEffort
+        );
+        assert_eq!(
+            ProviderCompat::standard().reasoning_dialect,
+            ReasoningDialect::OpenAiEffort
+        );
+        assert_eq!(
+            ProviderCompat::deepseek().reasoning_dialect,
+            ReasoningDialect::DeepSeek
+        );
+        assert_eq!(
+            ProviderCompat::minimax().reasoning_dialect,
+            ReasoningDialect::None
+        );
+        assert_eq!(
+            ProviderCompat::opencode_go().reasoning_dialect,
+            ReasoningDialect::OpenCodeGo
+        );
     }
 }

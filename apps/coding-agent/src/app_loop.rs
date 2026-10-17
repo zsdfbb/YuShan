@@ -27,7 +27,7 @@
 //!         finalize_turn_meta(..).await;   // 回合末写穿 meta
 //!       }
 //!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
-//!     SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
+//!     SetEffort/SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
 //!     ListSessions/ResumeSession => { 会话列表 / 原子恢复 → SessionList/SessionResumed }
 //!   }
 //!   emit_view();                     // 每个请求处理完刷一次快照
@@ -337,6 +337,8 @@ pub async fn run(
                                 ctx.config.provider.as_deref(),
                                 model.as_deref(),
                                 Some(ctx.thinking_visible),
+                                // TUI 模式：档位随回合末写穿会话 meta。
+                                Some(ctx.config.effort),
                                 ws.as_ref().map(|b| b.path.as_path()),
                                 ctx.stats,
                             )
@@ -369,6 +371,11 @@ pub async fn run(
             Request::SetThinking { visible } => {
                 // 单向更新进程级镜像；UI 侧已本地即时生效。无输出。
                 thinking_visible = visible;
+            }
+
+            Request::SetEffort { effort } => {
+                // 设置照常保存 + 重建 model；不支持的 provider 由能力函数给出 warning。
+                lines = capabilities::set_effort(&mut config, &mut wiring, effort);
             }
 
             Request::SetModel { model, provider } => {
@@ -1029,7 +1036,8 @@ mod tests {
     use ys_tools_web::{FetchedDir, WebConfig};
 
     /// 所有跨任务 `await` 都套这个超时：死锁回归必须表现为**失败**，而不是把测试挂住。
-    const TIMEOUT: Duration = Duration::from_secs(5);
+    /// 该值只是死锁守卫，真死锁仍会失败；取 15s 是为了避免并行测试负载下的误报。
+    const TIMEOUT: Duration = Duration::from_secs(15);
 
     /// 等「第 1 次 model 调用开始」的上限。**只影响失败有多快，不影响正确性**：
     /// 超时后照样放行门控（见 `stale_abort_...` 测试）。取一个远大于「任务已被
@@ -1879,6 +1887,14 @@ mod tests {
         meta.thinking_visible
     }
 
+    /// 读会话文件首行 meta 的 `effort`（测试专用）。
+    fn read_meta_effort(path: &Path) -> Option<ys_core::EffortLevel> {
+        let content = std::fs::read_to_string(path).expect("会话文件应存在");
+        let first = content.lines().next().expect("应有首行 meta");
+        let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
+        meta.effort
+    }
+
     /// 读会话文件首行 meta 的 `title`（测试专用）。
     fn read_meta_title(path: &Path) -> Option<String> {
         let content = std::fs::read_to_string(path).expect("会话文件应存在");
@@ -1963,9 +1979,99 @@ mod tests {
         );
     }
 
-    /// 6. **穷尽 `Request` 变体**：8 个变体各发一次，app 循环都必须处理并给出出站
-    ///    消息、不得 panic（`Prompt` → 事件；6 个能力 → `Output` + `View`；
-    ///    `SetThinking` → 仅 `View`）。
+    /// **回合末把 `config.effort` 写进会话 meta**（TUI 路径）。
+    ///
+    /// 变异：把 `finalize_turn_meta` 调用点的 `Some(ctx.config.effort)` 改成 `None`
+    /// ⇒ 回合结束后的 `meta.effort` 是 `None` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn turn_end_persists_effort_to_meta() {
+        let model = MockModel::new("mock");
+        let mut h = spawn_app_loop_with(Box::new(model), true, Vec::new(), |config, _tmp| {
+            // `/effort` 会重建 model；factory 给出可响应的实例，避免接线器被
+            // 置空后回合拿不到模型。
+            config.set_model_factory(|_| {
+                let m = MockModel::new("effort-model");
+                m.push_text("done");
+                Some(Box::new(m))
+            });
+        })
+        .await;
+
+        h.requests
+            .send(Request::SetEffort {
+                effort: Some(ys_core::EffortLevel::High),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let path = view.session_path.expect("持久会话应有文件");
+        assert_eq!(
+            read_meta_effort(&path),
+            Some(ys_core::EffortLevel::High),
+            "回合末应把当前档位写进 meta"
+        );
+    }
+
+    /// `/effort` 档位随进程、**`/new` 不重置**：`SetEffort(XHigh)` → 回合 →
+    /// `/new` → 回合，新会话 meta 仍为 `Some(XHigh)`。
+    ///
+    /// 变异：在 `Request::NewSession` 分支把 `config.effort` 清成 `None` ⇒ 第二条
+    /// 断言变红。
+    #[tokio::test]
+    async fn effort_survives_new_session() {
+        let model = MockModel::new("mock");
+        let mut h = spawn_app_loop_with(Box::new(model), true, Vec::new(), |config, _tmp| {
+            // `/effort` 会重建 model；两回合各需一条响应。
+            config.set_model_factory(|_| {
+                let m = MockModel::new("effort-model");
+                m.push_text("a");
+                m.push_text("b");
+                Some(Box::new(m))
+            });
+        })
+        .await;
+
+        h.requests
+            .send(Request::SetEffort {
+                effort: Some(ys_core::EffortLevel::XHigh),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(prompt("first")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let first_path = view.session_path.clone().expect("持久会话应有文件");
+        assert_eq!(
+            read_meta_effort(&first_path),
+            Some(ys_core::EffortLevel::XHigh),
+            "回合末应把 effort 写进 meta"
+        );
+
+        h.requests.send(Request::NewSession).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(prompt("second")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let second_path = view.session_path.clone().expect("持久会话应有文件");
+        assert_ne!(first_path, second_path, "应换到新会话");
+        assert_eq!(
+            read_meta_effort(&second_path),
+            Some(ys_core::EffortLevel::XHigh),
+            "/new 不得重置 effort"
+        );
+    }
+
+    /// 6. **`Request` 变体覆盖**：11 个变体中本用例发 9 个（`Prompt` + 7 个能力 +
+    ///    `SetThinking`；`ListSessions` / `ResumeSession` 需额外前置条件，另有用例），
+    ///    app 循环都必须处理并给出出站消息、不得 panic（`Prompt` → 事件；
+    ///    7 个能力 → `Output` + `View`；`SetThinking` → 仅 `View`）。
     #[tokio::test]
     async fn every_request_variant_is_handled() {
         let model = MockModel::new("mock");
@@ -1973,8 +2079,11 @@ mod tests {
         let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
         let export_path = h.temp_path("exported.jsonl");
 
-        // 除 `Prompt` 外、会产出 `Output` 的 6 个变体（`SetThinking` 无输出，单列）。
+        // 除 `Prompt` 外、会产出 `Output` 的 7 个变体（`SetThinking` 无输出，单列）。
         let cases = vec![
+            Request::SetEffort {
+                effort: Some(ys_core::EffortLevel::High),
+            },
             Request::SetModel {
                 model: "gpt-x".into(),
                 provider: None,
@@ -1994,7 +2103,7 @@ mod tests {
             Request::NewSession,
             Request::Compact,
         ];
-        assert_eq!(cases.len(), 6, "6 个有输出的能力变体");
+        assert_eq!(cases.len(), 7, "7 个有输出的能力变体");
 
         // `Prompt` 先跑：会话有内容，`/export` 才有东西可导。
         h.requests.send(prompt("hello")).await.unwrap();
@@ -2030,6 +2139,34 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let _ = take_view(&mut msgs);
         assert!(msgs.is_empty(), "SetThinking 不应产出 Output：{msgs:?}");
+    }
+
+    /// `SetEffort` 的可见后果：视图里的档位随请求更新，`None` 清除回未设置。
+    ///
+    /// 变异：`app_loop` 里漏掉 `Request::SetEffort` 臂 ⇒ 编译失败（`match` 穷尽）；
+    /// `view::build_view` 把 `CodingView { effort: cfg.effort }` 写死为 `None`
+    /// （配置 → 视图的透传断掉）⇒ 第一条 `view.effort` 断言变红。
+    #[tokio::test]
+    async fn set_effort_updates_view() {
+        let mut h = spawn_app_loop(Box::new(MockModel::new("mock")), false, Vec::new()).await;
+
+        h.requests
+            .send(Request::SetEffort {
+                effort: Some(ys_core::EffortLevel::XHigh),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert!(matches!(msgs.as_slice(), [Outbound::Output(_)]), "{msgs:?}");
+        assert_eq!(view.effort, Some(ys_core::EffortLevel::XHigh));
+
+        h.requests
+            .send(Request::SetEffort { effort: None })
+            .await
+            .unwrap();
+        let view = take_view(&mut collect_until_view(&mut h).await);
+        assert_eq!(view.effort, None, "None 应清除档位");
     }
 
     /// 7. **UI 退出**：drop `request_tx` → app 循环在超时内**正常返回**（不挂起）。

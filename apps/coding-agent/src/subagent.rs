@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use ys_component::RunLimits;
-use ys_core::{StopReason, Usage};
+use ys_core::{EffortLevel, StopReason, Usage};
 use ys_event::NoopEventSink;
 use ys_loop::AgentInput;
 use ys_model::Model;
@@ -186,14 +186,22 @@ impl SubagentsDir {
     }
 }
 
+/// 按名构造的模型实例缓存，键为「模型名 + 构建时的 `cfg.effort`」。
+///
+/// 把构建时档位纳入键，是为了让 `/effort` 变化后同名子 Agent 不以旧档位复用
+/// 既有实例。已知边界：键不含 provider / api_base —— 二者变化不会使缓存失效。
+pub(crate) type SubagentModelCache =
+    Arc<Mutex<HashMap<(String, Option<EffortLevel>), Arc<dyn Model>>>>;
+
 /// app 侧的派发实现：每回合构造一份（计数器天然 per-turn）。
 pub struct AppSubagentRunner<'a> {
     parent_model: Option<&'a dyn Model>,
     /// 按名构造模型用（`model` 参数）；`None` = 未接线 ⇒ 指定模型名一律 fail-closed。
     config: Option<&'a crate::config::Config>,
-    /// 按模型名缓存实例（跨派发复用连接池 + TLS）；缓存持 `Arc<dyn Model>`，
-    /// 因为 `SubagentRunner::run` 需要 `&dyn Model`，`Box` 拿不出稳定引用。
-    model_cache: Arc<Mutex<HashMap<String, Arc<dyn Model>>>>,
+    /// 按「模型名 + 构建时档位」缓存实例（跨派发复用连接池 + TLS）；缓存持
+    /// `Arc<dyn Model>`，因为 `SubagentRunner::run` 需要 `&dyn Model`，`Box`
+    /// 拿不出稳定引用。
+    model_cache: SubagentModelCache,
     child_prompt: String,
     child_limits: RunLimits,
     child_budget: Duration,
@@ -210,7 +218,7 @@ impl<'a> AppSubagentRunner<'a> {
     pub fn new(
         parent_model: Option<&'a dyn Model>,
         config: Option<&'a crate::config::Config>,
-        model_cache: Arc<Mutex<HashMap<String, Arc<dyn Model>>>>,
+        model_cache: SubagentModelCache,
         child_prompt: String,
         child_limits: RunLimits,
         child_budget: Duration,
@@ -247,8 +255,9 @@ pub struct SubagentSetup {
     workspace: PathBuf,
     web: WebConfig,
     dir: Arc<SubagentsDir>,
-    /// 按模型名缓存实例（跨派发复用；缓存持 `Arc<dyn Model>`，见 runner 的注释）。
-    model_cache: Arc<Mutex<HashMap<String, Arc<dyn Model>>>>,
+    /// 按「模型名 + 构建时档位」缓存实例（跨派发复用；缓存持 `Arc<dyn Model>`，
+    /// 见 runner 的注释）。
+    model_cache: SubagentModelCache,
 }
 
 impl SubagentSetup {
@@ -317,7 +326,10 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let owned: Option<Arc<dyn Model>> = match model {
             None => None,
             Some(name) => {
-                if let Some(hit) = self.model_cache.lock().unwrap().get(name).cloned() {
+                // 键含构建时档位：`/effort` 只重建主模型，若这里只按名缓存，
+                // 同名派发会命中旧实例（旧档位）。
+                let key = (name.to_string(), self.config.and_then(|c| c.effort));
+                if let Some(hit) = self.model_cache.lock().unwrap().get(&key).cloned() {
                     Some(hit)
                 } else {
                     let built = self
@@ -330,10 +342,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                             )
                         })?;
                     let arc: Arc<dyn Model> = Arc::from(built);
-                    self.model_cache
-                        .lock()
-                        .unwrap()
-                        .insert(name.to_string(), arc.clone());
+                    self.model_cache.lock().unwrap().insert(key, arc.clone());
                     Some(arc)
                 }
             }
@@ -881,6 +890,129 @@ mod tests {
         }
         let err = runner.run("t", None, None).await.unwrap_err();
         assert!(err.contains("上限"), "超限应响亮报错: {err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **P0**：具名模型缓存的键必须包含 `cfg.effort`。
+    ///
+    /// 同一模型名、`cfg.effort = None` 与 `Some(High)` 两次派发 ⇒ factory 被调用
+    /// 两次、缓存两条、两次摘要来自各自档位构建的实例。
+    ///
+    /// 变异：把 `SubagentModelCache` 的键改回 `String`（只用名字）⇒ 第二次派发命中旧实例，
+    /// factory 只调用一次 ⇒ `seen.len()` 与第二条摘要断言变红。
+    #[tokio::test]
+    async fn named_model_cache_key_includes_effort() {
+        use ys_model::{FinishReason, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+        use ys_tools_web::FetchedDir;
+
+        /// 把构建时的档位编进 `model_id` 与回复，便于从摘要观察实际用了哪个实例。
+        struct EffortEchoModel(String);
+        #[async_trait]
+        impl Model for EffortEchoModel {
+            fn model_id(&self) -> &str {
+                &self.0
+            }
+            async fn complete(
+                &self,
+                _request: ModelRequest,
+                _sink: &mut dyn ModelEventSink,
+            ) -> Result<ModelResponse, ModelError> {
+                Ok(ModelResponse {
+                    message: ys_core::Message {
+                        role: ys_core::Role::Assistant,
+                        content: vec![ys_core::ContentBlock::Text {
+                            text: format!("echo:{}", self.0),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                })
+            }
+        }
+
+        static COUNTER: AtomicU64 = AtomicU64::new(2);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "yushan_subagent_effort_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut config = {
+            let _guard = crate::test_env::env_lock();
+            crate::config::Config::from_env().unwrap()
+        };
+        config.api_base = Some("https://example.test".into());
+        config.api_key = Some("sk-test".into());
+        type Seen = Arc<Mutex<Vec<(String, Option<EffortLevel>)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        config.set_model_factory_for(move |cfg, name| {
+            recorder.lock().unwrap().push((name.to_string(), cfg.effort));
+            let tag = format!("{name}:{:?}", cfg.effort);
+            Some(Box::new(EffortEchoModel(tag)) as Box<dyn Model>)
+        });
+
+        let cache: SubagentModelCache = SubagentModelCache::default();
+        let dir = || Arc::new(SubagentsDir::at(base.join("subagents"), false));
+        let web = || WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
+
+        // 第一次派发：未设置档位。
+        let first = {
+            let runner = AppSubagentRunner::new(
+                None,
+                Some(&config),
+                cache.clone(),
+                "child".to_string(),
+                RunLimits::new(2),
+                Duration::from_secs(30),
+                base.clone(),
+                web(),
+                dir(),
+                Arc::new(UsageTotals::default()),
+            );
+            runner.run("x", Some("shared-name"), None).await.unwrap()
+        };
+        assert!(
+            first.summary.contains("echo:shared-name:None"),
+            "第一次派发应使用未设置档位的实例：{}",
+            first.summary
+        );
+
+        // 用户 `/effort high` 后同名再派发：必须重建，而非命中旧实例。
+        config.effort = Some(EffortLevel::High);
+        let second = {
+            let runner = AppSubagentRunner::new(
+                None,
+                Some(&config),
+                cache.clone(),
+                "child".to_string(),
+                RunLimits::new(2),
+                Duration::from_secs(30),
+                base.clone(),
+                web(),
+                dir(),
+                Arc::new(UsageTotals::default()),
+            );
+            runner.run("x", Some("shared-name"), None).await.unwrap()
+        };
+        assert!(
+            second.summary.contains("echo:shared-name:Some(High)"),
+            "档位变化后必须用新档位实例：{}",
+            second.summary
+        );
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("shared-name".to_string(), None),
+                ("shared-name".to_string(), Some(EffortLevel::High)),
+            ],
+            "factory 必须按（名字, 档位）各构建一次"
+        );
+        assert_eq!(cache.lock().unwrap().len(), 2, "缓存应有两条档位不同的条目");
 
         let _ = std::fs::remove_dir_all(&base);
     }

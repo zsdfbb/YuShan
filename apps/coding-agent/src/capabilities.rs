@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use ys_core::Message;
+use ys_core::{EffortLevel, Message};
 use ys_model::Model;
 use ys_protocol::SessionSummary;
 use ys_session::SessionMeta;
@@ -274,6 +274,36 @@ pub fn set_model(
     out
 }
 
+/// `/effort <level>`：设置思考档位，并**重建 model**（与 `SetModel` 同一路径 ——
+/// 档位落在 `OpenAICompatibleConfig` 上，只有重建才能进请求）。
+///
+/// `None` = 清除设置（恢复 provider 默认），同样需要重建。
+///
+/// 设置**照常保存**，即使当前 provider 不支持思考参数：切到支持的 provider 后
+/// 立刻生效；不支持时只在输出里多一条 warning（不阻断、不回 Err）。
+pub fn set_effort(
+    config: &mut Config,
+    wiring: &mut Wiring,
+    effort: Option<EffortLevel>,
+) -> Vec<String> {
+    config.effort = effort;
+    let shown = effort.map_or_else(|| "default".to_string(), |e| e.to_string());
+    let mut lines = vec![format!("effort: {shown}")];
+    if effort.is_some() && !config.supports_reasoning_effort() {
+        let provider = config.provider.as_deref().unwrap_or("custom");
+        lines.push(format!(
+            "warning: provider {provider} 不支持思考参数；请求中不会发送思考字段"
+        ));
+    }
+    // 与 `/model` 同规：无凭证时**清空**接线器的 model，绝不留下与 config 不一致的
+    // 旧实例（否则「已设置的档位」与「实际在跑的模型」静默各说一套）。
+    match config.build_model() {
+        Some(built) => wiring.set_model(Some(built)),
+        None => wiring.set_model(None),
+    }
+    lines
+}
+
 /// 拆 `/model` 的**限定名** `provider/model`：仅当 `/` 前那段逐字命中一个已知 provider
 /// 名时才拆，返回 `(provider, 裸模型名)`；否则 `None`（整串当模型 id）。
 ///
@@ -468,6 +498,8 @@ pub async fn resume_session(
     };
     // 3. 读目标 meta（只读首行）—— 复用启动期的读法。
     let meta = crate::sessions::read_meta(&path);
+    // 目标会话记录的思考档位（`None` = 未设置 ⇒ provider 默认）。
+    let effort = meta.as_ref().and_then(|m| m.effort);
     // 4. **纯解析**模型四字段（不写 `cfg`）；无可用凭证 ⇒ 报错、状态未动。
     let saved = state.load();
     let Some(choice) = crate::resolve_model_from_meta(cfg, meta.as_ref(), Some(&saved)) else {
@@ -477,7 +509,7 @@ pub async fn resume_session(
         );
     };
     // 5. 用**候选四字段**构建候选 model（不改动 `cfg` 的可见状态）—— 构建失败 ⇒ 报错。
-    let Some(built) = build_candidate_model(cfg, &choice) else {
+    let Some(built) = build_candidate_model(cfg, &choice, effort) else {
         return (
             vec!["Cannot resume: failed to build a model for this session.".to_string()],
             None,
@@ -493,6 +525,7 @@ pub async fn resume_session(
     cfg.api_base = Some(choice.api_base);
     cfg.api_key = Some(choice.api_key);
     cfg.model = choice.model;
+    cfg.effort = effort;
     wiring.set_model(Some(built));
 
     let summary = session_summary(&path, meta.as_ref());
@@ -510,12 +543,13 @@ pub async fn resume_session(
     )
 }
 
-/// 用**候选四字段**构建 model，但**不改动 `cfg` 对外可见的状态**。
+/// 用**候选四字段 + 候选档位**构建 model，但**不改动 `cfg` 对外可见的状态**。
 ///
 /// `build_model()` 需要一份带候选凭证的 `&Config`，而 `Config` 持有不可克隆的
 /// factory（`Box<dyn Fn>`），无法拷出一份「带候选字段的副本」。故就地换入候选四
-/// 字段、**同步**构建、随即还原 —— 全过程在任一 `await` 之前完成，对调用方而言
-/// `cfg` 从未改变（这是设计 §3.3「此步之前不得写 cfg」的落地：不留下可观测的写）。
+/// 字段与 `effort`、**同步**构建、随即还原 —— 全过程在任一 `await` 之前完成，对
+/// 调用方而言 `cfg` 从未改变（这是设计 §3.3「此步之前不得写 cfg」的落地：不留下
+/// 可观测的写）。
 ///
 /// # 前置条件：factory 不得 panic
 ///
@@ -523,11 +557,16 @@ pub async fn resume_session(
 /// factory（`build_model()` 间接调用）若 panic，栈展开会**跳过**还原，把候选四字段
 /// 留在 `cfg` 里（后续 `build_model()` 会用错凭证）。生产 factory 只做构造、不
 /// panic；此处显式声明该契约，供改动者判断是否要改成 guard 式还原。
-fn build_candidate_model(cfg: &mut Config, choice: &crate::ModelChoice) -> Option<Box<dyn Model>> {
+fn build_candidate_model(
+    cfg: &mut Config,
+    choice: &crate::ModelChoice,
+    effort: Option<EffortLevel>,
+) -> Option<Box<dyn Model>> {
     let prev_provider = cfg.provider.take();
     let prev_api_base = cfg.api_base.take();
     let prev_api_key = cfg.api_key.take();
     let prev_model = std::mem::replace(&mut cfg.model, choice.model.clone());
+    let prev_effort = std::mem::replace(&mut cfg.effort, effort);
     cfg.provider = choice.provider.clone();
     cfg.api_base = Some(choice.api_base.clone());
     cfg.api_key = Some(choice.api_key.clone());
@@ -536,6 +575,7 @@ fn build_candidate_model(cfg: &mut Config, choice: &crate::ModelChoice) -> Optio
     cfg.api_base = prev_api_base;
     cfg.api_key = prev_api_key;
     cfg.model = prev_model;
+    cfg.effort = prev_effort;
     built
 }
 
@@ -1551,6 +1591,219 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    // ───────────────────────── /effort ─────────────────────────
+
+    /// `set_effort(Some(High))`：档位保存、factory 收到它、接线器模型被重建、
+    /// 输出含用户可见的 `effort: high`。
+    ///
+    /// 变异：把 factory 调用改成不重建（只写 `config.effort`）⇒ `factory_saw` 与
+    /// `wiring.model_id()` 断言变红；把 `to_string()` 换成 Debug 拼写 ⇒ 文案断言变红。
+    #[test]
+    fn set_effort_persists_and_rebuilds_model() {
+        use std::sync::{Arc, Mutex};
+
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-test".into());
+        config.provider = Some("deepseek".into());
+        config.model = "deepseek-chat".into();
+
+        let factory_saw: Arc<Mutex<Vec<Option<EffortLevel>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = factory_saw.clone();
+        config.set_model_factory(move |cfg| {
+            seen.lock().unwrap().push(cfg.effort);
+            Some(Box::new(DummyModel))
+        });
+
+        // 接线器里先放一个旧实例，确认它被替换（而不是「本来就为空」）。
+        let mut wiring = Wiring::ephemeral(
+            Some(Box::new(DummyModel)),
+            Box::new(CollectingSink::new()),
+        );
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+
+        assert_eq!(config.effort, Some(EffortLevel::High));
+        assert_eq!(
+            *factory_saw.lock().unwrap(),
+            vec![Some(EffortLevel::High)],
+            "重建时必须传入新档位"
+        );
+        assert_eq!(wiring.model_id(), Some("dummy"), "接线器应拿到新模型");
+        assert!(out.iter().any(|l| l == "effort: high"), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `set_effort(None)` ⇒ 输出 `effort: default`（清除设置也走同一条重建路径）。
+    #[test]
+    fn set_effort_none_shows_default() {
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-test".into());
+        config.effort = Some(EffortLevel::Low);
+        let mut wiring = test_wiring();
+
+        let out = set_effort(&mut config, &mut wiring, None);
+
+        assert_eq!(config.effort, None);
+        assert!(out.iter().any(|l| l == "effort: default"), "{out:?}");
+        assert_eq!(wiring.model_id(), Some("dummy"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无凭证 ⇒ 设置仍保存，但接线器的 model **被清空**（不得留下与 config
+    /// 不一致的旧实例）。
+    #[test]
+    fn set_effort_without_credentials_clears_wiring_model() {
+        let (mut config, dir) = test_config();
+        config.api_base = None;
+        config.api_key = None;
+        let mut wiring = Wiring::ephemeral(
+            Some(Box::new(DummyModel)),
+            Box::new(CollectingSink::new()),
+        );
+        assert_eq!(wiring.model_id(), Some("dummy"), "测试前提");
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+
+        assert_eq!(config.effort, Some(EffortLevel::High), "设置照常保存");
+        assert_eq!(wiring.model_id(), None, "无凭证 ⇒ 必须清空：{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不支持的 provider（`minimax` 方言为 `None`）⇒ 多一条 warning，但**设置照常
+    /// 保存**（切到支持的 provider 后立刻生效）。
+    ///
+    /// 变异：把 warning 条件写成「不支持就拒绝设置」⇒ 第一条断言变红。
+    #[test]
+    fn set_effort_warns_when_provider_ignores_it() {
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.minimax.chat/v1".into());
+        config.api_key = Some("sk-mm".into());
+        config.provider = Some("minimax".into());
+        config.model = "MiniMax-M3".into();
+        let mut wiring = test_wiring();
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+
+        assert_eq!(
+            config.effort,
+            Some(EffortLevel::High),
+            "不支持也必须保存设置"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("warning: provider minimax")),
+            "应提示该 provider 不会发送思考字段：{out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/resume` 还原目标会话的档位：meta 里 `effort = Some(Max)` ⇒ 成功后
+    /// `cfg.effort == Some(Max)`。
+    ///
+    /// 变异：提交步漏掉 `cfg.effort = effort` ⇒ 本用例变红（仍是旧值）。
+    #[tokio::test]
+    async fn resume_session_restores_effort_from_meta() {
+        let dir = temp_dir("resume_effort");
+
+        let target_path = dir.join("target.jsonl");
+        let mut meta = SessionMeta::new(0);
+        meta.provider = Some("deepseek".into());
+        meta.model = Some("deepseek-chat".into());
+        meta.effort = Some(EffortLevel::Max);
+        std::fs::write(
+            &target_path,
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+
+        let mut cfg = {
+            let _guard = crate::test_env::env_lock();
+            Config::from_env().unwrap()
+        };
+        cfg.provider = Some("deepseek".into());
+        cfg.api_base = Some("https://api.deepseek.com".into());
+        cfg.api_key = Some("sk-test".into());
+        cfg.model = "deepseek-chat".into();
+        cfg.effort = Some(EffortLevel::Low); // 旧档位，必须被目标会话覆盖
+        // 候选模型必须按**目标会话**档位构建（而非旧档位 / None）。
+        let factory_saw: std::sync::Arc<std::sync::Mutex<Vec<Option<EffortLevel>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = factory_saw.clone();
+        cfg.set_model_factory(move |cfg| {
+            seen.lock().unwrap().push(cfg.effort);
+            if cfg.api_base.is_some() && cfg.api_key.is_some() {
+                Some(Box::new(DummyModel) as Box<dyn Model>)
+            } else {
+                None
+            }
+        });
+        let (state, state_dir) = test_state();
+
+        let (lines, resumed) = resume_session(&mut cfg, &mut wiring, &state, "target").await;
+
+        assert!(resumed.is_some(), "应成功恢复：{lines:?}");
+        assert_eq!(
+            cfg.effort,
+            Some(EffortLevel::Max),
+            "档位应随目标会话 meta 恢复"
+        );
+        assert_eq!(wiring.model_id(), Some("dummy"), "应已重建模型");
+        assert_eq!(
+            *factory_saw.lock().unwrap(),
+            vec![Some(EffortLevel::Max)],
+            "候选模型必须在目标档位下构建（变异：build_candidate_model 传 None ⇒ 变红）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// 候选构建失败（factory 恒 `None`）⇒ `cfg.effort` 必须还原为构建前的值。
+    ///
+    /// 变异：删掉 `cfg.effort = prev_effort;` 还原行 ⇒ `cfg` 停在目标档位
+    /// `Some(Max)` ⇒ 本用例变红。
+    #[test]
+    fn build_candidate_model_failure_restores_effort() {
+        let (mut cfg, dir) = test_config();
+        cfg.provider = Some("old-provider".into());
+        cfg.api_base = Some("https://old.example".into());
+        cfg.api_key = Some("old-key".into());
+        cfg.model = "old-model".into();
+        cfg.effort = Some(EffortLevel::Low);
+        // factory 恒返回 None ⇒ 候选构建失败。
+        cfg.set_model_factory(|_| None);
+
+        let choice = crate::ModelChoice {
+            provider: Some("new-provider".into()),
+            api_base: "https://new.example".into(),
+            api_key: "new-key".into(),
+            model: "new-model".into(),
+        };
+        let built = build_candidate_model(&mut cfg, &choice, Some(EffortLevel::Max));
+
+        assert!(built.is_none(), "factory 恒 None ⇒ 构建失败");
+        assert_eq!(
+            cfg.effort,
+            Some(EffortLevel::Low),
+            "构建失败必须还原旧档位"
+        );
+        assert_eq!(cfg.provider.as_deref(), Some("old-provider"));
+        assert_eq!(cfg.api_base.as_deref(), Some("https://old.example"));
+        assert_eq!(cfg.api_key.as_deref(), Some("old-key"));
+        assert_eq!(cfg.model, "old-model");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **N2 —— 顺序变异（I1）**：模型解析失败 ⇒ **会话 / 模型全不变**，只回错误文案。

@@ -424,6 +424,7 @@ async fn no_fallback_when_request_lacks_stream_options() {
             max_tokens: None,
             temperature: None,
             compat: ProviderCompat::minimax(),
+            effort: None,
         },
         client,
     );

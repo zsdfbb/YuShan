@@ -280,6 +280,7 @@ async fn e2e_skills_section_input_token_delta() {
         max_tokens: Some(4096),
         temperature: Some(0.0),
         compat: ProviderCompat::deepseek(),
+        effort: None,
     });
 
     // ── 跑 ①：**无** `<available_skills>`（工作区里此刻还没有 skills 目录）──

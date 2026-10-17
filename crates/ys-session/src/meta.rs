@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use ys_core::EffortLevel;
 
 /// 判别键 `"type"` 的取值域——恒为 `"meta"`。
 ///
@@ -42,6 +43,11 @@ pub struct SessionMeta {
     pub model: Option<String>,
     #[serde(default)]
     pub thinking_visible: bool,
+    /// 会话的思考档位（`None` = 未设置 / provider 默认）。
+    ///
+    /// `#[serde(default)]` 是回写兼容契约：早期 JSONL 首行无此键 ⇒ `None`。
+    #[serde(default)]
+    pub effort: Option<EffortLevel>,
     #[serde(default)]
     pub input_tokens: u32,
     #[serde(default)]
@@ -94,6 +100,40 @@ mod tests {
         let null = r#"{"type":"meta","workspace":null,"created_at":7}"#;
         assert_eq!(
             serde_json::from_str::<SessionMeta>(null).unwrap().workspace,
+            None
+        );
+    }
+
+    /// `effort` 的 serde 往返：`Some(High)` 必须精确回到原值。
+    #[test]
+    fn effort_serde_roundtrip() {
+        let mut meta = SessionMeta::new(7);
+        meta.effort = Some(EffortLevel::High);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("\"effort\":\"high\""),
+            "档位线拼写必须为小写：{json}"
+        );
+        let back: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.effort, Some(EffortLevel::High));
+    }
+
+    /// `effort` 是**可缺省**字段：无该键的旧 JSONL 首行照常反序列化 ⇒ `None`。
+    ///
+    /// `Option<EffortLevel>` 的缺键语义本就是 `None`；`#[serde(default)]` 是显式的
+    /// 可缺省意图表达，与结构体中其余可缺省字段（如 `workspace`）风格一致。
+    #[test]
+    fn effort_is_optional_and_backward_compatible() {
+        let old = r#"{"type":"meta","v":1,"title":"t","provider":"p","model":"m",
+            "thinking_visible":false,"input_tokens":3,"output_tokens":4,"turns":1,"created_at":42}"#;
+        let meta: SessionMeta = serde_json::from_str(old).expect("旧首行应仍可反序列化");
+        assert_eq!(meta.effort, None, "无 effort 键 ⇒ None");
+        assert_eq!(meta.title.as_deref(), Some("t"), "其余字段不受影响");
+
+        // 显式 `null` 亦按 None 处理（serde 的 Option 语义）。
+        let null = r#"{"type":"meta","effort":null,"created_at":7}"#;
+        assert_eq!(
+            serde_json::from_str::<SessionMeta>(null).unwrap().effort,
             None
         );
     }

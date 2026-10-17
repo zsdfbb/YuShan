@@ -343,7 +343,7 @@ mod tests {
     use crate::transcript::TranscriptLine;
     use crate::view::{CodingView, SkillEntry};
     use tokio::sync::mpsc;
-    use ys_core::{ContentBlock, Role};
+    use ys_core::{ContentBlock, EffortLevel, Role};
 
     /// 四条端点都留着 —— 两端都活着才是「信道通了」的语义，
     /// 只留发送端会让 `try_send` 直接 Disconnected，测试会测出假象。
@@ -1309,6 +1309,56 @@ mod tests {
             Request::SetThinking { visible: false }
         );
         assert!(ch.next_request().is_none());
+    }
+
+    /// `/effort <level>` → 直发 `SetEffort`；`default` → `effort: None`。
+    /// **不进 transcript**（档位真值由 app 侧快照推回来，命令本身没有本地回显）。
+    ///
+    /// 变异：把 `/effort` 接进 `/thinking` 那条「本地写一行 + 镜像请求」的路径
+    /// ⇒ 下面的 `transcript.is_empty` 与「只发一条」断言变红。
+    #[test]
+    fn test_effort_with_argument_sends_set_effort_only() {
+        for (input, expected) in [
+            (
+                "/effort high",
+                Request::SetEffort {
+                    effort: Some(EffortLevel::High),
+                },
+            ),
+            ("/effort default", Request::SetEffort { effort: None }),
+        ] {
+            let ch = channels();
+            let mut a = app();
+            a.input.insert_str(input);
+            key(&mut a, &ch, KeyCode::Enter);
+
+            assert_eq!(ch.next_request().unwrap(), expected, "输入 `{input}`");
+            assert!(ch.next_request().is_none(), "只发一条 SetEffort：`{input}`");
+            assert!(a.transcript.is_empty(), "命令不改 transcript：`{input}`");
+            assert!(!a.is_turning, "命令不是回合：`{input}`");
+            assert!(a.pending_prompt.is_none(), "`{input}` 不走浮层");
+        }
+    }
+
+    /// 无参 `/effort` 是**纯本地**动作：恰好一条 System 行（当前档位 + 用法），
+    /// 一个请求都不发。
+    ///
+    /// 变异：让 `Action::Local` 下也替 `Effort` 镜像一条 Request ⇒ 本测试变红。
+    #[test]
+    fn test_bare_effort_writes_one_local_line_and_sends_nothing() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/effort");
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(a.transcript.len(), 1, "只写一条：{:?}", a.transcript);
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s.starts_with("effort: default")),
+            "{:?}",
+            a.transcript
+        );
+        assert!(ch.next_request().is_none(), "无参 /effort 不发任何请求");
+        assert!(!a.is_turning);
     }
 
     /// 未知命令：本地提示 + **不发请求** + 不误当普通消息提交。

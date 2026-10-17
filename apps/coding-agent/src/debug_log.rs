@@ -26,7 +26,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
@@ -36,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use ys_core::Usage;
+use ys_model_openai_compat::{ModelAttempt, ModelTrace};
 
 use crate::logging;
 
@@ -400,6 +401,119 @@ impl DebugHandle {
         fields: Map<String, Value>,
     ) {
         record_with(&self.ctx, ev, ids, fields);
+    }
+}
+
+/// 适配器尝试读数的进程级路由器。
+///
+/// 模型 factory 在 debug 文件打开之前构造，而真实文件路径又取决于会话路径；
+/// 故模型只持有这个可克隆路由器，等 sink 就绪后由各入口 `attach` 当前会话的
+/// `DebugHandle`。debug 关闭时调用方不创建路由器，也不注入回调。
+#[derive(Clone, Default)]
+pub(crate) struct ModelTraceRouter {
+    target: Arc<RwLock<Option<TraceTarget>>>,
+}
+
+#[derive(Clone)]
+struct TraceTarget {
+    handle: DebugHandle,
+    session_id: String,
+}
+
+impl ModelTraceRouter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 绑定当前会话的写入口。`/new` / `/resume` 后必须重新绑定。
+    pub(crate) fn attach(&self, handle: DebugHandle, session_id: impl Into<String>) {
+        let mut target = self
+            .target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *target = Some(TraceTarget {
+            handle,
+            session_id: session_id.into(),
+        });
+    }
+
+    /// 给适配器的同步回调。拿不到当前目标时静默丢弃（debug 关闭或已收尾）。
+    pub(crate) fn callback(&self) -> ModelTrace {
+        let router = self.clone();
+        Arc::new(move |attempt: &ModelAttempt| router.record(attempt))
+    }
+
+    fn record(&self, attempt: &ModelAttempt) {
+        let target = self
+            .target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(target) = target else {
+            return;
+        };
+
+        let mut fields = Map::new();
+        fields.insert("attempt".into(), json!(attempt.attempt));
+        fields.insert("max_attempts".into(), json!(attempt.max_attempts));
+        fields.insert("outcome".into(), json!(attempt.outcome.as_str()));
+        fields.insert(
+            "reason_class".into(),
+            attempt
+                .reason_class
+                .map(|reason| json!(reason.as_str()))
+                .unwrap_or(Value::Null),
+        );
+        fields.insert(
+            "http_status".into(),
+            attempt
+                .http_status
+                .map(|status| json!(status))
+                .unwrap_or(Value::Null),
+        );
+        fields.insert(
+            "ttfb_ms".into(),
+            attempt
+                .ttfb_ms
+                .map(|ms| json!(ms))
+                .unwrap_or(Value::Null),
+        );
+        fields.insert(
+            "response_headers_ms".into(),
+            attempt
+                .response_headers_ms
+                .map(|ms| json!(ms))
+                .unwrap_or(Value::Null),
+        );
+        fields.insert("duration_ms".into(), json!(attempt.duration_ms));
+        fields.insert(
+            "backoff_ms".into(),
+            attempt
+                .backoff_ms
+                .map(|ms| json!(ms))
+                .unwrap_or(Value::Null),
+        );
+        fields.insert("retried".into(), json!(attempt.retried));
+        fields.insert(
+            "retry_suppressed".into(),
+            attempt
+                .retry_suppressed
+                .map(|reason| json!(reason.as_str()))
+                .unwrap_or(Value::Null),
+        );
+        fields.insert("stream_started".into(), json!(attempt.stream_started));
+        fields.insert("fallback_retry".into(), json!(attempt.fallback_retry));
+
+        target.handle.record(
+            "model_attempt",
+            DebugIds {
+                session_id: &target.session_id,
+                turn: None,
+                round: None,
+                tool_call_id: None,
+            },
+            fields,
+        );
     }
 }
 
@@ -1497,6 +1611,62 @@ mod tests {
         assert_eq!(evs.last().map(String::as_str), Some("run_end"), "{evs:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 适配器回调经 router 落到当前 debug 文件：空 router 静默，attach 后
+    /// 每个字段按 schema 写出；没有会话时不 panic、不写盘。
+    #[test]
+    fn model_trace_router_writes_attempt_records() {
+        let buf = SharedBuf::default();
+        let mut sink =
+            DebugSink::open_with_writer(buf.clone(), 64, 1024 * 1024, ArgsMode::Head).unwrap();
+        let router = ModelTraceRouter::new();
+        let callback = router.callback();
+
+        // 未 attach：debug 关闭或尚未打开，静默丢弃。
+        callback(&attempt_record());
+        assert!(buf.lines().is_empty());
+
+        router.attach(sink.handle(), "session-1");
+        callback(&attempt_record());
+        sink.flush("RunFinished");
+
+        let values: Vec<Value> = buf
+            .lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let attempt = values
+            .iter()
+            .find(|value| value["ev"] == "model_attempt")
+            .expect("应写出 model_attempt");
+        assert_eq!(attempt["session_id"], "session-1");
+        assert_eq!(attempt["attempt"], 1);
+        assert_eq!(attempt["max_attempts"], 3);
+        assert_eq!(attempt["outcome"], "retryable");
+        assert_eq!(attempt["reason_class"], "rate_limited");
+        assert_eq!(attempt["http_status"], 429);
+        assert_eq!(attempt["ttfb_ms"], Value::Null);
+        assert_eq!(attempt["backoff_ms"], 42);
+        assert_eq!(attempt["retried"], true);
+    }
+
+    fn attempt_record() -> ModelAttempt {
+        ModelAttempt {
+            attempt: 1,
+            max_attempts: 3,
+            outcome: ys_model_openai_compat::ModelAttemptOutcome::Retryable,
+            reason_class: Some(ys_model_openai_compat::ModelAttemptReason::RateLimited),
+            http_status: Some(429),
+            ttfb_ms: None,
+            response_headers_ms: Some(8),
+            duration_ms: 10,
+            backoff_ms: Some(42),
+            retried: true,
+            retry_suppressed: None,
+            stream_started: false,
+            fallback_retry: false,
+        }
     }
 
     /// 开关优先级：env 优先；`1/true/yes/on` 为开、其余非空为关；空串跟随 flag。

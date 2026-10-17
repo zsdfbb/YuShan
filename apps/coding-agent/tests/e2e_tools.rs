@@ -42,6 +42,7 @@ async fn e2e_four_tools_calculator() {
         model: "deepseek-chat".into(),
         max_tokens: Some(4096),
         temperature: Some(0.0),
+        reasoning_effort: None,
         compat: ProviderCompat::deepseek(),
     });
 

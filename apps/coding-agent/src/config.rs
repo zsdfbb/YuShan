@@ -6,6 +6,9 @@ use ys_model::Model;
 
 use crate::provider::ProviderRegistry;
 
+/// 默认推理强度。`high` 是该模型可接受的最低默认档，`low` 只留给显式实验。
+pub(crate) const DEFAULT_REASONING_EFFORT: &str = "high";
+
 /// Model factory 函数类型。封装适配器特有的构建逻辑。
 /// config 不完整（缺 api_base/api_key）时返回 None。
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
@@ -153,6 +156,8 @@ pub struct Config {
     pub skills: Vec<crate::skills::SkillEntry>,
     /// 因整表字节预算被收起的 skill 条数（`Catalogue.omitted`，R3 的可见性出口）。
     pub skills_omitted: usize,
+    /// 可选推理强度（`YUSHAN_REASONING_EFFORT`）。`None` = 不发送 provider 字段。
+    reasoning_effort: Option<String>,
     /// 从 `~/.yushan/config.json` 读到的覆盖项（用户写、app 只读）。
     ///
     /// 由 [`Config::load_user_config`] 写入，经 [`Config::context_window`] /
@@ -176,6 +181,10 @@ impl Config {
         // （`YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连时）。
         let model = std::env::var("YUSHAN_MODEL").unwrap_or_default();
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let reasoning_effort = parse_reasoning_effort(
+            std::env::var("YUSHAN_REASONING_EFFORT").ok().as_deref(),
+        )
+        .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_string()));
 
         Ok(Self {
             api_base,
@@ -186,6 +195,7 @@ impl Config {
             registry: ProviderRegistry::new(),
             skills: Vec::new(),
             skills_omitted: 0,
+            reasoning_effort,
             user_config: UserConfig::default(),
             model_factory: None,
             model_factory_for: None,
@@ -256,6 +266,11 @@ impl Config {
     /// 真正的兜底是这条**小时级**阀门，不是轮数（ADR-0027 决策 6）。
     pub fn max_turn_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.user_config.max_turn_duration_secs.unwrap_or(172_800))
+    }
+
+    /// 推理强度（provider 的 `reasoning_effort`）。缺省 `high`。
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
     }
 
     /// 模型调用重试策略（`config.json` 的 `model_retry`，ADR-0028 决策 4）。
@@ -399,6 +414,25 @@ impl Config {
     }
 }
 
+/// 解析推理强度。只接受主流 OpenAI 兼容取值；非法值落诊断后由调用方回落默认 `high`。
+fn parse_reasoning_effort(value: Option<&str>) -> Option<String> {
+    let value = value?.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if matches!(
+        value.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        Some(value)
+    } else {
+        crate::logging::log(&format!(
+            "ignoring YUSHAN_REASONING_EFFORT: expected minimal|low|medium|high|xhigh|max, got {value}"
+        ));
+        None
+    }
+}
+
 /// 解析 + 校验 `config.json` 文本。`Err` 仅表示**整份** JSON 畸形；
 /// 单条非法由本函数**就地丢弃 + 落日志**，不进 `Err`。
 fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
@@ -530,6 +564,7 @@ mod tests {
             registry: ProviderRegistry::new(),
             skills: Vec::new(),
             skills_omitted: 0,
+            reasoning_effort: None,
             user_config: UserConfig::default(),
             model_factory: None,
             model_factory_for: None,
@@ -560,6 +595,7 @@ mod tests {
     const API_ENV_KEYS: &[&str] = &[
         "YUSHAN_API_BASE",
         "YUSHAN_API_KEY",
+        "YUSHAN_REASONING_EFFORT",
         "OPENAI_API_BASE",
         "OPENAI_API_KEY",
     ];
@@ -621,6 +657,30 @@ mod tests {
         assert!(!config.is_configured());
         assert!(config.build_model().is_none());
         assert!(config.registry.find_provider("deepseek").is_some());
+        assert_eq!(config.reasoning_effort(), Some(DEFAULT_REASONING_EFFORT));
+    }
+
+    /// 推理强度只接受已知取值；大小写与空白归一化，非法值回落默认 `high`。
+    ///
+    /// 变异：去掉 `to_ascii_lowercase()` ⇒ 第一条变红；去掉白名单 ⇒ 非法值断言变红。
+    #[test]
+    fn reasoning_effort_is_optional_and_validated() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", " LoW ") };
+        assert_eq!(
+            Config::from_env().unwrap().reasoning_effort(),
+            Some("low")
+        );
+
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", "please-think-harder") };
+        assert_eq!(
+            Config::from_env().unwrap().reasoning_effort(),
+            Some(DEFAULT_REASONING_EFFORT)
+        );
     }
 
     /// `context_window_for(name)` 与 `context_window()` 对当前 model 必须一致；

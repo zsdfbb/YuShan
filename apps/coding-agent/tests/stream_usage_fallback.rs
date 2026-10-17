@@ -423,6 +423,7 @@ async fn no_fallback_when_request_lacks_stream_options() {
             model: "m".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             compat: ProviderCompat::minimax(),
         },
         client,

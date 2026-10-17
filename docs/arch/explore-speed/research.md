@@ -35,11 +35,14 @@
 | **deepseek-harness** | `reasoningEffort` 为 adapter 拥有的值 + `UNSUPPORTED_REASONING_EFFORT` 校验；子 agent 可清零 route 继承的 effort | `packages/llm/llm/src/index.ts:880-898`；`subagent/tool-subagent/src/model-selection.ts:92,120-126` |
 | **Vibe-Trading** | `LANGCHAIN_REASONING_EFFORT` 环境变量端到端（README 宣称 + 代码实做一致） | `agent/src/providers/chat.py:108,348`；`providers/capabilities.py:31-39,52` |
 
-**本仓现状：零。** 全仓 grep `reasoning_effort` / `thinking_budget` / `enable_thinking` **无命中**；
-`adapters/model-openai-compatible` 的请求面只有 `max_tokens` / `temperature`（`src/request.rs:18,20`）；
+**本仓现状（2026-10-17 更新）**：已接入可选 `reasoning_effort`，默认 `high` 且仅在
+provider compat 声明支持时发送（当前 `opencode-go`）；`thinking_budget` / `enable_thinking`
+仍未接入。实现见 `adapters/model-openai-compatible/src/request.rs` 与
+`apps/coding-agent/src/config.rs::parse_reasoning_effort`。
 `src/compat.rs` 只能**解析** `reasoning_content`（DeepSeek 方言），**不能控制**它。
 
-> **可用性判断**：本仓主用 provider 即 DeepSeek 系（`compat.rs` 已认该方言），Codewhale 的同名字段就是为该方言而设 —— 接入面看起来是"请求体加一个字段"，但**这是猜测，未验证**（见 §7 建议 1）。
+> **可用性判断（已验证）**：`opencode-go/deepseek-v4.1-flash` 接受顶层
+> `reasoning_effort`，真实请求与 `fact/1` A/B 均通过；其它 provider 默认不发送。
 
 ---
 
@@ -217,8 +220,8 @@
 2. **评估 `bash` 按命令契约判只读**（§3.1 ②）：杠杆最大（bash 占 83%，其中 45% 只读），
    但它是**从命令字符串猜副作用** —— 采纳前必须单独论证误判代价（一个写命令被误判为只读 ⇒ 与同批并发读竞争）。
    注意这是**正确性判断**，不是安全边界（项目硬约束"不做安全"）。
-3. **评估 `reasoning_effort` / `thinking` 开关**（轴 A）。本仓主用 provider 正是该方言，Codewhale 已有同名字段的先例。
-   ⚠️ **本仓适配器是否支持、provider 是否接受，均未验证** —— 落地前必须先跑通一条真实请求。
+3. ~~评估 `reasoning_effort` / `thinking` 开关~~（轴 A）：`reasoning_effort` 已落地并做过
+   `low` / 默认 `high` 的真实 A/B；`thinking` 仍未接入。
 4. **修 `context.md` 的 P0 口径**（§7）：把 `first_token_ms` 与 cache-hit 纳入逐轮读数。**建议在采基线之前定稿**，否则基线对不上同类读数。
 5. **把前缀缓存不变量成文**（轴 B）：Codewhale 的三区契约（`PinnedPrefix` / `AppendLog` / `TurnScratch`）可直接借形状；
    本仓现有 `toolset.rs` 的工具序测试是同类保护的一个实例，缺的是"**易变内容必须最后、且不得进稳定前缀**"这条断言。

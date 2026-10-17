@@ -12,6 +12,9 @@ pub struct ProviderCompat {
     /// 保证「安全」与「token 统计完整」兼顾。仅当已知某 provider 一定拒绝时
     /// （如未经验证的 MiniMax 兼容层）才显式关闭。
     pub supports_stream_usage: bool,
+    /// 是否接受顶层 `reasoning_effort` 字段。默认关闭：未知兼容端点不应收到
+    /// 它们可能严格校验的扩展字段。
+    pub supports_reasoning_effort: bool,
 }
 
 /// 手写而非 derive：`supports_stream_usage` 的「默认」必须是 **true**。
@@ -24,6 +27,7 @@ impl Default for ProviderCompat {
             has_reasoning_content: false,
             tool_calls_as_text: false,
             supports_stream_usage: true,
+            supports_reasoning_effort: false,
         }
     }
 }
@@ -60,6 +64,9 @@ impl ProviderCompat {
     pub fn opencode_go() -> Self {
         Self {
             has_reasoning_content: true,
+            // OpenCode Go 的推理模型声明 effort 档位（low/high/max），
+            // 网关实测接受顶层 `reasoning_effort`。
+            supports_reasoning_effort: true,
             ..Default::default()
         }
     }
@@ -107,6 +114,7 @@ mod tests {
         let compat = ProviderCompat::opencode_go();
         assert!(compat.has_reasoning_content);
         assert!(compat.supports_stream_usage);
+        assert!(compat.supports_reasoning_effort);
         assert!(!compat.tool_calls_as_text);
     }
 }

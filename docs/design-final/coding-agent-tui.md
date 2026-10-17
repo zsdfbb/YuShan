@@ -754,7 +754,7 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 ---
 
-## 15. `--debug` 结构化执行日志（P0）— as-built
+## 15. `--debug` 结构化执行日志（P0 + P1 尝试读数）— as-built
 
 设计见 `docs/arch/agent-observability/design.md` + `adr-debug-log.md`；执行计划
 `docs/exec-plans/2026-10-17-debug-log.md`。本节只记实际形态。
@@ -780,8 +780,8 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 | 运行 | `run_start`（版本 / pid / os / cwd / session_file / model / api_base 只留 scheme+host / limits / tools / skills / env 变量名）、`run_end`（stop_reason + `debug{records_written,dropped,write_errors,bytes_written,hot_path_ms}`） |
 | 回合 | `turn_start`（input_bytes / budget_ms）、`turn_end`（rounds / elapsed_ms / budget_remaining_ms / cache 读数） |
 | 轮 | `round_start`、`round_end`（ttft/gen/tools/total、thinking/text 首时刻与段长、增量计数、tool_calls） |
-| 调用 | `round_usage`（`purpose=turn/compaction` + 逐轮 usage，含 `reasoning_tokens` 三态）、`tool_call`（参数摘要 + `args_*`）、`tool_result`（耗时 / 大小 / 错误位，**不记内容**） |
-| 边界 | `boundary {phase: enqueued/observed, kind, origin}`（CLI 的预算 Abort 在 `push` 同刻用可克隆 `DebugHandle` 写 `enqueued`） |
+| 调用 | `round_usage`（`purpose=turn/compaction` + 逐轮 usage，含 `reasoning_tokens` 三态）、`tool_call`（参数摘要 + `args_*`）、`tool_result`（耗时 / 大小 / 错误位，**不记内容**）、`model_attempt`（每次 HTTP 尝试的 outcome / reason_class / http_status / ttfb / headers / duration / backoff / 抑制原因） |
+| 边界 | `boundary {phase: enqueued/observed, kind, origin}`（CLI 的预算 Abort 在 `push` 同刻用可克隆 `DebugHandle` 写 `enqueued`）、`context_compacted`、`context_compaction_failed`、`response_truncated` |
 
 `ModelTextDelta` / `ModelThinkingDelta` **零记录**（只累计计数）；`t_ms - dt_ms` 恒等于
 `run_start_unix_ms`。`run_end` 另带 `rounds` / `duration_ms` / `exit_code` / 累计 `usage`
@@ -789,6 +789,16 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 `/new` 换文件；同一 session 的 `/resume`（含**跨进程** CLI `--resume`）追加并在打开时按文件里
 最大 `run` 递增；跨 session 的 `/resume` 切到目标会话的文件。
+
+`model_attempt` 由适配器的同步回调经 `ModelTraceRouter` 写入当前 debug 文件。模型 factory
+早于 debug 文件打开，故路由器先保持空态，各入口在 sink 就绪后 `attach`；`/new` /
+`/resume` 后重新绑定。`attempt` 从 1 起，`max_attempts` 是总尝试数（配置的额外重试数 + 1）；
+`ttfb_ms` 只取响应体首个非空字节，HTTP 错误与传输失败为 `null`，另由
+`response_headers_ms` / `duration_ms` 解释。回调只挂在主模型 factory；子 agent 使用的是
+按模型名构造的 factory，其尝试仍不可见（与 §4.8 的既有边界一致）。该记录不带
+`turn` / `round`：适配器看不到循环状态；消费侧记录与适配器旁路写入是并发的，
+文件顺序不能保证严格夹在 `round_start` / `round_end` 之间。聚合时按时间邻近理解，
+不得把它当轮次强外键。
 
 ### 15.3 退出与既有行为
 
@@ -802,11 +812,44 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 ### 15.4 落地数字
 
-- `cargo test --workspace`：**1247 passed / 0 failed / 11 ignored**。
+- `cargo test --workspace`：**1257 passed / 0 failed / 11 ignored**。
 - 新增集成验收 `apps/coding-agent/tests/debug_log.rs`（7 个用例 + 1 个手动 golden 生成器）：
   T1（debug 关零文件、既有诊断不变、stdout/stderr 不被污染）、T2（过滤 `RoundUsage` 后与
   基线 golden 逐字节相同）、T5（flush 后文件完整、末行 `run_end`、run_end 字段齐全）、
   T7（强制压缩时 `turn` 与 `compaction` 同时出现）、失败退出仍有 `run_end`、预算 Abort 的
-  `enqueued`/`observed`、跨进程 `--resume` 的 `run` 递增。子进程带 30 s 看门狗。
+  `enqueued`/`observed`、跨进程 `--resume` 的 `run` 递增；T5 另断言成功模型调用产生
+  `model_attempt`。子进程带 30 s 看门狗。
 - `cargo clippy --all-targets`：**无新增 warning**（当前 28 个站点，基线 34 个；差异为既有 warning
   的行号漂移、5 处 `collapsible_if` 与 2 处 `too_many_arguments` 消失）。
+
+### 15.5 基准接线
+
+`apps/coding-agent/tests/e2e_bench.rs` 现在以 `-p --debug` 运行，并**优先解析本运行会话的
+debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文件混入）；文本日志仅作回退。
+逐次运行与中位数汇总新增：
+
+- `attempts`：HTTP 尝试数（含重试与 `stream_options` 回退）；
+- `retries`：实际进入退避的重试次数；
+- `retry_wait`：实际进入退避的累计等待；
+- `cache`：`round_usage` 的 `cache_read / input_tokens`。
+
+这把 `ttft` 长尾拆成「排队/prefill」「重试退避」「传输失败」三类，并保留
+`round_end` 的 thinking/text 分段作为原始证据。
+
+## 16. 推理强度 `reasoning_effort` — as-built
+
+决策与 A/B 依据见 `docs/adr/0042-default-reasoning-effort-high.md`。
+
+- `YUSHAN_REASONING_EFFORT` 取 `minimal|low|medium|high|xhigh|max`，大小写/空白归一化；
+  未设置或非法值回落默认 **`high`**。非法值落一行诊断。
+- `Config::reasoning_effort()` 给出配置值；模型 factory 再按
+  `ProviderCompat::supports_reasoning_effort` 决定是否真正发送。当前只有
+  `opencode-go` 声明支持，其他 provider（含 `deepseek` / `minimax` / custom）继续不发送该字段。
+- `ChatCompletionRequest.reasoning_effort` 带 `skip_serializing_if`：库测试里 `None` 时
+  wire JSON 不出现该键，`Some("low")` 时发送 `"reasoning_effort":"low"`。
+- `run_start` 记录实际生效的 `gen_ai.request.reasoning_effort`；provider 不支持时写 `null`。
+
+真实 A/B（同模型 `opencode-go/deepseek-v4.1-flash`、`fact/1`）：旧行为中位 199.2s，
+`low` 为 72.4 / 88.6s 但质量 2/3，默认 `high` 三次为 64.4 / 100.7 / 201.4s，
+中位 100.7s，且质量均 3/3。
+默认因此取 `high`；详细口径见 `docs/arch/explore-speed/cost-model.md` §8.5。

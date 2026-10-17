@@ -107,17 +107,20 @@ pub const IDLE_TIMEOUT_MARKER: &str = "stream idle timeout";
 /// `idle` 是**流空闲超时**：相邻两次字节到达的最长间隔。每一次 `stream.next()`
 /// 都被它包住 —— 「接受连接但不应答」的黑洞端点否则会让 `complete` 永久挂起，
 /// 而「没有失败」就「没有重试」。
-pub async fn parse_sse_stream<F>(
+pub async fn parse_sse_stream<F, B>(
     response: Response,
     idle: std::time::Duration,
     mut on_event: F,
+    mut on_first_byte: B,
 ) -> Result<(), ModelError>
 where
     F: FnMut(StreamEvent) -> Result<(), ModelError>,
+    B: FnMut(),
 {
     // 字节级缓冲：`Bytes` 直接按字节喂入，绝不在喂入前转 String。
     let mut buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
+    let mut saw_first_byte = false;
 
     loop {
         match tokio::time::timeout(idle, stream.next()).await {
@@ -129,6 +132,10 @@ where
             }
             Ok(None) => return Ok(()),
             Ok(Some(Ok(chunk))) => {
+                if !chunk.is_empty() && !saw_first_byte {
+                    saw_first_byte = true;
+                    on_first_byte();
+                }
                 if feed_sse_bytes(&mut buffer, &chunk, &mut on_event)? {
                     return Ok(());
                 }

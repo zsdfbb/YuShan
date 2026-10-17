@@ -3,29 +3,61 @@
 用于组装 Agent 的运行时（harness），不是自带全部功能的完整 Agent 产品。项目只负责模型调用、消息状态、工具调用循环和事件流；沙箱、隔离、权限、审批和多租户安全由其他项目独立解决。
 
 > **本文件按渐进式披露组织**：只放**每一轮都需要**的东西 —— 定位 / 目录结构 / 常用命令 / 硬性约束 / 工作约定 / 去哪找。
-> 架构、模块职责、数据流、命令分工等**细节一律在 `docs/`**（见文末「去哪找什么」）。
+> 架构、模块职责、数据流、命令分工等**细节一律在 `docs/`**（见下方「目录结构」的 `docs/` 部分）。
 >
 > **往这里加内容前先问一句：它每一轮都需要吗？** 不是 ⇒ 写进 `docs/`，这里只留一行指针。
 > 判据与先例见 `docs/arch/skills/design.md`（skill 的渐进式披露）与 `docs/CONTEXT.md`。
 
 ## 目录结构
 
+**本节就是「去哪找什么」**：`crates` / `adapters` / `apps` 止于模块名（一行职责），`docs/` 展开到二级
+（所有交付物都在那里）。更细的职责看对应模块的 `src/lib.rs` 模块头 `//!` 注释。
+
 ```
 YuShan/
-├── crates/      # 运行时核心库：10 个 ys-* crate（分层见 docs/architecture.md §1）
-├── adapters/    # 可选实现：模型（OpenAI 兼容）与工具（basic / web）
-├── apps/        # 可执行入口：coding-agent（TUI / -p / --json 三模式）
-├── docs/        # 设计、架构、ADR、as-built —— 入口见文末「去哪找什么」
-├── .claude/     # Claude Code 本地配置
-└── tmp/         # 临时目录（已被 .gitignore 忽略，勿放正式内容）
+├── crates/                       # 运行时核心库：10 个 ys-* crate（分层见 docs/architecture.md §1）
+│   ├── ys-core                   # 共享词汇与原语（零 tokio）
+│   ├── ys-event                  # 事件枚举与推式出口
+│   ├── ys-model                  # LLM 后端抽象
+│   ├── ys-tool                   # 工具接口与注册表
+│   ├── ys-session                # 会话状态管理
+│   ├── ys-component              # 运行时上下文容器
+│   ├── ys-loop                   # 执行循环与编排（BasicLoop）
+│   ├── ys-runtime                # 组装 facade，锁定外部导入路径
+│   ├── ys-protocol               # 能力平面（三模式共用）
+│   └── ys-tui-coding             # TUI 渲染层（不依赖 ys-runtime，编译器强制）
+├── adapters/                     # 可选实现，各自独立 crate
+│   ├── model-openai-compatible   # OpenAI 兼容模型后端
+│   ├── tools-basic               # 文件与 shell 工具
+│   └── tools-web                 # 联网工具（websearch / webfetch）
+├── apps/
+│   └── coding-agent              # 可执行入口：TUI / -p / --json 三模式
+├── docs/                         # 设计与过程产物；**「去哪找什么」就在这一层**
+│   ├── architecture.md           # 架构全貌（15 节：分层 / 信道 / 时序 / 数据流 / 输出三分 / TUI 形态 / 测试分层）
+│   ├── design.md                 # 架构规范、核心 trait、Hook/Event 边界、测试矩阵
+│   ├── extension-points.md       # 新需求归类（Event / Tool / Follow-up / 还是真需要 Hook）
+│   ├── CONTEXT.md                # 术语表（Turn / Round / StopReason / 错误结果 vs 基础设施失败…）
+│   ├── TODO.md                   # 未完成工作台账（完成即删条目）
+│   ├── adr/                      # 决策记录，**文件名即摘要**
+│   ├── arch/                     # 逐需求的 arch-explore → design → review 产出（目录名即主题）
+│   ├── design-final/             # as-built：**当前实现的实际形态**（含实现与设计的分歧）
+│   ├── design-plans/             # 设计计划（`completed/` 为已归档）
+│   ├── exec-plans/               # 执行计划（`completed/` 为已归档）
+│   └── reports/                  # 评审与验收报告
+├── .claude/                      # Claude Code 本地配置
+└── tmp/                          # 临时目录（已被 .gitignore 忽略，勿放正式内容）
 ```
 
 根文件：`Cargo.toml`（workspace 成员表）、`AGENTS.md`（`CLAUDE.md` 是指向它的软链）、`LICENSE`、`README.md`。
 
+两条补充指针 —— `docs/arch/` 里个别**跨需求**的常引文档值得单独点出：
+`prompt-delivery/notes.md`（把项目约定送到模型面前的通道与成本）、`commands/login-model-behavior/`（`/login` & `/model` 行为设计）。
+**尚未落地的主题**见 `docs/TODO.md` §C。
+
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（基线 1192 passed / 10 ignored，随开发增长，别当契约）
+- `cargo test --workspace` — 全量测试（当前实测 **1267 passed / 12 ignored**；数字随开发增长，**别当契约**）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
@@ -72,7 +104,8 @@ YuShan/
   - **不写**：**变更叙事**（「曾经在这里…」「以前是…」「修过…」「长期未被发现」）；**拿别的产品的做法当本设计的理由**（「X 是这么做的」「X 用 80%，我们取中」）。
   - **例外，要留**：外部**格式 / 协议 / 标准**的定义来源。「`SKILL.md` 是 Claude Code 定义的格式」是**兼容性契约**，属设计本身，不是竞品对照。
   - **去处**：设计的 why → `docs/adr/`；跨产品取舍对照 → `docs/arch/**/research.md`；变更过程 → `git log` 与 commit message。
-- 实现顺序遵循路线图：最小闭环 → 可用适配器 → 静态组件生态 → 动态插件 → Coding Agent MVP
+- 实现顺序遵循路线图：最小闭环 → 可用适配器 → 静态组件生态 → 动态插件 → Coding Agent MVP。
+  **当前**：前三级与 Coding Agent MVP 已落地；**动态插件有意推迟** —— ADR-0021 只留 `ToolPlugin` 装配缝、不建 hook 系统（ADR-0014 同）。剩余项见 `docs/TODO.md`。
 - 新模块和接口改动须能对应上 `docs/design.md` §12 测试矩阵中的条目
 - **测试隔离（并行安全，血的教训）**：
   - 临时目录名必须含**进程内原子序号 + `process::id()`**（`SystemTime::as_nanos()` 在 macOS 只到微秒级，并行测试会撞名 → 互删文件）
@@ -81,17 +114,3 @@ YuShan/
 - **事实性断言的指针纪律**：任何关于「X 当前是 Y 状态」的静态断言（已实现/未实现、是/否占位、有/没有 trait），必须引用 `code/` 或带 `[已关闭]`/`[已实现]` 标记的 `docs/design-final/`；旧 ADR / 旧 design plan 只记 **why**，不能用来佐证 **now**。候选清单里出现这类断言而无指针 ⇒ 不写进回答。
 - **流式/字节路径注意 UTF-8 边界**：TCP 分片可能切在多字节字符中间；缓冲必须是**字节级**，只在完整行上解码
 - `tmp/` 已被 `.gitignore` 忽略，勿将正式内容放入
-
-## 去哪找什么
-
-| 需要了解… | 读… |
-|---|---|
-| **架构全貌** | **`docs/architecture.md`**（14 节：分层与依赖 / 三信道与两线程 / 组件关系 / 一次 run 的时序 / 出站·入站数据流 / 事件信道两条路径 / 流式 / 生命周期 / 三种入口 / `/new` 换 Wiring / 会话落盘 / **输出与诊断三分** / `ys-tui-coding` 形态与命令分工 / 测试分层） |
-| 架构规范、核心 trait、Hook/Event 边界、测试矩阵 | `docs/design.md` |
-| 术语（Turn / Round / StopReason / 错误结果 vs 基础设施失败…） | `docs/CONTEXT.md` |
-| **给新需求归类**（Event / Tool / Follow-up / 还是真需要 Hook） | `docs/extension-points.md` |
-| 某个决策的 why | `docs/adr/` —— **文件名即摘要**（如 `0021-plugin-seam-without-hook-system.md`） |
-| **当前实现的实际形态**（含实现与设计的分歧） | `docs/design-final/coding-agent-tui.md`（路线 B as-built，最新）；其余 as-built：`session-default-new` / `search-tools` / `tools-web` / `compaction` / `skills` / `truncation-guard` / `opencode-go` |
-| 某个 crate / 文件干什么 | 对应 crate 的 `src/lib.rs`（模块头 `//!` 注释）；目录与分层见 `docs/architecture.md` §1、组件关系见 §3 |
-| `/login` & `/model` 的行为设计 | `docs/arch/commands/login-model-behavior/` |
-| 把项目约定送到模型面前的通道与成本 | `docs/arch/prompt-delivery/notes.md` |

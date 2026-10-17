@@ -186,6 +186,40 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
 
 ---
 
+### 4.7 与 session 文件如何对照
+
+debug 日志只记**索引**（谁、多久、参数摘要），**内容**在 session JSONL 里。两者靠下面的键对齐：
+
+| 维度 | 键 | 强度 |
+|---|---|---|
+| **工具调用的内容** | **`tool_call_id`** | **强外键**（两边同一 id） |
+| 轮次 | assistant 消息的**序号** ↔ `round` | 弱（每轮恰 1 条 assistant + 1 条 tool-result） |
+| 回合 | 跨回合累计的 assistant 序号 ↔ `(turn, round)` | 弱 |
+| 时间 | ❌ **对不上** —— session 逐条消息**没有时间戳** | — |
+
+`tool_call_id` 是天然的连接键：
+
+```text
+debug:    {"ev":"tool_call","tool_call_id":"call_00_mrti…","name":"bash",
+           "args":"{\"command\":\"grep -rn …\"}","dt_ms":12345,"duration_ms":30210}
+session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …}}]}
+          {"role":"User","content":[{"ToolResult":{"tool_call_id":"call_00_mrti…",
+                                                    "content":"<真正的内容>"}}]}
+```
+
+⇒ 排障路径：**debug 定位「哪个调用慢」→ 用 id 去 session 取「它返回了什么」**。
+典型配方：先 `jq 'select(.type=="tool_result" and .duration_ms>10000)'` 找出慢调用，
+再按 id 到 session 里搜。
+
+**session 的时间只有 meta 的 `created_at`（unix 秒、一次）**，逐条消息无时间戳。故两文件之间
+**只能按 id / 顺序对齐，不能按时间**。主用例不依赖时间：「为什么慢」在 debug，「读了什么」在 session。
+
+**本轮不为 session 加逐条时间戳**：它会改变一个持久化契约、给每条消息增字段，而 debug 开着时
+时间线已经有了。若将来需要「不依赖 debug、从 session 单独重建时间线」，再加一个
+`#[serde(default)]` 的 `ts` 字段即可（加法、不破坏老文件）。
+
+---
+
 ## 5. 分阶段落地
 
 | 阶段 | 内容 | 估计 |

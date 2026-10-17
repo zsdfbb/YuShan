@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use ys_core::Message;
+use ys_core::{EffortLevel, Message};
 
 use crate::{Envelope, SessionSummary};
 
@@ -35,6 +35,12 @@ pub enum Request {
     /// UI 侧 `App.thinking_visible` 是**运行期真值**，本请求只是把它**单向**
     /// 同步给 app 侧作持久化镜像（设计 §5.6）—— 不改变 UI 的本地即时生效语义。
     SetThinking { visible: bool },
+    /// 设置思考档位（`None` = 清除设置，恢复 provider 默认）。
+    ///
+    /// 与 `SetThinking` 并列：前者是内联思考标签的**显示**开关，本请求是发给
+    /// provider 的**思考深度**。值为 `None` 时由 app 侧删除已持久化的设置，
+    /// 而不是把 `"default"` 之类的伪档位写进枚举。
+    SetEffort { effort: Option<EffortLevel> },
     /// 登录一个 provider 并持久化凭证。
     ///
     /// `api_base` 是**用户显式提供的** API base（`/login custom` 这类没有内置 base
@@ -169,6 +175,17 @@ mod tests {
     fn test_request_set_thinking_roundtrip() {
         assert_roundtrip(&Request::SetThinking { visible: true });
         assert_roundtrip(&Request::SetThinking { visible: false });
+    }
+
+    /// `SetEffort` 的两种形态都要能过 serde：`Some` = 设定档位，
+    /// `None` = 清除设置（恢复 provider 默认）。漏测 `None` 会让 app 侧
+    /// 消费端在真实信道上炸。
+    #[test]
+    fn test_request_set_effort_roundtrip() {
+        assert_roundtrip(&Request::SetEffort {
+            effort: Some(EffortLevel::High),
+        });
+        assert_roundtrip(&Request::SetEffort { effort: None });
     }
 
     /// `Login` 的两种 `api_base` 都要能过 serde：`Some` = 用户显式填的 URL
@@ -345,6 +362,20 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Request>(json!({ "Export": { "path": null } })).unwrap(),
             Request::Export { path: None }
+        );
+        // `SetEffort` 是加法式新增，线格式同样为外部标签 + 小写档位拼写。
+        assert_eq!(
+            serde_json::from_value::<Request>(
+                json!({ "SetEffort": { "effort": "xhigh" } })
+            )
+            .unwrap(),
+            Request::SetEffort {
+                effort: Some(EffortLevel::XHigh),
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({ "SetEffort": { "effort": null } })).unwrap(),
+            Request::SetEffort { effort: None }
         );
     }
 

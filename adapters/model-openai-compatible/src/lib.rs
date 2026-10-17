@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use compat::ProviderCompat;
+use compat::{ProviderCompat, ReasoningDialect};
 use inline_thinking::{Segment, SegmentKind};
 use request::*;
 use response::*;
 use stream::{StreamEvent, parse_sse_stream};
-use ys_core::{ContentBlock, EventError, Message, Role, ToolCallId, Usage};
+use ys_core::{ContentBlock, EffortLevel, EventError, Message, Role, ToolCallId, Usage};
 use ys_model::{
     FinishReason, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
 };
@@ -25,6 +25,9 @@ pub struct OpenAICompatibleConfig {
     pub model: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// 请求侧的思考档位。`None` 表示「未设置 / 恢复默认」——
+    /// 此时不发送任何思考参数，由 provider 自行决定。
+    pub effort: Option<EffortLevel>,
     pub compat: ProviderCompat,
 }
 
@@ -778,6 +781,52 @@ fn normalize_finish_reason(raw: Option<String>) -> FinishReason {
     }
 }
 
+/// 按 provider 方言把思考档位翻成 wire 参数（`reasoning_effort` / `thinking`）。
+///
+/// 不变量：
+/// - `effort == None` 或方言为 [`ReasoningDialect::None`] ⇒ 两者皆不发；
+/// - [`ReasoningDialect::OpenCodeGo`] 下两个字段**互斥**（网关同时收到会 400）——
+///   `off` 只发 `thinking: disabled`，其余档位只发 `reasoning_effort`。
+fn reasoning_params(
+    dialect: ReasoningDialect,
+    effort: Option<EffortLevel>,
+) -> (Option<String>, Option<ThinkingToggle>) {
+    let Some(effort) = effort else {
+        return (None, None);
+    };
+    let disabled = || {
+        Some(ThinkingToggle {
+            kind: ThinkingToggleKind::Disabled,
+        })
+    };
+    let enabled = || {
+        Some(ThinkingToggle {
+            kind: ThinkingToggleKind::Enabled,
+        })
+    };
+    match dialect {
+        ReasoningDialect::None => (None, None),
+        // OpenAI 没有 `thinking` 字段；`off` 用约定拼写 `"none"`。
+        ReasoningDialect::OpenAiEffort => (
+            Some(match effort {
+                EffortLevel::Off => "none".to_string(),
+                level => level.as_wire().to_string(),
+            }),
+            None,
+        ),
+        // DeepSeek 官方：档位与开关同发；关闭时只发 disabled（不发档位）。
+        ReasoningDialect::DeepSeek => match effort {
+            EffortLevel::Off => (None, disabled()),
+            level => (Some(level.as_wire().to_string()), enabled()),
+        },
+        // OpenCode Go：档位与开关互斥。
+        ReasoningDialect::OpenCodeGo => match effort {
+            EffortLevel::Off => (None, disabled()),
+            level => (Some(level.as_wire().to_string()), None),
+        },
+    }
+}
+
 pub fn translate_request(
     request: &ModelRequest,
     config: &OpenAICompatibleConfig,
@@ -885,6 +934,9 @@ pub fn translate_request(
         )
     };
 
+    let (reasoning_effort, thinking) =
+        reasoning_params(config.compat.reasoning_dialect, config.effort);
+
     Ok(ChatCompletionRequest {
         model: config.model.clone(),
         messages,
@@ -899,6 +951,8 @@ pub fn translate_request(
             }),
         max_tokens: config.max_tokens.or(request.max_tokens),
         temperature: config.temperature.or(request.temperature),
+        reasoning_effort,
+        thinking,
     })
 }
 
@@ -916,6 +970,7 @@ mod tests {
             model: "deepseek-chat".into(),
             max_tokens: None,
             temperature: None,
+            effort: None,
             compat: ProviderCompat::standard(),
         };
 
@@ -948,6 +1003,7 @@ mod tests {
             model: "test".into(),
             max_tokens: None,
             temperature: None,
+            effort: None,
             compat: ProviderCompat::standard(),
         };
 
@@ -1330,6 +1386,7 @@ mod tests {
             model: "test".into(),
             max_tokens: None,
             temperature: None,
+            effort: None,
             compat: ProviderCompat::standard(),
         };
         let request = ModelRequest::default();
@@ -1345,7 +1402,152 @@ mod tests {
             model: "test".into(),
             max_tokens: None,
             temperature: None,
+            effort: None,
             compat,
+        }
+    }
+
+    /// 构造一个仅思考方言 / 档位可调的最小 config。
+    fn config_with_effort(
+        dialect: ReasoningDialect,
+        effort: Option<EffortLevel>,
+    ) -> OpenAICompatibleConfig {
+        OpenAICompatibleConfig {
+            api_base: "http://localhost".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+            max_tokens: None,
+            temperature: None,
+            effort,
+            compat: ProviderCompat {
+                reasoning_dialect: dialect,
+                ..ProviderCompat::standard()
+            },
+        }
+    }
+
+    fn request_json(dialect: ReasoningDialect, effort: Option<EffortLevel>) -> serde_json::Value {
+        let request = ModelRequest::default();
+        serde_json::to_value(translate_request(&request, &config_with_effort(dialect, effort)).unwrap())
+            .unwrap()
+    }
+
+    const ALL_DIALECTS: [ReasoningDialect; 4] = [
+        ReasoningDialect::None,
+        ReasoningDialect::OpenAiEffort,
+        ReasoningDialect::DeepSeek,
+        ReasoningDialect::OpenCodeGo,
+    ];
+
+    const ALL_LEVELS: [EffortLevel; 7] = [
+        EffortLevel::Off,
+        EffortLevel::Minimal,
+        EffortLevel::Low,
+        EffortLevel::Medium,
+        EffortLevel::High,
+        EffortLevel::XHigh,
+        EffortLevel::Max,
+    ];
+
+    /// 期望的 wire 参数：`(reasoning_effort, thinking.type)`。
+    /// 每个 `None` 表示该字段**不应出现在请求 JSON 里**。
+    fn expected(
+        dialect: ReasoningDialect,
+        level: EffortLevel,
+    ) -> (Option<&'static str>, Option<&'static str>) {
+        match dialect {
+            ReasoningDialect::None => (None, None),
+            // OpenAI 没有 `thinking` 字段；`off` 用约定拼写 `"none"`。
+            ReasoningDialect::OpenAiEffort => (
+                Some(match level {
+                    EffortLevel::Off => "none",
+                    other => other.as_wire(),
+                }),
+                None,
+            ),
+            // DeepSeek 官方：档位与开关同发；关闭时只发 disabled（不发档位）。
+            ReasoningDialect::DeepSeek => match level {
+                EffortLevel::Off => (None, Some("disabled")),
+                other => (Some(other.as_wire()), Some("enabled")),
+            },
+            // OpenCode Go：档位与开关互斥。
+            ReasoningDialect::OpenCodeGo => match level {
+                EffortLevel::Off => (None, Some("disabled")),
+                other => (Some(other.as_wire()), None),
+            },
+        }
+    }
+
+    /// 按期望逐字段断言请求 JSON；失败信息带上方言 / 档位与整份 JSON。
+    fn assert_reasoning_params(
+        json: &serde_json::Value,
+        want: (Option<&str>, Option<&str>),
+        context: &str,
+    ) {
+        match want.0 {
+            Some(effort) => assert_eq!(
+                json.get("reasoning_effort"),
+                Some(&serde_json::json!(effort)),
+                "{context}: json={json}"
+            ),
+            None => assert!(
+                json.get("reasoning_effort").is_none(),
+                "{context}: 不应发送 reasoning_effort，json={json}"
+            ),
+        }
+        match want.1 {
+            Some(kind) => assert_eq!(
+                json.get("thinking"),
+                Some(&serde_json::json!({"type": kind})),
+                "{context}: json={json}"
+            ),
+            None => assert!(
+                json.get("thinking").is_none(),
+                "{context}: 不应发送 thinking，json={json}"
+            ),
+        }
+    }
+
+    /// **全矩阵**：4 种方言 × 7 个档位逐一对照 wire 参数。
+    ///
+    /// 变异（任一 ⇒ 本用例变红）：
+    /// - OpenAI 的 `Off` 改回 `as_wire()`（`"off"`）；
+    /// - 任一档位映射被改成固定值（如 `level => level.as_wire()` → `"high"`）；
+    /// - DeepSeek 的 `Off` 分支补上 `reasoning_effort`，或 `enabled()` 改成 `disabled()`；
+    /// - OpenCode Go 的档位分支同时设 `thinking`（破坏互斥）；
+    /// - `None` 方言走 OpenAI 映射，或任一 `Off` 分支漏掉 `thinking: disabled`。
+    #[test]
+    fn reasoning_params_match_every_dialect_and_level() {
+        for dialect in ALL_DIALECTS {
+            for level in ALL_LEVELS {
+                let json = request_json(dialect, Some(level));
+                let context = format!("dialect={dialect:?} level={level:?}");
+                assert_reasoning_params(&json, expected(dialect, level), &context);
+
+                // OpenCode Go 网关同时收到两个字段会 400：逐档显式守互斥。
+                if dialect == ReasoningDialect::OpenCodeGo {
+                    let both =
+                        json.get("reasoning_effort").is_some() && json.get("thinking").is_some();
+                    assert!(!both, "{context}: 两字段不得并存，json={json}");
+                }
+            }
+        }
+    }
+
+    /// 未设置档位（`None`，即 `/effort default`）⇒ 任何方言都不发思考参数。
+    ///
+    /// 变异：删掉 `reasoning_params` 的 `let Some(effort) = effort else` 守卫
+    /// （默认成某个档位）⇒ **其余三种方言**的用例变红；`ReasoningDialect::None`
+    /// 仍返回 `(None, None)`，故保持绿色。
+    #[test]
+    fn no_effort_means_no_reasoning_params_for_every_dialect() {
+        for dialect in ALL_DIALECTS {
+            let json = request_json(dialect, None);
+            assert_reasoning_params(
+                &json,
+                (None, None),
+                &format!("dialect={dialect:?} effort=None"),
+            );
         }
     }
 

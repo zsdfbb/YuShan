@@ -9,6 +9,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use ys_core::EffortLevel;
+
 use crate::format::format_duration;
 
 /// 一个已知 provider（`/login` 浮层的选项）。
@@ -103,6 +105,10 @@ pub struct CodingView {
     pub session_path: Option<PathBuf>,
     /// 首次运行（无 `auth.json` 凭证）—— 用于欢迎语。
     pub is_first_run: bool,
+    /// 会话级思考档位；`None` = provider 默认。
+    ///
+    /// 由 app 侧快照推送 —— TUI 只显示，不在本地维护第二份真值。
+    pub effort: Option<EffortLevel>,
     /// 会话恢复的 `/thinking` 显示开关**启动初值**。
     ///
     /// 只在启动时被 `App::new` 消费一次；运行期真值是 `App.thinking_visible`，
@@ -130,6 +136,7 @@ impl Default for CodingView {
             context_window: None,
             session_path: None,
             is_first_run: true,
+            effort: None,
             thinking_visible: false,
         }
     }
@@ -214,6 +221,7 @@ impl CodingView {
             context_window: Some(65_536),
             session_path: None,
             is_first_run: false,
+            effort: None,
             thinking_visible: false,
         }
     }
@@ -228,6 +236,7 @@ mod tests {
     fn test_default_is_neutral() {
         let v = CodingView::default();
         assert!(v.model.is_none());
+        assert!(v.effort.is_none(), "默认无档位 = provider 默认");
         assert!(v.is_first_run);
         assert_eq!(v.session_duration_str(), "0s");
     }

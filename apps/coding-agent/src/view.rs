@@ -133,6 +133,8 @@ pub fn build_view(
         is_first_run: registry.logged_in_providers().is_empty() && !state.exists(),
         // `/thinking` 显示开关的**启动初值**（resume 时取自 meta；`App::new` 消费一次）。
         thinking_visible: wiring.meta().map(|m| m.thinking_visible).unwrap_or(false),
+        // `/effort` 的当前档位（`None` = 未设置，provider 默认）。
+        effort: cfg.effort,
     }
 }
 
@@ -246,6 +248,35 @@ mod tests {
         assert!(view.session_path.is_none(), "一次性会话无文件");
         assert!(view.is_first_run);
         assert_eq!(view.context_window, Some(agent.context_window()));
+        assert_eq!(view.effort, None, "未设置档位时视图为 None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `CodingView.effort` 透传 `Config.effort`（`None` = provider 默认）。
+    ///
+    /// 变异：把 `CodingView { effort: cfg.effort }` 改回常量 `None` ⇒ 本用例变红。
+    #[test]
+    fn test_build_view_passes_effort() {
+        let dir = temp_dir("effort");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.effort = Some(ys_core::EffortLevel::High);
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+
+        let view = build_view(
+            &cfg,
+            &agent,
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+        );
+
+        assert_eq!(view.effort, Some(ys_core::EffortLevel::High));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

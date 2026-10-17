@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use ys_core::{ContentBlock, Message, Role};
+use ys_core::{ContentBlock, EffortLevel, Message, Role};
 use ys_protocol::Request;
 
 use crate::app::App;
@@ -42,7 +42,14 @@ pub struct CommandSpec {
 ///
 /// 补全浮层（`completion.rs`）、`/help`（[`help_text`]）与解析（[`parse`]）三者
 /// 都从这一张表派生，故「浮层里看得到、敲下去却不认识」在结构上不可能发生。
-static COMMANDS: [CommandSpec; 13] = [
+/// `/effort` 的用法串 —— 解析失败与无参显示**共用同一份文本**，
+/// 避免两处措辞漂移。
+const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|max|default]";
+
+/// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
+const EFFORT_DEFAULT_TOKEN: &str = "default";
+
+static COMMANDS: [CommandSpec; 14] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -72,6 +79,11 @@ static COMMANDS: [CommandSpec; 13] = [
         name: "thinking",
         description: "开关思考内容的显示",
         arg_hint: Some("[on|off]"),
+    },
+    CommandSpec {
+        name: "effort",
+        description: "设置模型思考档位",
+        arg_hint: Some("[off|minimal|low|medium|high|xhigh|max|default]"),
     },
     CommandSpec {
         name: "model",
@@ -147,6 +159,8 @@ pub enum LocalAction {
     Copy,
     /// `Some(on)` 显式设置，`None` 为 toggle。
     Thinking(Option<bool>),
+    /// 无参 `/effort`：显示当前档位与用法（**不发请求**；真值在 `CodingView.effort`）。
+    Effort,
     /// 本地提示（未知命令 / 参数错误）—— 文本原样进 transcript。
     Hint(String),
 }
@@ -232,6 +246,29 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
                 "用法：/thinking [on|off]（`{other}` 不是有效取值）"
             ))),
         },
+        // 无参 = 本地显示当前档位（真值在视图里，TUI 不持有第二份）；
+        // 有参 = 直发 `SetEffort`。`default` 是**清除**令牌 —— 发 `None`，
+        // 不是第八个枚举值（`EffortLevel::from_str` 刻意拒绝它）。
+        //
+        // 大小写不敏感（与 `EffortLevel::from_str` 一致）；非法值只本地提示，
+        // **不改变任何状态**（视图由 app 侧快照推送，本地没有可改的真值）。
+        "effort" => {
+            if args.is_empty() {
+                Action::Local(LocalAction::Effort)
+            } else {
+                let value = arg();
+                if value.eq_ignore_ascii_case(EFFORT_DEFAULT_TOKEN) {
+                    Action::Request(Request::SetEffort { effort: None })
+                } else {
+                    match value.parse::<EffortLevel>() {
+                        Ok(level) => Action::Request(Request::SetEffort {
+                            effort: Some(level),
+                        }),
+                        Err(_) => Action::Local(LocalAction::Hint(EFFORT_USAGE.to_string())),
+                    }
+                }
+            }
+        }
         // **无参不直发 SetModel** —— 先开浮层选（设计 §6）。
         //
         // 有参时**原样透传**（`provider: None`）：限定名 `provider/model` 的拆分
@@ -400,10 +437,15 @@ pub fn status_text(view: &CodingView) -> String {
         .context_window
         .map(|c| c.to_string())
         .unwrap_or_else(dash);
+    let effort = view
+        .effort
+        .map(|level| level.to_string())
+        .unwrap_or_else(|| EFFORT_DEFAULT_TOKEN.to_string());
 
     [
         format!("provider   {}", view.provider.clone().unwrap_or_else(dash)),
         format!("model      {}", view.model_label()),
+        format!("effort: {effort}"),
         format!("tokens     {tokens}"),
         format!("turns      {}", view.turn_count),
         format!("messages   {}", view.message_count),
@@ -461,6 +503,16 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
                 if app.thinking_visible { "on" } else { "off" }
             )
         }
+        // **只读视图**：档位的真值归 app 侧（`/effort <level>` 发请求后由下一份
+        // 快照推回来），这里不写 `app.view.effort` —— 否则 UI 会先于 app 显示
+        // 一个尚未落盘的状态。
+        LocalAction::Effort => format!(
+            "effort: {}（{EFFORT_USAGE}）",
+            app.view
+                .effort
+                .map(|level| level.to_string())
+                .unwrap_or_else(|| EFFORT_DEFAULT_TOKEN.to_string())
+        ),
         LocalAction::Hint(text) => text,
     };
     app.transcript.push(TranscriptLine::System(text));
@@ -496,6 +548,21 @@ mod tests {
             ("/thinking", Action::Local(L::Thinking(None))),
             ("/thinking on", Action::Local(L::Thinking(Some(true)))),
             ("/thinking off", Action::Local(L::Thinking(Some(false)))),
+            ("/effort", Action::Local(L::Effort)),
+            (
+                "/effort high",
+                Action::Request(Request::SetEffort {
+                    effort: Some(EffortLevel::High),
+                }),
+            ),
+            (
+                "/effort default",
+                Action::Request(Request::SetEffort { effort: None }),
+            ),
+            (
+                "/effort maybe",
+                Action::Local(L::Hint(EFFORT_USAGE.to_string())),
+            ),
             ("/model", Action::Prompt(PromptKind::PickModel)),
             (
                 "/model gpt-4o",
@@ -535,7 +602,7 @@ mod tests {
     /// 实跑一遍，而不是「假设它应该产出什么」）。
     ///
     /// **别指望本测试拦住「`Request` 新增变体但忘了加命令」** —— 它只逐个
-    /// `matches!` 已知的 7 个变体，新增变体不会让它变红。真正与 `Request`
+    /// `matches!` 已知变体，新增变体不会让它变红。真正与 `Request`
     /// 对齐的闭环在 app 侧：app 循环对 `Request` 的穷尽 `match` 是**编译错误**，
     /// 漏实现编不过。本测试只保证这张表本身完整（每条命令都真能产出请求，
     /// 而不是解析成 `None` / `Hint` 被悄悄吞掉）。
@@ -544,6 +611,7 @@ mod tests {
         let mut produced: Vec<Request> = [
             "hello",
             "/model gpt",
+            "/effort high",
             "/logout",
             "/new",
             "/resume",
@@ -592,6 +660,15 @@ mod tests {
         assert!(
             has(|r| matches!(r, Request::SetModel { .. })),
             "缺 SetModel"
+        );
+        assert!(
+            has(|r| matches!(
+                r,
+                Request::SetEffort {
+                    effort: Some(_)
+                }
+            )),
+            "缺 SetEffort（设定档位）"
         );
         assert!(has(|r| matches!(r, Request::Login { .. })), "缺 Login");
         assert!(has(|r| matches!(r, Request::Logout)), "缺 Logout");
@@ -651,6 +728,123 @@ mod tests {
         }
     }
 
+    /// `/effort` 的四种形态：无参本地显示、合法档位直发、`default` 清除、
+    /// 非法值本地提示。
+    ///
+    /// 变异：删掉 `default` 分支 ⇒ `/effort default` 落进 `parse::<EffortLevel>`
+    /// 的 `Err` 分支变成 `Hint` ⇒ 本测试与
+    /// [`test_every_command_maps_to_the_designed_action`] 同时变红。
+    #[test]
+    fn test_effort_parse_forms() {
+        assert_eq!(parse("/effort"), Action::Local(LocalAction::Effort));
+        assert_eq!(
+            parse("/effort HIGH"),
+            Action::Request(Request::SetEffort {
+                effort: Some(EffortLevel::High),
+            }),
+            "大小写不敏感由 EffortLevel::from_str 决定"
+        );
+        assert_eq!(
+            parse("/effort xhigh"),
+            Action::Request(Request::SetEffort {
+                effort: Some(EffortLevel::XHigh),
+            })
+        );
+        assert_eq!(
+            parse("/effort default"),
+            Action::Request(Request::SetEffort { effort: None }),
+            "default = 清除设置，不是第八个枚举值"
+        );
+        // `default` 令牌同样大小写不敏感（`eq_ignore_ascii_case` 分支）。
+        // 变异：把该比较改成 `==` ⇒ 这两条变红（落进 `parse::<EffortLevel>` 的 `Err`）。
+        for input in ["/effort DEFAULT", "/effort Default"] {
+            assert_eq!(
+                parse(input),
+                Action::Request(Request::SetEffort { effort: None }),
+                "`{input}` 应识别为清除令牌"
+            );
+        }
+        // 前后与中间的多余空白由 `trim` + `split_whitespace` 吞掉。
+        assert_eq!(
+            parse("/effort   HIGH "),
+            Action::Request(Request::SetEffort {
+                effort: Some(EffortLevel::High),
+            }),
+            "多余空白不影响档位解析"
+        );
+        match parse("/effort maybe") {
+            Action::Local(LocalAction::Hint(text)) => {
+                assert!(text.contains("用法：/effort"), "{text}");
+                for legal in [
+                    "off", "minimal", "low", "medium", "high", "xhigh", "max", "default",
+                ] {
+                    assert!(text.contains(legal), "用法缺 `{legal}`：{text}");
+                }
+            }
+            other => panic!("非法档位应本地提示，得到 {other:?}"),
+        }
+    }
+
+    /// 无参 `/effort` 只读视图：恰好一条 System 行，档位 + 用法同处一行。
+    ///
+    /// 变异：把 `None` 的显示改回 `-` 或空串 ⇒ 本测试**不受影响**（它在 apply 前
+    /// 显式设了 `Some(High)`，不经过 `None` 分支），只有
+    /// [`test_apply_local_effort_shows_default_when_unset`] 变红。
+    #[test]
+    fn test_apply_local_effort_shows_current_level_and_usage() {
+        let mut a = app();
+        a.view.effort = Some(EffortLevel::High);
+        apply_local(&mut a, LocalAction::Effort);
+
+        assert_eq!(a.transcript.len(), 1, "只写一条：{:?}", a.transcript);
+        let Some(TranscriptLine::System(s)) = a.transcript.last() else {
+            panic!("应 push 一条 System：{:?}", a.transcript);
+        };
+        assert_eq!(
+            s,
+            "effort: high（用法：/effort [off|minimal|low|medium|high|xhigh|max|default]）"
+        );
+        assert!(a.follow, "本地输出后重新贴底");
+    }
+
+    /// `view.effort == None` ⇒ 显示 `default`（provider 默认）。
+    #[test]
+    fn test_apply_local_effort_shows_default_when_unset() {
+        let mut a = app();
+        assert!(a.view.effort.is_none());
+        apply_local(&mut a, LocalAction::Effort);
+
+        assert_eq!(a.transcript.len(), 1, "只写一条：{:?}", a.transcript);
+        let Some(TranscriptLine::System(s)) = a.transcript.last() else {
+            panic!("应 push 一条 System：{:?}", a.transcript);
+        };
+        assert!(
+            s.starts_with("effort: default（用法：/effort "),
+            "None 显示 default：{s}"
+        );
+    }
+
+    /// `/status` 的档位行：`None` → `default`，`Some` → 规范拼写。
+    #[test]
+    fn test_status_text_reports_effort() {
+        let line = |v: &CodingView| {
+            status_text(v)
+                .lines()
+                .find(|l| l.starts_with("effort:"))
+                .expect("`/status` 应有 effort 行")
+                .to_string()
+        };
+
+        let mut view = CodingView::for_test();
+        assert_eq!(line(&view), "effort: default");
+
+        view.effort = Some(EffortLevel::High);
+        assert_eq!(line(&view), "effort: high");
+
+        view.effort = Some(EffortLevel::XHigh);
+        assert_eq!(line(&view), "effort: xhigh", "用规范拼写而非 Debug 名");
+    }
+
     /// 空白与大小写：`/model` 无参**必须**走浮层，绝不直发 SetModel。
     ///
     /// 变异：把无参分支改成 `Request::SetModel{..}` → 本测试与
@@ -667,8 +861,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "skills", "copy", "quit", "thinking", "model", "login", "logout",
-                "new", "resume", "compact", "export",
+                "help", "status", "skills", "copy", "quit", "thinking", "effort", "model", "login",
+                "logout", "new", "resume", "compact", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );
@@ -683,6 +877,15 @@ mod tests {
                 .arg_hint,
             Some("[model_name]"),
             "浮层要显示 arg_hint（设计 §2.4）"
+        );
+        assert_eq!(
+            all_commands()
+                .iter()
+                .find(|c| c.name == "effort")
+                .unwrap()
+                .arg_hint,
+            Some("[off|minimal|low|medium|high|xhigh|max|default]"),
+            "合法取值必须在浮层可见"
         );
     }
 
@@ -816,6 +1019,7 @@ mod tests {
             "deepseek-chat",
             "↑1.2k ↓345",
             "turns      2",
+            "effort: default",
             "tools",
             "read, write",
             "/tmp",
@@ -993,6 +1197,10 @@ mod tests {
             "/status",
             "/help model",
             "/thinking maybe",
+            "/effort",
+            "/effort high",
+            "/effort default",
+            "/effort maybe",
             "/model",
             "/model gpt-4o",
             "/export a.jsonl",

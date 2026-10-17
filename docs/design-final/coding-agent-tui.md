@@ -277,7 +277,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 ## 6. 命令划分：TUI 侧表 vs app 侧能力
 
-**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，13 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，14 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app。二者唯一契约是 `Request` —— 漏实现是**编译错误**
 （app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -298,6 +298,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | `/copy` | 本地（最后一条 assistant 回复写进 transcript，**无剪贴板依赖**） | — |
 | `/quit` | 本地 | — |
 | `/thinking [on\|off]` | 本地开关 **（不在 design §6 表里，实现新增，见 §8）** | — |
+| `/effort [level]` | 无参本地显示当前档位与用法（**不发请求**）；有参直发；`default` 清除设置（发 `None`） | `SetEffort` |
 | `/model [name]` | 无参时**浮层选择**（`available_models`，每条显示 `provider/model`、可输入筛选）；有参直发，支持 `provider/model` 限定名 | `SetModel` |
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
@@ -312,7 +313,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 嵌套事件循环的模态浮层。任一问答步骤取消（Esc / 空 key）→ **不产生任何 `Request`**（半截登录比什么都不做更糟）。
 
 **app 侧能力**（`apps/coding-agent/src/capabilities.rs`）：`login` / `logout` / `set_model` /
-`new_session` / `compact` / `export`，每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
+`set_effort` / `new_session` / `compact` / `export`，每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
 `Outbound::Output`。**本模块绝不 print**（TUI 起屏后 stderr/stdout 会冲掉整屏）。
 `new_session` / `compact` 是 `async`（碰 `Session`），`export` 是**同步**（见 §8）。
 
@@ -370,7 +371,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D3 | app 循环伪代码把 `boundary_rx` 直接交给 `BasicLoop`（§7） | app 侧在 `select!` 里把 `boundary_rx` 收到的 `Boundary` **push 进每回合新建的 `QueueBoundarySource`** | ① app 循环在回合中已经 `select!` 着 `boundary_rx`，顺手泵进源即可；② 一次性源避免 `Abort` 标记跨回合污染（§4）。另加空闲期排空残留 |
 | D4 | app 循环伪代码在回合末**不排空**事件信道（§7） | 回合结束后 `while let Ok(env) = sink_rx.try_recv()` 排空 | `select!` 分支选择是随机的，可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件还躺在信道里；不排空会晚一整回合转发（`is_turning` 不复位、turn 摘要不显示） |
 | D5 | `CodingView` 字段清单「含 `ToolCallId → ToolCall` 映射，供工具结果回填」（§9 未决） | **视图不含映射**；结果回填靠 **UI 侧** `App` 自己的 `tool_index`（transcript 下标） | 视图只承载「状态行 / `/status`」要显示的东西；回填是渲染关注点，归 UI |
-| D6 | 命令表只有 §6 的 9 条 | 表里有 **13 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）与 **`/resume`**（运行期切换会话落地后补，见 §8.2 M19） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md` |
+| D6 | 命令表只有 §6 的 9 条 | 表里有 **14 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）、**`/resume`**（运行期切换会话落地后补，见 §8.2 M19）与 **`/effort`**（思考档位落地后补，见 §8.2 M21） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md`；`/effort` 见 `docs/design-final/effort.md` |
 | D7 | 初始化顺序编号为 1.信道 2.sink 3.阻塞 Wiring 4.Agent 5.view₀ 6.spawn（§7） | 实际 1+2.channel/sink → **4.Agent** → **3.阻塞 Wiring** → 5.view₀ → 6.spawn | Agent 构建不阻塞、不依赖 Wiring；先建 Agent 后建 Wiring 不破坏 R7 的承重结论（**阻塞早退发生在 spawn 之前**，`begin_turn` 只在 agent 真跑时发生） |
 | D8 | `ys-protocol` 里的 `Envelope` / `LifecyclePolicy`「迁往 ys-protocol」（review R1 建议） | 已迁；`ys-channel` 整 crate 删除 | 见 `core-channel.md` §8 |
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
@@ -403,6 +404,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M18 | **退出后打 `session: <id>`**（ADR-0032）：TUI 退出（alt-screen 已恢复、transcript 已回放）后由 `main` 往 **stderr** 写一行 `session: <id>`，与 `-p` / `--json` 同文案同去处；只在**已落盘**时打（惰性新会话没跑过回合就没有文件）。会话号取自 `app_loop::SessionPathHandle` —— 启动态由 `run_interactive` 从 `Wiring` 播种、`/new` 后由 app 循环刷新，**不等 app 线程收摊**（长回合中途退出时正卡在模型调用里，等就取不到） | `apps/coding-agent/src/{main,app_loop}.rs` |
 | M19 | **`/resume` 运行期切换会话**（ADR-0033，取代 ADR-0026 决策 6）：无参 → 浮层（候选挂 `App.pending_sessions`，由 `resolve_session_pick` 决策、标签含**完整 id** 以供反解、Esc 取消、空列表只提示不弹浮层）；有参 → 直切。app 侧 `resume_session` **可失败步全部前置**（解析 → 读 meta → 纯解析模型四字段 → 构建候选 model），`wiring.resume_into` **open 成功才替换**句柄（失败 ⇒ 当前会话全不变）。UI 侧回放经 `Outbound::SessionResumed` → `reset_for_replay()` + `replay_lines()`，**必须显式 `RenderCache::reset()`**（回放是本 app **第一个**清屏/缩短 transcript 的操作）。启动期 `--resume` 复用同一通路、顺带修掉空屏（出站顺序 `SessionResumed` 先于启动提示）。**`-p` / `--json` 不受影响**（不收 `Outbound`） | `ys-protocol/src/{session,request,lib}.rs`；`ys-tui-coding/src/{cache,transcript,commands,prompter,app,run,lib}.rs`；`apps/coding-agent/src/{wiring,capabilities,main,app_loop,sessions}.rs`；`apps/coding-agent/tests/resume_cli.rs`；见 `docs/design-final/runtime-resume.md` |
 | M20 | **模态选择器带常驻筛选输入框**：`select_modal`（`run.rs`）在候选列表**之上**加一行输入框 —— 打开即可敲字，大小写不敏感**子串**匹配**整条候选串**，↑↓ 在**过滤后**的列表里移动，Enter 确认（**无匹配时不动作**，取消的唯一出口是 Esc），Esc 取消；`Backspace/Delete/←→/Home/End` 与 `Paste` 编辑筛选串。空查询 ⇒ 过滤结果 = 全体 ⇒ 行为与「纯列表」逐字一致。四个模态命令（provider / model / skill / session）**共用** `select_modal`，故筛选对它们一并生效。两条纯函数（`filter_indices` / `clamp_selection`）与 `modal_move` 并列抽出，理由相同：模态循环要真终端，语义只能靠纯函数钉进单测 —— 尤其 `clamp_selection`，查询收窄后不收敛 `selected` 会让 `filtered[selected]` 越界 panic。**筛选框为空时显示占位文案「输入以筛选…」**（可筛选这件事在输入框里说，**不进标题** —— 标题塞提示会把框撑到 60+ 列，窄终端下反被裁掉） | `crates/ys-tui-coding/src/{run,draw}.rs` |
+| M21 | **`/effort` 不镜像本地状态，且设置走模型重建**：① 与 `/thinking` 不同，`/effort <level>` **不经**「本地先写一行 + 镜像 Request」——档位真值在 app 侧 `Config.effort`，TUI 只读 `CodingView.effort`；本地先改会让 UI 早于 app 显示一个**尚未重建模型**的档位，命令成功与否也无从区分。无参显示是纯本地读快照。② 档位**随会话 meta 持久化**（`SessionMeta.effort`）：它描述「本会话想用什么思考深度」，与 `/thinking` 的显示偏好同属会话级状态；`/new` 不重置（同 `thinking_visible`），`/resume` 从目标 meta 还原并重建，`-p` / `--json` **只读不写**（不覆盖既有会话）。③ 档位落在 `OpenAICompatibleConfig` 上，只有**重建 model** 才能进请求；`set_effort` 与 `set_model` 同路径（无凭证 ⇒ `wiring.set_model(None)`），故下一个回合（含 subagent / compact 的工厂构造）自动继承，回合内不热切换 | `ys-tui-coding/src/{commands,events,view}.rs`；`apps/coding-agent/src/{config,capabilities,app_loop,main,view}.rs`；`crates/ys-protocol/src/request.rs`；`crates/ys-session/src/meta.rs`；见 `docs/design-final/effort.md` |
 
 ---
 
@@ -467,6 +469,22 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
 - **M6** 把守卫判定放宽回「任意行」（去掉 `is_table_line`）→ `narrow_width_long_prose_keeps_markdown_styles` 变红。
 - **U3 的 panic hook 变异 A–D**（先 delegate 后 restore / 删 `LeaveAlternateScreen` / 删 `restore()` / 删 `delegate()`）
   均变红；**变异 G**（删 `restore_sequence()` 的 `PopKeyboardEnhancementFlags`）在补断言后由「存活」转为被捕获。
+
+### 9.5 `/effort`：新增用例与变异
+
+测试按层分布（逐条契约见 `docs/design-final/effort.md` §6）：
+
+| 落点 | 覆盖 | 变异点（注入 ⇒ 变红） |
+|---|---|---|
+| `crates/ys-core/src/effort.rs` | 七档 `parse → as_wire → Display` 往返；serde 与 `as_wire` 逐档一致；`default` / 空串 / 未知值被拒并列出合法值；大小写与 trim | 改任一 wire 拼写 ⇒ 往返用例；删 `rename_all = "lowercase"` ⇒ serde 用例；把 `default` 当合法档位 ⇒ 非法值用例 |
+| `crates/ys-protocol/src/request.rs` | `SetEffort { Some(..) }` / `{ None }` 双向往返；老 JSON 形态仍可反序列化（外部标签 + 小写拼写） | 删 `None` 形态的往返 ⇒ 真实信道上清除请求解析失败；改变体标签 ⇒ legacy 用例 |
+| `crates/ys-session/src/meta.rs` | `effort` 往返（落盘为小写）；缺键 / `null` ⇒ `None`，旧首行仍可反序列化 | 删 `#[serde(default)]` / 把字段改成非 `Option` ⇒ 缺键用例 |
+| `adapters/model-openai-compatible/src/lib.rs` | **4 方言 × 7 档**全矩阵对照 `reasoning_effort` / `thinking.type`；`None`（`default`）四方言皆不发；OpenCodeGo 两字段**逐档**互斥；构造器钉住各方言 | OpenAI `off` 改回 `"off"`；任一方言映射写成固定值；DeepSeek `off` 补发档位或 `enabled` 写成 `disabled`；OpenCodeGo 档位分支补 `thinking`；`None` 方言走 OpenAI 映射 |
+| `apps/coding-agent/src/capabilities.rs` | `set_effort` 保存 + 重建（factory 收到档位）+ 输出 `effort: high`；`None` 输出 `effort: default`；无凭证 ⇒ `wiring.model == None`；方言为 `None` 的 provider 仍保存并给 warning；`/resume` 从目标 meta 还原并重建 | 只写 `config.effort` 不重建 ⇒ factory 断言；无凭证仍保留旧 model ⇒ 置空断言；漏 `cfg.effort = effort` ⇒ resume 用例 |
+| `apps/coding-agent/src/app_loop.rs` | `SetEffort` 臂产出 `Output` + 刷新 `View.effort`；`None` 清除；`every_request_variant_is_handled` 覆盖该变体 | 漏 `SetEffort` 臂 ⇒ `match` 不穷尽编译失败；只改 config 不刷视图 ⇒ `set_effort_updates_view` |
+| `apps/coding-agent/src/{main,view}.rs` | `finalize_turn_meta` 三态（写入 / 清除 / 不写）；`CodingView.effort` 透传 `Config.effort` | 无条件写 ⇒ 三态用例；视图写死 `None` ⇒ `test_build_view_passes_effort` |
+| `crates/ys-tui-coding/src/{commands,events}.rs` | 命令表 14 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例 |
+| `scripts/doc-consistency.sh` | architecture.md 命令表含 `/effort` 且计数为 14 条 | 计数回退 / 命令表漏行 ⇒ 脚本非零退出 |
 
 ---
 

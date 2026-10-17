@@ -247,6 +247,7 @@ fn base_config(api_base: String) -> OpenAICompatibleConfig {
         model: "test-model".into(),
         max_tokens: None,
         temperature: None,
+        effort: None,
         compat: ProviderCompat {
             supports_stream_usage: false,
             ..ProviderCompat::standard()

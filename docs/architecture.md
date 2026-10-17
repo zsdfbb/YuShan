@@ -713,6 +713,10 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
   （`dropped`），绝不阻塞 agent。一行一次 `write_all`：**正常 flush / 排空时**末行完整；
   SIGKILL 等不可捕获退出仍可能截断末行（T5 的 P1 项）。
 - **只记段，不记增量**：`ModelTextDelta` / `ModelThinkingDelta` 只累计计数，不产生记录（长回答不会撑爆文件）。
+- **模型尝试可拆账**：`model_attempt` 记录每次 HTTP 尝试的 `ttfb_ms` / `response_headers_ms` /
+  `duration_ms`、重试分类、实际退避与抑制原因；`ttft` 不再把适配器内部重试混成不可解释的长尾。
+- **压缩 / 截断边界**：`context_compacted`、`context_compaction_failed`、`response_truncated`
+  独立落盘，分别记录估算 token 前后值、失败原因与被作废的工具调用数。
 - **不占输出通道**：debug 内容只进文件；`-p` 的 stdout 与 `--json` 的逐行 `Envelope` 保持原契约。
 - **退出收敛**：`main.rs` 的裸退出原语只允许出现在 `exit_with_debug`（先 `flush` 再 `exit`）。
 

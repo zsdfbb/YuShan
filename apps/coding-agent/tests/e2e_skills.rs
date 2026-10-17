@@ -279,6 +279,7 @@ async fn e2e_skills_section_input_token_delta() {
         model: model_name.clone(),
         max_tokens: Some(4096),
         temperature: Some(0.0),
+        reasoning_effort: None,
         compat: ProviderCompat::deepseek(),
     });
 

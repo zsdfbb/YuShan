@@ -18,6 +18,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// 推理强度（如 `low` / `high` / `max`）。`None` 时整个字段不序列化，
+    /// 保持既有端点行为不变；是否支持由具体 provider / model 决定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// `stream_options`：OpenAI 兼容端点用于让流式末包携带 usage 的开关。

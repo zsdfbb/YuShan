@@ -7,7 +7,7 @@ mod inline_thinking;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compat::ProviderCompat;
 use inline_thinking::{Segment, SegmentKind};
@@ -25,6 +25,8 @@ pub struct OpenAICompatibleConfig {
     pub model: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// 可选推理强度；`None` = 不发送该字段（默认，兼容所有端点）。
+    pub reasoning_effort: Option<String>,
     pub compat: ProviderCompat,
 }
 
@@ -76,12 +78,102 @@ impl Default for TimeoutConfig {
 /// 不往 `Envelope` / `AgentEvent` / `ModelEvent` 加任何变体。
 pub type ModelLogger = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 一次模型 HTTP 尝试的结果分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptOutcome {
+    Success,
+    Retryable,
+    Fatal,
+}
+
+impl ModelAttemptOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Retryable => "retryable",
+            Self::Fatal => "fatal",
+        }
+    }
+}
+
+/// 失败为何发生。主分类按 HTTP 状态 / 传输层来源给出；端点可通过
+/// `x-should-retry` 覆盖是否重试，但不会改变底层失败分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptReason {
+    Transport,
+    IdleTimeout,
+    RateLimited,
+    ServerError,
+    Quota,
+    Stream,
+    Fatal,
+}
+
+impl ModelAttemptReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::IdleTimeout => "idle_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::ServerError => "server_error",
+            Self::Quota => "quota",
+            Self::Stream => "stream",
+            Self::Fatal => "fatal",
+        }
+    }
+}
+
+/// 本可重试却没有重试的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAttemptRetrySuppressed {
+    StreamStarted,
+    Exhausted,
+    BackoffCap,
+}
+
+impl ModelAttemptRetrySuppressed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamStarted => "stream_started",
+            Self::Exhausted => "exhausted",
+            Self::BackoffCap => "backoff_cap",
+        }
+    }
+}
+
+/// 一次 HTTP 尝试的结构化读数。
+///
+/// `attempt` 从 1 起；`max_attempts` 是**总尝试次数**（配置里的额外重试次数 + 1）。
+/// `ttfb_ms` 只在成功解析到非空响应体字节后给出；HTTP 错误与传输失败为 `None`，
+/// 它们的等待时间由 `response_headers_ms` / `duration_ms` 解释。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelAttempt {
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub outcome: ModelAttemptOutcome,
+    pub reason_class: Option<ModelAttemptReason>,
+    pub http_status: Option<u16>,
+    pub ttfb_ms: Option<u64>,
+    pub response_headers_ms: Option<u64>,
+    pub duration_ms: u64,
+    pub backoff_ms: Option<u64>,
+    pub retried: bool,
+    pub retry_suppressed: Option<ModelAttemptRetrySuppressed>,
+    pub stream_started: bool,
+    /// 端点拒绝 `stream_options` 后，本尝试内部又发了一次请求。
+    pub fallback_retry: bool,
+}
+
+/// 每次 HTTP 尝试结束时同步回调一次。由 app 注入，适配器不直接写文件。
+pub type ModelTrace = Arc<dyn Fn(&ModelAttempt) + Send + Sync>;
+
 pub struct OpenAICompatibleModel {
     config: OpenAICompatibleConfig,
     client: reqwest::Client,
     retry: RetryConfig,
     timeouts: TimeoutConfig,
     log: Option<ModelLogger>,
+    trace: Option<ModelTrace>,
     /// 随**每个请求**发送的额外头。空的默认值覆盖绝大多数端点；
     /// 少数网关有接入要求（如 OpenCode Go 的 `x-opencode-session`）。
     extra_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
@@ -101,6 +193,7 @@ impl OpenAICompatibleModel {
             retry: RetryConfig::default(),
             timeouts,
             log: None,
+            trace: None,
             extra_headers: Vec::new(),
             owns_client: true,
         }
@@ -118,6 +211,7 @@ impl OpenAICompatibleModel {
             retry: RetryConfig::default(),
             timeouts: TimeoutConfig::default(),
             log: None,
+            trace: None,
             extra_headers: Vec::new(),
             owns_client: false,
         }
@@ -145,6 +239,12 @@ impl OpenAICompatibleModel {
         self
     }
 
+    /// 注入结构化尝试读数回调。未注入时静默；生产只在 debug 实际开启时注入。
+    pub fn with_trace(mut self, trace: ModelTrace) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     /// 追加一个随每个请求发送的额外头（可重复调用来追加多个）。
     ///
     /// 这是**传输层**契约，与 [`RetryConfig`] / [`TimeoutConfig`] / 日志回调同类；
@@ -168,6 +268,12 @@ impl OpenAICompatibleModel {
     fn log(&self, message: &str) {
         if let Some(log) = &self.log {
             log(message);
+        }
+    }
+
+    fn trace(&self, attempt: &ModelAttempt) {
+        if let Some(trace) = &self.trace {
+            trace(attempt);
         }
     }
 
@@ -207,10 +313,30 @@ enum AttemptError {
     /// 值得重试。`server_delay` 是服务端要求的等待（`Retry-After` / `Retry-After-ms`）。
     Retryable {
         reason: String,
+        reason_class: ModelAttemptReason,
         server_delay: Option<Duration>,
     },
     /// 确定性失败，直接上报。
-    Fatal(ModelError),
+    Fatal {
+        error: ModelError,
+        reason_class: ModelAttemptReason,
+    },
+}
+
+/// 单次尝试的计时与 HTTP 元数据。错误路径同样携带，便于把“失败前等在哪”落盘。
+#[derive(Debug, Clone, Copy, Default)]
+struct AttemptMeta {
+    http_status: Option<u16>,
+    ttfb_ms: Option<u64>,
+    response_headers_ms: Option<u64>,
+    duration_ms: u64,
+    stream_started: bool,
+    fallback_retry: bool,
+}
+
+struct AttemptCall {
+    result: Result<ModelResponse, AttemptError>,
+    meta: AttemptMeta,
 }
 
 /// 额度 / 计费耗尽的错误体措辞（大小写不敏感的子串匹配）。
@@ -284,28 +410,66 @@ impl Model for OpenAICompatibleModel {
 
         // 3. 有界重试循环。`max_attempts` 是**额外**重试次数，故总尝试数为 max_attempts + 1。
         //    每次尝试用 DeltaWatchingSink 记「本次是否已吐出 delta」——吐过就不许重试。
-        for attempt in 0..=self.retry.max_attempts {
-            let (outcome, emitted) = {
+        let max_attempts = self.retry.max_attempts.saturating_add(1);
+        for attempt in 0..max_attempts {
+            let started = Instant::now();
+            let (outcome, meta) = {
                 let mut watcher = DeltaWatchingSink::new(&mut *sink);
                 let outcome = self.attempt(&url, &mut chat_request, &mut watcher).await;
-                (outcome, watcher.emitted)
+                let mut meta = outcome.meta;
+                meta.duration_ms = started.elapsed().as_millis() as u64;
+                meta.stream_started = watcher.emitted;
+                (outcome.result, meta)
+            };
+            let mut record = ModelAttempt {
+                attempt: attempt + 1,
+                max_attempts,
+                outcome: ModelAttemptOutcome::Success,
+                reason_class: None,
+                http_status: meta.http_status,
+                ttfb_ms: meta.ttfb_ms,
+                response_headers_ms: meta.response_headers_ms,
+                duration_ms: meta.duration_ms,
+                backoff_ms: None,
+                retried: false,
+                retry_suppressed: None,
+                stream_started: meta.stream_started,
+                fallback_retry: meta.fallback_retry,
             };
 
             match outcome {
-                Ok(response) => return Ok(response),
-                Err(AttemptError::Fatal(error)) => return Err(error),
+                Ok(response) => {
+                    self.trace(&record);
+                    return Ok(response);
+                }
+                Err(AttemptError::Fatal {
+                    error,
+                    reason_class,
+                }) => {
+                    record.outcome = ModelAttemptOutcome::Fatal;
+                    record.reason_class = Some(reason_class);
+                    self.trace(&record);
+                    return Err(error);
+                }
                 Err(AttemptError::Retryable {
                     reason,
+                    reason_class,
                     server_delay,
                 }) => {
+                    record.outcome = ModelAttemptOutcome::Retryable;
+                    record.reason_class = Some(reason_class);
                     // 已吐出 delta ⇒ 一律不重试（重放会把已渲染的文本再渲染一遍）。
-                    if emitted {
+                    if meta.stream_started {
+                        record.retry_suppressed = Some(ModelAttemptRetrySuppressed::StreamStarted);
+                        self.trace(&record);
                         return Err(ModelError::Provider(format!(
                             "{reason} (streaming already began; not retried)"
                         )));
                     }
                     // 次数耗尽 ⇒ 上报最后一次的错误（消息里带尝试次数）。
-                    if attempt == self.retry.max_attempts {
+                    if attempt + 1 == max_attempts {
+                        record.retry_suppressed = Some(ModelAttemptRetrySuppressed::Exhausted);
+                        self.trace(&record);
                         self.log(&format!(
                             "retry giving up after {} attempt(s): {reason}",
                             attempt + 1
@@ -319,10 +483,16 @@ impl Model for OpenAICompatibleModel {
                     let delay = match self.backoff_delay(attempt, server_delay) {
                         Ok(delay) => delay,
                         Err(error) => {
+                            record.retry_suppressed =
+                                Some(ModelAttemptRetrySuppressed::BackoffCap);
+                            self.trace(&record);
                             self.log(&format!("retry giving up: {error}"));
                             return Err(error);
                         }
                     };
+                    record.backoff_ms = Some(delay.as_millis() as u64);
+                    record.retried = true;
+                    self.trace(&record);
                     // 进入退避前落一行日志（决策 7）：对排障可见、对 TUI 不可见。
                     self.log(&format!(
                         "retry attempt {}/{} delay={}ms reason={reason}",
@@ -348,11 +518,20 @@ impl OpenAICompatibleModel {
         url: &str,
         chat_request: &mut ChatCompletionRequest,
         sink: &mut dyn ModelEventSink,
-    ) -> Result<ModelResponse, AttemptError> {
-        let response = self
-            .send(url, chat_request)
-            .await
-            .map_err(retryable_transport_error)?;
+    ) -> AttemptCall {
+        let started = Instant::now();
+        let mut meta = AttemptMeta::default();
+        let response = match self.send(url, chat_request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return AttemptCall {
+                    result: Err(retryable_transport_error(error)),
+                    meta,
+                };
+            }
+        };
+        meta.response_headers_ms = Some(started.elapsed().as_millis() as u64);
+        meta.http_status = Some(response.status().as_u16());
 
         // 一次性回退：端点不认识 `stream_options.include_usage` 时返回 400。
         // 这是**单次尝试内部**的「剥掉不认识参数后重发一次」，与重试层无关 ——
@@ -361,6 +540,7 @@ impl OpenAICompatibleModel {
         let response = if response.status() == reqwest::StatusCode::BAD_REQUEST
             && chat_request.stream_options.is_some()
         {
+            meta.fallback_retry = true;
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             eprintln!(
@@ -369,15 +549,28 @@ impl OpenAICompatibleModel {
                  token usage for this run will be reported as 0"
             );
             chat_request.stream_options = None;
-            self.send(url, chat_request)
-                .await
-                .map_err(retryable_transport_error)?
+            match self.send(url, chat_request).await {
+                Ok(response) => {
+                    meta.response_headers_ms = Some(started.elapsed().as_millis() as u64);
+                    meta.http_status = Some(response.status().as_u16());
+                    response
+                }
+                Err(error) => {
+                    return AttemptCall {
+                        result: Err(retryable_transport_error(error)),
+                        meta,
+                    };
+                }
+            }
         } else {
             response
         };
 
         if !response.status().is_success() {
-            return Err(classify_error_response(response).await);
+            return AttemptCall {
+                result: Err(classify_error_response(response).await),
+                meta,
+            };
         }
 
         // 流式解析：SSE 每解析出一个 delta 就立刻推给 sink（真增量，不缓冲）。
@@ -386,7 +579,17 @@ impl OpenAICompatibleModel {
         let idle = Duration::from_secs(self.timeouts.idle_secs);
         let mut accumulator =
             StreamAccumulator::new(&mut *sink, self.config.compat.has_reasoning_content);
-        match parse_sse_stream(response, idle, |event| accumulator.handle(event)).await {
+        let mut first_byte_at = None;
+        let result = match parse_sse_stream(
+            response,
+            idle,
+            |event| accumulator.handle(event),
+            || {
+                first_byte_at.get_or_insert_with(Instant::now);
+            },
+        )
+        .await
+        {
             // `finish()` 仅在 `StreamEvent::Error` 置位后报错，而该事件只由传输层错误
             // 产生（见 `stream::parse_sse_stream` 的 `Ok(Some(Err(..)))` 分支）——
             // 故此处把它的 `Err` 无条件归为可重试是安全的。
@@ -398,10 +601,13 @@ impl OpenAICompatibleModel {
                 .finish()
                 .map_err(|error| AttemptError::Retryable {
                     reason: error.to_string(),
+                    reason_class: ModelAttemptReason::Stream,
                     server_delay: None,
                 }),
             Err(error) => Err(classify_stream_error(error)),
-        }
+        };
+        meta.ttfb_ms = first_byte_at.map(|at| at.duration_since(started).as_millis() as u64);
+        AttemptCall { result, meta }
     }
 
     /// 计算下一次退避时长。
@@ -459,6 +665,7 @@ fn jitter_fraction() -> f64 {
 fn retryable_transport_error(error: reqwest::Error) -> AttemptError {
     AttemptError::Retryable {
         reason: format!("HTTP request failed: {error}"),
+        reason_class: ModelAttemptReason::Transport,
         server_delay: None,
     }
 }
@@ -468,10 +675,14 @@ fn classify_stream_error(error: ModelError) -> AttemptError {
     if error.to_string().contains(stream::IDLE_TIMEOUT_MARKER) {
         AttemptError::Retryable {
             reason: error.to_string(),
+            reason_class: ModelAttemptReason::IdleTimeout,
             server_delay: None,
         }
     } else {
-        AttemptError::Fatal(error)
+        AttemptError::Fatal {
+            error,
+            reason_class: ModelAttemptReason::Stream,
+        }
     }
 }
 
@@ -493,26 +704,49 @@ async fn classify_error_response(response: reqwest::Response) -> AttemptError {
         Some("true") => {
             return AttemptError::Retryable {
                 reason,
+                reason_class: http_reason_class(status),
                 server_delay,
             };
         }
-        Some("false") => return AttemptError::Fatal(ModelError::Provider(reason)),
+        Some("false") => {
+            return AttemptError::Fatal {
+                error: ModelError::Provider(reason),
+                reason_class: http_reason_class(status),
+            };
+        }
         _ => {}
     }
 
     // ② 额度否决：即便状态码是 429，额度耗尽也不重试。
     if looks_like_quota_exhausted(&body) {
-        return AttemptError::Fatal(ModelError::Provider(reason));
+        return AttemptError::Fatal {
+            error: ModelError::Provider(reason),
+            reason_class: ModelAttemptReason::Quota,
+        };
     }
 
     // ③ 状态码：429 与 5xx 可重试，其余 4xx 是确定性失败。
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         AttemptError::Retryable {
             reason,
+            reason_class: http_reason_class(status),
             server_delay,
         }
     } else {
-        AttemptError::Fatal(ModelError::Provider(reason))
+        AttemptError::Fatal {
+            error: ModelError::Provider(reason),
+            reason_class: http_reason_class(status),
+        }
+    }
+}
+
+fn http_reason_class(status: reqwest::StatusCode) -> ModelAttemptReason {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        ModelAttemptReason::RateLimited
+    } else if status.is_server_error() {
+        ModelAttemptReason::ServerError
+    } else {
+        ModelAttemptReason::Fatal
     }
 }
 
@@ -899,6 +1133,7 @@ pub fn translate_request(
             }),
         max_tokens: config.max_tokens.or(request.max_tokens),
         temperature: config.temperature.or(request.temperature),
+        reasoning_effort: config.reasoning_effort.clone(),
     })
 }
 
@@ -916,6 +1151,7 @@ mod tests {
             model: "deepseek-chat".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             compat: ProviderCompat::standard(),
         };
 
@@ -948,6 +1184,7 @@ mod tests {
             model: "test".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             compat: ProviderCompat::standard(),
         };
 
@@ -1330,11 +1567,31 @@ mod tests {
             model: "test".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             compat: ProviderCompat::standard(),
         };
         let request = ModelRequest::default();
         let chat_req = translate_request(&request, &config).unwrap();
         assert_eq!(chat_req.stream, Some(true));
+    }
+
+    /// 推理强度默认不出现；显式设置时按 provider 字段名发送。
+    ///
+    /// 变异：去掉 `skip_serializing_if` ⇒ 默认请求多出 `"reasoning_effort":null`；
+    /// 把字段名改成 `reasoning` ⇒ 显式断言变红。
+    #[test]
+    fn reasoning_effort_is_optional_on_the_wire() {
+        let mut config = config_with(ProviderCompat::standard());
+        let request = ModelRequest::default();
+
+        let absent = translate_request(&request, &config).unwrap();
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(json.get("reasoning_effort").is_none(), "{json}");
+
+        config.reasoning_effort = Some("low".into());
+        let present = translate_request(&request, &config).unwrap();
+        let json = serde_json::to_value(&present).unwrap();
+        assert_eq!(json["reasoning_effort"], "low", "{json}");
     }
 
     /// 构造一个仅 compat 不同的最小 config。
@@ -1345,6 +1602,7 @@ mod tests {
             model: "test".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
             compat,
         }
     }

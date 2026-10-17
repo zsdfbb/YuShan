@@ -134,13 +134,13 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 
 | 记录 | 关键字段 |
 |---|---|
-| `run_start`（一次） | `version`、`pid`、`os`/`arch`、`cwd`、`session_file`、`gen_ai.system`、`gen_ai.request.model`、`api_base`（**只 scheme+host**）、`limits{...}`、`tools[{name,spec_bytes}]`、`skills{count,budget}`、`env_names[]`（**只记名字不记值**）、`semconv` |
+| `run_start`（一次） | `version`、`pid`、`os`/`arch`、`cwd`、`session_file`、`gen_ai.system`、`gen_ai.request.model`、`gen_ai.request.reasoning_effort`（实际发送值；不支持时为 `null`）、`api_base`（**只 scheme+host**）、`limits{...}`、`tools[{name,spec_bytes}]`、`skills{count,budget}`、`env_names[]`（**只记名字不记值**）、`semconv` |
 | `turn_start` / `turn_end` | `turn`、`input_bytes`、`budget_ms`；结束时 `rounds`、`elapsed_ms`、`budget_remaining_ms`、`cache_hit/miss` |
 | `round_start` / `round_end` | 轮号；结束时 `ttft_ms`、`gen_ms`、`tools_ms`、`total_ms`、**`first_thinking_ms` / `first_text_ms`**、`thinking_span_ms` / `text_span_ms`、`thinking_deltas` / `text_deltas`（**只计数**）、`tool_calls` |
 | **`round_usage`** | **`purpose`**（`turn` / `compaction` / `summarize`，见 §4.8）、`round`（辅助调用可缺）、`gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`、**`gen_ai.usage.cache_read.input_tokens`**、**`gen_ai.usage.reasoning.output_tokens`**、`usage_reported`、`reasoning_tokens_reported`（**区分"真 0"与"没上报"**） |
 | `tool_call` | `gen_ai.tool.name`、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（**摘要**）、`args_original_bytes`、`args_truncated`、`args_keys`、`args_redacted_keys` |
 | `tool_result` | `duration_ms`、`is_error`、`result_bytes`、`result_lines`、`result_lines_exact`（**不记内容**） |
-| `model_attempt` | `attempt`/`max_attempts`、`outcome`、`reason_class`（`transport`/`idle_timeout`/`rate_limited`/`server_error`/`quota`/`fatal`）、`http_status`、`backoff_ms`、**`ttfb_ms`（真·首字节）** |
+| `model_attempt` | `attempt`/`max_attempts`（后者为**总尝试数**）、`outcome`、`reason_class`（`transport`/`idle_timeout`/`rate_limited`/`server_error`/`quota`/`stream`/`fatal`）、`http_status`、`response_headers_ms`、`duration_ms`、`backoff_ms`、`retried`、`retry_suppressed`、`stream_started`、`fallback_retry`、**`ttfb_ms`（真·首字节）** |
 | `context_compacted` | `estimated_tokens_before` / `after` / `delta`、`summarized` / `kept` |
 | `boundary` | `phase`（`enqueued` / `observed`）、`kind`（`abort`/`steer`）、`origin`（`ui`/`budget`） |
 | `state_change` | `name`（`model`/`provider`/`session`/…）、`from`/`to` |
@@ -291,7 +291,7 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 | 阶段 | 内容 | 估计 |
 |---|---|---|
 | **P0** | 开关 + 独立文件 + 异步 sink + 段的富计时（thinking/text 拆分）+ 工具元数据 + `run_start`/`run_end`（含 `rounds` / `duration_ms` / `exit_code` / 累计 usage）+ `/new` 切文件 + 64 MiB 文件上限 + `boundary` 记录 + `reasoning_tokens` + `RoundUsage`（含 `purpose` 与压缩覆盖）+ 退出原语收敛到 `exit_with_run_end` | **~900–1,100 行** |
-| **P1** | `model_attempt`（含 `ttfb_ms`、重试分类）+ 适配器自检 + 截断/压缩失败的专用记录 | ~300 行 |
+| **P1（部分落地）** | ✅ `model_attempt`（含 `ttfb_ms`、重试分类、退避与抑制原因）、`context_compacted` / `context_compaction_failed` / `response_truncated`；⏳ 适配器自检 | ~300 行 |
 | **P2** | 启动期 sweep（旧 debug 文件清理）、`state_change`、jq 配方文档 | ~250 行 |
 
 > P0 的原估 ~700 行**偏乐观**（评审 R7）：它包含 `Usage` 加字段（**既有 27 处字面量（实际补 10 处）**，已核实）、

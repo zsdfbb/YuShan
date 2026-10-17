@@ -185,8 +185,8 @@ TUI 显示：rounds + elapsed_secs（crates/ys-tui-coding/src/app.rs:265-277）
 无测试或代码把它当承重事实。
 
 **④ 请求里从不发 `parallel_tool_calls`。**
-`ChatCompletionRequest` 只有 `model / messages / tools / stream / stream_options / max_tokens /
-temperature` 七个字段（`adapters/model-openai-compatible/src/request.rs:6-21`），**没有**
+`ChatCompletionRequest` 现有 `model / messages / tools / stream / stream_options / max_tokens /
+temperature / reasoning_effort` 八个字段（`adapters/model-openai-compatible/src/request.rs`），**没有**
 `parallel_tool_calls`，也没有 `tool_choice`。OpenAI 系端点该字段默认 `true`，**但各家兼容实现的默认值不一致**
 ⇒ 「模型只发一个调用」在某个端点上可能就是**服务端默认关掉了并行调用**，而不是模型不想。
 ⇒ 这是**一行就能试**的实验（显式发 `parallel_tool_calls: true`，看批大小分布是否变化），

@@ -216,6 +216,8 @@ pub async fn run(
     worktree: WorktreeHandle,
     // 结构化执行日志（`--debug`）。`None` = 关闭（零文件、零线程）。
     mut debug: Option<DebugSink>,
+    // 适配器尝试读数 → 当前 debug 文件；`/new` / `/resume` 后重新绑定。
+    model_trace: Option<crate::debug_log::ModelTraceRouter>,
     // `run_start` 的工具元数据（启动装配期量好；工具表不随 `/new` / `/resume` 变）。
     debug_tools: Vec<(String, usize)>,
 ) -> Result<(), AppLoopError> {
@@ -447,6 +449,9 @@ pub async fn run(
                     debug_run += 1;
                     sink.begin_run(debug_run, crate::unix_now_ms());
                     debug_session_id = crate::session_id_for(wiring.session_path());
+                    if let Some(trace) = &model_trace {
+                        trace.attach(sink.handle(), debug_session_id.clone());
+                    }
                     crate::emit_run_start(
                         sink,
                         &config,
@@ -531,6 +536,9 @@ pub async fn run(
                         debug_run += 1;
                         sink.begin_run(debug_run, crate::unix_now_ms());
                         debug_session_id = crate::session_id_for(path_after.as_deref());
+                        if let Some(trace) = &model_trace {
+                            trace.attach(sink.handle(), debug_session_id.clone());
+                        }
                         crate::emit_run_start(
                             sink,
                             &config,
@@ -1271,6 +1279,7 @@ mod tests {
             app_session_path,
             app_worktree,
             debug,
+            None,
             Vec::new(),
         ));
 

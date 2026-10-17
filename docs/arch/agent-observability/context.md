@@ -138,11 +138,16 @@ ys-loop 产出 AgentEvent ──► ChannelSink ──► 消费侧（两条入�
    `is_error`、是否超时。
 5. **内部状态变化**：压缩触发（前/后 token 估算）、缓存命中/未命中、重试次数与退避、
    预算剩余、边界（Abort/Steer）的产生与观察时机。
-6. **计时扩充**：
-   - **把 `gen` 拆成「思考」与「正文」两段**（`gen` 现在混着两者，是当前最大的归因盲区）
+6. **逐轮 usage**（本轮分析暴露的缺口，见「对照」一节）：
+   - **每轮**记 `input_tokens` / `output_tokens` / `prompt_cache_hit` / `prompt_cache_miss`
+     —— 回答「上下文怎么涨的」「生成慢是不是因为输出长」
+   - **`reasoning_tokens`**：**provider 已在报**（`completion_tokens_details.reasoning_tokens`），
+     我们没解析 —— 补上即能直接回答「想得久还是写得长」
+7. **计时扩充**：
+   - **把 `gen` 拆成「思考」与「正文」两段**（时间戳口径；与上一条的 token 口径互为交叉验证）
    - **模型交互分段**：请求发出 → 首字节 → 首个思考增量 → 首个正文增量 → 结束；
      **每次重试单独记一条**（这是 74 秒/离群轮的疑点所在）
-7. **运行起点事实**（一次）：版本、provider/model、cwd/workspace、工具表、skills 数量、
+8. **运行起点事实**（一次）：版本、provider/model、cwd/workspace、工具表、skills 数量、
    limits（`max_rounds` / wall-clock 预算 / context window）、生效的配置来源。
 
 ### 范围外（明确不做的）
@@ -169,6 +174,43 @@ ys-loop 产出 AgentEvent ──► ChannelSink ──► 消费侧（两条入�
 - **两条入口（TUI / `-p`）都要有**，且 `-p` 的 stdout 必须保持干净（debug 只进文件）。
 
 ---
+
+## 对照：本轮性能分析追问 × 记录需求
+
+把这次会话里**实际问过的每一个性能问题**对回记录，看现有方案够不够：
+
+| # | 追问 | 需要的记录 | 现状 |
+|---|---|---|---|
+| 1 | 墙钟花在模型还是工具 | 逐轮 `ttft`/`gen`/`tools` | ✅ 已有 |
+| 2 | 哪几轮是离群 | 逐轮 `total` | ✅ 已有 |
+| 3 | 那几轮里哪个调用慢 | **逐调用耗时** | ✅ 本轮已加 |
+| 4 | 缓存生效吗 | `cache_hit`/`cache_miss` | ✅（方言 bug 已修） |
+| 5 | 排队慢还是 prefill 慢 | 请求发出 → **首字节** → 首 token | ✅ 已列入范围 |
+| 6 | 模型重试了几次 | 每次 attempt 一条 | ✅ 已列入范围 |
+| 7 | 压缩何时触发 | 压缩前后 token | ✅ 已列入范围 |
+| 8 | **想得久还是写得长** | **每轮 `reasoning_tokens` vs 正文 token** | ❌ **缺口**（见下） |
+| 9 | 生成慢是不是因为输出长 | **每轮 `output_tokens`** | ❌ **缺口** |
+| 10 | 上下文怎么涨的 | **每轮 `input_tokens` + cache 命中** | ❌ **缺口** |
+| 11 | 每轮"装了多少"（调用数与形态） | 逐调用记录数（可数）+ 参数摘要能否判"面操作" | ⚠️ 取决于 Q4 粒度 |
+
+### 三个缺口的同一个修法：**逐轮 usage**
+
+`ChatUsage`（`adapters/model-openai-compatible/src/response.rs`）现在只解析
+`prompt_tokens` / `completion_tokens` / `prompt_cache_*` / `prompt_tokens_details`。
+
+**provider 已经在报 `completion_tokens_details.reasoning_tokens`** —— 实测响应原文：
+
+```json
+{"completion_tokens":4,"completion_tokens_details":{"reasoning_tokens":4}}
+```
+
+而我们**没有这个字段**。补上它，再**逐轮**记一条 usage（而不是只在回合末累计），8/9/10 三个缺口
+一次解决，且不依赖任何时间戳推断。
+
+> 这一条比"把 `gen` 按增量时间戳拆两段"更硬：**一个是 provider 报的 token 数，一个是客户端猜的**
+
+其余两个缺口：**重试**（已在范围内）、**参数摘要粒度**（Q4 未定）；**逐轮调用数**不用单独记 ——
+从"逐调用记录"按 `round` 分组数即可。
 
 ## 未澄清问题
 

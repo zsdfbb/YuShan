@@ -693,7 +693,7 @@ async fn run_turn_once(
                 // → 忙等。模式不匹配时 tokio 会**禁用**该分支。
                 Some(env) = ctx.sink_rx.recv() => {
                     count_round(&env, &mut observed_rounds);
-                    if let Some(line) = clock.observe(&env, Instant::now()) {
+                    for line in clock.observe(&env, Instant::now()) {
                         logging::log(&line);
                     }
                     send(ctx.out_tx, Outbound::Event(env)).await?;
@@ -731,14 +731,14 @@ async fn run_turn_once(
     // 回合已结束 → 生产者不会再发，`try_recv` 排到 `Empty` 即止。
     while let Ok(env) = ctx.sink_rx.try_recv() {
         count_round(&env, &mut observed_rounds);
-        if let Some(line) = clock.observe(&env, Instant::now()) {
+        for line in clock.observe(&env, Instant::now()) {
             logging::log(&line);
         }
         send(ctx.out_tx, Outbound::Event(env)).await?;
     }
     // 兜底：`RoundStarted` 已开轮、终局事件却没跟到（失败路径理论上会发生）时，
     // 仍为那一轮落一行 —— 排障时「跑了但没读数」比「读数为 0」更难查。
-    if let Some(line) = clock.take_line() {
+    for line in clock.take_lines() {
         logging::log(&line);
     }
 

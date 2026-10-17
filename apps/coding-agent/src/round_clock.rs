@@ -31,8 +31,10 @@
 //! - `tools` = 首末 `ToolResult` 之间。无工具调用的轮记 0。
 //! - 三者之外的余额（组装请求、落盘、事件转发）不计入任何一段 ⇒ **三段之和 ≤ total**。
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use ys_core::ToolCallId;
 use ys_event::AgentEvent;
 use ys_loop::{LoopError, RunResult};
 use ys_protocol::Envelope;
@@ -54,14 +56,24 @@ pub(crate) struct RoundClock {
     last_model: Option<Instant>,
     first_tool: Option<Instant>,
     last_tool: Option<Instant>,
+    /// 本轮**在飞**的调用：`id → (名字, 起点)`。
+    ///
+    /// 存在的理由：轮级的 `tools_ms` 是**首末之差**，它答不了"这一轮的 74 秒花在哪一个
+    /// 调用上" —— 实测出现过一轮里单个 `bash` 吃掉 73.7 秒，而命令本身平平无奇。
+    in_flight: HashMap<ToolCallId, (String, Instant)>,
+    /// 本轮**已完成**调用的耗时，按完成顺序（与 `in_flight` 一起在轮末清空）。
+    calls: Vec<(String, u128)>,
 }
 
 impl RoundClock {
-    /// 观察一条事件，返回**刚被它关闭的那一轮**的可观测行（没有则 `None`）。
-    pub(crate) fn observe(&mut self, env: &Envelope, now: Instant) -> Option<String> {
+    /// 观察一条事件，返回**刚被它关闭的那一轮**的可观测行（没有则空）。
+    ///
+    /// 至多两条：轮摘要行；若该轮有工具调用，再跟一条**逐调用**耗时行
+    /// （`tools round=N name:ms name:ms …`）。
+    pub(crate) fn observe(&mut self, env: &Envelope, now: Instant) -> Vec<String> {
         match &env.event {
             AgentEvent::RoundStarted { round } => {
-                let closed = self.take_line();
+                let closed = self.take_lines();
                 self.round = Some(*round);
                 self.started = Some(now);
                 closed
@@ -69,25 +81,33 @@ impl RoundClock {
             AgentEvent::ModelTextDelta { .. } | AgentEvent::ModelThinkingDelta { .. } => {
                 self.first_token.get_or_insert(now);
                 self.last_model = Some(now);
-                None
+                Vec::new()
             }
-            AgentEvent::ToolCall { .. } => {
+            AgentEvent::ToolCall { call } => {
                 self.first_tool.get_or_insert(now);
-                None
+                self.in_flight
+                    .insert(call.id.clone(), (call.name.clone(), now));
+                Vec::new()
             }
-            AgentEvent::ToolResult { .. } => {
+            AgentEvent::ToolResult { id, .. } => {
                 self.last_tool = Some(now);
-                None
+                if let Some((name, start)) = self.in_flight.remove(id) {
+                    self.calls
+                        .push((name, now.saturating_duration_since(start).as_millis()));
+                }
+                Vec::new()
             }
             // 终局事件之后不会再有本轮的增量/工具事件 ⇒ 就地收尾这一轮。
-            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. } => self.take_line(),
-            _ => None,
+            AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. } => self.take_lines(),
+            _ => Vec::new(),
         }
     }
 
-    /// 关闭当前轮并返回其可观测行；无进行中的轮时为 `None`。
-    pub(crate) fn take_line(&mut self) -> Option<String> {
-        let round = self.round.take()?;
+    /// 关闭当前轮并返回它的可观测行；无进行中的轮时为空。
+    pub(crate) fn take_lines(&mut self) -> Vec<String> {
+        let Some(round) = self.round.take() else {
+            return Vec::new();
+        };
         // **首个可观测输出**：优先取模型增量，没有才取首个 `ToolCall`。
         //
         // 为什么用 `or` 而不是取更早者：**增量必然先于 `ToolCall` 到达** —— 增量在流式
@@ -103,19 +123,29 @@ impl RoundClock {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        let line = format!(
+        let mut out = vec![format!(
             "round={round} ttft_ms={} gen_ms={} tools_ms={} total_ms={}",
             span_ms(self.started, first_out),
             span_ms(first_out, model_end),
             span_ms(self.first_tool, self.last_tool),
             span_ms(self.started, self.last_tool.or(model_end)),
-        );
+        )];
+        if !self.calls.is_empty() {
+            let parts: Vec<String> = self
+                .calls
+                .iter()
+                .map(|(name, ms)| format!("{name}:{ms}"))
+                .collect();
+            out.push(format!("tools round={round} {}", parts.join(" ")));
+        }
         self.started = None;
         self.first_token = None;
         self.last_model = None;
         self.first_tool = None;
         self.last_tool = None;
-        Some(line)
+        self.in_flight.clear();
+        self.calls.clear();
+        out
     }
 }
 
@@ -185,9 +215,13 @@ mod tests {
     }
 
     fn tool_call() -> AgentEvent {
+        tool_call_id("c1")
+    }
+
+    fn tool_call_id(id: &str) -> AgentEvent {
         AgentEvent::ToolCall {
             call: ToolCall {
-                id: ToolCallId("c1".into()),
+                id: ToolCallId(id.into()),
                 name: "read".into(),
                 arguments: serde_json::Value::Null,
             },
@@ -195,8 +229,12 @@ mod tests {
     }
 
     fn tool_result() -> AgentEvent {
+        tool_result_id("c1")
+    }
+
+    fn tool_result_id(id: &str) -> AgentEvent {
         AgentEvent::ToolResult {
-            id: ToolCallId("c1".into()),
+            id: ToolCallId(id.into()),
             result: ToolResult {
                 content: "ok".into(),
                 is_error: false,
@@ -235,7 +273,7 @@ mod tests {
         assert!(
             clock
                 .observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0)
-                .is_none(),
+                .is_empty(),
             "开轮本身不落行"
         );
         clock.observe(&env_of(text_delta()), t0 + 100 * MS);
@@ -245,14 +283,14 @@ mod tests {
         clock.observe(&env_of(tool_call()), t0 + 320 * MS);
         clock.observe(&env_of(tool_result()), t0 + 370 * MS);
 
-        let line = clock
+        let mut lines = clock
             .observe(
                 &env_of(AgentEvent::RoundStarted { round: 2 }),
                 t0 + 400 * MS,
-            )
-            .expect("下一轮开始时，上一轮应被关闭并落一行");
+            );
+
         assert_eq!(
-            line, "round=1 ttft_ms=100 gen_ms=220 tools_ms=50 total_ms=370",
+            lines.remove(0), "round=1 ttft_ms=100 gen_ms=220 tools_ms=50 total_ms=370",
             "三段口径：排队+prefill / 解码 / 工具"
         );
     }
@@ -269,7 +307,7 @@ mod tests {
         clock.observe(&env_of(text_delta()), t0 + 100 * MS);
         clock.observe(&env_of(text_delta()), t0 + 300 * MS);
 
-        let line = clock
+        let mut lines = clock
             .observe(
                 &env_of(AgentEvent::RunFinished {
                     stop_reason: StopReason::Completed,
@@ -277,9 +315,9 @@ mod tests {
                     rounds: 1,
                 }),
                 t0 + 320 * MS,
-            )
-            .expect("终局事件须关闭最后一轮 —— 否则末轮永远不落行");
-        assert_eq!(line, "round=1 ttft_ms=100 gen_ms=200 tools_ms=0 total_ms=300");
+            );
+
+        assert_eq!(lines.remove(0), "round=1 ttft_ms=100 gen_ms=200 tools_ms=0 total_ms=300");
     }
 
     /// **完全不流式的轮**（模型一个字符都不吐、直接给工具调用）必须仍被计时。
@@ -299,7 +337,7 @@ mod tests {
         // 没有任何 `Model*Delta`，直接就是工具调用。
         clock.observe(&env_of(tool_call()), t0 + 1780 * MS);
 
-        let line = clock
+        let mut lines = clock
             .observe(
                 &env_of(AgentEvent::RunFinished {
                     stop_reason: StopReason::Completed,
@@ -307,9 +345,47 @@ mod tests {
                     rounds: 1,
                 }),
                 t0 + 1790 * MS,
-            )
-            .expect("终局事件关闭本轮");
-        assert_eq!(line, "round=1 ttft_ms=1780 gen_ms=0 tools_ms=0 total_ms=1780");
+            );
+
+        assert_eq!(lines.remove(0), "round=1 ttft_ms=1780 gen_ms=0 tools_ms=0 total_ms=1780");
+    }
+
+    /// **逐调用耗时**：轮级 `tools_ms` 是首末之差，答不了「这轮的 N 秒花在哪一个调用上」。
+    ///
+    /// 实测出现过一轮里**单个 `bash` 吃掉 73.7 秒**（而命令本身平平无奇），
+    /// 只凭轮级数字无法定位 ⇒ 需要每个调用自己的耗时。
+    ///
+    /// 变异：把 `ToolResult` 分支里的 `self.calls.push(...)` 删掉 ⇒ 只落一条行，第一条断言变红
+    /// （已实际注入验证）。
+    #[test]
+    fn round_clock_reports_per_call_durations() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        clock.observe(&env_of(tool_call_id("c1")), t0 + 10 * MS);
+        clock.observe(&env_of(tool_result_id("c1")), t0 + 110 * MS); // 100 ms
+        clock.observe(&env_of(tool_call_id("c2")), t0 + 120 * MS);
+        clock.observe(&env_of(tool_result_id("c2")), t0 + 1320 * MS); // 1200 ms
+
+        let mut lines = clock.observe(
+            &env_of(AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 1,
+            }),
+            t0 + 1400 * MS,
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "有工具调用的轮应落两条：轮摘要 + 逐调用；{lines:?}"
+        );
+        assert_eq!(
+            lines.remove(1),
+            "tools round=1 read:100 read:1200",
+            "按完成顺序列每个调用的耗时"
+        );
     }
 
     /// 没有开轮时落不出行 —— 终局事件的 `take_line` 必须是 `None` 而不是空串。
@@ -327,7 +403,7 @@ mod tests {
                     }),
                     Instant::now()
                 )
-                .is_none()
+                .is_empty()
         );
     }
 

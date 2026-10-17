@@ -274,10 +274,11 @@ pub fn set_model(
     out
 }
 
-/// `/effort <level>`：设置思考档位，并**重建 model**（与 `SetModel` 同一路径 ——
-/// 档位落在 `OpenAICompatibleConfig` 上，只有重建才能进请求）。
+/// `/effort <level>`：设置会话级思考档位覆盖，并**重建 model**（与 `SetModel`
+/// 同一路径 —— 有效强度落在 `OpenAICompatibleConfig` 上，只有重建才能进请求）。
 ///
-/// `None` = 清除设置（恢复 provider 默认），同样需要重建。
+/// `None` = 清除覆盖，回落到配置默认（`YUSHAN_REASONING_EFFORT`，默认 `high`），
+/// 同样需要重建。
 ///
 /// 设置**照常保存**，即使当前 provider 不支持思考参数：切到支持的 provider 后
 /// 立刻生效；不支持时只在输出里多一条 warning（不阻断、不回 Err）。
@@ -287,7 +288,9 @@ pub fn set_effort(
     effort: Option<EffortLevel>,
 ) -> Vec<String> {
     config.effort = effort;
-    let shown = effort.map_or_else(|| "default".to_string(), |e| e.to_string());
+    let shown = config
+        .effective_reasoning_effort()
+        .unwrap_or_else(|| "default".to_string());
     let mut lines = vec![format!("effort: {shown}")];
     if effort.is_some() && !config.supports_reasoning_effort() {
         let provider = config.provider.as_deref().unwrap_or("custom");
@@ -1637,7 +1640,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `set_effort(None)` ⇒ 输出 `effort: default`（清除设置也走同一条重建路径）。
+    /// `set_effort(None)` ⇒ 清除覆盖，输出**实际生效**的配置默认 `high`
+    /// （清除设置也走同一条重建路径）。
     #[test]
     fn set_effort_none_shows_default() {
         let (mut config, dir) = test_config();
@@ -1649,7 +1653,7 @@ mod tests {
         let out = set_effort(&mut config, &mut wiring, None);
 
         assert_eq!(config.effort, None);
-        assert!(out.iter().any(|l| l == "effort: default"), "{out:?}");
+        assert!(out.iter().any(|l| l == "effort: high"), "{out:?}");
         assert_eq!(wiring.model_id(), Some("dummy"));
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -671,12 +671,79 @@ pub(crate) fn observe_event(
         Some(sink) => {
             let observation = clock.observe_debug(env, Instant::now());
             emit_observation(sink, session_id, Some(env.turn), observation);
+            record_special_event(sink, session_id, env);
         }
         None => {
             for line in clock.observe(env, Instant::now()) {
                 logging::log(&line);
             }
         }
+    }
+}
+
+/// 把压缩与截断这类低频、高影响的边界事件翻成 debug 记录。
+///
+/// 抽成纯构造函数以便单测；它们不属于逐轮时钟的状态机，避免把 `RoundClock`
+/// 变成所有事件的转储点。
+fn special_event_record(env: &Envelope) -> Option<DebugRecord> {
+    let mut fields = Map::new();
+    let ev = match &env.event {
+        AgentEvent::ContextCompacted {
+            estimated_tokens_before,
+            estimated_tokens_after,
+            summarized,
+            kept,
+        } => {
+            fields.insert(
+                "estimated_tokens_before".into(),
+                json!(estimated_tokens_before),
+            );
+            fields.insert(
+                "estimated_tokens_after".into(),
+                json!(estimated_tokens_after),
+            );
+            fields.insert(
+                "estimated_delta".into(),
+                json!(
+                    (*estimated_tokens_before as i64).saturating_sub(*estimated_tokens_after as i64)
+                ),
+            );
+            fields.insert("summarized".into(), json!(summarized));
+            fields.insert("kept".into(), json!(kept));
+            "context_compacted"
+        }
+        AgentEvent::ContextCompactionFailed { reason } => {
+            fields.insert("reason".into(), json!(reason));
+            "context_compaction_failed"
+        }
+        AgentEvent::ResponseTruncated {
+            dropped_tool_calls,
+        } => {
+            fields.insert("dropped_tool_calls".into(), json!(dropped_tool_calls));
+            "response_truncated"
+        }
+        _ => return None,
+    };
+    Some(DebugRecord {
+        ev,
+        round: None,
+        tool_call_id: None,
+        fields,
+    })
+}
+
+fn record_special_event(sink: &mut DebugSink, session_id: &str, env: &Envelope) {
+    if let Some(record) = special_event_record(env) {
+        sink.record(
+            record.ev,
+            DebugIds {
+                session_id,
+                turn: Some(env.turn),
+                round: record.round,
+                tool_call_id: None,
+            },
+            record.fields,
+        );
     }
 }
 
@@ -733,6 +800,17 @@ pub(crate) fn run_start_fields(
         json!(config.provider.as_deref().unwrap_or("custom")),
     );
     fields.insert("gen_ai.request.model".into(), json!(config.model));
+    let effective_reasoning_effort = if config.current_compat().supports_reasoning_effort {
+        config.reasoning_effort()
+    } else {
+        None
+    };
+    fields.insert(
+        "gen_ai.request.reasoning_effort".into(),
+        effective_reasoning_effort
+            .map(|effort| json!(effort))
+            .unwrap_or(Value::Null),
+    );
     fields.insert(
         "api_base".into(),
         match config.api_base.as_deref() {
@@ -863,6 +941,7 @@ where
             Some(tap) => {
                 let observation = clock.observe_debug(&env, Instant::now());
                 emit_observation(tap.sink, tap.session_id, Some(env.turn), observation);
+                record_special_event(tap.sink, tap.session_id, &env);
             }
             None => {
                 for line in clock.observe(&env, Instant::now()) {
@@ -944,6 +1023,18 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     // 真实会话再校准；`0` 会关闭闸门，故必须显式设非零。
     limits.max_turn_tool_result_tokens = config.context_window() / 4;
     limits
+}
+
+/// provider 不声明支持时不发送推理强度，避免严格端点因未知字段 400。
+fn reasoning_effort_for(
+    compat: &ys_model_openai_compat::compat::ProviderCompat,
+    configured: Option<&str>,
+) -> Option<String> {
+    if compat.supports_reasoning_effort {
+        configured.map(str::to_owned)
+    } else {
+        None
+    }
 }
 
 /// 每轮**固定开销**的 token 估算：system prompt + 工具表的 JSON spec。
@@ -1910,6 +2001,7 @@ fn run_interactive(
     worktree: app_loop::WorktreeHandle,
     default_workspace: PathBuf,
     debug_flag: bool,
+    model_trace: Option<debug_log::ModelTraceRouter>,
     tool_specs: Vec<(String, usize)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. 事件出口：有界信道 + 既定 policy（R7 的阻塞早退不影响它 —— 没 turn 就没有事件）。
@@ -1941,6 +2033,9 @@ fn run_interactive(
     let mut debug = debug_log::open_enabled(debug_flag, wiring.session_path());
     if let Some(sink) = debug.as_mut() {
         let session_id = session_id_for(wiring.session_path());
+        if let Some(trace) = &model_trace {
+            trace.attach(sink.handle(), session_id.clone());
+        }
         emit_run_start(
             sink,
             &config,
@@ -2044,6 +2139,7 @@ fn run_interactive(
             app_session_path,
             app_worktree,
             debug,
+            model_trace,
             tool_specs,
         )
         .await
@@ -2368,12 +2464,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 这份是**基值**：`fixed_prompt_tokens` 由 [`assembly::AgentFactory::build`] 按每次
     // 工作区派生出的 system prompt 量（见下方装配段），故本值不影响 `context_window`。
     let limits = resolve_limits(&config);
+    // 适配器尝试读数只在 debug 实际开启时注入：关闭路径连路由器与回调也不分配，
+    // 保持“零文件、零线程、零额外分配”。文件打开后再 attach 当前会话。
+    let model_trace =
+        debug_log::debug_enabled(args.debug).then(debug_log::ModelTraceRouter::new);
 
     // 注册 model factory（适配器特有的构建逻辑）
-    config.set_model_factory(|cfg| {
+    let trace_for_main = model_trace.clone();
+    config.set_model_factory(move |cfg| {
         let base = cfg.api_base.as_ref()?;
         let key = cfg.api_key.as_ref()?;
         let compat = cfg.current_compat();
+        let effective_effort = cfg.effective_reasoning_effort();
+        let reasoning_effort = reasoning_effort_for(&compat, effective_effort.as_deref());
         // `new` 自建 client（`owns_client == true`），故 `with_timeouts` 会按配置重建
         // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
         let retry = cfg.model_retry();
@@ -2387,8 +2490,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 绝不人为把模型掐断。辅助调用（摘要）在各自的请求里自带上限。
             max_tokens: None,
             temperature: Some(0.7),
+            reasoning_effort,
             compat,
-            effort: cfg.effort,
         })
         .with_retry(RetryConfig {
             max_attempts: retry.max_attempts,
@@ -2402,6 +2505,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 重试痕迹走 app 的 logging（ADR-0028 决策 7）：对 TUI 不可见、对排障可见。
         // 适配器绝不直接 print —— 这条回调是它唯一的诊断出口。
         .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg)));
+        if let Some(trace) = &trace_for_main {
+            model = model.with_trace(trace.callback());
+        }
         // 网关接入要求（OpenCode Go 的 `x-opencode-session` 等）：属**传输层**，
         // 由 provider 知识给出，不经 `OpenAICompatibleConfig`（那是方言）。
         for (header, value) in cfg.request_headers() {
@@ -2412,13 +2518,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 按**模型名**构造（subagent 的 `model` 参数）：同一 provider 上的另一个模型。
     // 未配置凭证 / 名字为空 ⇒ `None` ⇒ 调用方 **fail-closed**（绝不静默回退到父模型）。
-    config.set_model_factory_for(|cfg, name| {
+    config.set_model_factory_for(move |cfg, name| {
         if name.is_empty() {
             return None;
         }
         let base = cfg.api_base.as_ref()?;
         let key = cfg.api_key.as_ref()?;
         let compat = cfg.current_compat();
+        let effective_effort = cfg.effective_reasoning_effort();
+        let reasoning_effort = reasoning_effort_for(&compat, effective_effort.as_deref());
         let retry = cfg.model_retry();
         let timeout = cfg.model_timeout();
         let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
@@ -2428,8 +2536,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 同主工厂：不设输出上限，交由 provider 自身的模型上限。
             max_tokens: None,
             temperature: Some(0.7),
+            reasoning_effort,
             compat,
-            effort: cfg.effort,
         })
         .with_retry(RetryConfig {
             max_attempts: retry.max_attempts,
@@ -2530,6 +2638,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let debug_session_id = session_id_for(wiring.session_path());
             let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
             if let Some(sink) = debug.as_mut() {
+                if let Some(trace) = &model_trace {
+                    trace.attach(sink.handle(), debug_session_id.clone());
+                }
                 emit_run_start(
                     sink,
                     &config,
@@ -2609,6 +2720,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let debug_session_id = session_id_for(wiring.session_path());
             let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
             if let Some(sink) = debug.as_mut() {
+                if let Some(trace) = &model_trace {
+                    trace.attach(sink.handle(), debug_session_id.clone());
+                }
                 emit_run_start(
                     sink,
                     &config,
@@ -2681,6 +2795,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 worktree_handle,
                 shared_workspace,
                 args.debug,
+                model_trace,
                 tool_specs,
             )?;
         }
@@ -2743,6 +2858,41 @@ mod tests {
 
     fn env(event: AgentEvent) -> Envelope {
         Envelope::new(Source::agent(), 0, event)
+    }
+
+    /// 压缩 / 截断边界事件必须落成独立记录；普通逐轮事件不得被这条路径重复记录。
+    ///
+    /// 变异：把 `estimated_delta` 改成 `before + after` ⇒ 第一条断言红；
+    /// 让 `_ => None` 改成任意事件都产记录 ⇒ 最后一条断言红。
+    #[test]
+    fn special_events_map_to_debug_records() {
+        let compacted = special_event_record(&env(AgentEvent::ContextCompacted {
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 4_000,
+            summarized: 12,
+            kept: 3,
+        }))
+        .expect("压缩完成应有记录");
+        assert_eq!(compacted.ev, "context_compacted");
+        assert_eq!(compacted.fields["estimated_delta"], 6_000);
+        assert_eq!(compacted.fields["summarized"], 12);
+        assert_eq!(compacted.fields["kept"], 3);
+
+        let failed = special_event_record(&env(AgentEvent::ContextCompactionFailed {
+            reason: "boom".into(),
+        }))
+        .expect("压缩失败应有记录");
+        assert_eq!(failed.ev, "context_compaction_failed");
+        assert_eq!(failed.fields["reason"], "boom");
+
+        let truncated = special_event_record(&env(AgentEvent::ResponseTruncated {
+            dropped_tool_calls: 2,
+        }))
+        .expect("截断应有记录");
+        assert_eq!(truncated.ev, "response_truncated");
+        assert_eq!(truncated.fields["dropped_tool_calls"], 2);
+
+        assert!(special_event_record(&env(delta("x"))).is_none());
     }
 
     fn delta(text: &str) -> AgentEvent {
@@ -3803,6 +3953,27 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 推理强度只发给声明支持的 provider；配置存在也不能盲发给未知端点。
+    ///
+    /// 变异：去掉 compat 守卫 ⇒ 第一条断言从 `None` 变成 `Some("high")`。
+    #[test]
+    fn reasoning_effort_is_gated_by_provider_compat() {
+        use ys_model_openai_compat::compat::ProviderCompat;
+
+        assert_eq!(
+            reasoning_effort_for(&ProviderCompat::standard(), Some("high")),
+            None
+        );
+        assert_eq!(
+            reasoning_effort_for(&ProviderCompat::deepseek(), Some("high")),
+            None
+        );
+        assert_eq!(
+            reasoning_effort_for(&ProviderCompat::opencode_go(), Some("high")),
+            Some("high".to_string())
+        );
     }
 
     /// **两组默认常数不许漂移**（跨 crate 守卫）。

@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use ys_component::RunLimits;
-use ys_core::{EffortLevel, StopReason, Usage};
+use ys_core::{StopReason, Usage};
 use ys_event::NoopEventSink;
 use ys_loop::AgentInput;
 use ys_model::Model;
@@ -186,12 +186,13 @@ impl SubagentsDir {
     }
 }
 
-/// 按名构造的模型实例缓存，键为「模型名 + 构建时的 `cfg.effort`」。
+/// 按名构造的模型实例缓存，键为「模型名 + 构建时的有效推理强度」。
 ///
-/// 把构建时档位纳入键，是为了让 `/effort` 变化后同名子 Agent 不以旧档位复用
-/// 既有实例。已知边界：键不含 provider / api_base —— 二者变化不会使缓存失效。
+/// 把有效强度纳入键，是为了让 `/effort` 或配置默认变化后，同名子 Agent 不以
+/// 旧档位复用既有实例。已知边界：键不含 provider / api_base —— 二者变化不会
+/// 使缓存失效。
 pub(crate) type SubagentModelCache =
-    Arc<Mutex<HashMap<(String, Option<EffortLevel>), Arc<dyn Model>>>>;
+    Arc<Mutex<HashMap<(String, Option<String>), Arc<dyn Model>>>>;
 
 /// app 侧的派发实现：每回合构造一份（计数器天然 per-turn）。
 pub struct AppSubagentRunner<'a> {
@@ -328,7 +329,10 @@ impl SubagentRunner for AppSubagentRunner<'_> {
             Some(name) => {
                 // 键含构建时档位：`/effort` 只重建主模型，若这里只按名缓存，
                 // 同名派发会命中旧实例（旧档位）。
-                let key = (name.to_string(), self.config.and_then(|c| c.effort));
+                let key = (
+                    name.to_string(),
+                    self.config.and_then(|c| c.effective_reasoning_effort()),
+                );
                 if let Some(hit) = self.model_cache.lock().unwrap().get(&key).cloned() {
                     Some(hit)
                 } else {
@@ -894,10 +898,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **P0**：具名模型缓存的键必须包含 `cfg.effort`。
+    /// **P0**：具名模型缓存的键必须包含**有效推理强度**。
     ///
-    /// 同一模型名、`cfg.effort = None` 与 `Some(High)` 两次派发 ⇒ factory 被调用
-    /// 两次、缓存两条、两次摘要来自各自档位构建的实例。
+    /// 同一模型名、有效强度 `high`（配置默认）与覆盖为 `max` 两次派发 ⇒ factory
+    /// 被调用两次、缓存两条、两次摘要来自各自档位构建的实例。
     ///
     /// 变异：把 `SubagentModelCache` 的键改回 `String`（只用名字）⇒ 第二次派发命中旧实例，
     /// factory 只调用一次 ⇒ `seen.len()` 与第二条摘要断言变红。
@@ -946,12 +950,16 @@ mod tests {
         };
         config.api_base = Some("https://example.test".into());
         config.api_key = Some("sk-test".into());
-        type Seen = Arc<Mutex<Vec<(String, Option<EffortLevel>)>>>;
+        type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
         config.set_model_factory_for(move |cfg, name| {
-            recorder.lock().unwrap().push((name.to_string(), cfg.effort));
-            let tag = format!("{name}:{:?}", cfg.effort);
+            let effort = cfg.effective_reasoning_effort();
+            recorder
+                .lock()
+                .unwrap()
+                .push((name.to_string(), effort.clone()));
+            let tag = format!("{name}:{}", effort.unwrap_or_else(|| "none".into()));
             Some(Box::new(EffortEchoModel(tag)) as Box<dyn Model>)
         });
 
@@ -959,7 +967,7 @@ mod tests {
         let dir = || Arc::new(SubagentsDir::at(base.join("subagents"), false));
         let web = || WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
 
-        // 第一次派发：未设置档位。
+        // 第一次派发：无会话覆盖 ⇒ 用配置默认 `high`。
         let first = {
             let runner = AppSubagentRunner::new(
                 None,
@@ -976,13 +984,13 @@ mod tests {
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
         assert!(
-            first.summary.contains("echo:shared-name:None"),
-            "第一次派发应使用未设置档位的实例：{}",
+            first.summary.contains("echo:shared-name:high"),
+            "第一次派发应使用配置默认档位的实例：{}",
             first.summary
         );
 
-        // 用户 `/effort high` 后同名再派发：必须重建，而非命中旧实例。
-        config.effort = Some(EffortLevel::High);
+        // 用户 `/effort max` 后同名再派发：必须重建，而非命中旧实例。
+        config.effort = Some(ys_core::EffortLevel::Max);
         let second = {
             let runner = AppSubagentRunner::new(
                 None,
@@ -999,7 +1007,7 @@ mod tests {
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
         assert!(
-            second.summary.contains("echo:shared-name:Some(High)"),
+            second.summary.contains("echo:shared-name:max"),
             "档位变化后必须用新档位实例：{}",
             second.summary
         );
@@ -1007,10 +1015,10 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
-                ("shared-name".to_string(), None),
-                ("shared-name".to_string(), Some(EffortLevel::High)),
+                ("shared-name".to_string(), Some("high".to_string())),
+                ("shared-name".to_string(), Some("max".to_string())),
             ],
-            "factory 必须按（名字, 档位）各构建一次"
+            "factory 必须按（名字, 有效强度）各构建一次"
         );
         assert_eq!(cache.lock().unwrap().len(), 2, "缓存应有两条档位不同的条目");
 

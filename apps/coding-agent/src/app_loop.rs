@@ -216,6 +216,8 @@ pub async fn run(
     worktree: WorktreeHandle,
     // 结构化执行日志（`--debug`）。`None` = 关闭（零文件、零线程）。
     mut debug: Option<DebugSink>,
+    // 适配器尝试读数 → 当前 debug 文件；`/new` / `/resume` 后重新绑定。
+    model_trace: Option<crate::debug_log::ModelTraceRouter>,
     // `run_start` 的工具元数据（启动装配期量好；工具表不随 `/new` / `/resume` 变）。
     debug_tools: Vec<(String, usize)>,
 ) -> Result<(), AppLoopError> {
@@ -454,6 +456,9 @@ pub async fn run(
                     debug_run += 1;
                     sink.begin_run(debug_run, crate::unix_now_ms());
                     debug_session_id = crate::session_id_for(wiring.session_path());
+                    if let Some(trace) = &model_trace {
+                        trace.attach(sink.handle(), debug_session_id.clone());
+                    }
                     crate::emit_run_start(
                         sink,
                         &config,
@@ -538,6 +543,9 @@ pub async fn run(
                         debug_run += 1;
                         sink.begin_run(debug_run, crate::unix_now_ms());
                         debug_session_id = crate::session_id_for(path_after.as_deref());
+                        if let Some(trace) = &model_trace {
+                            trace.attach(sink.handle(), debug_session_id.clone());
+                        }
                         crate::emit_run_start(
                             sink,
                             &config,
@@ -1279,6 +1287,7 @@ mod tests {
             app_session_path,
             app_worktree,
             debug,
+            None,
             Vec::new(),
         ));
 
@@ -2091,8 +2100,10 @@ mod tests {
             Request::Login {
                 provider: "custom".into(),
                 api_key: "sk-test".into(),
-                // `custom` 没有内置 base —— 走 UI 追问到的那条路（`Some`）。
-                api_base: Some("https://custom.example.com".into()),
+                // `custom` 没有内置 base，harness 也未设 `YUSHAN_API_BASE` ⇒
+                // 在参数校验处直接收束，不触发网络；登录成功/失败细节由
+                // capabilities 的专门用例覆盖。本用例只验证变体分发与 Output。
+                api_base: None,
             },
             Request::Logout,
             // `Export` 在 `NewSession` 之前：`/new` 惰性换出的新文件尚未落盘，
@@ -2166,7 +2177,11 @@ mod tests {
             .await
             .unwrap();
         let view = take_view(&mut collect_until_view(&mut h).await);
-        assert_eq!(view.effort, None, "None 应清除档位");
+        assert_eq!(
+            view.effort,
+            Some(ys_core::EffortLevel::High),
+            "None 清除会话覆盖后应回落到配置默认 high"
+        );
     }
 
     /// 7. **UI 退出**：drop `request_tx` → app 循环在超时内**正常返回**（不挂起）。

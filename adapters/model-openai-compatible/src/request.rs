@@ -18,27 +18,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// OpenAI 风格的思考档位；`off` 由适配器翻成 `"none"`。
+    /// 推理强度（如 `low` / `high` / `max`）。`None` 时整个字段不序列化，
+    /// 保持既有端点行为不变；是否支持由具体 provider / model 决定。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// DeepSeek / OpenCode Go 风格的思考开关。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<ThinkingToggle>,
-}
-
-/// `thinking.type` 的取值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkingToggleKind {
-    Enabled,
-    Disabled,
-}
-
-/// `thinking` 对象。仅用于序列化 —— 响应里没有同名字段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ThinkingToggle {
-    #[serde(rename = "type")]
-    pub kind: ThinkingToggleKind,
 }
 
 /// `stream_options`：OpenAI 兼容端点用于让流式末包携带 usage 的开关。

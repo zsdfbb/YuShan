@@ -14,8 +14,8 @@
 //!    四次运行分别是 26 / 31 / 45 / 66 轮）⇒ 必须重复取分布。
 //! 2. **「改动前采基线」是 `docs/arch/explore-speed/context.md` 的 Q6**，至今未决 ——
 //!    没有它，任何「有没有变快」都是噪声。
-//! 3. 耗时的权威读数只有逐轮行（`round=` / `turn=`，见 `src/round_clock.rs`），
-//!    手工解析不可复现。
+//! 3. 每次运行带 `--debug`：优先解析本进程的 debug JSONL（逐轮分段、HTTP 尝试、
+//!    退避、缓存），文本日志只作回退。手工解析不可复现。
 //!
 //! # 提示集
 //!
@@ -48,10 +48,13 @@
 //! 本文件早期版本默认删除，结果一次 246 轮的运行只剩一个中位数。要清理就显式设
 //! `YUSHAN_BENCH_CLEAN=1`。
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 /// 提示集：`(名字, 任务文本, 是否长跑)`。
 ///
@@ -127,6 +130,13 @@ struct Reading {
     ttft_ms: u128,
     gen_ms: u128,
     tools_ms: u128,
+    /// HTTP 尝试数；含内部重试与 `stream_options` 回退后的请求。
+    attempts: u128,
+    /// 实际进入退避的重试次数与累计等待。
+    retried_attempts: u128,
+    retry_wait_ms: u128,
+    cache_hit: u128,
+    cache_miss: u128,
 }
 
 impl Reading {
@@ -191,6 +201,102 @@ fn parse_log(path: &Path) -> (u32, u128, u128, u128) {
     }
 }
 
+fn json_u128(value: &Value, key: &str) -> Option<u128> {
+    value.get(key)?.as_u64().map(u128::from)
+}
+
+/// 解析本次运行的 debug JSONL。
+///
+/// 以第一条 `run_end` 为界：同一会话文件可能含多次 `--resume` 运行，基准的一次
+/// 子进程只对应第一个 run。`model_attempt` 与 `round_usage` 提供文本日志没有的
+/// 重试/退避/缓存读数。
+fn parse_debug_text(text: &str) -> Option<Reading> {
+    let mut reading = Reading::default();
+    let mut saw_round = false;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("ev").and_then(Value::as_str) {
+            Some("round_end") => {
+                saw_round = true;
+                reading.rounds = reading.rounds.saturating_add(1);
+                reading.ttft_ms = reading
+                    .ttft_ms
+                    .saturating_add(json_u128(&value, "ttft_ms").unwrap_or(0));
+                reading.gen_ms = reading
+                    .gen_ms
+                    .saturating_add(json_u128(&value, "gen_ms").unwrap_or(0));
+                reading.tools_ms = reading
+                    .tools_ms
+                    .saturating_add(json_u128(&value, "tools_ms").unwrap_or(0));
+            }
+            Some("model_attempt") => {
+                reading.attempts = reading.attempts.saturating_add(1);
+                if value.get("retried").and_then(Value::as_bool) == Some(true) {
+                    reading.retried_attempts = reading.retried_attempts.saturating_add(1);
+                    reading.retry_wait_ms = reading
+                        .retry_wait_ms
+                        .saturating_add(json_u128(&value, "backoff_ms").unwrap_or(0));
+                }
+            }
+            Some("round_usage")
+                if value.get("purpose").and_then(Value::as_str) == Some("turn") =>
+            {
+                let input = json_u128(&value, "gen_ai.usage.input_tokens").unwrap_or(0);
+                let hit =
+                    json_u128(&value, "gen_ai.usage.cache_read.input_tokens").unwrap_or(0);
+                reading.cache_hit = reading.cache_hit.saturating_add(hit);
+                reading.cache_miss = reading
+                    .cache_miss
+                    .saturating_add(input.saturating_sub(hit));
+            }
+            Some("run_end") => return saw_round.then_some(reading),
+            _ => {}
+        }
+    }
+    saw_round.then_some(reading)
+}
+
+/// 按父进程 PID 选 debug 文件。模型可能自起 `ys-coding-agent` 子进程，它们共享
+/// `YUSHAN_LOG_DIR`；只按目录里第一个文件读会把两棵运行树混在一起。
+fn debug_file_for_pid(log_dir: &Path, pid: u32) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(log_dir).ok()?.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_debug = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("debug-") && name.ends_with(".jsonl"));
+        if !is_debug {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let owner = BufReader::new(file).lines().take(64).find_map(|line| {
+            let line = line.ok()?;
+            let value: Value = serde_json::from_str(&line).ok()?;
+            (value.get("ev").and_then(Value::as_str) == Some("run_start"))
+                .then(|| value.get("pid").and_then(Value::as_u64))
+                .flatten()
+        });
+        match owner {
+            Some(owner) if owner == u64::from(pid) => return Some(path),
+            None => candidates.push(path),
+            _ => {}
+        }
+    }
+    // 老 schema / 截断文件没有 `pid` 时，只有一个候选才敢用。
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn parse_debug(path: &Path, pid: u32) -> Option<Reading> {
+    let path = debug_file_for_pid(path, pid)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_debug_text(&text)
+}
+
 /// 跑一次真实二进制，返回读数；超时或异常退出时返回 `None`（**如实报告，不编数**）。
 fn run_once(
     bin: &Path,
@@ -207,6 +313,7 @@ fn run_once(
     let started = Instant::now();
     let mut child = Command::new(bin)
         .arg("-p")
+        .arg("--debug")
         .arg(task)
         .current_dir(workspace)
         // 日志与会话各自隔离到临时目录；**凭证仍走真实 HOME**（持久化 auth），
@@ -218,6 +325,7 @@ fn run_once(
         .stderr(Stdio::from(std::fs::File::create(run_dir.join("stderr.txt")).ok()?))
         .spawn()
         .ok()?;
+    let pid = child.id();
 
     loop {
         match child.try_wait() {
@@ -242,14 +350,18 @@ fn run_once(
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let (rounds, ttft_ms, gen_ms, tools_ms) = parse_log(&log_dir.join("yushan.log"));
-    Some(Reading {
-        wall_ms: started.elapsed().as_millis(),
-        rounds,
-        ttft_ms,
-        gen_ms,
-        tools_ms,
-    })
+    let mut reading = parse_debug(&log_dir, pid).unwrap_or_else(|| {
+        let (rounds, ttft_ms, gen_ms, tools_ms) = parse_log(&log_dir.join("yushan.log"));
+        Reading {
+            rounds,
+            ttft_ms,
+            gen_ms,
+            tools_ms,
+            ..Reading::default()
+        }
+    });
+    reading.wall_ms = started.elapsed().as_millis();
+    Some(reading)
 }
 
 /// 临时目录（进程内原子序号 + pid —— 与全仓测试隔离约定一致）。
@@ -288,6 +400,14 @@ fn secs(ms: u128) -> String {
     format!("{:.1}", ms as f64 / 1000.0)
 }
 
+fn cache_pct(hit: u128, miss: u128) -> String {
+    let total = hit + miss;
+    (100 * hit)
+        .checked_div(total)
+        .map(|pct| format!("{pct}%"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 /// 只有一条 `#[test]`：跑完整组提示，逐条打印，最后打印中位数汇总。
 ///
 /// **不断言任何东西** —— 见模块头。它失败的唯一方式是环境缺凭证 / 子进程起不来。
@@ -316,8 +436,21 @@ fn bench_report() {
         root.display()
     );
 
-    // (名字, 墙钟中位, 轮中位, ttft 中位, gen 中位, tools 中位)
-    let mut summary: Vec<(String, u128, u128, u128, u128, u128)> = Vec::new();
+    // (名字, 墙钟, 轮, ttft, gen, tools, attempts, retries, retry_wait, cache_hit, cache_miss)
+    type Summary = (
+        String,
+        u128,
+        u128,
+        u128,
+        u128,
+        u128,
+        u128,
+        u128,
+        u128,
+        u128,
+        u128,
+    );
+    let mut summary: Vec<Summary> = Vec::new();
     let mut skipped_heavy: Vec<&str> = Vec::new();
     for (name, task, heavy) in PROMPTS {
         // 点名优先：`YUSHAN_BENCH_ONLY` 命中的项**即使标了长跑也跑**（那是显式要求）。
@@ -338,7 +471,8 @@ fn bench_report() {
                 Some(r) => {
                     let (t, g, s) = r.split();
                     println!(
-                        "  run {}  墙钟 {}s  轮 {:<3} ttft {}%  gen {}%  tools {}%   ({}/{}/{} ms)",
+                        "  run {}  墙钟 {}s  轮 {:<3} ttft {}%  gen {}%  tools {}%   \
+                         ({}/{}/{} ms)  attempts {}  retries {}  retry_wait {}ms  cache {}",
                         i + 1,
                         secs(r.wall_ms),
                         r.rounds,
@@ -348,6 +482,10 @@ fn bench_report() {
                         r.ttft_ms,
                         r.gen_ms,
                         r.tools_ms,
+                        r.attempts,
+                        r.retried_attempts,
+                        r.retry_wait_ms,
+                        cache_pct(r.cache_hit, r.cache_miss),
                     );
                     readings.push(r);
                 }
@@ -363,13 +501,20 @@ fn bench_report() {
         let ttfts: Vec<u128> = readings.iter().map(|r| r.ttft_ms).collect();
         let gens: Vec<u128> = readings.iter().map(|r| r.gen_ms).collect();
         let tools: Vec<u128> = readings.iter().map(|r| r.tools_ms).collect();
+        let attempts: Vec<u128> = readings.iter().map(|r| r.attempts).collect();
+        let retries: Vec<u128> = readings.iter().map(|r| r.retried_attempts).collect();
+        let retry_waits: Vec<u128> = readings.iter().map(|r| r.retry_wait_ms).collect();
         println!(
-            "  **中位**  墙钟 {}s  轮 {}  ({}/{}/{} ms)\n",
+            "  **中位**  墙钟 {}s  轮 {}  ({}/{}/{} ms)  attempts {}  retries {}  \
+             retry_wait {}ms\n",
             secs(median(&walls)),
             median(&rounds),
             median(&ttfts),
             median(&gens),
             median(&tools),
+            median(&attempts),
+            median(&retries),
+            median(&retry_waits),
         );
         summary.push((
             (*name).to_string(),
@@ -378,15 +523,28 @@ fn bench_report() {
             median(&ttfts),
             median(&gens),
             median(&tools),
+            median(&attempts),
+            median(&retries),
+            median(&retry_waits),
+            readings.iter().map(|r| r.cache_hit).sum(),
+            readings.iter().map(|r| r.cache_miss).sum(),
         ));
     }
 
     println!("=== 汇总（中位）===");
-    println!("{:<10} {:>8} {:>5} {:>10} {:>10} {:>10}", "提示", "墙钟s", "轮", "ttft_ms", "gen_ms", "tools_ms");
-    for (name, wall, rounds, ttft, gen_ms, tools) in &summary {
+    println!(
+        "{:<10} {:>8} {:>5} {:>10} {:>10} {:>10} {:>9} {:>8} {:>12} {:>7}",
+        "提示", "墙钟s", "轮", "ttft_ms", "gen_ms", "tools_ms", "attempts", "retries",
+        "retry_wait", "cache"
+    );
+    for (name, wall, rounds, ttft, gen_ms, tools, attempts, retries, retry_wait, hit, miss) in
+        &summary
+    {
         println!(
-            "{name:<10} {:>8} {rounds:>5} {ttft:>10} {gen_ms:>10} {tools:>10}",
-            secs(*wall)
+            "{name:<10} {:>8} {rounds:>5} {ttft:>10} {gen_ms:>10} {tools:>10} \
+             {attempts:>9} {retries:>8} {retry_wait:>12} {:>7}",
+            secs(*wall),
+            cache_pct(*hit, *miss),
         );
     }
     println!();
@@ -402,7 +560,10 @@ fn bench_report() {
         let _ = std::fs::remove_dir_all(&root);
     } else {
         println!("证据保留在：{}", root.display());
-        println!("  逐轮读数：{}/<提示>-<序号>/logs/yushan.log", root.display());
+        println!(
+            "  逐轮读数：{}/<提示>-<序号>/logs/{{yushan.log,debug-*.jsonl}}",
+            root.display()
+        );
         println!("  想删掉：设 YUSHAN_BENCH_CLEAN=1 重跑，或直接 rm -rf\n");
     }
 }
@@ -430,4 +591,58 @@ fn parse_log_stops_at_the_first_turn_line() {
     // 没有终局行（崩溃等）⇒ 全量计入，不丢数据。
     let no_turn = "[1] round=1 ttft_ms=5 gen_ms=6 tools_ms=7 total_ms=18\n";
     assert_eq!(parse_log_text(no_turn), (1, 5, 6, 7));
+}
+
+/// debug JSONL 是基准的首选读数：同一份数据里同时得到轮耗时、HTTP 尝试、退避与缓存。
+///
+/// 变异：把 `round_end` 的 `rounds += 1` 删掉 ⇒ 第一条断言红；把 `retried` 判断
+/// 改成恒真 ⇒ 第二条断言红。
+#[test]
+fn parse_debug_text_collects_attempts_and_cache() {
+    let text = r#"{"ev":"run_start","pid":42}
+{"ev":"round_start","round":1}
+{"ev":"model_attempt","attempt":1,"retried":false}
+{"ev":"round_usage","purpose":"turn","gen_ai.usage.input_tokens":100,"gen_ai.usage.cache_read.input_tokens":90}
+{"ev":"round_end","ttft_ms":10,"gen_ms":20,"tools_ms":30}
+{"ev":"round_start","round":2}
+{"ev":"model_attempt","attempt":1,"retried":true,"backoff_ms":500}
+{"ev":"model_attempt","attempt":2,"retried":false}
+{"ev":"round_usage","purpose":"turn","gen_ai.usage.input_tokens":20,"gen_ai.usage.cache_read.input_tokens":15}
+{"ev":"round_end","ttft_ms":11,"gen_ms":21,"tools_ms":31}
+{"ev":"run_end"}
+{"ev":"round_end","ttft_ms":999,"gen_ms":999,"tools_ms":999}
+"#;
+    let reading = parse_debug_text(text).expect("应有读数");
+    assert_eq!(reading.rounds, 2, "首条 run_end 之后不得再计数");
+    assert_eq!(
+        (reading.ttft_ms, reading.gen_ms, reading.tools_ms),
+        (21, 41, 61)
+    );
+    assert_eq!(reading.attempts, 3);
+    assert_eq!(reading.retried_attempts, 1);
+    assert_eq!(reading.retry_wait_ms, 500);
+    assert_eq!((reading.cache_hit, reading.cache_miss), (105, 15));
+}
+
+/// 同一 `YUSHAN_LOG_DIR` 里有父/子两个 debug 文件时，必须按 `run_start.pid` 选父进程。
+#[test]
+fn debug_file_for_pid_uses_run_start_owner() {
+    let dir = temp_dir("debug-select");
+    std::fs::write(
+        dir.join("debug-child.jsonl"),
+        "{\"ev\":\"run_start\",\"pid\":99}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("debug-parent.jsonl"),
+        "{\"ev\":\"run_start\",\"pid\":42}\n",
+    )
+    .unwrap();
+
+    let selected = debug_file_for_pid(&dir, 42).expect("应选中父进程文件");
+    assert_eq!(
+        selected.file_name().and_then(|name| name.to_str()),
+        Some("debug-parent.jsonl")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

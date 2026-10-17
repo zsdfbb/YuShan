@@ -7,6 +7,9 @@ use ys_model::Model;
 
 use crate::provider::ProviderRegistry;
 
+/// 默认推理强度。`high` 是该模型可接受的最低默认档，`low` 只留给显式实验。
+pub(crate) const DEFAULT_REASONING_EFFORT: &str = "high";
+
 /// Model factory 函数类型。封装适配器特有的构建逻辑。
 /// config 不完整（缺 api_base/api_key）时返回 None。
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;
@@ -142,8 +145,9 @@ pub struct Config {
     pub model: String,
     pub cwd: PathBuf,
     pub provider: Option<String>,
-    /// 当前思考档位（`/effort`）。`None` = 未设置 ⇒ 请求里不发思考参数
-    /// （provider 默认）。随会话 meta 恢复与持久化，但**不**进 `config.json`。
+    /// 会话级思考档位覆盖（`/effort`）。`None` = 无覆盖 ⇒ 使用
+    /// [`Config::reasoning_effort`] 的配置默认（`YUSHAN_REASONING_EFFORT`，默认
+    /// `high`）。随会话 meta 恢复与持久化，但**不**进 `config.json`。
     pub effort: Option<EffortLevel>,
     pub registry: ProviderRegistry,
     /// 启动期扫描到的 skill（**已去重、已按 `command` 升序**）。
@@ -157,6 +161,8 @@ pub struct Config {
     pub skills: Vec<crate::skills::SkillEntry>,
     /// 因整表字节预算被收起的 skill 条数（`Catalogue.omitted`，R3 的可见性出口）。
     pub skills_omitted: usize,
+    /// 可选推理强度（`YUSHAN_REASONING_EFFORT`）。`None` = 不发送 provider 字段。
+    reasoning_effort: Option<String>,
     /// 从 `~/.yushan/config.json` 读到的覆盖项（用户写、app 只读）。
     ///
     /// 由 [`Config::load_user_config`] 写入，经 [`Config::context_window`] /
@@ -180,6 +186,10 @@ impl Config {
         // （`YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连时）。
         let model = std::env::var("YUSHAN_MODEL").unwrap_or_default();
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        let reasoning_effort = parse_reasoning_effort(
+            std::env::var("YUSHAN_REASONING_EFFORT").ok().as_deref(),
+        )
+        .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_string()));
 
         Ok(Self {
             api_base,
@@ -191,6 +201,7 @@ impl Config {
             registry: ProviderRegistry::new(),
             skills: Vec::new(),
             skills_omitted: 0,
+            reasoning_effort,
             user_config: UserConfig::default(),
             model_factory: None,
             model_factory_for: None,
@@ -261,6 +272,32 @@ impl Config {
     /// 真正的兜底是这条**小时级**阀门，不是轮数（ADR-0027 决策 6）。
     pub fn max_turn_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.user_config.max_turn_duration_secs.unwrap_or(172_800))
+    }
+
+    /// 配置层推理强度（provider 的 `reasoning_effort`）。缺省 `high`。
+    ///
+    /// 这是 `/effort` 覆盖之前的值；请求实际发送的是
+    /// [`Config::effective_reasoning_effort`]。
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
+    }
+
+    /// 请求实际使用的推理强度：会话覆盖优先，否则回落配置默认。
+    pub fn effective_reasoning_effort(&self) -> Option<String> {
+        self.effort
+            .map(|effort| effort.as_wire().to_string())
+            .or_else(|| self.reasoning_effort().map(str::to_owned))
+    }
+
+    /// 请求实际生效的思考档位（用于 `/effort` 无参与 `/status` 显示）。
+    ///
+    /// 配置默认无法解析成 [`EffortLevel`] 时返回 `None`（`parse_reasoning_effort`
+    /// 已做白名单，生产上不会发生）。
+    pub fn effective_effort_level(&self) -> Option<EffortLevel> {
+        self.effort.or_else(|| {
+            self.reasoning_effort()
+                .and_then(|value| value.parse::<EffortLevel>().ok())
+        })
     }
 
     /// 模型调用重试策略（`config.json` 的 `model_retry`，ADR-0028 决策 4）。
@@ -394,13 +431,12 @@ impl Config {
         self.registry.compat_for(name)
     }
 
-    /// 当前 provider 是否接受思考参数（`minimax` 等方言为 `None`）。
+    /// 当前 provider 是否声明接受 `reasoning_effort`。
     ///
     /// 设置档位照常保存（切到支持的 provider 后立即生效），此处只决定是否给
     /// 用户一条「本次请求不会发送思考字段」的提示。
     pub fn supports_reasoning_effort(&self) -> bool {
-        self.current_compat().reasoning_dialect
-            != ys_model_openai_compat::compat::ReasoningDialect::None
+        self.current_compat().supports_reasoning_effort
     }
 
     /// 当前 provider / api_base 要求的额外请求头（透传给适配器）。
@@ -410,6 +446,25 @@ impl Config {
     pub fn request_headers(&self) -> Vec<(String, String)> {
         self.registry
             .request_headers(self.provider.as_deref(), self.api_base.as_deref())
+    }
+}
+
+/// 解析推理强度。只接受主流 OpenAI 兼容取值；非法值落诊断后由调用方回落默认 `high`。
+fn parse_reasoning_effort(value: Option<&str>) -> Option<String> {
+    let value = value?.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if matches!(
+        value.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        Some(value)
+    } else {
+        crate::logging::log(&format!(
+            "ignoring YUSHAN_REASONING_EFFORT: expected minimal|low|medium|high|xhigh|max, got {value}"
+        ));
+        None
     }
 }
 
@@ -545,6 +600,7 @@ mod tests {
             registry: ProviderRegistry::new(),
             skills: Vec::new(),
             skills_omitted: 0,
+            reasoning_effort: None,
             user_config: UserConfig::default(),
             model_factory: None,
             model_factory_for: None,
@@ -575,6 +631,7 @@ mod tests {
     const API_ENV_KEYS: &[&str] = &[
         "YUSHAN_API_BASE",
         "YUSHAN_API_KEY",
+        "YUSHAN_REASONING_EFFORT",
         "OPENAI_API_BASE",
         "OPENAI_API_KEY",
     ];
@@ -636,6 +693,62 @@ mod tests {
         assert!(!config.is_configured());
         assert!(config.build_model().is_none());
         assert!(config.registry.find_provider("deepseek").is_some());
+        assert_eq!(config.reasoning_effort(), Some(DEFAULT_REASONING_EFFORT));
+    }
+
+    /// 推理强度只接受已知取值；大小写与空白归一化，非法值回落默认 `high`。
+    ///
+    /// 变异：去掉 `to_ascii_lowercase()` ⇒ 第一条变红；去掉白名单 ⇒ 非法值断言变红。
+    #[test]
+    fn reasoning_effort_is_optional_and_validated() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", " LoW ") };
+        assert_eq!(
+            Config::from_env().unwrap().reasoning_effort(),
+            Some("low")
+        );
+
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", "please-think-harder") };
+        assert_eq!(
+            Config::from_env().unwrap().reasoning_effort(),
+            Some(DEFAULT_REASONING_EFFORT)
+        );
+    }
+
+    /// 有效强度：会话覆盖优先，清除覆盖后回落到配置默认（env 或 `high`）。
+    ///
+    /// 变异：把 `effective_reasoning_effort` 的优先级反转 ⇒ 第一条覆盖断言变红；
+    /// 去掉回落分支 ⇒ `None` 覆盖后的断言变红。
+    #[test]
+    fn effective_effort_prefers_override_then_default() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+        let mut config = Config::from_env().unwrap();
+
+        assert_eq!(config.effective_reasoning_effort().as_deref(), Some("high"));
+        assert_eq!(config.effective_effort_level(), Some(EffortLevel::High));
+
+        config.effort = Some(EffortLevel::Max);
+        assert_eq!(config.effective_reasoning_effort().as_deref(), Some("max"));
+        assert_eq!(config.effective_effort_level(), Some(EffortLevel::Max));
+
+        config.effort = None;
+        assert_eq!(config.effective_reasoning_effort().as_deref(), Some("high"));
+
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", "low") };
+        let mut config = Config::from_env().unwrap();
+        assert_eq!(config.effective_reasoning_effort().as_deref(), Some("low"));
+        config.effort = Some(EffortLevel::XHigh);
+        assert_eq!(
+            config.effective_reasoning_effort().as_deref(),
+            Some("xhigh"),
+            "覆盖优先于 env 默认"
+        );
     }
 
     /// `context_window_for(name)` 与 `context_window()` 对当前 model 必须一致；

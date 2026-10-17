@@ -1,29 +1,9 @@
-/// 思考参数的 provider wire 方言。
-///
-/// 各 provider 对「如何要求模型思考」的字段组合不同，且**互斥性**不同：
-/// 有的只认 `reasoning_effort`，有的要求 `thinking` 开关与档位同发，
-/// 有的网关则拒绝两者同时出现。翻译规则见 `lib.rs::reasoning_params`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningDialect {
-    /// 不发送任何思考参数（如 MiniMax）。
-    None,
-    /// OpenAI 风格：只发 `reasoning_effort`；`off` → `"none"`。
-    OpenAiEffort,
-    /// DeepSeek 官方：`reasoning_effort` + `thinking:{type}` 同发；`off` → 只发 disabled。
-    DeepSeek,
-    /// OpenCode Go 网关：`off` → 只发 `thinking:disabled`；档位 → 只发 `reasoning_effort`。
-    /// **绝不同时发送两个字段**（网关会 400）。
-    OpenCodeGo,
-}
-
 #[derive(Debug, Clone)]
 pub struct ProviderCompat {
     /// DeepSeek: reasoning_content 字段
     pub has_reasoning_content: bool,
     /// MiniMax: tool_calls 可能作为 text 返回
     pub tool_calls_as_text: bool,
-    /// 思考参数的 wire 方言。
-    pub reasoning_dialect: ReasoningDialect,
     /// 是否在流式请求里发送 `stream_options.include_usage` 以获取 token 统计。
     ///
     /// 默认开启（见 [`ProviderCompat::standard`]）。OpenAI 兼容端点普遍容忍
@@ -32,6 +12,9 @@ pub struct ProviderCompat {
     /// 保证「安全」与「token 统计完整」兼顾。仅当已知某 provider 一定拒绝时
     /// （如未经验证的 MiniMax 兼容层）才显式关闭。
     pub supports_stream_usage: bool,
+    /// 是否接受顶层 `reasoning_effort` 字段。默认关闭：未知兼容端点不应收到
+    /// 它们可能严格校验的扩展字段。
+    pub supports_reasoning_effort: bool,
 }
 
 /// 手写而非 derive：`supports_stream_usage` 的「默认」必须是 **true**。
@@ -43,8 +26,8 @@ impl Default for ProviderCompat {
         Self {
             has_reasoning_content: false,
             tool_calls_as_text: false,
-            reasoning_dialect: ReasoningDialect::OpenAiEffort,
             supports_stream_usage: true,
+            supports_reasoning_effort: false,
         }
     }
 }
@@ -53,7 +36,6 @@ impl ProviderCompat {
     pub fn deepseek() -> Self {
         Self {
             has_reasoning_content: true,
-            reasoning_dialect: ReasoningDialect::DeepSeek,
             // DeepSeek 兼容 OpenAI 的 stream_options.include_usage，流式末包带 usage。
             supports_stream_usage: true,
             ..Default::default()
@@ -63,7 +45,6 @@ impl ProviderCompat {
     pub fn minimax() -> Self {
         Self {
             tool_calls_as_text: true,
-            reasoning_dialect: ReasoningDialect::None,
             // MiniMax 兼容层对未知顶层字段是否放行未经验证，保守关闭：
             // 宁可 token 统计为 0，也不冒 400 的风险。（若实测放行，可改为 true。）
             supports_stream_usage: false,
@@ -78,12 +59,13 @@ impl ProviderCompat {
     /// `reasoning_content`（非标准 `reasoning` 字段）。故解析开关沿用
     /// [`ProviderCompat::deepseek`]。
     ///
+    /// 网关实测接受顶层 `reasoning_effort`，故显式声明支持。
     /// `supports_stream_usage` 保持开启：网关放行 `stream_options.include_usage`；
     /// 若将来拒绝，适配器的「剥参数一次性回退」仍能兜住。
     pub fn opencode_go() -> Self {
         Self {
             has_reasoning_content: true,
-            reasoning_dialect: ReasoningDialect::OpenCodeGo,
+            supports_reasoning_effort: true,
             ..Default::default()
         }
     }
@@ -125,39 +107,23 @@ mod tests {
     }
 
     /// opencode go 的推理模型在**响应侧**用 `reasoning_content`（同 DeepSeek 的
-    /// 解析形状），且放行 `stream_options.include_usage`。
+    /// 解析形状），且放行 `stream_options.include_usage` 与顶层 `reasoning_effort`。
     #[test]
     fn opencode_go_parses_deepseek_reasoning_content_and_stream_usage() {
         let compat = ProviderCompat::opencode_go();
         assert!(compat.has_reasoning_content);
         assert!(compat.supports_stream_usage);
+        assert!(compat.supports_reasoning_effort);
         assert!(!compat.tool_calls_as_text);
-        assert_eq!(compat.reasoning_dialect, ReasoningDialect::OpenCodeGo);
     }
 
-    /// 每个构造器都必须显式钉住自己的思考方言；
-    /// `default()` / `standard()` 落到 `OpenAiEffort`。
+    /// 只有明确声明支持的 provider 才允许发送 `reasoning_effort`。
     #[test]
-    fn constructors_pin_reasoning_dialect() {
-        assert_eq!(
-            ProviderCompat::default().reasoning_dialect,
-            ReasoningDialect::OpenAiEffort
-        );
-        assert_eq!(
-            ProviderCompat::standard().reasoning_dialect,
-            ReasoningDialect::OpenAiEffort
-        );
-        assert_eq!(
-            ProviderCompat::deepseek().reasoning_dialect,
-            ReasoningDialect::DeepSeek
-        );
-        assert_eq!(
-            ProviderCompat::minimax().reasoning_dialect,
-            ReasoningDialect::None
-        );
-        assert_eq!(
-            ProviderCompat::opencode_go().reasoning_dialect,
-            ReasoningDialect::OpenCodeGo
-        );
+    fn constructors_pin_reasoning_effort_support() {
+        assert!(!ProviderCompat::default().supports_reasoning_effort);
+        assert!(!ProviderCompat::standard().supports_reasoning_effort);
+        assert!(!ProviderCompat::deepseek().supports_reasoning_effort);
+        assert!(!ProviderCompat::minimax().supports_reasoning_effort);
+        assert!(ProviderCompat::opencode_go().supports_reasoning_effort);
     }
 }

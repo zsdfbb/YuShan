@@ -952,6 +952,7 @@ fn t5_debug_file_is_complete_and_structured() {
         "run_start",
         "turn_start",
         "round_start",
+        "model_attempt",
         "round_usage",
         "round_end",
         "turn_end",
@@ -962,10 +963,11 @@ fn t5_debug_file_is_complete_and_structured() {
         );
     }
     // 允许名单而非「名字不含 delta」：后者会放过任何新造的增量类记录名。
-    const ALLOWED: [&str; 7] = [
+    const ALLOWED: [&str; 8] = [
         "run_start",
         "turn_start",
         "round_start",
+        "model_attempt",
         "round_usage",
         "round_end",
         "turn_end",
@@ -984,6 +986,18 @@ fn t5_debug_file_is_complete_and_structured() {
     assert_eq!(usage["gen_ai.usage.reasoning.output_tokens"], json!(4));
     assert_eq!(usage["reasoning_tokens_reported"], json!(true));
     assert_eq!(usage["purpose"], json!("turn"));
+
+    // 适配器尝试读数必须经 app 路由器落盘；成功尝试有真实首字节延迟。
+    let attempt = records
+        .iter()
+        .find(|record| record["ev"] == json!("model_attempt"))
+        .expect("应有 model_attempt 记录");
+    assert_eq!(attempt["attempt"], json!(1));
+    assert_eq!(attempt["max_attempts"], json!(6));
+    assert_eq!(attempt["outcome"], json!("success"));
+    assert_eq!(attempt["http_status"], json!(200));
+    assert!(attempt["ttfb_ms"].is_u64(), "成功尝试应有 ttfb_ms：{attempt}");
+    assert_eq!(attempt["retried"], json!(false));
 }
 
 // ---------------------------------------------------------------------------

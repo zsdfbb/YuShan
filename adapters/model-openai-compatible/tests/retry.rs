@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use ys_core::EventError;
 use ys_model::{Model, ModelEvent, ModelEventSink, ModelRequest};
 use ys_model_openai_compat::{
-    OpenAICompatibleConfig, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
+    ModelAttempt, ModelAttemptOutcome, ModelAttemptReason, OpenAICompatibleConfig,
+    ModelAttemptRetrySuppressed, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
     compat::ProviderCompat,
 };
 
@@ -247,7 +248,7 @@ fn base_config(api_base: String) -> OpenAICompatibleConfig {
         model: "test-model".into(),
         max_tokens: None,
         temperature: None,
-        effort: None,
+        reasoning_effort: None,
         compat: ProviderCompat {
             supports_stream_usage: false,
             ..ProviderCompat::standard()
@@ -273,6 +274,17 @@ fn logs() -> Logs {
 fn log_listener(logs: &Logs) -> Arc<dyn Fn(&str) + Send + Sync> {
     let logs = logs.clone();
     Arc::new(move |message: &str| logs.lock().unwrap().push(message.to_string()))
+}
+
+type Traces = Arc<Mutex<Vec<ModelAttempt>>>;
+
+fn traces() -> Traces {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn trace_listener(traces: &Traces) -> Arc<dyn Fn(&ModelAttempt) + Send + Sync> {
+    let traces = traces.clone();
+    Arc::new(move |attempt| traces.lock().unwrap().push(attempt.clone()))
 }
 
 fn full_sse() -> Vec<u8> {
@@ -551,6 +563,133 @@ async fn retry_logs_are_visible() {
         lines.iter().any(|l| l.contains("giving up")),
         "应有最终放弃日志：{lines:?}"
     );
+}
+
+/// 11. 结构化尝试读数覆盖 429 → 成功：第一次可重试且记录了退避，第二次成功；
+///     成功尝试的 `ttfb_ms` 来自响应体首个非空 chunk，而不是连接建立时间。
+#[tokio::test]
+async fn model_attempt_trace_retry_then_success() {
+    let traces = traces();
+    let server = MockServer::start(vec![
+        json_reply(
+            "429 Too Many Requests",
+            vec![("retry-after", "0".into())],
+            "{\"error\":\"rate limited\"}",
+        ),
+        Reply::Sse(full_sse()),
+    ]);
+    let model = model_for(&server, fast_retry(2, 100), 30, None)
+        .with_trace(trace_listener(&traces));
+
+    model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect("429 后应重试成功");
+
+    let records = traces.lock().unwrap().clone();
+    assert_eq!(records.len(), 2, "每个 HTTP 尝试恰好一条记录：{records:?}");
+    let first = &records[0];
+    assert_eq!(first.attempt, 1);
+    assert_eq!(first.max_attempts, 3);
+    assert_eq!(first.outcome, ModelAttemptOutcome::Retryable);
+    assert_eq!(first.reason_class, Some(ModelAttemptReason::RateLimited));
+    assert_eq!(first.http_status, Some(429));
+    assert_eq!(first.ttfb_ms, None);
+    assert!(first.response_headers_ms.is_some());
+    assert!(first.retried);
+    assert_eq!(first.retry_suppressed, None);
+    assert!(!first.stream_started);
+    assert!(!first.fallback_retry);
+    assert!(
+        records[0].backoff_ms.is_some(),
+        "实际排程的退避必须落盘：{records:?}"
+    );
+    assert_eq!(records[1].attempt, 2);
+    assert_eq!(records[1].outcome, ModelAttemptOutcome::Success);
+    assert_eq!(records[1].http_status, Some(200));
+    assert!(
+        records[1].ttfb_ms.is_some(),
+        "成功尝试必须记录首个响应体字节：{records:?}"
+    );
+    assert!(!records[1].retried);
+}
+
+/// 12. 次数耗尽只记“可重试但被抑制”，不得伪装成成功或普通 fatal。
+#[tokio::test]
+async fn model_attempt_trace_marks_exhausted_retry() {
+    let traces = traces();
+    let server = MockServer::start(vec![json_reply(
+        "500 Internal Server Error",
+        vec![],
+        "{\"error\":\"boom\"}",
+    )]);
+    let model = model_for(&server, fast_retry(1, 10), 30, None)
+        .with_trace(trace_listener(&traces));
+
+    model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect_err("持续 500 应失败");
+
+    let records = traces.lock().unwrap().clone();
+    assert_eq!(records.len(), 2, "1 次额外重试 ⇒ 2 个 HTTP 尝试");
+    assert_eq!(records[0].outcome, ModelAttemptOutcome::Retryable);
+    assert_eq!(
+        records[0].reason_class,
+        Some(ModelAttemptReason::ServerError)
+    );
+    assert!(records[0].retried);
+    assert_eq!(records[1].attempt, 2);
+    assert_eq!(records[1].outcome, ModelAttemptOutcome::Retryable);
+    assert_eq!(
+        records[1].retry_suppressed,
+        Some(ModelAttemptRetrySuppressed::Exhausted)
+    );
+    assert!(!records[1].retried);
+}
+
+/// 13. 端点拒绝 `stream_options` 后的单次内部回退仍属同一 attempt，但必须由
+///     `fallback_retry` 标明；否则 2 次 HTTP 请求会看起来像 1 次。
+#[tokio::test]
+async fn model_attempt_trace_marks_stream_options_fallback() {
+    let traces = traces();
+    let server = MockServer::start(vec![
+        json_reply(
+            "400 Bad Request",
+            vec![],
+            "{\"error\":\"stream_options unsupported\"}",
+        ),
+        Reply::Sse(full_sse()),
+    ]);
+    let config = OpenAICompatibleConfig {
+        api_base: server.api_base(),
+        api_key: "test-key".into(),
+        model: "test-model".into(),
+        max_tokens: None,
+        temperature: None,
+        reasoning_effort: None,
+        compat: ProviderCompat::standard(),
+    };
+    let model = OpenAICompatibleModel::with_client(config, no_proxy_client())
+        .with_retry(fast_retry(0, 10))
+        .with_timeouts(TimeoutConfig {
+            connect_secs: 5,
+            idle_secs: 30,
+        })
+        .with_trace(trace_listener(&traces));
+
+    model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect("剥掉 stream_options 后应成功");
+
+    let records = traces.lock().unwrap().clone();
+    assert_eq!(records.len(), 1, "内部回退不增加 attempt 序号");
+    assert!(records[0].fallback_retry);
+    assert_eq!(records[0].attempt, 1);
+    assert_eq!(records[0].http_status, Some(200));
+    assert_eq!(records[0].outcome, ModelAttemptOutcome::Success);
+    assert_eq!(server.request_count(), 2);
 }
 
 /// 10. **默认值被钉住**：生产接线落地前，这两组默认值**就是实际生效值**，

@@ -117,7 +117,7 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 | `apps/coding-agent/src/logging.rs`（改） | 抽出 `log_dir()` 供 debug 复用（`YUSHAN_LOG_DIR` / `HOME` 回退），**行为不变** |
 | `adapters/model-openai-compatible/src/response.rs`（改） | `ChatUsage` 增 `completion_tokens_details.reasoning_tokens` |
 | `adapters/model-openai-compatible/src/lib.rs`（改） | attempt / 首字节 / 重试 trace（与既有 `with_logger` 并列） |
-| `crates/ys-core/src/usage.rs`（改） | `Usage` 增 `reasoning_tokens: u32`（`#[serde(default)]`），纳入 `Add` |
+| `crates/ys-core/src/usage.rs`（改） | `Usage` 增 **`reasoning_tokens: Option<u32>`**（`#[serde(default, skip_serializing_if = "Option::is_none")]`），纳入 `Add`。**必须是 `Option` 而非裸 `u32`**：裸写会让每条 `RunFinished.usage` 都多一个键，直接破坏 §8 验收 T2 的「过滤后逐字节不变」；`None` 同时精确表达 §4.2 的「没上报 ≠ 0」 |
 | `crates/ys-event/src/event.rs`（改） | 新增非终局 `RoundUsage { round, usage }` |
 | `crates/ys-loop/src/basic.rs`（改） | Step 7 拿到 `response.usage` 后 emit `RoundUsage{purpose:"turn"}`；压缩分支 emit `purpose:"compaction"` |
 | `crates/ys-loop/src/compact.rs`（改） | `CompactOutcome` 增 `usage: Usage`（`execute` 手里已有响应，供调用方发 `RoundUsage`） |
@@ -319,8 +319,8 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 ## 8. 验收
 
 1. **关闭 debug（负向验收）**：目标目录零新文件；`yushan.log` 文本行逐字节不变；
-   **`--json` 输出也必须逐字节相同** —— 注意 `RoundUsage` 在 debug 关闭时**仍会发**，
-   这是设计的选择（它服务于所有消费者），**必须被本条钉住**，否则将来有人会以为"关 debug 就等于零变化"。
+   **`--json` 在过滤掉 `RoundUsage` 后逐字节相同** —— `RoundUsage` 在 debug 关闭时**仍会发**
+   （它服务于所有消费者），这是一次**加法契约变更**，必须按「过滤后比对」的口径验收。
 2. **打开 debug + 一次 10k 增量的运行**：debug 文件 < 200 KiB；**零** `ModelTextDelta` /
    `ModelThinkingDelta` 记录；每行是合法 JSON、`seq` 严格 +1、`t_ms - dt_ms` 恒定。
 3. **队列满**（注入慢 writer）：`dropped > 0`，已写行完整；`run_end` 报出该数。

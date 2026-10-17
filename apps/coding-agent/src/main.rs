@@ -46,6 +46,7 @@ mod capabilities;
 mod channel;
 mod config;
 mod debug_log;
+mod help;
 mod logging;
 mod prompt;
 mod provider;
@@ -101,6 +102,8 @@ enum Mode {
     Json(String),
     /// 交互式 TUI：真正的 UI 在 `ys-tui-coding`（独立 crate），本 crate 只接线。
     Interactive,
+    /// 打印帮助文档后退出（`--help` / `-h` / `help`）。
+    Help,
 }
 
 /// 启动期会话形态。
@@ -267,6 +270,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     };
 
     match first {
+        "help" | "--help" | "-h" => Ok(Args {
+            mode: Mode::Help,
+            stats: false,
+            debug,
+            resume,
+            worktree: None,
+        }),
         "-p" => {
             let (stats, flag_debug, flag_resume, rest) = split_leading_flags(&argv[idx + 1..])?;
             let task = rest.join(" ");
@@ -2283,6 +2293,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_args(&argv)?;
 
+    // help 是**纯打印**：不建 runtime、不读凭证、不进 TUI。
+    // 紧跟 `parse_args` 早退 ⇒ 无凭证也能跑；输出走 stdout，stderr 不打任何东西。
+    if let Mode::Help = args.mode {
+        println!("{}", help::help_text());
+        // 走进程退出的唯一落点：此时 debug sink 尚未建立，`None` 分支零副作用。
+        exit_with_debug(&mut None, 0);
+    }
+
     let mut config = config::Config::from_env()?;
 
     // 从 auth.json 加载已保存的凭证
@@ -2799,6 +2817,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tool_specs,
             )?;
         }
+        // `main` 在 `parse_args` 之后立即打印并退出，不应到达此处。
+        Mode::Help => unreachable!("Help 已由 main 提前处理，不应到达此处"),
     }
 
     Ok(())
@@ -2998,6 +3018,118 @@ mod tests {
         assert_eq!(
             parse_args(&s(&["-p", "--help", "me"])).unwrap().mode,
             Mode::Print("--help me".into())
+        );
+    }
+
+    /// 三种触发形态（`--help` / `-h` / 裸词 `help`）在**首个位置**都得到 [`Mode::Help`]。
+    #[test]
+    fn parse_help_flag_and_alias_and_bare_word() {
+        for argv in [s(&["--help"]), s(&["-h"]), s(&["help"])] {
+            assert_eq!(
+                parse_args(&argv).unwrap().mode,
+                Mode::Help,
+                "argv = {argv:?}"
+            );
+        }
+    }
+
+    /// 回归护栏：`--help` 只在**首个参数位置**判定模式 flag —— 模式 flag 之后它是任务文本的
+    /// 一部分（与 `--stats` 同一套剥离规则，只认紧邻 flag 区）。
+    #[test]
+    fn parse_help_is_only_a_leading_mode_flag() {
+        assert_eq!(
+            parse_args(&s(&["-p", "--help", "me"])).unwrap().mode,
+            Mode::Print("--help me".into())
+        );
+        assert_eq!(
+            parse_args(&s(&["--json", "--help", "me"])).unwrap().mode,
+            Mode::Json("--help me".into())
+        );
+        // worktree 子命令不认 help：`--help` 是以 `-` 开头的名参 ⇒ 既有校验报错
+        assert!(parse_args(&s(&["worktree", "--help"])).is_err());
+        // 首部 flag 区之后才出现 help ⇒ 仍按首 token 之前的 flag 语义解析
+        assert_eq!(
+            parse_args(&s(&["--debug", "--help"])).unwrap().mode,
+            Mode::Help
+        );
+    }
+
+    /// 帮助文案：三种触发形态 + 公共 flag + worktree 四动词。
+    #[test]
+    fn help_text_mentions_cli_shapes_and_flags() {
+        let text = help::help_text();
+        for needle in [
+            "--help",
+            "-h",
+            " help ",
+            "ys-coding-agent",
+            "-p <任务>",
+            "--json <任务>",
+            "--resume [<id>]",
+            "--debug",
+            "--stats",
+            "create",
+            "attach",
+            "list",
+            "remove",
+        ] {
+            assert!(text.contains(needle), "缺 {needle:?}：\n{text}");
+        }
+    }
+
+    /// 帮助文案：15 个 `YUSHAN_*` 环境变量名 + 另外两个目录覆盖。
+    #[test]
+    fn help_text_lists_env_vars() {
+        let text = help::help_text();
+        for var in [
+            "YUSHAN_API_BASE",
+            "YUSHAN_API_KEY",
+            "YUSHAN_MODEL",
+            "YUSHAN_REASONING_EFFORT",
+            "YUSHAN_CHANNEL_CAPACITY",
+            "YUSHAN_SESSIONS_DIR",
+            "YUSHAN_LOG_DIR",
+            "YUSHAN_DEBUG",
+            "YUSHAN_DEBUG_ARGS",
+            "YUSHAN_SEARCH_SEARXNG_URL",
+            "YUSHAN_SEARCH_DEEPSEEK_KEY",
+            "YUSHAN_SEARCH_TAVILY_KEY",
+            "YUSHAN_SEARCH_BOCHA_KEY",
+            "YUSHAN_SEARCH_FIRECRAWL_KEY",
+            "YUSHAN_FETCHED_DIR",
+            "YUSHAN_SUBAGENTS_DIR",
+            "YUSHAN_WORKTREES_DIR",
+        ] {
+            assert!(text.contains(var), "缺环境变量 {var}：\n{text}");
+        }
+    }
+
+    /// 帮助文案：斜杠命令名与总行数区间（防空壳 / 失控膨胀）。
+    #[test]
+    fn help_text_lists_slash_commands_within_size_bounds() {
+        let text = help::help_text();
+        for cmd in [
+            "/help",
+            "/status",
+            "/skills",
+            "/copy",
+            "/quit",
+            "/thinking",
+            "/effort",
+            "/model",
+            "/login",
+            "/logout",
+            "/new",
+            "/resume",
+            "/compact",
+            "/export",
+        ] {
+            assert!(text.contains(cmd), "缺斜杠命令 {cmd}：\n{text}");
+        }
+        let lines = text.lines().count();
+        assert!(
+            (40..=120).contains(&lines),
+            "帮助总行数应在 40..=120，实得 {lines}：\n{text}"
         );
     }
 

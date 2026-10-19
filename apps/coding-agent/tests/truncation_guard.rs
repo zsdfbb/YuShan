@@ -407,11 +407,17 @@ fn truncated_tool_batch_is_never_executed() {
     );
 
     // ── 前提：残缺 JSON 确实到了适配器（否则本用例没在测它以为在测的东西）──
-    // 适配器把非法参数降级为 `Value::Null` 时打这条警告；它是「index 0 的参数
-    // 真的是残缺 JSON」的直接证据。
+    // 适配器把非法参数降级为 `Value::Null` 时把警告写进日志；它是「index 0
+    // 的参数真的是残缺 JSON」的直接证据，同时不得污染 stderr/TUI。
+    let log =
+        std::fs::read_to_string(home.join(".yushan/logs/yushan.log")).expect("应写入 yushan.log");
     assert!(
-        stderr.contains("not valid JSON"),
-        "前提不成立：适配器未报「参数非法 JSON」，说明残缺调用没被构造出来\nstderr:\n{stderr}"
+        log.contains("not valid JSON"),
+        "前提不成立：适配器日志未报「参数非法 JSON」，说明残缺调用没被构造出来\nlog:\n{log}"
+    );
+    assert!(
+        !stderr.contains("not valid JSON"),
+        "参数修复警告不得直接写 stderr\nstderr:\n{stderr}"
     );
 
     // ── 断言 2：广播了 ResponseTruncated，且计数覆盖整批 ──────────────────

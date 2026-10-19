@@ -1,14 +1,21 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{Message, Session, SessionError, SessionMeta};
+use ys_core::{ContentBlock, Role, ToolCallId};
+
+use crate::{Message, Session, SessionError, SessionMeta, SessionRecovery};
+
+const INTERRUPTED_TOOL_RESULT: &str = "Tool execution was interrupted; result unavailable.";
 
 pub struct JsonlSession {
     path: PathBuf,
     /// 会话级元数据，落盘于文件**首行**；缺省即无首行 meta。
     meta: Option<SessionMeta>,
     messages: Vec<Message>,
+    /// 打开文件时完成的修复记录；由 [`Session::take_recovery`] 一次性取走。
+    recovery: Option<SessionRecovery>,
     /// 仅测试用：`flush_to_file` 的调用次数。用来断言 `replace_all` 只触发一次落盘
     /// （若退回 trait 默认实现，次数会变成 N+1）。
     #[cfg(test)]
@@ -19,54 +26,80 @@ impl JsonlSession {
     /// 打开或创建 JSONL session 文件
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, SessionError> {
         let path = path.into();
-        let (meta, messages) = if path.exists() {
+        let (meta, mut messages, skipped_lines) = if path.exists() {
             Self::load_from_file(&path).await?
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), 0)
         };
-        Ok(Self {
+        let repaired_tool_calls = repair_dangling_tool_calls(&mut messages);
+        let recovery = SessionRecovery {
+            repaired_tool_calls,
+            skipped_lines,
+        };
+        let session = Self {
             path,
             meta,
             messages,
+            recovery: (!recovery.is_empty()).then_some(recovery),
             #[cfg(test)]
             flush_count: std::sync::atomic::AtomicUsize::new(0),
-        })
+        };
+        // 修复必须先落盘再交给调用方：只在内存里补结果会让下一次 resume 再次失败。
+        // `flush_to_file` 沿用 tmp + rename；失败直接让 open 失败，不返回半修会话。
+        if repaired_tool_calls > 0 {
+            session.flush_to_file().await?;
+        }
+        Ok(session)
     }
 
     /// 逐行判别：先按 `Message` 解析（绝大多数行），失败再按 `SessionMeta` 解析；
-    /// 两者皆失败 ⇒ 告警并跳过（不终止）。
+    /// 两者皆失败 ⇒ 跳过（不终止），并把数量交给调用方记录到诊断日志/修复摘要。
     ///
     /// 判别安全：`Message` 无 `type` 字段，`SessionMeta` 的 `type` 为必填 ⇒ 两者互不误判。
     async fn load_from_file(
         path: &Path,
-    ) -> Result<(Option<SessionMeta>, Vec<Message>), SessionError> {
+    ) -> Result<(Option<SessionMeta>, Vec<Message>, usize), SessionError> {
         let file = File::open(path)
             .await
             .map_err(|e| SessionError::Storage(format!("failed to open session: {e}")))?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
         let mut meta = None;
         let mut msgs = Vec::new();
-        let mut line_num = 0u64;
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|e| SessionError::Storage(format!("failed to read session: {e}")))?
-        {
-            line_num += 1;
-            if let Ok(msg) = serde_json::from_str::<Message>(&line) {
+        let mut skipped_lines = 0usize;
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|e| SessionError::Storage(format!("failed to read session: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            let Ok(line) = std::str::from_utf8(&line) else {
+                skipped_lines += 1;
+                continue;
+            };
+            if let Ok(msg) = serde_json::from_str::<Message>(line) {
                 msgs.push(msg);
                 continue;
             }
-            match serde_json::from_str::<SessionMeta>(&line) {
+            match serde_json::from_str::<SessionMeta>(line) {
                 Ok(m) => meta = Some(m),
-                Err(e) => {
-                    // 损坏行：跳过并告警、不终止（修复 C3）
-                    eprintln!("Warning: skipping corrupt session line {line_num}: {e}");
+                Err(_) => {
+                    // 损坏行：跳过、不终止。库层不直接写 stderr —— TUI 起屏后
+                    // 任何直写都会冲进输入区；调用方从 `SessionRecovery` 统一告警。
+                    skipped_lines += 1;
                 }
             }
         }
-        Ok((meta, msgs))
+        Ok((meta, msgs, skipped_lines))
     }
 
     /// 原子写入：先写临时文件，再 rename（防止崩溃时数据丢失）
@@ -120,6 +153,10 @@ impl Session for JsonlSession {
         self.meta.as_ref()
     }
 
+    fn take_recovery(&mut self) -> Option<SessionRecovery> {
+        self.recovery.take()
+    }
+
     async fn set_meta(&mut self, meta: SessionMeta) -> Result<(), SessionError> {
         self.meta = Some(meta);
         self.flush_to_file().await
@@ -148,6 +185,91 @@ impl Session for JsonlSession {
     }
 }
 
+/// 修复被中断会话中缺少结果的 `ToolUse`。
+///
+/// OpenAI-compatible 协议要求 assistant `tool_calls` 后紧跟对应的 tool
+/// 消息。只在文件末尾补一条结果不够：若调用后已经有用户文本，那条结果仍会
+/// 排在用户文本之后。这里对每个不完整的 assistant 调用：
+///
+/// - 紧随其后的 User 消息已含 `ToolResult` ⇒ 把缺失结果追加到该消息；
+/// - 否则立即插入一条只含合成结果的 User 消息。
+///
+/// 返回实际合成的 block 数。按 id 去重；已有对应结果（即使不在相邻位置）的调用
+/// 不会再次合成。
+fn repair_dangling_tool_calls(messages: &mut Vec<Message>) -> usize {
+    let mut resolved: HashSet<ToolCallId> = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut repaired = 0usize;
+    let mut index = 0usize;
+    while index < messages.len() {
+        if messages[index].role != Role::Assistant {
+            index += 1;
+            continue;
+        }
+
+        let mut seen_in_message = HashSet::new();
+        let missing: Vec<ToolCallId> = messages[index]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. }
+                    if !resolved.contains(id) && seen_in_message.insert(id.clone()) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        if missing.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        for id in &missing {
+            resolved.insert(id.clone());
+        }
+        repaired += missing.len();
+        let synthetic: Vec<ContentBlock> = missing
+            .into_iter()
+            .map(|tool_call_id| ContentBlock::ToolResult {
+                tool_call_id,
+                content: INTERRUPTED_TOOL_RESULT.to_string(),
+                is_error: true,
+            })
+            .collect();
+
+        let next_is_result_group = messages.get(index + 1).is_some_and(|message| {
+            message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        });
+        if next_is_result_group {
+            messages[index + 1].content.extend(synthetic);
+            index += 1;
+        } else {
+            messages.insert(
+                index + 1,
+                Message {
+                    role: Role::User,
+                    content: synthetic,
+                },
+            );
+            index += 2;
+        }
+    }
+    repaired
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +288,54 @@ mod tests {
             role,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
+    }
+
+    fn tool_use_msg(calls: &[(&str, &str)]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: calls
+                .iter()
+                .map(|(id, name)| ContentBlock::ToolUse {
+                    id: ToolCallId((*id).into()),
+                    name: (*name).into(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                })
+                .collect(),
+        }
+    }
+
+    fn tool_result_msg(results: &[(&str, bool)]) -> Message {
+        Message {
+            role: Role::User,
+            content: results
+                .iter()
+                .map(|(id, is_error)| ContentBlock::ToolResult {
+                    tool_call_id: ToolCallId((*id).into()),
+                    content: format!("result for {id}"),
+                    is_error: *is_error,
+                })
+                .collect(),
+        }
+    }
+
+    async fn write_messages(path: &Path, messages: &[Message]) {
+        let mut body = String::new();
+        for message in messages {
+            body.push_str(&serde_json::to_string(message).unwrap());
+            body.push('\n');
+        }
+        tokio::fs::write(path, body).await.unwrap();
+    }
+
+    fn tool_result_ids(message: &Message) -> Vec<&ToolCallId> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_call_id, .. } => Some(tool_call_id),
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -262,6 +432,30 @@ mod tests {
         // 损坏行应被跳过，只恢复有效消息
         assert_eq!(session.messages().len(), 1);
         assert_eq!(session.messages()[0].role, Role::User);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_line_is_skipped_without_failing_the_session() {
+        let path = temp_path("invalid_utf8");
+        let before = text_msg(Role::User, "before");
+        let after = text_msg(Role::Assistant, "after");
+        let mut content = serde_json::to_vec(&before).unwrap();
+        content.extend_from_slice(b"\n\xff\xfe\n");
+        content.extend_from_slice(&serde_json::to_vec(&after).unwrap());
+        content.push(b'\n');
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(session.messages(), [before, after]);
+        assert_eq!(
+            session.take_recovery(),
+            Some(SessionRecovery {
+                repaired_tool_calls: 0,
+                skipped_lines: 1,
+            })
+        );
 
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -468,10 +662,155 @@ mod tests {
         );
         tokio::fs::write(&path, content).await.unwrap();
 
-        let session = JsonlSession::open(&path).await.unwrap();
+        let mut session = JsonlSession::open(&path).await.unwrap();
         assert_eq!(session.messages(), [good], "带 type 的非法行仍应被跳过");
         assert!(session.meta().is_none());
+        assert_eq!(
+            session.take_recovery(),
+            Some(SessionRecovery {
+                repaired_tool_calls: 0,
+                skipped_lines: 3,
+            }),
+            "坏行应计数并交给调用方记录，不得由库层直接打印"
+        );
 
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn dangling_tool_use_at_tail_is_repaired_and_persisted() {
+        let path = temp_path("repair_tail");
+        write_messages(&path, &[tool_use_msg(&[("c1", "read")])]).await;
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(
+            session.take_recovery(),
+            Some(SessionRecovery {
+                repaired_tool_calls: 1,
+                skipped_lines: 0,
+            })
+        );
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(session.messages()[1].role, Role::User);
+        assert_eq!(
+            tool_result_ids(&session.messages()[1]),
+            [&ToolCallId("c1".into())]
+        );
+        assert!(matches!(
+            &session.messages()[1].content[0],
+            ContentBlock::ToolResult {
+                content,
+                is_error: true,
+                ..
+            } if content == INTERRUPTED_TOOL_RESULT
+        ));
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(reopened.messages(), session.messages());
+        assert!(
+            reopened.recovery.is_none(),
+            "修复落盘后再次打开不应重复补结果"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn dangling_tool_result_is_inserted_before_following_user_text() {
+        let path = temp_path("repair_before_user");
+        write_messages(
+            &path,
+            &[
+                tool_use_msg(&[("c1", "bash")]),
+                text_msg(Role::User, "continue please"),
+            ],
+        )
+        .await;
+
+        let session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(session.messages().len(), 3);
+        assert_eq!(session.messages()[0].role, Role::Assistant);
+        assert_eq!(session.messages()[1].role, Role::User);
+        assert_eq!(
+            tool_result_ids(&session.messages()[1]),
+            [&ToolCallId("c1".into())],
+            "合成结果必须紧跟 assistant，不能排到后续用户文本之后"
+        );
+        assert_eq!(
+            session.messages()[2],
+            text_msg(Role::User, "continue please")
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn partial_result_group_only_gets_missing_tool_results() {
+        let path = temp_path("repair_partial");
+        write_messages(
+            &path,
+            &[
+                tool_use_msg(&[("c1", "read"), ("c2", "bash")]),
+                tool_result_msg(&[("c1", false)]),
+            ],
+        )
+        .await;
+
+        let session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(session.messages().len(), 2, "缺失结果应追加到紧随的消息");
+        let ids = tool_result_ids(&session.messages()[1]);
+        assert_eq!(ids, [&ToolCallId("c1".into()), &ToolCallId("c2".into())]);
+        assert!(matches!(
+            &session.messages()[1].content[1],
+            ContentBlock::ToolResult {
+                tool_call_id,
+                is_error: true,
+                ..
+            } if tool_call_id == &ToolCallId("c2".into())
+        ));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn clean_session_is_not_rewritten_when_opened() {
+        let path = temp_path("clean_no_rewrite");
+        write_messages(
+            &path,
+            &[
+                tool_use_msg(&[("c1", "read")]),
+                tool_result_msg(&[("c1", false)]),
+            ],
+        )
+        .await;
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let session = JsonlSession::open(&path).await.unwrap();
+        assert!(session.recovery.is_none());
+        let after = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(after, before, "无需修复时不得重写会话文件");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn repair_flush_failure_fails_open_instead_of_returning_memory_only_fix() {
+        let path = temp_path("repair_flush_failure");
+        write_messages(&path, &[tool_use_msg(&[("c1", "read")])]).await;
+        let tmp_path = path.with_extension("jsonl.tmp");
+        tokio::fs::create_dir(&tmp_path).await.unwrap();
+
+        let error = JsonlSession::open(&path)
+            .await
+            .err()
+            .expect("合成的 ToolResult 无法落盘时必须让 open 失败，不能只修内存");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create tmp session file"),
+            "错误应保留落盘失败分类：{error}"
+        );
+
+        tokio::fs::remove_dir(&tmp_path).await.unwrap();
         let _ = tokio::fs::remove_file(&path).await;
     }
 

@@ -444,6 +444,37 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionSummary> {
     crate::sessions::list(dir)
 }
 
+/// 会话恢复摘要的用户可见文案。
+///
+/// `ys-session` 只报告事实；措辞与展示通道归应用层。只列实际发生的修复，
+/// 不输出「0 个」这类噪声。
+pub fn session_recovery_notice(recovery: ys_session::SessionRecovery) -> String {
+    let mut parts = Vec::new();
+    if recovery.repaired_tool_calls > 0 {
+        let noun = if recovery.repaired_tool_calls == 1 {
+            "tool call"
+        } else {
+            "tool calls"
+        };
+        parts.push(format!(
+            "synthesized error results for {} interrupted {noun}",
+            recovery.repaired_tool_calls
+        ));
+    }
+    if recovery.skipped_lines > 0 {
+        let noun = if recovery.skipped_lines == 1 {
+            "line"
+        } else {
+            "lines"
+        };
+        parts.push(format!(
+            "skipped {} corrupt session {noun}",
+            recovery.skipped_lines
+        ));
+    }
+    format!("Session recovery: {}.", parts.join("; "))
+}
+
 /// 一次成功的运行期恢复 —— `app_loop` 据此完成提交步与出站。
 ///
 /// 三样恰好对应 [`Outbound::SessionResumed`](ys_protocol::Outbound::SessionResumed)
@@ -531,12 +562,17 @@ pub async fn resume_session(
     cfg.effort = effort;
     wiring.set_model(Some(built));
 
+    let recovery = wiring.take_recovery();
     let summary = session_summary(&path, meta.as_ref());
     let thinking_visible = meta.as_ref().map(|m| m.thinking_visible).unwrap_or(false);
     let workspace = meta.as_ref().and_then(|m| m.workspace.clone());
     let history = wiring.session_messages().to_vec();
+    let mut lines = vec![format!("Resumed session: {}", summary.id)];
+    if let Some(recovery) = recovery {
+        lines.push(session_recovery_notice(recovery));
+    }
     (
-        vec![format!("Resumed session: {}", summary.id)],
+        lines,
         Some(ResumedSession {
             summary,
             thinking_visible,
@@ -615,6 +651,7 @@ mod tests {
     use ys_core::{ContentBlock, Message, Role};
     use ys_event::CollectingSink;
     use ys_model::{MockModel, Model, ModelError, ModelEventSink, ModelRequest, ModelResponse};
+    use ys_session::SessionRecovery;
 
     /// 一条 `tokens` 量级的文本消息（估算器是「字节 / 4」，用整数倍长度让切分
     /// 边界可精确断言）。`tag` 用于区分消息 —— 断言「谁被摘要掉、谁被留下」。
@@ -666,6 +703,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn session_recovery_notice_lists_only_observed_repairs() {
+        assert_eq!(
+            session_recovery_notice(SessionRecovery {
+                repaired_tool_calls: 1,
+                skipped_lines: 0,
+            }),
+            "Session recovery: synthesized error results for 1 interrupted tool call."
+        );
+        assert_eq!(
+            session_recovery_notice(SessionRecovery {
+                repaired_tool_calls: 2,
+                skipped_lines: 3,
+            }),
+            "Session recovery: synthesized error results for 2 interrupted tool calls; \
+             skipped 3 corrupt session lines."
+        );
+        assert_eq!(
+            session_recovery_notice(SessionRecovery {
+                repaired_tool_calls: 0,
+                skipped_lines: 1,
+            }),
+            "Session recovery: skipped 1 corrupt session line."
+        );
     }
 
     /// 测试 model：`build_model` 的产物，只需满足 `Model`。
@@ -1767,6 +1830,72 @@ mod tests {
             *factory_saw.lock().unwrap(),
             vec![Some(EffortLevel::Max)],
             "候选模型必须在目标档位下构建（变异：build_candidate_model 传 None ⇒ 变红）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// 运行期恢复被中断的会话：`open` 合成错误结果并落盘，恢复结果同时把修复事实
+    /// 带入命令输出；摘要只能消费一次。
+    #[tokio::test]
+    async fn resume_session_reports_interrupted_tool_repair_once() {
+        let dir = temp_dir("resume_repair");
+        let target_path = dir.join("target.jsonl");
+        let mut meta = SessionMeta::new(0);
+        meta.provider = Some("deepseek".into());
+        meta.model = Some("deepseek-chat".into());
+        let dangling = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: ys_core::ToolCallId("call-1".into()),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            }],
+        };
+        std::fs::write(
+            &target_path,
+            format!(
+                "{}\n{}\nnot-json\n",
+                serde_json::to_string(&meta).unwrap(),
+                serde_json::to_string(&dangling).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        let mut cfg = {
+            let _guard = crate::test_env::env_lock();
+            Config::from_env().unwrap()
+        };
+        cfg.provider = Some("deepseek".into());
+        cfg.api_base = Some("https://api.deepseek.com".into());
+        cfg.api_key = Some("sk-test".into());
+        cfg.model = "deepseek-chat".into();
+        cfg.set_model_factory(|_| Some(Box::new(DummyModel) as Box<dyn Model>));
+        let (state, state_dir) = test_state();
+
+        let (lines, resumed) = resume_session(&mut cfg, &mut wiring, &state, "target").await;
+        let resumed = resumed.expect("配置完整时应恢复成功");
+
+        assert_eq!(lines[0], "Resumed session: target");
+        assert_eq!(lines.len(), 2, "成功恢复 + 一条修复摘要：{lines:?}");
+        assert!(lines[1].contains("1 interrupted tool call"));
+        assert!(lines[1].contains("1 corrupt session line"));
+        assert_eq!(resumed.history.len(), 2, "悬空调用应补成一条结果消息");
+        assert!(matches!(
+            &resumed.history[1].content[..],
+            [ContentBlock::ToolResult {
+                tool_call_id,
+                is_error: true,
+                ..
+            }] if tool_call_id == &ys_core::ToolCallId("call-1".into())
+        ));
+        assert!(
+            wiring.take_recovery().is_none(),
+            "同一修复摘要只能交给用户一次"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

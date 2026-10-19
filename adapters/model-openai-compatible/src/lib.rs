@@ -533,21 +533,39 @@ impl OpenAICompatibleModel {
         meta.response_headers_ms = Some(started.elapsed().as_millis() as u64);
         meta.http_status = Some(response.status().as_u16());
 
-        // 一次性回退：端点不认识 `stream_options.include_usage` 时返回 400。
-        // 这是**单次尝试内部**的「剥掉不认识参数后重发一次」，与重试层无关 ——
-        // 保持其位置与语义不变，之后才进下面的分类。
-        // 请求本来就没带（`supports_stream_usage = false`）→ 不触发，直接报错。
+        // 一次性回退：端点明确表示不认识 `stream_options.include_usage` 时返回 400。
+        // 只有响应体把该字段本身归为不支持时才剥掉重发；普通 400（例如历史里的
+        // tool call 未配对）必须原样进入错误分类，不能被误判成兼容性问题。
+        // 请求本来就没带（`supports_stream_usage = false`）→ 不触发。
         let response = if response.status() == reqwest::StatusCode::BAD_REQUEST
             && chat_request.stream_options.is_some()
         {
-            meta.fallback_retry = true;
             let status = response.status();
+            let should_retry = response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().to_ascii_lowercase());
+            let server_delay = parse_retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
-            eprintln!(
+            if !is_stream_options_unsupported(&body) {
+                return AttemptCall {
+                    result: Err(classify_error_parts(
+                        status,
+                        should_retry,
+                        server_delay,
+                        body,
+                    )),
+                    meta,
+                };
+            }
+
+            meta.fallback_retry = true;
+            self.log(&format!(
                 "warning: endpoint rejected `stream_options.include_usage` \
                  ({status}: {body}); retrying once without it — \
                  token usage for this run will be reported as 0"
-            );
+            ));
             chat_request.stream_options = None;
             match self.send(url, chat_request).await {
                 Ok(response) => {
@@ -598,7 +616,7 @@ impl OpenAICompatibleModel {
             // 因此下面 `Err` 分支当前只由流空闲超时（`stream.rs`）到达，
             // `classify_stream_error` 的 `Fatal` 分支在当前路径下不可达。
             Ok(()) => accumulator
-                .finish()
+                .finish_with_logger(&|message| self.log(message))
                 .map_err(|error| AttemptError::Retryable {
                     reason: error.to_string(),
                     reason_class: ModelAttemptReason::Stream,
@@ -697,6 +715,16 @@ async fn classify_error_response(response: reqwest::Response) -> AttemptError {
         .map(|v| v.trim().to_ascii_lowercase());
     let server_delay = parse_retry_after(response.headers());
     let body = response.text().await.unwrap_or_default();
+    classify_error_parts(status, should_retry, server_delay, body)
+}
+
+/// 已读出 body 后的错误分类；与 [`classify_error_response`] 共用同一条判定链。
+fn classify_error_parts(
+    status: reqwest::StatusCode,
+    should_retry: Option<String>,
+    server_delay: Option<Duration>,
+    body: String,
+) -> AttemptError {
     let reason = format!("API error {status}: {body}");
 
     // ① 响应头定论：端点自陈的可重试性比从状态码推断更权威。
@@ -755,6 +783,25 @@ fn looks_like_quota_exhausted(body: &str) -> bool {
     QUOTA_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+/// 400 响应体是否明确把 `stream_options` 归为不支持。
+///
+/// 仅凭状态码不足以触发兼容回退：协议错误、参数错误与鉴权错误同样可能返回 400。
+/// 这里要求响应体同时出现字段名与「不支持 / 未知 / 未识别」语义。
+fn is_stream_options_unsupported(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("stream_options")
+        && [
+            "unsupported",
+            "unknown",
+            "unrecognized",
+            "not support",
+            "not supported",
+            "unexpected",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 /// 解析服务端要求的等待：`Retry-After-ms`（毫秒）优先于 `Retry-After`（秒）。
 ///
 /// 只识别整数形式（HTTP-date 形式的 `Retry-After` 忽略——国内兼容端点不用它）。
@@ -802,7 +849,7 @@ impl ToolCallAccumulator {
     }
 
     /// 收敛为一个 `ToolUse` block。参数为空串（无参工具）时退化为 `null`。
-    fn into_content_block(self) -> ContentBlock {
+    fn into_content_block(self, log: &dyn Fn(&str)) -> ContentBlock {
         // 已知降级：参数 JSON 非法时退化为 `Value::Null`（工具层看到空参数）。
         // 这是保守兜底——不 panic，也不回喂错误结果（回喂涉及工具层协议，
         // 超出适配器职责）；为使其可观测，非空但解析失败时打一条警告。
@@ -814,11 +861,11 @@ impl ToolCallAccumulator {
                 Ok(value) => value,
                 Err(e) => {
                     let prefix: String = self.arguments.chars().take(120).collect();
-                    eprintln!(
+                    log(&format!(
                         "warning: model tool_call arguments for `{}` are not valid JSON \
                          ({e}); falling back to null. arguments prefix: {prefix:?}",
                         self.name
-                    );
+                    ));
                     serde_json::Value::Null
                 }
             }
@@ -956,7 +1003,13 @@ impl<'s> StreamAccumulator<'s> {
     }
 
     /// 流结束后收敛为 [`ModelResponse`]。
-    fn finish(mut self) -> Result<ModelResponse, ModelError> {
+    #[cfg(test)]
+    fn finish(self) -> Result<ModelResponse, ModelError> {
+        self.finish_with_logger(&|_| {})
+    }
+
+    /// 与 [`Self::finish`] 相同，但把工具参数修复等诊断交给注入的 logger。
+    fn finish_with_logger(mut self, log: &dyn Fn(&str)) -> Result<ModelResponse, ModelError> {
         if let Some(message) = self.error {
             // 流式解析失败不做非流式回退——直接以 Provider 错误上抛。
             return Err(ModelError::Provider(format!("SSE stream error: {message}")));
@@ -975,7 +1028,7 @@ impl<'s> StreamAccumulator<'s> {
         for (_, accumulator) in self.tool_calls {
             // 参数完整（有 name）时才产出；一个调用一个 block。
             if !accumulator.name.is_empty() {
-                content_blocks.push(accumulator.into_content_block());
+                content_blocks.push(accumulator.into_content_block(log));
             }
         }
 

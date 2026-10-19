@@ -2,7 +2,8 @@
 
 > 性质：**实际建成记录**。设计见 `docs/arch/runtime-resume/design.md`
 > （+ `context.md` / `candidates/`），决策见 `docs/adr/0033-runtime-resume-command.md`
-> （**取代 ADR-0026 决策 6**），质量分析见 `docs/arch/runtime-resume/review.md`
+> （**取代 ADR-0026 决策 6**）与 `docs/adr/0043-resume-repairs-interrupted-tool-calls.md`，
+> 质量分析见 `docs/arch/runtime-resume/review.md`
 > （24 条发现 / 8 条 P1，全部回修进设计），执行计划见
 > `docs/exec-plans/2026-10-10-runtime-resume.md`（含「波次修正」节）。
 > 日期：2026-10-11 ｜ 基线 `eb3ff23`。
@@ -32,6 +33,7 @@ TUI 运行期新增 **`/resume [id]`** —— 无参弹浮层列出现有会话�
 | **I11** | 回放的渲染边界（`ToolResult`-only 用户消息不画空行；无配对 `ToolUse` 不显成功） | `transcript::replay_lines`（无配对 ⇒ `success = false`） |
 | **I12** | `/resume` 后 `/new` 行为不变（只换句柄、不清 transcript） | `/new` 路径未动 |
 | **I13** | `sessions_dir == None`（内存会话）⇒ app 回提示、不弹浮层 | `app_loop` 的 `ListSessions` 臂 `None` 分支 |
+| **I14** | 被中断的工具调用在 resume 时补成错误结果并先落盘；修复摘要只消费一次，排在回放之后 | `JsonlSession::open` / `Session::take_recovery` / 三模式应用层接线（ADR-0043） |
 
 ## 改动清单（按层）
 
@@ -99,7 +101,7 @@ apps/coding-agent/
    `build_candidate_model` 的**换入 → 同步 `build_model()` → 立即还原**；三段间**不得插 `await`**
    （否则把「已换入、未还原」的中间态暴露给并发观察者）。
 5. **`JsonlSession::open` 惰性 + 逐行容错** ⇒ 「路径不存在 / 非法 JSONL 令 open 失败」**不成立**
-   （不存在 ⇒ `Ok(空会话)`；坏行逐行跳过）。失败原子性只能用**真 OS 读错**构造 ——
+   （不存在 ⇒ `Ok(空会话)`；坏行逐行跳过并计数）。失败原子性只能用**真 OS 读错**构造 ——
    `resume_into_failure_leaves_current_session_untouched` 传一个**目录**（`EISDIR`）。
 6. **I11 取 (b) 方案**：无配对 `ToolUse` 置 `success = false`（屏上 ✗），**不伪造结果文案**
    （`draw.rs` 的既有语义是「失败才显结果首行」，无 `result` 即无说明行）。
@@ -111,6 +113,28 @@ apps/coding-agent/
    同步**：`app.rs` 与 `app_loop.rs` 的补臂必须与协议加臂排进同一编译单元。
 9. **启动期出站顺序**：**先投 `SessionResumed`（回放）、再投 `startup_hint`**；反序会让回放的 `clear()`
    吃掉提示（I10）。`startup_outbound_sequence` 是启动期唯一给出该次序的地方。
+
+## 恢复韧性：悬空工具调用与坏行（ADR-0043）
+
+`JsonlSession::open` 现在同时完成「读取」与一次性的**历史规范化**：
+
+1. 按字节收集完整行，再对整行做 UTF-8 与 JSON 解码；非 UTF-8、非法 JSON、
+   `Message` / `SessionMeta` 皆失败的行只增加 `skipped_lines`，库层不直接打印。
+2. 收集全部已有 `ToolResult.tool_call_id`，并为缺失结果的 `ToolUse` 合成
+   `is_error = true` 的 `ToolResult`（`Tool execution was interrupted; result unavailable.`）。
+3. 若 assistant 后紧跟工具结果组，缺失项追加到该 User 消息；否则在其后插入一条只含合成结果的
+   User 消息。后续用户文本仍排在结果组之后。
+4. 只要发生工具修复，就先经既有 tmp + rename 原子路径重写；失败则 `open` 失败。无修复不重写。
+5. `SessionRecovery { repaired_tool_calls, skipped_lines }` 暂存在会话句柄，
+   `Session::take_recovery` 一次性取走。
+
+应用层只在三个位置消费摘要：启动 TUI 把它并入启动提示（`SessionResumed` 之后）、运行期 `/resume`
+把它并入成功 `Output`（同样在回放之后）、`-p` / `--json` 写 stderr。这样 TUI 回放清屏不会吞掉告警，
+JSON stdout 也不会混入非 `Envelope` 行。
+
+**边界**：不重新执行工具（副作用不可重放）；已有结果按 id 全局计为已配对，不主动重排结果位于
+其他位置的畸形历史。当前 agent 写路径只会产生「assistant 后紧跟完整结果组」，进程在两个 append
+之间终止时则产生文件尾悬空调用，二者都被本策略覆盖。
 
 ## 回放 ≠ 逐行等价：三条已知形状分叉
 
@@ -152,6 +176,10 @@ apps/coding-agent/
 | `wiring::resume_into_failure_leaves_current_session_untouched` | I1（open 失败原子性，传目录取 `EISDIR`） | 注释：失败时 session/session_path/meta/history 全断言不变 |
 | `capabilities::resume_session_model_failure_leaves_session_untouched` | I1 / **N2 半切换** | **变异：把模型解析挪到 `resume_into` 之后且失败 ⇒ 必须红**（只覆盖 `open` 失败的变异抓不到） |
 | `app_loop::resume_emits_session_resumed_then_output_then_view` | I2（运行期出站顺序） | 变异：把 `session_event` 移到 `Output` 之后 ⇒ 红 |
+| `jsonl::tests::dangling_tool_use_at_tail_is_repaired_and_persisted` | I14（合成、落盘、再次打开不重复修） | 变异：只修内存 / 不写文件 ⇒ 重开断言红 |
+| `jsonl::tests::repair_flush_failure_fails_open_instead_of_returning_memory_only_fix` | I14（修复落盘失败 ⇒ open 失败） | 变异：忽略 flush 错误 ⇒ `open` 返回 `Ok` ⇒ 红 |
+| `capabilities::tests::resume_session_reports_interrupted_tool_repair_once` | I14（运行期摘要与一次性消费） | 变异：不取摘要 / 重复取 ⇒ 文案或 `None` 断言红 |
+| `tests::with_session_recovery_hint_preserves_existing_hint_and_skips_empty` | I14（启动提示合并） | 变异：覆盖原提示 / 无修复也追加 ⇒ 红 |
 | `main::startup_outbound_sequence_puts_replay_before_hint` | I10（启动期顺序） | 变异：交换 replay 与 hint ⇒ 红 |
 | `app_loop::resume_resets_thinking_mirror_so_next_turn_writes_target_value` | I9（thinking 三方真值） | 变异：删 `thinking_visible = r.thinking_visible` ⇒ 红（下一回合把旧值写进新 meta） |
 | `app_loop::resume_success_keeps_process_turn_sequence_but_seeds_view_from_target_meta` | 决策 5（`turns` 不归零 / `TurnStats` 重新播种） | 断言 `Envelope.turn` 续号、view 取自目标 meta |
@@ -166,6 +194,8 @@ apps/coding-agent/
   浮层「立刻弹」，需独立的列表服务任务 —— 本轮不做。
 - **`SessionMeta` 无 cwd 字段** ⇒ 不同项目的会话混在一个列表里（pi/Codewhale 都有 workspace 分组）。
   本需求的 picker 把它变成**用户可见问题**，建议单独立项。
+- **会话修复不做备份**：需要工具修复时会按现有原子重写流程移除无法解析的坏行；摘要给出数量，但不生成
+  `.bak`。若后续需要取证，应独立设计归档副本，避免 resume 路径隐式堆积文件。
 - **多进程并发写同一文件无锁**（`session-default-new` 既有缺口）：切到「另一进程正在写的会话」有整文件
   重写丢更新的风险。
 - **有界回放**：待实测（I7 首帧指标 + 100 ms 阈值）；当前实测远低于阈值，预案不触发。
@@ -183,14 +213,12 @@ apps/coding-agent/
 
 ## 全量回归现状
 
-`cargo test --workspace` = **1065 passed / 2 failed / 7 ignored**（`ignored` 为 `#[ignore]` 测试属性计数：
-`harvest.rs` ×4 + `e2e_tools` / `e2e_skills` 各 1 + 本特性新增的 N13 基准 1；另有两个 `#[ignore]` 文档测试，
-不计入这 7）。
-
-**两条失败全部**在 `crates/ys-tui-coding/src/draw.rs` 的 `draw::tests::*`
-（`test_chat_has_one_row_gap_before_input`、`test_scroll_uses_wrapped_rows_not_transcript_entries`），
-系**另一会话在途的 TUI 布局重构**（其 diff 重写了那两个测试与几何推导），**与本次变更无关**。
-本特性自身新增的用例全绿。
+2026-10-19 实测 `cargo test --workspace` **全绿**。本次恢复韧性新增单测覆盖：会话摘要文案、
+运行期修复摘要与一次性消费、启动提示合并。既有 `/resume` 出站顺序用例同时扩为真实悬空工具调用，
+断言合成结果进入回放历史且摘要随 `Output` 抵达。
+`cargo clippy -p ys-session -p ys-model-openai-compat --all-targets --no-deps -- -D warnings`
+通过；全 workspace clippy 仍受基线既有的 `ys-protocol` / coding-agent lint 阻塞，本次未顺手修改
+范围外代码。
 
 ## 参考
 

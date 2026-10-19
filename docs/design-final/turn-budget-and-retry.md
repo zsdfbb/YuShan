@@ -29,7 +29,10 @@ apps/coding-agent/src/prompt.rs     guideline「多轮工具任务每批前一�
 
 **③ 空响应重试只对合法空回复生效。** 触发条件**全部**满足：`text.trim().is_empty()` + `finish_reason == Stop` + `RunLimits::retry_empty_response` + 本回合尚未重试。动作：append 一条固定催促消息 + `continue`（消耗一个轮 ⇒ 自动受 `max_rounds` 与轮边界 abort 约束）。仍空才判 `NoOutput`。`retry_empty_response = false` ⇒ 与第一批**逐字节一致**。注意：**`NoOutput` 的判定本身仍只看 `trim()`、不看 `finish_reason`** —— 第二批只给「是否重试」加闸，不改变第一批判定。
 
-**④ 过程叙述 guideline 仅工作型工具在场时出现。** `read`/`grep`/`find`/`ls`/`bash`/`edit`/`write` 任一 ⇒ 加一句（一句话，不是一段）；空工具表 / 纯检索类不加。它进 `fixed_prompt_tokens`（system prompt 缓存前缀）。
+**④ 过程叙述 guideline 仅工作型工具在场时出现。** `read`/`grep`/`find`/`ls`/`bash`/`edit`/`write`
+任一 ⇒ 要求**每个工具批次前**写一句用户可见说明，里程碑后简述“已完成 / 下一步”，并明确不得暴露
+私有思维链；空工具表 / 纯检索类不加。它进 `fixed_prompt_tokens`（system prompt 缓存前缀）。
+`narration_guideline_appears_only_with_working_tools` 同时钉住文案、门控与反向缺席断言。
 
 ## 测试与验证
 

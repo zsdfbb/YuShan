@@ -334,8 +334,8 @@ fn request_omits_max_tokens_so_provider_uses_its_own_limit() {
 }
 
 /// 2. env-var 配置＋对 `stream_options` 返回 400 的 mock：
-///    剥掉该字段重试一次后成功；有回退警告；第二次请求不含 `stream_options`；
-///    本次 `RunFinished.usage` 为 0。
+///    剥掉该字段重试一次后成功；回退警告进入日志文件而非 stderr；
+///    第二次请求不含 `stream_options`；本次 `RunFinished.usage` 为 0。
 #[test]
 fn endpoint_rejecting_stream_options_falls_back_once() {
     let server = MockServer::start(MockConfig {
@@ -365,10 +365,16 @@ fn endpoint_rejecting_stream_options_falls_back_once() {
     );
     assert_eq!(finished["usage"]["output_tokens"], 0);
 
-    // stderr 有明确的回退警告（含 stream_options 与 400）。
+    // 回退警告只进日志文件，不能污染 TUI/JSON 模式的终端输出。
+    let log =
+        std::fs::read_to_string(home.join(".yushan/logs/yushan.log")).expect("应写入 yushan.log");
     assert!(
-        stderr.contains("stream_options") && stderr.contains("400"),
-        "stderr 应含回退警告\nstderr:\n{stderr}"
+        log.contains("stream_options") && log.contains("400"),
+        "日志应含回退警告\nlog:\n{log}"
+    );
+    assert!(
+        !stderr.contains("rejected `stream_options.include_usage`"),
+        "回退警告不得直接写 stderr\nstderr:\n{stderr}"
     );
 
     // 恰好两次请求：首次带 stream_options（400），重试不带。

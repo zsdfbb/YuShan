@@ -91,7 +91,6 @@ pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogue
     if let Some(s) = skills_block {
         segments.push(s);
     }
-
     segments.join("\n\n")
 }
 
@@ -261,8 +260,10 @@ fn tool_guidelines(tools: &[&str]) -> String {
         )
     }) {
         guidelines.push(
-            "For multi-step tool work, briefly say what you are about to do before a batch of \
-             tool calls (one short sentence, not a paragraph)"
+            "Before every batch of tool calls in multi-step work, write one concise user-facing \
+             sentence explaining what you are about to do. After a meaningful milestone, briefly \
+             state what was completed and what comes next. Keep updates to one sentence; do not \
+             expose private chain-of-thought"
                 .to_string(),
         );
     }
@@ -773,7 +774,8 @@ mod tests {
         let _guard = env_lock();
         let _env = no_global_prompt();
 
-        let sentence = "- For multi-step tool work, briefly say what you are about to do before";
+        let sentence =
+            "- Before every batch of tool calls in multi-step work, write one concise user-facing";
 
         let with_read = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
         assert!(
@@ -781,8 +783,18 @@ mod tests {
             "含 read 时应给「过程叙述」指引；prompt = {with_read}"
         );
         assert!(
-            with_read.contains("one short sentence, not a paragraph"),
+            with_read.contains("Keep updates to one sentence"),
             "指引应限定「一句话」；prompt = {with_read}"
+        );
+        assert!(
+            with_read.contains(
+                "Before every batch of tool calls in multi-step work, write one concise user-facing sentence"
+            ),
+            "工作过程 guideline 必须给出强制的批次前说明；prompt = {with_read}"
+        );
+        assert!(
+            with_read.contains("what was completed and what comes next"),
+            "工作过程 guideline 必须要求里程碑后说明进展；prompt = {with_read}"
         );
 
         let with_bash = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
@@ -795,6 +807,16 @@ mod tests {
         assert!(
             !no_tools.contains("multi-step tool work"),
             "空工具表时不得出现该指引；prompt = {no_tools}"
+        );
+        assert!(
+            !no_tools.contains("Before every batch of tool calls"),
+            "空工具表时不得出现工作过程要求；prompt = {no_tools}"
+        );
+
+        let web_only = build_system_prompt(Path::new("/tmp"), &[spec("websearch")], &no_skills());
+        assert!(
+            !web_only.contains("Before every batch of tool calls"),
+            "纯检索工具表不得出现工作型进展要求；prompt = {web_only}"
         );
     }
 

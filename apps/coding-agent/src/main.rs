@@ -1135,6 +1135,24 @@ fn with_resume_hint(hint: Option<String>, triggered: bool) -> Option<String> {
     })
 }
 
+/// 把打开会话时产生的一次性修复摘要追加到启动期提示末尾。
+///
+/// 与 [`with_resume_hint`] 同规：原提示逐字保留在前，空摘要不产生空行。调用点必须
+/// 在 `SessionResumed` 回放之后投递这条提示，否则 UI 的回放清屏会把它吃掉。
+fn with_session_recovery_hint(
+    hint: Option<String>,
+    recovery: Option<ys_session::SessionRecovery>,
+) -> Option<String> {
+    let Some(recovery) = recovery else {
+        return hint;
+    };
+    let notice = capabilities::session_recovery_notice(recovery);
+    Some(match hint {
+        Some(h) => format!("{h}\n{notice}"),
+        None => notice,
+    })
+}
+
 /// `-p` / `--json` 的 task 展开：与 TUI 的 `Request::Prompt` 走**同一套**逻辑
 /// （`skills::expand_invocation`），三模式行为一致（设计 §关键数据流）。
 fn expand_task(task: String, skill_entries: &[skills::SkillEntry]) -> String {
@@ -2024,7 +2042,7 @@ fn run_interactive(
     // 2.【阻塞】会话 + model 构造 —— 失败会提前返回（此刻 turn 恒 0 也无所谓）。
     //    有 resume 路径 ⇒ 恢复它；否则默认新会话（惰性落盘）。
     let model = config.build_model();
-    let wiring = rt.block_on(async {
+    let mut wiring = rt.block_on(async {
         match resume_path.as_deref() {
             Some(path) => {
                 Wiring::resume(model, Box::new(sink), sessions_dir, path.to_path_buf()).await
@@ -2032,6 +2050,7 @@ fn run_interactive(
             None => Wiring::persistent_new(model, Box::new(sink), sessions_dir).await,
         }
     })?;
+    let startup_hint = with_session_recovery_hint(startup_hint, wiring.take_recovery());
 
     // 会话路径快照：UI 退出后打印 `session: <id>` 用。启动态在此播种（此刻只有
     // 这里知道 `persistent_new` 算出的文件名），`/new` 之后由 app 循环刷新。
@@ -2653,6 +2672,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })?;
+            if let Some(recovery) = wiring.take_recovery() {
+                eprintln!("{}", capabilities::session_recovery_notice(recovery));
+            }
             let debug_session_id = session_id_for(wiring.session_path());
             let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
             if let Some(sink) = debug.as_mut() {
@@ -2735,6 +2757,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })?;
+            if let Some(recovery) = wiring.take_recovery() {
+                eprintln!("{}", capabilities::session_recovery_notice(recovery));
+            }
             let debug_session_id = session_id_for(wiring.session_path());
             let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
             if let Some(sink) = debug.as_mut() {
@@ -4270,6 +4295,25 @@ mod tests {
             with_resume_hint(Some("原有提示".into()), false).as_deref(),
             Some("原有提示"),
             "未触发必须原样返回，不得追加"
+        );
+    }
+
+    #[test]
+    fn with_session_recovery_hint_preserves_existing_hint_and_skips_empty() {
+        let recovery = ys_session::SessionRecovery {
+            repaired_tool_calls: 1,
+            skipped_lines: 2,
+        };
+        let merged = with_session_recovery_hint(Some("原有提示".into()), Some(recovery))
+            .expect("修复摘要应形成提示");
+        assert!(merged.starts_with("原有提示\nSession recovery:"));
+        assert!(merged.contains("1 interrupted tool call"));
+        assert!(merged.contains("2 corrupt session lines"));
+
+        assert_eq!(
+            with_session_recovery_hint(Some("原有提示".into()), None).as_deref(),
+            Some("原有提示"),
+            "无修复任务时必须原样返回"
         );
     }
 

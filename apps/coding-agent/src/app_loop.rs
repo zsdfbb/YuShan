@@ -2921,7 +2921,15 @@ mod tests {
         let mut h = spawn_resumable(0).await;
         let mut meta = ys_session::SessionMeta::new(0);
         meta.title = Some("目标会话".into());
-        write_target_session(&h, "target-1", &meta, &[user_message("hello")]);
+        let dangling = Message {
+            role: ys_core::Role::Assistant,
+            content: vec![ys_core::ContentBlock::ToolUse {
+                id: ToolCallId("call-1".into()),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            }],
+        };
+        write_target_session(&h, "target-1", &meta, &[user_message("hello"), dangling]);
 
         h.requests
             .send(Request::ResumeSession {
@@ -2942,13 +2950,23 @@ mod tests {
                 assert_eq!(summary.id, "target-1");
                 assert_eq!(summary.title, "目标会话");
                 assert!(!*thinking_visible, "目标 meta 未开 thinking");
-                assert_eq!(history.len(), 1, "应带目标历史");
+                assert_eq!(history.len(), 3, "应带目标历史与合成结果");
+                assert!(matches!(
+                    &history[2].content[..],
+                    [ys_core::ContentBlock::ToolResult {
+                        tool_call_id,
+                        is_error: true,
+                        ..
+                    }] if tool_call_id == &ToolCallId("call-1".into())
+                ));
             }
             other => panic!("第一条出站必须是 SessionResumed（I2）：{other:?}"),
         }
         assert!(
-            matches!(&msgs[1], Outbound::Output(t) if t.contains("Resumed session")),
-            "第二条应为成功提示 Output：{msgs:?}"
+            matches!(&msgs[1], Outbound::Output(t)
+                if t.contains("Resumed session")
+                    && t.contains("1 interrupted tool call")),
+            "第二条应为成功提示 + 修复摘要 Output：{msgs:?}"
         );
     }
 

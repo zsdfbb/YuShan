@@ -21,7 +21,9 @@ use ys_event::EventSink;
 use ys_model::Model;
 use ys_protocol::BoundarySource;
 use ys_runtime::AgentPorts;
-use ys_session::{JsonlSession, MemorySession, Session, SessionError, SessionMeta};
+use ys_session::{
+    JsonlSession, MemorySession, Session, SessionError, SessionMeta, SessionRecovery,
+};
 // `Session` trait 需在作用域内才能对 `Box<dyn Session>` 调方法。
 use ys_session::Message;
 
@@ -211,6 +213,14 @@ impl Wiring {
     /// 当前会话元数据（`None` = 尚无首行 meta）。
     pub fn meta(&self) -> Option<&SessionMeta> {
         self.session.meta()
+    }
+
+    /// 取走当前会话打开时产生的一次性修复摘要。
+    ///
+    /// 消费者必须在会话内容展示给用户之前调用：`JsonlSession::open` 已把中断的
+    /// 工具调用补成错误结果并落盘，但用户仍需知道历史被自动修复过。
+    pub fn take_recovery(&mut self) -> Option<SessionRecovery> {
+        self.session.take_recovery()
     }
 
     /// 就地修改 meta 并落盘。
@@ -547,11 +557,7 @@ mod tests {
         assert!(meta.thinking_visible);
         assert_eq!(meta.turns, 3);
         assert_eq!(w.session_messages().len(), 1, "应读回目标历史");
-        assert_eq!(
-            w.sessions_dir_path(),
-            Some(dir.as_path()),
-            "恢复不换目录"
-        );
+        assert_eq!(w.sessions_dir_path(), Some(dir.as_path()), "恢复不换目录");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

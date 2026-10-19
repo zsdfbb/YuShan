@@ -13,11 +13,36 @@ pub use ys_core::Message;
 
 use async_trait::async_trait;
 
+/// 打开既有会话时执行的一次性修复记录。
+///
+/// 会话实现可把修复结果暂存到自身，由接线器通过 [`Session::take_recovery`]
+/// 取走；`take` 语义保证同一结果只被消费一次。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionRecovery {
+    /// 为中断的 `ToolUse` 合成的 `ToolResult` 数量。
+    pub repaired_tool_calls: usize,
+    /// 读取时跳过、无法判别为 `Message` 或 `SessionMeta` 的行数。
+    pub skipped_lines: usize,
+}
+
+impl SessionRecovery {
+    pub fn is_empty(&self) -> bool {
+        self.repaired_tool_calls == 0 && self.skipped_lines == 0
+    }
+}
+
 /// Session trait —— 消息历史管理
 #[async_trait]
 pub trait Session: Send {
     /// 获取 session 中的所有消息
     fn messages(&self) -> &[Message];
+
+    /// 取走打开会话时产生的修复记录。
+    ///
+    /// 默认实现返回 `None`：不持久化、也不需要修复的会话无需关心本能力。
+    fn take_recovery(&mut self) -> Option<SessionRecovery> {
+        None
+    }
 
     /// 会话级元数据；不支持的实现返回 `None`（默认实现让 `MemorySession` 零改动）。
     fn meta(&self) -> Option<&SessionMeta> {

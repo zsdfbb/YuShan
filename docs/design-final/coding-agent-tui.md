@@ -588,6 +588,9 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 - **有界退避**（`backoff_delay` / `backoff_delay_with_fraction`）：指数 + 抖动，**先抖后夹**到 `max_delay_ms`（绝对上界）；`429` 的 `Retry-After` / `Retry-After-ms` 被尊重，但**超过 `max_delay_ms` 硬上限即放弃**（不取「与上界取 max」）。
 - **`DeltaWatchingSink`**：只看 `TextDelta` / `ThinkingDelta`；一旦吐出即 `.emitted = true`，其后失败**直接上报、不重试**（重放会把已渲染文本再渲染一遍 —— `-p` 直写 stdout 无法撤回）。
 - **重试日志**经注入的 `ModelLogger` 回调（生产接 `crate::logging::log`）：进入退避前落 `retry attempt k/n delay=…ms reason=…`，放弃时另落一行。**重试日志只经该回调落，不经 stdout / stderr**（TUI 起屏后直写会冲掉整屏）；重试**对 TUI 不可见、对排障可见**。
+- **stream_options 兼容回退**只在 400 响应体**明确**把 `stream_options` 归为不支持 / 未知时触发；
+  普通 400（包括 tool call 配对错误）原样失败、不额外重发。回退 warning 走同一 `ModelLogger`，
+  不得直写 stderr；非法 tool-call 参数 JSON 的降级 warning 同样走 logger。
 - **超时**：连接建立经 `build_client` 的 `.connect_timeout(connect_secs)`；**流空闲超时**落 `stream.rs` 的 `parse_sse_stream` —— `tokio::time::timeout(idle, stream.next())` 包住每次字节读取，超时错误带 `IDLE_TIMEOUT_MARKER`（`classify_stream_error` 据此归为可重试）。黑洞端点「接受连接但不应答」否则会让 `complete` 永久挂起。
 
 ### 11.6 TUI 判别式（零 `ys-protocol` 改动）

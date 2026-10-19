@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use ys_core::EventError;
 use ys_model::{Model, ModelEvent, ModelEventSink, ModelRequest};
 use ys_model_openai_compat::{
-    ModelAttempt, ModelAttemptOutcome, ModelAttemptReason, OpenAICompatibleConfig,
-    ModelAttemptRetrySuppressed, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
+    ModelAttempt, ModelAttemptOutcome, ModelAttemptReason, ModelAttemptRetrySuppressed,
+    OpenAICompatibleConfig, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
     compat::ProviderCompat,
 };
 
@@ -578,8 +578,8 @@ async fn model_attempt_trace_retry_then_success() {
         ),
         Reply::Sse(full_sse()),
     ]);
-    let model = model_for(&server, fast_retry(2, 100), 30, None)
-        .with_trace(trace_listener(&traces));
+    let model =
+        model_for(&server, fast_retry(2, 100), 30, None).with_trace(trace_listener(&traces));
 
     model
         .complete(ModelRequest::default(), &mut NullSink)
@@ -623,8 +623,7 @@ async fn model_attempt_trace_marks_exhausted_retry() {
         vec![],
         "{\"error\":\"boom\"}",
     )]);
-    let model = model_for(&server, fast_retry(1, 10), 30, None)
-        .with_trace(trace_listener(&traces));
+    let model = model_for(&server, fast_retry(1, 10), 30, None).with_trace(trace_listener(&traces));
 
     model
         .complete(ModelRequest::default(), &mut NullSink)
@@ -653,6 +652,7 @@ async fn model_attempt_trace_marks_exhausted_retry() {
 #[tokio::test]
 async fn model_attempt_trace_marks_stream_options_fallback() {
     let traces = traces();
+    let logs = logs();
     let server = MockServer::start(vec![
         json_reply(
             "400 Bad Request",
@@ -677,6 +677,7 @@ async fn model_attempt_trace_marks_stream_options_fallback() {
             idle_secs: 30,
         })
         .with_trace(trace_listener(&traces));
+    let model = model.with_logger(log_listener(&logs));
 
     model
         .complete(ModelRequest::default(), &mut NullSink)
@@ -690,6 +691,81 @@ async fn model_attempt_trace_marks_stream_options_fallback() {
     assert_eq!(records[0].http_status, Some(200));
     assert_eq!(records[0].outcome, ModelAttemptOutcome::Success);
     assert_eq!(server.request_count(), 2);
+    let logs = logs.lock().unwrap().clone();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("rejected `stream_options.include_usage`")),
+        "fallback warning 必须进入 logger，不能写 stderr：{logs:?}"
+    );
+}
+
+/// 普通 400 不是兼容性信号：tool call 配对错误必须原样失败，不能剥参数重发。
+///
+/// 变异：把 fallback 条件退回“任意 400 + stream_options 存在” ⇒ request_count 变 2。
+#[tokio::test]
+async fn unrelated_bad_request_does_not_trigger_stream_options_fallback() {
+    let server = MockServer::start(vec![json_reply(
+        "400 Bad Request",
+        vec![],
+        "{\"error\":{\"message\":\"An assistant message with tool_calls must be followed by tool messages\"}}",
+    )]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let error = model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect_err("tool call 配对错误必须失败");
+
+    assert_eq!(server.request_count(), 1, "普通 400 不得内部重发");
+    assert!(
+        error.to_string().contains("tool_calls must be followed"),
+        "应保留 provider 原始错误正文：{error}"
+    );
+}
+
+/// 非法工具参数 JSON 是运行期诊断：必须进入 logger，仍按设计降级为 null。
+///
+/// 变异：改回 `eprintln!` ⇒ logger 为空且 TUI 会被污染。
+#[tokio::test]
+async fn invalid_tool_arguments_warning_uses_logger() {
+    let logs = logs();
+    let server = MockServer::start(vec![Reply::Sse(
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{bad\"}}]}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n"
+            .to_vec(),
+    )]);
+    let model = model_for(&server, fast_retry(0, 10), 30, Some(&logs));
+
+    let response = model
+        .complete(ModelRequest::default(), &mut NullSink)
+        .await
+        .expect("非法参数应降级而不是失败");
+
+    let ys_core::ContentBlock::ToolUse { arguments, .. } = &response.message.content[0] else {
+        panic!("应产出 ToolUse");
+    };
+    assert_eq!(arguments, &serde_json::Value::Null);
+    let logs = logs.lock().unwrap().clone();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("tool_call arguments for `read` are not valid JSON")),
+        "工具参数修复 warning 必须进入 logger：{logs:?}"
+    );
+}
+
+/// 适配器生产源不得绕过 logger 直写终端。
+///
+/// `concat!` 拼针脚，避免测试源码自身命中扫描。
+#[test]
+fn production_source_has_no_direct_terminal_prints() {
+    let source = include_str!("../src/lib.rs");
+    for needle in [concat!("eprint", "ln!"), concat!("print", "ln!")] {
+        assert!(
+            !source.contains(needle),
+            "适配器不得直接打印 `{needle}`：TUI 起屏后会污染输入区"
+        );
+    }
 }
 
 /// 10. **默认值被钉住**：生产接线落地前，这两组默认值**就是实际生效值**，

@@ -128,3 +128,4 @@ AgentEvent::{ModelTextDelta / ToolCall / RunFinished …}   →  app.apply_event
 
 - `arch-design` 的多方案对比在本需求上收益有限（单点小改），未启用。
 - 若要进一步做「按块类型分别配间距」（如 tool 行前后也留白），再回到 `arch-design` 做方案对比。
+  —— **已落地**：见 `docs/arch/tui-action-blocks/context.md`（行动块缩进降色 + 块边界留白）。

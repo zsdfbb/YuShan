@@ -51,9 +51,29 @@ const INPUT_GAP_ROWS: u16 = 1;
 /// 一眼看得到「这一轮从哪开始」。与 [`INPUT_GAP_ROWS`] 正交：那个在 transcript **外部**
 /// （Chat 内区底 → Input 顶边框），只保证末行不贴输入框，管不到问答边界。
 ///
-/// 只有 `User` 之前留白 —— assistant / tool / summary 之间保持紧密，一屏能看更多内容。
-/// 空行同样不添视觉噪音、拷贝不留痕（同 [`INPUT_GAP_ROWS`] 的取向）。
+/// 与 [`BLOCK_GAP_ROWS`] 正交：那条管「**块类型**之间」（行动块 / 正文块），
+/// 本条管「**问答**之间」。两条规则叠加（同一处可能各留一次）。
 const USER_GAP_ROWS: usize = 2;
+/// 条目「类别」变化时保留的**空白行数** —— transcript **内部**的块边界。
+///
+/// 「类别」见 [`LineClass`]：用户提问 / 行动块（思考 + 工具）/ 正文块（assistant 文本）。
+/// 类变了 ⇒ 插一行空白，让「过程」与「产物」在扫视时分得开。
+///
+/// 与 [`USER_GAP_ROWS`] 正交（那条按**条目类型**、这条按**块类别**）——
+/// 「思考 → 工具」同类不留白（一串工具调用是同一个行动块，切碎它反而更难读），
+/// 「工具 → 正文」类变了则留白。
+const BLOCK_GAP_ROWS: usize = 1;
+/// 行动块（思考 + 工具）整体的**缩进格数**。
+///
+/// 缩进把「过程」推到正文之下，配合降色，使「模型在做什么」与「模型说了什么」可分。
+/// **不依赖任何特殊字形** —— 字体缺某个符号时缩进照样成立（对比 `⌁` U+2301 的低覆盖率）。
+///
+/// 用**空格**而非制表符：制表宽度随终端设置变化，同一份内容在不同终端下会错位。
+const ACTION_INDENT: usize = 2;
+/// 行动块**内部**再缩进的格数（工具行相对思考行）。
+///
+/// 层次：思考（[`ACTION_INDENT`]）⊂ 工具（[`ACTION_INDENT`] + [`ACTION_TOOL_INDENT`]）。
+const ACTION_TOOL_INDENT: usize = 2;
 /// 窗口小于此尺寸直接不渲染（留给「终端太小」）。
 const MIN_WIDTH: u16 = 10;
 const MIN_HEIGHT: u16 = 5;
@@ -560,13 +580,50 @@ fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // 「上一条的类别」与「已有可见行」共同决定本条之前的留白。
+    // 二者都由 `gap_rows` 统一算（两条渲染路径共用同一套规则）。
+    let mut prev_class: Option<LineClass> = None;
+    let mut has_visible = false;
     for (idx, item) in app.transcript.iter().enumerate() {
-        // 先算再借：`user_gap_rows` 要读 `lines` 的当前长度，而紧接着要可变借它。
-        let gap = user_gap_rows(item, !lines.is_empty());
+        let gap = gap_rows(item, prev_class, has_visible, thinking_visible);
+        // 先算再借：`gap_rows` 要读 `lines` 的当前长度，而紧接着要可变借它。
         lines.extend((0..gap).map(|_| Line::from("")));
         push_transcript_line(&mut lines, item, width, thinking_visible, app, idx, now);
+        // 不可见的条目（隐藏的思考、空 assistant）不推进状态 ——
+        // 它们在屏上不存在，不该切块边界。
+        if is_visible(item, thinking_visible) {
+            has_visible = true;
+            prev_class = Some(LineClass::of(item));
+        }
     }
     Text::from(lines)
+}
+
+/// 本条之前的**留白行数**（问答边界 + 块边界之和）。
+///
+/// 两条留白规则**正交**、各自独立：
+/// - [`user_gap_rows`]：按**条目类型**（`User` 之前留 [`USER_GAP_ROWS`] 行）
+/// - [`block_gap_rows`]：按**块类别**（类变了留 [`BLOCK_GAP_ROWS`] 行）
+///
+/// 两者可叠加（「用户提问」紧接「正文」时 = 2 + 1 行）。这是有意的：一个是**问答**边界，
+/// 一个是**块类型**边界，语义不同、视觉上叠加才完整。
+///
+/// **本条自己不可见时（隐藏的思考、空 assistant）取 0** —— 它不产出行，
+/// 在它之前留白会留下**孤立空行**（无人消费的空白）。且它**不推进**「上一条类别」，
+/// 故它后面的条目仍按**前一个可见条目**算边界。
+///
+/// 只返回**计数**、不代插入（两条渲染路径的目标容器不同：TUI 是 `Vec<Line>`、
+/// 退出回放是 `Vec<String>`）。
+fn gap_rows(
+    item: &TranscriptLine,
+    prev_class: Option<LineClass>,
+    has_visible_before: bool,
+    thinking_visible: bool,
+) -> usize {
+    if !is_visible(item, thinking_visible) {
+        return 0;
+    }
+    user_gap_rows(item, has_visible_before) + block_gap_rows(item, prev_class, has_visible_before)
 }
 
 /// `User` 条目之前应插入的空白行数 —— 见 [`USER_GAP_ROWS`]。
@@ -584,6 +641,93 @@ fn user_gap_rows(item: &TranscriptLine, has_visible_before: bool) -> usize {
         USER_GAP_ROWS
     } else {
         0
+    }
+}
+
+/// transcript 条目的**块类别** —— 决定缩进、降色与块边界留白。
+///
+/// 三类：
+/// - [`LineClass::Prompt`]：用户提问
+/// - [`LineClass::Action`]：**行动块** = 模型思考 + 工具调用（模型的「过程」）
+/// - [`LineClass::Content`]：正文块 = assistant 文本（模型的「产物」）
+///
+/// 「思考」与「工具」同属 `Action` —— 它们是同一件事的两面（想 → 做），
+/// 拆成两类会在中间插空白，把一串工具调用切碎。两者在块**内部**的层次差
+/// 由 [`ACTION_INDENT`] / [`ACTION_TOOL_INDENT`] 表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineClass {
+    Prompt,
+    Action,
+    Content,
+}
+
+impl LineClass {
+    /// 条目 → 类别。
+    ///
+    /// `Summary` / `Error` / `System` 归 [`LineClass::Content`] —— 它们是模型的
+    /// **产物或提示**，与 assistant 文本同属「内容」一侧，不该带行动块的缩进。
+    fn of(item: &TranscriptLine) -> Self {
+        match item {
+            TranscriptLine::User(_) => Self::Prompt,
+            TranscriptLine::Thinking(_) | TranscriptLine::Tool { .. } => Self::Action,
+            TranscriptLine::Assistant(_)
+            | TranscriptLine::Summary { .. }
+            | TranscriptLine::Error(_)
+            | TranscriptLine::System(_) => Self::Content,
+        }
+    }
+
+    /// 行动块的**缩进格数**。
+    ///
+    /// 行动块内再分两级：思考 [`ACTION_INDENT`]、工具 [`ACTION_INDENT`] + [`ACTION_TOOL_INDENT`]。
+    fn indent(self, item: &TranscriptLine) -> usize {
+        match (self, item) {
+            (Self::Action, TranscriptLine::Tool { .. }) => ACTION_INDENT + ACTION_TOOL_INDENT,
+            (Self::Action, _) => ACTION_INDENT,
+            _ => 0,
+        }
+    }
+}
+
+/// 本条目是否产出**可见行** —— 留白规则的可见性判据。
+///
+/// 两条渲染路径（TUI / 退出回放）**共用**本判据 ⇒ 留白在两边必然一致。
+/// 不看「实际产出了几行」而看「内容是否可见」：回放路径的 assistant 走 raw
+/// `split('\n')`，空串会产出 1 个空行；而 TUI 路径的 `md::render("")` 产出 0 行。
+/// 若用「产出行数」当判据，两条路径会在**空 assistant** 之后给出不同的留白。
+///
+/// 不可见的条目**不推进**「上一条类别」—— 它在屏上不存在，不该切块边界。
+fn is_visible(item: &TranscriptLine, thinking_visible: bool) -> bool {
+    match item {
+        TranscriptLine::Thinking(s) => thinking_visible && !s.is_empty(),
+        TranscriptLine::Assistant(s) => !s.is_empty(),
+        _ => true,
+    }
+}
+
+/// 块类别变化时插入的空白行数 —— 见 [`BLOCK_GAP_ROWS`]。
+///
+/// **除了**「该条目之前尚无任何可见行」时取 `0`（顶部凭空多行）。
+/// 判据与 [`user_gap_rows`] 同源（以「已有可见行」为准，而非下标 > 0）——
+/// `/thinking off` 时首条 `Thinking` 不产出行，按下标会把紧接的首条误判成非首条。
+///
+/// 「上一条的类别」= **上一条可见条目**的类别：不可见的条目（隐藏的思考、空 assistant）
+/// 不推进它 —— 它们在屏上不存在，切块边界没有意义。
+fn block_gap_rows(
+    item: &TranscriptLine,
+    prev: Option<LineClass>,
+    has_visible_before: bool,
+) -> usize {
+    if !has_visible_before {
+        return 0;
+    }
+    let Some(prev) = prev else {
+        return 0;
+    };
+    if LineClass::of(item) == prev {
+        0
+    } else {
+        BLOCK_GAP_ROWS
     }
 }
 
@@ -647,8 +791,15 @@ fn push_non_assistant(
             let style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
+            // 缩进由 `LineClass` 决定（唯一真相源）—— 思考与工具同属行动块，
+            // 但工具在块内**多缩进**一级（层次：想 ⊂ 做）。
+            let indent = " ".repeat(LineClass::of(item).indent(item));
             for (i, part) in s.split('\n').enumerate() {
-                let prefix = if i == 0 { "⌁ " } else { "  " };
+                let prefix = if i == 0 {
+                    format!("{indent}⌁ ")
+                } else {
+                    format!("{indent}  ")
+                };
                 out.push(Line::from(vec![
                     Span::styled(prefix, style),
                     Span::styled(part.to_string(), style),
@@ -667,9 +818,14 @@ fn push_non_assistant(
             } else {
                 ("✗", Style::default().fg(Color::Red))
             };
+            // 行动块整体降色（暗灰）：与顶格的 assistant 正文拉开视觉重量。
+            // 标记 `✓` / `✗` 保留自己的绿 / 红 —— 那是**语义**信号（成功与否），
+            // 不属于「行动」的类别色。
+            let action_style = Style::default().fg(Color::DarkGray);
+            let indent = " ".repeat(LineClass::of(item).indent(item));
             out.push(Line::from(vec![
-                Span::raw(format!("  ⏺ {name} ")),
-                Span::raw(summary.clone()),
+                Span::styled(format!("{indent}⏺ {name} "), action_style),
+                Span::styled(summary.clone(), action_style),
                 Span::raw("   "),
                 Span::styled(mark, mark_style),
             ]));
@@ -678,7 +834,7 @@ fn push_non_assistant(
                 let first = body.lines().next().unwrap_or("");
                 let budget = width.saturating_sub(6).max(1);
                 out.push(Line::from(Span::styled(
-                    format!("    └ {}", truncate_to_width(first, budget)),
+                    format!("{indent}  └ {}", truncate_to_width(first, budget)),
                     Style::default().fg(Color::Red),
                 )));
             }
@@ -737,22 +893,32 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
 pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
+    // 与 TUI 路径（`build_text_with`）**同一套**留白规则：同一个 `gap_rows`。
+    // `prev_class` / `has_visible` 的推进方式也一致（“本条是否产出行”）。
+    let mut prev_class: Option<LineClass> = None;
+    let mut has_visible = false;
     for item in &app.transcript {
-        let has_visible_before = !out.is_empty();
+        let gap = gap_rows(item, prev_class, has_visible, app.thinking_visible);
         if let TranscriptLine::Assistant(s) = item {
+            // assistant 走 raw 路径（`\n` 原样切行、不经 md 渲染）——
+            // 与 TUI 内不同形，这是**有意**的（退出后主屏留原始 markdown 源）。
+            // 但留白与缩进仍与 TUI 一致，故**先**落留白行、再落内容。
+            out.extend(std::iter::repeat_n(String::new(), gap));
             out.extend(s.split('\n').map(str::to_string));
-            continue;
+        } else {
+            // 问答边界与块边界均与 TUI 内一致：空白行必须在 `wrap_plain` **之前**落到 `out` 上
+            // （空行经 wrap 仍是 1 行空串，但顺序必须是「先空行、后内容」）。
+            out.extend(std::iter::repeat_n(String::new(), gap));
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            push_non_assistant(&mut lines, item, width, app.thinking_visible);
+            for line in &lines {
+                out.extend(wrap_plain(&line.to_string(), width));
+            }
         }
-        // 问答边界与 TUI 内一致：空白行必须在 `wrap_plain` **之前**落到 `out` 上
-        // （空行经 wrap 仍是 1 行空串，但顺序必须是「先空行、后内容」）。
-        out.extend(std::iter::repeat_n(
-            String::new(),
-            user_gap_rows(item, has_visible_before),
-        ));
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        push_non_assistant(&mut lines, item, width, app.thinking_visible);
-        for line in &lines {
-            out.extend(wrap_plain(&line.to_string(), width));
+        // 与 TUI 路径**同一个**可见性判据 ⇒ 留白在两边必然一致。
+        if is_visible(item, app.thinking_visible) {
+            has_visible = true;
+            prev_class = Some(LineClass::of(item));
         }
     }
     if out.is_empty() {
@@ -1064,7 +1230,12 @@ mod tests {
         );
     }
 
-    /// 问答边界：每条**非首条可见** `User` 之前恒 [`USER_GAP_ROWS`] 行空白，首条不留白。
+    /// 留白契约：**问答边界**（`User` 之前）与**块边界**（类别变化时）**叠加**。
+    ///
+    /// - `q1`（首条可见）两条规则都不生效 ⇒ 0 行空白。
+    /// - `a1` 之前：`Content` → `Content`，类未变 ⇒ 0 行（块边界不生效）。
+    /// - `q2` 之前：`Content` → `Prompt`，类变了 ⇒ 块边界 1 行 + 问答边界 2 行 = **3 行**。
+    /// - `q3` 之前：`Prompt` → `Prompt`，类未变 ⇒ 只问答边界 2 行 = **2 行**。
     ///
     /// 相邻两条 `User`（回合中插话 / 排队回声）之间**同样留白** —— 规则统一为
     /// 「非首条可见即留」，不按「上一条是不是 User」特判。
@@ -1082,8 +1253,8 @@ mod tests {
         let lines = transcript_plain_lines(&app, 80);
         assert_eq!(
             lines,
-            vec!["> q1", "a1", "", "", "> q2", "", "", "> q3"],
-            "q1 首条不留白；q2 / q3 之前各 2 行空白"
+            vec!["> q1", "", "a1", "", "", "", "> q2", "", "", "> q3"],
+            "q1 首条不留白；q2 前 3 行（块边界 1 + 问答 2）；q3 前 2 行（同类，仅问答边界）"
         );
     }
 
@@ -1115,11 +1286,16 @@ mod tests {
         );
     }
 
-    /// 屏上形状（TUI 渲染路径，不只是 `build_text` 的数据）：第 2 条用户行上方真的空两行。
+    /// 屏上形状（TUI 渲染路径，不只是 `build_text` 的数据）：第 2 条用户行上方真的空 3 行。
+    ///
+    /// 3 = 块边界 1（`Content` → `Prompt`，类别变了）+ 问答边界 2（`User` 之前）。
+    /// 两条规则**叠加**，屏上必须看得见叠加后的总数。
     #[test]
     fn test_rendered_screen_shows_blank_rows_above_second_user_line() {
         const W: u16 = 40;
-        const H: u16 = 12;
+        // 内容高 7 行（`> q1` / 空 / `a1` / 空×3 / `> q2`）+ Chat 边框与底部留白
+        // ⇒ 内区需 ≥ 7 行，否则 `follow` 贴底会把 `> q1` 滚出视野。
+        const H: u16 = 16;
         let mut app = app_with(CodingView::for_test());
         app.transcript.push(TranscriptLine::User("q1".into()));
         app.transcript.push(TranscriptLine::Assistant("a1".into()));
@@ -1134,18 +1310,19 @@ mod tests {
             "首条贴顶不留白：{:?}",
             rows[inner.y as usize]
         );
-        // 从 `a1` 所在行往下数：紧邻两行必须空白，第三行才是新的用户行。
+        // 从 `a1` 所在行往下数：紧邻 3 行必须空白（块边界 + 问答边界），第 4 行才是新的用户行。
         let a1 = rows
             .iter()
             .position(|r| r.contains("a1"))
             .expect("assistant 行应可见");
-        for (i, row) in rows[a1 + 1..a1 + 1 + USER_GAP_ROWS].iter().enumerate() {
+        let gap = USER_GAP_ROWS + BLOCK_GAP_ROWS;
+        for (i, row) in rows[a1 + 1..a1 + 1 + gap].iter().enumerate() {
             assert!(row.trim().is_empty(), "第 {} 行空白被占：{row:?}", i + 1);
         }
         assert!(
-            rows[a1 + 1 + USER_GAP_ROWS].contains("> q2"),
-            "第 2 条用户行应在 2 行空白之后：{:?}",
-            rows[a1 + 1 + USER_GAP_ROWS]
+            rows[a1 + 1 + gap].contains("> q2"),
+            "第 2 条用户行应在 {gap} 行空白之后：{:?}",
+            rows[a1 + 1 + gap]
         );
     }
 
@@ -1185,6 +1362,155 @@ mod tests {
         assert!(
             !joined.contains("line2-should-not-show"),
             "只显示首行：{joined}"
+        );
+    }
+
+    /// 行动块（思考 + 工具）与正文块的**块边界**留白。
+    ///
+    /// 类别序列 `Prompt → Action → Action → Content` ⇒ 留白：
+    /// - `Prompt` 之后（→ `Action`）：类变了 ⇒ 1 行块边界
+    /// - `Action` → `Action`（思考 → 工具）：同类 ⇒ **0 行**（一串工具调用是同一行动块）
+    /// - `Action` → `Content`（工具 → 正文）：类变了 ⇒ 1 行块边界
+    ///
+    /// **变异**：`block_gap_rows` 恒返回 0（去掉块边界）⇒ 本用例红；
+    /// 把 `Thinking` 与 `Tool` 分成不同类（`Action` 拆两类）⇒ 思考与工具之间多出空行 ⇒ 本用例红。
+    #[test]
+    fn test_block_gap_only_between_different_classes() {
+        let mut app = app_with(CodingView::for_test());
+        // `for_test` 默认隐藏思考（ADR-0025）⇒ 本用例需显式开启，否则看不到思考行。
+        app.thinking_visible = true;
+        app.transcript.push(TranscriptLine::User("q1".into()));
+        app.transcript.push(TranscriptLine::Thinking("思考".into()));
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "read".into(),
+            summary: "src/x.rs".into(),
+            result: None,
+            success: true,
+        });
+        app.transcript.push(TranscriptLine::Assistant("a1".into()));
+
+        let lines = transcript_plain_lines(&app, 80);
+        // 思考与工具**之间无空行**（同一行动块）。
+        let think = lines
+            .iter()
+            .position(|l| l.contains("思考"))
+            .expect("思考行应可见");
+        let tool = lines
+            .iter()
+            .position(|l| l.contains("⏺ read"))
+            .expect("工具行应可见");
+        assert_eq!(tool, think + 1, "思考与工具同属行动块，不留白：{lines:?}");
+        // 工具与正文**之间**留 1 行块边界。
+        let body = lines
+            .iter()
+            .position(|l| l.contains("a1"))
+            .expect("正文行应可见");
+        assert_eq!(body, tool + 2, "工具 → 正文：1 行块边界：{lines:?}");
+    }
+
+    /// 行动块的**缩进**：思考缩进 2 格、工具缩进 4 格（层次：想 ⊂ 做）。
+    ///
+    /// 缩进用**空格**而非制表符 —— 制表宽度随终端设置变化。
+    ///
+    /// **变异**：`LineClass::indent` 恒返回 0（去掉缩进）⇒ 本用例红；
+    /// 工具缩进改成与思考相同（层次塌陷）⇒ 本用例红。
+    #[test]
+    fn test_action_block_indent_levels() {
+        let mut app = app_with(CodingView::for_test());
+        app.thinking_visible = true;
+        app.transcript.push(TranscriptLine::Thinking("思考".into()));
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "read".into(),
+            summary: "src/x.rs".into(),
+            result: None,
+            success: true,
+        });
+
+        let lines = transcript_plain_lines(&app, 80);
+        let think = &lines[0];
+        let tool = &lines[1];
+        assert!(
+            think.starts_with(&" ".repeat(ACTION_INDENT)),
+            "思考缩进 {ACTION_INDENT} 格：{think:?}"
+        );
+        assert!(
+            tool.starts_with(&" ".repeat(ACTION_INDENT + ACTION_TOOL_INDENT)),
+            "工具缩进 {} 格：{tool:?}",
+            ACTION_INDENT + ACTION_TOOL_INDENT
+        );
+        // 缩进用空格 —— 断言不含制表符。
+        assert!(
+            !think.contains('\t') && !tool.contains('\t'),
+            "缩进不得用制表符"
+        );
+    }
+
+    /// 两条渲染路径的**留白必须一致** —— 否则退出回放与 TUI 内形状不同。
+    ///
+    /// 退出回放（`transcript_plain_lines`）与 TUI（`build_text_with`）共用 `gap_rows`，
+    /// 本用例钉住二者**行数**相同（不比较内容：assistant 在回放走 raw、TUI 走 md 渲染，
+    /// 形状本就有意不同）。
+    ///
+    /// **变异**：只在一侧加块边界留白（两条路径分叉）⇒ 本用例红。
+    #[test]
+    fn test_both_render_paths_agree_on_gap_rows() {
+        let mut app = app_with(CodingView::for_test());
+        app.thinking_visible = true;
+        app.transcript.push(TranscriptLine::User("q1".into()));
+        app.transcript.push(TranscriptLine::Thinking("思考".into()));
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "read".into(),
+            summary: "src/x.rs".into(),
+            result: None,
+            success: true,
+        });
+        app.transcript.push(TranscriptLine::Assistant("a1".into()));
+        app.transcript.push(TranscriptLine::User("q2".into()));
+
+        let plain = transcript_plain_lines(&app, 80);
+        let tui = build_text_with(&app, 80, true, Instant::now());
+        // `build_text_with` 的行**已是** wrap 后的视觉行（`md::render` 内部折行完毕），
+        // 故直接取行数，**不得**再乘一次折行系数。
+        assert_eq!(
+            plain.len(),
+            tui.lines.len(),
+            "两条路径行数应一致：plain={} tui={}",
+            plain.len(),
+            tui.lines.len()
+        );
+    }
+
+    /// 隐藏的思考**不推进**块边界、也**不留下孤立空行** —— 它在屏上不存在。
+    ///
+    /// `/thinking off` 时 `Thinking` 不产出行：
+    /// - 若它仍推进「上一条类别」⇒ `User` →（隐藏思考）→ `Assistant` 被切成两块，多出空行；
+    /// - 若它自己之前仍插空白 ⇒ 留下**无人消费的孤立空行**。
+    ///
+    /// 正确形状：`> q1` / 空（块边界 1）/ `a1` —— `a1` 在**第 3 行**（下标 2）。
+    ///
+    /// **变异**：`is_visible` 对 `Thinking` 恒返回 true（不看 `thinking_visible`）⇒ 本用例红；
+    /// `gap_rows` 不对不可见条目返回 0（留白照插）⇒ 本用例红。
+    #[test]
+    fn test_hidden_thinking_does_not_shift_block_boundary() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("q1".into()));
+        app.transcript.push(TranscriptLine::Thinking("思考".into()));
+        app.transcript.push(TranscriptLine::Assistant("a1".into()));
+
+        let hidden = transcript_plain_lines(&app, 80);
+        assert!(
+            !hidden.iter().any(|l| l.contains("思考")),
+            "思考隐藏时不应产出：{hidden:?}"
+        );
+        // `User` →（隐藏）→ `Assistant`：assistant 与 user **不同类** ⇒ 恰好 1 行块边界。
+        // 隐藏的思考**不额外**制造第二个块边界，也**不**留下自己的空行。
+        assert_eq!(
+            hidden,
+            vec!["> q1", "", "a1"],
+            "隐藏思考不应留下孤立空行、也不应多切一块：{hidden:?}"
         );
     }
 
@@ -2147,7 +2473,10 @@ mod tests {
         });
         let joined = rows.join("\n");
         assert!(joined.contains("minimax/MiniMax-M3"), "{joined}");
-        assert!(!joined.contains("deepseek/deepseek-chat"), "未筛中的不该画：{joined}");
+        assert!(
+            !joined.contains("deepseek/deepseek-chat"),
+            "未筛中的不该画：{joined}"
+        );
         assert!(!joined.contains("opencode-go"), "未筛中的不该画：{joined}");
 
         let highlighted: Vec<&String> = rows

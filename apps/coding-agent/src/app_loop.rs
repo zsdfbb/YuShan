@@ -403,36 +403,54 @@ pub async fn run(
                 match capabilities::resolve_login_base(&config, &provider, api_base.as_deref()) {
                     Err(msg) => lines = msg,
                     Ok(base) => {
-                        let catalog = match ProviderRegistry::fetch_models(&base, &api_key).await {
-                            FetchModelsResult::Success(models) if !models.is_empty() => {
-                                Some(models)
+                        // Esc 可打断这次拉取：命令不过 `BasicLoop`，没人读 `Boundary`，
+                        // 不在这里 `select!` 一个取消口，就只剩「Ctrl-C 关整个进程」一条出路。
+                        // 取消 = **什么也不改**（与浮层里 Esc 的契约一致）。
+                        match cancel_on_abort(
+                            ProviderRegistry::fetch_models(&base, &api_key),
+                            &mut boundary_rx,
+                        )
+                        .await
+                        {
+                            None => {
+                                logging::log(&format!("login {base}: cancelled by user (Esc)"));
+                                lines = vec![
+                                    "Login cancelled. Nothing was changed.".to_string(),
+                                ];
                             }
-                            FetchModelsResult::Success(_) => {
-                                logging::log(&format!("login {base}: empty model list"));
-                                None
+                            Some(fetched) => {
+                                let catalog = match fetched {
+                                    FetchModelsResult::Success(models) if !models.is_empty() => {
+                                        Some(models)
+                                    }
+                                    FetchModelsResult::Success(_) => {
+                                        logging::log(&format!("login {base}: empty model list"));
+                                        None
+                                    }
+                                    FetchModelsResult::AuthError(e) => {
+                                        logging::log(&format!("login {base}: auth error: {e}"));
+                                        None
+                                    }
+                                    FetchModelsResult::NetworkError(e) => {
+                                        logging::log(&format!("login {base}: network error: {e}"));
+                                        None
+                                    }
+                                };
+                                lines = capabilities::login(
+                                    &mut config,
+                                    &mut wiring,
+                                    &state_store,
+                                    &provider,
+                                    &api_key,
+                                    api_base.as_deref(),
+                                    catalog.as_deref(),
+                                );
+                                if let Some(models) = catalog {
+                                    let mut cache = ModelCache::new();
+                                    cache.insert(base.trim_end_matches('/').to_string(), models);
+                                    config.registry.apply_model_cache(cache);
+                                }
                             }
-                            FetchModelsResult::AuthError(e) => {
-                                logging::log(&format!("login {base}: auth error: {e}"));
-                                None
-                            }
-                            FetchModelsResult::NetworkError(e) => {
-                                logging::log(&format!("login {base}: network error: {e}"));
-                                None
-                            }
-                        };
-                        lines = capabilities::login(
-                            &mut config,
-                            &mut wiring,
-                            &state_store,
-                            &provider,
-                            &api_key,
-                            api_base.as_deref(),
-                            catalog.as_deref(),
-                        );
-                        if let Some(models) = catalog {
-                            let mut cache = ModelCache::new();
-                            cache.insert(base.trim_end_matches('/').to_string(), models);
-                            config.registry.apply_model_cache(cache);
                         }
                     }
                 }
@@ -592,6 +610,41 @@ pub async fn run(
             session_started,
         );
         send_or_flush(&out_tx, Outbound::View(view), &mut debug, &stats, run_rounds).await?;
+    }
+}
+
+/// 命令内部的可取消等待 —— 把 `Esc` 的 `Boundary::Abort` 接到一条**不属于回合**的
+/// future 上。
+///
+/// # 为何需要
+///
+/// 命令请求不经过 `BasicLoop`，没有轮边界去读 `Boundary`。`/login` 却要在命令里做
+/// 一次网络往返（`/v1/models`，`fetch_models` 自带 5s 超时，TCP 挂起时更久）：
+/// 这段时间里 Esc 没人读，用户唯一的出路是 Ctrl-C 关掉整个进程。
+///
+/// # 语义
+///
+/// - 先完成的赢 —— `Some(fut 的结果)`，与不用本函数逐字等价；
+/// - `Abort` 先到 —— `None`，**future 被 drop**（请求真正取消），调用方必须
+///   遵守「取消不改任何状态」；
+/// - `Steer` 等与命令无关的边界消息直接丢弃：命令不是回合，没有轮边界可以装它；
+///   命令结束后下一回合的起点也会把它排空（`run_turn_once` 头部的排空），
+///   故丢弃不改变任何已有语义；
+/// - 边界信道关闭（UI 没了）—— 不再有取消入口，交 future 自己收场。
+async fn cancel_on_abort<F: std::future::Future>(
+    fut: F,
+    boundary_rx: &mut mpsc::Receiver<Boundary>,
+) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            msg = boundary_rx.recv() => match msg {
+                Some(Boundary::Abort) => return None,
+                Some(_) => continue,
+                None => return Some(fut.await),
+            },
+        }
     }
 }
 
@@ -1574,6 +1627,88 @@ mod tests {
     }
 
     // -------------------------------------------------------------------- 测试
+
+    /// `cancel_on_abort`：future 先完成 ⇒ `Some(结果)`，与不套本函数逐字等价
+    /// （命令正常收场不能被取消口影响）。
+    #[tokio::test]
+    async fn cancel_on_abort_passes_through_completed_future() {
+        let (_tx, mut rx) = mpsc::channel::<Boundary>(4);
+        assert_eq!(cancel_on_abort(async { 7 }, &mut rx).await, Some(7));
+    }
+
+    /// `Abort` 先到 ⇒ `None`：**永不完成的 future 也必须立刻返回**。
+    ///
+    /// 这正是 `/login` 挂住的场景：`fetch_models` 的请求没回来时，Esc 是唯一出口。
+    /// 变异：把 `Some(Boundary::Abort) => return None` 改成 `continue` ⇒ 本用例挂死。
+    #[tokio::test]
+    async fn cancel_on_abort_returns_none_when_abort_wins() {
+        let (tx, mut rx) = mpsc::channel::<Boundary>(4);
+        tx.send(Boundary::Abort).await.unwrap();
+        let out = cancel_on_abort(std::future::pending::<u32>(), &mut rx).await;
+        assert_eq!(out, None, "Abort 必须结束等待");
+    }
+
+    /// 取消 = **真的丢掉**那条 future（reqwest 的请求随之取消），
+    /// 不是丢到后台继续跑、把凭证改一半。
+    ///
+    /// 变异：`Abort` 臂不返回（继续持有 `fut`）⇒ 本用例挂死；
+    /// 若改用 `tokio::spawn` 则 guard 不会在返回前 drop。
+    #[tokio::test]
+    async fn cancel_on_abort_drops_the_future() {
+        use std::sync::atomic::AtomicBool;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&flag));
+        let (tx, mut rx) = mpsc::channel::<Boundary>(4);
+        tx.send(Boundary::Abort).await.unwrap();
+
+        let out = cancel_on_abort(
+            async move {
+                let _hold = &guard;
+                std::future::pending::<u32>().await
+            },
+            &mut rx,
+        )
+        .await;
+
+        assert_eq!(out, None);
+        assert!(flag.load(Ordering::SeqCst), "future 必须被 drop");
+    }
+
+    /// 命令期间收到的 `Steer` 与命令无关：丢掉它并**继续等**。
+    /// 下一回合的起点本来就会排空残留边界消息（`run_turn_once` 头部），
+    /// 故丢弃不改变任何已有语义。
+    ///
+    /// 变异：把 `Some(_) => continue` 改成返回 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn cancel_on_abort_ignores_steer() {
+        let (tx, mut rx) = mpsc::channel::<Boundary>(4);
+        tx.send(Boundary::Steer(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "插一句".into(),
+            }],
+        }))
+        .await
+        .unwrap();
+
+        let out = cancel_on_abort(
+            async {
+                tokio::task::yield_now().await;
+                7
+            },
+            &mut rx,
+        )
+        .await;
+        assert_eq!(out, Some(7), "Steer 不算取消");
+    }
 
     /// 1. **单一出站写者 / 顺序确定性**（设计 §8）：事件按到达顺序、终局 `View`
     ///    落在最后、`Output` 绝不插到事件中间、`Envelope.turn` 随回合单调。

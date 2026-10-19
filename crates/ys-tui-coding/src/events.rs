@@ -159,7 +159,11 @@ pub fn handle_key(
 
     match key.code {
         KeyCode::Esc => {
-            if app.is_turning {
+            // Esc = **全局取消**：回合中取消回合，命令在飞时取消命令（`/login` 的网络
+            // 往返最长 5s；不取消就只能 Ctrl-C 把整个进程关掉）；两者都不是才后退到
+            // 「清空输入」这条 idle 语义。在飞期间**不动输入框**：用户可能在等的时候
+            // 已经在敲下一条消息，丢掉它比保留更意外。
+            if app.is_turning || app.command_in_flight {
                 request_abort(boundaries);
             } else {
                 app.input.clear();
@@ -321,6 +325,7 @@ fn dispatch(
 
 /// 投一条请求给 app 线程（信道 ①）。
 fn send_request(app: &mut App, requests: &Sender<Request>, req: Request) {
+    app.note_request_sent(&req);
     if requests.blocking_send(req).is_err() {
         // app 线程已消失 —— 没有对话对象了，收摊（恢复仍由 run 无条件执行）
         app.should_quit = true;
@@ -344,6 +349,7 @@ mod tests {
     use crate::view::{CodingView, SkillEntry};
     use tokio::sync::mpsc;
     use ys_core::{ContentBlock, EffortLevel, Role};
+    use ys_protocol::Outbound;
 
     /// 四条端点都留着 —— 两端都活着才是「信道通了」的语义，
     /// 只留发送端会让 `try_send` 直接 Disconnected，测试会测出假象。
@@ -618,6 +624,66 @@ mod tests {
         a.input.insert_str("/mo");
         handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
         assert!(a.input.text.is_empty(), "idle Esc 清空输入");
+    }
+
+    /// **回归（命令在飞时 Esc 要能取消）**：`/login` 这类命令会做一次网络往返
+    /// （`/v1/models`，最长 5s，TCP 挂起时更久），而命令不经过 `BasicLoop` —— 没有任何
+    /// 人会去读 `Boundary`。若 Esc 只认 `is_turning`，这段时间里按 Esc 就毫无反应，
+    /// 用户只能 Ctrl-C 关掉整个进程。本用例钉住：在飞态的 Esc 也要投 `Abort`。
+    ///
+    /// 变异：把 Esc 的判断改回只看 `is_turning` ⇒ 第一个断言变红。
+    #[test]
+    fn test_esc_sends_abort_while_command_in_flight() {
+        let ch = channels();
+        let mut a = app();
+
+        a.input.insert_str("/model deepseek/chat");
+        handle_key(press(KeyCode::Enter), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(!a.is_turning, "命令请求不开回合态");
+        assert!(a.command_in_flight, "命令请求投出去即进入在飞态");
+        assert!(matches!(ch.next_request(), Some(Request::SetModel { .. })));
+
+        // 等的时候用户已经开始敲下一条：Esc 只取消命令，不该把它清掉。
+        a.input.insert_str("第二条");
+        handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(
+            ch.next_boundary().unwrap(),
+            Boundary::Abort,
+            "在飞态的 Esc 必须投 Abort，否则命令无法取消"
+        );
+        assert_eq!(a.input.text, "第二条", "取消命令不该清掉用户新敲的字");
+    }
+
+    /// 在飞态由**任意一条出站消息**清除：`app_loop` 处理完每个请求都会刷一条
+    /// `Outbound::View`，故命令收场后 Esc 必须退回「清空输入」的 idle 语义。
+    ///
+    /// 变异：漏掉 `apply_outbound` 里的清位 ⇒ 完成后 Esc 仍投 Abort（且不再清输入）。
+    #[test]
+    fn test_command_in_flight_cleared_by_any_outbound() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/logout");
+        handle_key(press(KeyCode::Enter), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(a.command_in_flight);
+
+        a.apply_outbound(Outbound::View(CodingView::for_test()));
+        assert!(!a.command_in_flight, "出站消息即视为命令收场");
+
+        a.input.insert_str("/mo");
+        handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(ch.next_boundary().is_none(), "收场后的 Esc 不再投 Abort");
+        assert!(a.input.text.is_empty(), "收场后的 Esc 回到清空输入");
+    }
+
+    /// `Request::Prompt` **不**进入在飞态：回合有自己的取消路径（`is_turning`）。
+    #[test]
+    fn test_prompt_request_does_not_enter_command_in_flight() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("你好");
+        handle_key(press(KeyCode::Enter), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(a.is_turning);
+        assert!(!a.command_in_flight, "回合请求归 is_turning 管");
     }
 
     #[test]

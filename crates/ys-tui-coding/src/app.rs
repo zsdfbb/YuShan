@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use ys_core::{ContentBlock, Message, StopReason, ToolCallId};
 use ys_event::AgentEvent;
-use ys_protocol::{Envelope, Outbound, SessionSummary};
+use ys_protocol::{Envelope, Outbound, Request, SessionSummary};
 
 use crate::commands::PromptKind;
 use crate::completion::CompletionState;
@@ -39,6 +39,17 @@ pub struct App {
     /// 与 `pending_prompt` **同 take 同清**：`run.rs` 在开 `/resume` 浮层时把它
     /// `take()` 走，浮层结束（选中 / Esc）后即空，不会残留旧列表被下一次浮层读到。
     pub pending_sessions: Option<Vec<SessionSummary>>,
+    /// 命令类请求**在飞**：已投给 app 线程、尚未收到任何出站消息。
+    ///
+    /// 只有 [`Request::Prompt`] 以外的请求会置位，而它们**不经过 `BasicLoop`** ——
+    /// 没有轮边界去读 `Boundary`，故命令里一旦有网络往返（`/login` 拉 `/v1/models`
+    /// 最长 5s，TCP 挂起时可更久），界面上按 Esc 就毫无反应。置位期间 Esc 投
+    /// `Boundary::Abort`，由 `app_loop` 在命令内部 `select!` 它（`cancel_on_abort`）。
+    ///
+    /// 清位口径：**任意一条出站消息**。`app_loop` 处理完每个请求都会刷一条
+    /// `Outbound::View`，故不会漏清；反过来若某个请求什么都不发（当前不存在），
+    /// 最坏也只是多投一条 `Abort` —— 它会被下一回合起点的排空丢弃，无副作用。
+    pub(crate) command_in_flight: bool,
     pub is_turning: bool,
     /// 本回合是否已经按过一次 Ctrl-C（取消已请求）。
     ///
@@ -104,6 +115,7 @@ impl App {
             completion: None,
             pending_prompt: None,
             pending_sessions: None,
+            command_in_flight: false,
             is_turning: false,
             abort_requested: false,
             thinking_visible,
@@ -120,6 +132,8 @@ impl App {
 
     /// 处理一条 app → UI 的出站消息。
     pub fn apply_outbound(&mut self, out: Outbound<CodingView>) {
+        // 任何出站消息都意味着「在飞的那条请求已经收场」（见 `command_in_flight`）。
+        self.command_in_flight = false;
         match out {
             Outbound::Event(env) => self.apply_event(env),
             Outbound::View(view) => self.view = view,
@@ -187,6 +201,18 @@ impl App {
         self.pending_echo_texts.clear();
         self.follow = true;
         self.scroll_offset = 0;
+    }
+
+    /// 记一条「已投出的请求」：`Prompt` 之外的请求进入**在飞态**
+    /// （见 [`App::command_in_flight`]）。
+    ///
+    /// 投放方有两处：主循环的 `send_request`（`/model`、`/resume` 等直发命令）与
+    /// 模态浮层的 `apply_prompt_outcome`（`/login`、`/model` 无参选完之后的请求）。
+    /// 两条路径都得记 —— 否则浮层发出去的 `/login` 拿不到 Esc 取消。
+    pub(crate) fn note_request_sent(&mut self, req: &Request) {
+        if !matches!(req, Request::Prompt(_)) {
+            self.command_in_flight = true;
+        }
     }
 
     /// 把一个 agent 事件应用到 transcript / 状态。

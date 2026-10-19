@@ -28,6 +28,11 @@ use crate::view::{CodingView, ModelEntry};
 pub enum PromptError {
     /// 用户按 Esc（或回车交了空答案）—— **中止整条命令，不改任何状态**。
     Cancelled,
+    /// 用户按 Ctrl-C —— **关闭整个程序**。
+    ///
+    /// 与 [`Self::Cancelled`] 的区别是全局性：Ctrl-C 在浮层里与空闲时同义
+    /// （关掉跑 TUI 的这个进程），不止关浮层。
+    Quit,
     /// 其他失败（选择器无可选项、终端 IO 出错…）。
     Other(String),
 }
@@ -36,6 +41,7 @@ impl std::fmt::Display for PromptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PromptError::Cancelled => write!(f, "已取消"),
+            PromptError::Quit => write!(f, "已退出"),
             PromptError::Other(msg) => write!(f, "{msg}"),
         }
     }

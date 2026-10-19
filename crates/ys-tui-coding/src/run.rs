@@ -283,6 +283,7 @@ fn apply_prompt_outcome(
 ) {
     match outcome {
         Ok(PromptOutcome::Request(req)) => {
+            app.note_request_sent(&req);
             if requests.blocking_send(req).is_err() {
                 app.should_quit = true;
             }
@@ -297,6 +298,9 @@ fn apply_prompt_outcome(
             app.follow = true;
         }
         Err(PromptError::Cancelled) => {}
+        // 浮层里的 Ctrl-C = **关程序**（与空闲时的 Ctrl-C 同义）。只关浮层不够：
+        // 用户按 Ctrl-C 就是要退出，把人退回聊天界面是另一种「没生效」。
+        Err(PromptError::Quit) => app.should_quit = true,
         Err(PromptError::Other(msg)) => {
             app.transcript
                 .push(TranscriptLine::System(format!("命令失败：{msg}")));
@@ -401,7 +405,7 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
     /// （provider / model / skill / session）共用本函数，故筛选对它们一并生效。
     ///
     /// **Enter 在无匹配时不动作**（既不确认也不取消）：常驻输入框下，敲到一半误按
-    /// Enter 不该把浮层关掉；取消的唯一出口是 Esc。
+    /// Enter 不该把浮层关掉；**取消（Esc）与关程序（Ctrl-C）是两个不同的出口**。
     fn select_modal(
         &mut self,
         prompt: &str,
@@ -454,6 +458,10 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                     }
                     KeyCode::Enter => {}
                     KeyCode::Esc => return Err(PromptError::Cancelled),
+                    // Ctrl-C 在浮层里也是「关程序」，不能被吞掉。
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err(PromptError::Quit)
+                    }
                     KeyCode::Backspace => query.backspace(),
                     KeyCode::Delete => query.delete_forward(),
                     KeyCode::Left => query.cursor_left(),
@@ -472,7 +480,7 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
         }
     }
 
-    /// 单行文本输入（`/login` 的 api_key）：Enter 确认、Esc 取消。
+    /// 单行文本输入（`/login` 的 api_key）：Enter 确认、Esc 取消、Ctrl-C 关程序。
     fn text_modal(&mut self, prompt: &str, help: Option<&str>) -> Result<String, PromptError> {
         let mut buf = InputBuffer::new();
         loop {
@@ -501,6 +509,10 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Enter => return Ok(buf.take().trim().to_string()),
                     KeyCode::Esc => return Err(PromptError::Cancelled),
+                    // Ctrl-C 在浮层里也是「关程序」（与 `select_modal` 同规）。
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err(PromptError::Quit)
+                    }
                     KeyCode::Backspace => buf.backspace(),
                     KeyCode::Delete => buf.delete_forward(),
                     KeyCode::Left => buf.cursor_left(),
@@ -866,6 +878,37 @@ mod tests {
         assert_eq!(app.transcript, before, "取消不改 transcript");
         assert_eq!(app.input.text, "/resume", "取消不改输入框");
         assert!(app.pending_sessions.is_some(), "取消不改 pending_sessions");
+    }
+
+    /// 浮层里的 Ctrl-C ⇒ `PromptError::Quit` ⇒ **关程序**。
+    ///
+    /// 终端里的浮层循环无法单测，但「Quit 会落到 `should_quit`」这条可以：不落它，
+    /// 浮层里的 Ctrl-C 就只是静默无效（用户按下去既不关浮层也不退程序）。
+    ///
+    /// 变异：删 `Err(PromptError::Quit) => app.should_quit = true` 整臂（或归入
+    /// `Cancelled`）⇒ 本用例变红。
+    #[test]
+    fn test_apply_prompt_outcome_quit_closes_program() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Request>(4);
+        let mut app = App::new(CodingView::for_test());
+        apply_prompt_outcome(&mut app, &tx, Err(PromptError::Quit));
+        assert!(app.should_quit, "浮层里的 Ctrl-C 必须关程序");
+    }
+
+    /// 浮层选完产出的**命令请求**也要进入在飞态 —— 否则 `/login` 的网络往返期间
+    /// Esc 无人可投（路径：浮层 → `apply_prompt_outcome`，不经 `events::send_request`）。
+    ///
+    /// 变异：删 `app.note_request_sent(&req)` ⇒ 本用例变红。
+    #[test]
+    fn test_apply_prompt_outcome_marks_command_in_flight() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Request>(4);
+        let mut app = App::new(CodingView::for_test());
+        apply_prompt_outcome(
+            &mut app,
+            &tx,
+            Ok(PromptOutcome::Request(Request::Logout)),
+        );
+        assert!(app.command_in_flight, "浮层发出去的命令同样算在飞");
     }
 
     /// `NoOp` 结局 ⇒ 不发请求，但把提示写进 transcript 并贴底（不静默）。

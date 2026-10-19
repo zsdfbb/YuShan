@@ -1,6 +1,6 @@
 # YuShan 架构图说
 
-> **最后更新**：2026-09-14（路线 B 重构：三信道 + 两线程 + `ys-protocol` + `ys-tui-coding`）
+> **最后更新**：2026-10-20（并行工具事件时序、subagent 诊断/转录、debug 默认保留与 TUI 摘要）
 >
 > 用图解释设计。**规范细节**见 `docs/design.md`；**as-built 实现形态**（含实现与设计的分歧）见 `docs/design-final/coding-agent-tui.md`（路线 B，最新；核心信道第一刀见 `docs/design-final/core-channel.md`，其信道/actor 部分已被前者取代）；术语见 `docs/CONTEXT.md`；决策的 why 见 `docs/adr/`。
 >
@@ -268,6 +268,14 @@ sequenceDiagram
     A-->>U: rx_out.try_recv 更新 transcript / view
 ```
 
+**并行工具批（Step 9）**：只有当一批工具 **多于一个** 且 **每一个**都声明
+`is_concurrency_safe() == true` 时才走并行；混合批仍走串行。并行路径在 9a 按原始调用顺序
+emit 全部 `ToolCall`，9b 用 `buffer_unordered(max_parallel_tools.max(1))` 执行，任一工具完成时
+立即 emit 对应的 `ToolResult` 并写回原始 index；9c 再按原始 `tool_calls` 顺序组装回喂模型的
+单条 `Role::User` 消息。因此**事件结果按完成顺序出现，模型消息仍按调用顺序配对**；
+TUI 按 `ToolCallId` 回填，不依赖 `ToolResult` 事件顺序。当前声明并发安全的集合是
+`subagent` 与只读工具 `read` / `find` / `ls` / `grep`；`bash` / `write` / `edit` 等保持串行准入。
+
 **两个边界的区别**（容易混淆）
 
 | 边界 | 何时 | 拉哪条信道 | 语义 |
@@ -395,7 +403,9 @@ pub struct QueueBoundarySource { inner: Mutex<Inner { queue: VecDeque<Boundary>,
   + 末位 `subagent`；见 `docs/design-final/coding-agent-tui.md` §13）。`Tool` 另有两个不进 `ToolSpec`
   的默认方法：`timeout()`（per-tool 墙钟上限，优先级 工具声明 → `bash_timeout` → 300s）与
   `is_concurrency_safe()`（默认 `false`）。只有当一批 **每一个**工具都为 `true` 时才并发
-  （`buffered(max_parallel_tools)`，**保序**）；否则保持原串行路径（事件 `C1,R1,C2,R2`）。
+  （`buffer_unordered(max_parallel_tools.max(1))`，**完成即发**）；否则保持原串行路径
+  （事件 `C1,R1,C2,R2`）。当前安全集合为 `subagent` + `read` / `find` / `ls` / `grep`。
+  并行批的模型回喂消息仍在 Step 9c 按原 `tool_calls` 顺序组装。
 
 ---
 
@@ -691,7 +701,7 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
 | **退出时** | `session: <id>`（TUI 退出回放**之后**写主屏；`-p` / `--json` 收尾） | **stderr** |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
-| **`--debug` 运行期间** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
+| **debug 运行期间（默认开启）** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
 
 **退出时**是第三类时机：TUI 已退 alt-screen（`restore_terminal` 把对话回放到 stdout），此刻写 stderr
 的字节落在主屏、不会被冲掉，也不污染 `-p` 的模型文本 / `--json` 的逐行 `Envelope`。内容由
@@ -705,10 +715,14 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 > **只有 2 处（`provider.rs` / `state.rs`）严格需要日志文件** —— 其余靠「启动期 stderr / 命令期
 > `Output`」就够。日志文件的价值是**通用兜底**：TUI 应用没有「历史输出」可看。
 
-**`--debug` 的结构化记录**（`apps/coding-agent/src/debug_log.rs`）：与 `yushan.log` 同目录、独立文件，
-一行一条 JSON（`schema: yushan.debug/1`）。契约：
+**debug 结构化记录**（`apps/coding-agent/src/debug_log.rs`）：与 `yushan.log` 同目录、独立文件，
+一行一条 JSON（`schema: yushan.debug/1`）。`YUSHAN_DEBUG` 未设置或为空串时默认开启；
+非空值中 `1/true/yes/on` 开启、其余关闭，且优先于命令行 `--debug`（`--debug` 仅为兼容保留）。
+契约：
 
-- **关闭时零开销**：`Option<DebugSink>` 为 `None` —— 不解析路径、不建文件、不起线程。
+- **显式关闭只关闭 sink**：`YUSHAN_DEBUG=0` 等关闭值时 `open_enabled` 返回 `None`，
+  不创建 debug 文件、writer 线程或 sink；正常启动仍会在早退之后解析一次 `LogDir`，
+  并对 `Default` 目录执行启动期 sweep。
 - **异步单写者**：调用线程只做「取时间/序号 → 序列化 → `try_send`」；有界队列满时**丢当前记录并计数**
   （`dropped`），绝不阻塞 agent。一行一次 `write_all`：**正常 flush / 排空时**末行完整；
   SIGKILL 等不可捕获退出仍可能截断末行（T5 的 P1 项）。
@@ -719,6 +733,22 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
   独立落盘，分别记录估算 token 前后值、失败原因与被作废的工具调用数。
 - **不占输出通道**：debug 内容只进文件；`-p` 的 stdout 与 `--json` 的逐行 `Envelope` 保持原契约。
 - **退出收敛**：`main.rs` 的裸退出原语只允许出现在 `exit_with_debug`（先 `flush` 再 `exit`）。
+- **默认目录保留**：正常启动时只清理 `Default` 日志目录中超过 7 天、文件名匹配
+  `debug-*.jsonl` 的普通文件；不跟随符号链接，保留同名目录、符号链接、近期文件与 `yushan.log`。
+  `YUSHAN_LOG_DIR` 非空为 `Override`，照常写入但不清理。清理独立于开关，
+  `YUSHAN_DEBUG=0` 的正常启动仍执行。日志目录在启动期一次解析为 `path + source`，
+  sweep、初始 sink 与 `/new` / `/resume` 的后续路径都使用同一结果。
+
+**subagent 失败现场**：子 agent 的本地 `CollectingSink` 捕获本次回合事件，不进入父事件流；
+转录按子会话内容块保留 `Text`、`ToolUse` 参数与 `ToolResult`，工具结果正文优先取事件中的原始
+`ToolResult`（会话可能被 turn budget 降级），仅在事件缺失时回退会话正文。非 `Completed` 结果回给
+父工具的结果首行是 `[diagnostic: ...]`：物理单行、控制字符替换为空格、总计不超过 1024 字节；
+`Cancelled` 带 `cause=parent-turn-cancelled|child-budget|unknown`。只有在子回合已经启动、
+`child.run_turn` 返回 `Err` 的路径才生成 `stop_reason=cancelled cause=unknown` 的诊断并附真实
+错误文本；无模型、派发次数超限、`AgentBuilder` 组装失败等 runner 前置错误直接返回 `Err`，
+由 `SubagentTool` 映射为 `ToolError::Execution`，没有 diagnostic 前缀。转录写失败不 panic，
+错误并入诊断；摘要文本主体按 `MAX_SUMMARY_BYTES` 截断，截断标记与随后保证的 `## Files`
+节可使最终 summary 略超该值。
 
 **`capabilities.rs` 绝不 print** —— 命令期间的失败也走 `Output`。
 `--stats` 的背压读数**只在非 TUI 模式**出现，写 stderr，不污染 stdout 的 JSON / 文本流。
@@ -782,6 +812,9 @@ flowchart TB
 - **对话区**：`TranscriptLine` 结构化（`User` / `Assistant` / `Thinking` / `Tool{…}` / `Summary` /
   `Error` / `System`）；工具调用压一行，摘要由 `summarize_tool_args` 抽取（摘要规则属产品知识，故在
   TUI crate 而非协议）。
+- **回合摘要**：`Summary` 输出 `{symbol} {stop-label} · N rounds · X.Ys`。五种已知
+  `StopReason` 使用 `completed` / `max rounds` / `cancelled` / `truncated` / `no output`，
+  未来变体由通配分支显示 `unknown`；TUI 与退出 scrollback 共用这一格式。
 - **状态行**：`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**；turn 中把 model 段换成
   `⏳ Working·`（300ms 节拍前进）。
 - **输入区**：多行（`Shift/Alt+Enter` 换行、`Enter` 提交）；启用 bracketed paste（`Event::Paste`

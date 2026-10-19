@@ -845,8 +845,9 @@ fn push_non_assistant(
             elapsed_secs,
         } => {
             out.push(Line::from(format!(
-                "{} {rounds} rounds · {elapsed_secs:.1}s",
-                stop_symbol(stop)
+                "{} {} · {rounds} rounds · {elapsed_secs:.1}s",
+                stop_symbol(stop),
+                stop_label(stop)
             )));
         }
         TranscriptLine::Error(s) => {
@@ -881,6 +882,21 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
         // 「空产出」不是错误也不是完成：用 ∅ 表示「回合结束了，但模型什么也没给出」。
         StopReason::NoOutput => "∅",
         _ => "?",
+    }
+}
+
+/// `StopReason` → 摘要中的可读短标签。
+///
+/// `StopReason` 是 `#[non_exhaustive]`，下游无法构造未来变体；
+/// 通配分支让新增变体至少显示为 `unknown`，不会静默落成错误的原因。
+fn stop_label(stop: &StopReason) -> &'static str {
+    match stop {
+        StopReason::Completed => "completed",
+        StopReason::Cancelled => "cancelled",
+        StopReason::MaxRounds => "max rounds",
+        StopReason::Truncated => "truncated",
+        StopReason::NoOutput => "no output",
+        _ => "unknown",
     }
 }
 
@@ -1516,12 +1532,12 @@ mod tests {
 
     #[test]
     fn test_summary_symbols_per_stop_reason() {
-        for (reason, sym) in [
-            (StopReason::Completed, "✓"),
-            (StopReason::MaxRounds, "⚠"),
-            (StopReason::Cancelled, "✗"),
-            (StopReason::Truncated, "✂"),
-            (StopReason::NoOutput, "∅"),
+        for (reason, sym, label) in [
+            (StopReason::Completed, "✓", "completed"),
+            (StopReason::MaxRounds, "⚠", "max rounds"),
+            (StopReason::Cancelled, "✗", "cancelled"),
+            (StopReason::Truncated, "✂", "truncated"),
+            (StopReason::NoOutput, "∅", "no output"),
         ] {
             let mut app = app_with(CodingView::for_test());
             app.transcript.push(TranscriptLine::Summary {
@@ -1531,10 +1547,56 @@ mod tests {
             });
             let joined = rows_of(&mut app, 120, 40).join("\n");
             assert!(
-                joined.contains(&format!("{sym} 2 rounds · 1.3s")),
-                "{reason:?} 应渲染 {sym}：{joined}"
+                joined.contains(&format!("{sym} {label} · 2 rounds · 1.3s")),
+                "{reason:?} 应渲染符号 {sym} 与标签 {label}：{joined}"
             );
         }
+    }
+
+    #[test]
+    fn test_summary_render_matches_plain_transcript() {
+        let expected = "✗ cancelled · 2 rounds · 1.3s";
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::Summary {
+            rounds: 2,
+            stop: StopReason::Cancelled,
+            elapsed_secs: 1.3,
+        });
+
+        let tui = rows_of(&mut app, 120, 40).join("\n");
+        let plain = transcript_plain_lines(&app, 120);
+        assert!(tui.contains(expected), "TUI Summary 应含完整标签：{tui}");
+        assert_eq!(plain, vec![expected], "退出回放应与 TUI 使用同一格式");
+    }
+
+    #[test]
+    fn test_summary_wraps_without_overlap_at_min_width() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("q".into()));
+        app.transcript.push(TranscriptLine::Summary {
+            rounds: 2,
+            stop: StopReason::Cancelled,
+            elapsed_secs: 1.3,
+        });
+
+        let rows = rows_of(&mut app, MIN_WIDTH, 20);
+        let input_row = rows
+            .iter()
+            .position(|row| row.contains("Input"))
+            .expect("窄宽度下仍应渲染输入区");
+        let chat = rows[..input_row].join("\n");
+        assert!(chat.contains('✗'), "Summary 符号应可见：{rows:#?}");
+        assert!(
+            chat.contains("rounds"),
+            "Summary 应在窄宽度下自动换行：{rows:#?}"
+        );
+        assert!(chat.contains("1.3s"), "Summary 耗时应可见：{rows:#?}");
+        assert!(
+            !rows[input_row..]
+                .iter()
+                .any(|row| row.contains('✗') || row.contains("rounds") || row.contains("1.3s")),
+            "Summary 不得与本条之后的输入区或状态行重叠：{rows:#?}"
+        );
     }
 
     #[test]

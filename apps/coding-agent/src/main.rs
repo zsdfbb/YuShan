@@ -139,7 +139,7 @@ struct Args {
     mode: Mode,
     /// `--stats`：显式要求把背压读数摘要写到 stderr（无论有无背压）。
     stats: bool,
-    /// `--debug`：打开结构化执行日志（`YUSHAN_DEBUG` 优先于本 flag）。
+    /// `--debug`：兼容旧脚本；结构化执行日志默认开启，`YUSHAN_DEBUG` 可关闭。
     debug: bool,
     /// 启动期会话形态。
     resume: Resume,
@@ -2029,6 +2029,7 @@ fn run_interactive(
     worktree: app_loop::WorktreeHandle,
     default_workspace: PathBuf,
     debug_flag: bool,
+    log_dir: Option<&logging::LogDir>,
     model_trace: Option<debug_log::ModelTraceRouter>,
     tool_specs: Vec<(String, usize)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2059,7 +2060,7 @@ fn run_interactive(
 
     // debug sink：**必须在 `Wiring` 建好、会话路径已知之后**打开（文件名取自它）。
     // 关闭时 `open_enabled` 早退 ⇒ 不建文件、不起线程；`run_start` 是文件里的第一条。
-    let mut debug = debug_log::open_enabled(debug_flag, wiring.session_path());
+    let mut debug = debug_log::open_enabled(debug_flag, wiring.session_path(), log_dir);
     if let Some(sink) = debug.as_mut() {
         let session_id = session_id_for(wiring.session_path());
         if let Some(trace) = &model_trace {
@@ -2384,6 +2385,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
 
+    // 进程级 help / worktree 子命令已早退。此刻执行一次启动期保留清理：
+    // 它不依赖 debug 开关，且发生在任何正常模式的 sink 创建之前。
+    let resolved_log_dir = logging::resolve_log_dir();
+    debug_log::sweep_default_logs(resolved_log_dir.as_ref());
+
     // 会话目录 + `--resume` 解析 —— 必须**在模型解析之前**（meta 参与模型选择），
     // 且**在 skill 扫描之前**：meta 记录的工作区要与 `attach` 注入 `config.cwd`
     // **同一时机**生效，而 skill 根 / 提示词 / 工具都从 `config.cwd` 派生。
@@ -2676,7 +2682,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{}", capabilities::session_recovery_notice(recovery));
             }
             let debug_session_id = session_id_for(wiring.session_path());
-            let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
+            let mut debug = debug_log::open_enabled(
+                args.debug,
+                wiring.session_path(),
+                resolved_log_dir.as_ref(),
+            );
             if let Some(sink) = debug.as_mut() {
                 if let Some(trace) = &model_trace {
                     trace.attach(sink.handle(), debug_session_id.clone());
@@ -2761,7 +2771,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{}", capabilities::session_recovery_notice(recovery));
             }
             let debug_session_id = session_id_for(wiring.session_path());
-            let mut debug = debug_log::open_enabled(args.debug, wiring.session_path());
+            let mut debug = debug_log::open_enabled(
+                args.debug,
+                wiring.session_path(),
+                resolved_log_dir.as_ref(),
+            );
             if let Some(sink) = debug.as_mut() {
                 if let Some(trace) = &model_trace {
                     trace.attach(sink.handle(), debug_session_id.clone());
@@ -2838,6 +2852,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 worktree_handle,
                 shared_workspace,
                 args.debug,
+                resolved_log_dir.as_ref(),
                 model_trace,
                 tool_specs,
             )?;
@@ -5055,11 +5070,13 @@ mod tests {
         // SAFETY: 持有 env_lock，独占这两个变量。
         unsafe {
             std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
-            std::env::remove_var(debug_log::DEBUG_ENV);
+            std::env::set_var(debug_log::DEBUG_ENV, "0");
         }
 
         // 关闭 ⇒ `None`（不解析路径、不建文件、不起线程）。
-        let debug = debug_log::open_enabled(false, Some(&dir.join("session.jsonl")));
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
+        let debug =
+            debug_log::open_enabled(false, Some(&dir.join("session.jsonl")), Some(&log_dir));
         assert!(debug.is_none(), "debug 关时不得创建 sink");
 
         let (tx, rx) = mpsc::channel(8);
@@ -5107,7 +5124,7 @@ mod tests {
         // SAFETY: 持有 env_lock。
         unsafe {
             std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
-            std::env::remove_var(debug_log::DEBUG_ENV);
+            std::env::set_var(debug_log::DEBUG_ENV, "0");
         }
 
         let usage = ys_core::Usage {
@@ -5267,12 +5284,14 @@ mod tests {
         // SAFETY: 持有 env_lock。
         unsafe {
             std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
-            std::env::remove_var(debug_log::DEBUG_ENV);
+            std::env::set_var(debug_log::DEBUG_ENV, "1");
         }
 
         let session = dir.join("2026-10-17-abc.jsonl");
-        let path = debug_log::debug_path_for(Some(&session)).unwrap();
-        let mut sink = debug_log::open_enabled(true, Some(&session)).expect("sink 应打开");
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
+        let path = debug_log::debug_path_for(Some(&session), &log_dir);
+        let mut sink =
+            debug_log::open_enabled(true, Some(&session), Some(&log_dir)).expect("sink 应打开");
         let mut fields = Map::new();
         fields.insert("probe".into(), json!(1));
         sink.record(
@@ -5347,18 +5366,18 @@ mod tests {
         assert_eq!(text_json.mode, Mode::Json("do --debug x".into()));
     }
 
-    /// `YUSHAN_DEBUG` **优先于** `--debug`；`0/false/no/off` 一律关；空串回落 flag。
+    /// 未设置 / 空串默认开启；`0/false/no/off` 一律关且优先于 `--debug`。
     ///
-    /// 变异：去掉 `debug_enabled` 的环境变量分支（只看 flag）⇒ 前两组断言红；
-    /// 把空串当成「非空值」⇒ 最后一组断言红。
+    /// 变异：把未设置 / 空串回落到 flag ⇒ 默认开断言红；
+    /// 去掉 `debug_enabled` 的环境变量分支 ⇒ 显式关闭断言红。
     #[test]
-    fn debug_env_overrides_cli_flag() {
+    fn debug_enabled_env_overrides_cli_flag() {
         let _guard = env_lock();
         let _env = EnvRestore::capture(&[debug_log::DEBUG_ENV]);
         // SAFETY: 持有 env_lock。
         unsafe { std::env::remove_var(debug_log::DEBUG_ENV) };
+        assert!(debug_log::debug_enabled(false), "未设置时默认开启");
         assert!(debug_log::debug_enabled(true));
-        assert!(!debug_log::debug_enabled(false));
 
         for on in ["1", "true", "yes", "on", "TRUE", " On "] {
             // SAFETY: 持有 env_lock。
@@ -5378,7 +5397,7 @@ mod tests {
         }
         // SAFETY: 持有 env_lock。
         unsafe { std::env::set_var(debug_log::DEBUG_ENV, "") };
-        assert!(!debug_log::debug_enabled(false), "空串应回落 flag=false");
-        assert!(debug_log::debug_enabled(true), "空串应回落 flag=true");
+        assert!(debug_log::debug_enabled(false), "空串应默认开启");
+        assert!(debug_log::debug_enabled(true), "空串应默认开启");
     }
 }

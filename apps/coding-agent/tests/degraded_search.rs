@@ -86,6 +86,8 @@ fn run_guarded(path_dir: &Path, home: &Path) -> Output {
 fn isolate(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home)
         .env_remove("USERPROFILE")
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         // ① 模型侧：不清则不走「无模型配置」早退。
         .env_remove("YUSHAN_API_BASE")
         .env_remove("YUSHAN_API_KEY")

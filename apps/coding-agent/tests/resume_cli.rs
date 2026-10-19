@@ -76,6 +76,8 @@ impl Roots {
 /// 所有用例共用的隔离（**全部 per-child**，不碰父进程 env）。
 fn isolate(cmd: &mut Command, roots: &Roots) {
     cmd.current_dir(&roots.workspace)
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         .env("HOME", &roots.home)
         .env("PATH", &roots.path_dir)
         .env_remove("USERPROFILE")

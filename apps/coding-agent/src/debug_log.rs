@@ -5,7 +5,7 @@
 //!
 //! # 职责
 //!
-//! - 开关解析（`--debug` / `YUSHAN_DEBUG`，环境变量优先）；
+//! - 开关解析（`YUSHAN_DEBUG` 默认开启，`--debug` 兼容保留）；
 //! - 单行一条记录的 JSONL 信封（`schema`/`ev`/`t_ms`/`dt_ms`/`seq`/`run`/相关 id）；
 //! - **独立 OS 写线程 + 有界记录队列**：调用线程只序列化并 `try_send`，绝不碰
 //!   文件 IO；控制命令（`Switch` / `BeginRun` / `Stop`）走独立无界通道；
@@ -40,7 +40,7 @@ use ys_model_openai_compat::{ModelAttempt, ModelTrace};
 
 use crate::logging;
 
-/// 开关环境变量：优先于命令行 `--debug`。
+/// 开关环境变量：设置后覆盖默认开启值。
 pub(crate) const DEBUG_ENV: &str = "YUSHAN_DEBUG";
 /// 工具参数摘要档位环境变量（`none` / `head` / `full`，默认 `head`）。
 pub(crate) const ARGS_ENV: &str = "YUSHAN_DEBUG_ARGS";
@@ -63,43 +63,106 @@ const HEAD_BUDGET_BYTES: usize = 512;
 /// `full` 档工具参数总预算。
 const FULL_BUDGET_BYTES: usize = 8 * 1024;
 
-/// 解析开关：`YUSHAN_DEBUG` 非空时优先；`1/true/yes/on` 为开，其余非空值为关；
-/// 未设置或空字符串时跟随命令行 `cli_flag`。
-pub(crate) fn debug_enabled(cli_flag: bool) -> bool {
+/// 解析开关：未设置或空字符串默认开启；非空值为 `1/true/yes/on` 时开启，
+/// 其余非空值关闭。`--debug` 仅为命令行兼容保留，不再影响结果。
+pub(crate) fn debug_enabled(_cli_flag: bool) -> bool {
     match std::env::var_os(DEBUG_ENV) {
         Some(value) if !value.is_empty() => {
             let value = value.to_string_lossy().trim().to_ascii_lowercase();
             matches!(value.as_str(), "1" | "true" | "yes" | "on")
         }
-        _ => cli_flag,
+        _ => true,
     }
 }
 
-/// debug 文件路径：`log_dir()/debug-<session stem>.jsonl`。
+/// 在已解析的日志目录中构造 debug 文件路径：
+/// `log_dir/debug-<session stem>.jsonl`。
 ///
 /// 无 session 文件（会话尚未落盘）时用 `debug-<pid>-<unix_ms>.jsonl`；
-/// 日志目录不可得时返回 `None`，调用方据此不创建 sink。
-pub(crate) fn debug_path_for(session_path: Option<&Path>) -> Option<PathBuf> {
-    let dir = logging::log_dir()?;
+/// 本函数不读取环境变量。
+pub(crate) fn debug_path_for(
+    session_path: Option<&Path>,
+    log_dir: &logging::LogDir,
+) -> PathBuf {
     let name = session_path
         .and_then(Path::file_stem)
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.is_empty())
         .map(|stem| format!("debug-{stem}.jsonl"))
         .unwrap_or_else(|| format!("debug-{}-{}.jsonl", std::process::id(), now_unix_ms()));
-    Some(dir.join(name))
+    log_dir.path.join(name)
+}
+
+/// debug 文件默认保留期。
+const DEBUG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// 正常启动时清理默认日志目录中的过期 debug 文件。
+///
+/// 清理独立于 [`open_enabled`]：即使 `YUSHAN_DEBUG=0` 关闭写入，正常启动仍会
+/// 调用本函数。覆盖目录属于调用方，只写不删。
+pub(crate) fn sweep_default_logs(log_dir: Option<&logging::LogDir>) {
+    sweep_default_logs_at(log_dir, SystemTime::now());
+}
+
+fn sweep_default_logs_at(log_dir: Option<&logging::LogDir>, now: SystemTime) {
+    let Some(log_dir) = log_dir else {
+        return;
+    };
+    if log_dir.source != logging::LogDirSource::Default {
+        return;
+    }
+    sweep_debug_files(&log_dir.path, now);
+}
+
+/// 只删除目录中超过保留期、文件名匹配 `debug-*.jsonl` 的普通文件。
+///
+/// `DirEntry::file_type()` 不跟随符号链接；任何读取或删除失败都静默跳过。
+fn sweep_debug_files(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("debug-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > DEBUG_RETENTION {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// 接线入口：关闭 debug 时**在解析路径与起线程之前**早退。
 ///
 /// `None` 同时表示「开关关闭」与「路径不可得」—— 两种情况调用方都只需持有
 /// `None`，不解析路径、不建目录、不起线程。
-pub(crate) fn open_enabled(cli_flag: bool, session_path: Option<&Path>) -> Option<DebugSink> {
+pub(crate) fn open_enabled(
+    cli_flag: bool,
+    session_path: Option<&Path>,
+    log_dir: Option<&logging::LogDir>,
+) -> Option<DebugSink> {
     if !debug_enabled(cli_flag) {
         return None;
     }
-    let path = debug_path_for(session_path)?;
+    let log_dir = log_dir?;
+    let path = debug_path_for(session_path, log_dir);
     let mut sink = DebugSink::open(path.clone(), DEFAULT_QUEUE_CAPACITY)?;
+    sink.log_dir = Some(log_dir.clone());
     // 跨进程 `--resume` 会追加同一个 session 的 debug 文件：`run` 必须接着已有
     // 记录递增，否则文件里会出现两条 `run=0` 的 `run_start`，失去区分 run 的能力。
     let run = next_run(&path);
@@ -270,6 +333,8 @@ pub(crate) struct DebugSink {
     ctx: RecordContext,
     control: Sender<ControlMessage>,
     writer: Option<JoinHandle<()>>,
+    /// 由启动期解析并传入的日志目录；运行期换文件据此派生路径。
+    log_dir: Option<logging::LogDir>,
 }
 
 impl DebugSink {
@@ -358,6 +423,7 @@ impl DebugSink {
             },
             control: control_tx,
             writer: Some(handle),
+            log_dir: None,
         })
     }
 
@@ -579,6 +645,11 @@ impl RecordContext {
 }
 
 impl DebugSink {
+    /// 在打开 sink 时保存的同一日志目录中派生会话文件路径。
+    pub(crate) fn path_for_session(&self, session_path: Option<&Path>) -> Option<PathBuf> {
+        Some(debug_path_for(session_path, self.log_dir.as_ref()?))
+    }
+
     /// `/new` 换会话时切到新文件。同一 session 的 `/resume` **不调用**（继续追加）。
     pub(crate) fn switch_file(&mut self, path: &Path) {
         // 控制通道无界：即使记录队列已满，switch 也不会丢失。
@@ -1522,9 +1593,10 @@ mod tests {
             std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
         }
         let session = dir.join("session-1.jsonl");
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
 
         // CLI 为真但 env 明确为关：必须返回 None，且本模块不得创建任何文件。
-        let sink = open_enabled(true, Some(&session));
+        let sink = open_enabled(true, Some(&session), Some(&log_dir));
         assert!(
             sink.is_none(),
             "YUSHAN_DEBUG=0 时 open_enabled 必须返回 None"
@@ -1573,9 +1645,10 @@ mod tests {
         }
         let session = dir.join("session-1.jsonl");
         let expected = dir.join("debug-session-1.jsonl");
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
 
-        let mut sink =
-            open_enabled(false, Some(&session)).expect("YUSHAN_DEBUG=1 时必须打开 debug");
+        let mut sink = open_enabled(false, Some(&session), Some(&log_dir))
+            .expect("YUSHAN_DEBUG=1 时必须打开 debug");
         assert!(
             expected.exists(),
             "open_enabled 必须创建 {expected:?}，实际目录：{:?}",
@@ -1669,10 +1742,10 @@ mod tests {
         }
     }
 
-    /// 开关优先级：env 优先；`1/true/yes/on` 为开、其余非空为关；空串跟随 flag。
+    /// 开关矩阵：未设置 / 空串默认开；`1/true/yes/on` 为开、其余非空为关。
     ///
-    /// 变异：去掉 env 分支 ⇒ `YUSHAN_DEBUG=0` + flag 的断言变红；
-    /// 把空串当 off ⇒ 空串 + flag 的断言变红。
+    /// 变异：把未设置 / 空串回落到 `cli_flag` ⇒ 默认开断言变红；
+    /// 去掉 env 分支 ⇒ 显式关闭断言变红。
     #[test]
     fn test_debug_enabled_matrix() {
         let _guard = crate::test_env::env_lock();
@@ -1680,8 +1753,8 @@ mod tests {
 
         // SAFETY: 持有 env_lock。
         unsafe { std::env::remove_var(DEBUG_ENV) };
-        assert!(debug_enabled(true), "未设置时跟随 cli=true");
-        assert!(!debug_enabled(false), "未设置时跟随 cli=false");
+        assert!(debug_enabled(false), "未设置时默认开启，与 cli flag 无关");
+        assert!(debug_enabled(true), "未设置时默认开启");
 
         for on in ["1", "true", "TRUE", "yes", "on", " On "] {
             // SAFETY: 持有 env_lock。
@@ -1696,8 +1769,191 @@ mod tests {
 
         // SAFETY: 持有 env_lock。
         unsafe { std::env::set_var(DEBUG_ENV, "") };
-        assert!(debug_enabled(true), "空串视为未设置 ⇒ 跟随 cli=true");
-        assert!(!debug_enabled(false), "空串视为未设置 ⇒ 跟随 cli=false");
+        assert!(debug_enabled(false), "空串视为未设置 ⇒ 默认开启");
+        assert!(debug_enabled(true), "空串视为未设置 ⇒ 默认开启");
+    }
+
+    fn write_aged_debug_file(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+    }
+
+    /// sweep 只删除 Default 目录中超过 7 天的普通 `debug-*.jsonl`。
+    #[test]
+    fn test_sweep_removes_only_old_matching_regular_debug_files() {
+        let dir = temp_dir("sweep_filter");
+        let old = dir.join("debug-old.jsonl");
+        let recent = dir.join("debug-recent.jsonl");
+        let nonmatching = dir.join("debug-old.txt");
+        let text_log = dir.join("yushan.log");
+        let same_name_dir = dir.join("debug-dir.jsonl");
+
+        write_aged_debug_file(&old);
+        std::fs::write(&recent, b"recent").unwrap();
+        write_aged_debug_file(&nonmatching);
+        write_aged_debug_file(&text_log);
+        std::fs::create_dir(&same_name_dir).unwrap();
+        std::fs::File::open(&same_name_dir)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+
+        #[cfg(unix)]
+        let (link, target) = {
+            let target = dir.join("link-target.jsonl");
+            write_aged_debug_file(&target);
+            let link = dir.join("debug-link.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (link, target)
+        };
+
+        sweep_debug_files(&dir, SystemTime::now());
+
+        assert!(!old.exists(), "超龄普通 debug 文件应删除");
+        assert!(recent.exists(), "近期文件应保留");
+        assert!(nonmatching.exists(), "非匹配文件应保留");
+        assert!(text_log.exists(), "yushan.log 应保留");
+        assert!(same_name_dir.is_dir(), "同名目录不得删除");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert!(
+                link.symlink_metadata().is_ok(),
+                "符号链接本身不得被当作普通文件删除"
+            );
+            assert!(target.exists(), "符号链接目标不得被删除");
+
+            let unreadable = dir.join("unreadable");
+            std::fs::create_dir(&unreadable).unwrap();
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            sweep_debug_files(&unreadable, SystemTime::now());
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(unreadable.is_dir(), "清理失败不得改变目录本身");
+        }
+
+        // 目录不存在时同样 best-effort 返回。
+        sweep_debug_files(&dir.join("missing"), SystemTime::now());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Override 目录只写不删。
+    #[test]
+    fn test_sweep_skips_override_directory() {
+        let _guard = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvRestore::capture(&[
+            DEBUG_ENV,
+            crate::logging::LOG_DIR_ENV,
+            "HOME",
+            "USERPROFILE",
+        ]);
+        let dir = temp_dir("sweep_override");
+        let old = dir.join("debug-old.jsonl");
+        write_aged_debug_file(&old);
+
+        // SAFETY: 持有 env_lock。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
+            std::env::set_var(DEBUG_ENV, "0");
+        }
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
+        sweep_default_logs_at(Some(&log_dir), SystemTime::now());
+
+        assert!(old.exists(), "YUSHAN_LOG_DIR 覆盖目录不得清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// sweep 独立于 debug 开关：`YUSHAN_DEBUG=0` 的正常启动仍清理 Default 目录。
+    #[test]
+    fn test_sweep_runs_when_debug_disabled() {
+        let _guard = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvRestore::capture(&[
+            DEBUG_ENV,
+            crate::logging::LOG_DIR_ENV,
+            "HOME",
+            "USERPROFILE",
+        ]);
+        let home = temp_dir("sweep_disabled_home");
+        let logs = home.join(".yushan").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let old = logs.join("debug-old.jsonl");
+        write_aged_debug_file(&old);
+
+        // SAFETY: 持有 env_lock。空 YUSHAN_LOG_DIR 等同于未设置，回落 HOME 默认目录。
+        unsafe {
+            std::env::set_var(DEBUG_ENV, "0");
+            std::env::set_var(crate::logging::LOG_DIR_ENV, "");
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("USERPROFILE");
+        }
+        assert!(!debug_enabled(true), "前提：显式关闭 debug 写入");
+        let log_dir = crate::logging::resolve_log_dir().expect("默认日志目录应可解析");
+        sweep_default_logs_at(Some(&log_dir), SystemTime::now());
+
+        assert!(!old.exists(), "debug 关闭时也必须清理 Default 目录");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// sweep 与 sink 只使用调用方传入的同一份解析结果；真实 env 随后变化不影响二者。
+    #[test]
+    fn test_sweep_and_sink_share_one_resolved_log_dir() {
+        let _guard = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvRestore::capture(&[
+            DEBUG_ENV,
+            crate::logging::LOG_DIR_ENV,
+            "HOME",
+            "USERPROFILE",
+        ]);
+        let home_a = temp_dir("shared_dir_home_a");
+        let home_b = temp_dir("shared_dir_home_b");
+        let logs_a = home_a.join(".yushan").join("logs");
+        let logs_b = home_b.join(".yushan").join("logs");
+        std::fs::create_dir_all(&logs_a).unwrap();
+        std::fs::create_dir_all(&logs_b).unwrap();
+        let old_a = logs_a.join("debug-old.jsonl");
+        let old_b = logs_b.join("debug-old.jsonl");
+        write_aged_debug_file(&old_a);
+        write_aged_debug_file(&old_b);
+
+        // SAFETY: 持有 env_lock。先解析 Default 结果，再故意把 env 指向另一个 Override 目录。
+        unsafe {
+            std::env::set_var(DEBUG_ENV, "1");
+            std::env::set_var(crate::logging::LOG_DIR_ENV, "");
+            std::env::set_var("HOME", &home_a);
+            std::env::remove_var("USERPROFILE");
+        }
+        let resolved = crate::logging::resolve_log_dir().expect("Default 日志目录应可解析");
+
+        // SAFETY: 持有 env_lock。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &logs_b);
+            std::env::set_var("HOME", &home_b);
+        }
+
+        sweep_default_logs_at(Some(&resolved), SystemTime::now());
+        let session = home_a.join("sessions").join("session-1.jsonl");
+        let mut sink = open_enabled(false, Some(&session), Some(&resolved))
+            .expect("传入已解析目录时必须打开 sink");
+        let switched = sink
+            .path_for_session(Some(Path::new("/sessions/session-2.jsonl")))
+            .expect("sink 应保存启动期目录");
+        sink.flush("RunFinished");
+
+        assert!(!old_a.exists(), "sweep 必须使用传入的 Default 目录");
+        assert!(old_b.exists(), "后续 env 变化不得改变 sweep 目录");
+        assert_eq!(switched, logs_a.join("debug-session-2.jsonl"));
+        assert!(
+            logs_a.join("debug-session-1.jsonl").exists(),
+            "sink 必须使用与 sweep 相同的解析结果"
+        );
+        assert!(
+            !logs_b.join("debug-session-1.jsonl").exists(),
+            "sink 不得重新读取后续 env"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_a);
+        let _ = std::fs::remove_dir_all(&home_b);
     }
 
     #[test]
@@ -1734,10 +1990,11 @@ mod tests {
         // SAFETY: 持有 env_lock。
         unsafe { std::env::set_var(crate::logging::LOG_DIR_ENV, &dir) };
 
-        let path = debug_path_for(Some(Path::new("/sessions/session-42.json"))).unwrap();
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
+        let path = debug_path_for(Some(Path::new("/sessions/session-42.json")), &log_dir);
         assert_eq!(path, dir.join("debug-session-42.jsonl"));
 
-        let fallback = debug_path_for(None).unwrap();
+        let fallback = debug_path_for(None, &log_dir);
         let name = fallback.file_name().unwrap().to_string_lossy().to_string();
         assert!(
             name.starts_with(&format!("debug-{}-", std::process::id())),

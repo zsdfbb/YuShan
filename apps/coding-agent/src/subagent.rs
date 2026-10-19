@@ -1,7 +1,7 @@
 //! subagent 派发（刀 4）—— app 侧**真活**：造子执行环境、跑、落盘、截断、记账。
 //!
 //! 形态由 [ADR-0022](../../../docs/adr/0022-subagent-dispatch.md) 定死：
-//! 子事件**不进**父事件流（`NoopEventSink`）、子表 = 父表去掉 `subagent`、
+//! 子事件只在本地 `CollectingSink` 收集、**不进**父事件流；子表 = 父表去掉 `subagent`、
 //! 结果 = 硬截断摘要 + 产物路径 + `StopReason`、取消 = `ChildBoundary` 只透传
 //! `is_aborted`。落地裁定见 [ADR-0029](../../../docs/adr/0029-subagent-landing-decisions.md)：
 //! 每回合派发总量上限、`model` 名解析失败 fail-closed、产物目录 sweep + 环境变量覆盖口。
@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use ys_component::RunLimits;
-use ys_core::{StopReason, Usage};
-use ys_event::NoopEventSink;
+use ys_core::{ContentBlock, StopReason, ToolCallId, Usage};
+use ys_event::{AgentEvent, CollectingSink};
 use ys_loop::AgentInput;
 use ys_model::Model;
 use ys_protocol::{Boundary, BoundarySource, QueueBoundarySource};
@@ -36,6 +36,27 @@ pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 派发工具外闸相对**子预算**的宽限：让协作路径（watchdog → 轮边界）先赢，
 /// 外闸只兜「连轮边界都到不了」的挂死（ADR-0029 修正 2）。
 pub const OUTER_GRACE: Duration = Duration::from_secs(60);
+/// 单条诊断的硬上限（含 `[diagnostic:` 前缀与截断标记）。
+const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+const DIAGNOSTIC_PREFIX: &str = "[diagnostic: ";
+
+/// 子 agent 被取消时的可归因来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelCause {
+    ParentTurnCancelled,
+    ChildBudget,
+    Unknown,
+}
+
+impl CancelCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentTurnCancelled => "parent-turn-cancelled",
+            Self::ChildBudget => "child-budget",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 /// 子 agent 的边界源：`is_aborted` 透传父的；`take()` **只取自己那份**，绝不消费父队列。
 ///
@@ -191,8 +212,7 @@ impl SubagentsDir {
 /// 把有效强度纳入键，是为了让 `/effort` 或配置默认变化后，同名子 Agent 不以
 /// 旧档位复用既有实例。已知边界：键不含 provider / api_base —— 二者变化不会
 /// 使缓存失效。
-pub(crate) type SubagentModelCache =
-    Arc<Mutex<HashMap<(String, Option<String>), Arc<dyn Model>>>>;
+pub(crate) type SubagentModelCache = Arc<Mutex<HashMap<(String, Option<String>), Arc<dyn Model>>>>;
 
 /// app 侧的派发实现：每回合构造一份（计数器天然 per-turn）。
 pub struct AppSubagentRunner<'a> {
@@ -323,6 +343,8 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         model: Option<&str>,
         boundary: Option<&dyn BoundarySource>,
     ) -> Result<SubagentOutcome, String> {
+        let started = Instant::now();
+
         // fail-closed：未支持按名构造模型时**绝不静默回退到父模型**。
         let owned: Option<Arc<dyn Model>> = match model {
             None => None,
@@ -398,7 +420,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let _watchdog_guard = tokio_util::task::AbortOnDropHandle::new(handle);
 
         let mut session = MemorySession::new();
-        let mut sink = NoopEventSink;
+        let mut sink = CollectingSink::new();
         let result = child
             .run_turn(
                 AgentInput::text(format!("{prompt}{CHILD_TASK_SUFFIX}")),
@@ -410,18 +432,37 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 ),
             )
             .await;
+        let elapsed_ms = trusted_elapsed_ms(started);
+        let raw_tool_results = collect_raw_tool_results(sink.events());
 
         let outcome = match result {
             Ok(run) => {
                 self.totals.add(&run.usage);
                 let summary =
                     ensure_files_section(&transcript_summary(&session, run.final_message.as_ref()));
-                let artifact = self.dir.write_transcript(&transcript_body(&session)).ok();
-                let stop_reason = run.stop_reason.clone();
-                let diagnostic = match &stop_reason {
-                    StopReason::Completed => None,
-                    other => Some(format!("子 agent 未正常收尾：{other:?}")),
+                let stop_reason = run.stop_reason;
+                let cause = cancel_cause(
+                    &stop_reason,
+                    is_parent_cancelled(boundary),
+                    child_boundary.own().is_aborted(),
+                );
+                let mut details = Vec::new();
+                let body = transcript_body(
+                    &session,
+                    &raw_tool_results,
+                    &stop_reason,
+                    cause,
+                    elapsed_ms,
+                    run_diagnostic(&stop_reason, cause, elapsed_ms, &details).as_deref(),
+                );
+                let artifact = match self.dir.write_transcript(&body) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        details.push(format!("transcript write failed: {error}"));
+                        None
+                    }
                 };
+                let diagnostic = run_diagnostic(&stop_reason, cause, elapsed_ms, &details);
                 SubagentOutcome {
                     summary,
                     artifact: artifact.map(|p| p.display().to_string()),
@@ -431,19 +472,128 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 }
             }
             Err(e) => {
-                // 「跑都跑不起来」—— 仍尽量留下已写出的转录。
-                let artifact = self.dir.write_transcript(&transcript_body(&session)).ok();
+                // 「跑都跑不起来」仍尽量留转录；错误文本只进诊断，不伪装成父/子取消。
+                let stop_reason = StopReason::Cancelled;
+                let cause = Some(CancelCause::Unknown);
+                let mut details = vec![format!("error={e}")];
+                let body = transcript_body(
+                    &session,
+                    &raw_tool_results,
+                    &stop_reason,
+                    cause,
+                    elapsed_ms,
+                    run_diagnostic(&stop_reason, cause, elapsed_ms, &details).as_deref(),
+                );
+                let artifact = match self.dir.write_transcript(&body) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        details.push(format!("transcript write failed: {error}"));
+                        None
+                    }
+                };
+                let diagnostic = run_diagnostic(&stop_reason, cause, elapsed_ms, &details);
                 SubagentOutcome {
                     summary: String::new(),
                     artifact: artifact.map(|p| p.display().to_string()),
-                    stop_reason: StopReason::Cancelled,
-                    diagnostic: Some(format!("子 agent 执行失败: {e}")),
+                    stop_reason,
+                    diagnostic,
                     usage: Usage::default(),
                 }
             }
         };
         Ok(outcome)
     }
+}
+
+fn trusted_elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn is_parent_cancelled(boundary: Option<&dyn BoundarySource>) -> bool {
+    boundary.is_some_and(|source| source.is_aborted())
+}
+
+/// 只有 `Cancelled` 有 `cause`；父取消优先于子预算，无法归因时为 `Unknown`。
+fn cancel_cause(
+    stop_reason: &StopReason,
+    parent_cancelled: bool,
+    child_cancelled: bool,
+) -> Option<CancelCause> {
+    if !matches!(stop_reason, StopReason::Cancelled) {
+        return None;
+    }
+    Some(if parent_cancelled {
+        CancelCause::ParentTurnCancelled
+    } else if child_cancelled {
+        CancelCause::ChildBudget
+    } else {
+        CancelCause::Unknown
+    })
+}
+
+fn stop_reason_label(stop_reason: &StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::Completed => "completed",
+        StopReason::MaxRounds => "max-rounds",
+        StopReason::Cancelled => "cancelled",
+        StopReason::Truncated => "truncated",
+        StopReason::NoOutput => "no-output",
+        _ => "unknown",
+    }
+}
+
+fn run_diagnostic(
+    stop_reason: &StopReason,
+    cause: Option<CancelCause>,
+    elapsed_ms: u64,
+    details: &[String],
+) -> Option<String> {
+    if matches!(stop_reason, StopReason::Completed) && details.is_empty() {
+        return None;
+    }
+
+    let mut payload = format!(
+        "stop_reason={} elapsed_ms={elapsed_ms}",
+        stop_reason_label(stop_reason)
+    );
+    if let Some(cause) = cause {
+        payload.push_str(&format!(" cause={}", cause.as_str()));
+    }
+    for detail in details {
+        payload.push(' ');
+        payload.push_str(detail);
+    }
+    Some(render_diagnostic(&payload))
+}
+
+/// 清洗控制字符并保证最终整条诊断不超过 [`MAX_DIAGNOSTIC_BYTES`]。
+fn render_diagnostic(payload: &str) -> String {
+    let sanitized: String = payload
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let full = format!("{DIAGNOSTIC_PREFIX}{sanitized}]");
+    if full.len() <= MAX_DIAGNOSTIC_BYTES {
+        return full;
+    }
+
+    const ELLIPSIS: &str = "...";
+    let budget = MAX_DIAGNOSTIC_BYTES - DIAGNOSTIC_PREFIX.len() - ELLIPSIS.len();
+    let mut end = budget;
+    while end > 0 && !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{DIAGNOSTIC_PREFIX}{}{ELLIPSIS}", &sanitized[..end])
+}
+
+fn collect_raw_tool_results(events: &[AgentEvent]) -> HashMap<ToolCallId, String> {
+    let mut results = HashMap::new();
+    for event in events {
+        if let AgentEvent::ToolResult { id, result } = event {
+            results.insert(id.clone(), result.content.clone());
+        }
+    }
+    results
 }
 
 /// 追加在子 agent 任务正文之后的一行要求：让子 agent 按 `## Files` 节汇报产物。
@@ -489,11 +639,63 @@ fn text_of(m: &ys_core::Message) -> String {
         .join("\n")
 }
 
-fn transcript_body(session: &MemorySession) -> String {
+fn transcript_body(
+    session: &MemorySession,
+    raw_tool_results: &HashMap<ToolCallId, String>,
+    stop_reason: &StopReason,
+    cause: Option<CancelCause>,
+    elapsed_ms: u64,
+    diagnostic: Option<&str>,
+) -> String {
     let mut out = String::new();
     for m in session.messages() {
-        out.push_str(&format!("## {:?}\n{}\n\n", m.role, text_of(m)));
+        out.push_str(&format!("## {:?}\n", m.role));
+        for block in &m.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    out.push_str(&format!("[tool_use id={} name={name}]\n", id.0));
+                    out.push_str(
+                        &serde_json::to_string_pretty(arguments)
+                            .unwrap_or_else(|_| arguments.to_string()),
+                    );
+                    out.push('\n');
+                }
+                ContentBlock::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                } => {
+                    let content = raw_tool_results
+                        .get(tool_call_id)
+                        .map(String::as_str)
+                        .unwrap_or(content);
+                    out.push_str(&format!(
+                        "[tool_result id={} is_error={is_error}]\n{content}\n",
+                        tool_call_id.0
+                    ));
+                }
+                _ => out.push_str("[unknown content block]\n"),
+            }
+        }
+        out.push('\n');
     }
+    out.push_str("## Run\n");
+    out.push_str(&format!("stop_reason={}\n", stop_reason_label(stop_reason)));
+    if let Some(cause) = cause {
+        out.push_str(&format!("cause={}\n", cause.as_str()));
+    }
+    out.push_str(&format!("elapsed_ms={elapsed_ms}\n"));
+    out.push_str("diagnostic=");
+    out.push_str(diagnostic.unwrap_or("(none)"));
+    out.push('\n');
     out
 }
 
@@ -564,12 +766,21 @@ impl Tool for SubagentTool {
             .await
             .map_err(ToolError::Execution)?;
 
-        let mut content = out.summary;
-        if let Some(a) = &out.artifact {
-            content.push_str(&format!("\n[full transcript: {a}]"));
-        }
+        let mut content = String::new();
         if let Some(d) = &out.diagnostic {
-            content.push_str(&format!("\n[diagnostic: {d}]"));
+            content.push_str(d);
+        }
+        if !out.summary.is_empty() {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&out.summary);
+        }
+        if let Some(a) = &out.artifact {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&format!("[full transcript: {a}]"));
         }
         Ok(ToolResult {
             content,
@@ -581,6 +792,7 @@ impl Tool for SubagentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use ys_core::Role;
 
     #[test]
@@ -718,7 +930,8 @@ mod tests {
                     summary: format!("摘要:{prompt}"),
                     artifact: Some("/tmp/t.md".into()),
                     stop_reason: self.0.clone(),
-                    diagnostic: (self.0 != StopReason::Completed).then(|| "boom".into()),
+                    diagnostic: (self.0 != StopReason::Completed)
+                        .then(|| "[diagnostic: stop_reason=max-rounds elapsed_ms=1]".into()),
                     usage: Usage::default(),
                 })
             }
@@ -744,6 +957,15 @@ mod tests {
             .await
             .unwrap();
         assert!(r2.is_error, "非 Completed ⇒ is_error（父回合不失败）");
+        assert!(
+            r2.content.starts_with("[diagnostic:"),
+            "诊断必须是正文首行：{}",
+            r2.content
+        );
+        let diagnostic_at = r2.content.find("[diagnostic:").unwrap();
+        let summary_at = r2.content.find("摘要:干活").unwrap();
+        let path_at = r2.content.find("[full transcript:").unwrap();
+        assert!(diagnostic_at < summary_at && summary_at < path_at);
 
         // 未挂载 ⇒ Execution 错误。
         let bare = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."));
@@ -1030,7 +1252,536 @@ mod tests {
     fn transcript_body_renders_roles() {
         let s = MemorySession::new();
         // 空会话 → 空正文（不 panic）。
-        assert_eq!(transcript_body(&s), "");
+        let body = transcript_body(&s, &HashMap::new(), &StopReason::Completed, None, 0, None);
+        assert!(
+            body.starts_with("## Run\nstop_reason=completed\nelapsed_ms=0\n"),
+            "{body}"
+        );
         let _ = Role::User;
+    }
+
+    #[test]
+    fn cancel_cause_prioritizes_parent_and_only_marks_cancelled() {
+        assert_eq!(
+            cancel_cause(&StopReason::Cancelled, false, false),
+            Some(CancelCause::Unknown)
+        );
+        assert_eq!(
+            cancel_cause(&StopReason::Cancelled, false, true),
+            Some(CancelCause::ChildBudget)
+        );
+        assert_eq!(
+            cancel_cause(&StopReason::Cancelled, true, true),
+            Some(CancelCause::ParentTurnCancelled),
+            "父取消优先于同时到点的子预算"
+        );
+        assert_eq!(cancel_cause(&StopReason::MaxRounds, true, true), None);
+        assert_eq!(cancel_cause(&StopReason::Completed, false, false), None);
+    }
+
+    #[test]
+    fn diagnostic_is_single_line_bounded_and_utf8_safe() {
+        let clean = render_diagnostic("stop_reason=cancelled\r\ncause=x\u{7}\telapsed_ms=12");
+        assert!(clean.starts_with(DIAGNOSTIC_PREFIX), "{clean}");
+        assert!(clean.ends_with(']'), "{clean}");
+        assert!(
+            !clean.chars().any(char::is_control),
+            "控制字符必须替换成空格：{clean:?}"
+        );
+        assert!(clean.contains("stop_reason=cancelled"), "{clean:?}");
+        assert!(clean.contains("cause=x"), "{clean:?}");
+        assert!(clean.contains("elapsed_ms=12"), "{clean:?}");
+
+        let long = format!("stop_reason=cancelled error={}", "中".repeat(600));
+        let truncated = render_diagnostic(&long);
+        assert!(
+            truncated.starts_with(DIAGNOSTIC_PREFIX),
+            "截断后仍须保留前缀"
+        );
+        assert!(
+            truncated.len() <= MAX_DIAGNOSTIC_BYTES,
+            "诊断 {} bytes 超上限",
+            truncated.len()
+        );
+        assert!(truncated.ends_with("..."), "截断标记必须是 ASCII ...");
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn run_diagnostic_has_cause_only_for_cancelled() {
+        let cancelled = run_diagnostic(
+            &StopReason::Cancelled,
+            Some(CancelCause::ParentTurnCancelled),
+            17,
+            &[],
+        )
+        .unwrap();
+        assert!(cancelled.contains("stop_reason=cancelled"));
+        assert!(cancelled.contains("cause=parent-turn-cancelled"));
+        assert!(cancelled.contains("elapsed_ms=17"));
+
+        let max_rounds = run_diagnostic(&StopReason::MaxRounds, None, 23, &[]).unwrap();
+        assert!(max_rounds.contains("stop_reason=max-rounds"));
+        assert!(!max_rounds.contains("cause="));
+        assert!(max_rounds.contains("elapsed_ms=23"));
+        assert_eq!(run_diagnostic(&StopReason::Completed, None, 1, &[]), None);
+    }
+
+    #[tokio::test]
+    async fn transcript_prefers_event_result_when_session_was_budget_elided() {
+        use ys_session::Session;
+
+        let id = ToolCallId("call-big".into());
+        let original = (0..60)
+            .map(|i| {
+                if i == 50 {
+                    "ORIGINAL_TOOL_RESULT_MARKER".to_string()
+                } else {
+                    format!("line {i:03}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = ys_core::Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_call_id: id.clone(),
+                content: original.clone(),
+                is_error: true,
+            }],
+        };
+        let degraded = ys_loop::elide_message(&message).expect("60 行结果应触发回合预算降级");
+        let degraded_text = match &degraded.content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            _ => unreachable!(),
+        };
+        assert!(degraded_text.contains(ys_loop::ELIDED_MARKER));
+        assert!(!degraded_text.contains("ORIGINAL_TOOL_RESULT_MARKER"));
+
+        let mut session = MemorySession::new();
+        session.append(degraded).await.unwrap();
+        let mut raw = HashMap::new();
+        raw.insert(id.clone(), original);
+        let body = transcript_body(&session, &raw, &StopReason::Completed, None, 9, None);
+        assert!(body.contains("[tool_result id=call-big is_error=true]"));
+        assert!(
+            body.contains("ORIGINAL_TOOL_RESULT_MARKER"),
+            "必须写事件中的原始工具结果：{body}"
+        );
+        assert!(!body.contains(ys_loop::ELIDED_MARKER));
+        assert!(body.contains("stop_reason=completed"));
+        assert!(body.contains("elapsed_ms=9"));
+    }
+
+    struct RecordingModel {
+        id: String,
+        responses: Mutex<VecDeque<ys_model::ModelResponse>>,
+        requests: Mutex<Vec<ys_model::ModelRequest>>,
+        delay: Duration,
+    }
+
+    impl RecordingModel {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                responses: Mutex::new(VecDeque::new()),
+                requests: Mutex::new(Vec::new()),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+
+        fn push_tool_call(&self, id: &str, name: &str, arguments: serde_json::Value) -> &Self {
+            self.responses
+                .lock()
+                .unwrap()
+                .push_back(ys_model::ModelResponse {
+                    message: ys_core::Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ToolCallId(id.to_string()),
+                            name: name.to_string(),
+                            arguments,
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: ys_model::FinishReason::ToolCalls,
+                });
+            self
+        }
+
+        fn push_text(&self, text: &str) -> &Self {
+            self.responses
+                .lock()
+                .unwrap()
+                .push_back(ys_model::ModelResponse {
+                    message: ys_core::Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: text.to_string(),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: ys_model::FinishReason::Stop,
+                });
+            self
+        }
+
+        fn requests(&self) -> Vec<ys_model::ModelRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Model for RecordingModel {
+        fn model_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn complete(
+            &self,
+            request: ys_model::ModelRequest,
+            _sink: &mut dyn ys_model::ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            self.requests.lock().unwrap().push(request);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("RecordingModel 响应队列已耗尽"))
+        }
+    }
+
+    fn request_has_elided_tool_result(request: &ys_model::ModelRequest) -> bool {
+        request.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { content, .. }
+                        if content.contains(ys_loop::ELIDED_MARKER)
+                )
+            })
+        })
+    }
+
+    fn unique_subagent_test_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(100);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "yushan_subagent_{label}_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_runner<'a>(
+        model: &'a dyn Model,
+        base: &std::path::Path,
+        dir: Arc<SubagentsDir>,
+        limits: RunLimits,
+    ) -> AppSubagentRunner<'a> {
+        test_runner_with_budget(model, base, dir, limits, Duration::from_secs(30))
+    }
+
+    fn test_runner_with_budget<'a>(
+        model: &'a dyn Model,
+        base: &std::path::Path,
+        dir: Arc<SubagentsDir>,
+        limits: RunLimits,
+        child_budget: Duration,
+    ) -> AppSubagentRunner<'a> {
+        use ys_tools_web::FetchedDir;
+
+        AppSubagentRunner::new(
+            Some(model),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            "child prompt".to_string(),
+            limits,
+            child_budget,
+            base.to_path_buf(),
+            WebConfig::offline(FetchedDir::Temp(base.join("fetched"))),
+            dir,
+            Arc::new(UsageTotals::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn app_runner_transcript_contains_full_tool_trace() {
+        use ys_model::MockModel;
+
+        let base = unique_subagent_test_dir("full_trace");
+        std::fs::write(base.join("note.txt"), "NOTE_FROM_TOOL\n").unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("read", serde_json::json!({"path": "note.txt"}));
+        model.push_text("FULL_TRACE_FINAL_TEXT_MARKER");
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner(&model, &base, dir, RunLimits::new(4));
+
+        let out = runner.run("读文件", None, None).await.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Completed);
+        assert_eq!(out.diagnostic, None);
+        let artifact = out.artifact.expect("应写转录");
+        let body = std::fs::read_to_string(artifact).unwrap();
+        assert!(body.contains("[tool_use id=mock-read name=read]"), "{body}");
+        assert!(body.contains("\"path\": \"note.txt\""), "{body}");
+        assert!(
+            body.contains("[tool_result id=mock-read is_error=false]"),
+            "{body}"
+        );
+        assert!(body.contains("NOTE_FROM_TOOL"), "{body}");
+        assert!(
+            body.contains("FULL_TRACE_FINAL_TEXT_MARKER"),
+            "Text 块原文必须保留：{body}"
+        );
+        assert!(body.contains("## Run\nstop_reason=completed\n"));
+        assert!(body.contains("elapsed_ms="));
+        assert!(body.contains("diagnostic=(none)"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_turn_budget_elides_session_but_transcript_keeps_raw_result() {
+        let base = unique_subagent_test_dir("turn_budget_raw");
+        let big = (0..60)
+            .map(|i| {
+                if i == 50 {
+                    "ORIGINAL_TURN_BUDGET_MARKER".to_string()
+                } else {
+                    format!("line {i:03}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(base.join("big.txt"), big).unwrap();
+        std::fs::write(base.join("small.txt"), "SECOND_TOOL_RESULT\n").unwrap();
+
+        let model = RecordingModel::new("recording");
+        model
+            .push_tool_call("call-big", "read", serde_json::json!({"path": "big.txt"}))
+            .push_tool_call(
+                "call-small",
+                "read",
+                serde_json::json!({"path": "small.txt"}),
+            )
+            .push_text("TURN_BUDGET_FINAL_TEXT_MARKER");
+        let mut limits = RunLimits::new(5);
+        limits.max_turn_tool_result_tokens = 1;
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner(&model, &base, dir, limits);
+
+        let out = runner.run("预算回归", None, None).await.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Completed);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3, "两批工具后应发生第三次模型请求");
+        assert!(
+            request_has_elided_tool_result(&requests[2]),
+            "第二次工具结果落盘后，下一次模型请求必须看到被 turn budget 降级的结果"
+        );
+
+        let artifact = out.artifact.expect("应写转录");
+        let body = std::fs::read_to_string(artifact).unwrap();
+        assert!(
+            body.contains("ORIGINAL_TURN_BUDGET_MARKER"),
+            "落盘转录必须保留事件里的原始 ToolResult：{body}"
+        );
+        assert!(
+            !body.contains(ys_loop::ELIDED_MARKER),
+            "落盘转录不得使用已被预算改写的会话正文：{body}"
+        );
+        assert!(body.contains("TURN_BUDGET_FINAL_TEXT_MARKER"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_later_tool_result_with_same_id_wins_in_transcript() {
+        let base = unique_subagent_test_dir("duplicate_id");
+        std::fs::write(base.join("first.txt"), "FIRST_DUP_RESULT\n").unwrap();
+        std::fs::write(base.join("second.txt"), "SECOND_DUP_RESULT\n").unwrap();
+        let model = RecordingModel::new("recording");
+        model
+            .push_tool_call("call-dup", "read", serde_json::json!({"path": "first.txt"}))
+            .push_tool_call(
+                "call-dup",
+                "read",
+                serde_json::json!({"path": "second.txt"}),
+            )
+            .push_text("DUPLICATE_ID_FINAL_TEXT");
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner(&model, &base, dir, RunLimits::new(5));
+
+        let out = runner.run("重复 id", None, None).await.unwrap();
+        let body = std::fs::read_to_string(out.artifact.expect("应写转录")).unwrap();
+        assert!(
+            !body.contains("FIRST_DUP_RESULT"),
+            "同 id 的较早 ToolResult 应被后到值覆盖：{body}"
+        );
+        assert_eq!(
+            body.matches("SECOND_DUP_RESULT").count(),
+            2,
+            "两个同 id 会话块都应使用后到的原始结果：{body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_run_error_is_unknown_cause_and_sanitized() {
+        use ys_model::MockModel;
+
+        let base = unique_subagent_test_dir("run_error");
+        let model = MockModel::new("m");
+        model.push_error("provider failed\nsecond line\r\u{7}");
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner(&model, &base, dir, RunLimits::new(2));
+
+        let out = runner.run("失败", None, None).await.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Cancelled);
+        let diagnostic = out.diagnostic.expect("Run Err 必须有诊断");
+        assert!(diagnostic.starts_with(DIAGNOSTIC_PREFIX));
+        assert!(diagnostic.contains("stop_reason=cancelled"));
+        assert!(diagnostic.contains("cause=unknown"));
+        assert!(diagnostic.contains("elapsed_ms="));
+        assert!(diagnostic.contains("provider failed second line"));
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(diagnostic.len() <= MAX_DIAGNOSTIC_BYTES);
+
+        let artifact = out.artifact.expect("即使 Run Err 也应尽量写转录");
+        let body = std::fs::read_to_string(artifact).unwrap();
+        assert!(body.contains("cause=unknown"));
+        assert!(body.contains("diagnostic=[diagnostic: stop_reason=cancelled"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_write_failure_is_reported_in_diagnostic() {
+        use ys_model::MockModel;
+
+        let base = unique_subagent_test_dir("write_failure");
+        let blocker = base.join("not-a-directory");
+        std::fs::write(&blocker, "file blocks create_dir_all").unwrap();
+        let model = MockModel::new("m");
+        model.push_text("WRITE_FAILURE_SUMMARY_MARKER");
+        let runner = test_runner(
+            &model,
+            &base,
+            Arc::new(SubagentsDir::at(blocker, false)),
+            RunLimits::new(2),
+        );
+
+        let out = runner.run("写失败", None, None).await.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Completed);
+        assert_eq!(out.artifact, None);
+        assert!(
+            out.summary.contains("WRITE_FAILURE_SUMMARY_MARKER"),
+            "写失败不得吞掉已有摘要：{}",
+            out.summary
+        );
+        assert!(out.summary.contains("## Files"));
+        let diagnostic = out.diagnostic.expect("写失败必须产生诊断");
+        assert!(diagnostic.starts_with(DIAGNOSTIC_PREFIX));
+        assert!(diagnostic.contains("stop_reason=completed"));
+        assert!(diagnostic.contains("transcript write failed"));
+        assert!(!diagnostic.contains("cause="));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_parent_cancellation_wins_over_child_budget() {
+        use ys_model::MockModel;
+
+        let base = unique_subagent_test_dir("parent_cancel");
+        let parent = QueueBoundarySource::new();
+        parent.push(Boundary::Abort);
+        let model = MockModel::new("must-not-run");
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner(&model, &base, dir, RunLimits::new(2));
+
+        let out = runner.run("取消", None, Some(&parent)).await.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Cancelled);
+        let diagnostic = out.diagnostic.expect("取消必须有诊断");
+        assert!(diagnostic.contains("cause=parent-turn-cancelled"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_watchdog_child_budget_is_attributed() {
+        let base = unique_subagent_test_dir("child_budget");
+        std::fs::write(base.join("note.txt"), "note\n").unwrap();
+        let model = RecordingModel::new("slow-child").with_delay(Duration::from_millis(40));
+        model.push_tool_call(
+            "budget-read",
+            "read",
+            serde_json::json!({"path": "note.txt"}),
+        );
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner_with_budget(
+            &model,
+            &base,
+            dir,
+            RunLimits::new(2),
+            Duration::from_millis(5),
+        );
+
+        let out = runner.run("子预算", None, None).await.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Cancelled);
+        let diagnostic = out.diagnostic.expect("子预算取消必须有诊断");
+        assert!(
+            diagnostic.contains("cause=child-budget"),
+            "真实 watchdog 应归因为子预算：{diagnostic}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn app_runner_parent_cancel_wins_when_watchdog_budget_also_expires() {
+        let base = unique_subagent_test_dir("parent_and_budget");
+        std::fs::write(base.join("note.txt"), "note\n").unwrap();
+        let model = RecordingModel::new("slow-child").with_delay(Duration::from_millis(80));
+        model.push_tool_call(
+            "budget-read",
+            "read",
+            serde_json::json!({"path": "note.txt"}),
+        );
+        let parent = QueueBoundarySource::new();
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner_with_budget(
+            &model,
+            &base,
+            dir,
+            RunLimits::new(2),
+            Duration::from_millis(5),
+        );
+
+        let cancel_parent = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            parent.push(Boundary::Abort);
+        };
+        let (out, ()) = tokio::join!(runner.run("父取消", None, Some(&parent)), cancel_parent);
+        let out = out.unwrap();
+        assert_eq!(out.stop_reason, StopReason::Cancelled);
+        let diagnostic = out.diagnostic.expect("取消必须有诊断");
+        assert!(
+            diagnostic.contains("cause=parent-turn-cancelled"),
+            "父取消与子预算都到点时父取消优先：{diagnostic}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

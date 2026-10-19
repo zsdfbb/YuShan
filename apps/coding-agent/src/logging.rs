@@ -24,20 +24,46 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// ⇒ 只改 `HOME` 会把凭证一起改没，故必须有一个独立的覆盖口。
 pub const LOG_DIR_ENV: &str = "YUSHAN_LOG_DIR";
 
-/// 日志**目录**：`$YUSHAN_LOG_DIR`，否则 `~/.yushan/logs`（两者都不可得时为 `None`）。
+/// 日志目录来源。清理只作用于 [`LogDirSource::Default`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogDirSource {
+    Default,
+    Override,
+}
+
+/// 一次解析得到的日志目录及其来源。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LogDir {
+    pub(crate) path: PathBuf,
+    pub(crate) source: LogDirSource,
+}
+
+/// 解析日志目录及其来源：`$YUSHAN_LOG_DIR` 非空为覆盖目录，
+/// 否则为 `~/.yushan/logs`（两者都不可得时为 `None`）。
 ///
 /// 空字符串视为**未设置** —— 否则会静默落到当前工作目录，比不覆盖更糟。
 ///
 /// 这是诊断产物的统一父目录：`yushan.log` 与 `debug-*.jsonl` 都放在这里，
 /// 从而 `YUSHAN_LOG_DIR` 一次覆盖全部诊断输出。
-pub fn log_dir() -> Option<PathBuf> {
+pub(crate) fn resolve_log_dir() -> Option<LogDir> {
     if let Some(dir) = std::env::var_os(LOG_DIR_ENV)
         && !dir.is_empty()
     {
-        return Some(PathBuf::from(dir));
+        return Some(LogDir {
+            path: PathBuf::from(dir),
+            source: LogDirSource::Override,
+        });
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".yushan").join("logs"))
+    Some(LogDir {
+        path: PathBuf::from(home).join(".yushan").join("logs"),
+        source: LogDirSource::Default,
+    })
+}
+
+/// 日志**目录**：`$YUSHAN_LOG_DIR`，否则 `~/.yushan/logs`（两者都不可得时为 `None`）。
+pub fn log_dir() -> Option<PathBuf> {
+    resolve_log_dir().map(|dir| dir.path)
 }
 
 /// 默认日志文件：`log_dir()/yushan.log`（目录不可得时为 `None`）。
@@ -180,14 +206,35 @@ mod tests {
         // SAFETY: 持有 env_lock，独占这几个变量的修改与恢复。
         unsafe { std::env::set_var(LOG_DIR_ENV, &dir) };
         assert_eq!(default_log_path(), Some(dir.join("yushan.log")));
+        assert_eq!(
+            resolve_log_dir(),
+            Some(LogDir {
+                path: dir.clone(),
+                source: LogDirSource::Override,
+            })
+        );
 
         // 覆盖优先于 HOME：即便 HOME 不可得也照样给出路径。
         unsafe { std::env::remove_var("HOME") };
         assert_eq!(default_log_path(), Some(dir.join("yushan.log")));
 
-        // 空值 = 未设置 ⇒ 回落到 HOME（此处 HOME 已移除 ⇒ 无路径），而不是 `./yushan.log`。
-        unsafe { std::env::set_var(LOG_DIR_ENV, "") };
-        assert_eq!(default_log_path(), None, "空值不得落到当前工作目录");
+        // 空值 = 未设置：有 HOME 时回落默认目录并标为 Default。
+        unsafe {
+            std::env::set_var(LOG_DIR_ENV, "");
+            std::env::set_var("HOME", &dir);
+        }
+        assert_eq!(
+            resolve_log_dir(),
+            Some(LogDir {
+                path: dir.join(".yushan").join("logs"),
+                source: LogDirSource::Default,
+            }),
+            "空值不得落到当前工作目录"
+        );
+
+        // 无 HOME 时回到 None，而不是 `./yushan.log`。
+        unsafe { std::env::remove_var("HOME") };
+        assert_eq!(default_log_path(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

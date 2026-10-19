@@ -349,6 +349,8 @@ fn event_payloads(stdout: &str, name: &str) -> Vec<Value> {
 fn run_json(api_base: &str, task: &str, home: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ys-coding-agent"))
         .args(["--json", task])
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         .env("YUSHAN_API_BASE", api_base)
         .env("YUSHAN_API_KEY", "test-key")
         .env("YUSHAN_MODEL", "test-model")

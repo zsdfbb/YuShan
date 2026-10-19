@@ -128,6 +128,8 @@ fn isolate(cmd: &mut Command, roots: &Roots, api_base: &str) {
         .env("HOME", &roots.home)
         .env("PATH", &roots.path_dir)
         .env_remove("USERPROFILE")
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         .env("YUSHAN_SESSIONS_DIR", &roots.sessions_dir)
         // 模型侧凭证：指向回环 mock。
         .env("YUSHAN_API_BASE", api_base)

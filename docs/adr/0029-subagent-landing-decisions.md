@@ -37,11 +37,13 @@ accepted（2026-10-09；本轮四项待决已全部裁定为「本轮做」，�
 
 `Tool` 加**默认方法** `fn is_concurrency_safe(&self) -> bool { false }`；`RunLimits` 加字段 `max_parallel_tools`。
 **准入条件（承重）**：批次 `len > 1` **且**每一个工具都命中且 `is_concurrency_safe() == true` 才走并行；否则**原串行路径一字不改**。
-⇒ 今天没有任何工具为 `true` ⇒ 既有的一切批次仍走原路径（「逐字节不变」的全部依据）。本轮只有 `subagent` 覆写为 `true`；混合批次自动退回串行。
+当前声明为 `true` 的集合是 `subagent` 与只读工具 `read` / `find` / `ls` / `grep`；混合批次自动退回串行。
 
-实现用 `futures_util::stream::iter(...).buffered(n)`（**保序**、单任务内并发、不需 `'static`）；**不用** `tokio::spawn` / `JoinSet`
-（`Tool::call` 的 future 借了 `&dyn Tool` / `ToolContext<'_>`，非 `'static`）。`ctx.events: &mut dyn EventSink` 不能跨并发任务共享 ⇒
-**先串行 emit 全部 `ToolCall`，并发执行，再按原始顺序串行 emit 全部 `ToolResult`**；落盘 `ContentBlock` 顺序同理（ADR-0001 配对完整性）；审批检查提前到并发之前。
+实现用 `futures_util::stream::iter(...).buffer_unordered(n.max(1))`（单任务内并发、不需 `'static`）；**不用**
+`tokio::spawn` / `JoinSet`（`Tool::call` 的 future 借了 `&dyn Tool` / `ToolContext<'_>`，非 `'static`）。
+`ctx.events: &mut dyn EventSink` 不能跨并发任务共享 ⇒ **先串行 emit 全部 `ToolCall`，并发执行，完成一个就
+emit 一个 `ToolResult`**，同时按 future 携带的原始 index 写回 `outcomes`。父模型消息仍在 Step 9c
+按原始 `tool_call` 顺序组装（ADR-0001 配对完整性）；审批检查提前到并发之前。
 
 ### 3. 子独立预算：独立**实例**，取值**与主一致**
 
@@ -104,16 +106,17 @@ ADR-0022 写的「子必有界」在「取值与主一致」下**实际废弃**�
 - **A 最小复杂度**（**取**）：2 个 trait 默认方法 + 1 个 `RunLimits` 字段；Step 9 就地分叉；子预算直接调 `Config` 访问器，**不加 `Budget` 类型**。
 - **B 可扩展优先**（**否**）：把预算升为一等类型 `RunBudget { deadline, rounds_left, dispatches_left }` 穿过 `ys-component → ys-loop`；把工具批收成 `ToolBatchExecutor`；成本用 `CostLedger`。
   否的理由（ADR-0014「零消费者 ⇒ 不建」）：ADR-0027 的复核回合**不是**第二个预算消费者 —— 它与主回合**共享同一条 deadline**（`apps/coding-agent/src/app_loop.rs:131-133` 在 `pending` 循环之外算一次），今天已被正确覆盖；todo（ADR-0024）尚未驱动模型调用 ⇒ 第三个消费者是假想的。
-- **C 性能/资源优先**（**吸收三项**）：启动期冻结父子 spec 与 system prompt；`buffered` 保序；`AtomicU64` 记账；三条守卫测试。
-  其中三项被吸收 —— 它们不是性能优化，是**正确性守卫**：父/子前缀 `sha256` 锚（P0 指纹）；「同一子表构造两次逐字节相同」（ADR-0022 决策 19 的新抖动面）；并行必须用 `buffered`、**不得**用 `buffer_unordered` 再手工重排。
+- **C 性能/资源优先**（**吸收三项**）：启动期冻结父子 spec 与 system prompt；`buffer_unordered` 完成即发、会话消息保序；`AtomicU64` 记账；三条守卫测试。
+  其中三项被吸收 —— 它们不是性能优化，是**正确性守卫**：父/子前缀 `sha256` 锚（P0 指纹）；「同一子表构造两次逐字节相同」（ADR-0022 决策 19 的新抖动面）；并行必须用 `buffer_unordered` 完成即发，会话消息另行按原始 tool-call 顺序组装。
+- **按批等齐后按原序发结果（`buffered` 或先收集再重排）**（否决）：虽然事件顺序稳定，但先完成的结果被延迟，无法满足完成即发的可观测性契约。现行实现是 `buffer_unordered(max(1))`；事件按完成顺序，模型消息按原始 tool-call 顺序。
 
 ## Consequences
 
 - **全为加法式**：`ys-tool` +2 trait 默认方法 +1 字段；`ys-component` +1 常量 +1 字段；`ys-runtime` +1 字段；`ys-core` `Usage` +2 字段。
   **零破坏性变更、零 tokio 越界、零依赖方向变化。**
-- ⚠️ **Step 9 是本 ADR 唯一动既有执行语义的地方**，其行为变更被 `is_concurrency_safe()` 默认 `false` **完全闸住**（准入条件里的「每一个」）。
+- ⚠️ **Step 9 是本 ADR 唯一动既有执行语义的地方**；准入条件里的「每一个」保证只有全部显式声明安全的批次走并行，当前安全集合为 `subagent` + `read` / `find` / `ls` / `grep`。
 - `Source` / `Envelope` / `AgentEvent` / `ys-tui-coding` / 三个事件消费者**零改动**（ADR-0022 决策 2：子事件不发射 ⇒ `Source::subagent(id)` 不实现）。
-- **已知缺口（明确接受）**：① 子 agent 内部不可观测（只有落盘转录）；② 并行子 agent 的写冲突无人管（本仓无 branch/worktree、无沙箱，只能靠 guideline「写目标不相交」）；
+- **已知缺口（明确接受）**：① 子 agent 内部不在父输出通道中显示（只有落盘转录）；② 并行子 agent 的写冲突无人管（本仓无 branch/worktree、无沙箱，只能靠 guideline 检查依赖与写入范围，范围不明时串行）；
   ③ 子预算名义独立、实际由父回合 deadline 兜底；④ `Tool::timeout()` 依赖构造期注入 ⇒ `toolset::build_tools` 签名变更；
   ⑤ 成本读数对未上报缓存字段的 provider 恒 `0`（`u32` 而非 `Option<u32>`，与「真的 0 命中」不可区分）；⑥ `futures-util` 成为 `ys-loop` 直接依赖（已在 `Cargo.lock`，无新下载）；
   ⑦ `Tool::spec()` 必须是纯函数 —— 今天**没有**测试守卫它。

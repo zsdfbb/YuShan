@@ -423,13 +423,32 @@ impl Drop for Sandbox {
 /// 没有看门狗时测试会永久阻塞（而不是变红）。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 子进程的 debug 开关来源。集成测试不继承开发机环境：每个用例显式选择
+/// 「未设置（默认开启）」或「显式关闭」。
+#[derive(Clone, Copy)]
+enum DebugEnv {
+    Unset,
+    Off,
+}
+
 fn run_bin(bin: &Path, api_base: &str, sandbox: &Sandbox, args: &[&str]) -> Output {
+    run_bin_with_debug_env(bin, api_base, sandbox, args, DebugEnv::Unset)
+}
+
+fn run_bin_with_debug_env(
+    bin: &Path,
+    api_base: &str,
+    sandbox: &Sandbox,
+    args: &[&str],
+    debug_env: DebugEnv,
+) -> Output {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(&sandbox.workdir)
         .env("YUSHAN_API_BASE", api_base)
         .env("YUSHAN_API_KEY", "test-key")
         .env("YUSHAN_MODEL", "test-model")
+        .env_remove("YUSHAN_LOG_DIR")
         .env("YUSHAN_LOG_DIR", &sandbox.logs)
         .env("YUSHAN_SESSIONS_DIR", &sandbox.sessions)
         .env("HOME", &sandbox.home)
@@ -457,6 +476,14 @@ fn run_bin(bin: &Path, api_base: &str, sandbox: &Sandbox, args: &[&str]) -> Outp
         .env_remove("all_proxy")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    match debug_env {
+        DebugEnv::Unset => {
+            cmd.env_remove("YUSHAN_DEBUG");
+        }
+        DebugEnv::Off => {
+            cmd.env("YUSHAN_DEBUG", "0");
+        }
+    }
 
     let mut child = cmd.spawn().expect("spawn ys-coding-agent");
     // 必须**边跑边读**管道：输出（压缩用例的 80 KB 用户消息）超过管道缓冲时，
@@ -618,7 +645,17 @@ fn t1_debug_off_creates_no_debug_file_and_keeps_existing_diagnostics() {
             args.push("--debug");
         }
         args.push("hi");
-        let out = run_bin(&current_bin(), &server.api_base(), &sandbox, &args);
+        let out = if debug {
+            run_bin(&current_bin(), &server.api_base(), &sandbox, &args)
+        } else {
+            run_bin_with_debug_env(
+                &current_bin(),
+                &server.api_base(),
+                &sandbox,
+                &args,
+                DebugEnv::Off,
+            )
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         assert!(
@@ -671,6 +708,67 @@ fn t1_debug_off_creates_no_debug_file_and_keeps_existing_diagnostics() {
         normalize_log(&on_text),
         "debug 开关不得改变既有诊断输出\n--- off ---\n{off_text}\n--- on ---\n{on_text}"
     );
+}
+
+/// 未设置 `YUSHAN_DEBUG` 且不带 flag 时，两种单回合模式都应默认生成一个
+/// 独立的 debug 文件，并以完整 `run_end` 收尾。
+#[test]
+fn default_debug_env_writes_complete_run_end_for_print_and_json() {
+    for (tag, args) in [
+        ("default_print", ["-p", "hi"]),
+        ("default_json", ["--json", "hi"]),
+    ] {
+        let server = MockServer::start(vec![Step::text("hi", UsageSpec::NONE)]);
+        let sandbox = Sandbox::new(tag);
+
+        let out = run_bin(&current_bin(), &server.api_base(), &sandbox, &args);
+        assert!(
+            out.status.success(),
+            "{tag}: 默认 debug 不得改变运行结果\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            server.remaining_steps(),
+            0,
+            "{tag}: mock 脚本必须被完整消费"
+        );
+
+        let files = sandbox.debug_files();
+        assert_eq!(
+            files.len(),
+            1,
+            "{tag}: 默认开启时应恰好一个 debug 文件：{files:?}"
+        );
+        let raw = std::fs::read(&files[0]).unwrap();
+        assert!(
+            raw.ends_with(b"\n"),
+            "{tag}: debug 文件必须以完整 JSON 行收尾"
+        );
+        let records = debug_records(&files[0]);
+        let run_end = records
+            .last()
+            .unwrap_or_else(|| panic!("{tag}: debug 文件不得为空"));
+        assert_eq!(
+            run_end["ev"],
+            json!("run_end"),
+            "{tag}: 最后一行应为 run_end"
+        );
+        assert_eq!(
+            run_end["stop_reason"],
+            json!("RunFinished"),
+            "{tag}: run_end 必须有终局原因"
+        );
+        assert_eq!(
+            run_end["exit_code"],
+            json!(0),
+            "{tag}: run_end 必须记录成功退出码"
+        );
+        assert!(
+            !sandbox.home.join(".yushan").join("logs").exists(),
+            "{tag}: 显式 YUSHAN_LOG_DIR 不得把日志写回 HOME"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

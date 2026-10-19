@@ -49,6 +49,13 @@ use std::time::Duration;
 /// 子进程退出上限。worktree 动作秒级返回；`-p` 回合走回环 mock 也是秒级。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 子进程的 debug 环境。所有命令都先移除 `YUSHAN_LOG_DIR`，再由用例显式选择。
+#[derive(Clone, Copy)]
+enum DebugEnv {
+    Off,
+    Unset,
+}
+
 /// 进程内唯一临时目录：**原子序号 + `process::id()`**（并行安全，项目硬约定）。
 fn unique_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +79,7 @@ struct Sandbox {
     home: PathBuf,
     trees: PathBuf,
     sessions: PathBuf,
+    logs: PathBuf,
     /// 临时 git 仓（`<home>/Develop/YuShan`）。
     repo: PathBuf,
     /// 临时**非 git** 目录。
@@ -88,9 +96,10 @@ impl Sandbox {
         let home = base.join("home");
         let trees = base.join("trees");
         let sessions = base.join("sessions");
+        let logs = base.join("logs");
         let repo = home.join("Develop").join("YuShan");
         let plain = base.join("plain");
-        for d in [&home, &trees, &sessions, &plain] {
+        for d in [&home, &trees, &sessions, &logs, &plain] {
             std::fs::create_dir_all(d).unwrap();
         }
         Self {
@@ -98,6 +107,7 @@ impl Sandbox {
             home,
             trees,
             sessions,
+            logs,
             repo,
             plain,
         }
@@ -115,10 +125,15 @@ impl Drop for Sandbox {
 ///
 /// 刻意**不设置 `PATH`**：被测二进制需 spawn `git`（见文件头）。
 fn command(sb: &Sandbox, cwd: &Path) -> Command {
+    command_with_debug(sb, cwd, DebugEnv::Off)
+}
+
+fn command_with_debug(sb: &Sandbox, cwd: &Path, debug_env: DebugEnv) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ys-coding-agent"));
     cmd.current_dir(cwd)
         .env("HOME", &sb.home)
         .env_remove("USERPROFILE")
+        .env_remove("YUSHAN_LOG_DIR")
         .env("YUSHAN_WORKTREES_DIR", &sb.trees)
         .env("YUSHAN_SESSIONS_DIR", &sb.sessions)
         // 模型侧：清干净，使 N8 的「无凭证早退」与 N9 的 mock 凭证都确定。
@@ -137,6 +152,14 @@ fn command(sb: &Sandbox, cwd: &Path) -> Command {
         .env_remove("http_proxy")
         .env_remove("https_proxy")
         .env_remove("all_proxy");
+    match debug_env {
+        DebugEnv::Off => {
+            cmd.env("YUSHAN_DEBUG", "0");
+        }
+        DebugEnv::Unset => {
+            cmd.env_remove("YUSHAN_DEBUG");
+        }
+    }
     cmd
 }
 
@@ -167,6 +190,21 @@ fn streams(out: &Output) -> (String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+fn debug_jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("debug-") && name.ends_with(".jsonl"))
+        })
+        .collect()
 }
 
 /// 取以某个前缀开头的行（去前缀）。用于从 stderr 抓 `worktree: <name>` / `路径：<path>`。
@@ -396,6 +434,35 @@ fn n5_list_shows_names_and_paths_and_empty_repo_is_ok() {
         let want = want.to_str().unwrap();
         assert!(stdout.contains(want), "list 的 stdout 应含路径 {want:?}：\n{stdout}");
     }
+}
+
+/// 未设置 `YUSHAN_DEBUG`（默认开启）时，`worktree list` 仍在 sink 建立前早退，
+/// 不得创建 debug 文件。
+#[test]
+fn worktree_list_early_exit_creates_no_debug_files_with_default_debug_on() {
+    let sb = Sandbox::new("list_default_debug");
+    init_repo(&sb.repo);
+    let mut cmd = command_with_debug(&sb, &sb.repo, DebugEnv::Unset);
+    cmd.args(["worktree", "list"])
+        .env("YUSHAN_LOG_DIR", &sb.logs);
+    let out = run_cmd(cmd, &["worktree", "list"]);
+    let (_, stderr) = streams(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "空仓 list 应 exit(0)；stderr:\n{stderr}"
+    );
+
+    let debug_files = debug_jsonl_files(&sb.logs);
+    assert!(
+        debug_files.is_empty(),
+        "worktree list 早退不得建立 debug 文件：{debug_files:?}"
+    );
+    let home_debug_files = debug_jsonl_files(&sb.home.join(".yushan").join("logs"));
+    assert!(
+        home_debug_files.is_empty(),
+        "worktree list 早退不得绕过 Override 写进 HOME：{home_debug_files:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

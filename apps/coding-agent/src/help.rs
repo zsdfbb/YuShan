@@ -17,7 +17,7 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
   ys-coding-agent --help | -h | help     打印本帮助后退出（不读凭证、不建运行时）
 
 公共 flag：
-  --debug         打开结构化执行日志（YUSHAN_DEBUG 环境变量优先于本 flag）
+  --debug         兼容旧脚本；结构化执行日志默认开启，设置 YUSHAN_DEBUG=0 可关闭
   --resume [<id>] 恢复既有会话；空格形态 <id>，旧的 `--resume=<id>` 已移除
   --stats         把背压统计摘要写到 stderr（仅 `-p` / `--json` 的 flag 区）
   -h              `--help` 的别名
@@ -31,7 +31,8 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
   YUSHAN_CHANNEL_CAPACITY      信道容量（下限 16，默认 1024）
   YUSHAN_SESSIONS_DIR          会话目录覆盖
   YUSHAN_LOG_DIR               日志目录覆盖
-  YUSHAN_DEBUG                 打开 --debug（1/true/yes/on）；非空其他值关闭，优先于命令行 flag
+  YUSHAN_DEBUG                 结构化执行日志：默认开启；1/true/yes/on 开启，其余非空值关闭，
+                               优先于 --debug
   YUSHAN_DEBUG_ARGS            工具参数摘要档位：none / head / full，默认 head
   YUSHAN_SEARCH_SEARXNG_URL    搜索后端：SearXNG
   YUSHAN_SEARCH_DEEPSEEK_KEY   搜索后端：DeepSeek（亦认 DEEPSEEK_API_KEY，命名空间名优先）
@@ -63,10 +64,25 @@ TUI 斜杠命令：
 示例：
   ys-coding-agent -p "解释这个仓库的架构"
   ys-coding-agent --json --stats "跑一遍测试"
-  ys-coding-agent --resume 2026-10-07-abc
-"#;
+  ys-coding-agent --resume 2026-10-07-abc"#;
 
 /// 帮助文档全文（供 `main` 在 `parse_args` 之后立即早退打印）。
 pub fn help_text() -> &'static str {
     HELP_TEXT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_text_has_no_own_trailing_newline_and_documents_debug_default() {
+        assert!(!HELP_TEXT.ends_with('\n'), "`println!` 负责唯一的尾换行");
+        assert!(HELP_TEXT.contains("默认开启"));
+        assert!(HELP_TEXT.contains("YUSHAN_DEBUG=0"));
+
+        let rendered = format!("{}\n", help_text());
+        assert!(rendered.ends_with('\n'));
+        assert!(!rendered.ends_with("\n\n"), "help stdout 不得有双尾换行");
+    }
 }

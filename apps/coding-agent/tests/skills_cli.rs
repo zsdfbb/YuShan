@@ -114,6 +114,8 @@ impl Roots {
 /// ④⑤ 与本文件的三条 skill 断言**无关**，清掉只为让 stderr 的内容**完全由被测变量决定**。
 fn isolate(cmd: &mut Command, roots: &Roots) {
     cmd.current_dir(&roots.workspace)
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         .env("HOME", &roots.home)
         .env("PATH", &roots.path_dir)
         .env_remove("USERPROFILE")

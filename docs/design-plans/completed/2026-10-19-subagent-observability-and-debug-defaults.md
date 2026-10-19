@@ -5,7 +5,7 @@
 - 会话 `1792258864_767825000` 中，subagent 以 `Cancelled` 结束后只留下不醒目的 `✗`；父回合当时已被取消，没有机会继续推理。
 - 子转录只保存文本，工具调用与工具结果全部丢失，失败现场无法复核。
 - 并行 subagent 必须等整批结束才发出全部 `ToolResult`，先完成的任务也不会及时反馈。
-- debug 当前是 opt-in，关键时刻没有 JSONL 现场；默认关闭与“便于排障”的目标相反。
+- debug 需要在没有额外 flag 的正常运行中留下 JSONL 现场，否则关键故障缺少可聚合证据。
 - 现有 subagent 调度提示只约束写入范围，没有表达任务依赖、验证依赖和失败后的处理。
 
 ## 设计
@@ -25,9 +25,11 @@
   - CR、LF 及其他控制字符在截断前统一替换为一个 ASCII 空格，从而保证物理单行；
     替换后连续空格无需额外折叠。
   - `cause` 只在 `stop_reason == Cancelled` 时出现。父取消、子预算、未知三值及优先级仍按上文。
-  - `Run Err` 的错误文本进入 diagnostic 前走同一清洗与截断。该路径仍保持现有
-    `stop_reason=Cancelled` 契约，但固定写 `cause=unknown`，由 error 文本说明真实失败；
-    不把模型/运行时错误伪装成可归因的父取消或子预算。
+  - 只有子回合已经启动、`child.run_turn` 返回 `Err` 的路径才生成 `SubagentOutcome`，
+    其错误文本进入 diagnostic 前走同一清洗与截断；该诊断固定写
+    `stop_reason=cancelled cause=unknown`，由 error 文本说明真实失败，不伪装成父取消或子预算。
+    无可用模型、派发次数超限、`AgentBuilder` 组装失败等前置错误直接从 runner 返回 `Err`，
+    `SubagentTool` 映射为 `ToolError::Execution`，不生成 diagnostic 前缀。
 
   ```text
   [diagnostic: stop_reason=cancelled cause=parent-turn-cancelled elapsed_ms=1234]
@@ -53,7 +55,8 @@
 - 这样 `Text` / `ToolUse` 的顺序与边界仍由会话决定，被预算降级的工具结果不会污染诊断转录。
 - 末尾追加终局元数据：`stop_reason`、取消来源、`elapsed_ms`、诊断。
 - `write_transcript` 失败时仍返回可继续使用的 `SubagentOutcome`；错误文本并入诊断，不 panic、不丢弃已有摘要。
-- 摘要选取与 `## Files` 保证逻辑不变；摘要仍只取文本，不把工具参数混入 8 KiB 父上下文回传。
+- 摘要选取与 `## Files` 保证逻辑不变；摘要仍只取文本。`MAX_SUMMARY_BYTES = 8 KiB`
+  约束摘要文本主体，截断标记与随后追加的 `## Files` 节可使最终 summary 略超 8 KiB。
 
 ### 3. 并行工具结果即时可见
 
@@ -62,7 +65,7 @@
   携带原始 index，完成后立即发对应 `ToolResult`，同时写入 `outcomes[original_index]`。
   必须保留 `.max(1)` 防护，不能让配置值 0 产生永不推进的并行流。
 - 父模型回喂的单条 `Role::User` 消息仍在 Step 9c 按原始 tool-call 顺序组装；事件到达顺序与模型消息顺序明确分离。
-- 保留全部既有闸门：仅全部工具 `is_concurrency_safe()` 才并行、混合批退回串行、`max_parallel_tools` 限流、TUI 按 `ToolCallId` 回填。
+- 保留全部既有闸门：仅全部工具 `is_concurrency_safe()` 才并行、混合批退回串行、`max_parallel_tools` 限流、TUI 按 `ToolCallId` 回填。当前安全集合是 `subagent` 与只读工具 `read` / `find` / `ls` / `grep`。
 - 测试用可控完成顺序（`oneshot` / `Notify`，或至少明显分离的延迟）制造“快者先完成”；
   不依赖两个相近 `sleep` 的调度巧合。旧测试中硬编码 `R1,R2,...` 的断言改为分别验证：
   全部 `ToolCall` 先于任何 `ToolResult`、快者结果先发、会话结果仍按原始调用顺序。
@@ -159,7 +162,7 @@
 ### 测试合同（Phase 3 审查依据）
 
 #### N1: Subagent 失败诊断可解释
-- **验收方法**: `cargo test -p ys-coding-agent subagent` — 断言非完成结果首行以 `[diagnostic:` 开头，包含 `stop_reason`、`elapsed_ms`；`Cancelled` 包含 `cause`，父取消、子预算、未知三值均有覆盖，父取消优先级有断言；非 `Cancelled` 不写 `cause`；`Run Err` 为 `stop_reason=cancelled cause=unknown` 且 error 文本说明真实失败。
+- **验收方法**: `cargo test -p ys-coding-agent subagent` — 断言非完成结果首行以 `[diagnostic:` 开头，包含 `stop_reason`、`elapsed_ms`；`Cancelled` 包含 `cause`，父取消、子预算、未知三值均有覆盖，父取消优先级有断言；非 `Cancelled` 不写 `cause`；子回合启动后的 `run_turn Err` 为 `stop_reason=cancelled cause=unknown` 且 error 文本说明真实失败；无模型、派发超限、`AgentBuilder` 失败等前置 `Err` 直接映射为 `ToolError::Execution`，没有 diagnostic 前缀。
 - **清洗合同**: CR/LF/其他控制字符变空格；含多字节字符的边界输入按 UTF-8 安全截断；最终文本不超过 `MAX_DIAGNOSTIC_BYTES=1024`，超限以 ASCII `...` 结尾，且前缀仍位于开头。
 - **优先级**: 必测
 - **验收人**: review subagent
@@ -202,7 +205,7 @@
 - **验收人**: review subagent
 
 #### N9: 文档与契约同步
-- **验收方法**: `rg -n "buffer_unordered|按完成顺序|默认开启|7 天|parent-turn-cancelled|依赖|HELP_TEXT"` 指定的 ADR/as-built/AGENTS/TODO 文件 — 事件顺序、debug 默认值、清理规则、帮助单一尾换行与 subagent 诊断均有唯一、一致描述，且 `docs/TODO.md` 不再保留已完成的 debug sweep 待办。
+- **验收方法**: `rg -n "buffer_unordered|按完成顺序|默认开启|7 天|parent-turn-cancelled|ToolError::Execution|MAX_SUMMARY_BYTES|HELP_TEXT"` 指定的 ADR/as-built/AGENTS/TODO 文件 — 事件顺序、debug 默认值、清理规则、帮助单一尾换行、并发安全集合、runner 错误分界与摘要上限均有唯一、一致描述，且 `docs/TODO.md` 不再保留已完成的 debug sweep 待办。
 - **优先级**: 必测
 - **验收人**: review subagent
 
@@ -224,7 +227,8 @@
 | 把诊断放回摘要之后 | N1 首行断言 |
 | 父取消与子预算同时命中时选子预算 | N1 优先级断言 |
 | 让 CR/LF 原样穿过或截断切坏 UTF-8 | N1 单行与边界断言 |
-| 把 `Run Err` 的 cause 写成父取消/子预算 | N1 的 `cause=unknown` 断言 |
+| 把子回合启动后的 `run_turn Err` cause 写成父取消/子预算 | N1 的 `cause=unknown` 断言 |
+| 给前置 runner `Err` 伪造 diagnostic | N1 的 `ToolError::Execution` 断言 |
 | 转录忽略 `ToolUse` / `ToolResult` | N2 |
 | 转录只读已被 turn budget 降级的 `MemorySession` | N2 超预算原始结果回归 |
 | `buffer_unordered` 后仍等全部完成再 emit | N4 完成顺序 |

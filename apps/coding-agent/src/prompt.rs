@@ -287,7 +287,7 @@ fn tool_guidelines(tools: &[&str]) -> String {
     if tools.contains(&"subagent") {
         // 防失控 + 防重复劳动（来源：Anthropic 多 agent 博客的量化经验，见
         // `docs/arch/subagent/research.md` §2.9）。措辞要点：
-        // 规模规则、任务描述四要素、并行写目标不相交、成本提醒。
+        // 规模规则、任务描述四要素、依赖与写入范围、失败诊断、成本提醒。
         // 并发槽位数读 `ys-component` 的**单一真值常量**（ADR-0022 决策 14 的双轨：
         // 常量是唯一真值，`RunLimits.max_parallel_tools` 与这里都取它）。
         guidelines.push(format!(
@@ -311,8 +311,16 @@ fn tool_guidelines(tools: &[&str]) -> String {
                 .to_string(),
         );
         guidelines.push(
-            "parallel subagents share this workspace: never dispatch several in one turn if their \
-             write targets overlap"
+            "Before dispatching multiple subagents, check their dependencies and write scopes. If \
+             a task consumes another task's output or verifies its changes, wait for the \
+             prerequisite to finish. Run tasks in parallel only when their outputs are \
+             independent and their write scopes do not overlap; serialize them when the scope is \
+             unclear"
+                .to_string(),
+        );
+        guidelines.push(
+            "If a subagent returns an error or is cancelled, read its diagnostic first, then \
+             either narrow the task and retry or report the failure to the user"
                 .to_string(),
         );
         guidelines.push(
@@ -1054,6 +1062,101 @@ mod tests {
             child.contains("no subagents"),
             "子提示（无 subagent 工具）应逐字保留那句；prompt = {child}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn subagent_guideline_block(prompt: &str) -> &str {
+        let start = prompt
+            .find("At most ")
+            .expect("父提示应含 subagent 并发槽位 guideline");
+        let rest = &prompt[start..];
+        let end = rest
+            .find("use it to save context, not to look busy")
+            .expect("subagent guideline 段应以成本提醒结束")
+            + "use it to save context, not to look busy".len();
+        &rest[..end]
+    }
+
+    #[test]
+    fn subagent_dispatch_guidelines_in_parent_prompt() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("subagent_dispatch_parent");
+        let cat = one_skill("arch-design", "多方案架构设计");
+        let prompt = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
+        let block = subagent_guideline_block(&prompt);
+
+        assert!(
+            block.contains(
+                "Before dispatching multiple subagents, check their dependencies and write scopes"
+            ),
+            "须要求派发前检查依赖与写入范围；block = {block}"
+        );
+        assert!(
+            block.contains("wait for the prerequisite to finish"),
+            "消费输出或验证修改的任务须等待前置完成；block = {block}"
+        );
+        assert!(
+            block.contains("outputs are independent and their write scopes do not overlap"),
+            "只有输出独立且写入范围不相交才可并行；block = {block}"
+        );
+        assert!(
+            block.contains("serialize them when the scope is unclear"),
+            "范围不明时须串行；block = {block}"
+        );
+        assert!(
+            block.contains("read its diagnostic first")
+                && block.contains("narrow the task and retry")
+                && block.contains("report the failure to the user"),
+            "失败或取消后须先读诊断，再缩窄重试或报告；block = {block}"
+        );
+        assert!(
+            !block.contains(
+                "parallel subagents share this workspace: never dispatch several in one turn if their write targets overlap"
+            ),
+            "旧窄写入规则必须删除；block = {block}"
+        );
+        assert!(
+            block.contains(&format!(
+                "At most {} subagents run in parallel in one turn",
+                ys_component::DEFAULT_MAX_PARALLEL_TOOLS
+            )),
+            "并发槽位提醒必须保留；block = {block}"
+        );
+        assert!(
+            block.contains("A subagent is not free")
+                && block.contains("use it to save context, not to look busy"),
+            "成本提醒必须保留；block = {block}"
+        );
+        assert!(
+            !block.to_lowercase().contains("review") && !block.to_lowercase().contains("test"),
+            "subagent guideline 不得硬编码 review/test 特例；block = {block}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagent_dispatch_guidelines_absent_from_child_prompt() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("subagent_dispatch_child");
+        let cat = one_skill("arch-design", "多方案架构设计");
+        let prompt = build_system_prompt(&dir, &[spec("read")], &cat);
+
+        for phrase in [
+            "Before dispatching multiple subagents",
+            "wait for the prerequisite to finish",
+            "write scopes do not overlap",
+            "serialize them when the scope is unclear",
+            "read its diagnostic first",
+        ] {
+            assert!(
+                !prompt.contains(phrase),
+                "子提示不得含派发 guideline `{phrase}`；prompt = {prompt}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

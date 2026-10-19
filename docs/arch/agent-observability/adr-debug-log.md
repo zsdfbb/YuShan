@@ -1,7 +1,8 @@
-# ADR — `--debug` 结构化执行日志：事件流而非旁路回调，只记段不记增量
+# ADR — debug 结构化执行日志：事件流而非旁路回调，只记段不记增量
 
-给 `ys-coding-agent` 加一个显式开关的结构化执行日志（`--debug` / `YUSHAN_DEBUG`）：
-关闭时零字节零开销；打开时把**段边界**（轮、工具调用、模型尝试、状态变化）写成
+`ys-coding-agent` 默认写结构化执行日志（`--debug` / `YUSHAN_DEBUG`）：未设置或空串时开启，
+显式关闭时不创建 sink、debug 文件或 writer 线程；正常启动无论开关值仍解析一次日志目录并
+清理 `Default` 目录。开启时把**段边界**（轮、工具调用、模型尝试、状态变化）写成
 `$YUSHAN_LOG_DIR/debug-<session>.jsonl`，字段名对齐 OTel GenAI semconv。
 
 **两处关键取舍**：① **逐轮 usage 走事件流**（新增非终局 `AgentEvent::RoundUsage`），
@@ -9,7 +10,7 @@
 
 ## Status
 
-proposed（2026-10-17）
+accepted（2026-10-20）
 
 ## 背景
 
@@ -18,7 +19,7 @@ proposed（2026-10-17）
 - **直接动因是三处实测盲区**：33 轮里 3 个离群轮吃掉 36% 墙钟；一轮里单个 `bash` 吃掉 73.7 秒
   （逐调用计时已定位）；同一提示 `gen` 46 s vs 143 s **无法归因**（思考与正文混在一起）。
 - **已有的可观测面**：`yushan.log`（手写 logger，35 个调用点，无级别）、`--json` 事件流、
-  `--stats` 背压读数、启动/退出期 stderr。缺的是「可开关、可机器聚合、带相关 id」。
+  `--stats` 背压读数、启动/退出期 stderr。缺的是「默认有现场、可显式关闭、可机器聚合、带相关 id」。
 - **同类做法**：codex 用 `tracing` + OpenTelemetry（`api_request.duration_ms` / `ttft` /
   `tbt` / `tool.call.duration_ms` / `turn.token_usage`）；OTel GenAI semconv 给出
   `gen_ai.usage.*`（含 `cache_read.input_tokens` 与 `reasoning.output_tokens`）与
@@ -30,9 +31,29 @@ proposed（2026-10-17）
 
 ### 1. 开关与落点
 
-`--debug` 命令行 + `YUSHAN_DEBUG` 环境变量（**环境变量优先**）；输出**结构化 JSONL** 到
-**独立文件** `debug-<session>.jsonl`。不开时 `Option<DebugSink>` 为 `None` ——
-不建线程、不建文件、不分配、不写一个字节。
+`YUSHAN_DEBUG` 未设置或为空串时开启；非空值去除首尾空白并忽略大小写后，`1` / `true` / `yes` / `on`
+开启，其余非空值关闭。环境变量优先于 `--debug`；`--debug` 继续被命令行解析器接受以兼容脚本，
+但不是开启日志的必要条件。输出**结构化 JSONL** 到**独立文件** `debug-<session>.jsonl`。
+显式关闭或日志路径不可得时 `open_enabled` 返回 `None` —— 不建 writer 线程、不建 debug 文件、
+不写一个日志字节；正常启动路径仍会在 help / 进程级 worktree 早退之后解析一次日志目录并执行
+`Default` sweep。
+
+TUI、`-p`、`--json` 和 `worktree attach` 的正常启动路径共享同一 `open_enabled` 决策；
+`help` 与进程级 `worktree` 子命令在 sink 创建前早退。
+
+### 1b. 启动期保留清理
+
+日志目录只解析一次，结果包含 `path` 与来源 `Default` / `Override`：
+
+- `YUSHAN_LOG_DIR` 非空为 `Override`，照常写入，不执行清理；
+- 空串等同于未设置，回落到 `~/.yushan/logs` 并标为 `Default`。
+
+正常启动时，Default 目录中修改时间超过 7 天、文件名匹配 `debug-*.jsonl` 的普通文件会被删除。
+判断使用 `DirEntry::file_type().is_file()`，不跟随符号链接；同名目录、符号链接、近期文件、
+非匹配文件和 `yushan.log` 保留。清理失败静默跳过。
+
+清理独立于开关：`YUSHAN_DEBUG=0` 的正常启动仍清理 Default 目录。单文件 64 MiB 上限、
+默认 `head` 参数摘要和脱敏规则不变。
 
 ### 2. **只记段，不记增量**
 
@@ -68,13 +89,13 @@ proposed（2026-10-17）
 - **代价可控** —— `--json` 是加法变更（与 `RoundStarted` 同形）；关闭 debug 时每轮多一条事件，
   相对每轮 1k–10k 个增量可忽略。
 
-> ⚠️ **撤回一条曾用过的理由**：「子 agent 的 usage 自然可见」—— **不成立**。
-> 子 agent 的事件出口是 `NoopEventSink`（`apps/coding-agent/src/subagent.rs:4,371`），
-> 其 `RoundUsage` 会被丢弃；父侧只在回合末看到上卷总量。子 agent 的逐轮可见性是**另一个需求**。
+> ⚠️ 子 agent 的事件出口是本地 `CollectingSink`，只用于生成子转录；其 `RoundUsage` 不进入父事件流。
+> 父侧只在回合末看到上卷总量。子 agent 的逐轮可见性是**另一个需求**。
 
 **覆盖面（有意为之的边界）**：主循环每轮（`purpose=turn`）与**压缩摘要**（`purpose=compaction`，
 需给 `CompactOutcome` 加 `usage`）覆盖；**工具侧摘要**与**子 agent 逐轮**不覆盖 ——
-前者所在工具上下文没有事件出口（`summarize.rs:42`），后者事件被 `NoopEventSink` 丢弃。
+前者所在工具上下文没有事件出口（`summarize.rs:42`），后者事件只在本地 `CollectingSink`
+中收集而不进入父事件流。
 `run_end` 记回合累计 usage 兜底，总量始终可核。
 
 ### 4b. 通道边界：事件 vs 旁路
@@ -110,8 +131,8 @@ cache 与 reasoning 都带 `*_reported` 布尔。
   - `Usage` 加字段牵动**既有 27 处** `Usage` 字面量（其中 **17 处带 `..Default::default()`** 自动兼容，
     **实际补字段 10 处**）—— 机械修补，一次性；
   - `--json` 多一类事件，消费者须忽略未知变体（`AgentEvent` 已 `#[non_exhaustive]`）；
-  - debug 文件是**新的敏感产物**（命令头、路径、pattern 会落盘）—— 默认 `head` 已最小化，
-    但**没有默认保留期清理**（留作后续）；
+  - debug 文件是**默认产生的敏感产物**（命令头、路径、pattern 会落盘）—— 默认 `head` 已最小化；
+    默认目录在正常启动时清理超过 7 天的 `debug-*.jsonl`，`YUSHAN_LOG_DIR` 覆盖目录不清理；
   - 异步写线程在单核高负载下仍与主路径争 CPU（无 `nice`/亲和性）。
 - **明确不做**：完整请求/响应体（用户排除 + semconv 默认）；日志级别体系（本轮只做开/关）；
   远端上报/采样；TUI 内展示 debug 流。
@@ -122,5 +143,6 @@ cache 与 reasoning 都带 `*_reported` 布尔。
 
 - [`context.md`](./context.md) —— 现状、约束、范围与未澄清问题
 - [`design.md`](./design.md) —— 融合方案、三个候选的对比矩阵、Q1/Q4 的详细答案
+- [ADR-0044](../../adr/0044-subagent-observability-and-debug-defaults.md) —— debug 默认开关与保留契约
 - codex 的指标命名（`api_request.duration_ms` / `ttft` / `tbt` / `tool.call.duration_ms`）
 - OTel GenAI semantic conventions（`gen_ai.*`；内容采集默认关闭）

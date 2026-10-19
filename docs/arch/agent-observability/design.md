@@ -1,4 +1,4 @@
-# agent-observability — 设计：显式开关的结构化执行日志
+# agent-observability — 设计：默认开启的结构化执行日志
 
 > 日期：2026-10-17
 > 性质：`arch-design` 产出。需求与约束见 [`context.md`](./context.md)，决策记录见
@@ -10,8 +10,9 @@
 
 ## 1. 推荐方案（一句话）
 
-**一个 `--debug` 开关 + 一个异步单写者的 JSONL sink；只在"段"边界记录，永不逐增量；
-字段名对齐 OTel `gen_ai.*`；逐轮 usage 走事件流而非旁路回调。**
+**一个默认开启、可由 `YUSHAN_DEBUG=0` 显式关闭的异步单写者 JSONL sink；`--debug` 仅作为
+兼容入口保留。只在"段"边界记录，永不逐增量；字段名对齐 OTel `gen_ai.*`；逐轮 usage 走事件流
+而非旁路回调。**
 
 ```text
 ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop / -p main::consume_events）
@@ -31,7 +32,8 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
    （`d-t4`：8,465 思考增量 vs 10 正文增量）。逐条落盘 = 单次运行 ~700 KB + 数千次写盘，
    且会通过**事件信道背压**反向拉长模型流 —— 不只是读数偏移，是改变被测对象。
 2. **不在被测区间里做格式化** —— 时间戳在观测入口取，摘要/序列化/入队全部在其后。
-3. **关闭时零字节、零线程、零分配** —— `Option<DebugSink>` 为 `None`，热路径只剩一个可预测空判断。
+3. **关闭时 sink 为零行为** —— `open_enabled` 返回 `None`，不创建 debug 文件或 writer 线程；
+   观测热路径只剩一个可预测空判断。正常启动仍会解析一次日志目录并执行 `Default` sweep。
 
 ---
 
@@ -77,8 +79,8 @@ ys-loop ──AgentEvent──► ChannelSink ──► 消费侧（TUI app_loop
    相对每轮 1k–10k 个增量可以忽略。
 
 > ⚠️ **曾被误列为理由的一条（已撤回）**：「子 agent 的 usage 自然可见」—— **不成立**。
-> 子 agent 的事件出口是 `NoopEventSink`（`apps/coding-agent/src/subagent.rs:4`、`:371`），
-> 其 `RoundUsage` **会被丢弃**；父侧只在回合末看到上卷后的总 usage。
+> 子 agent 的事件出口是本地 `CollectingSink`，事件只用于生成子转录、**不进入父事件流**；
+> 父侧只在回合末看到上卷后的总 usage。
 > 子 agent 的逐轮可见性是**另一个需求**，不在本设计内（见 §4.8）。
 
 ---
@@ -110,11 +112,11 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 
 | 文件 | 职责 |
 |---|---|
-| `apps/coding-agent/src/debug_log.rs`（新增） | 开关解析、记录信封、**异步单写者**、有界队列与丢弃计数、工具参数摘要与脱敏 |
+| `apps/coding-agent/src/debug_log.rs`（新增） | 开关解析、默认目录 sweep、记录信封、**异步单写者**、有界队列与丢弃计数、工具参数摘要与脱敏 |
 | `apps/coding-agent/src/round_clock.rs`（改） | 既有文本行**逐字节不变**；新增把事件翻成 debug 记录（thinking/text 分段、计数、工具元数据） |
-| `apps/coding-agent/src/main.rs`（改） | `--debug` 解析、sink 创建、`-p`/`--json` 接线、退出前 flush |
+| `apps/coding-agent/src/main.rs`（改） | `YUSHAN_DEBUG` 默认开关、`--debug` 兼容解析、日志目录一次解析、sink 创建、`-p`/`--json` 接线、退出前 flush |
 | `apps/coding-agent/src/app_loop.rs`（改） | TUI 接线、turn 边界、`/new` `/resume` 切文件、Abort 记录 |
-| `apps/coding-agent/src/logging.rs`（改） | 抽出 `log_dir()` 供 debug 复用（`YUSHAN_LOG_DIR` / `HOME` 回退），**行为不变** |
+| `apps/coding-agent/src/logging.rs`（改） | 一次解析 `LogDir { path, source: Default | Override }`，供日志、debug 写入与 Default sweep 共用 |
 | `adapters/model-openai-compatible/src/response.rs`（改） | `ChatUsage` 增 `completion_tokens_details.reasoning_tokens` |
 | `adapters/model-openai-compatible/src/lib.rs`（改） | attempt / 首字节 / 重试 trace（与既有 `with_logger` 并列） |
 | `crates/ys-core/src/usage.rs`（改） | `Usage` 增 **`reasoning_tokens: Option<u32>`**（`#[serde(default, skip_serializing_if = "Option::is_none")]`），纳入 `Add`。**必须是 `Option` 而非裸 `u32`**：裸写会让每条 `RunFinished.usage` 都多一个键，直接破坏 §8 验收 T2 的「过滤后逐字节不变」；`None` 同时精确表达 §4.2 的「没上报 ≠ 0」 |
@@ -225,8 +227,11 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 （"这轮没有工具调用" ≠ "工具调用记录被丢了"）。
 
 **R6 · 文件保留。**
-一 session 一文件、`/resume` 追加 ⇒ 会累积。**P2 加启动期 sweep**：按 mtime 保留最近 N 天
-（默认 7）或最多 M 份，删前不提示（debug 文件是可再生证据）。在那之前，文档明说"会累积、需手动清理"。
+一 session 一文件、`/resume` 追加。正常启动时对 `Default` 目录执行一次 sweep：删除修改时间
+超过 7 天且文件名匹配 `debug-*.jsonl` 的普通文件，删前不提示（debug 文件是可再生证据）。
+不跟随符号链接；同名目录、符号链接、近期文件、非匹配文件与 `yushan.log` 保留。
+`YUSHAN_LOG_DIR` 非空为 `Override`，照常写入但不清理。清理独立于开关：`YUSHAN_DEBUG=0`
+的正常启动仍执行；任何读取或删除失败静默跳过。
 
 ### 4.6 `/resume` 与轮转
 
@@ -245,7 +250,7 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 | 主循环每轮 | `basic.rs` Step 7（拿到 `response.usage`） | ✅ `purpose="turn"`、带 `round` | |
 | **压缩摘要** | `basic.rs` 的 `compact::execute` 分支 | ✅ `purpose="compaction"`、带 `round` | 需给 `CompactOutcome` 加 `usage: Usage`（`execute` 手里已有响应） |
 | **工具侧摘要**（webfetch / subagent 的 `ModelSummarizer`） | —— | ❌ | 工具上下文**没有事件出口**（`summarize.rs:42`：工具侧不通事件）；要覆盖需另立需求 |
-| **子 agent 的逐轮调用** | —— | ❌ | 子事件进 `NoopEventSink`（`subagent.rs:4`）；父侧只在回合末看到上卷总量 |
+| **子 agent 的逐轮调用** | —— | ❌ | 子事件进入本地 `CollectingSink`，不进入父事件流；父侧只在回合末看到上卷总量 |
 
 **兜底**：`run_end` 记回合**累计** usage（含子 agent 上卷），因此"总量对不对"始终可核；
 缺的只是"哪一次辅助调用花了多少"。
@@ -292,7 +297,7 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 |---|---|---|
 | **P0** | 开关 + 独立文件 + 异步 sink + 段的富计时（thinking/text 拆分）+ 工具元数据 + `run_start`/`run_end`（含 `rounds` / `duration_ms` / `exit_code` / 累计 usage）+ `/new` 切文件 + 64 MiB 文件上限 + `boundary` 记录 + `reasoning_tokens` + `RoundUsage`（含 `purpose` 与压缩覆盖）+ 退出原语收敛到 `exit_with_run_end` | **~900–1,100 行** |
 | **P1（部分落地）** | ✅ `model_attempt`（含 `ttfb_ms`、重试分类、退避与抑制原因）、`context_compacted` / `context_compaction_failed` / `response_truncated`；⏳ 适配器自检 | ~300 行 |
-| **P2** | 启动期 sweep（旧 debug 文件清理）、`state_change`、jq 配方文档 | ~250 行 |
+| **P2（部分落地）** | ✅ 启动期 sweep（Default 目录 7 天清理，Override 不清理）；⏳ `state_change`；⏳ jq 配方文档 | ~250 行 |
 
 > P0 的原估 ~700 行**偏乐观**（评审 R7）：它包含 `Usage` 加字段（**既有 27 处字面量（实际补 10 处）**，已核实）、
 > 新事件 + 两处 emit、`debug_log.rs`、两条入口接线、`RoundClock` 富化、14 处退出收敛。
@@ -327,7 +332,7 @@ session:  {"role":"Assistant","content":[{"ToolUse":{"id":"call_00_mrti…", …
 
 ## 8. 验收
 
-1. **关闭 debug（负向验收）**：目标目录零新文件；`yushan.log` 文本行逐字节不变；
+1. **显式关闭 debug（负向验收，如 `YUSHAN_DEBUG=0`）**：目标目录零新文件；`yushan.log` 文本行逐字节不变；
    **`--json` 在过滤掉 `RoundUsage` 后逐字节相同** —— `RoundUsage` 在 debug 关闭时**仍会发**
    （它服务于所有消费者），这是一次**加法契约变更**，必须按「过滤后比对」的口径验收。
 2. **打开 debug + 一次 10k 增量的运行**：debug 文件 < 200 KiB；**零** `ModelTextDelta` /

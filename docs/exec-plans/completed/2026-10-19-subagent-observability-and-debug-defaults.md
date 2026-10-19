@@ -9,7 +9,8 @@
 
 ## 基线
 
-- **基线 ref**: `<Phase 3 由 scripts/baseline.sh 填写>`
+- **基线 ref**: `d5df3b76c12f20b86356d89e4f8522221b2ff3c7`
+- **备份分支**: `sw-backup/2026-10-19-subagent-observability-and-debug-defaults`
 - **Phase 1 核实偏差已吸收**: 新 ADR 改用 0044；诊断、原始工具结果、并行测试、提示测试、
   debug 默认翻转与文档波及面已按核实结论补全，Phase 3 基线仍待填写。
 - 用途: review 执行 `git diff <基线 ref> -- <files>` 取字节级证据（含未跟踪新文件）。
@@ -23,8 +24,10 @@
   - 新增内部取消来源与耗时；`Cause` 只在 `Cancelled` 时填写，其他非完成 stop reason 不编造 cause。
   - 新增 `MAX_DIAGNOSTIC_BYTES = 1024` 的同一清洗函数：CR/LF/其他控制字符替换为空格，
     按 UTF-8 边界截断，超限以 ASCII `...` 结尾，保持 `[diagnostic:` 前缀。
-  - `Run Err` 的 error 文本走同一清洗；保持现有 `stop_reason=Cancelled`，但写
-    `cause=unknown`，由 error 文本说明真实失败。
+  - 只有子回合已经启动、`child.run_turn` 返回 `Err` 时才构造 `SubagentOutcome` 并写
+    `stop_reason=cancelled cause=unknown`，error 文本走同一清洗；无可用模型、派发超限、
+    `AgentBuilder` 失败等前置错误直接返回 `Err`，由 `SubagentTool` 映射为
+    `ToolError::Execution`，不生成 diagnostic 前缀。
   - 子 runner 使用 `CollectingSink` 捕获事件，从 `ToolResult` 事件按 `tool_call_id`
     建立原始结果表；转录仍按会话块顺序，Text/ToolUse 取会话，ToolResult 正文优先取事件原文，
     缺失时才回退会话，避免 turn budget 降级文本污染转录。
@@ -40,7 +43,7 @@
   - 分类测试覆盖 parent / child budget / unknown，并断言 parent 优先；测试 helper 以纯函数接收两个 bool。
   - 断言 diagnostic 首行格式、`MAX_DIAGNOSTIC_BYTES=1024` 上限、CR/LF/控制字符变空格、
     多字节 UTF-8 安全截断及 ASCII `...` 尾；非 `Cancelled` 不写 cause。
-  - 断言 `Run Err` 为 `stop_reason=cancelled cause=unknown`，error 文本经同一清洗并说明真实失败。
+  - 断言子回合启动后的 `run_turn Err` 为 `stop_reason=cancelled cause=unknown`，error 文本经同一清洗并说明真实失败；前置 runner `Err` 映射为 `ToolError::Execution` 且没有 diagnostic 前缀。
   - 用 `MemorySession` + `CollectingSink` 构造 Text + ToolUse + ToolResult，断言转录包含
     id/name/args/原始 result/is_error/stop_reason/cause/elapsed。
   - 构造超过 `max_turn_tool_result_tokens` 的较早结果，确认会话已被预算降级后，
@@ -59,7 +62,8 @@
 - **描述**: 并行工具批用带原始 index 的 future +
   `buffer_unordered(max_parallel_tools.max(1))` 执行；每次完成立即 emit 对应 `ToolResult`
   并填 `outcomes[index]`。保留 `.max(1)` 防护、先发全部 `ToolCall`、串行回退与并发上限；
-  Step 9c 仍按原 tool-call 顺序组装父模型消息。
+  Step 9c 仍按原 tool-call 顺序组装父模型消息。当前安全集合是 `subagent` 与
+  `read` / `find` / `ls` / `grep`。
 - **关联测试任务**: Task 4
 - **依赖**: 无
 
@@ -139,6 +143,8 @@
     Override 跳过。sweep 独立于 `open_enabled`，`YUSHAN_DEBUG=0` 的正常启动仍执行。
   - `main` 在 help/进程级 worktree 早退之后、正常启动 sink 之前调用一次清理；
     TUI/-p/--json/attach 仍共用 `open_enabled`。
+  - 关闭 debug 只让 `open_enabled` 返回 `None`；正常启动无论开关值都解析一次 `LogDir`
+    并执行 `Default` sweep，不能写成关闭后全启动路径“零路径解析”。
 - **关联测试任务**: Task 10
 - **依赖**: 无
 
@@ -213,9 +219,10 @@
 - **涉及目录**: `docs/adr/`, `docs/arch/agent-observability/`
 - **涉及文件**: 同 Task 13
 - **描述**: 用 `rg` 逐项核对 `buffer_unordered`、按完成顺序、模型消息原序、默认开启、
-  7 天、Override 不删、parent-turn-cancelled、诊断清洗与通用调度规则，确保无旧表述残留。
+  7 天、Override 不删、parent-turn-cancelled、并发安全集合、runner 前置 `Err` 分界、
+  摘要主体上限、诊断清洗与通用调度规则，确保无旧表述残留。
 - **验证方法**:
-  - `rg -n "buffered|按原始顺序 emit 全部 ToolResult|YUSHAN_DEBUG|默认开启|7 天|只写不删|显式开关|opt-in|不开时|没有默认保留期清理" docs/adr/0022-subagent-dispatch.md docs/adr/0029-subagent-landing-decisions.md docs/adr/0044-subagent-observability-and-debug-defaults.md docs/arch/agent-observability/adr-debug-log.md`
+  - `rg -n "buffered|按原始顺序 emit 全部 ToolResult|YUSHAN_DEBUG|默认开启|7 天|只写不删|显式开关|opt-in|不开时|没有默认保留期清理|今天没有工具|只有 .*subagent|零路径解析" docs/adr/0022-subagent-dispatch.md docs/adr/0029-subagent-landing-decisions.md docs/adr/0044-subagent-observability-and-debug-defaults.md docs/arch/agent-observability/adr-debug-log.md`
   - 期望：相关新语义存在；`buffered` 若保留仅作历史 rejected option 说明，不作为当前契约。
 - **关联 impl**: Task 13
 - **依赖**: Task 13
@@ -237,10 +244,12 @@
 ### Task 16: docs — as-built 一致性核对  [type=test]
 - **涉及目录**: `docs/`, 仓库根
 - **涉及文件**: 同 Task 15
-- **描述**: 核对 as-built 不再声称 `ToolResult` 整批保序，debug 不再声称 opt-in，
-  AGENTS 不再写“默认关闭”；TODO 不再保留 debug sweep 待办；help 单一尾换行有明确落点。
+- **描述**: 核对 as-built 不再声称 `ToolResult` 整批保序，debug 不再声称 opt-in 或全启动路径
+  “零路径解析”，并发安全集合为 `subagent` + `read/find/ls/grep`，runner 前置错误不伪造
+  diagnostic，摘要主体上限不被写成最终 summary 硬上限；AGENTS 不再写“默认关闭”；
+  TODO 不再保留 debug sweep 待办；help 单一尾换行有明确落点。
 - **验证方法**:
-  - `rg -n "ToolResult|buffer_unordered|默认开启|YUSHAN_DEBUG|7 天|cancelled|HELP_TEXT|尾换行|debug sweep" docs/architecture.md docs/design-final/coding-agent-tui.md docs/TODO.md docs/arch/agent-observability/design.md AGENTS.md`
+  - `rg -n "ToolResult|buffer_unordered|默认开启|YUSHAN_DEBUG|7 天|cancelled|ToolError::Execution|MAX_SUMMARY_BYTES|只有 .*subagent|零路径解析|HELP_TEXT|尾换行|debug sweep" docs/architecture.md docs/design-final/coding-agent-tui.md docs/TODO.md docs/arch/agent-observability/design.md AGENTS.md`
   - 期望：事件顺序、开关默认值、保留策略与 help 字节形状描述一致；
     `docs/TODO.md` 无已完成的 debug sweep 条目。
 - **关联 impl**: Task 15
@@ -250,17 +259,26 @@
 
 | 单元 | 含任务 | 涉及文件 | 依赖 | 波次 | review 档 |
 |------|--------|---------|------|------|-----------|
+| U1 | Task 1, 2 | `apps/coding-agent/src/subagent.rs` | 无 | W0 | deep |
+| U2 | Task 3, 4 | `crates/ys-loop/src/basic.rs` | 无 | W0 | deep |
+| U3 | Task 5, 6 | `crates/ys-tui-coding/src/draw.rs` | 无 | W0 | shallow |
+| U4 | Task 7, 8 | `apps/coding-agent/src/prompt.rs` | 无 | W0 | shallow |
+| U5a | Task 9, 11 + Task 10 内部测试 | `debug_log.rs`, `logging.rs`, `main.rs`, `app_loop.rs`, `help.rs` | 无 | W0 | deep |
+| U5b1 | Task 10 集成测试第 1 组 + Task 12 | `budget_exit.rs`, `debug_log.rs`, `degraded_search.rs`, `help_cli.rs`, `worktree_cli.rs` | U5a | W1 | deep |
+| U5b2 | Task 10 集成测试第 2 组 | `resume_cli.rs`, `session_cli.rs`, `skills_cli.rs`, `stream_usage_fallback.rs`, `truncation_guard.rs` | U5a | W1 | shallow |
+| U7 | Task 13, 14 | ADR 与 observability 文档 | U1, U2, U4, U5a | W1 | shallow |
+| U8 | Task 15, 16 | as-built、架构、TODO、AGENTS 文档 | U3, U7 | W2 | shallow |
 
 ## 验证清单
 
-- [ ] Task 1–16 的 impl/test 配对全部由 review 放行。
-- [ ] `cargo test -p ys-coding-agent`
-- [ ] `cargo test -p ys-loop`
-- [ ] `cargo test -p ys-tui-coding`
-- [ ] `cargo test -p ys-coding-agent --test budget_exit --test debug_log --test degraded_search
+- [x] Task 1–16 的 impl/test 配对全部由 review 放行。
+- [x] `cargo test -p ys-coding-agent`
+- [x] `cargo test -p ys-loop`
+- [x] `cargo test -p ys-tui-coding`
+- [x] `cargo test -p ys-coding-agent --test budget_exit --test debug_log --test degraded_search
       --test help_cli --test resume_cli --test session_cli --test skills_cli
       --test stream_usage_fallback --test truncation_guard --test worktree_cli`
-- [ ] `cargo test --workspace`
-- [ ] `cargo clippy --all-targets`
-- [ ] N1–N9 测试合同逐条留证；关键变异均确认先红后绿。
-- [ ] 无计划外文件改动；测试隔离与 env 恢复纪律已核对。
+- [x] `cargo test --workspace`
+- [x] `cargo clippy --all-targets`
+- [x] N1–N9 测试合同逐条留证；关键变异均确认先红后绿。
+- [x] 无计划外文件改动；测试隔离与 env 恢复纪律已核对。

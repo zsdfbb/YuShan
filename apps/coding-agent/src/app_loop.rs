@@ -65,7 +65,7 @@ use ys_tui_coding::CodingView;
 
 use crate::capabilities;
 use crate::config::Config;
-use crate::debug_log::{ArgsMode, DebugSink, debug_path_for};
+use crate::debug_log::{ArgsMode, DebugSink};
 use crate::logging;
 use crate::provider::{FetchModelsResult, ModelCache, ProviderRegistry};
 use crate::state::StateStore;
@@ -468,7 +468,7 @@ pub async fn run(
                 session_path.record(wiring.session_path());
                 // `/new` **切新 debug 文件**（旧文件自然结束），并开一个新的 run。
                 if let Some(sink) = debug.as_mut() {
-                    if let Some(path) = debug_path_for(wiring.session_path()) {
+                    if let Some(path) = sink.path_for_session(wiring.session_path()) {
                         sink.switch_file(&path);
                     }
                     debug_run += 1;
@@ -554,7 +554,7 @@ pub async fn run(
                     if let Some(sink) = debug.as_mut() {
                         let path_after = wiring.session_path().map(Path::to_path_buf);
                         if path_after != path_before
-                            && let Some(path) = debug_path_for(path_after.as_deref())
+                            && let Some(path) = sink.path_for_session(path_after.as_deref())
                         {
                             sink.switch_file(&path);
                         }
@@ -1281,7 +1281,18 @@ mod tests {
 
         // 与生产侧同规：debug sink 在 `Wiring` 建好、会话路径已知之后打开，
         // 并由「启动期一方」写第一条 `run_start`。关闭时 `open_enabled` 早退。
-        let mut debug = crate::debug_log::open_enabled(debug_flag, wiring.session_path());
+        let mut debug = if env_prelocked {
+            let log_dir = crate::logging::resolve_log_dir();
+            crate::debug_log::open_enabled(debug_flag, wiring.session_path(), log_dir.as_ref())
+        } else {
+            debug_assert!(!debug_flag, "debug-on 用例必须自行隔离 YUSHAN_LOG_DIR");
+            let _guard = crate::test_env::env_lock();
+            let _env = crate::test_env::EnvRestore::capture(&[crate::debug_log::DEBUG_ENV]);
+            // SAFETY: 持有 env_lock；默认关闭 debug 的 harness 不继承开发机环境。
+            unsafe { std::env::set_var(crate::debug_log::DEBUG_ENV, "0") };
+            let log_dir = crate::logging::resolve_log_dir();
+            crate::debug_log::open_enabled(false, wiring.session_path(), log_dir.as_ref())
+        };
         if let Some(sink) = debug.as_mut() {
             let session_id = crate::session_id_for(wiring.session_path());
             crate::emit_run_start(sink, &config, wiring.session_path(), &session_id, &[]);
@@ -3450,6 +3461,23 @@ mod tests {
                 _guard: guard,
             }
         }
+
+        fn set_disabled(log_dir: &Path) -> Self {
+            let guard = crate::test_env::env_lock();
+            let restore = crate::test_env::EnvRestore::capture(&[
+                crate::logging::LOG_DIR_ENV,
+                crate::debug_log::DEBUG_ENV,
+            ]);
+            // SAFETY: 持有 env_lock。
+            unsafe {
+                std::env::set_var(crate::logging::LOG_DIR_ENV, log_dir);
+                std::env::set_var(crate::debug_log::DEBUG_ENV, "0");
+            }
+            Self {
+                _restore: restore,
+                _guard: guard,
+            }
+        }
     }
 
     /// 目录里的 `debug-*.jsonl`：返回 `(路径, 解析后的记录)`，按路径排序。
@@ -3711,7 +3739,7 @@ mod tests {
     #[tokio::test]
     async fn debug_off_tui_creates_no_files() {
         let logs = TempDir::new("debug_off_tui_logs");
-        let _env = DebugEnv::set(&logs.0);
+        let _env = DebugEnv::set_disabled(&logs.0);
 
         let model = MockModel::new("m");
         model.push_text("hello");

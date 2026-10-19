@@ -226,6 +226,9 @@ impl QueueBoundarySource {
 `Summary{rounds,stop,elapsed_secs}` / `Error` / `System`）—— 工具调用压一行渲染，摘要由
 `summarize_tool_args`（`SUMMARY_KEYS = [path, file_path, command, pattern, query, url]`）从结构化参数抽取，
 **摘要规则属产品知识，故在 TUI crate 而非协议**。失败的工具显示结果首行，成功的只给 ✓。
+`Summary` 渲染为 `{symbol} {stop-label} · N rounds · X.Ys`：已知 `StopReason` 的标签为
+`completed` / `max rounds` / `cancelled` / `truncated` / `no output`，未知变体显示 `unknown`；
+TUI 绘制与退出 scrollback 使用同一格式。
 thinking 默认隐藏，`/thinking on` 后以暗色渲染。
 provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoning>` 标签里时，由适配器剥离并转成同样的 Thinking 行（见 `docs/adr/0025-hide-inline-thinking-tags.md`）。
 
@@ -681,26 +684,28 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 ### 13.2 每回合的注入与运行
 
 - 三条入口（TUI `app_loop` / `-p` / `--json`）**每回合**造一份 `AppSubagentRunner`（派发计数器因此天然 per-turn），经 `AgentPorts::with_subagent` → `RuntimeContext.subagent` → `ToolContext.subagent` 三跳送达工具。
-- 一次派发：建**全新子 `Agent`**（`Agent::run_turn` 取 `&mut self`，实例不可共享） + `MemorySession` + `NoopEventSink`（**子事件不进父事件流**）+ `ChildBoundary`。
+- 一次派发：建**全新子 `Agent`**（`Agent::run_turn` 取 `&mut self`，实例不可共享） + `MemorySession` + 本地 `CollectingSink`（**子事件只用于本地转录，不进父事件流**）+ `ChildBoundary`。
 - **取消**：`ChildBoundary::take()` 只取自己那份、`is_aborted()` = 自己 **或** 父 —— 父 Abort 经探针向下传播，子吃不到父的 `Steer`。
 - **子预算**：watchdog（`tokio::spawn(sleep(budget) → 子边界源 push(Abort))`，用 **`AbortOnDropHandle`** 防孤儿任务）；子预算与主 agent 同值 ⇒ 真实天花板是父回合那条 deadline。
 - **超时**：`Tool::timeout()` 的优先级链（工具声明 → `bash_timeout` → 300s）；`subagent` 的外闸 = 子预算 + 60s 宽限，**构造期由 `Config` 注入**（ADR-0029 修正 2）。
 
 ### 13.3 结果与产物
 
-- **回传**：摘要硬截断 ≤ 8 KB（`MAX_SUMMARY_BYTES`，UTF-8 安全）+ 完整转录落 `~/.yushan/subagents/`（`YUSHAN_SUBAGENTS_DIR` 覆盖口；Primary 档启动期 sweep 7 天）+ **`## Files` 节由 runner 保证存在**（子不报写 `(none)`）。
-- **失败**：子撞 `max_rounds` / 被取消 ⇒ `Ok` + 非 `Completed` 的 `stop_reason` + `diagnostic` ⇒ 父侧 `ToolResult{is_error}`，**父回合不失败**。只有「跑都跑不起来」（如 `model` 名构造失败）才让 `run` 返回 `Err`。
+- **回传**：摘要文本主体按 `MAX_SUMMARY_BYTES = 8 KiB` 做 UTF-8 安全截断；截断标记与随后由 runner 保证的 `## Files` 节不在这 8 KiB 预算内，因此最终 `summary` 可略超 8 KiB。完整转录落 `~/.yushan/subagents/`（`YUSHAN_SUBAGENTS_DIR` 覆盖口；Primary 档启动期 sweep 7 天）。
+- **完整转录**：按子会话内容块保留 `Text`、`ToolUse` 的 id/name/参数 JSON、`ToolResult` 的 id/is_error/正文。工具结果正文优先取 `CollectingSink` 中的原始 `ToolResult` 事件，只有事件缺失时才回退会话正文（turn budget 可能已把较早结果改写为降级文本）。末尾记录 `stop_reason`、取消来源、`elapsed_ms` 与诊断。
+- **失败**：子撞 `max_rounds` / 被取消 ⇒ `Ok` + 非 `Completed` 的 `stop_reason` + `diagnostic` ⇒ 父侧 `ToolResult{is_error}`，**父回合不失败**。`SubagentTool` 的结果正文顺序为诊断 → 摘要 → 转录路径（无诊断时摘要在前）。诊断固定以 `[diagnostic: ` 开头，控制字符替换为空格，整条最多 1024 字节并在 UTF-8 边界截断；`Cancelled` 带 `cause=parent-turn-cancelled|child-budget|unknown`，父取消优先于子预算。转录写失败不 panic，错误并入诊断；摘要保留。
+- **Runner 错误分界**：只有子回合已经启动、`child.run_turn` 返回 `Err` 时，runner 才构造 `SubagentOutcome{stop_reason: Cancelled}` 并生成 `stop_reason=cancelled cause=unknown` 诊断。无可用模型、派发次数超限、`AgentBuilder` 组装失败等发生在子回合之前的错误直接从 `AppSubagentRunner::run` 返回 `Err`；`SubagentTool` 将其映射为 `ToolError::Execution`，不生成 diagnostic 前缀。
 - **`model` 参数**：按名构造（`Config::build_model_for`）+ `Arc<dyn Model>` 缓存（复用连接池/TLS）；构造失败 **fail-closed**，绝不静默回退父模型。
 - **usage 上卷**：子 usage 累加进 `Arc<UsageTotals>`，回合末 drain 并追加进 `RunResult.usage` ⇒ `TurnStats` / meta / 退出码看到真实总消耗。
 
 ### 13.4 并行批（Step 9）
 
-- 准入：批次 `len > 1` **且每一个**工具都 `is_concurrency_safe()` ⇒ 走 `futures_util::stream::iter(..).buffered(max_parallel_tools)`（**保序**、单任务内并发、不需 `'static`）；否则**原串行路径**。
-- 事件顺序：并行批先保序 emit 全部 `ToolCall`、执行、再保序 emit 全部 `ToolResult`；**串行批保持逐个 `C1,R1,C2,R2`**（既有行为逐字节不变）。默认 `is_concurrency_safe() == false` 是这条的守卫；今天只有 `subagent` 覆写为 `true`。
+- 准入：批次 `len > 1` **且每一个**工具都 `is_concurrency_safe()` ⇒ 走 `futures_util::stream::iter(..).buffer_unordered(max_parallel_tools.max(1))`（单任务内并发、完成即交出一个结果、不需 `'static`）；否则**原串行路径**。`max_parallel_tools = 0` 钳为 1。
+- 事件顺序：并行批先按原始调用顺序 emit 全部 `ToolCall`；执行阶段每个工具完成时立即 emit 对应 `ToolResult`，因此结果事件按完成顺序出现。结果同时写回原始 index，Step 9c 仍按原 `tool_calls` 顺序组装单条回喂消息。**串行批保持逐个 `C1,R1,C2,R2`**。默认 `is_concurrency_safe() == false` 是准入守卫；当前声明为 `true` 的集合是 `subagent` 与 `read` / `find` / `ls` / `grep`。
 
 ### 13.5 已知缺口（承接 §10/§12 的口径）
 
-- 子 agent 内部活动在**任何输出通道都不可见**（`--json` 亦然），只有落盘转录可查 —— ADR-0022 决策 2 的少数派偏离。
+- 子 agent 内部活动在**任何输出通道都不可见**（`--json` 亦然），只有落盘完整转录可查 —— ADR-0022 决策 2 的少数派偏离。
 - 并行子 agent 的**写冲突无人管**（本仓无 branch/worktree、无沙箱），只能靠 guideline「写目标不相交」。
 - 每回合派发总量上限（`DEFAULT_MAX_DISPATCHES_PER_TURN = 16`）是**仅剩的代码级成本防线**：`max_rounds` 默认已放宽到 `u32::MAX`，且子取同一份 `Config`（子自身无独立上界）。
 - ⚠️ **`--json` 的 `RunFinished.usage` 不含子 agent usage**：子 usage 是在 app 侧、回合**结束后**追加进 `RunResult.usage` 的（`merge` 点在 `app_loop::run_turn_once` / `main::run_single_turn`），而 `RunFinished` 由 `BasicLoop` 在回合内发出 ⇒ **事件流里的 usage 只算父**。TUI 的状态行（`TurnStats`）与 `-p` 的 meta 走的是合并后的 `RunResult.usage`，**是正确总数**。⇒ 脚本消费者若要精确总成本，需自行减去或改用 meta；这是「循环拥有 `RunFinished`」这一结构的直接代价，记在此处。
@@ -804,7 +809,7 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 ---
 
-## 15. `--debug` 结构化执行日志（P0 + P1 尝试读数）— as-built
+## 15. debug 结构化执行日志（默认开启）— as-built
 
 设计见 `docs/arch/agent-observability/design.md` + `adr-debug-log.md`；执行计划
 `docs/exec-plans/2026-10-17-debug-log.md`。本节只记实际形态。
@@ -814,11 +819,21 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 - `--debug` 在 TUI 首部 flag 区与 `-p` / `--json` 模式 flag 之后都可出现，与
   `--stats` / `--resume` **顺序无关**（`split_leading_flags` 循环剥离，重复 last-wins）。
   任务文本一旦开始就不再剥离（`-p "任务 --debug"` 的文本逐字保留）。
-- `YUSHAN_DEBUG` 非空时**优先于命令行**（`1/true/yes/on` 开，其余非空值关；空串视为未设置）。
+- `YUSHAN_DEBUG` 未设置或为空串时**默认开启**；非空值去除首尾空白并忽略大小写后，
+  `1/true/yes/on` 开启，其余非空值关闭，且**优先于命令行 `--debug`**。`--debug` 仍被解析器接受以兼容脚本，但不是创建 sink 的必要条件。
   `YUSHAN_DEBUG_ARGS` 控制工具参数摘要档位（`none` / `head` / `full`，默认 `head`）。
-- 文件：`logging::log_dir()/debug-<session stem>.jsonl`（`YUSHAN_LOG_DIR` 一次覆盖日志与
-  debug 两个产物）；会话尚未落盘时为 `debug-<pid>-<unix_ms>.jsonl`。追加写。
-- 关闭时 `Option<DebugSink>` 为 `None`：**零文件、零线程、零路径解析**。
+- 文件：`logging::resolve_log_dir()` 一次解析出 `path + source`，随后 sweep、初始 sink 与
+  `/new` / `/resume` 的后续路径都消费同一结果；路径为 `path/debug-<session stem>.jsonl`
+  （`YUSHAN_LOG_DIR` 一次覆盖日志与 debug 两个产物）；会话尚未落盘时为
+  `debug-<pid>-<unix_ms>.jsonl`。追加写。
+- 显式关闭时 `open_enabled` 返回 `None`：**不创建 debug 文件、writer 线程或 sink**。
+  正常启动仍会在 help / 进程级 worktree 早退之后解析一次 `LogDir`，并对 `Default` 目录
+  执行启动期 sweep；`help` 与进程级 `worktree create/list/remove` 在创建 sink 前早退，
+  不产生 debug 文件。
+- 正常启动在 help / 进程级 worktree 早退之后、sink 创建之前清理一次 `Default` 目录：
+  只删除修改时间超过 7 天、文件名匹配 `debug-*.jsonl` 的普通文件，不跟随符号链接；
+  同名目录、符号链接、近期文件、非匹配文件与 `yushan.log` 保留。`YUSHAN_LOG_DIR` 非空为
+  `Override`，照常写入但不清理。清理独立于开关，`YUSHAN_DEBUG=0` 时仍执行，失败静默跳过。
 
 ### 15.2 记录形状
 
@@ -903,3 +918,10 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 `low` 为 72.4 / 88.6s 但质量 2/3，默认 `high` 三次为 64.4 / 100.7 / 201.4s，
 中位 100.7s，且质量均 3/3。
 默认因此取 `high`；详细口径见 `docs/arch/explore-speed/cost-model.md` §8.5。
+
+## 17. CLI help — as-built
+
+`HELP_TEXT` 是纯文本常量，**自身不带尾换行**；`main` 用 `println!("{}", help::help_text())`
+输出，因此 stdout 恰以一个 `\n` 结尾，且不以 `\n\n` 或 `\r\n` 结尾。`--help`、`-h` 与
+`help` 三种触发形态逐字节一致。help 在 `Config::from_env`、运行时、凭证读取与 debug sink
+创建之前早退；即使 `YUSHAN_DEBUG` 未设置（默认开启），help 也不产生 debug 文件。

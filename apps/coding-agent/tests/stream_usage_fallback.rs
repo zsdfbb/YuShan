@@ -17,7 +17,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -227,7 +227,12 @@ fn event_payload(stdout: &str, name: &str) -> Option<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 fn isolate_home(tag: &str) -> std::path::PathBuf {
-    let home = std::env::temp_dir().join(format!("yushan_usage_fallback_{tag}"));
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!(
+        "yushan_usage_fallback_{tag}_{}_{seq}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
     home
@@ -237,6 +242,8 @@ fn isolate_home(tag: &str) -> std::path::PathBuf {
 fn run_json(api_base: &str, task: &str, home: &std::path::Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ys-coding-agent"))
         .args(["--json", task])
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         .env("YUSHAN_API_BASE", api_base)
         .env("YUSHAN_API_KEY", "test-key")
         .env("YUSHAN_MODEL", "test-model")

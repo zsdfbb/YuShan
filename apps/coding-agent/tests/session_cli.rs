@@ -114,6 +114,8 @@ impl Roots {
 /// 也会被开发机 shell 里的凭证短路。
 fn isolate(cmd: &mut Command, roots: &Roots) {
     cmd.current_dir(&roots.workspace)
+        .env_remove("YUSHAN_LOG_DIR")
+        .env("YUSHAN_DEBUG", "0")
         .env("HOME", &roots.home)
         .env("PATH", &roots.path_dir)
         .env_remove("USERPROFILE")

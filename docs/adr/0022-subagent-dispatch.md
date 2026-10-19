@@ -1,6 +1,6 @@
 # 0022 — Subagent 派发：窄能力注入（照 `Summarizer`），子事件不进父事件流
 
-给「主 agent 可派发 subagent 完成一些任务」定下形态 —— ① **派发能力走窄 trait 注入**（`ys-tool::SubagentRunner`，`&str` 进 / `SubagentOutcome` 出），经 `AgentPorts → RuntimeContext → ToolContext` 三跳送达工具，**形状与既有的 `Summarizer` 逐字同构**；② **子 agent 的事件不进父事件流**（复用既有的 `NoopEventSink`）⇒ `Source` / `Envelope` / `AgentEvent` / 三个事件消费者**全部零改动**；③ **子工具表 = 父表去掉派发工具**，且派发工具**追加在末位**（结构上不可能递归 + 命中 prompt cache）；④ **结果 = 代码硬截断的摘要 + 失败诊断 + 落盘转录的绝对路径**（照 `webfetch` 惯用法），`stop_reason` **复用 `ys-core::StopReason`**；⑤ **取消用 `ChildBoundary` 只透传 `is_aborted`**；⑥ **子 usage 必须上卷进 `TurnStats`**；⑦ 顺带解掉一个**前置阻塞项**：`BasicLoop` 用 300s 包住每个 `tool.call` 且超时 drop future。决策依据含 **12 个同类软件的补充调研**（见 `docs/arch/subagent/research.md`）。
+给「主 agent 可派发 subagent 完成一些任务」定下形态 —— ① **派发能力走窄 trait 注入**（`ys-tool::SubagentRunner`，`&str` 进 / `SubagentOutcome` 出），经 `AgentPorts → RuntimeContext → ToolContext` 三跳送达工具，**形状与既有的 `Summarizer` 逐字同构**；② **子 agent 的事件不进父事件流**（由子 runner 的本地 `CollectingSink` 收集并写入转录）⇒ `Source` / `Envelope` / `AgentEvent` / 三个事件消费者**全部零改动**；③ **子工具表 = 父表去掉派发工具**，且派发工具**追加在末位**（结构上不可能递归 + 命中 prompt cache）；④ **结果 = 代码硬截断的摘要 + 失败诊断 + 落盘转录的绝对路径**（照 `webfetch` 惯用法），`stop_reason` **复用 `ys-core::StopReason`**；⑤ **取消用 `ChildBoundary` 只透传 `is_aborted`**；⑥ **子 usage 必须上卷进 `TurnStats`**；⑦ 顺带解掉一个**前置阻塞项**：`BasicLoop` 用 300s 包住每个 `tool.call` 且超时 drop future。决策依据含 **12 个同类软件的补充调研**（见 `docs/arch/subagent/research.md`）。失败诊断、转录和并行事件时序的现行契约见 [ADR-0044](./0044-subagent-observability-and-debug-defaults.md)。
 
 >
 > ⚠️ **成本数字待重算**：本文的固定开销实测值（子 system ~18,100、每轮 ~24,630）是**在 `CLAUDE.md` 仍被加载时**量的。
@@ -66,13 +66,14 @@ pub trait SubagentRunner: Send + Sync {
 
 ### 2. 子 agent 的事件**不进**父事件流
 
-子 agent 用 `MemorySession::new()` + **既有的** `ys_event::NoopEventSink`（`crates/ys-event/src/noop.rs:8`）+ 新建的 `Agent`。
+子 agent 用 `MemorySession::new()` + **本地** `ys_event::CollectingSink` + 新建的 `Agent`。
+收集到的事件只用于生成子转录，不进入父事件流；父侧仍看不到子 agent 的逐条活动。
 
 ⇒ **`Source` / `Envelope` / `AgentEvent` / `ChannelSink` / `ys-tui-coding` / 三个消费者全部零改动。** 回合号语义、`is_turning` 误关、`--json` 提前收尾这三件事**整体消失**（不是被修好，是不会发生）。
 
 **「至少能够区分」靠工具行满足**：模型发的是 `ToolUse{name:"task"}`，TUI 渲染成一条普通 Tool 行（`app.rs:103-119` 既有机制），结果行闭合时显示摘要 —— 与 Claude Code 的 `⏺ Task agent finished · …` 同一层级，正是需求②要的层级。
 
-**如实记录代价**：子 agent 的内部活动**在任何输出通道都不可见**（`--json` 亦然），排障只能看落盘转录。**若将来要可见**，缝仍在：加 `Source::subagent(id)` + 在 `app_loop` 转发处与 `-p`/`--json` 的消费循环各加一次 source 判断。**触发条件**：出现「要在 UI 上看到子 agent 逐条工具调用」的真实需求。
+**如实记录代价**：子 agent 的内部活动**不在父输出通道中显示**（`--json` 亦然），排障看落盘转录。**若将来要可见**，缝仍在：加 `Source::subagent(id)` + 在 `app_loop` 转发处与 `-p`/`--json` 的消费循环各加一次 source 判断。**触发条件**：出现「要在 UI 上看到子 agent 逐条工具调用」的真实需求。
 
 > **本条推翻了 `context.md` 的「身份是第 1 刀」建议。** 那里判定的 bug 是真的，但它的**触发前提**（子 agent 事件进父流）在本设计下不成立。按 ADR-0014「零消费者 ⇒ 不建」，不发射比发射后过滤**更强**且更省。
 
@@ -85,15 +86,15 @@ pub trait SubagentRunner: Send + Sync {
 
 ### 4. 结果 = 硬截断的摘要 + 失败诊断 + 落盘转录的绝对路径
 
-`SubagentOutcome { summary, artifact, stop_reason, diagnostic, usage }`。三道闸叠加：① 摘要 ≤ 8 KB，**在代码里硬截断**（不靠提示词）；② 完整子转录写 `~/.yushan/subagents/`，结果尾部附绝对路径，父按需 `read offset=` / `grep`（**照 `webfetch` 的 ADR-0016 惯用法**）；③ 子 `max_rounds` 保证产物有界。
+`SubagentOutcome { summary, artifact, stop_reason, diagnostic, usage }`。三道闸叠加：① 摘要文本主体按 `MAX_SUMMARY_BYTES = 8 KiB` **在代码里硬截断**（不靠提示词）；截断标记与随后保证的 `## Files` 节使最终 summary 可略超 8 KiB；② 完整子转录写 `~/.yushan/subagents/`，结果尾部附绝对路径，父按需 `read offset=` / `grep`（**照 `webfetch` 的 ADR-0016 惯用法**）；③ 子 `max_rounds` 保证产物有界。
 
 - **`stop_reason` 复用 `ys-core::StopReason`，不新造词汇**：`Completed` ↔ 正常收尾；`MaxRounds` ↔ 撞轮数上限（部分结果）；`Cancelled` ↔ 被取消；`Truncated` ↔ 输出被截断。非 `Completed` ⇒ 父侧 `ToolResult{is_error: true}`（ADR-0001 错误结果通道）。（对照：deepseek-harness 需要自造 `SubagentStopReason`，因为它没有共享的 `StopReason` 类型 —— **本仓有，直接复用。**）
-- **`diagnostic`**：非 `Completed` 时的安全失败详情（provider 报错原文等），**实现方须硬上限截断**（对照 deepseek-harness 的 4096 UTF-8 字节）。**绝不允许「返回空且无错误」** —— opencode #37852 正是该形态（aborted stream 被记成正常结束 ⇒ 子返回空且无错误），Kimi #11364 是它的下游后果（父只好自己重读）。
-- **落 `~/.yushan/subagents/`，保留策略照 `fetched` 的先例：启动期 sweep 超过 7 天的文件**（只清 Primary 档，`Override` 档只写不删）。理由是它是**派生物**（源子会话已终止），且**悬空指针是优雅降级**（`read` 失败，模型自会 adapt），不是正确性 bug。⚠️ **不照 `sessions` 的「永不清理」** —— 那是既存缺口，不是该复制到新目录的先例；**本轮不顺手改它**。配套 `YUSHAN_SUBAGENTS_DIR` 测试覆盖口（否则测试会写进用户真实的 `~/.yushan/subagents/`）。
+- **`diagnostic`**：非 `Completed` 或因转录写入失败产生的安全失败详情，包含 `stop_reason`、整数耗时和可选取消来源；控制字符替换为空格，总长上限 1024 字节，超出时按 UTF-8 边界截断。**绝不允许「返回空且无错误」** —— opencode #37852 正是该形态（aborted stream 被记成正常结束 ⇒ 子返回空且无错误），Kimi #11364 是它的下游后果（父只好自己重读）。
+- **落 `~/.yushan/subagents/`，保留策略照 `fetched` 的先例：启动期 sweep 超过 7 天的文件**（只清 Primary 档，`Override` 档不清理）。理由是它是**派生物**（源子会话已终止），且**悬空指针是优雅降级**（`read` 失败，模型自会 adapt），不是正确性 bug。⚠️ **不照 `sessions` 的「永不清理」** —— 那是既存缺口，不是该复制到新目录的先例；**本轮不顺手改它**。配套 `YUSHAN_SUBAGENTS_DIR` 测试覆盖口（否则测试会写进用户真实的 `~/.yushan/subagents/`）。
 - **落 `~/.yushan/` 而非工作区**：会话与抓取内容都已在 `~/.yushan/`；写进用户仓库会污染其 git 工作区，本仓对此有明文警惕（`apps/coding-agent/src/main.rs:437-439`）。
 - **不照抄 Claude Code 的「只回最终消息」**：那会永久丢掉细节；加一个指针的成本是一行字符串。**调研确认这是差异化优势** —— 9 家里只有 2 家做到「截断 + 指针」的组合。
 - **「产物」的另一半**（子写进工作区的文件）父本就能 `read` 到；要设计的是**父怎么知道去哪找** ⇒ 在子的**输入消息**里要求按 `## Files` 节汇报。**格式不发明** —— 本仓压缩摘要已用且承重该节（`crates/ys-component/src/compact.rs:87,109,154`）。**放 messages 不放 system**（放 system 就是每轮前缀变动）。这与 deepseek-harness 的 *"runtime-context contribution rather than a system-prompt section"* 是同一条纪律。
-- **失败**：子撞 `max_rounds` / 模型报错 ⇒ `Ok` + 非 `Completed` 的 `stop_reason` ⇒ `ToolResult{is_error: true}` ⇒ 照 ADR-0001 回喂父模型，**父回合不因此失败**。只有「**跑都跑不起来**」（如 `model` 名解析失败）才走 `Err`。
+- **失败**：子回合启动后撞 `max_rounds` / 模型或运行时报错 / 被取消 ⇒ `Ok` + 非 `Completed` 的 `stop_reason` ⇒ `ToolResult{is_error: true}` ⇒ 照 ADR-0001 回喂父模型，**父回合不因此失败**。无可用模型、派发次数超限、`AgentBuilder` 失败等「跑都跑不起来」的前置错误直接返回 `Err`；`SubagentTool` 映射为 `ToolError::Execution`，不生成 `[diagnostic: ...]`。
 
 ### 5. 取消：`ChildBoundary` 只透传 `is_aborted`，`take()` 恒 `None`
 
@@ -132,7 +133,7 @@ pub trait SubagentRunner: Send + Sync {
 不设只读限制：**子 agent 的能力完全由「创建时给它的那张表」决定**。子 agent 能写，是因为表里有 `write`/`edit`。
 ⇒ 附带好处：将来若要只读子 agent（12 家里 6 家有内建只读角色），**不需要新机制** —— 只是换一张表。
 
-⚠️ **配套护栏（子表可写 + 决策 11 的并行 ⇒ 并发子 agent 可以互相覆盖文件）**：工具 guideline 写死 **「并行派发的子 agent 之间，写目标必须不相交」**（Gemini 的 prompt 原文 *"You should NEVER run multiple subagents in a single turn if their abilities mutate the same files or resources"*；Amp 的 *"multiple tasks in parallel **iff** their write targets are disjoint"*）。**本仓无 branch/worktree、不做沙箱** ⇒ 这条只能靠提示词约束，**记录为已知缺口**。
+⚠️ **配套护栏（子表可写 + 决策 11 的并行 ⇒ 并发子 agent 可以互相覆盖文件）**：工具 guideline 写死两条通用调度规则：① 派发多个 subagent 前检查依赖与写入范围；消费另一任务输出或验证其修改的任务必须等前置完成，只有输出独立且写入范围不相交才并行，范围不明则串行；② subagent 返回错误或取消后，先读诊断，再缩窄重试或向用户报告。**本仓无 branch/worktree、不做沙箱** ⇒ 这条只能靠提示词约束，**记录为已知缺口**。
 
 ### 11. **支持并行派发** —— `BasicLoop` Step 9 从「串行（v0）」升级为**条件并行**
 
@@ -144,15 +145,15 @@ pub trait SubagentRunner: Send + Sync {
 
 ```rust
 // ys-tool：与 Tool::timeout() 同一种加法式改动
-fn is_concurrency_safe(&self) -> bool { false }   // 默认 false ⇒ 既有工具逐字节不变
+fn is_concurrency_safe(&self) -> bool { false }   // 默认 false ⇒ 未显式声明的工具保持串行
 // ys-component
 pub max_parallel_tools: usize,                     // 建议默认 4
 ```
 
 **执行规则**：仅当「批次 > 1 **且** 批次中**每一个**工具都声明 `is_concurrency_safe()`」时才走并行路径（信号量限流 ≤ `max_parallel_tools`），否则**原串行路径一字不改**。
-⚠️ 「每一个」这个条件是承重的：它保证**既有的一切批次行为逐字节不变**（今天没有工具声明 `true`）；唯一走并行的新情况是「同一条消息里 ≥2 个 `subagent`」，那是新场景、不存在回归。混合批次（`subagent` + `bash`）自动退回串行。
+⚠️ 「每一个」这个条件是承重的：只有批内全部工具都声明 `true` 才并行；未全声明的批次继续保持原串行路径。混合批次（`subagent` + `bash`）自动退回串行。当前声明为 `true` 的集合是 `subagent` 与只读工具 `read` / `find` / `ls` / `grep`。
 
-**三个必须处理的技术点**：① `ctx.events` 是 `&mut dyn EventSink` **不能跨并发任务共享** ⇒ 先串行 emit 全部 `ToolCall`，并发执行，再**按原始顺序**串行 emit 全部 `ToolResult`（`ContentBlock` 落盘同样按原始 id 顺序，ADR-0001 配对完整性；TUI 靠 `tool_index` 按 id 回填，**无需改动**）；② 审批检查提前到并发之前；③ **每次派发建一个全新子 `Agent`** —— `Agent::run_turn(&mut self)` 使一个实例无法被两个并发派发共用，原设计的 `Mutex<Agent>` 会在并行下退化成串行，已删除。代价已核实可忽略（`ToolRegistry::build` 只是 9 个小结构体的 `HashMap`，`crates/ys-tool/src/registry.rs:25-41`）。
+**三个必须处理的技术点**：① `ctx.events` 是 `&mut dyn EventSink` **不能跨并发任务共享** ⇒ 先串行 emit 全部 `ToolCall`，再用 `buffer_unordered(max_parallel_tools.max(1))` 执行；每个 future 携带原始 index，完成即按完成顺序 emit 对应 `ToolResult` 并写回 `outcomes[index]`。父模型消息仍在 Step 9c 按原始 tool-call 顺序组装（ADR-0001 配对完整性；TUI 靠 `tool_index` 按 id 回填，**无需改动**）；② 审批检查提前到并发之前；③ **每次派发建一个全新子 `Agent`** —— `Agent::run_turn(&mut self)` 使一个实例无法被两个并发派发共用，原设计的 `Mutex<Agent>` 会在并行下退化成串行，已删除。代价已核实可忽略（`ToolRegistry::build` 只是 9 个小结构体的 `HashMap`，`crates/ys-tool/src/registry.rs:25-41`）。
 
 **上限 4，且排队而非报错**：数量依据 Codex（并发默认 4）/ Goose（后台 5）/ Anthropic 经验（一次并行 3–5 个）；行为上 Codex 与 Goose 超限都**直接报错**，对模型不友好 —— 本仓用信号量**排队**。槽位数写进 guideline（照 Codex 的 *"There are N available concurrency slots…"*），⚠️ **故它是前缀的一部分 ⇒ 必须是固定默认值，不做成运行时可调的用户配置**（与 `ToolPlugin.order` 同一条理由）。
 
@@ -165,9 +166,9 @@ pub max_parallel_tools: usize,                     // 建议默认 4
 ⚠️ **代价必须记住：每次派发 ~18,100 est token 的子 system**（本仓实测；详见下文「成本模型修正」），而且它**必然 miss 缓存**（前缀在 tools 层就断了）。
 ✅ **但有一条反向红利**：同批的 N 个子 agent 的 system 与工具表**逐字节相同** ⇒ 第 2..N 个**互相命中**（4 并发的 system 成本 ≈ 23.5k 而非 72k）。「统一」因此不只是保守，是**缓存相干**的。
 
-### 13. 并行的闸门**只开给 `subagent`**
+### 13. 并行闸门**只开给显式声明安全的工具**
 
-`Tool::is_concurrency_safe()` 默认 `false` ⇒ 既有工具**逐字节不变**；本轮只有 `subagent` 覆写为 `true`。**只读工具（read/grep/find/ls/…）本轮不动** —— 它们改的是**既有批次**的行为（事件顺序 `C1,R1,C2,R2` → `C1,C2,R1,R2`，TUI 观感 + `--json` 输出顺序），须走一次显式的行为变更评审。**准入规则先写下**：可证明对共享状态无副作用才准开（⇒ 只读工具可以；`bash`/`write`/`edit` 永远不行）。
+`Tool::is_concurrency_safe()` 默认 `false`。当前声明为 `true` 的集合是 `subagent` 与只读工具 `read` / `find` / `ls` / `grep`；`bash` / `write` / `edit` 等保持默认串行。只读批次因此走 `C1,C2,R(按完成顺序)`，TUI 用 `ToolCallId` 回填、`--json` 消费者看到完成顺序。准入规则是：只有可证明对共享状态无副作用的工具才能声明安全。
 
 ### 14. 并发上限 `max_parallel_tools`：**常量 + 字段双轨**
 
@@ -275,13 +276,13 @@ pub max_parallel_tools: usize,                     // 建议默认 4
 - **`resume` / 持久可恢复的子实例**（Kimi / codex）—— 本仓无 branch/fork，且会话 JSONL 已有自己的恢复语义。
 - **多 provider 注册表**（deepseek-harness 的 `spawn`/`fork`/`acp`/`codex`）—— 本仓只有一个 in-process provider；建注册表就是为假想消费者设计（ADR-0014）。
 - **把并行做进工具（`{tasks: [...]}` 数组）而非循环** —— 为了并行而改掉一个已被 12 家验证过的收敛 schema，且 UI 只剩一条工具行。**已采纳循环层方案**（决策 11）。
-- **并行默认开启（无 `is_concurrency_safe` 闸门）** —— 会让同批 `bash`+`edit` 也并发，直接引入既有工具的行为变更与写冲突。**必须是「默认串行 + 显式声明」**。
+- **并行无条件开启（无 `is_concurrency_safe` 闸门）** —— 会让同批 `bash`+`edit` 也并发，直接引入既有工具的行为变更与写冲突。**必须是「默认串行 + 显式声明」**。
 - **并发超限直接报错**（Codex 的 `AgentLimitReached` / Goose 的 *"Maximum N background tasks already running"*）—— 对模型不友好。**已改为信号量排队**。
 - **子返回「下限」机制**（Kimi 的 `SUMMARY_MIN_LENGTH = 200` 重提示）—— 那是「模型欠汇报」的补丁；本仓用提示词里的回报模板解决，零机制。
 
 ## Consequences
 
-- **`ys-*` 核心 crate 的改动**：`ys-tool` +1 trait +1 字段 +2 trait 默认方法；`ys-component` +1 字段 +1 limit；`ys-runtime` +1 字段；`ys-loop` 接线 1 行 + 超时改用 `tool.timeout()` + **Step 9 加条件并行路径**。**零破坏性变更、零 tokio 越界、零依赖方向变化**；除 Step 9 外全部为加法式。⚠️ **Step 9 是本 ADR 唯一动既有执行语义的地方**，其行为变更被 `Tool::is_concurrency_safe()` 默认 `false` **完全闸住** —— 既有的一切批次仍走原串行路径（决策 11 的「每一个」条件）。
+- **`ys-*` 核心 crate 的改动**：`ys-tool` +1 trait +1 字段 +2 trait 默认方法；`ys-component` +1 字段 +1 limit；`ys-runtime` +1 字段；`ys-loop` 接线 1 行 + 超时改用 `tool.timeout()` + **Step 9 加条件并行路径**。**零破坏性变更、零 tokio 越界、零依赖方向变化**；除 Step 9 外全部为加法式。⚠️ **Step 9 是本 ADR 唯一动既有执行语义的地方**，未全声明 `is_concurrency_safe()` 的批次仍走原串行路径；当前只读安全集合与 `subagent` 走并行。
 - **`ys-tui-coding` / `ys-protocol` / `ys-event` / `ys-core` 零改动。**
 - **`Source` 仍是预留缝**，其触发条件（要看见子 agent 逐条活动）已写下 —— 避免后人误以为「已经支持多 agent 身份了」。
 - ⚠️ **本 ADR 在「子事件不进父流」上是少数派**：12 个同类软件里**多数都把子 agent 活动显示出来**（Codex `/subagents`、Gemini 可折叠组、Kimi TASK BROWSER、opencode 检查器）。偏离的唯一依据是用户答②。**代价必须记住**：UI 不可观测性正是「成本不聚合」与「排障困难」的共同根源 —— 若答② 松动，决策 2 是**第一个该翻的**（缝已留好）。
@@ -290,9 +291,9 @@ pub max_parallel_tools: usize,                     // 建议默认 4
 - **P0 prefix 指纹测试是本需求的第 0 刀**（用户已定④）：先锚 9 工具，冻结；加第 10 个工具后重新锚 —— 这一步把一次**预期的**前缀漂移（≈9k token 的一次性缓存失效）变成**显式**的。
 - **已知缺口（明确接受）**：
   1. 子 agent 内部不可观测（只有落盘转录可查）—— **本设计的少数派偏离**，见上；
-  2. **并行子 agent 之间的写冲突无人管**（子表可写 + 决策 11 的并行）—— 本仓无 branch/worktree、无沙箱，只能靠提示词约束「写目标必须不相交」。同类软件的并行事故全部集中于此（Google 官方博客警告 *"agents overwriting one another"*；OpenHands 的并发默认值至今是 **1**）。**这是决策 11 明确接受的代价。**
+  2. **并行子 agent 之间的写冲突无人管**（子表可写 + 决策 11 的并行）—— 本仓无 branch/worktree、无沙箱，只能靠提示词约束「检查依赖与写入范围、范围不明时串行」，失败或取消后先读诊断再缩窄重试或报告。同类软件的并行事故全部集中于此（Google 官方博客警告 *"agents overwriting one another"*；OpenHands 的并发默认值至今是 **1**）。**这是决策 11 明确接受的代价。**
   3. 子 agent 的提示词是第二份固定开销，其 `fixed_prompt_tokens` 必须填**子表的值**（否则子会话系统性晚触发压缩）；
-  4. 父子同时改同一文件无人管（本仓无 branch/worktree）—— 同类软件的并行事故最集中于此，与本仓「不做并行」的保守选择一致；
+  4. 父子同时改同一文件无人管（本仓无 branch/worktree）—— 同类软件的并行事故最集中于此，是并行能力明确接受的写冲突风险；
   5. **子 agent 的 `edit`/`write` 直落用户工作区**（本仓不做沙箱）—— 决策 10 的只读选项正是为此留的口子。
 - **三项裁决已定**（用户 2026-09-23）：① 子表**可写**（能力 = 创建时给它的工具表）；② **支持并行**；③ 工具名 = **`subagent`**。见 `design.md` §8 裁决记录。
 - 设计与成本模型（含 back-of-envelope）：`docs/arch/subagent/design.md`；**12 项目补充调研**：同目录 `research.md`；上下文与四点澄清：同目录 `context.md`。

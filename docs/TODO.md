@@ -18,15 +18,14 @@
 ### A1. `--debug` 结构化日志 P1 / P2
 
 P0 已落地；P1、P2 是**设计文档自己排的阶段**，标注见
-`docs/arch/agent-observability/design.md:294`（P1）与 `:295`（P2）。
+`docs/arch/agent-observability/design.md` §5（P1 / P2）。
 
 | 阶段 | 缺什么 | 状态依据 |
 |---|---|---|
-| P1 | **适配器自检**（启动期检测旁路静默退化的缓解措施） | `design.md:294` 标 ⏳，全仓无自检代码 |
+| P1 | **适配器自检**（启动期检测旁路静默退化的缓解措施） | `design.md` §5 标 ⏳，全仓无自检代码 |
 | P1 | T5 的「进程被 `kill -9`」不 flush 退出 | `docs/exec-plans/2026-10-17-debug-log.md:454` 仍为 `[ ]` |
-| P2 | 启动期 **sweep**（旧 debug 文件按 mtime 清理） | `design.md:295`；`main.rs` 只有 `sweep_fetched`（`:1278`）与 `subagents_dir.sweep_old()`（`:2549`），无 debug 目录 sweep |
 | P2 | `state_change` 记录 | 全仓源码 grep `state_change` **零命中** |
-| P2 | jq 配方文档 | `design.md:295` |
+| P2 | jq 配方文档 | `design.md` §5 标 ⏳ |
 
 > P1 的 `model_attempt` / `context_compacted` / `context_compaction_failed` / `response_truncated`
 > **已落地**（`apps/coding-agent/src/debug_log.rs:508`、`main.rs:713`、`main.rs:723`），不在本清单内。

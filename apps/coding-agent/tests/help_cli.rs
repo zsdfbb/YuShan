@@ -42,6 +42,13 @@ use std::time::Duration;
 /// 校验 worktree 名），故取 60s 上限而非 help 自身的耗时。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 子进程的 debug 环境。所有命令都先移除 `YUSHAN_LOG_DIR`，再由用例显式选择。
+#[derive(Clone, Copy)]
+enum DebugEnv {
+    Off,
+    Unset,
+}
+
 /// 三种触发形态 → 子进程 argv（`src/main.rs::parse_args` 的**首位置**判定）。
 const TRIGGERS: [(&str, &[&str]); 3] = [
     ("--help", &["--help"]),
@@ -80,6 +87,7 @@ struct Roots {
     workspace: PathBuf,
     home: PathBuf,
     sessions_dir: PathBuf,
+    logs_dir: PathBuf,
 }
 
 impl Roots {
@@ -88,6 +96,7 @@ impl Roots {
             workspace: unique_dir(&format!("{tag}_ws")),
             home: unique_dir(&format!("{tag}_home")),
             sessions_dir: unique_dir(&format!("{tag}_sessions")),
+            logs_dir: unique_dir(&format!("{tag}_logs")),
         };
         // 「无凭证」是本文件全部用例的前提：隔离 HOME 必须真的是空的，
         // 否则从上一用例漏进来的 auth.json 会让「无凭证也能跑」这条断言失去意义。
@@ -105,6 +114,7 @@ impl Drop for Roots {
         let _ = std::fs::remove_dir_all(&self.workspace);
         let _ = std::fs::remove_dir_all(&self.home);
         let _ = std::fs::remove_dir_all(&self.sessions_dir);
+        let _ = std::fs::remove_dir_all(&self.logs_dir);
     }
 }
 
@@ -113,11 +123,16 @@ impl Drop for Roots {
 /// 模型侧凭证必须清干净：否则开发机 shell 里的凭证会让 T6 / T7 走到真实网络请求，
 /// 既慢又不确定 —— 本文件全部用例都要求「无凭证」这一前提。
 fn isolated_command(roots: &Roots) -> Command {
+    isolated_command_with_debug(roots, DebugEnv::Off)
+}
+
+fn isolated_command_with_debug(roots: &Roots, debug_env: DebugEnv) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ys-coding-agent"));
     cmd.current_dir(&roots.workspace)
         .env("HOME", &roots.home)
         .env_remove("USERPROFILE")
         .env("YUSHAN_SESSIONS_DIR", &roots.sessions_dir)
+        .env_remove("YUSHAN_LOG_DIR")
         // 模型侧
         .env_remove("YUSHAN_API_BASE")
         .env_remove("YUSHAN_API_KEY")
@@ -134,6 +149,14 @@ fn isolated_command(roots: &Roots) -> Command {
         .env_remove("YUSHAN_SEARCH_BOCHA_KEY")
         .env_remove("YUSHAN_SEARCH_FIRECRAWL_KEY")
         .env_remove("YUSHAN_FETCHED_DIR");
+    match debug_env {
+        DebugEnv::Off => {
+            cmd.env("YUSHAN_DEBUG", "0");
+        }
+        DebugEnv::Unset => {
+            cmd.env_remove("YUSHAN_DEBUG");
+        }
+    }
     cmd
 }
 
@@ -154,6 +177,15 @@ fn run_guarded(argv: &[&str], roots: &Roots) -> String {
 fn run_guarded_output(argv: &[&str], roots: &Roots) -> Output {
     let mut cmd = isolated_command(roots);
     cmd.args(argv);
+    run_guarded_cmd(cmd, argv)
+}
+
+fn run_guarded_output_with_debug(argv: &[&str], roots: &Roots, debug_env: DebugEnv) -> Output {
+    let mut cmd = isolated_command_with_debug(roots, debug_env);
+    cmd.args(argv);
+    if matches!(debug_env, DebugEnv::Unset) {
+        cmd.env("YUSHAN_LOG_DIR", &roots.logs_dir);
+    }
     run_guarded_cmd(cmd, argv)
 }
 
@@ -185,6 +217,21 @@ fn hits_help_markers(text: &str) -> Vec<&'static str> {
         .iter()
         .filter(|m| text.contains(**m))
         .copied()
+        .collect()
+}
+
+fn debug_jsonl_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("debug-") && name.ends_with(".jsonl"))
+        })
         .collect()
 }
 
@@ -229,12 +276,61 @@ fn three_trigger_shapes_emit_byte_identical_stdout() {
         captured.push((name, out.stdout.clone()));
     }
     let ((first, first_bytes), rest) = captured.split_first().expect("TRIGGERS 非空");
+    assert!(
+        first_bytes.ends_with(b"\n"),
+        "{first:?} 的 stdout 应以一个换行结尾"
+    );
+    assert!(
+        !first_bytes.ends_with(b"\r\n"),
+        "{first:?} 的 stdout 不得以 CRLF 结尾"
+    );
+    assert!(
+        !first_bytes.ends_with(b"\n\n"),
+        "{first:?} 的 stdout 不得以双换行结尾"
+    );
     for (name, bytes) in rest {
+        assert!(
+            bytes.ends_with(b"\n") && !bytes.ends_with(b"\n\n"),
+            "{name:?} 的 stdout 应恰以一个换行结尾"
+        );
+        assert!(
+            !bytes.ends_with(b"\r\n"),
+            "{name:?} 的 stdout 不得以 CRLF 结尾"
+        );
         assert_eq!(
             first_bytes, bytes,
             "{first:?} 与 {name:?} 的 stdout 应逐字节一致（帮助是纯文本常量，无形态差异）"
         );
     }
+}
+
+/// help 在 sink 建立前早退：即使 `YUSHAN_DEBUG` 未设置（默认开启）且日志目录
+/// 已显式隔离，也不得创建任何 debug 文件。
+#[test]
+fn help_early_exit_creates_no_debug_files_with_default_debug_on() {
+    let roots = Roots::new("help_default_debug");
+    let out = run_guarded_output_with_debug(&["--help"], &roots, DebugEnv::Unset);
+    let (stdout, stderr) = streams(&out);
+    assert!(
+        out.status.success(),
+        "`--help` 应 exit 0\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "`--help` 的 stderr 应为空，实际：\n{stderr}"
+    );
+
+    let debug_files = debug_jsonl_files(&roots.logs_dir);
+    assert!(
+        debug_files.is_empty(),
+        "help 早退不得建立 debug 文件：{debug_files:?}"
+    );
+    let home_debug_files =
+        debug_jsonl_files(&roots.home.join(".yushan").join("logs"));
+    assert!(
+        home_debug_files.is_empty(),
+        "help 早退不得绕过 Override 写进 HOME：{home_debug_files:?}"
+    );
 }
 
 /// T5：无凭证环境下仍能跑通 —— **help 纯打印契约本身**。

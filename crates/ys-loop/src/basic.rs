@@ -602,8 +602,8 @@ impl AgentLoop for BasicLoop {
             //
             // 三段式（`ctx.events: &mut dyn EventSink` 不能跨并发任务共享）：
             //   9a 串行：审批 + emit `ToolCall`（保原顺序）
-            //   9b 执行：all-safe ⇒ `buffered(n)`（**保序**、单任务内并发）；否则原串行
-            //   9c 保序：emit `ToolResult` + 连续错误计数 + 组装单条消息（ADR-0001 配对）
+            //   9b 执行：all-safe ⇒ `buffer_unordered(n)`（完成即发）；否则原串行
+            //   9c 保序：连续错误计数 + 组装单条消息（ADR-0001 配对）
             let mut outcomes: Vec<Option<CoreToolResult>> = vec![None; tool_calls.len()];
             let summarizer = ModelSummarizer { model: ctx.model };
 
@@ -655,8 +655,9 @@ impl AgentLoop for BasicLoop {
                     .await
                     .map_err(LoopError::Event)?;
                 }
-                // `buffered` 而非 `spawn`：`Tool::call` 的 future 借了 `&dyn Tool` 与
-                // `ToolContext<'_>`（非 `'static`）；`buffered` 在**单任务内**并发且**保序**。
+                // `buffer_unordered` 而非 `spawn`：`Tool::call` 的 future 借了
+                // `&dyn Tool` 与 `ToolContext<'_>`（非 `'static`）；该组合子在单任务内
+                // 并发，完成一个就交出一个，结果在这里按完成顺序立即发出。
                 let mut futs = Vec::with_capacity(pending.len());
                 for &i in &pending {
                     let (_, tool_name, tool_args) = &tool_calls[i];
@@ -670,21 +671,27 @@ impl AgentLoop for BasicLoop {
                     let budget = tool_budget(tool, &ctx.limits);
                     let name = tool_name.clone();
                     let args = tool_args.clone();
-                    futs.push(async move { call_one(tool, name, args, tool_ctx, budget).await });
+                    futs.push(
+                        async move { (i, call_one(tool, name, args, tool_ctx, budget).await) },
+                    );
                 }
                 let n = ctx.limits.max_parallel_tools.max(1);
-                let executed: Vec<CoreToolResult> =
-                    futures_util::stream::iter(futs).buffered(n).collect().await;
-                for (slot, result) in pending.iter().zip(executed) {
-                    outcomes[*slot] = Some(result);
-                }
-                // 再按原始顺序 emit 全部 `ToolResult`。
-                for &i in &pending {
+                let mut executed = futures_util::stream::iter(futs).buffer_unordered(n);
+                // future 只借 registry / boundary / subagent；events 是另一个字段，
+                // 因而可以在每个结果完成时立即 reborrow 并 await emit。
+                let events = &mut *ctx.events;
+                while let Some((i, result)) = executed.next().await {
                     let id = tool_calls[i].0.clone();
-                    let result = outcomes[i].clone().expect("已填");
-                    emit(ctx.events, AgentEvent::ToolResult { id, result })
-                        .await
-                        .map_err(LoopError::Event)?;
+                    emit(
+                        events,
+                        AgentEvent::ToolResult {
+                            id,
+                            result: result.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                    outcomes[i] = Some(result);
                 }
             } else {
                 // 串行路径：**逐个** emit ToolCall → 执行 → emit ToolResult（保持既有
@@ -810,7 +817,9 @@ impl AgentLoop for BasicLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1836,7 +1845,7 @@ mod tests {
         }
     }
 
-    /// 事件流里 `ToolCall` / `ToolResult` 的 (kind, id) 序列 —— 断言**保序**用。
+    /// 事件流里 `ToolCall` / `ToolResult` 的 (kind, id) 序列。
     fn call_result_order(events: &CollectingSink) -> Vec<(&'static str, String)> {
         events
             .events()
@@ -1844,6 +1853,54 @@ mod tests {
             .filter_map(|e| match e {
                 AgentEvent::ToolCall { call } => Some(("C", call.id.0.clone())),
                 AgentEvent::ToolResult { id, .. } => Some(("R", id.0.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_calls_precede_results(
+        order: &[(&'static str, String)],
+        expected_calls: usize,
+        expected_results: usize,
+    ) {
+        assert_eq!(order.len(), expected_calls + expected_results);
+        assert!(
+            order[..expected_calls].iter().all(|(kind, _)| *kind == "C"),
+            "全部 ToolCall 必须先于任何 ToolResult：{order:?}"
+        );
+        assert!(
+            order[expected_calls..].iter().all(|(kind, _)| *kind == "R"),
+            "全部 ToolCall 发完后才允许出现 ToolResult：{order:?}"
+        );
+    }
+
+    fn result_ids_in(order: &[(&'static str, String)]) -> Vec<String> {
+        order
+            .iter()
+            .filter_map(|(kind, id)| (*kind == "R").then(|| id.clone()))
+            .collect()
+    }
+
+    fn tool_result_pairs(events: &CollectingSink) -> Vec<(String, String)> {
+        events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { id, result } => {
+                    Some((id.0.clone(), result.content.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_result_ids_in(session: &MemorySession) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_call_id, .. } => Some(tool_call_id.0.clone()),
                 _ => None,
             })
             .collect()
@@ -1908,27 +1965,20 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 1, "串行不得有重叠执行");
     }
 
-    /// §4.4-2：**每一个都声明 safe** ⇒ 并行（墙钟 ≈ max 而非 sum），事件 `C1,C2,R1,R2`。
+    /// §4.4-2：**每一个都声明 safe** ⇒ 并行。
+    ///
+    /// `ToolResult` 的顺序由完成顺序决定，不是本用例的稳定契约；这里只钉住
+    /// 「全部 ToolCall 先发」、两个结果恰好各出现一次，以及峰值并发为 2。
     #[tokio::test]
     async fn batch_is_parallel_when_every_tool_is_safe() {
         let (registry, _, peak) = conc_tool_registry(&[("a", true, 250), ("b", true, 250)]);
         let model = MultiToolModel::new(&[("1", "a"), ("2", "b")]);
-        let (order, elapsed) = run_batch(&registry, &model, 4).await;
-        assert_eq!(
-            order,
-            vec![
-                ("C", "1".into()),
-                ("C", "2".into()),
-                ("R", "1".into()),
-                ("R", "2".into())
-            ],
-            "并行：先发完全部 ToolCall，再按原序发 ToolResult"
-        );
+        let (order, _) = run_batch(&registry, &model, 4).await;
+        assert_calls_precede_results(&order, 2, 2);
+        let mut result_ids = result_ids_in(&order);
+        result_ids.sort();
+        assert_eq!(result_ids, vec!["1", "2"]);
         assert_eq!(peak.load(Ordering::SeqCst), 2, "两个 safe 工具应真的并发");
-        assert!(
-            elapsed < Duration::from_millis(450),
-            "并行墙钟应 ≈ max(250,250) 而非 sum(500)：{elapsed:?}"
-        );
     }
 
     /// §4.4-3：**混合批次**（一个 safe 一个 unsafe）⇒ 退回串行。
@@ -1964,20 +2014,417 @@ mod tests {
         let model = MultiToolModel::new(&[("1", "a"), ("2", "b"), ("3", "c"), ("4", "d")]);
         let (order, _) = run_batch(&registry, &model, 2).await;
         assert_eq!(peak.load(Ordering::SeqCst), 2, "峰值并发不得超过上限");
-        // 保序：结果仍按原始 id 顺序回填。
+        assert_calls_precede_results(&order, 4, 4);
+        let mut result_ids = result_ids_in(&order);
+        result_ids.sort();
+        assert_eq!(result_ids, vec!["1", "2", "3", "4"]);
+    }
+
+    /// `max_parallel_tools = 0` 必须被 `.max(1)` 钳成 1。
+    ///
+    /// 变异：直接传 0 给 `buffer_unordered` ⇒ 流不推进，本用例被超时打红。
+    #[tokio::test]
+    async fn zero_max_parallel_tools_is_clamped_to_one() {
+        let (registry, _, peak) = conc_tool_registry(&[("a", true, 20), ("b", true, 20)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b")]);
+        let (order, _) =
+            tokio::time::timeout(Duration::from_secs(2), run_batch(&registry, &model, 0))
+                .await
+                .expect("max_parallel_tools=0 必须被钳成 1，而不是让并行流停住");
+
+        assert_calls_precede_results(&order, 2, 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "钳成 1 后只允许单路推进");
+    }
+
+    struct NotifyOnToolResult {
+        inner: CollectingSink,
+        notify: Arc<tokio::sync::Notify>,
+        tool_result_id: &'static str,
+    }
+
+    impl EventSink for NotifyOnToolResult {
+        fn try_emit(&mut self, event: AgentEvent) -> Result<(), AgentEvent> {
+            if matches!(
+                &event,
+                AgentEvent::ToolResult { id, .. } if id.0 == self.tool_result_id
+            ) {
+                self.notify.notify_one();
+            }
+            self.inner.try_emit(event)
+        }
+
+        fn emit<'a>(
+            &'a mut self,
+            event: AgentEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ys_core::EventError>> + Send + 'a>> {
+            Box::pin(async move {
+                let _ = self.try_emit(event);
+                Ok(())
+            })
+        }
+    }
+
+    /// 声明并发安全；带 `release` 的工具会等测试发信号后才完成。
+    struct GatedTool {
+        name: String,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        is_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for GatedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(
+                self.name.as_str(),
+                "gated conc probe",
+                serde_json::json!({}),
+            )
+        }
+        fn is_concurrency_safe(&self) -> bool {
+            true
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                release
+                    .await
+                    .map_err(|_| ys_tool::ToolError::Execution("gate dropped".into()))?;
+            }
+            Ok(CoreToolResult {
+                content: if self.is_error {
+                    format!("{} failed", self.name)
+                } else {
+                    format!("{} ok", self.name)
+                },
+                is_error: self.is_error,
+            })
+        }
+    }
+
+    /// 结果按完成顺序即时发出，但 Step 9c 回喂模型的单条消息仍按原 tool-call 顺序。
+    ///
+    /// slow 先占住原序第 1 位并等待；fast 完成后发事件，测试看到 fast 的 `ToolResult`
+    /// 才释放 slow。若实现退回 `buffered`，fast 事件要等 slow 完成才出现，双方互等至超时。
+    #[tokio::test]
+    async fn parallel_results_follow_completion_while_session_keeps_call_order() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let registry = ToolRegistry::build(vec![
+            Box::new(GatedTool {
+                name: "slow".into(),
+                release: Mutex::new(Some(release_rx)),
+                is_error: false,
+            }),
+            Box::new(GatedTool {
+                name: "fast".into(),
+                release: Mutex::new(None),
+                is_error: false,
+            }),
+        ])
+        .unwrap();
+        let model = MultiToolModel::new(&[("slow", "slow"), ("fast", "fast")]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut events = NotifyOnToolResult {
+            inner: CollectingSink::new(),
+            notify: notify.clone(),
+            tool_result_id: "fast",
+        };
+        let mut session = MemorySession::new();
+
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let run = BasicLoop.run_turn(AgentInput::text("go"), &mut ctx);
+                let release = async {
+                    notify.notified().await;
+                    release_tx.send(()).unwrap();
+                };
+                let (run_result, ()) = tokio::join!(run, release);
+                run_result.unwrap()
+            })
+            .await
+            .expect("fast 的 ToolResult 必须在 slow 完成前发出，否则双方互等");
+        }
+
+        let order = call_result_order(&events.inner);
         assert_eq!(
             order,
             vec![
-                ("C", "1".into()),
-                ("C", "2".into()),
-                ("C", "3".into()),
-                ("C", "4".into()),
-                ("R", "1".into()),
-                ("R", "2".into()),
-                ("R", "3".into()),
-                ("R", "4".into()),
+                ("C", "slow".into()),
+                ("C", "fast".into()),
+                ("R", "fast".into()),
+                ("R", "slow".into()),
+            ],
+            "事件按完成顺序发结果，但全部 ToolCall 仍先发"
+        );
+        assert_eq!(
+            tool_result_pairs(&events.inner),
+            vec![
+                ("fast".to_string(), "fast ok".to_string()),
+                ("slow".to_string(), "slow ok".to_string()),
+            ],
+            "ToolResult 正文必须与对应 id 匹配，不能按完成顺序错配"
+        );
+        assert_eq!(
+            tool_result_ids_in(&session),
+            vec!["slow".to_string(), "fast".to_string()],
+            "回喂模型的单条 User 消息必须保持原始 tool-call 顺序"
+        );
+    }
+
+    /// 并行批中快速成功、慢速失败：快速结果即时发出，错误结果回喂后父回合继续。
+    #[tokio::test]
+    async fn parallel_error_result_continues_parent_turn() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let registry = ToolRegistry::build(vec![
+            Box::new(GatedTool {
+                name: "slow-error".into(),
+                release: Mutex::new(Some(release_rx)),
+                is_error: true,
+            }),
+            Box::new(GatedTool {
+                name: "fast-ok".into(),
+                release: Mutex::new(None),
+                is_error: false,
+            }),
+        ])
+        .unwrap();
+        let model = MultiToolModel::new(&[("slow-error", "slow-error"), ("fast-ok", "fast-ok")]);
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut events = NotifyOnToolResult {
+            inner: CollectingSink::new(),
+            notify: notify.clone(),
+            tool_result_id: "fast-ok",
+        };
+        let mut session = MemorySession::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let run = BasicLoop.run_turn(AgentInput::text("go"), &mut ctx);
+                let release = async {
+                    notify.notified().await;
+                    release_tx.send(()).unwrap();
+                };
+                let (run_result, ()) = tokio::join!(run, release);
+                run_result.unwrap()
+            })
+            .await
+            .expect("并行批中 fast-ok 的结果必须立即发出，不能等待 slow-error 完成")
+        };
+
+        let order = call_result_order(&events.inner);
+        assert_eq!(
+            order,
+            vec![
+                ("C", "slow-error".into()),
+                ("C", "fast-ok".into()),
+                ("R", "fast-ok".into()),
+                ("R", "slow-error".into()),
+            ],
+            "快速结果必须先发出，随后才是慢速错误结果"
+        );
+        assert_eq!(
+            tool_result_pairs(&events.inner),
+            vec![
+                ("fast-ok".to_string(), "fast-ok ok".to_string()),
+                ("slow-error".to_string(), "slow-error failed".to_string()),
             ]
         );
+        assert_eq!(
+            model.round.load(Ordering::SeqCst),
+            2,
+            "错误结果回喂后必须继续第二次模型调用"
+        );
+        assert_eq!(result.stop_reason, StopReason::Completed);
+
+        let results = tool_results_in(&session);
+        assert_eq!(results.len(), 2);
+        assert!(matches!(
+            results[0],
+            ContentBlock::ToolResult {
+                tool_call_id,
+                is_error: true,
+                ..
+            } if tool_call_id.0 == "slow-error"
+        ));
+        assert!(matches!(
+            results[1],
+            ContentBlock::ToolResult {
+                tool_call_id,
+                is_error: false,
+                ..
+            } if tool_call_id.0 == "fast-ok"
+        ));
+    }
+
+    struct ErrorThenSuccessModel {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ErrorThenSuccessModel {
+        fn model_id(&self) -> &str {
+            "error-then-success"
+        }
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 {
+                ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ys_core::ToolCallId("err-1".into()),
+                            name: "unstable".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                }
+            } else {
+                ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "recovered".into(),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                }
+            })
+        }
+    }
+
+    struct AlwaysFailTool;
+
+    #[async_trait::async_trait]
+    impl Tool for AlwaysFailTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new("unstable", "always errors", serde_json::json!({}))
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            Err(ys_tool::ToolError::Execution("boom".into()))
+        }
+    }
+
+    /// 工具错误结果回喂后父回合继续；取消只由父边界决定。
+    #[tokio::test]
+    async fn error_tool_result_continues_parent_turn() {
+        let registry = ToolRegistry::build(vec![Box::new(AlwaysFailTool)]).unwrap();
+        let model = ErrorThenSuccessModel {
+            calls: AtomicUsize::new(0),
+        };
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            2,
+            "错误结果后必须再调模型"
+        );
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        let results = tool_results_in(&session);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0],
+            ContentBlock::ToolResult { is_error: true, .. }
+        ));
+        assert!(
+            result
+                .final_message
+                .as_ref()
+                .is_some_and(|m| content_has_text(m, "recovered")),
+            "第二次模型调用应正常收尾"
+        );
+    }
+
+    /// 父边界在入口已取消：零模型调用，且只发一条 `RunFinished{Cancelled}`。
+    #[tokio::test]
+    async fn parent_boundary_pre_cancel_makes_zero_model_calls() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = CountingModel {
+            calls: Mutex::new(0),
+        };
+        let boundary = ys_protocol::QueueBoundarySource::new();
+        boundary.push(Boundary::Abort);
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            )
+            .with_boundary(&boundary);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(*model.calls.lock().unwrap(), 0, "预取消不得调用模型");
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
+        assert_eq!(result.rounds, 0);
+        assert!(session.messages().is_empty());
+        let terminals: Vec<_> = events
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. }
+                )
+            })
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(
+            terminals[0],
+            AgentEvent::RunFinished {
+                stop_reason: StopReason::Cancelled,
+                rounds: 0,
+                ..
+            }
+        ));
     }
 
     /// 会话里所有 `ToolResult` block（按出现顺序）。

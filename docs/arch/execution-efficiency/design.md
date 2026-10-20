@@ -333,8 +333,8 @@ round 10 工具 31.3s、round 11 工具 27.1s（**同一条命令跑两遍**，�
 | `apps/coding-agent/src/assembly.rs:117-119` | 父表在 `subagent` **之前**插入 `bash_bg` + `bash_poll` ⇒ 父表 12 元，**子表 9 元仍是父 JSON 的字节前缀**（保住 `apps/coding-agent/src/assembly.rs:117` 注释记的缓存性质）。 |
 | `apps/coding-agent/src/assembly.rs:81` | `AgentFactory::new` 多收一个 `Arc<BackgroundTasks>`（与工作区无关 ⇒ 属 `AgentFactory` 冻结的那类量） |
 | `apps/coding-agent/src/main.rs:2618` | 创建 `Arc<BackgroundTasks>`（进程级）+ 启 sweeper |
-| `apps/coding-agent/src/main.rs:1971` | `std::process::exit(code)` **之前**显式 `kill_all(全部)`（该行跳过析构 ⇒ `Drop` 兜底在此路径无效） |
-| `apps/coding-agent/src/app_loop.rs:463` / `:517` / `:914` | 三个清理点：`/new` → `kill_all(session)` + 删会话输出目录；`/resume` → `kill_all(session)`；`Boundary::Abort` → `kill_all(session)` |
+| `apps/coding-agent/src/main.rs:2058` | `std::process::exit(code)` **之前**显式 `kill_all(全部)`（该行跳过析构 ⇒ `Drop` 兜底在此路径无效） |
+| `apps/coding-agent/src/app_loop.rs:555` / `:620` / `:1034` | 三个清理点：`/new` → `kill_all(session)` + 删会话输出目录；`/resume` → `kill_all(session)`；`Boundary::Abort` → `kill_all(session)` |
 | `apps/coding-agent/src/prompt.rs` | 两条 guideline（§4.6） |
 | `apps/coding-agent/src/debug_log.rs` | **四个**度量字段（§6.1）—— 三个的原始数据**已有**，只有「重复命令数」要**新增 `command_fp` 字段** |
 | `apps/coding-agent/src/assembly.rs`（新增断言） | **父表前缀不变量的真实守卫**：断言真实父表 JSON 以「子表 JSON 去末尾 `]`」开头、且 `subagent` 仍是**末位**（现有 `apps/coding-agent/src/toolset.rs:596` 的测试**自己拼**父表 ⇒ 插入新工具后它照样全绿，却不再描述真实父表）。 |
@@ -382,9 +382,20 @@ round 10 工具 31.3s、round 11 工具 27.1s（**同一条命令跑两遍**，�
       ⚠ **顺序是承重的**：先杀后收。反了就命中 `adapters/tools-basic/src/bash.rs:158-162`
         的告诫 —— leader 一旦被收尸，pid 就可能被复用，`kill -9 -<pid>` 会打到无关的进程组。
         这条告诫必须**继承**到新模块（同一份内核、同一条注释）。
-      ⚠ 2 MiB 闸门是**轮询式**的 ⇒ 两跳之间可瞬时超限 ⇒ 启动命令时用
-        `ulimit -f`（POSIX sh 支持）让内核在写超限时以 `SIGXFSZ` 杀掉进程 ⇒
-        **超限即失败**，不静默截断（与本仓「不得静默成功」的立场一致）。
+      ⚠ 2 MiB 闸门是**轮询式**的 ⇒ 两跳之间可瞬时超限 ⇒ 启动命令时另设
+        **粗闸门**（见下方「粗闸门与精确闸门的分工」）⇒ **超限即失败**，
+        不静默截断（与本仓「不得静默成功」的立场一致）。
+
+   **粗闸门与精确闸门的分工**（两个闸门量纲不同，不可互换）：
+   - **精确闸门 = 2 MiB**（**harness 的输出上限**）⇒ 由 sweeper 的 `stat` 闸门承担
+     （本节 ② 的第一行）⇒ 命中即**杀进程组 + 记失败**，归因措辞是
+     「harness 的输出上限」。
+   - **粗闸门 = `ulimit -f`（进程级文件写入上限）** ⇒ **内核侧**的兜底，
+     命中即 `SIGXFSZ` ⇒ 归因措辞是「内核 SIGXFSZ」。
+   ⚠ **`ulimit -f` 是进程级上限，不是「本命令的输出上限」** ⇒ 它的取值**不能**取
+     2 MiB（那会连正常构建（`cargo build` 写 target/）一起杀掉）。
+     ⇒ 取 `max(2 MiB, 64 MiB)`：既拦住「单条命令写出百 MiB 垃圾」这种真失控，
+     又不误杀正常构建。**它不是精确闸门** —— 精确的 2 MiB 由 sweeper 的 `stat` 闸门负责。
 
 ③ 模型发 bash_poll(handle="bgN")（**与其它调用同一条消息** ⇒ 不占额外轮次）
    └─ BashPollTool::call
@@ -392,8 +403,12 @@ round 10 工具 31.3s、round 11 工具 27.1s（**同一条命令跑两遍**，�
       ├─ tokio::fs: open + seek(consumed) → 读到**最后一个完整行**为止（≤ 50 KiB）
       │           ⇒ **不切半行、不切多字节字符**（AGENTS.md「流式/字节路径注意 UTF-8 边界」
       │             要求只在完整行上解码）；余下字节留给下一次 poll
-      ├─ ys_tool::truncate::head_tail(...) 组装（同一 2000 行 / 50 KiB 预算，不放宽）
+      ├─ bg_output::assemble(...) 组装（内部用 ys_tool::truncate::head_tail，
+      │     同一 2000 行 / 50 KiB 预算，不放宽）
       │     ⇒ 头尾混合**会跳过中间段** ⇒ 跳过的字节数必须**显式报出**（`skipped_bytes`）
+      │     ⇒ `skipped_bytes` 的定义是「**源文本中未出现在展示内容里的字节数**」
+      │       （展示内容 = 头 + 尾，两段互不重叠；头尾之间的换行符与源文本的尾随换行都计入）
+      │       ⇒ 恒等式：`skipped_bytes + head.len() + tail.len() == 源文本字节数`
       └─ 锁内推进 consumed ← size（文件尾）
 
    **交付语义（三条，缺一不可）**：
@@ -401,6 +416,14 @@ round 10 工具 31.3s、round 11 工具 27.1s（**同一条命令跑两遍**，�
    - **未送达的字节必须明示**：凡未随本次结果交付的字节（头尾裁掉的中间段），
      结果里要报出数量与**完整输出的路径** ⇒ 模型的 `grep` / `read` 逃生门才有效。
    - **不静默丢弃**：头尾裁剪与字节预算都**不放宽**，裁掉就是裁掉，但**要报出来**。
+
+   **末行（无换行结尾）的两态规则**（`consumed` 推进的边界）：
+   - **命令仍在跑** ⇒ 末段**不是完整行**，**不交付**，`consumed` 停在最后一个完整行的边界；
+     未交付的字节数必须**明示**（模型据此知道还有内容没到）。
+   - **命令已结束且进程已收尸** ⇒ 输出文件不会再增长 ⇒ 末段**就是最后一行**
+     ⇒ **整段交付**，`consumed` 推到文件尾。
+   ⚠ 判据是「**进程已收尸**」而非「状态非 Running」：`Killed` 但尚未收尸时，
+   子进程仍可能在写 ⇒ 此刻把半行当完整行交付会交付出**截断的多字节字符**。
 
    ⚠ 「consumed ← size」与「宁可重复不可跳过」**不能同时成立** ——
    头尾混合本就跳过中间段，再把 consumed 推到文件尾 ⇒ 中间段**永久丢失**且无从得知。
@@ -430,6 +453,16 @@ pub struct HeadTail {
 
 /// 头尾混合截断：字节预算**不放宽**，行数预算**不放宽**。
 /// `head_bytes` 是分配给头部的字节（其余给尾部）。
+///
+/// `omitted_bytes` = **源文本中未出现在展示内容里的字节数**（展示内容 = `head` + `tail`，
+/// 两段互不重叠；头尾之间的换行符与源文本的尾随换行都计入）
+/// ⇒ 恒等式：`omitted_bytes + head.len() + tail.len() == text.len()`。
+/// 尾随换行**不算一行**（`str::lines()` 语义）；**部分展示的行算「已展示」**。
+///
+/// **单行超预算**：源文本只有一行且超出字节预算时 ⇒ **头部给出该行的前缀**
+/// （≤ `head_bytes`，且不切在多字节字符中间），尾部为空（同一行不得同时出现在头与尾）
+/// ⇒ 被裁字节计入 `omitted_bytes` 并报出。
+/// 行数预算为 0 时**不给**前缀（预算不放宽）。
 pub fn head_tail(text: &str, max_lines: usize, max_bytes: usize, head_bytes: usize) -> HeadTail;
 ```
 
@@ -531,6 +564,28 @@ impl BackgroundTasks {
 pub(crate) fn kill_group(pid: u32);
 ```
 
+#### `adapters/tools-basic/src/bg_output.rs`（新增）
+
+**输出拼装的唯一真源** —— `bg_tools` 不再自带第二份拼装逻辑（两份实现必然漂移）。
+
+```rust
+/// 组装一次 poll 的结果文本。行的顺序是契约：
+/// **头 → 省略标记 → 尾 → 头尾裁剪的未送达报出 → 待交付提示 → 完整输出路径**。
+/// 后两行都是「还有字节没送达」的说明 ⇒ 相邻；最后一行是「没送达的部分去哪取」的指针。
+///
+/// `pending_note` 是「还有字节没交付」的提示措辞（由 `bg_tools` 按读域知识给出），
+/// **插入位置由本函数决定**。
+pub fn assemble(
+    text: &str,
+    handle_label: &str,
+    output_path: &Path,
+    pending_note: Option<&str>,
+) -> BgOutput;
+```
+
+**为什么把「措辞」与「位置」分开**：措辞依赖读域知识（在跑 / 已结束 / 多字节残片三种情形），
+归 `bg_tools`；位置是输出契约，归 `bg_output`。两者混在一处就会重新长出第二份实现。
+
 #### `adapters/tools-basic/src/bg_tools.rs`（新增）
 
 ```rust
@@ -589,11 +644,11 @@ poll 时核对**是第二道：即便某个清理点漏了（新增清理路径�
 
 | 时机 | 落点 | 动作 |
 |---|---|---|
-| **abort** | `apps/coding-agent/src/app_loop.rs:914` 的 `Boundary::Abort` 臂 | `kill_all(session)` |
+| **abort** | `apps/coding-agent/src/app_loop.rs:1034` 的 `Boundary::Abort` 臂 | `kill_all(session)` |
 | **回合预算到点** | `app_loop.rs` 的 `sleep_until(deadline)` 臂（同样 push `Boundary::Abort`） | 同一路径 ⇒ 同样 `kill_all(session)` |
-| **`/new`** | `apps/coding-agent/src/app_loop.rs:463` | `kill_all(session)` + 删除该会话输出目录 |
-| **`/resume`** | `apps/coding-agent/src/app_loop.rs:517` | `kill_all(session)`（旧工作区的命令对新工作区无意义） |
-| **进程退出** | `apps/coding-agent/src/main.rs:1971` **之前** | `kill_all(全部)`（`std::process::exit` 不跑析构 ⇒ `Drop` 兜底在此路径无效） |
+| **`/new`** | `apps/coding-agent/src/app_loop.rs:555`（换会话**之前**） | `kill_all(session)` + 删除该会话输出目录 |
+| **`/resume`** | `apps/coding-agent/src/app_loop.rs:620`（恢复成功后） | `kill_all(session)`（旧工作区的命令对新工作区无意义） |
+| **进程退出** | `apps/coding-agent/src/main.rs:2058` **之前** | `kill_all(全部)`（`std::process::exit` 不跑析构 ⇒ `Drop` 兜底在此路径无效） |
 | **panic（unwind）** | `impl Drop for BackgroundTasks` | 兜底杀全部进程组（`Drop` 只能用同步 kill） |
 
 **为什么不用 `ToolContext` 的第 4 个挂载点**（Q3 的答案）：
@@ -644,7 +699,7 @@ Collect it with bash_poll(handle="bg7"). The command is killed when this session
 返回（失败，**同步报错**，绝不返回「永远就绪」的句柄）：
 
 ```
-[bash_bg] too many background commands are running (4) — poll or kill one first
+[bash_bg] too many background commands are running (4) — wait for one to finish, then start another
 [bash_bg] failed to start command: <原因>
 ```
 
@@ -709,13 +764,14 @@ Collect it with bash_poll(handle="bg7"). The command is killed when this session
 |---|---|---|
 | **并发在跑的后台命令** | **4** | 与 `DEFAULT_MAX_PARALLEL_TOOLS = 4`（`crates/ys-component/src/limits.rs:8`）同量级。超限 ⇒ `bash_bg` **同步报错**（不排队、不静默）。 |
 | **句柄表条目** | **8**（在跑 + 已完成未取走） | 满了 ⇒ 淘汰**最旧的已完成**条目（删文件）；若全在跑 ⇒ 报错。 |
-| **单命令输出（磁盘）** | **2 MiB** | 超出 ⇒ 杀进程组 + 记 `failed`。`cargo test --workspace` 1295 个用例 ≈ 90 KiB 输出，2 MiB ≈ 20× 余量。闸门由**启动时的 `ulimit -f`**（内核侧，POSIX sh 支持）+ sweeper 的 `stat` 双保险 ⇒ 轮询间隙的瞬时超限由内核兜住。 |
+| **单命令输出（磁盘）** | **2 MiB** | 超出 ⇒ 杀进程组 + 记 `failed`。`cargo test --workspace` 1295 个用例 ≈ 90 KiB 输出，2 MiB ≈ 20× 余量。**精确闸门** = sweeper 的 `stat`（2 MiB，harness 语义）；**粗闸门** = 启动时的 `ulimit -f`（进程级，取 `max(2 MiB, 64 MiB)`，内核语义）⇒ 轮询间隙的瞬时超限由内核兜住，而正常构建不会被误杀（`ulimit -f` 是进程级上限，取 2 MiB 会杀掉 `cargo build`）。 |
 | **磁盘总量** | ≤ 8 × 2 MiB = **16 MiB** | 会话结束删目录 ⇒ 稳态更低。 |
 | **父进程 fd（稳态）** | **0 / 条** | 子进程持有 stdout/stderr；父侧随 `spawn` 关闭。 |
 | **父进程 fd（轮询瞬时）** | **+1** | 读完即关。 |
 | **tokio 任务** | **1 个共享 sweeper**（不是每条一个） | 100ms tick；8 条 ⇒ 160 syscall/s ≈ **0.16 ms/s ≈ 0.016% 单核**。 |
-| **常驻内存** | 8 条 × ~200 B + sweeper ~8 KB ≈ **< 10 KB** | **不缓存输出正文**；单次轮询临时缓冲 ≤ 50 KiB（读完即弃）。 |
-| **单次轮询读** | **≤ 50 KiB** | 与 `MAX_BYTES` 同额（`crates/ys-tool/src/truncate.rs:24`）；行数同样受 `MAX_LINES = 2000`（`:22`）约束 ⇒ **不放宽**。读**只到最后一个完整行**为止 ⇒ 不切半行、不切多字节字符。 |
+| **常驻内存** | 8 条 × ~200 B + sweeper ~8 KB ≈ **< 10 KB** | **不缓存输出正文**；单次轮询临时缓冲：运行中 ≤ 50 KiB、终态收尾读 ≤ `min(输出上限, 8 MiB)`（读完即弃）。 |
+| **单次轮询读** | 运行中 **≤ 50 KiB**；终态收尾读 **≤ `min(输出上限, 8 MiB)`** | 运行中与 `MAX_BYTES` 同额（`crates/ys-tool/src/truncate.rs:24`）；行数同样受 `MAX_LINES = 2000`（`:22`）约束 ⇒ **展示预算不放宽**。运行中读**只到最后一个完整行**为止 ⇒ 不切半行、不切多字节字符；**终态收尾读**要把末段整段交付（否则末行永久丢失），上限由输出上限与 8 MiB 硬闸门兜住 ⇒ 缓冲有界。 |
+| **展示裁剪（头尾混合）** | 头 **1/4**（12.5 KiB）+ 尾 **3/4**（37.5 KiB）= `max_bytes` 50 KiB | 头尾份额是**策略切分** ⇒ 源文本只有一行时尾部为空、实际展示 ≤ 12.5 KiB（尾部余量**不**让给头部）；单行超预算 ⇒ 展示该行**前缀**（字符边界安全），被裁字节计入 `skipped_bytes` 并**报出**。行数预算 `MAX_LINES = 2000` 同样不放宽。 |
 | **轮询总拷贝** | **O(n)**（增量 + 一次收尾） | 第 k 次轮询只读 `[consumed_k, size_k]`。被头尾裁掉的字节**不重复读**，但**必须报出跳过量**（§4.3 ③）。 |
 | **上下文 token** | **+230 / 轮**（2 spec + 2 guideline），全在缓存前缀 | 未命中增量 ≈ 0；`fixed_prompt_tokens` 同步 +230 ⇒ 压缩触发点位移 0.09%（窗口 258400）。 |
 
@@ -746,7 +802,7 @@ Collect it with bash_poll(handle="bg7"). The command is killed when this session
 |---|---|---|---|
 | **0a** | **修 D1**：外层工具预算经 `ToolContext` 传给工具（`ys-tool` 加字段 + `ys-loop` 填一处）；内层 deadline = `min(模型值, 外层 − Δ)`，**模型未传值时也用外层** ⇒ 工具**始终**有 deadline（§3.5 修正 4/5） | 无 | 两条用例：① 模型传 `timeout: 900` ⇒ 实际在 ~295s 被砍、文案写**生效值**、**进程组被杀**；② 模型**不传** `timeout` ⇒ 外层预算到点时**进程组被杀**（不靠 `kill_on_drop`） |
 | **0b** | **修 D2**：无 boundary 路径的超时补上进程组杀（`adapters/tools-basic/src/bash.rs:265-268`），与有 boundary 路径同款内核 | 无 | 用例：`bash("sleep 60 & wait", timeout 1)` ⇒ **孙进程**（`sleep`）不在了 |
-| **0c** | **G3 窗口声明**：把 `minimax-m3.1-flash-free` 的窗口从 128000 提到实测可用值，走**已有**的用户级 `windows` 覆盖；并把「窗口值从哪来」写进 `/model` | 无 | 长会话跑到 150k token ⇒ **不**在 108800 处被静默压缩 |
+| **0c** | **G3 窗口声明**：把 `minimax-m3.1-flash-free` 的窗口从 128000 提到实测可用值，走**已有**的用户级覆盖（`~/.yushan/config.json` 的 **JSON 键是 `context_window`**，内部字段名才叫 `windows` —— `apps/coding-agent/src/config.rs:31`）；并把「窗口值从哪来」写进 `/model` | 无 | 长会话跑到 150k token ⇒ **不**在 108800 处被静默压缩 |
 | **0d** | **提示词两条准则**（§4.6） | 无 | 同批 prompt 对照：重复执行次数 1 → 0 |
 | **0e** | **debug 度量补齐**（§6） | 无 | 日志里能直接读出三个指标 + **按工具名分桶**的耗时 |
 | **0f** | **文档同步**：`AGENTS.md` 环境变量段登记 `YUSHAN_BG_DIR`；`docs/design.md` §12 与 `docs/design-final/coding-agent-tui.md` 的父表元素数 | 无 | 三处都能查到同一份数字 |

@@ -187,7 +187,7 @@ pub subagent: Option<&'a dyn SubagentRunner>,
 
 - YuShan 侧 `RunLimits::default().context_window = 128_000`（`crates/ys-component/src/limits.rs:65`）。
 - 解析链（`apps/coding-agent/src/config.rs:235` `context_window_for`）三级：
-  ① 用户配置 `windows` → ② 网关 `/v1/models` 目录自报 → ③ 内建表
+  ① 用户配置 `context_window`（JSON 键；内部字段名 `windows`）→ ② 网关 `/v1/models` 目录自报 → ③ 内建表
   `KNOWN_MODEL_WINDOWS`（`apps/coding-agent/src/provider.rs:488`）。
 - ②级实测**对 `minimax-m3.1-flash-free` 不报窗口**（`/v1/models` 返回的 `context_length` 为 `None`）。
 - ③级内建表**只精确收录** `MiniMax-M3` / `MiniMax-M2.7`，匹配不到本模型 ⇒ **落到 128000**。
@@ -198,7 +198,7 @@ pub subagent: Option<&'a dyn SubagentRunner>,
 本次会话输入峰值仅 29127 token，**未触发**，故本条**在本例中无损失** ——
 但它是**长会话的真实风险**，且属于**静默**行为（用户只看到「上下文被压缩了」）。
 
-> ✅ **用户级覆盖已存在**：`~/.yushan/config.json` 的 `windows` 字段是 ①级，
+> ✅ **用户级覆盖已存在**：`~/.yushan/config.json` 的 `context_window` 字段是 ①级，
 > 改配置即可覆盖（`apps/coding-agent/src/config.rs:236`）。
 > ⇒ **本条是「立即可用但没人知道」的配置问题**，不是必须改代码的问题。
 > 真正的代码问题是 ③级表为什么是精确匹配 —— 但那是另一个话题。
@@ -255,7 +255,7 @@ pub subagent: Option<&'a dyn SubagentRunner>,
 
 - **P0 · 零契约改动**（当天可落地）
   1. **窗口声明修正**：把 `minimax-m3.1-flash-free` 的窗口从 128000 提到实测可用值，
-     走**已有**的用户级 `windows` 覆盖；并把「窗口值从哪来」写进 `/model` 或 `docs/`。
+     走**已有**的用户级覆盖（`~/.yushan/config.json` 的 **JSON 键是 `context_window`**，内部字段名才叫 `windows` —— `apps/coding-agent/src/config.rs:31`）；并把「窗口值从哪来」写进 `/model` 或 `docs/`。
   2. **「长命令一次取全量」提示准则**：在 guideline / prompt 层点明「要统计口径就一次跑完并带聚合过滤器，
      不要先 `tail` 再补跑」⇒ 直接治 G1 的**重复执行**那一半。
   3. **度量补齐**：在 debug 日志里加三个可判定指标（设计已细化为四个，见 [`design.md`](./design.md) §6.1）—— **重复命令识别**（同一条命令串在一回合内出现 >1 次）、
@@ -347,7 +347,7 @@ pub subagent: Option<&'a dyn SubagentRunner>,
 1. **先做 P0 的第 3 项（度量补齐）** —— 它是后面一切验收的前提：
    「重复命令数 / 真命令耗时 / 工具阻塞占比」三个指标不进日志，P1/P2 的收益就**无法证明**。
    debug 日志已有 `yushan.debug/1` schema 与逐轮 `round_end.tools_ms`，扩字段成本低。
-2. **P0 的第 1 项（窗口声明）当天就能验**：把窗口值通过 `~/.yushan/config.json` 的 `windows`
+2. **P0 的第 1 项（窗口声明）当天就能验**：把窗口值通过 `~/.yushan/config.json` 的 `context_window`
    覆盖到实测可用值，跑一次长会话看压缩触发点是否后移。**先确认用户级覆盖这一条路走不走得通**，
    再决定要不要动 ③级内建表的匹配策略。
 3. **P1 交 `arch-design`**：设计要点至少三条 ——

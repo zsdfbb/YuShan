@@ -195,12 +195,12 @@
 - **涉及文件**: `apps/coding-agent/src/config.rs`, `apps/coding-agent/src/capabilities.rs`
 - **描述**:
   - `config.rs`：新增「窗口来源」查询（与 `context_window_for` 的**四级同源**：
-    ① `~/.yushan/config.json` 的 `windows` 覆盖 > ② provider 目录的 `context_window` >
+    ① `~/.yushan/config.json` 的 `context_window` 覆盖 > ② provider 目录的 `context_window` >
     ③ 内置兜底表 > ④ 默认 128000）。**不另写一套判定** —— 两份判定会漂移 ⇒ 窗口值与来源可能对不上。
   - `capabilities.rs::set_model`：输出里追加窗口值与**来源**（走 `Outbound::Output` → transcript，
     **绝不 print**）。文案示例：`Context window: 258400 (source: user override)`。
   - **用户级配置（用户动作，仓库外）**：在 `~/.yushan/config.json` 写
-    `{"windows": {"<model>": <实测可用窗口>}}` —— 走**已有**的覆盖机制，**不改代码**。
+    `{"context_window": {"<model>": <实测可用窗口>}}`（用户级配置 JSON 的键是 `context_window`；内部 Rust 字段名才叫 `windows`）—— 走**已有**的覆盖机制，**不改代码**。
 - **依据**: design.md §4.9 切片 0c（「并把『窗口值从哪来』写进 `/model`」）；
   `apps/coding-agent/src/config.rs` 的四级解析（① 覆盖 > ② 目录 > ③ 内置表 > ④ 默认）。
 - **验收命令**:
@@ -356,7 +356,9 @@
 - **涉及文件**: `crates/ys-tool/src/truncate.rs`（`#[cfg(test)]`）
 - **描述**:
   - 短文本 ⇒ `omitted_lines == 0`、`omitted_bytes == 0`、头尾拼起来等于原文。
-  - 超长文本 ⇒ 头 1/4 + 尾 3/4 的预算切分生效；`omitted_bytes` **等于被跳过的那段**。
+  - 超长文本 ⇒ 头 1/4 + 尾 3/4 的预算切分生效；`omitted_bytes` = **源文本中未出现在展示内容里的字节数**
+    （含头尾之间的换行符与源文本尾随换行）⇒ 恒等式 `omitted_bytes + head.len() + tail.len() == 源文本字节数`。
+  - **单行超预算** ⇒ 头部给出该行的**前缀**（≤ 头部预算、字符边界安全），尾部为空；被裁字节计入 `omitted_bytes`。
   - 预算**不放宽**：超出 `max_bytes` 的部分必然被裁掉并**报出**。
   - 变异：把 `omitted_bytes` 恒置 0 ⇒ 第二条断言变红。
 - **验证方法**:
@@ -419,7 +421,7 @@
     `is_concurrency_safe()` = **`false`**（虽对模型是只读，但它推进注册表里的**交付偏移**，
     **对模型可观测** ⇒ 按 `crates/ys-tool/src/lib.rs:53` 的准入纪律判不安全）。
   - `BashPollTool::call` 的读法：**按 `consumed` 偏移增量读**，**只到最后一个完整行**为止
-    （不切半行、不切多字节字符）；用 `ys_tool::truncate::head_tail` 组装（同一 2000 行 / 50 KiB 预算，**不放宽**）。
+    （不切半行、不切多字节字符）；用 `bg_output::assemble` 组装（`bg_tools` 不再自带拼装；`assemble` 内部用 `ys_tool::truncate::head_tail`）（同一 2000 行 / 50 KiB 预算，**不放宽**）。
   - 交付语义三条：不重复送达 / 未送达必须明示（报 `skipped_bytes` + 完整输出路径）/ 不静默丢弃。
   - 措辞纪律：「**被 harness 杀掉**」与「**命令自身非零退码**」用**不同措辞**；退码 ≠ 0 ⇒ `is_error == true`
     且退码原样带出；句柄不存在 ⇒ 明确的「未知句柄」错误。
@@ -456,7 +458,10 @@
 - **涉及文件**: `adapters/tools-basic/src/bg_output.rs`（**新建**）, `apps/coding-agent/src/wiring.rs`,
   `apps/coding-agent/src/assembly.rs`, `apps/coding-agent/src/main.rs`
 - **描述**:
-  - `bg_output.rs`：头尾混合截断的**组装**（调用 `ys_tool::truncate::head_tail`）+ `skipped_bytes` 报出
+  - `bg_output.rs`：头尾混合截断的**组装**（调用 `ys_tool::truncate::head_tail`）+ `skipped_bytes` 报出；
+    **输出拼装的唯一真源** —— `bg_tools` 不再自带第二份拼装逻辑
+    ⇒ `assemble(text, handle_label, output_path, pending_note)`：`pending_note` 的**措辞**由 `bg_tools`
+    给出（读域知识），**插入位置**由 `assemble` 决定（输出契约）
     + 完整输出路径。**截断策略本身仍在 `ys-tool`**（本模块只组装）。
   - `assembly.rs`：`AgentFactory` 持 `Arc<BackgroundTasks>`（**进程级**，随工厂冻结 ⇒ `/resume` 重建时是同一份）；
     父表插入 `bash_bg` / `bash_poll` —— **在 `subagent` 之前** ⇒ 子表 9 元**仍是父 JSON 的字节前缀**。
@@ -700,24 +705,25 @@
 
 ## 验证清单
 
-- [ ] **所有 (impl, test) 配对均已 completed**（Phase 3 review 放行条件）
-- [ ] `cargo test --workspace` — 0 failed（基线 1295 passed / 12 ignored；通过数不低于基线）
-- [ ] `cargo clippy --all-targets` — **无新增 warning**
-- [ ] `grep -c 'process::exit' apps/coding-agent/src/main.rs` — 等于 1
-- [ ] `grep -c 'YUSHAN_BG_DIR' AGENTS.md` — 等于 1
-- [ ] T1/T2/T3：预算进工具、钳位严格小于外层、不传 `timeout` 也被砍且进程组被杀
-- [ ] T4：无 boundary 路径超时不留孤儿（孙进程不存在）
-- [ ] T5：`/model` 输出含窗口值与来源
-- [ ] T7：两条 guideline 按工具名派生
-- [ ] T8：`command_fp` 区分同命令与异命令，且不落命令正文
-- [ ] T9：四个指标可从日志直读
-- [ ] T10：`bash_bg` / `bash_poll` 的 spec、并发声明、错误措辞
-- [ ] T11：交付语义三条 + 完整行边界
-- [ ] T12：六个清理点 + 孤儿进程数 = 0
-- [ ] T2–T12 之外的变异清单（Task 34）**全部能变红**
-- [ ] T6（长会话 150k 不被压缩）由用户人工确认（MANUAL_ACK_REQUIRED）
-- [ ] T13（切片 1 前后对照）由用户人工确认（MANUAL_ACK_REQUIRED）
-- [ ] T14（协议面 A/B）由用户人工确认（MANUAL_ACK_REQUIRED）
+- [x] **所有 (impl, test) 配对均已 completed**（Phase 3 review 放行条件）
+- [x] `cargo test --workspace` — **1485 passed / 0 failed / 12 ignored**
+      （基线 1377 passed / 12 ignored ⇒ 通过数高于基线，failed = 0）
+- [x] `cargo clippy --all-targets` — **无新增 warning**（既有 warning 24 处，逐条核对均不在本次改动内）
+- [x] `grep -c 'process::exit' apps/coding-agent/src/main.rs` — 等于 **1**
+- [x] `grep -c 'YUSHAN_BG_DIR' AGENTS.md` — 等于 **1**
+- [x] T1/T2/T3：预算进工具、钳位严格小于外层、不传 `timeout` 也被砍且进程组被杀
+- [x] T4：无 boundary 路径超时不留孤儿（孙进程不存在）
+- [x] T5：`/model` 输出含窗口值与来源
+- [x] T7：两条 guideline 按工具名派生
+- [x] T8：`command_fp` 区分同命令与异命令，且不落命令正文
+- [x] T9：四个指标可从日志直读
+- [x] T10：`bash_bg` / `bash_poll` 的 spec、并发声明、错误措辞
+- [x] T11：交付语义三条 + 完整行边界
+- [x] T12：六个清理点 + 孤儿进程数 = 0
+- [x] 变异清单（Task 34）**全部能变红**（共 7 + 6 + 4 + 2 + 3 条，逐单元留证）
+- [ ] T6（长会话 150k 不被压缩）—— **MANUAL_ACK_REQUIRED**（本机无凭证）
+- [ ] T13（切片 1 前后对照）—— **MANUAL_ACK_REQUIRED**（本机无凭证）
+- [ ] T14（协议面 A/B）—— **MANUAL_ACK_REQUIRED**（本机无凭证）
 
 ## 验收记录
 

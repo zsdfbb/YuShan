@@ -9,7 +9,8 @@
 > 或 `docs/exec-plans/completed/`。新增条目前先问一句：这是**真的待办**，还是**有意不做**？
 > 后者属于设计决策，该进 ADR，不进本清单。
 >
-> 基线：`master` @ `5af317e`（核实于 2026-10-17）。
+> 基线：`master` @ `7fd655b`（核实于 2026-10-21）。A1–A4 / B / C / D 沿用 `5af317e`（2026-10-17）的核实结果，
+> 本次只新增 A5 并复核了它。
 
 ---
 
@@ -62,6 +63,27 @@ ADR-0022（accepted）`:132-133` 同文）。
 >
 > **边界**：同表 `:835`「按任务类型动态裁剪子工具表」是**另一项**（R > 5 才回本，且破前缀），
 > 不随本项一起做。
+
+### A5. execution-efficiency 的落地（后台命令执行 + 两条既存缺陷）
+
+设计链已走完并过评审：`docs/arch/execution-efficiency/`（context → design → ADR → review）。
+**exec-plan 未写、代码零落地**。ADR 状态是「提议」（`adr-background-command-execution.md` 的「状态」段），
+未 accepted ⇒ 不进 §B。
+
+| 缺什么 | 状态依据（核实于 `7fd655b`，2026-10-21） |
+|---|---|
+| `bash_bg` / `bash_poll` 两个工具 | 全仓源码 grep `bash_bg` / `bash_poll` **零命中** |
+| 后台命令注册表 | grep `BackgroundTasks` **零命中** |
+| `ys-tool` 的 `head_tail()` | `crates/ys-tool/src/truncate.rs` 现有 `head_lines` / `head` / `tail`，**无** `head_tail`（同名私有函数在 `apps/coding-agent/src/debug_log.rs:1333`，语义不同，勿混） |
+| 工具预算进 `ToolContext` | `crates/ys-tool/src/context.rs:8-26` **无**预算字段；grep `tool_budget` 只命中 `crates/ys-loop/src/basic.rs` 的**既有函数名** |
+| `YUSHAN_BG_DIR` 环境变量 | 全仓 grep **零命中**；`AGENTS.md` 环境变量段未登记 |
+| 命令串指纹字段 `command_fp` | `apps/coding-agent/src/debug_log.rs` 无此字段 —— 「重复命令数」目前**算不出来**（`args_original_bytes` 是参数对象字节数、命令串在默认 `head` 档被截断），见 design §6.1 |
+| exec-plan | `docs/exec-plans/` 无本主题文件 |
+
+**切片顺序**（design §4.9）：**0a–0f → 1 → 2**。
+**0e 的度量是 1 的前提** —— 没有度量，Slice 1 的收益无法证明（design §9 后续 1）。
+**三条架构级决策留到切片 1**（review 的「处置」章末）：`tools-basic` 承载进程级状态 vs 整体搬进 app、
+进程组「先杀后收」契约化、「用句柄替代『工具未完成』状态」显式记账。
 
 ---
 

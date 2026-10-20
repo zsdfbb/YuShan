@@ -13,8 +13,12 @@
 //! **不再有 `Inbox`**（T1 起删除）：未处理输入的唯一持有者是 UI 的输入框，
 //! app 线程每收到一条 [`Request::Prompt`](ys_protocol::Request::Prompt) 就跑
 //! 一个回合 —— 队列与历史的历史性合并已成过去（设计 §8 三条信道）。
+//!
+//! **后台命令上下文**（[`BackgroundContext`]：进程级注册表 + 当前会话 id 的共享槽）
+//! 也挂在这里 —— 清理点（会话结束 / abort / 进程退出）从它取注册表与当前会话 id。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ys_event::EventSink;
@@ -26,6 +30,7 @@ use ys_session::{
 };
 // `Session` trait 需在作用域内才能对 `Box<dyn Session>` 调方法。
 use ys_session::Message;
+use ys_tools_basic::{BackgroundTasks, SessionSlot};
 
 /// 接线器：agent 之外的所有权所在。
 ///
@@ -41,6 +46,46 @@ pub struct Wiring {
     sessions_dir: Option<PathBuf>,
     /// 当前会话文件路径（持久形态）。
     session_path: Option<PathBuf>,
+    /// 后台命令上下文（**进程级**）—— `None` = 本接线器不带后台能力。
+    backgrounds: Option<BackgroundContext>,
+}
+
+/// 后台命令的**进程级**上下文 —— 注册表 + 会话槽。
+///
+/// **两个持有者共享同一份**：注册表由 `Arc` 共享、会话槽内部也是 `Arc` ⇒
+/// 克隆出来的副本改的是**同一个**槽（工具与清理点看到的会话 id 必然一致）。
+///
+/// **为什么是进程级**：工具表是**建表期产物**（进程级冻结）⇒ 注册表对象不能随
+/// 会话重建；而会话 id 是**运行期**的（`/new`、`/resume` 后会变）⇒ 它住在**共享槽**里，
+/// 由工具在调用时读。
+#[derive(Clone)]
+pub struct BackgroundContext {
+    /// 后台命令注册表（进程级）—— 条目按会话过滤。
+    tasks: Arc<BackgroundTasks>,
+    /// 当前会话 id 的共享槽。
+    session: SessionSlot,
+}
+
+impl BackgroundContext {
+    /// 装配上下文 —— 注册表与会话槽。
+    pub fn new(tasks: Arc<BackgroundTasks>, session: SessionSlot) -> Self {
+        Self { tasks, session }
+    }
+
+    /// 注册表（进程级）—— 清理点用它杀后台进程组。
+    pub fn tasks(&self) -> &Arc<BackgroundTasks> {
+        &self.tasks
+    }
+
+    /// 会话槽 —— 工具读它拿当前会话 id（**运行时读**，不是建表期冻结）。
+    pub fn session(&self) -> &SessionSlot {
+        &self.session
+    }
+
+    /// 当前会话 id。
+    pub fn session_id(&self) -> String {
+        self.session.get()
+    }
 }
 
 impl Wiring {
@@ -56,6 +101,7 @@ impl Wiring {
             events,
             sessions_dir: None,
             session_path: None,
+            backgrounds: None,
         }
     }
 
@@ -103,6 +149,7 @@ impl Wiring {
             events,
             sessions_dir: Some(sessions_dir),
             session_path: Some(path),
+            backgrounds: None,
         })
     }
 
@@ -120,11 +167,13 @@ impl Wiring {
                 let session = JsonlSession::open(&path).await?;
                 self.session = Box::new(session);
                 self.session_path = Some(path.clone());
+                self.sync_background_session();
                 Ok(Some(path))
             }
             None => {
                 self.session = Box::new(MemorySession::new());
                 self.session_path = None;
+                self.sync_background_session();
                 Ok(None)
             }
         }
@@ -146,7 +195,37 @@ impl Wiring {
         let meta = session.meta().cloned();
         self.session = Box::new(session);
         self.session_path = Some(path);
+        self.sync_background_session();
         Ok(meta)
+    }
+
+    /// 挂上后台命令上下文（**进程级**）—— 并把会话槽同步到**当前**会话。
+    ///
+    /// 会话槽的值必须与本接线器当前的会话一致 ⇒ 挂载时立刻同步一次；
+    /// 之后每次换会话（[`Wiring::new_session`] / [`Wiring::resume_into`]）再同步。
+    pub fn attach_backgrounds(&mut self, context: BackgroundContext) {
+        context.session().set(self.session_id());
+        self.backgrounds = Some(context);
+    }
+
+    /// 后台命令上下文 —— 清理点用（`None` = 本接线器不带后台能力）。
+    pub fn backgrounds(&self) -> Option<&BackgroundContext> {
+        self.backgrounds.as_ref()
+    }
+
+    /// 本接线器当前会话的 id —— 落盘目录名与注册表条目的会话键。
+    fn session_id(&self) -> String {
+        crate::session_id_for(self.session_path())
+    }
+
+    /// 会话换过之后，把会话槽同步到**新**会话。
+    ///
+    /// 工具在**调用时**读槽（工具表是建表期冻结的）⇒ 换会话后必须同步，
+    /// 否则后台命令会挂到**旧会话**的目录与条目上（清理点也就找不到它们）。
+    fn sync_background_session(&self) {
+        if let Some(context) = &self.backgrounds {
+            context.session().set(self.session_id());
+        }
     }
 
     /// 会话落盘目录（`None` = 一次性 / 内存会话）—— 运行期 `/resume` 扫目录的取数口。
@@ -264,6 +343,7 @@ mod tests {
 
     use ys_core::{ContentBlock, Role};
     use ys_event::CollectingSink;
+    use ys_tools_basic::BgLimits;
 
     fn text_message(text: &str) -> Message {
         Message {
@@ -293,6 +373,41 @@ mod tests {
 
         assert!(path.is_none(), "一次性会话无文件");
         assert!(w.session_messages().is_empty(), "历史应清空");
+    }
+
+    /// **会话切换 ⇒ 会话槽同步**：工具读到的必须是**当前**会话 id。
+    ///
+    /// `/new` 与 `/resume` 两条路径都经 `Wiring` 的会话替换方法 ⇒ 槽在两处都同步
+    /// （工具表是建表期产物，会话 id 只能运行时读这个共享槽）。
+    #[tokio::test]
+    async fn session_slot_follows_session_switches() {
+        let dir = temp_dir("bg_slot");
+        let mut w = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        let slot = SessionSlot::new("placeholder");
+        w.attach_backgrounds(BackgroundContext::new(
+            Arc::new(BackgroundTasks::new(dir.join("bg"), BgLimits::default())),
+            slot.clone(),
+        ));
+
+        // 挂载即同步到当前会话（会话文件名的 stem）。
+        let current = crate::session_id_for(w.session_path());
+        assert_eq!(slot.get(), current, "挂载后槽必须等于当前会话 id");
+
+        // `/new` ⇒ 换会话 ⇒ 槽跟着换。
+        w.new_session().await.unwrap();
+        let after_new = crate::session_id_for(w.session_path());
+        assert_ne!(after_new, current, "换会话后会话 id 必须变");
+        assert_eq!(slot.get(), after_new, "`/new` 后槽必须同步到新会话");
+
+        // `/resume` ⇒ 换会话 ⇒ 槽跟着换。
+        let target = dir.join("target.jsonl");
+        std::fs::write(&target, "").unwrap();
+        w.resume_into(target).await.unwrap();
+        assert_eq!(slot.get(), "target", "`/resume` 后槽必须同步到目标会话");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `/new`（持久）：旧文件保留；新会话**惰性**（不发消息则不落盘）。

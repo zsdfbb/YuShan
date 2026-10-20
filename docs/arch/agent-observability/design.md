@@ -140,7 +140,7 @@ debug 已开、且已发出过模型请求，但整个 session 一条 `model_att
 | `turn_start` / `turn_end` | `turn`、`input_bytes`、`budget_ms`；结束时 `rounds`、`elapsed_ms`、`budget_remaining_ms`、`cache_hit/miss` |
 | `round_start` / `round_end` | 轮号；结束时 `ttft_ms`、`gen_ms`、`tools_ms`、`total_ms`、**`first_thinking_ms` / `first_text_ms`**、`thinking_span_ms` / `text_span_ms`、`thinking_deltas` / `text_deltas`（**只计数**）、`tool_calls` |
 | **`round_usage`** | **`purpose`**（`turn` / `compaction` / `summarize`，见 §4.8）、`round`（辅助调用可缺）、`gen_ai.usage.input_tokens` / `output_tokens` / `total_tokens`、**`gen_ai.usage.cache_read.input_tokens`**、**`gen_ai.usage.reasoning.output_tokens`**、`usage_reported`、`reasoning_tokens_reported`（**区分"真 0"与"没上报"**） |
-| `tool_call` | `gen_ai.tool.name`、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（**摘要**）、`args_original_bytes`、`args_truncated`、`args_keys`、`args_redacted_keys` |
+| `tool_call` | `gen_ai.tool.name`、`gen_ai.tool.call.id`、`gen_ai.tool.call.arguments`（**摘要**）、`args_original_bytes`、`args_truncated`、`args_keys`、`args_redacted_keys`、**`command_fp`**（命令类工具的**命令串指纹**；非命令类工具为 `null`） |
 | `tool_result` | `duration_ms`、`is_error`、`result_bytes`、`result_lines`、`result_lines_exact`（**不记内容**） |
 | `model_attempt` | `attempt`/`max_attempts`（后者为**总尝试数**）、`outcome`、`reason_class`（`transport`/`idle_timeout`/`rate_limited`/`server_error`/`quota`/`stream`/`fatal`）、`http_status`、`response_headers_ms`、`duration_ms`、`backoff_ms`、`retried`、`retry_suppressed`、`stream_started`、`fallback_retry`、**`ttfb_ms`（真·首字节）** |
 | `context_compacted` | `estimated_tokens_before` / `after` / `delta`、`summarized` / `kept` |

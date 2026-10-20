@@ -678,9 +678,9 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 ### 13.1 装配（启动期一次，之后冻结）
 
-- **父工具表 = 基础 9 元 + `SubagentTool` 追加末位**（`main.rs`：`toolset::build_tools` 之后 `tools.push(Box::new(subagent::SubagentTool::new(setup.outer_timeout())))`）。末位保证**子 tools JSON 是父的字节前缀** ⇒ 命中 prompt cache。
+- **父工具表 = 基础 9 元 + `bash_bg` + `bash_poll` + `SubagentTool` 追加末位**（`apps/coding-agent/src/assembly.rs` 的 `AgentFactory::build()`：基础 9 元之后依次 `push` 两个后台工具，最后 `push` 派发工具）。末位保证**子 tools JSON 是父的字节前缀** ⇒ 命中 prompt cache。
 - **子工具表 = 基础 9 元**（无 `subagent`）⇒ 派发**结构上不可能递归**（`registry.get("subagent")` 未命中 ⇒ 走 `tool not found`）。
-- **两份系统提示**：父（10 工具，能力边界声明改为「CAN delegate tasks to subagents」）、子（9 工具，逐字保留「no subagents」）。由 `prompt::build_system_prompt` 按**工具表派生**，不是常量。
+- **两份系统提示**：父（12 工具，能力边界声明改为「CAN delegate tasks to subagents」）、子（9 工具，逐字保留「no subagents」）。由 `prompt::build_system_prompt` 按**工具表派生**，不是常量。
 - **子 `RunLimits`**：与主 agent 同源（同一份 `Config`），但 `fixed_prompt_tokens` 填**子表**的真值（否则子会话系统性晚触发压缩）。
 
 ### 13.2 每回合的注入与运行
@@ -997,3 +997,155 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
   「可能没跟上」，不是「算错」。
 - 逐行 `line_count` 有分配开销（每条目只在内容变化时算一次）。
 - 真实终端的「翻页跟手」观感仍是 `MANUAL_ACK` 项（见 §10）。
+## 19. 后台命令执行（execution-efficiency）— as-built
+
+本节只记**已成立**的事实。切片 1 的两个工具**已注册**（父表 12 元，见 §19.1）；
+仍在收口的条目在对应小节写明现状；落盘目录契约见
+`docs/arch/execution-efficiency/design.md` §4.5。
+
+### 19.1 父/子工具表元素数
+
+- **父表 = 12 元**：基础 9 元（`apps/coding-agent/src/toolset.rs:88` 的 `build_tools`）+
+  `bash_bg` + `bash_poll` + `SubagentTool` **追加末位**（`apps/coding-agent/src/assembly.rs`
+  的 `AgentFactory::build()`）；两个后台工具排在 `subagent` **之前** —— 顺序即契约。
+- **子表 = 9 元**（不含 `bash_bg` / `bash_poll` / `subagent`）⇒ 派发**结构上**不可能递归，
+  子 agent 天然没有后台能力。
+- 前缀性质：子表 JSON 是父表 JSON 的**字节前缀**（父表 = 子表去掉末尾 `]` +
+  追加段 `,{bash_bg…},{bash_poll…},{subagent…}]`）⇒ 命中 prompt cache。
+  真实装配产物的字节级断言在 `apps/coding-agent/src/assembly.rs` 的
+  `real_parent_table_keeps_the_child_table_as_its_byte_prefix`（元素数 + 前缀 + 追加段逐字节）
+  与 `real_parent_table_ends_with_the_subagent_tool`（末位）。
+  `apps/coding-agent/src/toolset.rs` 那条顺序用例**自拼**父表 ⇒ 不描述真实父表。
+- **装配条件**：后台上下文未注入时父表少两项；生产装配路径恒注入 ⇒ 父表恒为 12 元。
+
+### 19.2 六个清理点
+
+后台命令的**注册表**（`adapters/tools-basic/src/background.rs` 的 `BackgroundTasks`，
+进程级单例经 `apps/coding-agent/src/wiring.rs` 的 `BackgroundContext` 持有）与
+**回收机制**（app 侧的六个显式清理点）**均已落地**；六处时机各不相同：
+
+| 时机 | 落点 | 动作 |
+|---|---|---|
+| abort | `apps/coding-agent/src/app_loop.rs:1034`（`Boundary::Abort` 臂） | `kill_all(session)` |
+| 回合预算到点 | `apps/coding-agent/src/app_loop.rs:1062`（`sleep_until(deadline)` 臂，同样 push `Boundary::Abort`） | 同一路径 ⇒ 同一动作 |
+| `/new` | `apps/coding-agent/src/app_loop.rs:555`（换会话**之前**） | `kill_all(session)` + 删除该会话输出目录 |
+| `/resume` | `apps/coding-agent/src/app_loop.rs:620`（恢复成功后） | `kill_all(session)` |
+| 进程退出 | `apps/coding-agent/src/main.rs:2058` **之前**（清理调用在 `main.rs:2057`） | `kill_all(全部)`（`std::process::exit` 不跑析构 ⇒ `Drop` 兜底在此路径无效） |
+| panic（unwind） | `impl Drop for BackgroundTasks` | 兜底杀全部进程组（`Drop` 只能用同步 kill） |
+
+- `kill_all` **按会话过滤** ⇒ 漏掉的清理点不会波及别的会话。
+- **会话 id 的取法**：全部取自**会话槽**（`wiring.backgrounds().session_id()`）——
+  与工具给注册表条目打标签用的是**同一份**槽 ⇒ 必然命中。
+  `/new` 与 `/resume` 都是**先存旧 id、再换会话**：拿换之后的 id 去清理会**打空**。
+- `/resume` **仅在会话 id 变化时**才清理（同会话追加同一文件 ⇒ 不动，
+  否则会杀掉本会话自己的命令）。
+- `/new` 的删目录走 `BackgroundTasks::remove_session_dir`
+  （`adapters/tools-basic/src/background.rs:587`）：只允许删 `<root>` 的**直接子目录**，
+  会话 id 含路径分隔符或 `..` 一律拒绝；目录删不掉（权限 / 并发占用）**不影响控制流**。
+- **共享 sweeper**：`apps/coding-agent/src/app_loop.rs:106`
+  （`ensure_background_sweeper`），在 `app_loop::run`（`app_loop.rs:321`）启动 ——
+  **全局 1 个** tokio 任务，100ms tick 调 `BackgroundTasks::sweep`；
+  已有活着的就不重复启，注册表被丢弃后任务自行收摊（只持**弱引用**）。
+- **回合末计数**：`apps/coding-agent/src/app_loop.rs:1163` 记 debug 记录
+  `ev = "background_tasks"`、字段 `running` = 本会话仍在跑的条数 ——
+  **只进 debug 文件**，不进模型上下文、不进 transcript。
+
+### 19.3 `/model` 的窗口来源
+
+- 窗口值与来源**成对**产出：`Config::context_window_with_source_for`
+  （`apps/coding-agent/src/config.rs:280`）在**一次判定**里同时给出两个值 ——
+  分开两次判定会漂移，值与来源会对不上。
+- 四级来源（`ContextWindowSource`，`apps/coding-agent/src/config.rs:149`）：
+
+  | 级 | 来源 | 标签 |
+  |---|---|---|
+  | ① | `~/.yushan/config.json` 的 `context_window` 覆盖 | `user override` |
+  | ② | provider 目录（`/v1/models`）自报的窗口 | `provider catalog` |
+  | ③ | 内建兜底表 `KNOWN_MODEL_WINDOWS`（`apps/coding-agent/src/provider.rs:488`） | `builtin table` |
+  | ④ | `RunLimits::default().context_window` = 128000 | `default` |
+
+- `/model` 的输出追加一行 `Context window: <值> (source: <标签>)`
+  （`apps/coding-agent/src/capabilities.rs:279`）；走 `Outbound::Output` → transcript，**绝不 print**。
+- 内建兜底表是**精确匹配**，只收录 `MiniMax-M3` / `MiniMax-M2.7`；其余模型落 ④。
+  用户级覆盖的 JSON 键是 `context_window`（内部字段名才叫 `windows`，
+  `apps/coding-agent/src/config.rs:31`）。
+
+### 19.4 两个新工具的形态
+
+`bash_bg` / `bash_poll` **已注册**（`apps/coding-agent/src/assembly.rs` 的
+`AgentFactory::build()`，排在 `subagent` **之前**）。契约位有两处：
+
+- 提示词侧：工具说明与两条 guideline 已按名字备好
+  （`apps/coding-agent/src/prompt.rs:170`、`:173`、`:306`），沿用既有工具的
+  **「在场才出现」**守卫形态 ⇒ 子表不含这两个工具 ⇒ 子 agent 天然看不到那两条 guideline。
+- debug 侧：命令串指纹已把 `bash_bg` 计入命令类工具
+  （`apps/coding-agent/src/debug_log.rs:1088`）。
+
+形态要点：
+
+- `bash_bg` 启动后台命令并**立即**返回句柄；`bash_poll` 查状态 + **只给上次轮询之后的增量输出**。
+- 落盘 `<bg_root>/<session_id>/bg<N>.log`；`bg_root` = `$YUSHAN_BG_DIR`
+  （**须绝对路径**，与 `YUSHAN_FETCHED_DIR` 同规矩）或 `<temp_dir>/yushan-bg`。
+- 句柄 `BgHandle(u32)` 进程内**单调递增、永不复用**；条目带 `session` 字段，poll 时核对
+  ⇒ 跨会话的旧句柄命中不到本会话的条目。
+- 两个工具**均非** `is_concurrency_safe`（`bash_poll` 会推进注册表里的交付偏移）。
+- 触发只取显式（`bash_bg`），回收只取显式轮询（`bash_poll`）；**不做**通知注入。
+
+### 19.5 交付语义（三条，缺一不可）
+
+1. **已送达的字节不重复送达** —— `consumed` 单调推进（`advance_consumed` 只进不退）
+   ⇒ 总拷贝 O(n)。
+2. **未送达的字节必须明示** —— 头尾裁掉的中间段报出**字节数**与**完整输出路径**。
+3. **不静默丢弃** —— 裁剪与字节预算都**不放宽**，裁掉就裁掉，但**要报出来**。
+
+**末行（无换行结尾）的两态规则**：
+
+- **命令仍在跑** ⇒ 末段**不是完整行**，**不交付**，`consumed` 停在最后一个完整行的边界；
+  未交付的字节数**明示**（「还有 N B 待交付」）。
+- **命令已结束且进程已收尸** ⇒ 输出文件不会再增长 ⇒ 末段**就是最后一行**
+  ⇒ **整段交付**，`consumed` 推到文件尾。
+  判据是「**进程已收尸**」而非「状态非 Running」：`Killed` 但尚未收尸时子进程仍可能在写
+  ⇒ 此刻把半行当完整行交付会交付出**截断的多字节字符**。
+
+**模型可见形态**（`bash_poll` 的真实返回）：
+
+```
+[bg1] running — 0.0s elapsed — 0 B produced, 0 B new
+[bash_poll] full output: <bg_root>/<session_id>/bg1.log
+
+[bg1] finished — exit code 0 — 2.0s — 11 B produced, 11 B new
+alpha
+beta
+
+[bash_poll] full output: <bg_root>/<session_id>/bg1.log
+
+[bash_poll] unknown handle "bg1" — no running handles
+```
+
+「被 harness 杀掉」与「命令自身非零退码」用**不同措辞**（前者是 harness 的闸门，
+后者是命令自身的退码）⇒ 模型不会把被杀误报成「测试挂了」。
+
+### 19.6 输出上限的两个闸门（量纲不同，不可互换）
+
+| 闸门 | 值 | 归因措辞 | 落点 |
+|---|---|---|---|
+| **精确闸门** | **2 MiB** | 「harness 的输出上限」 | sweeper 的 `stat`（`BackgroundTasks::sweep`）⇒ 命中即**杀进程组 + 记失败** |
+| **粗闸门** | `max(2 MiB, 64 MiB)` | 「内核 SIGXFSZ」 | 启动命令时的 `ulimit -f`（内核侧文件写入上限） |
+
+⚠ **`ulimit -f` 是进程级上限，不是「本命令的输出上限」** ⇒ 取 2 MiB 会把
+`cargo build` 写 `target/` 的正常构建一起杀掉 ⇒ 粗闸门取 `max(2 MiB, 64 MiB)`，
+精确的 2 MiB 由 sweeper 的 `stat` 闸门负责。
+
+### 19.7 展示裁剪（`ys_tool::head_tail`）
+
+- 头尾混合：头 **1/4**（12.5 KiB）+ 尾 **3/4**（37.5 KiB）= `MAX_BYTES` 50 KiB，
+  行数预算 `MAX_LINES = 2000` —— **都不放宽**。
+- `omitted_bytes` = **源文本中未出现在展示内容里的字节数**（展示内容 = 头 + 尾，
+  两段互不重叠；头尾之间的换行符与源文本的**尾随换行**都计入）
+  ⇒ 恒等式 `omitted_bytes + head.len() + tail.len() == 源文本字节数`。
+- **单行超预算** ⇒ 头部给出该行的**前缀**（≤ 头部预算、字符边界安全），尾部为空
+  （同一行不得同时出现在头与尾）⇒ 被裁字节计入 `omitted_bytes` 并报出。
+- **输出的拼装只有一份**：`adapters/tools-basic/src/bg_output.rs` 的
+  `assemble(text, handle_label, output_path, pending_note)` 是**唯一真源** ——
+  行的顺序是「头 → 省略标记 → 尾 → 未送达报出 → 待交付提示 → 完整输出路径」；
+  `bg_tools` 只提供「待交付」提示的**措辞**（读域知识），**插入位置**由 `assemble` 决定。

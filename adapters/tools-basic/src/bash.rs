@@ -4,10 +4,122 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use ys_core::ToolResult;
+use ys_protocol::BoundarySource;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
+
+#[cfg(unix)]
+use crate::proc_group;
 
 /// 挂载了 `boundary` 时的中止轮询间隔 —— 命令中止的感知延迟上界。
 const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 内层 deadline 与外层预算之间的**余量** —— 内层必须**严格早于**外层到期。
+///
+/// 外层预算到点时是把工具 future **drop** 掉（`ys-loop` 的 `tokio::time::timeout`），
+/// 届时只有 `kill_on_drop` 生效（只杀直接子进程）⇒ 进程组不会被清理。
+/// 故内层留出余量，让「超时」一律由**工具自己**发现 ⇒ 走「杀进程组」的那条分支。
+const DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+/// 生效 deadline 的**下限** —— 外层预算过紧时不得算出 0 或负数。
+const MIN_DEADLINE: Duration = Duration::from_secs(1);
+
+/// 算出工具内的**生效 deadline**。
+///
+/// 两条上限同时生效：
+/// - 模型传了 `timeout` ⇒ 上限是**模型值**；
+/// - 外层预算（[`ToolContext::tool_budget`]）存在 ⇒ 上限是「**外层预算 − 余量**」。
+///
+/// 两者都有时取**更小**者；**模型没传 `timeout` 时仍然有 deadline**（= 外层预算 − 余量）。
+/// 两者都没有 ⇒ `None`（既无外层预算也无模型值 ⇒ 沿用「跑到自然结束」的语义）。
+///
+/// 模型值**原样**参与取小（模型传 0 ⇒ 生效 deadline 就是 0）——
+/// 那一档的超时文案写「0 seconds」（见 [`deadline_secs`]）。
+///
+/// **「无 deadline」档位的完成条件**：阶段 A 以「管道读到 EOF」为完成条件
+/// ⇒ 若有孙进程持着写端，工具会**一直阻塞**到孙进程自己退出；
+/// 唯一的打断是 boundary 的中止信号（挂 boundary 时）。
+/// 该档位的可达性：生产路径两路都必挂 `with_tool_budget` ⇒ **不可达**；
+/// 但「挂 boundary、不挂 `tool_budget`、模型不传 `timeout`」的组合在
+/// **直接调用工具**时可达（正常命令仍能正常返回，见
+/// `test_no_deadline_tier_returns_a_normal_command`）。
+fn effective_deadline(model: Option<Duration>, outer: Option<Duration>) -> Option<Duration> {
+    match (model, outer) {
+        (None, None) => None,
+        (Some(model), None) => Some(model),
+        (None, Some(outer)) => inner_from_outer(outer),
+        (Some(model), Some(outer)) => match inner_from_outer(outer) {
+            Some(inner) => Some(model.min(inner)),
+            // 外层预算小到减不出内层 ⇒ 视作「没有外层预算」⇒ 只受模型值约束
+            None => Some(model),
+        },
+    }
+}
+
+/// 由外层预算推出内层 deadline —— **严格早于**外层到期，且**为正**。
+///
+/// 外层预算减得掉余量时取「外层 − 余量」；减不掉时钳到**最小正秒数**，
+/// 但仍须**严格早于**外层 ⇒ 外层本身已不足 1s 时取它的一半；
+/// 外层不足 2ns（取半后为 0）⇒ 减不出「正的且严格早于外层」的值 ⇒ **无预算可用**
+/// （`None` = 视作没有外层预算）。
+fn inner_from_outer(outer: Duration) -> Option<Duration> {
+    let inner = outer.saturating_sub(DEADLINE_MARGIN);
+    if inner >= MIN_DEADLINE {
+        return Some(inner);
+    }
+    if outer > MIN_DEADLINE {
+        return Some(MIN_DEADLINE);
+    }
+    let half = outer / 2;
+    if half.is_zero() { None } else { Some(half) }
+}
+
+/// 生效 deadline 的**秒数**（写进超时文案）—— 向上取整到整秒。
+///
+/// 文案写**生效值**：模型传 900、实际生效 295 ⇒ 文案说 295；
+/// 生效值为 0（模型传 `timeout: 0`）⇒ 文案说 0 —— 与生效值**逐字一致**，
+/// 不因「秒数为 0 看着不像超时」而擅自抬到 1。
+fn deadline_secs(deadline: Duration) -> u64 {
+    let nanos = deadline.as_nanos();
+    u64::try_from(nanos.div_ceil(1_000_000_000)).unwrap_or(u64::MAX)
+}
+
+/// 等待阶段的结局 —— 「被中止」/「撞上生效 deadline」/「等待本身失败」。
+///
+/// `TimedOut` 携带**生效时长**：超时文案必须写生效值（模型传的值可能远大于它）。
+enum WaitOutcome {
+    /// 边界发出了中止信号。
+    Aborted,
+    /// 撞上生效 deadline（携带生效时长）。
+    TimedOut(Duration),
+    /// 等待本身失败（`wait` 报错）。
+    Failed(String),
+}
+
+/// 等到边界发出中止信号。
+///
+/// `None` = 没有边界控制 ⇒ **永不完成**（调用方的 `select!` 只会等另外两个分支）。
+async fn wait_abort(boundary: Option<&dyn BoundarySource>) {
+    match boundary {
+        Some(boundary) => loop {
+            if boundary.is_aborted() {
+                return;
+            }
+            tokio::time::sleep(ABORT_POLL_INTERVAL).await;
+        },
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// 等到生效 deadline 到点。
+///
+/// 携带生效时长，供超时文案写**生效值**。
+/// `None` = 没有 deadline ⇒ **永不完成**。
+async fn wait_deadline(deadline: Option<(Instant, Duration)>) {
+    match deadline {
+        Some((at, _)) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
 
 pub struct BashTool {
     workspace: PathBuf,
@@ -154,25 +266,28 @@ fn take_shell_token(s: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// 尽力终止整个进程组（spawn 时已 `process_group(0)`，故进程组 id == 子进程 pid）。
+/// 尽力终止整个进程组（含孙进程）—— 委托共享内核 [`proc_group::kill_group_async`]。
 ///
-/// **`exec::run_bounded` 复用同一份** —— 两处的前置条件相同（都 `process_group(0)`），
-/// 各写一份会漂移。调用方**必须**在 `wait()` 收尸**之前**调用：leader 一旦被收尸，
-/// 它的 pid 就可能被复用，`kill -9 -<pid>` 便可能打到无关的进程组。
-///
-/// 不引入 `libc` 依赖：借助本工具已依赖的 `sh` 内建 `kill`，向负 pid（= 进程组）
-/// 发 `SIGKILL`。仅覆盖 `sh` fork 出的孙进程（如 `sh -c "npm test"` 的 node 子进程）；
-/// 失败时静默 —— 调用方仍有 `Child::start_kill()` 兜底。
+/// 内核的落点与「**必须先杀后收**」「pid 复用窗口」两条告诫写在
+/// [`proc_group::kill_group`] 的文档里 —— 本 crate 只有那一份实现。
 #[cfg(unix)]
 pub(crate) async fn kill_process_group(pid: u32) {
-    let _ = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -9 -{pid}"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+    proc_group::kill_group_async(pid).await;
+}
+
+/// 收场：先杀进程组（含孙进程），再杀直接子进程兜底，最后收尸组长。
+///
+/// **顺序不可颠倒**：组长一旦被收尸，它的 pid 就可能被复用，
+/// 此时 `kill -9 -{pid}` 可能打到无关的进程组（见 [`proc_group::kill_group`]）。
+async fn terminate(child: &mut tokio::process::Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        kill_process_group(pid).await;
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 #[async_trait::async_trait]
@@ -199,6 +314,12 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing 'command'".into()))?;
         let timeout_secs = input["timeout"].as_u64();
+
+        // 工具内**始终**有 deadline：模型传的 `timeout` 与外层预算（`ctx.tool_budget`）
+        // 取更小者；模型没传 `timeout` 时取「外层预算 − 余量」。
+        // ⇒ 超时一律由**工具自己**发现 ⇒ 走「杀进程组」的那条分支，
+        // 而非外层 drop future 时只触发 `kill_on_drop`。
+        let deadline = effective_deadline(timeout_secs.map(Duration::from_secs), ctx.tool_budget);
 
         // 工作目录不成立 ⇒ 硬报错。放行到 `spawn` 只会得到一句
         // `Failed to spawn command`，与「命令本身有问题」无法区分。
@@ -235,8 +356,11 @@ impl Tool for BashTool {
             .current_dir(&self.workspace)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // 超时/中止后 `Child` 在 `wait_with_output` 的 future 被 drop 时随之 drop，
-            // 若无此设置子进程会继续跑到自然结束。
+            // `kill_on_drop` 是**最后一道兜底**，不是主路径：
+            // 主路径是工具自己发现 deadline / 中止 ⇒ 走 [`terminate`] 的「杀整个进程组」
+            // ⇒ 孙进程随组而死。
+            // 兜底只在**工具 future 被外层预算 drop**（`Child` 随之 drop）时生效，
+            // 而它只杀**直接子进程** ⇒ 该路径下孙进程仍可能成为孤儿。
             .kill_on_drop(true);
 
         // Unix 上使用进程组
@@ -251,113 +375,103 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| ToolError::Execution(format!("Failed to spawn command: {e}")))?;
 
-        // ── 无边界控制：保持既有整体等待路径（行为不变） ──
-        let Some(boundary) = ctx.boundary else {
-            let output = if let Some(secs) = timeout_secs {
-                let timeout = Duration::from_secs(secs);
-                match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                    Ok(result) => result.map_err(|e| {
-                        ToolError::Execution(format!("Failed to wait for command: {e}"))
-                    })?,
-                    Err(_timeout) => {
-                        // 超时时杀死进程树
-                        #[cfg(unix)]
-                        {
-                            // child 在该点已被 drop，但仍可尝试向进程组发送信号来终止
-                        }
-                        return Err(ToolError::Timeout(format!(
-                            "Command timed out after {secs} seconds"
-                        )));
-                    }
-                }
-            } else {
-                child
-                    .wait_with_output()
-                    .await
-                    .map_err(|e| ToolError::Execution(format!("Failed to wait for command: {e}")))?
-            };
+        let pid = child.id();
 
-            return Ok(render_result(
-                &output.stdout,
-                &output.stderr,
-                output.status.code(),
-                note.as_deref(),
-            ));
+        // 管道由独立任务排空。**组长退出 ≠ 管道排空**：孙进程可能仍持着写端
+        // （`sh -c 'sleep 900 &'` 这类）⇒ 排空必须**自己**受生效 deadline 约束，
+        // 否则工具会越过自己的 deadline 一直阻塞（孙进程攥着写端不放）。
+        let mut stdout_pipe = child.stdout.take().expect("stdout 已 piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr 已 piped");
+        let mut out_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+        let mut err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+
+        // 生效 deadline 的**绝对时刻**与时长 —— 两个阶段共用同一份上界。
+        let deadline_at = deadline.map(|d| (Instant::now() + d, d));
+        let boundary = ctx.boundary;
+
+        // ── 阶段 A：排空管道 ──
+        // 完成条件是「管道读到 EOF」，**不是**「组长退出」——
+        // 后者会让「组长已退、孙进程持管道」的形状越过 deadline 一直阻塞。
+        //
+        // **不变量：阶段 A 绝不调用 `try_wait` / `wait`。**
+        // 「先杀后收」（见 [`terminate`]）成立的前提是「组长在阶段 A 期间仍未被收尸」：
+        // 一旦在这里收尸，组长的 pid 就可能被复用 ⇒ 随后的 `kill -9 -{pid}`
+        // 会打到无关的进程组（见 [`proc_group::kill_group`]）。
+        // 该前提依赖 tokio 的 reaper 是**惰性**的 —— 只有被 poll 才会 `waitpid`
+        // （tokio 1.53 的 `reap.rs` / `pidfd_reaper.rs` 两条路径皆如此）。
+        // ⇒ 在阶段 A 加一次 `try_wait()` 轮询前，必须先重新评估这条不变量。
+        let drained = {
+            let drain = async {
+                let (out, err) = tokio::join!(&mut out_task, &mut err_task);
+                (out.unwrap_or_default(), err.unwrap_or_default())
+            };
+            tokio::select! {
+                biased;
+                result = drain => Ok(result),
+                _ = wait_abort(boundary) => Err(WaitOutcome::Aborted),
+                _ = wait_deadline(deadline_at) => Err(WaitOutcome::TimedOut(
+                    deadline_at.map(|(_, d)| d).unwrap_or_default(),
+                )),
+            }
         };
 
-        // ── 有边界控制：接管管道 + 轮询 `try_wait`/`is_aborted`，命令可被中途中止 ──
-        let pid = child.id();
-        let mut stdout = child.stdout.take().expect("stdout 已 piped");
-        let mut stderr = child.stderr.take().expect("stderr 已 piped");
-
-        // 读取与等待必须并发：管道写满会阻塞子进程，若不持续排空则死锁。
-        let out_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf).await;
-            buf
-        });
-        let err_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf).await;
-            buf
-        });
-
-        let deadline = timeout_secs.map(|s| (Instant::now() + Duration::from_secs(s), s));
-
-        let outcome = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => {}
-                Err(e) => {
-                    break Err(ToolError::Execution(format!(
-                        "Failed to wait for command: {e}"
-                    )));
+        // ── 阶段 B：组长退出并收尸 ──
+        // 收尸放在**最后**：组长一旦被收尸，它的 pid 就可能被复用，
+        // 此时再 `kill -9 -{pid}` 可能打到无关的进程组（见 [`proc_group::kill_group`]）。
+        let outcome = match drained {
+            Err(outcome) => Err(outcome),
+            Ok((stdout, stderr)) => {
+                let wait = child.wait();
+                tokio::pin!(wait);
+                let exited = tokio::select! {
+                    biased;
+                    result = &mut wait => match result {
+                        Ok(status) => Ok(status.code()),
+                        Err(e) => Err(WaitOutcome::Failed(e.to_string())),
+                    },
+                    _ = wait_abort(boundary) => Err(WaitOutcome::Aborted),
+                    _ = wait_deadline(deadline_at) => Err(WaitOutcome::TimedOut(
+                        deadline_at.map(|(_, d)| d).unwrap_or_default(),
+                    )),
+                };
+                match exited {
+                    Ok(exit_code) => Ok((stdout, stderr, exit_code)),
+                    Err(outcome) => Err(outcome),
                 }
             }
-
-            if boundary.is_aborted() {
-                break Err(ToolError::Execution("aborted by user".into()));
-            }
-
-            if let Some((dl, secs)) = deadline {
-                if Instant::now() >= dl {
-                    break Err(ToolError::Timeout(format!(
-                        "Command timed out after {secs} seconds"
-                    )));
-                }
-            }
-
-            // 有 deadline 时按剩余时间收敛，避免超时被轮询间隔拉长
-            let mut nap = ABORT_POLL_INTERVAL;
-            if let Some((dl, _)) = deadline {
-                nap = nap.min(dl.saturating_duration_since(Instant::now()));
-            }
-            tokio::time::sleep(nap).await;
         };
 
         match outcome {
-            Ok(status) => {
-                let stdout = out_task.await.unwrap_or_default();
-                let stderr = err_task.await.unwrap_or_default();
-                Ok(render_result(
-                    &stdout,
-                    &stderr,
-                    status.code(),
-                    note.as_deref(),
-                ))
-            }
-            Err(err) => {
-                // 中止 / 超时 / 等待失败：先杀进程组（含孙进程），再杀子进程兜底
-                if let Some(pid) = pid {
-                    #[cfg(unix)]
-                    kill_process_group(pid).await;
-                }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            Ok((stdout, stderr, exit_code)) => Ok(render_result(
+                &stdout,
+                &stderr,
+                exit_code,
+                note.as_deref(),
+            )),
+            Err(outcome) => {
+                // 中止 / 超时 / 等待失败：先杀进程组（含孙进程），再杀子进程兜底，最后收尸
+                terminate(&mut child, pid).await;
                 // 已丢弃输出，读取任务不必再等（孙进程可能仍持写端）
                 out_task.abort();
                 err_task.abort();
-                Err(err)
+                Err(match outcome {
+                    WaitOutcome::Aborted => ToolError::Execution("aborted by user".into()),
+                    WaitOutcome::TimedOut(deadline) => ToolError::Timeout(format!(
+                        "Command timed out after {} seconds",
+                        deadline_secs(deadline)
+                    )),
+                    WaitOutcome::Failed(msg) => ToolError::Execution(format!(
+                        "Failed to wait for command: {msg}"
+                    )),
+                })
             }
         }
     }
@@ -445,7 +559,10 @@ mod tests {
         let tool = BashTool::new(PathBuf::from("."));
         let ctx = make_ctx();
         let input = json!({ "command": "sleep 30", "timeout": 1 });
-        let result = tool.call(input, ctx).await;
+        // 墙钟上界：超时必须由**工具自己**发现（工具内没有 deadline 时会挂到 sleep 自然结束）
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.call(input, ctx))
+            .await
+            .expect("超时应由工具自己发现（10s 内返回）");
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -454,14 +571,20 @@ mod tests {
 
     /// N3（不泄漏）：超时后**直接子进程必须已被杀死**，不得继续执行后续命令。
     ///
-    /// 原理：`cmd.kill_on_drop(true)` 在 `wait_with_output()` 的 future 被 timeout drop 时
-    /// 连带 drop `Child`，从而 SIGKILL 直接子进程 `sh`；`sh` 死于 1s，来不及在 2s 执行
-    /// `touch`。故 3s 后 sentinel 必须不存在。
+    /// 原理：超时由**工具自己**发现 ⇒ 走 [`terminate`] 的收场序列
+    /// （先杀整个进程组含孙进程，再杀直接子进程兜底，最后收尸组长）。
+    /// `sh` 死于 1s，来不及在 2s 执行 `touch` ⇒ 故 3s 后 sentinel 必须不存在。
     ///
-    /// ⚠️ 本用例只用「`sh` 亲自执行 `touch`」的形式 —— `kill_on_drop` 只杀直接子进程，
-    /// `sh -c '(… ) & wait'` 之类**孙进程**仍会存活（已登记的后续项 P2-2，不在此编码）。
+    /// ⚠️ 本用例只用「`sh` 亲自执行 `touch`」的形式 —— 孙进程是否随组而死，
+    /// 由 `test_bash_timeout_kills_grandchild_without_boundary` 单独覆盖；
+    /// `kill_on_drop`（外层 drop 工具 future 时的兜底）由
+    /// `test_dropping_the_tool_future_kills_the_direct_child` 单独覆盖。
     ///
-    /// 变异：删掉 `.kill_on_drop(true)` → `sh` 活过 2s 并 `touch` → sentinel 存在 → 红。
+    /// 变异：**同时**去掉两处终止 —— `.kill_on_drop(true)` 与 `terminate` 里的
+    /// 「杀进程组 + 杀直接子进程」⇒ `sh` 活过 2s 并 `touch` ⇒ sentinel 存在 ⇒ 红。
+    /// （只去掉其中一处仍绿：两处各自都能单独杀掉 `sh` ——
+    /// `terminate` 是工具自己发现超时时走的收场序列，`kill_on_drop` 是工具
+    /// 返回、`Child` 被 drop 时的兜底。）
     #[tokio::test]
     async fn test_bash_timeout_does_not_leak_child_process() {
         let dir = test_dir();
@@ -495,8 +618,527 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             !sentinel.exists(),
-            "超时后子进程仍存活并执行了 touch（kill_on_drop 未生效）：{}",
+            "超时后子进程仍存活并执行了 touch（终止动作未生效）：{}",
             sentinel.display()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 工具 future 被**外部 drop** ⇒ `kill_on_drop` 是唯一生效的终止手段。
+    ///
+    /// 场景：外层预算到点时把工具 future drop 掉（`ys-loop` 的 `tokio::time::timeout`），
+    /// 工具来不及走「杀进程组」那条收场序列 ⇒ 只剩 `kill_on_drop` 杀**直接子进程**。
+    /// 该路径**只覆盖直接子进程**（孙进程仍可能成孤儿）。
+    ///
+    /// 判据是**进程存在性**（按 pid 查 `ps`），不是错误文案。
+    ///
+    /// 变异：删掉 `.kill_on_drop(true)` → 直接子进程活过 5s → 断言变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dropping_the_tool_future_kills_the_direct_child() {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let pid_file = dir.join("leader.pid");
+        let secs = unique_sleep_secs(&dir);
+        let marker = format!("sleep {secs}");
+        // 残留守卫：断言 panic 时也不留孤儿
+        let _guard = LeftoverGuard::new(&pid_file, &marker);
+
+        let tool = BashTool::new(dir.clone());
+        let ctx = make_ctx();
+        // `exec sleep <secs>` 让组长**自己**变成那个 `sleep`（pid 不变）⇒ 没有孙进程，
+        // 残留面只有这一个进程。
+        let input = json!({
+            "command": format!("echo $$ > '{}'; exec sleep {secs}", pid_file.display())
+        });
+
+        let handle = tokio::spawn(async move { tool.call(input, ctx).await });
+        let pid = read_pid(&pid_file).await;
+        assert_eq!(
+            grandchild_alive(pid, &marker),
+            Some(true),
+            "组长必须已经起来（pid {pid}）"
+        );
+
+        // 模拟外层预算到点：drop 工具 future ⇒ `Child` 被 drop ⇒ `kill_on_drop` 生效
+        handle.abort();
+        let _ = handle.await;
+
+        let gone = wait_until_gone(pid, &marker, Duration::from_secs(5)).await;
+        assert!(
+            gone,
+            "工具 future 被 drop 后直接子进程必须已被 kill_on_drop 杀掉（pid {pid}）"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── D2：超时后孙进程必须一起消失 ──────────────────────────────
+
+    /// 读一份 `ps` 快照 —— 失败诊断用（进程已消失时返回空串）。
+    #[cfg(unix)]
+    fn ps_snapshot(pid: u32) -> String {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("stat=,command=")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_else(|e| format!("<ps 调用失败: {e}>"))
+    }
+
+    /// 失败路径的清理：把**残留**的孙进程按 pid 杀掉。
+    ///
+    /// 只在孙进程**仍然活着**（按唯一的 `sleep <secs>` 标记确认身份）时才动手
+    /// ⇒ 不会误伤 pid 已被复用的无关进程。
+    ///
+    /// 只杀孙进程本身：它的进程组 leader（`sh`）由工具自己的清理 / `kill_on_drop` 负责。
+    #[cfg(unix)]
+    async fn kill_leftover_grandchild(pid_file: &Path, marker: &str) {
+        let Ok(text) = tokio::fs::read_to_string(pid_file).await else {
+            return;
+        };
+        let Ok(pid) = text.trim().parse::<u32>() else {
+            return;
+        };
+        kill_grandchild(pid, marker);
+    }
+
+    /// 拼一条「后台跑 `sleep` 并把它的 pid 写进文件」的命令 —— **按 pid** 认领孙进程，
+    /// 不靠进程名猜。
+    ///
+    /// `sleep` 的秒数取自测试目录名里的序号 ⇒ 本进程内唯一 ⇒ 判「还在不在」时
+    /// 不会撞上别的同名 `sleep`（pid 复用也不怕）。
+    fn grandchild_command(pid_file: &Path, secs: u64) -> String {
+        format!("sleep {secs} & echo $! > '{}'; wait", pid_file.display())
+    }
+
+    /// 拼一条「**组长先退出**」的命令 —— 与 [`grandchild_command`] 只差一个 `wait`。
+    ///
+    /// 组长 `sh` 执行完 `echo $!` 就退出（`&` 之后不再等待）⇒
+    /// **孙进程独自持有 stdout 管道写端** ⇒ 「组长已退出」与「管道已排空」是两件事。
+    fn leader_exits_first_command(pid_file: &Path, secs: u64) -> String {
+        format!("sleep {secs} & echo $! > '{}'", pid_file.display())
+    }
+
+    /// 工具调用的**墙钟上界** —— 工具内若没有 deadline，命令会挂到 `sleep` 自然结束
+    /// ⇒ 没有这个上界，测试会**永久挂起**而不是快速失败。
+    const TOOL_CALL_GUARD: Duration = Duration::from_secs(10);
+
+    /// 残留孙进程的清理守卫 —— `Drop` 时按 pid 杀掉**残留**的孙进程。
+    ///
+    /// 让「断言 panic」这条路径也不留孤儿（`sleep 900000+` ≈ 10.4 天）。
+    /// 只杀**按标记确认过身份**的进程 ⇒ 不会误伤 pid 已被复用的无关进程。
+    struct LeftoverGuard {
+        pid_file: PathBuf,
+        marker: String,
+    }
+
+    impl LeftoverGuard {
+        fn new(pid_file: &Path, marker: &str) -> Self {
+            Self {
+                pid_file: pid_file.to_path_buf(),
+                marker: marker.to_string(),
+            }
+        }
+    }
+
+    impl Drop for LeftoverGuard {
+        fn drop(&mut self) {
+            // panic 展开时不能再 await ⇒ 同步清理
+            let Ok(text) = std::fs::read_to_string(&self.pid_file) else {
+                return;
+            };
+            let Ok(pid) = text.trim().parse::<u32>() else {
+                return;
+            };
+            kill_grandchild(pid, &self.marker);
+        }
+    }
+
+    /// 从测试目录名里取出序号 ⇒ 本次运行内唯一的 `sleep` 秒数。
+    fn unique_sleep_secs(dir: &Path) -> u64 {
+        let seq = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit('_').next())
+            .and_then(|seq| seq.parse::<u64>().ok())
+            .unwrap_or(0);
+        900_000 + seq
+    }
+
+    /// 该 pid 是否仍是**活着的孙进程**：进程存在、非僵尸、且命令就是那个 `sleep`。
+    ///
+    /// 用 `ps` 而不是 `kill -0`：僵尸进程仍然「存在」，但已不再运行。
+    ///
+    /// `None` = **`ps` 调用失败** ⇒ **无法判定**。调用方不得把它当成「进程已死」——
+    /// 那会让「孙进程还在跑」的断言**假绿**。
+    fn grandchild_alive(pid: u32, marker: &str) -> Option<bool> {
+        let out = std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("stat=,command=")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some(line) = text.lines().find(|line| !line.trim().is_empty()) else {
+            return Some(false);
+        };
+        let (stat, command) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        if stat.contains('Z') {
+            return Some(false);
+        }
+        Some(command.contains(marker))
+    }
+
+    /// 查一个 pid 的 `ps` 状态。
+    ///
+    /// - `None`：**`ps` 调用失败** ⇒ 无法判定（不得当成「进程已消失」）。
+    /// - `Some(None)`：`ps` 跑通但查无此进程 ⇒ **已被收尸**（pid 已释放）。
+    /// - `Some(Some(stat))`：状态字符串（`Z` = 僵尸 = 已退出、**未收尸**）。
+    fn ps_stat(pid: u32) -> Option<Option<String>> {
+        let out = std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("stat=")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Some(
+            text.lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| line.trim().to_string()),
+        )
+    }
+
+    /// 按 pid 杀掉**残留**的孙进程（同步内核 —— `Drop` 守卫与异步清理共用）。
+    ///
+    /// 只在孙进程**仍然活着**（按唯一的 `sleep <secs>` 标记确认身份）时才动手
+    /// ⇒ 不会误伤 pid 已被复用的无关进程。`ps` 调用失败 ⇒ 无法确认身份 ⇒ 不动手。
+    fn kill_grandchild(pid: u32, marker: &str) {
+        if grandchild_alive(pid, marker) != Some(true) {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    /// 读 pid 文件（还没写好 ⇒ `None`）—— 观测循环用，不 panic。
+    async fn read_pid_if_present(path: &Path) -> Option<u32> {
+        let text = tokio::fs::read_to_string(path).await.ok()?;
+        text.trim().parse::<u32>().ok()
+    }
+
+    /// 等孙进程 pid 文件出现并读出 pid（命令一起来就写，通常在工具返回前就已在）。
+    async fn read_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(text) = tokio::fs::read_to_string(path).await
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "孙进程 pid 文件始终没出现：{}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 等到该 pid 不再是活着的孙进程（或预算耗尽）。
+    ///
+    /// `ps` **无法判定**时返回 `false` —— 「判不出」不得当成「已消失」。
+    async fn wait_until_gone(pid: u32, marker: &str, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            match grandchild_alive(pid, marker) {
+                Some(false) => return true,
+                Some(true) => {}
+                None => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// D2 · 无 boundary 路径：超时后**孙进程**必须不存在。
+    ///
+    /// 判据是**进程存在性**（按 pid 查 `ps`），不是错误文案 ——
+    /// 错误文案在修与不修时一模一样。
+    ///
+    /// 变异：删掉无 boundary 分支的进程组杀 ⇒ `sleep` 活下来 ⇒ 断言变红。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_bash_timeout_kills_grandchild_without_boundary() {
+        assert_grandchild_killed(make_ctx()).await;
+    }
+
+    /// D2 · 有 boundary 路径：同样按进程存在性断言 —— 两路走同一份内核，行为必须一致。
+    ///
+    /// 变异：把有 boundary 分支的进程组杀去掉 ⇒ `sleep` 活下来 ⇒ 断言变红。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_bash_timeout_kills_grandchild_with_boundary() {
+        let boundary = ys_protocol::QueueBoundarySource::new();
+        assert_grandchild_killed(ctx_with(&boundary)).await;
+    }
+
+    /// D2 断言的公共体：跑一条「后台 `sleep` + `wait`」的命令 ⇒ 断言**孙进程**消失。
+    ///
+    /// **三处等待都有明确上界**（工具调用 ≤ [`TOOL_CALL_GUARD`]、pid 文件出现 ≤ 3s、
+    /// 孙进程消失 ≤ 3s）⇒ 注入 bug 时是**快速失败**（红），不会把测试/CI 挂死。
+    ///
+    /// 孙进程的 `sleep` 秒数是 900000+ 序号量级（**正常路径下绝不会被真的等到** ——
+    /// 工具在 1s 处超时并杀掉进程组，孙进程随即消失）；这个量级只保证
+    /// 「`sleep` 命令行在本进程内唯一」，判存活时不撞上别的同名 `sleep`。
+    #[cfg(unix)]
+    async fn assert_grandchild_killed(ctx: ToolContext<'_>) {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let pid_file = dir.join("grandchild.pid");
+        let secs = unique_sleep_secs(&dir);
+        let marker = format!("sleep {secs}");
+        // 断言 panic 也不留孤儿
+        let _guard = LeftoverGuard::new(&pid_file, &marker);
+
+        let tool = BashTool::new(dir.clone());
+        let input = json!({
+            "command": grandchild_command(&pid_file, secs),
+            "timeout": 1
+        });
+
+        let result = match tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // 工具没按时返回 ⇒ 命令挂到了 `sleep` 的自然结束 ⇒ 先清残留再失败
+                kill_leftover_grandchild(&pid_file, &marker).await;
+                panic!(
+                    "工具调用未在 {TOOL_CALL_GUARD:?} 内返回 —— 工具内没有 deadline \
+                     （命令会挂到 sleep 自然结束）"
+                );
+            }
+        };
+        let err = result.expect_err("超时必须返回 Err");
+        assert!(
+            matches!(err, ToolError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+
+        let pid = read_pid(&pid_file).await;
+        let gone = wait_until_gone(pid, &marker, Duration::from_secs(3)).await;
+        // 诊断快照在清理**之前**取 —— 清掉之后就看不到残留进程了
+        let snapshot = ps_snapshot(pid);
+        if !gone {
+            kill_leftover_grandchild(&pid_file, &marker).await;
+        }
+        assert!(
+            gone,
+            "超时后孙进程仍在运行（{marker}，pid={pid}）—— 进程组没被杀；ps: {snapshot}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── 组长先退出：管道排空必须同样受生效 deadline 约束 ──────────────
+
+    /// 「组长先退出 + 孙进程持管道」的公共断言体。
+    ///
+    /// 命令形状：`sleep <secs> & echo $! > <pid_file>`（**不带 `wait`**）——
+    /// 组长 `sh` 立刻退出，孙进程独自持有 stdout 管道写端。
+    ///
+    /// 判据：① 工具在**生效 deadline** 内返回 `Timeout`；
+    /// ② **孙进程按 pid 查 `ps` 不存在**（进程组被杀）。
+    ///
+    /// 三处等待都有明确上界（工具调用 ≤ [`TOOL_CALL_GUARD`]、pid 文件出现 ≤ 3s、
+    /// 孙进程消失 ≤ 3s）⇒ 注入 bug 时是**快速失败**（红），不会把测试挂死。
+    #[cfg(unix)]
+    async fn assert_leader_exited_grandchild_killed(
+        ctx: ToolContext<'_>,
+        timeout_secs: Option<u64>,
+    ) {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let pid_file = dir.join("grandchild.pid");
+        let secs = unique_sleep_secs(&dir);
+        let marker = format!("sleep {secs}");
+        // 断言 panic 也不留孤儿
+        let _guard = LeftoverGuard::new(&pid_file, &marker);
+
+        let tool = BashTool::new(dir.clone());
+        let mut input = json!({ "command": leader_exits_first_command(&pid_file, secs) });
+        if let Some(timeout_secs) = timeout_secs {
+            input["timeout"] = json!(timeout_secs);
+        }
+
+        let started = Instant::now();
+        let result = match tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx)).await {
+            Ok(result) => result,
+            Err(_) => {
+                panic!(
+                    "工具调用未在 {TOOL_CALL_GUARD:?} 内返回 —— 管道排空未受生效 deadline 约束 \
+                     （孙进程攥着管道写端不放，工具越过自己的 deadline 一直阻塞）"
+                );
+            }
+        };
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("超时必须返回 Err");
+        assert!(
+            matches!(err, ToolError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时应按生效 deadline 收敛（~1s），实际耗时 {elapsed:?}"
+        );
+
+        let pid = read_pid(&pid_file).await;
+        let gone = wait_until_gone(pid, &marker, Duration::from_secs(3)).await;
+        // 诊断快照在清理**之前**取 —— 清掉之后就看不到残留进程了
+        let snapshot = ps_snapshot(pid);
+        assert!(
+            gone,
+            "组长先退出后孙进程仍在运行（{marker}，pid={pid}）—— 进程组没被杀；ps: {snapshot}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 边界路径 · **组长先退出**：孙进程独自持有 stdout 管道写端。
+    ///
+    /// 这条路径是**生产默认**（每回合都挂 boundary）⇒ 越过 deadline 阻塞会直接
+    /// 卡住整轮。
+    ///
+    /// 变异：删掉「管道排空也受生效 deadline 约束」那一支 ⇒ 工具挂到 `sleep` 的
+    /// 自然结束 ⇒ 墙钟守卫爆掉 ⇒ 断言变红。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_boundary_path_kills_grandchild_when_leader_exits_first() {
+        let boundary = ys_protocol::QueueBoundarySource::new();
+        assert_leader_exited_grandchild_killed(ctx_with(&boundary), Some(1)).await;
+    }
+
+    /// 无边界路径 · **组长先退出**：与有 boundary 路径同款判据。
+    ///
+    /// 变异：把无 boundary 路径的管道排空改成「组长退出即算完」⇒ 孙进程留活 ⇒ 变红。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_no_boundary_path_kills_grandchild_when_leader_exits_first() {
+        assert_leader_exited_grandchild_killed(make_ctx(), Some(1)).await;
+    }
+
+    /// 切片 0a 验收 ②：模型**不传** `timeout` + 外层预算到点 ⇒ **进程组被杀**。
+    ///
+    /// 判据是**进程存在性**（按 pid 查 `ps`），不是错误文案。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_outer_budget_kills_grandchild_without_model_timeout() {
+        let ctx = ctx_with_budget(Duration::from_secs(6));
+        assert_leader_exited_grandchild_killed(ctx, None).await;
+    }
+
+    /// 「先杀后收」的顺序判据。
+    ///
+    /// 组长一旦被收尸，它的 pid 就可能被复用 ⇒ 此时再 `kill -9 -{pid}` 可能打到
+    /// 无关的进程组（见 `proc_group::kill_group`）⇒ 超时分支必须**先杀组、再收尸**。
+    ///
+    /// 观测（工具运行期间持续轮询组长的 `ps` 状态）：
+    /// ① 组长已退出但仍是**僵尸**（状态含 `Z`）⇒ 收尸发生在杀组**之后**；
+    /// ② **孙进程还活着**时组长不得被回收 —— 组长消失即说明顺序是「先收后杀」。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_group_is_killed_before_the_leader_is_reaped() {
+        let dir = test_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let leader_file = dir.join("leader.pid");
+        let pid_file = dir.join("grandchild.pid");
+        let secs = unique_sleep_secs(&dir);
+        let marker = format!("sleep {secs}");
+        let _guard = LeftoverGuard::new(&pid_file, &marker);
+
+        // 组长写下自己的 pid 后立刻退出（**不带 `wait`**）⇒ 孙进程独自持有管道写端。
+        let command = format!(
+            "echo $$ > '{}'; sleep {secs} & echo $! > '{}'",
+            leader_file.display(),
+            pid_file.display()
+        );
+        let tool = BashTool::new(dir.clone());
+        let input = json!({ "command": command, "timeout": 1 });
+        let ctx = make_ctx();
+
+        let handle = tokio::spawn(async move { tool.call(input, ctx).await });
+
+        let mut saw_zombie = false;
+        let mut reaped_first: Option<String> = None;
+        // 观测窗口有上界 —— 工具挂住时观测循环也必须收场（不得把测试挂死）
+        let watch_until = Instant::now() + TOOL_CALL_GUARD;
+        while !handle.is_finished() && Instant::now() < watch_until {
+            if let Some(leader_pid) = read_pid_if_present(&leader_file).await {
+                match ps_stat(leader_pid) {
+                    // 组长已退出、**未收尸**（僵尸）⇒ 收尸发生在杀组之后
+                    Some(Some(stat)) if stat.contains('Z') => saw_zombie = true,
+                    // 组长查无此进程 ⇒ 已被收尸
+                    Some(None) => {
+                        if let Some(gc_pid) = read_pid_if_present(&pid_file).await {
+                            // 给 SIGKILL 的落地留一点宽限，再判孙进程是否还活着
+                            let grace = Instant::now() + Duration::from_millis(300);
+                            while grandchild_alive(gc_pid, &marker) == Some(true)
+                                && Instant::now() < grace
+                            {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            if grandchild_alive(gc_pid, &marker) == Some(true) {
+                                reaped_first = Some(format!(
+                                    "组长（pid={leader_pid}）已被收尸，而孙进程（pid={gc_pid}）仍在运行"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    // `ps` 无法判定 / 组长还在跑 ⇒ 不作结论
+                    None => {}
+                    Some(Some(_)) => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let result = tokio::time::timeout(TOOL_CALL_GUARD, handle)
+            .await
+            .expect("工具调用必须在墙钟上界内返回 —— 管道排空未受生效 deadline 约束")
+            .expect("工具调用 task 不应 panic");
+        let err = result.expect_err("超时必须返回 Err");
+        assert!(
+            matches!(err, ToolError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            reaped_first.is_none(),
+            "顺序错：{} ⇒ 是「先收后杀」（pid 复用窗口）",
+            reaped_first.unwrap_or_default()
+        );
+        assert!(
+            saw_zombie,
+            "组长退出后应处于僵尸态（Z）—— 它**尚未被收尸**；\
+             若实现先收后杀，组长会被立即回收，观察不到 Z"
+        );
+
+        let pid = read_pid(&pid_file).await;
+        let gone = wait_until_gone(pid, &marker, Duration::from_secs(3)).await;
+        let snapshot = ps_snapshot(pid);
+        assert!(
+            gone,
+            "超时后孙进程仍在运行（{marker}，pid={pid}）—— 进程组没被杀；ps: {snapshot}"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -599,7 +1241,13 @@ mod tests {
         let input = json!({ "command": "sleep 10", "timeout": 1 });
 
         let started = Instant::now();
-        let result = tool.call(input, ctx_with(&boundary)).await;
+        // 墙钟上界：命令的 `sleep 10` 远长于此 ⇒ 工具内没有 deadline 时会在这里卡住
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            tool.call(input, ctx_with(&boundary)),
+        )
+        .await
+        .expect("超时应由工具自己发现（8s 内返回）");
         let elapsed = started.elapsed();
 
         let err = result.expect_err("超时应中止");
@@ -887,5 +1535,285 @@ mod tests {
         assert!(msg.contains(&file.display().to_string()), "{msg}");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── D1：工具内始终有 deadline，且超时文案写**生效值** ──────────────
+
+    /// 挂上**外层工具预算**的上下文 —— 无 boundary。
+    fn ctx_with_budget(budget: Duration) -> ToolContext<'static> {
+        ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_tool_budget(budget)
+    }
+
+    /// 挂上**外层工具预算**且**挂 boundary** 的上下文。
+    fn ctx_with_boundary_and_budget(
+        boundary: &ys_protocol::QueueBoundarySource,
+        budget: Duration,
+    ) -> ToolContext<'_> {
+        ToolContext::new(Some(boundary), PathBuf::from("."), PathBuf::from("."))
+            .with_tool_budget(budget)
+    }
+
+    /// 模型传 `timeout: 900` + 外层 300s ⇒ 生效 deadline = **295s**（外层 − 余量），
+    /// 取「模型值」的那支被否。
+    ///
+    /// 变异：把 `min` 改成直接取模型值 ⇒ 断言变红。
+    #[test]
+    fn test_effective_deadline_takes_the_smaller_of_model_value_and_outer_minus_margin() {
+        let effective = effective_deadline(
+            Some(Duration::from_secs(900)),
+            Some(Duration::from_secs(300)),
+        );
+        assert_eq!(
+            effective,
+            Some(Duration::from_secs(295)),
+            "生效 deadline 应为外层 300s 减余量 5s"
+        );
+        assert_eq!(deadline_secs(effective.unwrap()), 295);
+    }
+
+    /// 模型**不传** `timeout` + 外层 300s ⇒ **仍有 deadline**（295s），不是「无 deadline」。
+    ///
+    /// 变异：删掉「未传值时取外层 − 余量」那一支 ⇒ 断言变红。
+    #[test]
+    fn test_effective_deadline_without_model_timeout_is_outer_minus_margin() {
+        let effective = effective_deadline(None, Some(Duration::from_secs(300)));
+        assert_eq!(
+            effective,
+            Some(Duration::from_secs(295)),
+            "模型没传 timeout 时仍须有 deadline（外层 300s 减余量 5s）"
+        );
+        assert_eq!(deadline_secs(effective.unwrap()), 295);
+    }
+
+    /// 外层预算**没有**挂载 ⇒ 只有模型值约束（沿用既有语义）；两者皆无 ⇒ 无 deadline。
+    #[test]
+    fn test_effective_deadline_without_outer_budget_follows_the_model_value_only() {
+        assert_eq!(
+            effective_deadline(Some(Duration::from_secs(900)), None),
+            Some(Duration::from_secs(900)),
+            "没有外层预算时只受模型值约束"
+        );
+        assert_eq!(
+            effective_deadline(None, None),
+            None,
+            "既无外层预算也无模型值 ⇒ 无 deadline（跑到自然结束）"
+        );
+    }
+
+    /// 外层预算 < 余量 ⇒ 钳到**最小正秒数**，不得算出 0 或负数。
+    #[test]
+    fn test_effective_deadline_clamps_to_a_positive_minimum_when_outer_is_tighter() {
+        let effective = effective_deadline(None, Some(Duration::from_secs(3)));
+        let effective = effective.expect("外层预算存在 ⇒ 必有 deadline");
+        assert_eq!(
+            effective,
+            Duration::from_secs(1),
+            "外层预算小于余量时应钳到最小正秒数"
+        );
+        assert!(effective_secs_positive(effective));
+    }
+
+    /// 生效 deadline 必须是**正**的 —— 0 或负数会让超时立即触发或永不触发。
+    fn effective_secs_positive(deadline: Duration) -> bool {
+        !deadline.is_zero() && deadline_secs(deadline) >= 1
+    }
+
+    /// 生效 deadline 必须**严格早于**外层预算 —— 等于或大于外层，外层就会先赢
+    /// （drop 工具 future ⇒ 只剩 `kill_on_drop`，孙进程成孤儿）。
+    ///
+    /// 外层预算小到减不出内层（不足 2ns）⇒ **无预算可用** ⇒ 不算 deadline。
+    #[test]
+    fn test_effective_deadline_is_strictly_earlier_than_the_outer_budget() {
+        for outer_ms in [1u64, 3, 10, 100, 999, 1000, 5000, 6000, 60_000, 300_000] {
+            let outer = Duration::from_millis(outer_ms);
+            let effective = effective_deadline(None, Some(outer));
+            let Some(effective) = effective else {
+                panic!("外层预算 {outer_ms}ms ⇒ 须有生效 deadline");
+            };
+            assert!(
+                effective > Duration::ZERO && effective < outer,
+                "生效 deadline {effective:?} 必须是正的且严格早于外层预算 {outer:?}"
+            );
+        }
+        // 外层不足 2ns ⇒ 取半后为 0 ⇒ 无预算可用（不得算出大于外层的值）
+        let outer = Duration::from_nanos(1);
+        assert_eq!(
+            effective_deadline(None, Some(outer)),
+            None,
+            "外层预算不足 2ns ⇒ 减不出「正的且严格早于外层」的值 ⇒ 无预算可用"
+        );
+        // 有模型值时：外层视作「没有外层预算」⇒ 只受模型值约束
+        assert_eq!(
+            effective_deadline(Some(Duration::from_secs(5)), Some(outer)),
+            Some(Duration::from_secs(5)),
+            "外层预算不足 2ns ⇒ 视作没有外层预算"
+        );
+    }
+
+    /// 模型传 `timeout: 900`、外层预算 6s ⇒ 生效 1s ⇒ **文案写 1**（不是 900）。
+    ///
+    /// 挂钟约 1s（不真等 295s）—— 断言落在「文案里的秒数」上。
+    ///
+    /// 变异：把文案改回写模型值 ⇒ 断言变红。
+    #[tokio::test]
+    async fn test_timeout_message_writes_the_effective_seconds_not_the_model_value() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = ctx_with_budget(Duration::from_secs(6));
+        let input = json!({ "command": "sleep 30", "timeout": 900 });
+
+        let started = Instant::now();
+        // 墙钟上界：工具内没有 deadline 时会挂到 `sleep 30` 自然结束 ⇒ 必须快速失败
+        let err = tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx))
+            .await
+            .expect("1s 后必须超时返回 Err")
+            .expect_err("1s 后必须超时返回 Err");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, ToolError::Timeout(_)), "got {err:?}");
+        let msg = match &err {
+            ToolError::Timeout(m) => m.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            msg.contains("Command timed out after 1 seconds"),
+            "文案须写生效值（1s），实际：{msg}"
+        );
+        assert!(!msg.contains("900"), "文案不得写模型传的值（900）：{msg}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时应按生效 deadline 收敛（~1s），实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 模型**不传** `timeout` + 外层预算 6s ⇒ **无 boundary 路径**同样有 deadline。
+    ///
+    /// 完成条件是「**工具自己**发现 deadline 到点」⇒ 命令由工具终止
+    /// （先杀进程组、再收尸），而不是等外层 drop 工具 future
+    /// （那条路径只剩 `kill_on_drop`，孙进程会成孤儿）。
+    ///
+    /// 变异：删掉「未传值时取外层 − 余量」那一支 ⇒ 挂住（10s 兜底超时）⇒ 断言变红。
+    #[tokio::test]
+    async fn test_no_boundary_path_still_times_out_on_the_outer_budget_without_model_timeout() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = ctx_with_budget(Duration::from_secs(6));
+        let input = json!({ "command": "sleep 30" });
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.call(input, ctx))
+            .await
+            .expect("无 boundary 路径也必须有 deadline（10s 内必须返回）");
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("超时必须返回 Err");
+        assert!(matches!(err, ToolError::Timeout(_)), "got {err:?}");
+        let msg = match &err {
+            ToolError::Timeout(m) => m.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            msg.contains("Command timed out after 1 seconds"),
+            "文案须写生效值（外层 6s 减余量 5s = 1s），实际：{msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时应按生效 deadline 收敛（~1s），实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 有 boundary 路径用**同一份生效值** ⇒ 文案与无 boundary 路径逐字相同。
+    #[tokio::test]
+    async fn test_boundary_path_uses_the_same_effective_value() {
+        let boundary = ys_protocol::QueueBoundarySource::new();
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = ctx_with_boundary_and_budget(&boundary, Duration::from_secs(6));
+        let input = json!({ "command": "sleep 30", "timeout": 900 });
+
+        let started = Instant::now();
+        // 墙钟上界：工具内没有 deadline 时会挂到 `sleep 30` 自然结束 ⇒ 必须快速失败
+        let err = tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx))
+            .await
+            .expect("1s 后必须超时返回 Err")
+            .expect_err("1s 后必须超时返回 Err");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, ToolError::Timeout(_)), "got {err:?}");
+        let msg = match &err {
+            ToolError::Timeout(m) => m.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            msg.contains("Command timed out after 1 seconds"),
+            "两条路径须用同一份生效值，实际：{msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "超时应按生效 deadline 收敛（~1s），实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 模型传 `timeout: 0` ⇒ 生效 deadline 为 **0** ⇒ 文案逐字写 **0**。
+    ///
+    /// 合同是「文案写**生效值**」⇒ 生效值是 0 就写 0，不得抬到 1。
+    ///
+    /// 变异：把 `deadline_secs` 的取值改回「至少 1 秒」⇒ 文案变 "1 seconds" ⇒ 变红。
+    #[tokio::test]
+    async fn test_timeout_message_writes_zero_when_the_effective_deadline_is_zero() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = make_ctx();
+        let input = json!({ "command": "sleep 30", "timeout": 0 });
+
+        let started = Instant::now();
+        let err = tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx))
+            .await
+            .expect("生效 deadline 为 0 ⇒ 必须立刻返回 Err（10s 内返回）")
+            .expect_err("生效 deadline 为 0 ⇒ 必须返回 Err");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, ToolError::Timeout(_)), "got {err:?}");
+        let msg = match &err {
+            ToolError::Timeout(m) => m.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            msg.contains("Command timed out after 0 seconds"),
+            "文案须逐字写生效值（0s），实际：{msg}"
+        );
+        assert!(!msg.contains("after 1 seconds"), "文案不得把 0 抬到 1：{msg}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "生效 deadline 为 0 ⇒ 必须立刻返回，实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 「无 deadline」档位（挂 boundary、不挂 `tool_budget`、模型不传 `timeout`）
+    /// ⇒ 正常命令必须**正常返回**：不误超时、输出完整、不挂死。
+    ///
+    /// 该档位的完成条件是「管道读到 EOF」⇒ 孙进程持着写端时会一直阻塞
+    /// （见 `effective_deadline` 的文档）；本用例只钉「正常命令能返回」这一条。
+    ///
+    /// 变异：把阶段 A 的完成条件改成「不等 EOF」⇒ 输出被截断 ⇒ 断言变红；
+    /// 或让该档位永不完成 ⇒ 10s 兜底超时 ⇒ 断言变红。
+    #[tokio::test]
+    async fn test_no_deadline_tier_returns_a_normal_command() {
+        let boundary = ys_protocol::QueueBoundarySource::new();
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = ctx_with(&boundary);
+        assert!(
+            ctx.tool_budget.is_none(),
+            "本用例的前提是不挂 tool_budget（否则不是「无 deadline」档位）"
+        );
+        let input = json!({ "command": "echo no-deadline-tier" });
+
+        let result = tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx))
+            .await
+            .expect("无 deadline 档位的正常命令必须在 10s 内返回")
+            .expect("无 deadline 档位的正常命令必须成功返回");
+
+        assert!(!result.is_error, "正常命令不该报错：{}", result.content);
+        assert!(
+            result.content.contains("no-deadline-tier"),
+            "正常命令的输出必须完整返回：{}",
+            result.content
+        );
     }
 }

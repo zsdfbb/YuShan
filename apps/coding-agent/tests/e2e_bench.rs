@@ -42,11 +42,41 @@
 //! | `YUSHAN_BENCH_TIMEOUT_SECS` | `900` | 单次运行的墙钟上限，超时杀掉 |
 //! | `YUSHAN_BENCH_HEAVY` | 空 | 连**长跑项**一起跑（默认跳过，见 `PROMPTS`） |
 //! | `YUSHAN_BENCH_CLEAN` | 空 | 设了才删临时目录（**默认保留**，见下） |
+//! | `YUSHAN_BENCH_PROTOCOL` | `chat` | 协议面档位：`chat` / `responses`（非法值回退 `chat`） |
+//! | `YUSHAN_BENCH_BASE` | 空 | 覆盖子进程的 `YUSHAN_API_BASE`（协议面 A/B 用） |
 //!
 //! ⚠️ **默认保留证据**：临时目录里有每次运行的**逐轮日志**（`logs/yushan.log`）、
 //! 会话转录与 stdout/stderr。跑一次基准要真金白银，删掉就没法回溯「那些轮是怎么长出来的」——
 //! 本文件早期版本默认删除，结果一次 246 轮的运行只剩一个中位数。要清理就显式设
 //! `YUSHAN_BENCH_CLEAN=1`。
+//!
+//! # 协议面（`YUSHAN_BENCH_PROTOCOL`）
+//!
+//! 档位只有两个：`chat`（OpenAI 兼容的 `/chat/completions`）与 `responses`
+//! （Responses API）。**应用侧只实现了 `chat`** —— `responses` 档由**外部端点 / shim**
+//! 提供：shim 接受 `POST <base>/chat/completions`，把请求转发到 Responses API。
+//! 本仓库不给 `ys-model` 加 Responses 后端（那要动 `Model` trait 与流式事件形态）。
+//!
+//! 档位与 base **各管一件事**：档位说「对面讲的是哪种协议」（记录表里的「协议」列），
+//! base 说「跟谁说话」（`YUSHAN_BENCH_BASE` 覆盖子进程的 `YUSHAN_API_BASE`；未设置
+//! 则沿用继承的 `YUSHAN_API_BASE`）。一次 A/B = 两次基准运行，两次之间只换这两个变量。
+//!
+//! ⚠️ **base 覆盖要配合 env 凭证**：应用侧的模型解析是「env 完整凭证优先」
+//! （`apps/coding-agent/src/main.rs:1441` 档 1）—— `YUSHAN_API_BASE` 与
+//! `YUSHAN_API_KEY` **都在**才用 env 的 base；只有 base 没有 key 时，会退回
+//! `/login` 存下的 provider base ⇒ 两次 A/B 打在同一个端点上。基准会在这种情况下
+//! 打一行提示。
+//!
+//! # 质量位
+//!
+//! **不可只看墙钟** —— 质量必须同时记录。本文件只做**机械**核对（模型输出非确定，
+//! 语义判定不可复现，断言它只会换来 flaky）：
+//!
+//! - 答案非空；
+//! - 证据引用（`文件:行号`）够不够（逐提示的判据见 `QUALITY_SPECS`）；
+//! - 引用是否指向仓库里**真实存在**的文件与行 —— 这是「结论是否与证据一致」的机械代理。
+//!
+//! 取值：`Q+` 全过 / `Q~` 部分过 / `Q-` 不过 / `Q?` 该提示未设机械判据。
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -137,6 +167,8 @@ struct Reading {
     retry_wait_ms: u128,
     cache_hit: u128,
     cache_miss: u128,
+    /// 质量位（机械核对的结果；跑完拿到答案后才回填，见 `quality_of`）。
+    quality: Quality,
 }
 
 impl Reading {
@@ -320,6 +352,8 @@ fn run_once(
         // 故不改 HOME —— 这正是 `YUSHAN_LOG_DIR` 存在的理由。
         .env("YUSHAN_LOG_DIR", &log_dir)
         .env("YUSHAN_SESSIONS_DIR", &sessions)
+        // base 覆盖（协议面 A/B）：`YUSHAN_BENCH_BASE` 未设置 ⇒ 不动继承的 base。
+        .envs(base_override())
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::fs::File::create(run_dir.join("stdout.txt")).ok()?))
         .stderr(Stdio::from(std::fs::File::create(run_dir.join("stderr.txt")).ok()?))
@@ -408,12 +442,325 @@ fn cache_pct(hit: u128, miss: u128) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+// ─────────────────────────────── 协议面 ───────────────────────────────
+
+/// 协议面档位。
+///
+/// `Chat` = OpenAI 兼容的 `/chat/completions`（应用唯一实现的协议面）；
+/// `Responses` = Responses API —— **应用侧不实现**该后端，由外部端点 / shim 提供
+/// （见模块头「协议面」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Chat,
+    Responses,
+}
+
+impl Protocol {
+    /// 表格与日志里的标签。
+    fn label(self) -> &'static str {
+        match self {
+            Protocol::Chat => "chat",
+            Protocol::Responses => "responses",
+        }
+    }
+}
+
+/// 协议面开关的环境变量名。
+const PROTOCOL_ENV: &str = "YUSHAN_BENCH_PROTOCOL";
+
+/// base 覆盖的环境变量名（覆盖子进程的 `YUSHAN_API_BASE`）。
+const BASE_ENV: &str = "YUSHAN_BENCH_BASE";
+
+/// 解析协议面取值：**未设置或非法值 ⇒ `chat`**（不 panic）。
+///
+/// 基准不该因一个拼错的开关整个挂掉：拼错时回退默认档，实际档位照实记进记录表。
+fn parse_protocol(raw: Option<&str>) -> Protocol {
+    let normalized = raw.map(str::trim).map(str::to_ascii_lowercase);
+    match normalized.as_deref() {
+        Some("responses") => Protocol::Responses,
+        _ => Protocol::Chat,
+    }
+}
+
+/// 读环境里的协议面档位。
+fn protocol_from_env() -> Protocol {
+    parse_protocol(std::env::var(PROTOCOL_ENV).ok().as_deref())
+}
+
+/// 协议面 A/B 用的 base 覆盖；未设置 ⇒ 子进程沿用继承的 `YUSHAN_API_BASE`。
+fn base_override() -> Option<(&'static str, String)> {
+    let base = std::env::var(BASE_ENV).ok()?;
+    let base = base.trim().to_string();
+    (!base.is_empty()).then_some(("YUSHAN_API_BASE", base))
+}
+
+/// base 覆盖是否**会真的生效**。
+///
+/// 应用侧的模型解析是「env 完整凭证优先」（`apps/coding-agent/src/main.rs:1441` 档 1）：
+/// base 与 key 都在才用 env 的 base；只有 base 没有 key 时会退回 `/login` 存下的
+/// provider base —— 那就不是在测指定的端点。
+fn base_override_effective() -> bool {
+    base_override().is_some()
+        && (std::env::var("YUSHAN_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok())
+}
+
+// ─────────────────────────────── 质量位 ───────────────────────────────
+
+/// 质量判据：只做**机械**核对，不对结论做语义判定。
+struct QualitySpec {
+    /// 期望的最少证据引用数（去重后的、指向仓库真实位置的引用）。
+    min_citations: usize,
+}
+
+/// 有机械判据的提示；其余提示的质量位记「未设判据」。
+const QUALITY_SPECS: &[(&str, QualitySpec)] = &[
+    // 3 处不一致 × (文档 + 代码) 各一条证据。
+    ("fact/1", QualitySpec { min_citations: 6 }),
+    // 至少一处实现 + 一处调用点。
+    ("daily/2", QualitySpec { min_citations: 2 }),
+];
+
+/// 质量位。
+///
+/// 派生顺序即**严重度**（`Fail` 最大）—— 汇总时取各次运行里的最差值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Quality {
+    /// 该提示没有可机械核对的判据。
+    #[default]
+    Unjudged,
+    /// 判据全过。
+    Pass,
+    /// 部分过（有引用指向不存在的位置）。
+    Partial,
+    /// 不过（无输出 / 证据不足）。
+    Fail,
+}
+
+impl Quality {
+    /// 表格里的短标签。
+    fn label(self) -> &'static str {
+        match self {
+            Quality::Unjudged => "Q?",
+            Quality::Pass => "Q+",
+            Quality::Partial => "Q~",
+            Quality::Fail => "Q-",
+        }
+    }
+}
+
+/// 取提示的质量判据；没有则 `None`（质量位记「未设判据」）。
+fn quality_spec(name: &str) -> Option<&'static QualitySpec> {
+    QUALITY_SPECS
+        .iter()
+        .find(|(prompt, _)| *prompt == name)
+        .map(|(_, spec)| spec)
+}
+
+/// 一条证据引用（`文件:行号`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Citation {
+    path: String,
+    line: u64,
+}
+
+/// 只有以这些顶层目录开头的引用才**可核对** —— 只有它们知道相对仓库根的位置。
+///
+/// 其余写法（如 `src/lib.rs`）无从判断基准目录，只计数、不判真假。
+const ROOTED_DIRS: &[&str] = &["crates", "adapters", "apps", "docs", "scripts", "examples"];
+
+/// 路径字符：ASCII 字母数字与 `_` `-` `.` `/`。
+///
+/// 刻意**不含**非 ASCII —— 中文正文里紧贴路径（"见crates/x.rs:12"）时，
+/// 路径段才能从真正的路径起点开始。
+fn is_path_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/')
+}
+
+/// 末段是否带扩展名（`.` 后面还有字符）。
+fn has_extension(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    match last.rfind('.') {
+        Some(dot) => dot + 1 < last.len(),
+        None => false,
+    }
+}
+
+/// `:`（或全角 `：`）后紧跟的数字段 ⇒ 行号；返回 (行号, 消耗的字符数)。
+fn leading_line(text: &str) -> Option<(u64, usize)> {
+    let colon = text.chars().next()?;
+    if colon != ':' && colon != '：' {
+        return None;
+    }
+    let tail = &text[colon.len_utf8()..];
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let consumed = colon.len_utf8() + digits.len();
+    digits.parse().ok().map(|line| (line, consumed))
+}
+
+/// 从答案文本里抽出 `文件:行号` 形式的证据引用。
+///
+/// 路径取「路径字符」的极大连续段，其后紧跟 `:`（或全角 `：`）加数字即成一条引用。
+/// 末段必须带扩展名 —— 这样 `localhost:8080` 这类不会混进来。
+fn citations(text: &str) -> Vec<Citation> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let Some(ch) = text[offset..].chars().next() else {
+            break;
+        };
+        if !is_path_char(ch) {
+            offset += ch.len_utf8();
+            continue;
+        }
+        let start = offset;
+        while offset < text.len() {
+            let Some(ch) = text[offset..].chars().next() else {
+                break;
+            };
+            if !is_path_char(ch) {
+                break;
+            }
+            offset += ch.len_utf8();
+        }
+        let path = text[start..offset].trim_end_matches('.');
+        let Some((line, consumed)) = leading_line(&text[offset..]) else {
+            continue;
+        };
+        offset += consumed;
+        if path.is_empty() || !has_extension(path) {
+            continue;
+        }
+        out.push(Citation {
+            path: path.to_string(),
+            line,
+        });
+    }
+    out
+}
+
+/// 引用是否**可核对**：路径首段是仓库的顶层目录。
+fn is_judgeable(citation: &Citation) -> bool {
+    let first = citation.path.split('/').next().unwrap_or("");
+    ROOTED_DIRS.contains(&first)
+}
+
+/// 引用是否指向仓库里**真实存在**的位置。
+///
+/// 「存在」= 文件在仓库里找得到，且行数不少于引用行号。
+fn citation_exists(root: &Path, citation: &Citation) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join(&citation.path)) else {
+        return false;
+    };
+    text.lines().count() as u64 >= citation.line
+}
+
+/// 按判据核对一次运行的答案 ⇒ 质量位。
+///
+/// 规则：
+/// - 答案为空 ⇒ 不过；
+/// - 有判据：可核对的引用不足 ⇒ 不过；有引用指向不存在的位置 ⇒ 部分过；
+/// - 无判据：没有可核对的引用 ⇒ 未设判据；否则按引用是否指向真实位置记通过 / 部分过。
+fn quality_of(answer: &str, root: &Path, spec: Option<&QualitySpec>) -> Quality {
+    if answer.trim().is_empty() {
+        return Quality::Fail;
+    }
+    let mut judged: Vec<&Citation> = Vec::new();
+    let found = citations(answer);
+    for citation in &found {
+        if is_judgeable(citation) && !judged.contains(&citation) {
+            judged.push(citation);
+        }
+    }
+    let invalid = judged
+        .iter()
+        .filter(|citation| !citation_exists(root, citation))
+        .count();
+    match spec {
+        Some(spec) => {
+            if judged.len() < spec.min_citations {
+                return Quality::Fail;
+            }
+            if invalid > 0 {
+                Quality::Partial
+            } else {
+                Quality::Pass
+            }
+        }
+        None => {
+            if judged.is_empty() {
+                Quality::Unjudged
+            } else if invalid > 0 {
+                Quality::Partial
+            } else {
+                Quality::Pass
+            }
+        }
+    }
+}
+
+/// 读一次运行的答案文本（`-p` 模式的 stdout —— 只有模型的文本增量）。
+fn answer_text(run_dir: &Path) -> String {
+    std::fs::read_to_string(run_dir.join("stdout.txt")).unwrap_or_default()
+}
+
+/// 汇总表的一行：`(名字, 墙钟, 轮, ttft, gen, tools, attempts, retries, retry_wait, cache_hit, cache_miss, 质量)`。
+type Summary = (
+    String,
+    u128,
+    u128,
+    u128,
+    u128,
+    u128,
+    u128,
+    u128,
+    u128,
+    u128,
+    u128,
+    Quality,
+);
+
+/// 汇总表的表头（列名）。
+fn summary_header() -> String {
+    format!(
+        "{:<10} {:<9} {:>8} {:>5} {:>10} {:>10} {:>10} {:>4} {:>9} {:>8} {:>12} {:>7}",
+        "提示",
+        "协议",
+        "墙钟s",
+        "轮",
+        "ttft_ms",
+        "gen_ms",
+        "tools_ms",
+        "质量",
+        "attempts",
+        "retries",
+        "retry_wait",
+        "cache"
+    )
+}
+
+/// 汇总表的一行。
+fn summary_row(row: &Summary, protocol: Protocol) -> String {
+    let (name, wall, rounds, ttft, gen_ms, tools, attempts, retries, retry_wait, hit, miss, quality) = row;
+    format!(
+        "{name:<10} {proto_label:<9} {:>8} {rounds:>5} {ttft:>10} {gen_ms:>10} {tools:>10} {qual_label:>4} {attempts:>9} {retries:>8} {retry_wait:>12} {:>7}",
+        secs(*wall),
+        cache_pct(*hit, *miss),
+        proto_label = protocol.label(),
+        qual_label = quality.label(),
+    )
+}
+
 /// 只有一条 `#[test]`：跑完整组提示，逐条打印，最后打印中位数汇总。
 ///
 /// **不断言任何东西** —— 见模块头。它失败的唯一方式是环境缺凭证 / 子进程起不来。
 #[test]
 #[ignore = "基准：需真实凭证 + 真金白银，手动跑（见模块头）"]
 fn bench_report() {
+    // 与改写进程级 env 的用例串行：否则子进程可能读到被临时清掉的 key。
+    let _env_guard = env_lock();
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_ys-coding-agent"));
     // 工作区固定为仓库根：跨运行可比的前提是「同一个工作区、只读任务」。
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -428,6 +775,8 @@ fn bench_report() {
     // 长跑项默认不跑（见 `PROMPTS` 的说明）；点名或显式开关才跑。
     let heavy_enabled = std::env::var("YUSHAN_BENCH_HEAVY").is_ok();
     let root = temp_dir("bench");
+    // 协议面档位：决定记录表里的「协议」列（base 由 `YUSHAN_BENCH_BASE` 覆盖）。
+    let protocol = protocol_from_env();
 
     println!(
         "\n基准：{} 条提示 × {repeats} 次   工作区 {}\n临时目录 {}\n",
@@ -435,21 +784,20 @@ fn bench_report() {
         workspace.display(),
         root.display()
     );
-
-    // (名字, 墙钟, 轮, ttft, gen, tools, attempts, retries, retry_wait, cache_hit, cache_miss)
-    type Summary = (
-        String,
-        u128,
-        u128,
-        u128,
-        u128,
-        u128,
-        u128,
-        u128,
-        u128,
-        u128,
-        u128,
+    println!(
+        "协议面：{}   base：{}",
+        protocol.label(),
+        base_override()
+            .map(|(_, base)| base)
+            .unwrap_or_else(|| "（沿用 YUSHAN_API_BASE）".to_string())
     );
+    if base_override().is_some() && !base_override_effective() {
+        println!(
+            "⚠ 设了 {}，但 env 里没有 API key —— 应用会用 /login 存下的 provider base，本次不是协议面对照。",
+            BASE_ENV
+        );
+    }
+
     let mut summary: Vec<Summary> = Vec::new();
     let mut skipped_heavy: Vec<&str> = Vec::new();
     for (name, task, heavy) in PROMPTS {
@@ -463,17 +811,23 @@ fn bench_report() {
             continue;
         }
         println!("=== {name} ===");
+        // 质量判据：没有则该提示的质量位记「未设判据」。
+        let spec = quality_spec(name);
         let mut readings = Vec::new();
         for i in 0..repeats {
             let run_dir = root.join(format!("{}-{}", sanitize(name), i));
             std::fs::create_dir_all(&run_dir).expect("建运行目录");
             match run_once(&bin, &workspace, &run_dir, task, timeout) {
-                Some(r) => {
+                Some(mut r) => {
+                    // 质量位：机械核对（证据齐不齐、引用指不指得到真位置）。
+                    r.quality = quality_of(&answer_text(&run_dir), &workspace, spec);
                     let (t, g, s) = r.split();
                     println!(
-                        "  run {}  墙钟 {}s  轮 {:<3} ttft {}%  gen {}%  tools {}%   \
+                        "  run {}  协议 {}  质量 {}  墙钟 {}s  轮 {:<3} ttft {}%  gen {}%  tools {}%   \
                          ({}/{}/{} ms)  attempts {}  retries {}  retry_wait {}ms  cache {}",
                         i + 1,
+                        protocol.label(),
+                        r.quality.label(),
                         secs(r.wall_ms),
                         r.rounds,
                         t,
@@ -516,6 +870,12 @@ fn bench_report() {
             median(&retries),
             median(&retry_waits),
         );
+        // 质量位取各次运行里的**最差**值（`Fail` 最重）。
+        let quality = readings
+            .iter()
+            .map(|r| r.quality)
+            .max()
+            .unwrap_or(Quality::Unjudged);
         summary.push((
             (*name).to_string(),
             median(&walls),
@@ -528,24 +888,14 @@ fn bench_report() {
             median(&retry_waits),
             readings.iter().map(|r| r.cache_hit).sum(),
             readings.iter().map(|r| r.cache_miss).sum(),
+            quality,
         ));
     }
 
     println!("=== 汇总（中位）===");
-    println!(
-        "{:<10} {:>8} {:>5} {:>10} {:>10} {:>10} {:>9} {:>8} {:>12} {:>7}",
-        "提示", "墙钟s", "轮", "ttft_ms", "gen_ms", "tools_ms", "attempts", "retries",
-        "retry_wait", "cache"
-    );
-    for (name, wall, rounds, ttft, gen_ms, tools, attempts, retries, retry_wait, hit, miss) in
-        &summary
-    {
-        println!(
-            "{name:<10} {:>8} {rounds:>5} {ttft:>10} {gen_ms:>10} {tools:>10} \
-             {attempts:>9} {retries:>8} {retry_wait:>12} {:>7}",
-            secs(*wall),
-            cache_pct(*hit, *miss),
-        );
+    println!("{}", summary_header());
+    for row in &summary {
+        println!("{}", summary_row(row, protocol));
     }
     println!();
     if !skipped_heavy.is_empty() {
@@ -645,4 +995,223 @@ fn debug_file_for_pid_uses_run_start_owner() {
         Some("debug-parent.jsonl")
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────────────── 离线单测辅助 ───────────────────────────────
+
+/// 进程级 env 改写的互斥锁。
+///
+/// 集成测试拿不到 app 的 `test_env` 模块，这里按同一约定自备一份：
+/// 改写进程级 env 的用例必须先拿这把锁，彼此串行。
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 进程级 env 的原值记录，`Drop` 时恢复。
+///
+/// 用 `Drop` 而非测试末尾手动恢复：断言 panic 时也能还原，不污染同 binary 内的其他用例。
+struct EnvRestore {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvRestore {
+    /// 记录 `keys` 在当前进程中的原值。
+    fn capture(keys: &[&'static str]) -> Self {
+        EnvRestore {
+            saved: keys.iter().map(|k| (*k, std::env::var_os(k))).collect(),
+        }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        // SAFETY: 调用方持有 env_lock，独占进程环境变量的修改与恢复。
+        unsafe {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+/// 协议面开关的解析：未设置 ⇒ `chat`；`responses` ⇒ 生效；非法值 ⇒ 回退 `chat`。
+#[test]
+fn protocol_parse_falls_back_to_chat() {
+    assert_eq!(parse_protocol(None), Protocol::Chat, "未设置 ⇒ chat");
+    assert_eq!(parse_protocol(Some("chat")), Protocol::Chat);
+    assert_eq!(
+        parse_protocol(Some("responses")),
+        Protocol::Responses,
+        "responses 档必须生效"
+    );
+    assert_eq!(parse_protocol(Some(" Responses ")), Protocol::Responses);
+    // 非法值 ⇒ 回退默认档，不 panic。
+    assert_eq!(parse_protocol(Some("grpc")), Protocol::Chat);
+    assert_eq!(parse_protocol(Some("response")), Protocol::Chat);
+    assert_eq!(parse_protocol(Some("")), Protocol::Chat);
+}
+
+/// 开关确实从 `YUSHAN_BENCH_PROTOCOL` 读（不只是纯函数自洽）。
+#[test]
+fn protocol_env_switch_takes_effect() {
+    let _guard = env_lock();
+    let _restore = EnvRestore::capture(&[PROTOCOL_ENV]);
+    // SAFETY: 持有 env_lock，独占进程环境变量的修改。
+    unsafe { std::env::remove_var(PROTOCOL_ENV) };
+    assert_eq!(protocol_from_env(), Protocol::Chat, "未设置 ⇒ chat");
+    // SAFETY: 同上。
+    unsafe { std::env::set_var(PROTOCOL_ENV, "responses") };
+    assert_eq!(
+        protocol_from_env(),
+        Protocol::Responses,
+        "设为 responses ⇒ 生效"
+    );
+    // SAFETY: 同上。
+    unsafe { std::env::set_var(PROTOCOL_ENV, "not-a-protocol") };
+    assert_eq!(protocol_from_env(), Protocol::Chat, "非法值 ⇒ 回退 chat");
+}
+
+/// 记录表：列名与渲染必须齐（墙钟 / 轮数 / ttft / gen / tools / 质量位）。
+#[test]
+fn summary_table_header_and_row_line_up() {
+    let header = summary_header();
+    for column in [
+        "提示",
+        "协议",
+        "墙钟s",
+        "轮",
+        "ttft_ms",
+        "gen_ms",
+        "tools_ms",
+        "质量",
+        "attempts",
+        "retries",
+        "retry_wait",
+        "cache",
+    ] {
+        assert!(header.contains(column), "表头缺列：{column}");
+    }
+    let row = (
+        "fact/1".to_string(),
+        12_300,
+        3,
+        1_200,
+        3_400,
+        800,
+        3,
+        1,
+        500,
+        90,
+        10,
+        Quality::Pass,
+    );
+    let rendered = summary_row(&row, Protocol::Responses);
+    assert_eq!(
+        rendered.split_whitespace().count(),
+        header.split_whitespace().count(),
+        "表头与数据行的列数必须一致：\n{header}\n{rendered}"
+    );
+    assert!(rendered.contains("fact/1"), "行里要有提示名");
+    assert!(rendered.contains("responses"), "行里要有协议面");
+    assert!(rendered.contains("Q+"), "行里要有质量位");
+    assert!(rendered.contains("12.3"), "行里要有墙钟秒数");
+    assert!(rendered.contains("1200"), "行里要有 ttft 毫秒");
+    assert!(rendered.contains("3400"), "行里要有 gen 毫秒");
+    assert!(rendered.contains("800"), "行里要有 tools 毫秒");
+}
+
+/// 证据引用的抽取：只认「像仓库路径」的 `文件:行号`。
+#[test]
+fn citations_only_take_file_line_references() {
+    let found = citations("见 docs/a.md:2 与 crates/x/src/lib.rs:10-12，还有 http://h:8080/p");
+    assert_eq!(found.len(), 2, "端口号不是文件行号：{found:?}");
+    assert_eq!(
+        found[0],
+        Citation {
+            path: "docs/a.md".to_string(),
+            line: 2
+        }
+    );
+    assert_eq!(
+        found[1],
+        Citation {
+            path: "crates/x/src/lib.rs".to_string(),
+            line: 10
+        }
+    );
+    // 全角冒号也认。
+    let full = citations("docs/a.md：7");
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0].line, 7);
+}
+
+/// 质量位：机械核对 —— 证据齐不齐、引用指不指得到真位置。
+#[test]
+fn quality_bit_checks_evidence_against_the_workspace() {
+    let root = temp_dir("quality");
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(root.join("crates/demo/src")).unwrap();
+    std::fs::write(root.join("docs/a.md"), "1\n2\n3\n").unwrap();
+    std::fs::write(root.join("crates/demo/src/lib.rs"), "1\n2\n3\n").unwrap();
+
+    let spec = QualitySpec { min_citations: 2 };
+
+    // 证据齐、引用都指得到 ⇒ 通过
+    let good = "见 docs/a.md:2 与 crates/demo/src/lib.rs:3";
+    assert_eq!(quality_of(good, &root, Some(&spec)), Quality::Pass);
+    // 引用数不足 ⇒ 不过
+    assert_eq!(quality_of("见 docs/a.md:2", &root, Some(&spec)), Quality::Fail);
+    // 引用指向不存在的行 ⇒ 部分过
+    assert_eq!(
+        quality_of(
+            "见 docs/a.md:99 与 crates/demo/src/lib.rs:3",
+            &root,
+            Some(&spec)
+        ),
+        Quality::Partial
+    );
+    // 空答案 ⇒ 不过
+    assert_eq!(quality_of("   \n", &root, Some(&spec)), Quality::Fail);
+    // 无判据又没有可核对的引用 ⇒ 未设判据
+    assert_eq!(quality_of("结论如下", &root, None), Quality::Unjudged);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 质量判据挂在正确的提示上。
+#[test]
+fn quality_specs_cover_the_judgeable_prompts() {
+    let fact = quality_spec("fact/1").expect("fact/1 是可判定任务");
+    assert_eq!(fact.min_citations, 6, "3 处 × (文档 + 代码) 各一条");
+    assert!(quality_spec("daily/2").is_some(), "daily/2 要文件与行号");
+    assert!(quality_spec("daily/1").is_none(), "没有机械判据 ⇒ 不挂");
+}
+
+/// base 覆盖的生效条件：env 里要有**完整**凭证（base + key）。
+#[test]
+fn base_override_needs_complete_env_credentials() {
+    let _guard = env_lock();
+    let _restore = EnvRestore::capture(&[BASE_ENV, "YUSHAN_API_KEY", "OPENAI_API_KEY"]);
+    // SAFETY: 持有 env_lock，独占进程环境变量的修改。
+    unsafe {
+        std::env::remove_var(BASE_ENV);
+        std::env::remove_var("YUSHAN_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    assert!(base_override().is_none(), "没设 base ⇒ 无覆盖");
+    assert!(!base_override_effective(), "没设 base ⇒ 不生效");
+    // SAFETY: 同上。
+    unsafe { std::env::set_var(BASE_ENV, "http://127.0.0.1:9/v1") };
+    assert!(base_override().is_some(), "设了 base ⇒ 有覆盖");
+    assert!(
+        !base_override_effective(),
+        "只有 base 没有 key ⇒ 不生效（应用会用 /login 的 provider base）"
+    );
+    // SAFETY: 同上。
+    unsafe { std::env::set_var("YUSHAN_API_KEY", "sk-test") };
+    assert!(base_override_effective(), "base + key ⇒ 生效");
 }

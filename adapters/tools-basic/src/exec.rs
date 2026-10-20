@@ -24,7 +24,7 @@ use ys_protocol::BoundarySource;
 use ys_tool::ToolError;
 
 #[cfg(unix)]
-use crate::bash::kill_process_group;
+use crate::proc_group::kill_group_async;
 
 /// 中止 / 上限轮询间隔 —— 与 `bash.rs::ABORT_POLL_INTERVAL` 一致：中止的感知延迟上界。
 const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -214,7 +214,7 @@ pub async fn run_bounded(
         // 外层超时 drop future 时连带杀子进程（与 `bash.rs` 同款，防泄漏）。
         .kill_on_drop(true);
 
-    // 独立进程组（pgid == 子进程 pid），与 [`kill_process_group`] 配对：**只有进了自己的组，
+    // 独立进程组（pgid == 子进程 pid），与 [`kill_group_async`] 配对：**只有进了自己的组，
     // `kill -9 -<pid>` 才覆盖得到孙进程**。否则「被杀」只及直接子进程 —— `sh -c '... &'`
     // 这类后端的孙进程会漏网成 `ppid=1` 的孤儿，并继续攥着管道写端。
     #[cfg(unix)]
@@ -320,7 +320,7 @@ pub async fn run_bounded(
         // 攥着写端让下面两个排空任务永远等不到 EOF。**必须赶在 `wait()` 之前**（见该函数文档）。
         #[cfg(unix)]
         if let Some(pid) = child.id() {
-            kill_process_group(pid).await;
+            kill_group_async(pid).await;
         }
         let _ = child.start_kill();
         if let Ok(status) = child.wait().await {

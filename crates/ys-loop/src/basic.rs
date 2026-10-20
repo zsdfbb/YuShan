@@ -662,13 +662,17 @@ impl AgentLoop for BasicLoop {
                 for &i in &pending {
                     let (_, tool_name, tool_args) = &tool_calls[i];
                     let tool = ctx.registry.get(tool_name).expect("已确认命中");
+                    let budget = tool_budget(tool, &ctx.limits);
+                    // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依。
+                    // 预算**按工具**算（工具声明值优先 → `limits.bash_timeout` → 300s）
+                    // ⇒ 并行批里每个工具拿到**各自**的预算。
                     let mut tool_ctx =
                         ToolContext::new(ctx.boundary, ctx.cwd.clone(), ctx.workspace_root.clone())
-                            .with_summarizer(&summarizer);
+                            .with_summarizer(&summarizer)
+                            .with_tool_budget(budget);
                     if let Some(runner) = ctx.subagent {
                         tool_ctx = tool_ctx.with_subagent(runner);
                     }
-                    let budget = tool_budget(tool, &ctx.limits);
                     let name = tool_name.clone();
                     let args = tool_args.clone();
                     futs.push(
@@ -713,16 +717,19 @@ impl AgentLoop for BasicLoop {
 
                     let result = match ctx.registry.get(tool_name) {
                         Some(tool) => {
+                            let budget = tool_budget(tool, &ctx.limits);
+                            // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依
+                            // （与并行路径同款：预算按工具算）。
                             let mut tool_ctx = ToolContext::new(
                                 ctx.boundary,
                                 ctx.cwd.clone(),
                                 ctx.workspace_root.clone(),
                             )
-                            .with_summarizer(&summarizer);
+                            .with_summarizer(&summarizer)
+                            .with_tool_budget(budget);
                             if let Some(runner) = ctx.subagent {
                                 tool_ctx = tool_ctx.with_subagent(runner);
                             }
-                            let budget = tool_budget(tool, &ctx.limits);
                             call_one(tool, tool_name.clone(), tool_args.clone(), tool_ctx, budget)
                                 .await
                         }
@@ -3208,6 +3215,255 @@ mod tests {
         assert!(
             contents.iter().all(|c| *c == big_result_content()),
             "关闭闸门 ⇒ 内容逐字节原样"
+        );
+    }
+    // ==================== 外层工具预算：挂进 `ToolContext` ====================
+    //
+    // 契约：本次调用的**外层预算**（`tool_budget(tool, limits)`）必须挂进
+    // `ToolContext` ⇒ 工具内**始终**有 deadline 可依。预算**按工具**算
+    // （工具声明 `tool.timeout()` → `limits.bash_timeout` → 300s）。
+    // 证据取「工具自己读到的值」—— 挂载点漏了就是 `None`，不会被旁路计算掩盖。
+
+    /// 探针读到的预算记录：(工具名, 工具读到的外层预算)。
+    type SeenBudgets = Arc<Mutex<Vec<(String, Option<Duration>)>>>;
+
+    /// 记录「工具在 `ToolContext` 里读到的外层预算」的探针工具。
+    struct BudgetProbeTool {
+        name: String,
+        timeout: Option<Duration>,
+        safe: bool,
+        seen: SeenBudgets,
+    }
+
+    impl BudgetProbeTool {
+        fn new(name: &str, timeout: Option<Duration>, safe: bool, seen: SeenBudgets) -> Self {
+            Self {
+                name: name.to_string(),
+                timeout,
+                safe,
+                seen,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BudgetProbeTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(
+                self.name.as_str(),
+                "records the outer tool budget it sees",
+                serde_json::json!({}),
+            )
+        }
+        fn timeout(&self) -> Option<Duration> {
+            self.timeout
+        }
+        fn is_concurrency_safe(&self) -> bool {
+            self.safe
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((self.name.clone(), ctx.tool_budget));
+            Ok(CoreToolResult {
+                content: "probe ok".into(),
+                is_error: false,
+            })
+        }
+    }
+
+    /// 探针读到的预算（按工具名索引）；工具没被调用过 ⇒ 断言失败。
+    fn seen_budget(seen: &SeenBudgets, name: &str) -> Option<Duration> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|(tool_name, _)| tool_name == name)
+            .map(|(_, budget)| *budget)
+            .expect("该工具应被调用过")
+    }
+
+    /// 串行路径：工具在 `ToolContext` 里**读到**外层预算，值 = 该工具自己的
+    /// `tool.timeout()`（42s）。
+    ///
+    /// 变异：删掉串行路径的 `with_tool_budget` ⇒ 探针读到 `None` ⇒ 变红。
+    #[tokio::test]
+    async fn serial_path_mounts_outer_budget_into_tool_context() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::build(vec![Box::new(BudgetProbeTool::new(
+            "probe",
+            Some(Duration::from_secs(42)),
+            // 非并发安全 ⇒ 单个工具调用走串行路径。
+            false,
+            seen.clone(),
+        ))])
+        .unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("probe", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            seen_budget(&seen, "probe"),
+            Some(Duration::from_secs(42)),
+            "串行路径的工具应读到外层预算（= 该工具的 timeout 声明值）"
+        );
+    }
+
+    /// 并行路径：两个并发安全工具**各自**读到**自己**的外层预算（42s / 7s）——
+    /// 证明并行批里预算仍**按工具**算，不是整批共用一个值。
+    ///
+    /// 变异：删掉并行路径的 `with_tool_budget` ⇒ 两个探针都读到 `None` ⇒ 变红；
+    /// 把并行路径的预算换成「整批一个值」⇒ 第二个探针的断言变红。
+    #[tokio::test]
+    async fn parallel_path_mounts_outer_budget_into_tool_context() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::build(vec![
+            Box::new(BudgetProbeTool::new(
+                "probe_a",
+                Some(Duration::from_secs(42)),
+                true,
+                seen.clone(),
+            )),
+            Box::new(BudgetProbeTool::new(
+                "probe_b",
+                Some(Duration::from_secs(7)),
+                true,
+                seen.clone(),
+            )),
+        ])
+        .unwrap();
+        let model = MultiToolModel::new(&[("id-a", "probe_a"), ("id-b", "probe_b")]);
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        // 并行路径的事件形状：全部 `ToolCall` 先于任何 `ToolResult`（串行路径是交错的）。
+        let order = call_result_order(&events);
+        assert_calls_precede_results(&order, 2, 2);
+        assert_eq!(
+            seen_budget(&seen, "probe_a"),
+            Some(Duration::from_secs(42)),
+            "并行路径的工具应读到自己的外层预算"
+        );
+        assert_eq!(
+            seen_budget(&seen, "probe_b"),
+            Some(Duration::from_secs(7)),
+            "并行批里每个工具的预算按工具算，不是整批共用一个值"
+        );
+    }
+
+    /// 工具**未声明** `timeout()` ⇒ 外层预算回落到 `limits.bash_timeout`；
+    /// `bash_timeout` 也没设 ⇒ 回落到 300s。
+    ///
+    /// 变异：把 `tool_budget` 改成忽略 `bash_timeout` ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn outer_budget_falls_back_to_limits_then_default() {
+        // ① 工具未声明 timeout，limits 给了 bash_timeout = 11s。
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::build(vec![Box::new(BudgetProbeTool::new(
+            "probe",
+            None,
+            false,
+            seen.clone(),
+        ))])
+        .unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("probe", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.bash_timeout = Some(11);
+        {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            seen_budget(&seen, "probe"),
+            Some(Duration::from_secs(11)),
+            "工具未声明 timeout ⇒ 外层预算回落 limits.bash_timeout"
+        );
+
+        // ② 工具未声明 timeout，limits 也没给 bash_timeout ⇒ 300s 兜底。
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::build(vec![Box::new(BudgetProbeTool::new(
+            "probe",
+            None,
+            false,
+            seen.clone(),
+        ))])
+        .unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call("probe", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            seen_budget(&seen, "probe"),
+            Some(Duration::from_secs(300)),
+            "工具与 limits 都未声明 ⇒ 外层预算回落 300s"
+        );
+    }
+
+    /// 源码级钉子：并行与串行**两处**构造点都要挂预算 ⇒ 源码里那条挂载调用的
+    /// 出现次数 ≥ 2。
+    ///
+    /// 探针用的字面量**刻意拆开**（分成两半拼）⇒ 本文件自身不含那条完整调用，
+    /// 计数只反映实现处（注释里提到的名字不带调用形态，不计入）。
+    ///
+    /// 变异：删掉任一处的挂载调用 ⇒ 计数变 1 ⇒ 变红。
+    #[test]
+    fn both_tool_context_sites_mount_budget() {
+        let needle = format!(".with_tool_{}({})", "budget", "budget");
+        let count = include_str!("basic.rs").matches(&needle).count();
+        assert!(
+            count >= 2,
+            "并行与串行两处构造点都要挂外层预算；count = {count}"
         );
     }
 }

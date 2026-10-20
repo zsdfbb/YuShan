@@ -1,6 +1,7 @@
 //! 截断的唯一实现 —— 纯函数、零依赖、无 IO。
 //!
 //! **分工（重要）**：本模块只计算「取哪些行 / 撞上了哪个上限」，返回 [`Truncation`]；
+//! 截断结果有两型：[`Truncation`]（单段：头或尾）与 [`HeadTail`]（头尾混合）。
 //! **通知文案一律由调用方拼**。bash 的 `[Truncated N lines.]`（前插）、read 的
 //! `[Showing lines a-b of n. Use offset=N to continue.]`（后追加）、grep 的 match limit
 //! 提示，都留在各自工具里。这样 bash / read 改用本模块后输出**逐字节不变**，
@@ -12,6 +13,7 @@
 //! |---|---|---|---|
 //! | [`head`] / [`head_lines`] | 取头 | `line.len()`，**不含**换行符 | **1 行**（首行无条件保留） |
 //! | [`tail`] | 取尾 | `line.len() + 1`，**含**换行符 | 0 行 |
+//! | [`head_tail`] | 头尾混合 | 头部同 [`head`]、尾部同 [`tail`] | 0 行（行数预算为 0 时）；否则头部至少给出**首行的前缀** |
 //!
 //! 前者对齐既有 `read.rs` 的循环（先格式化再按格式化后字节数计，且 `&& !output_lines.is_empty()`），
 //! 后者对齐既有 `bash.rs` 的 `tail_truncate`。
@@ -165,6 +167,157 @@ pub fn tail(text: &str, max_lines: usize, max_bytes: usize) -> Truncation {
         total_lines,
         shown_lines: total_lines - start,
     }
+}
+
+/// 头尾混合截断的结果：**不含任何通知文案**（文案由调用方拼 —— 与本模块既有分工一致）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadTail {
+    /// 头部内容：源文本的前若干行（行间以 `\n` 连接，不带尾随换行）。
+    pub head: String,
+    /// 尾部内容：源文本的后若干行（行间以 `\n` 连接，不带尾随换行）。
+    pub tail: String,
+    /// 被跳过的行数（既不在头部、也不在尾部的行）。
+    pub omitted_lines: usize,
+    /// 源文本中**未出现在展示内容里**的字节数。
+    ///
+    /// 展示内容 = [`HeadTail::head`] + [`HeadTail::tail`]（两段互不重叠）⇒ 恒等式
+    /// `omitted_bytes + head.len() + tail.len() == 源文本字节数`。
+    ///
+    /// 头尾之间的那个换行符、以及源文本的**尾随换行**都**不在**展示内容里
+    /// ⇒ 计入本值（跳过量按**源文本**记，不按展示内容记）。
+    pub omitted_bytes: usize,
+    /// 源文本的总行数。
+    pub total_lines: usize,
+    /// 实际展示的行数（头部 + 尾部）。
+    pub shown_lines: usize,
+}
+
+/// 头尾混合截断：保留**头部**与**尾部**，中间段跳过并**报出跳过量**。
+///
+/// 用途：长输出的**两端**通常比中段更有信息量（开头是上下文、结尾是报错与汇总），
+/// 但只留尾部会丢掉开头、只留开头会丢掉结尾 —— 故取两头、跳过中间。
+///
+/// **预算不放宽**：
+/// - 字节：头部内容 ≤ `head_bytes`（且 `head_bytes` 越过 `max_bytes` 时按 `max_bytes` 算），
+///   尾部内容 ≤ `max_bytes - head_bytes`，两者之和 ≤ `max_bytes`；
+/// - 行数：头部与尾部的行数之和 ≤ `max_lines`。
+///
+/// **份额等比**：行数预算按字节份额拆分（`head_bytes / max_bytes`），
+/// 使头尾在字节与行数两个维度上的份额一致。
+///
+/// **头尾不重叠**：尾部先定（[`tail`]），头部只能在尾部起点之前取行（[`head_lines`]）。
+///
+/// 字节口径沿用本模块既有约定：头部按**行内容字节**（不含行间换行符，同 [`head_lines`]），
+/// 尾部按**行内容 + 换行符**（同 [`tail`]）；本函数另按**拼装后的实际字节**回收头部行，
+/// 保证头部内容不超过 `head_bytes`。
+///
+/// **单行超预算**：首行**放不进**头部预算且行数预算不为 0 ⇒ 头部给出该行的**一个前缀**
+/// （长度 ≤ 头部预算、**不切在多字节字符中间**），其余字节计入 `omitted_bytes`
+/// ⇒ 模型至少看到一行内容的开头，而不是一个空结果。行数预算为 0 时**不给**
+/// （预算不放宽 ⇒ 一行都不展示）。
+///
+/// **跳过量口径**：`omitted_bytes` = 源文本中**未出现在展示内容里**的字节数 ⇒ 恒等式
+/// `omitted_bytes + head.len() + tail.len() == 源文本字节数`。
+pub fn head_tail(
+    text: &str,
+    max_lines: usize,
+    max_bytes: usize,
+    head_bytes: usize,
+) -> HeadTail {
+    let lines: Vec<&str> = text.lines().collect();
+    let total_lines = lines.len();
+
+    // 整体放得下 ⇒ 原样返回：头部即全文、尾部为空，跳过量恒为 0。
+    if total_lines <= max_lines && text.len() <= max_bytes {
+        return HeadTail {
+            head: text.to_string(),
+            tail: String::new(),
+            omitted_lines: 0,
+            omitted_bytes: 0,
+            total_lines,
+            shown_lines: total_lines,
+        };
+    }
+
+    // 头部预算不得越过总预算 —— 越界即等于放宽预算。
+    let head_budget = head_bytes.min(max_bytes);
+    let tail_budget = max_bytes - head_budget;
+
+    // 行数预算按字节份额等比分摊：头尾各得与自身字节份额相称的行数。
+    // `max_bytes == 0` ⇒ 无字节可分 ⇒ 头部行数预算为 0。
+    let head_line_budget = max_lines
+        .saturating_mul(head_budget)
+        .checked_div(max_bytes)
+        .unwrap_or(0);
+    let tail_line_budget = max_lines - head_line_budget;
+
+    // 尾部先定：尾部的起点即头部的可用区间上界 ⇒ 头尾绝不重叠。
+    let tail_trunc = tail(text, tail_line_budget, tail_budget);
+    let tail_start = total_lines - tail_trunc.shown_lines;
+
+    // 头部只能在尾部起点之前取行。
+    let head_line_cap = head_line_budget.min(tail_start);
+    let head_trunc = head_lines(&lines[..tail_start], head_line_cap, head_budget);
+    // `head_lines` 的「首行无条件保留」在行数预算为 0 时会让头部多出一行 ⇒ 这里再收一道。
+    let head_shown = trim_head_to_budget(
+        &lines,
+        head_trunc.shown_lines.min(head_line_cap),
+        head_budget,
+    );
+
+    // 首行**放不进**头部预算 ⇒ 头部给出该行的**一个前缀**（不切碎多字节字符）。
+    // 行数预算为 0 时**不给**（预算不放宽 ⇒ 一行都不展示）。
+    let head_is_prefix = head_shown == 0 && head_line_cap >= 1;
+    let head = if head_is_prefix {
+        prefix_within_budget(lines[0], head_budget).to_string()
+    } else {
+        lines[..head_shown].join("\n")
+    };
+    // 前缀只覆盖**首行的一部分** ⇒ 该行仍算「已展示」（跳过量按**字节**记）。
+    let head_lines_shown = if head_is_prefix { 1 } else { head_shown };
+
+    // 跳过量 = 源文本字节数 − 展示内容字节数（展示内容 = 头 + 尾，两段互不重叠）。
+    let omitted_bytes = text.len().saturating_sub(head.len() + tail_trunc.content.len());
+
+    HeadTail {
+        head,
+        tail: tail_trunc.content,
+        omitted_lines: tail_start - head_lines_shown,
+        omitted_bytes,
+        total_lines,
+        shown_lines: head_lines_shown + tail_trunc.shown_lines,
+    }
+}
+
+/// 取文本的**前缀**：长度不超过 `budget` 字节，且**不切在多字节字符中间**。
+///
+/// 切点回退到**字符边界** ⇒ 展示内容里不会出现半个多字节字符。
+fn prefix_within_budget(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        return text;
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// 把头部行数收到**拼装后**的字节预算之内，返回实际保留的行数。
+///
+/// [`head_lines`] 的字节口径**不含**行间换行符（与既有 `read.rs` 一致），
+/// 故拼装结果可能超出预算；这里按「行内容 + 行间分隔符」的实际字节回收尾部行，
+/// 保证头部内容不超预算（预算不放宽）。
+fn trim_head_to_budget(lines: &[&str], shown_lines: usize, budget: usize) -> usize {
+    let mut content_bytes = 0usize;
+    for (index, line) in lines.iter().take(shown_lines).enumerate() {
+        content_bytes += line.len();
+        // 拼装前 `index + 1` 行的字节 = 各行内容之和 + 行间分隔符（`index` 个）。
+        if content_bytes + index > budget {
+            return index;
+        }
+    }
+    shown_lines
 }
 
 /// 单行截断：按**字符**（非字节）保留前 `max_chars` 个，返回值与「是否被截断」。
@@ -396,6 +549,226 @@ mod tests {
         assert_eq!(t.content, "");
 
         // 变异：`len() + 1` 改成 `len()` → 50 <= 50 放得下 → shown_lines 变 1 → 红。
+    }
+
+    // ---------- head_tail：头尾混合，头尾不重叠，跳过段必须报出 ----------
+
+    #[test]
+    fn head_tail_short_text_is_intact() {
+        let text = "第一行\n第二行\n第三行";
+        let t = head_tail(text, MAX_LINES, MAX_BYTES, MAX_BYTES / 4);
+
+        assert_eq!(t.omitted_lines, 0, "短文本不应有跳过行");
+        assert_eq!(t.omitted_bytes, 0, "短文本不应有跳过字节");
+        assert_eq!(t.total_lines, 3);
+        assert_eq!(t.shown_lines, 3);
+
+        let joined = t.head.clone() + &t.tail;
+        assert_eq!(joined, text, "头尾拼起来必须等于原文");
+
+        // 变异：短文本也走切分路径（早退分支去掉）⇒ omitted_bytes 不再为 0 ⇒ 红。
+    }
+
+    #[test]
+    fn head_tail_empty_input() {
+        let t = head_tail("", MAX_LINES, MAX_BYTES, MAX_BYTES / 4);
+
+        assert_eq!(t.head, "");
+        assert_eq!(t.tail, "");
+        assert_eq!(t.omitted_lines, 0);
+        assert_eq!(t.omitted_bytes, 0);
+        assert_eq!(t.total_lines, 0);
+        assert_eq!(t.shown_lines, 0);
+    }
+
+    #[test]
+    fn head_tail_is_reachable_from_crate_root() {
+        // `lib.rs` 以 `pub use truncate::*;` 导出 ⇒ crate 根路径必须可用。
+        let t = crate::head_tail("a\nb", 10, 100, 50);
+
+        assert_eq!(t.total_lines, 2);
+        assert_eq!(t.head, "a\nb");
+        assert_eq!(t.tail, "");
+    }
+
+    #[test]
+    fn head_tail_long_text_splits_budget_and_reports_omission() {
+        // 3000 行 × 40 字节 ⇒ 源文本 122999 字节，远超 50 KiB 预算。
+        let lines = lines_of(3_000, 40);
+        let text = lines.join("\n");
+        let head_budget = MAX_BYTES / 4;
+        let t = head_tail(&text, MAX_LINES, MAX_BYTES, head_budget);
+
+        // 预算不放宽：头尾内容之和不得超过总字节预算。
+        assert!(
+            t.head.len() + t.tail.len() <= MAX_BYTES,
+            "头尾合计 {} 字节，超出预算 {}",
+            t.head.len() + t.tail.len(),
+            MAX_BYTES
+        );
+        assert!(
+            t.head.len() <= head_budget,
+            "头部 {} 字节，超出分给它的预算 {}",
+            t.head.len(),
+            head_budget
+        );
+        assert!(
+            t.tail.len() <= MAX_BYTES - head_budget,
+            "尾部 {} 字节，超出剩余预算 {}",
+            t.tail.len(),
+            MAX_BYTES - head_budget
+        );
+
+        // 预算切分生效：尾部吃掉 38400 / 41 = 936 行，头部吃掉 (12800 - 312) / 41 ≈ 312 行。
+        assert_eq!(t.tail.lines().count(), 936, "尾部的行数由尾部字节预算决定");
+        assert_eq!(t.head.lines().count(), 312, "头部的行数由头部字节预算决定");
+
+        // 头尾不得重叠。
+        let head_last = t.head.lines().last().unwrap();
+        let tail_first = t.tail.lines().next().unwrap();
+        let head_last_index = lines.iter().position(|l| l.as_str() == head_last).unwrap();
+        let tail_first_index = lines.iter().position(|l| l.as_str() == tail_first).unwrap();
+        assert!(
+            head_last_index < tail_first_index,
+            "头部末行必须在尾部首行之前"
+        );
+
+        // 跳过量必须**等于源文本里没出现在展示内容中的字节**（按源文本独立重算）。
+        // 被跳过的每一行都带自己的行尾换行；此外**头部末行之后**还有一个换行符
+        // 没有出现在展示内容里（头与尾是分开拼的）⇒ 也要计入。
+        let skipped: usize = lines[head_last_index + 1..tail_first_index]
+            .iter()
+            .map(|line| line.len() + 1)
+            .sum();
+        assert_eq!(t.omitted_lines, tail_first_index - head_last_index - 1);
+        assert_eq!(
+            t.omitted_bytes,
+            skipped + 1,
+            "跳过的字节数必须等于源文本里没出现在展示内容中的字节"
+        );
+
+        // 恒等式：源文本字节 = 展示内容字节 + 跳过量。
+        assert_eq!(
+            text.len(),
+            t.head.len() + t.omitted_bytes + t.tail.len(),
+            "源文本字节必须被展示内容与跳过量完整瓜分"
+        );
+
+        // 变异：把 `omitted_bytes` 恒置 0 ⇒ 上面两条断言变红。
+        // 变异：头尾取行区间重叠（头部不再限制在尾部起点之前）⇒ 头尾不重叠断言变红。
+    }
+
+    #[test]
+    fn head_tail_never_exceeds_the_byte_budget() {
+        // 单行 100000 字节：整行都放不进任何一份预算 ⇒ 头部给出该行的**一个前缀**，
+        // 尾部让位（同一行不得同时出现在头与尾），跳过量如实报出。
+        let text = "x".repeat(100_000);
+        let head_budget = MAX_BYTES / 4;
+        let t = head_tail(&text, MAX_LINES, MAX_BYTES, head_budget);
+
+        assert!(
+            t.head.len() <= head_budget,
+            "头部 {} 字节，超出分给它的预算 {}",
+            t.head.len(),
+            head_budget
+        );
+        assert_eq!(t.head, "x".repeat(head_budget), "前缀必须落在首行之内");
+        assert!(t.tail.is_empty(), "同一行不得同时出现在头与尾");
+        assert_eq!(t.total_lines, 1);
+        assert_eq!(t.shown_lines, 1, "首行（部分）已出现在展示内容里");
+        assert_eq!(t.omitted_lines, 0, "该行已（部分）出现 ⇒ 不算整行被跳过");
+        assert_eq!(
+            t.omitted_bytes,
+            text.len() - head_budget,
+            "跳过的字节数必须等于没出现在展示内容里的字节"
+        );
+
+        // 恒等式：源文本字节 = 展示内容字节 + 跳过量。
+        assert_eq!(text.len(), t.head.len() + t.omitted_bytes + t.tail.len());
+
+        // 变异：单行超预算时退回「不返回任何内容」⇒ 前缀与跳过量断言变红。
+        // 变异：头部保留超预算的整行（`head_lines` 的「首行无条件保留」被照搬进来）⇒ 红。
+    }
+
+    /// 单行超预算时的前缀必须**落在字符边界上** —— 半个多字节字符会让模型看到乱码。
+    #[test]
+    fn head_tail_gives_a_character_safe_prefix_of_an_oversized_single_line() {
+        // 20000 个中文字 = 60000 字节（单行，无换行）⇒ 整行放不进头部预算。
+        let text = "中".repeat(20_000);
+        let head_budget = MAX_BYTES / 4;
+        let t = head_tail(&text, MAX_LINES, MAX_BYTES, head_budget);
+
+        assert!(!t.head.is_empty(), "单行超预算也必须给出前缀");
+        assert!(t.head.len() <= head_budget, "前缀不得超过头部预算");
+        assert!(
+            !t.head.contains('\u{FFFD}'),
+            "前缀不得切在多字节字符中间"
+        );
+        assert!(
+            text.starts_with(&t.head),
+            "前缀必须落在首行之内"
+        );
+        assert_eq!(t.omitted_bytes + t.head.len() + t.tail.len(), text.len());
+    }
+
+    /// **尾随换行**没有出现在展示内容里 ⇒ 计入跳过量（源文本按字节记账）。
+    #[test]
+    fn head_tail_counts_the_trailing_newline_as_omitted() {
+        // 5 行 × 8 字节 + 行间换行 + **尾随换行** = 45 字节。
+        let lines = lines_of(5, 8);
+        let mut text = lines.join("\n");
+        text.push('\n');
+        let t = head_tail(&text, 2, 24, 12);
+
+        // 跳过量 = 3 个被跳过的行（各 9 字节）+ 头部末行之后的换行符 + 尾随换行。
+        assert_eq!(t.omitted_lines, 3);
+        assert_eq!(
+            t.omitted_bytes, 29,
+            "尾随换行必须计入跳过量：3×9 + 1（头后换行）+ 1（尾随换行）"
+        );
+
+        // 去掉尾随换行 ⇒ 跳过量恰好少 1 字节（差 1 字节的账目洞）。
+        let without = lines.join("\n");
+        let t2 = head_tail(&without, 2, 24, 12);
+        assert_eq!(t2.omitted_bytes, 28);
+
+        // 恒等式：源文本字节 = 展示内容字节 + 跳过量。
+        assert_eq!(text.len(), t.head.len() + t.omitted_bytes + t.tail.len());
+        assert_eq!(without.len(), t2.head.len() + t2.omitted_bytes + t2.tail.len());
+    }
+
+    #[test]
+    fn head_tail_line_budget_is_not_loosened() {
+        // 3000 行 × 4 字节 ⇒ 源文本 14999 字节（< 50 KiB）⇒ 只有行数闸生效。
+        let lines = lines_of(3_000, 4);
+        let text = lines.join("\n");
+        let t = head_tail(&text, MAX_LINES, MAX_BYTES, MAX_BYTES / 4);
+
+        assert_eq!(t.total_lines, 3_000);
+        assert_eq!(t.shown_lines, MAX_LINES, "头尾行数之和不得超过行数预算");
+        assert_eq!(t.omitted_lines, 1_000, "跳过的行必须被报出");
+        assert!(t.omitted_bytes > 0, "跳过的字节必须被报出");
+
+        // 行数预算为 0 ⇒ 一行都不展示（预算不放宽）。
+        let t0 = head_tail(&text, 0, MAX_BYTES, MAX_BYTES / 4);
+        assert_eq!(t0.shown_lines, 0, "行数预算为 0 ⇒ 不得展示任何行");
+        assert_eq!(t0.omitted_lines, 3_000);
+
+        // 变异：行数预算按字节份额拆分这一条去掉（头尾各拿满 max_lines）⇒ 红。
+    }
+
+    #[test]
+    fn head_tail_keeps_both_ends() {
+        // 中间段被跳过，但开头与结尾都留着。
+        let lines: Vec<String> = (0..100).map(|i| format!("line{i}")).collect();
+        let text = lines.join("\n");
+        let t = head_tail(&text, 10, 100, 40);
+
+        assert!(t.head.starts_with("line0"), "开头必须在");
+        assert!(t.tail.ends_with("line99"), "结尾必须在");
+        assert!(t.omitted_lines > 0, "中间段必须被跳过并报出");
+
+        // 变异：只取尾部（头部恒空）⇒ 开头断言变红。
     }
 
     // ---------- line：按**字符**截断，不切碎 UTF-8 ----------

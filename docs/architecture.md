@@ -803,7 +803,7 @@ flowchart TB
 
 | pane | 约束 | 说明 |
 |---|---|---|
-| **Chat** | `Constraint::Min(3)` | 唯一可滚动区域；滚动以 **wrap 后的视觉行**为单位 |
+| **Chat** | `Constraint::Min(3)` | 唯一可滚动区域；滚动以 **wrap 后的视觉行**为单位；**视窗化渲染**（折行结果按条目记忆，只画视窗覆盖的行）与「视窗原地不动」的跟随语义见 `docs/adr/0045-tui-scroll-viewport.md` |
 | **Input** | `Constraint::Length(1..=5)` | 高度随内容自适应（`INPUT_MAX_LINES = 5`） |
 | **Status** | `Constraint::Length(1)` | **最底**，常驻一行 |
 

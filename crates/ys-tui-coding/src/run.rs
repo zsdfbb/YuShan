@@ -50,9 +50,7 @@ use ys_protocol::{Boundary, Outbound, Request};
 use crate::app::App;
 use crate::commands::PromptKind;
 use crate::input::InputBuffer;
-use crate::prompter::{
-    PromptError, PromptOutcome, Prompter, resolve_prompt, resolve_session_pick,
-};
+use crate::prompter::{PromptError, PromptOutcome, Prompter, resolve_prompt, resolve_session_pick};
 use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
 use crate::{draw, events};
@@ -213,10 +211,9 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             last_tick = Instant::now();
         }
 
-        // 滚动位置按当前尺寸重新夹紧（窗口缩放后 wrap 行数会变）
-        app.scroll_offset = app
-            .scroll_offset
-            .min(app.compute_max_scroll(size.width, size.height));
+        // 滚动位置按当前尺寸重新夹紧（窗口缩放后 wrap 行数会变）——
+        // `compute_max_scroll` 内部同步布局并把 `scroll_offset` 夹到有效范围。
+        app.compute_max_scroll(size.width, size.height);
 
         if app.should_quit {
             break;
@@ -460,7 +457,7 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                     KeyCode::Esc => return Err(PromptError::Cancelled),
                     // Ctrl-C 在浮层里也是「关程序」，不能被吞掉。
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err(PromptError::Quit)
+                        return Err(PromptError::Quit);
                     }
                     KeyCode::Backspace => query.backspace(),
                     KeyCode::Delete => query.delete_forward(),
@@ -511,7 +508,7 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                     KeyCode::Esc => return Err(PromptError::Cancelled),
                     // Ctrl-C 在浮层里也是「关程序」（与 `select_modal` 同规）。
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err(PromptError::Quit)
+                        return Err(PromptError::Quit);
                     }
                     KeyCode::Backspace => buf.backspace(),
                     KeyCode::Delete => buf.delete_forward(),
@@ -746,9 +743,17 @@ mod tests {
     /// 变异：`filter_indices` 里去掉 `to_lowercase()` ⇒ 大写查询匹配不上 ⇒ 变红。
     #[test]
     fn test_filter_indices_case_insensitive_substring() {
-        let o = opts(&["deepseek/deepseek-chat", "opencode-go/FLASH", "minimax/MiniMax-M3"]);
+        let o = opts(&[
+            "deepseek/deepseek-chat",
+            "opencode-go/FLASH",
+            "minimax/MiniMax-M3",
+        ]);
 
-        assert_eq!(filter_indices(&o, ""), vec![0, 1, 2], "空查询 = 全选（保序）");
+        assert_eq!(
+            filter_indices(&o, ""),
+            vec![0, 1, 2],
+            "空查询 = 全选（保序）"
+        );
         assert_eq!(filter_indices(&o, "opencode"), vec![1]);
         assert_eq!(filter_indices(&o, "CHAT"), vec![0], "大小写不敏感");
         assert_eq!(filter_indices(&o, "flash"), vec![1], "候选里是大写也命中");
@@ -768,7 +773,11 @@ mod tests {
             vec![0, 1],
             "provider 名与模型名一起筛"
         );
-        assert_eq!(filter_indices(&o, "deepseek/"), vec![0], "加了斜杠即精确到官方");
+        assert_eq!(
+            filter_indices(&o, "deepseek/"),
+            vec![0],
+            "加了斜杠即精确到官方"
+        );
     }
 
     /// CJK / emoji 候选不 panic 且能命中（`to_lowercase`/`contains` 按 char 边界工作）。
@@ -903,11 +912,7 @@ mod tests {
     fn test_apply_prompt_outcome_marks_command_in_flight() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Request>(4);
         let mut app = App::new(CodingView::for_test());
-        apply_prompt_outcome(
-            &mut app,
-            &tx,
-            Ok(PromptOutcome::Request(Request::Logout)),
-        );
+        apply_prompt_outcome(&mut app, &tx, Ok(PromptOutcome::Request(Request::Logout)));
         assert!(app.command_in_flight, "浮层发出去的命令同样算在飞");
     }
 

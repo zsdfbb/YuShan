@@ -42,13 +42,24 @@
 //! | `Left` / `Right` / `Delete` / `Home` | **输入光标**（`InputBuffer`） |
 //! | `Ctrl`·`⌥` + `Left` / `Right`（或 `⌥b` / `⌥f`） | **输入按词移动** |
 //! | `Ctrl-A` / `Ctrl-E` | **输入行首 / 行尾** |
-//! | `End` | **回到最新消息**（`scroll_offset = 0`、`follow = true`） |
+//! | `End` / `Ctrl-End` / `Ctrl-Down` | **跳到最新消息**（`scroll_offset = 0`、`follow = true`） |
+//! | `Ctrl-Home` / `Ctrl-Up` | **跳到最早消息** |
 //!
 //! 即：竖直方向 = 聊天，水平方向 = 输入。`Home`/`End` 这一对**不做对称绑定** ——
 //! `End` 早在 T5 就钉住了「跳回聊天底部」的语义（有测试），`Home` 之前空着，
 //! 于是给输入行首。理由：聊天滚动已有 4 个键（且退回底部是高频操作），而输入
 //! 行首此前**无键可用**（`Home` 是唯一自然的候选）。输入的「行尾」因此**不占 `End`**：
 //! 走 `Ctrl-E`，行首走 `Ctrl-A` —— 成对且是 readline 约定。
+//!
+//! # 「跳到最新 / 最早」为什么用 `Ctrl+↑/↓` 与 `Ctrl+Home/End`
+//!
+//! - **不绑 `⌘` 组合**：macOS 的终端自己消费 `⌘`，字节**到不了应用**
+//!   （`Terminal.app` / `iTerm2` 的出厂键映射把 `⌘+←/→` 映射成 `Ctrl-A/E`，
+//!   正是这个道理）。`⌘+↓` 在应用里收不到。
+//! - **不绑 `⌥+↓`**：Terminal.app 把 `⌥+↓` 发成 `ESC[B` —— 与普通 `↓` **同形**，
+//!   终端之间还不一致（有的发 `ESC[1;3B`），无法可靠区分。
+//! - **`Ctrl+↑/↓` 与 `Ctrl+Home/End` 终端无关**（`CSI 1;5A` / `CSI 1;5B` 一类），
+//!   Mac / Linux 通用 ⇒ 取这一组。
 //!
 //! **`⌘` 组合到不了应用**：终端自己消费 `⌘`，从不把它交给程序，所以 ⌘←/⌘→ 只能靠
 //! 终端把它们映射成别的字节。Terminal.app 与 iTerm2 的出厂映射恰好是 `Ctrl-A` /
@@ -64,9 +75,6 @@ use ys_protocol::{Boundary, Request};
 use crate::app::{App, message_text};
 use crate::commands::{self, Action};
 use crate::completion;
-
-/// 一次 PageUp/PageDown 滚动的行数。
-const PAGE_ROWS: isize = 10;
 
 /// 处理一个 crossterm 事件。
 pub fn handle_event(
@@ -187,15 +195,17 @@ pub fn handle_key(
         KeyCode::Left => app.input.cursor_left(),
         KeyCode::Right => app.input.cursor_right(),
         // Home 之前未绑定：给输入**行首**（End 保留给「回到最新消息」）
-        KeyCode::Home => app.input.cursor_home(),
+        KeyCode::Home if !ctrl => app.input.cursor_home(),
+        // `Ctrl` + Home/End：**聊天**的首/末尾（与输入光标的一对 `Ctrl+A/E` 呼应）。
+        // `Ctrl+↑/↓` 是同一组动作的另一种写法（部分用户更习惯方向键）。
+        KeyCode::Home => jump_to_start(app, width, height),
+        KeyCode::End => app.jump_to_end(),
+        KeyCode::Up if ctrl => jump_to_start(app, width, height),
+        KeyCode::Down if ctrl => app.jump_to_end(),
         KeyCode::Up => scroll(app, width, height, 1),
-        KeyCode::PageUp => scroll(app, width, height, PAGE_ROWS),
+        KeyCode::PageUp => scroll(app, width, height, page_rows(app, width, height)),
         KeyCode::Down => scroll(app, width, height, -1),
-        KeyCode::PageDown => scroll(app, width, height, -PAGE_ROWS),
-        KeyCode::End => {
-            app.scroll_offset = 0;
-            app.follow = true;
-        }
+        KeyCode::PageDown => scroll(app, width, height, -page_rows(app, width, height)),
         // Tab：输入 `/` 开头时按前缀开补全浮层（无命中 / 不以 `/` 开头 = no-op）。
         // 候选含 skill（与 `submit` 的解析同源，见模块文档）。
         KeyCode::Tab => {
@@ -253,6 +263,20 @@ fn handle_completion_key(app: &mut App, code: KeyCode) -> bool {
             false
         }
     }
+}
+
+/// `PageUp` / `PageDown` 的步长 —— **视窗高度 − 1** 行（留一行重叠，便于对位）。
+///
+/// 与终端尺寸相关：视窗越高，翻页越多。
+fn page_rows(app: &App, width: u16, height: u16) -> isize {
+    let (_, inner_h) = crate::draw::chat_viewport(app, width, height);
+    (inner_h as isize).saturating_sub(1).max(1)
+}
+
+/// 跳到对话的**最早**内容（顶部）—— 脱离跟随。
+fn jump_to_start(app: &mut App, width: u16, height: u16) {
+    let max = app.compute_max_scroll(width, height);
+    app.jump_to_start(max);
 }
 
 /// 滚动：`delta > 0` 向上（远离底部），`delta < 0` 向下（回到贴底）。
@@ -638,7 +662,14 @@ mod tests {
         let mut a = app();
 
         a.input.insert_str("/model deepseek/chat");
-        handle_key(press(KeyCode::Enter), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
         assert!(!a.is_turning, "命令请求不开回合态");
         assert!(a.command_in_flight, "命令请求投出去即进入在飞态");
         assert!(matches!(ch.next_request(), Some(Request::SetModel { .. })));
@@ -663,7 +694,14 @@ mod tests {
         let ch = channels();
         let mut a = app();
         a.input.insert_str("/logout");
-        handle_key(press(KeyCode::Enter), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
         assert!(a.command_in_flight);
 
         a.apply_outbound(Outbound::View(CodingView::for_test()));
@@ -681,7 +719,14 @@ mod tests {
         let ch = channels();
         let mut a = app();
         a.input.insert_str("你好");
-        handle_key(press(KeyCode::Enter), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
         assert!(a.is_turning);
         assert!(!a.command_in_flight, "回合请求归 is_turning 管");
     }
@@ -714,6 +759,9 @@ mod tests {
         assert_eq!(a.scroll_offset, 1);
         assert!(!a.follow, "向上滚即脱离跟随");
 
+        // 翻页步长 = **视窗高度 − 1** 行（120×40 下 Chat 内区 34 行 ⇒ 33）。
+        // 与视窗相关（不是写死的常数）：窗口越大翻得越多。
+        const PAGE: usize = 33;
         handle_key(
             press(KeyCode::PageUp),
             &mut a,
@@ -722,7 +770,7 @@ mod tests {
             120,
             40,
         );
-        assert_eq!(a.scroll_offset, 11);
+        assert_eq!(a.scroll_offset, 1 + PAGE);
 
         handle_key(
             press(KeyCode::PageDown),
@@ -736,6 +784,96 @@ mod tests {
 
         handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
         assert_eq!(a.scroll_offset, 0);
+        assert!(a.follow);
+    }
+
+    /// `Ctrl+↓` / `Ctrl+End` 跳到最新内容；`Ctrl+↑` / `Ctrl+Home` 跳到最早内容。
+    ///
+    /// 这组键与终端无关（`CSI 1;5B` 一类），Mac / Linux 通用 ——
+    /// `⌘` 组合到不了应用（终端自己消费），故不绑。
+    #[test]
+    fn test_ctrl_arrows_and_home_end_jump_to_ends() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        let max = a.compute_max_scroll(120, 40);
+        assert!(max > 10, "前置：内容长于一屏");
+
+        // 跳到底部
+        handle_key(
+            with_mod(KeyCode::Down, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "Ctrl+↓ ⇒ 跳到底部");
+        assert!(a.follow, "Ctrl+↓ ⇒ 恢复贴底");
+
+        // 跳到顶部
+        handle_key(
+            with_mod(KeyCode::Up, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, max, "Ctrl+↑ ⇒ 跳到顶部");
+        assert!(!a.follow, "跳到顶部 ⇒ 脱离跟随");
+
+        // `Ctrl+End` / `Ctrl+Home` 是同一组动作的别名
+        handle_key(
+            with_mod(KeyCode::End, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "Ctrl+End ⇒ 跳到底部");
+        assert!(a.follow);
+
+        handle_key(
+            with_mod(KeyCode::Home, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, max, "Ctrl+Home ⇒ 跳到顶部");
+        assert!(!a.follow);
+    }
+
+    /// `End` 跳到底部；**裸** `Home` 仍归输入光标（行首）—— 两者刻意不对称。
+    #[test]
+    fn test_end_jumps_to_latest_but_bare_home_stays_in_input() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.input.insert_str("abc");
+        a.input.cursor_home();
+        a.input.cursor_right();
+        assert_eq!(a.input.cursor, 1, "前置：光标在中间");
+
+        handle_key(
+            press(KeyCode::Home),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.cursor, 0, "裸 Home ⇒ 输入行首（不动聊天滚动）");
+
+        handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.scroll_offset, 0, "End ⇒ 跳到最新消息");
         assert!(a.follow);
     }
 

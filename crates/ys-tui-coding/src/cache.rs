@@ -47,9 +47,9 @@ struct Slot {
 
 /// assistant 渲染产物的记忆缓存 + 流式节流状态。
 ///
-/// 节流状态**存在本结构内**（它记住每条上次算出什么、何时算的），令 `total_rows` 与
-/// `draw_transcript` 读到**同一份**上次产物 —— 否则滚动按新内容、画面按旧内容，二者错位
-/// （设计 §2.5 边界 ①，风险 R11）。
+/// 节流状态**存在本结构内**（它记住每条上次算出什么、何时算的），令布局同步
+/// （[`crate::layout`]）与画面读到**同一份**上次产物 —— 否则滚动按新内容、画面按旧内容，
+/// 二者错位（设计 §2.5 边界 ①，风险 R11）。
 #[derive(Default)]
 pub(crate) struct RenderCache {
     slots: Vec<Option<Slot>>,
@@ -342,13 +342,17 @@ mod tests {
         cache.sync_len(1);
         let base = Instant::now();
 
-        let a = cache.lines_for(0, "AAAA", 60, AssistantStyles, base).to_vec();
+        let a = cache
+            .lines_for(0, "AAAA", 60, AssistantStyles, base)
+            .to_vec();
         assert_eq!(flat_all(&a), "AAAA", "先填充 A 的产物");
         assert_eq!(md::render_calls(), 1);
 
         // 回放：清屏后立刻 extend 到**相同长度** —— 长度没变，键看起来「没变」。
         cache.reset();
-        let b = cache.lines_for(0, "BBBB", 60, AssistantStyles, base).to_vec();
+        let b = cache
+            .lines_for(0, "BBBB", 60, AssistantStyles, base)
+            .to_vec();
 
         assert_eq!(flat_all(&b), "BBBB", "回放后必须重渲染，不得复用等长旧产物");
         assert!(

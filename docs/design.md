@@ -529,6 +529,7 @@ let agent = AgentBuilder::new()
 | `ys-core` | 消息、Tool Call、事件和序列化；**终止原因（含 `NoOutput`）的序列化字面量契约** |
 | `/effort`（思考档位） | `EffortLevel` 七档 `FromStr` / `Display` / serde 往返（`default` 与未知值被拒）；`SetEffort` 协议双形态往返；`SessionMeta.effort` 可缺省与往返；有效强度 = 会话覆盖 > 配置默认（`high`）；provider 能力门控（`supports_reasoning_effort`）；`set_effort` 重建模型 / 无凭证清空 / 不支持提示；`/resume` 还原、回合末三态写穿；TUI 四形态解析与本地显示 |
 | `BasicLoop` | 文本回复、工具调用、模型错误、工具错误、取消、最大轮数、增量拼接与终态消息一致、截断保护；**工具超时闸（工具声明 → `bash_timeout` → 300s）**；**并行批闸门与保序**（默认串行 `C1,R1,C2,R2` 不变；全 safe 才并行 `C1,C2,R1,R2`；混合退回串行；`max_parallel_tools` 限流）；**空 / 纯思考响应 ⇒ `NoOutput`**（不再静默当 `Completed`，空白字符同样算空）；**空响应重试一次**（首轮空 + 次轮正常 ⇒ `Completed`、`rounds == 2`；两轮空 ⇒ `NoOutput`、`rounds == 2`；`retry_empty_response = false` ⇒ 首轮即 `NoOutput`、`rounds == 1`）；**截断续写一次**（纯文本截断 ⇒ 回喂续写催促 + 继续，续写后完成 ⇒ `Completed`、`rounds == 2`；续写仍截断 ⇒ `Truncated`、`rounds == 2`；带工具调用的截断仍整批作废 + 继续，不设上限）；**回合级工具输出闸门**（超预算降最旧、保留最新、配对完整；`budget = 0` / 未超预算 ⇒ 会话逐字节不变）|
+| `TUI 滚动`（视窗化） | **视窗渲染 ≡ 整段渲染**（逐行相同）；N4（逐条目折行之和 == 整段折行）；**视窗有界**（送进渲染的行数 ≤ 视窗高 + 1，与 transcript 长度无关）；内容未变 ⇒ 不重新解析；**视窗原地不动**（新内容到达不把视窗拽回底部）+ 状态行「↓ 有新内容」提示位；跳到最新/最早（`End` / `Ctrl+End` / `Ctrl+↓` / `Ctrl+Home` / `Ctrl+↑`）；`PageUp/PageDown` 步长 = 视窗高 − 1（ADR-0045） |
 | `Registry` | 注册、查找、重复名称和缺失组件 |
 | `Session` | 追加消息、保存恢复、空会话和损坏数据；损坏行跳过计数，悬空 `ToolUse` 合成错误结果并先原子落盘，修复摘要一次性取出 |
 | `EventSink` | 事件顺序、失败传播和 Noop Sink |

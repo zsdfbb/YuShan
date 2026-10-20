@@ -25,8 +25,20 @@ pub struct App {
     pub transcript: Vec<TranscriptLine>,
     /// 距底部向上滚动的**视觉行数**（0 = 贴底）。
     pub scroll_offset: usize,
-    /// 贴底跟随（新内容到达时自动滚到底）。
+    /// 贴底跟随（`scroll_offset` 恒为 0）。
+    ///
+    /// **新内容到达不再强制置真** —— 用户往上翻后，视窗原地不动（见
+    /// [`App::sync_scroll_state`] 的增量补偿），只有「跳到底部」这类显式动作才回到跟随。
     pub follow: bool,
+    /// 脱离底部期间**下方又来了新内容** —— 状态行据此提示「↓ 有新内容」。
+    ///
+    /// 只由「内容追加到尾部」置真（流式增量、工具行、回合结算行…）；
+    /// 原地改写（工具结果回填）不置真 —— 那不是「下方的新内容」。
+    pub new_content_below: bool,
+    /// 上一次同步布局时的总视觉行数 —— 增量补偿的基准（见 [`App::sync_scroll_state`]）。
+    ///
+    /// `None` = **还没同步过**：首次同步不补偿（此前没有「上一帧的行号空间」可对）。
+    last_total_rows: Option<usize>,
     pub input: InputBuffer,
     pub completion: Option<CompletionState>,
     /// 命令要开模态浮层（`/login` / `/model` 无参）—— **由 `run.rs` 消费**。
@@ -76,10 +88,14 @@ pub struct App {
     pub current_round: Option<u32>,
     /// assistant 渲染产物缓存 + 流式节流状态（设计 §2.5）。
     ///
-    /// `RefCell`：`draw.rs` 的 `build_text_with` / `total_rows` 走 `&App`，而缓存需要
-    /// 可变访问；UI 侧单线程、无重入 ⇒ 单借用、无竞态（不变量 5）。缓存是**纯 memo**，
+    /// `RefCell`：`layout.rs` 的条目渲染走 `&App`，而缓存需要可变访问；
+    /// UI 侧单线程、无重入 ⇒ 单借用、无竞态（不变量 5）。缓存是**纯 memo**，
     /// 清空只损失 CPU、绝不改变输出。
     pub(crate) md_cache: std::cell::RefCell<crate::cache::RenderCache>,
+    /// transcript 的**视窗化布局**记忆（逐条目记折行行数）—— 见 [`crate::layout`]。
+    ///
+    /// `RefCell`：`layout` 走 `&App`（帧路径与事件路径共用），内部需要可变访问。
+    pub(crate) layout: std::cell::RefCell<crate::layout::TranscriptLayout>,
     /// `ToolCallId` → transcript 下标 —— 工具结果据此回填到对应的 Tool 行。
     pub(crate) tool_index: HashMap<ToolCallId, usize>,
     /// 本地回显抑制计数：提交时已本地 push 的那条 `UserMessage`，
@@ -111,6 +127,8 @@ impl App {
             transcript: Vec::new(),
             scroll_offset: 0,
             follow: true,
+            new_content_below: false,
+            last_total_rows: None,
             input: InputBuffer::new(),
             completion: None,
             pending_prompt: None,
@@ -124,6 +142,7 @@ impl App {
             working_dot: 0,
             current_round: None,
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
+            layout: std::cell::RefCell::new(crate::layout::TranscriptLayout::default()),
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
             pending_echo_texts: VecDeque::new(),
@@ -140,7 +159,8 @@ impl App {
             Outbound::Output(text) => {
                 // 命令期间的输出（如 `/login` 的 "✓ Logged in"）进 transcript（设计 §5）
                 self.transcript.push(TranscriptLine::System(text));
-                self.follow = true;
+                // 内容追加在**尾部** ⇒ 脱离底部时视窗原地不动（只置提示位）。
+                self.note_appended_below();
             }
             Outbound::Quit => self.should_quit = true,
             // 会话列表（`/resume` 无参的响应）。**空列表不弹空浮层**，只提示（I4）——
@@ -196,6 +216,9 @@ impl App {
         // 等长碰撞陷阱 ⇒ 必须显式 reset，不能指望 `sync_len` 兜住）。
         self.transcript.clear();
         self.md_cache.borrow_mut().reset();
+        // 布局记忆（逐条目折行行数）同样作废 —— transcript 整体被替换。
+        self.layout.borrow_mut().reset();
+        self.last_total_rows = None;
         self.tool_index.clear();
         self.suppress_user_echo = 0;
         self.pending_echo_texts.clear();
@@ -263,7 +286,8 @@ impl App {
                     self.turn_started_at = Some(Instant::now());
                     self.current_round = None;
                 }
-                self.follow = true;
+                // 内容追加在**尾部** ⇒ 脱离底部时视窗原地不动（只置提示位）。
+                self.note_appended_below();
             }
             // 轮开始：回合进行中唯一的「进度刻度」。**不产生任何显示行** —— 只更新
             // 状态行用的轮号（`draw.rs` 的 `status_text` 在回合中显示它）。
@@ -287,7 +311,8 @@ impl App {
                 // 或把 id 映射成多条下标。当前行为由
                 // `test_duplicate_tool_call_id_overwrites_mapping` 钉住。
                 self.tool_index.insert(call.id, idx);
-                self.follow = true;
+                // 内容追加在**尾部** ⇒ 脱离底部时视窗原地不动（只置提示位）。
+                self.note_appended_below();
             }
             AgentEvent::ToolResult { id, result } => {
                 if let Some(&idx) = self.tool_index.get(&id)
@@ -335,7 +360,7 @@ impl App {
                 self.transcript.push(TranscriptLine::System(format!(
                     "context compacted: ~{estimated_tokens_before} → ~{estimated_tokens_after} tokens ({summarized} summarized, {kept} kept)"
                 )));
-                self.follow = true;
+                self.note_appended_below();
             }
             AgentEvent::ContextCompactionFailed { reason } => {
                 // 压缩失败不终止回合（session 未改动，本轮照常继续）——
@@ -343,7 +368,7 @@ impl App {
                 self.transcript.push(TranscriptLine::Error(format!(
                     "context compaction failed: {reason}"
                 )));
-                self.follow = true;
+                self.note_appended_below();
             }
             AgentEvent::ResponseTruncated { dropped_tool_calls } => {
                 // 非终局事件：有工具调用时循环会**继续**（那批工具被作废、未执行），
@@ -357,7 +382,7 @@ impl App {
                     )
                 };
                 self.transcript.push(TranscriptLine::System(msg));
-                self.follow = true;
+                self.note_appended_below();
             }
             _ => {} // AgentEvent 是 #[non_exhaustive]
         }
@@ -396,9 +421,92 @@ impl App {
         format!("Working{}", ".".repeat(1 + self.working_dot as usize))
     }
 
-    /// 滚动上限（视觉行数）—— 委托 `draw`（那里才知道 wrap 规则）。
-    pub fn compute_max_scroll(&self, width: u16, height: u16) -> usize {
+    /// 滚动上限（视觉行数）—— 同步布局后返回。
+    ///
+    /// 顺带把滚动状态夹到有效范围（resize 后行号空间变了）—— 见 [`App::sync_scroll_state`]。
+    pub fn compute_max_scroll(&mut self, width: u16, height: u16) -> usize {
         crate::draw::max_scroll_offset(self, width, height)
+    }
+
+    /// 同步布局（逐条目的折行记忆）并维护滚动状态。
+    ///
+    /// 返回视窗顶部的**全局视觉行号**与滚动上限 —— 帧路径据此渲染视窗，
+    /// 事件路径据此夹取 `scroll_offset`。两处读**同一份**布局 ⇒ 画面与滚动必然一致。
+    ///
+    /// # 「视窗原地不动」
+    ///
+    /// 脱离底部（`follow == false`）时，内容在**尾部**增长 Δ 行不应把用户拽下去 ——
+    /// 故把 `scroll_offset` 也加 Δ（它是「距底部行数」）：视窗顶部那一行不动。
+    /// 宽度变化时行号空间整个换掉 ⇒ 不补偿（宽度变化本就重排内容）。
+    pub(crate) fn sync_scroll_state(
+        &mut self,
+        width: u16,
+        height: u16,
+        now: Instant,
+    ) -> crate::layout::ScrollState {
+        let (inner_w, inner_h) = crate::draw::chat_viewport(self, width, height);
+        if inner_h == 0 {
+            return crate::layout::ScrollState::default();
+        }
+        let (total_rows, width_changed) = {
+            let mut cache = self.md_cache.borrow_mut();
+            let mut layout = self.layout.borrow_mut();
+            let result = layout.sync(
+                &self.transcript,
+                &mut cache,
+                self.thinking_visible,
+                inner_w,
+                now,
+            );
+            (result.total_rows, result.width_changed)
+        };
+
+        // 增量补偿：内容在尾部增长 ⇒ 视窗原地不动。
+        // 首次同步不补偿（没有「上一帧的行号空间」可对）。
+        if let Some(previous) = self.last_total_rows
+            && !self.follow
+            && !width_changed
+            && total_rows > previous
+        {
+            self.scroll_offset += total_rows - previous;
+        }
+        self.last_total_rows = Some(total_rows);
+
+        let max_scroll = total_rows.saturating_sub(inner_h as usize);
+        if self.follow {
+            self.scroll_offset = 0;
+            self.new_content_below = false;
+        } else {
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+        }
+        let top_row = max_scroll.saturating_sub(self.scroll_offset);
+        crate::layout::ScrollState {
+            max_scroll,
+            top_row,
+        }
+    }
+
+    /// 记「有新内容追加到**下方**」—— 脱离底部时用于状态行提示。
+    ///
+    /// 只在**尾部追加**时调用；原地改写（工具结果回填）不调用 ——
+    /// 那不是「下方的新内容」。
+    fn note_appended_below(&mut self) {
+        if !self.follow {
+            self.new_content_below = true;
+        }
+    }
+
+    /// 跳到**最新内容**（末尾）—— 恢复贴底跟随，并清掉「有新内容」提示。
+    pub fn jump_to_end(&mut self) {
+        self.scroll_offset = 0;
+        self.follow = true;
+        self.new_content_below = false;
+    }
+
+    /// 跳到**最早内容**（顶部）—— 脱离跟随。
+    pub fn jump_to_start(&mut self, max_scroll: usize) {
+        self.scroll_offset = max_scroll;
+        self.follow = false;
     }
 
     /// 本回合已用秒数（回合未开始时为 0）。`draw.rs` 的状态行要用 ⇒ `pub(crate)`。
@@ -433,7 +541,8 @@ impl App {
         self.current_round = None;
         self.suppress_user_echo = 0;
         self.tool_index.clear();
-        self.follow = true;
+        // **不**强制贴底：回合结算行（Summary）已按「尾部追加」记过提示位。
+        // 视窗在底部时靠 `follow` 继续跟随；用户翻上去时视窗原地不动。
     }
 
     /// 流式增量：末尾同为该类型则追加，否则新起一条。
@@ -456,7 +565,8 @@ impl App {
                 StreamKind::Thinking => TranscriptLine::Thinking(text),
             });
         }
-        self.follow = true;
+        // 流式增量追加在**尾部** ⇒ 脱离底部时视窗原地不动（只置提示位）。
+        self.note_appended_below();
     }
 }
 
@@ -883,6 +993,7 @@ mod tests {
     #[test]
     fn test_non_echo_user_message_while_idle_is_review_system_line() {
         let mut a = app();
+        a.follow = false;
         assert!(!a.is_turning, "前置：不在 turn 态（主回合已 RunFinished）");
         assert!(a.turn_started_at.is_none());
 
@@ -897,7 +1008,11 @@ mod tests {
         }
         assert!(a.is_turning, "复核回合同样是一个回合 ⇒ 点亮 Working");
         assert!(a.turn_started_at.is_some(), "复核回合 elapsed 从此刻起算");
-        assert!(a.follow, "新内容到达 → 回到贴底");
+        assert!(
+            !a.follow,
+            "新内容到达**不得**把视窗拽回底部（视窗原地不动）"
+        );
+        assert!(a.new_content_below, "脱离底部时提示「下方有新内容」");
     }
 
     /// **回归护栏**：`is_turning == true` 时到达的非回显 `UserMessage` 仍是
@@ -1333,6 +1448,7 @@ mod tests {
     #[test]
     fn test_context_compacted_pushes_system_line() {
         let mut a = app();
+        a.follow = false;
         a.apply_event(env(AgentEvent::ContextCompacted {
             estimated_tokens_before: 12_000,
             estimated_tokens_after: 3_500,
@@ -1350,7 +1466,8 @@ mod tests {
             }
             other => panic!("expected System, got {other:?}"),
         }
-        assert!(a.follow, "新内容到达 → 回到贴底");
+        assert!(!a.follow, "新内容到达**不得**把视窗拽回底部");
+        assert!(a.new_content_below, "脱离底部时提示「下方有新内容」");
     }
 
     /// 压缩失败：推一条 `Error` 行，且**不结束回合**（session 未改动，本轮继续）。
@@ -1450,6 +1567,7 @@ mod tests {
     #[test]
     fn test_response_truncated_without_tool_calls_omits_tool_wording() {
         let mut a = app();
+        a.follow = false;
         a.apply_event(env(AgentEvent::ResponseTruncated {
             dropped_tool_calls: 0,
         }));
@@ -1462,7 +1580,8 @@ mod tests {
             }
             other => panic!("expected System, got {other:?}"),
         }
-        assert!(a.follow, "新内容到达 → 回到贴底");
+        assert!(!a.follow, "新内容到达**不得**把视窗拽回底部");
+        assert!(a.new_content_below, "脱离底部时提示「下方有新内容」");
     }
 
     #[test]
@@ -1656,8 +1775,65 @@ mod tests {
             "回放前必须清屏（旧会话的行不得残留）：{:?}",
             a.transcript
         );
-        assert!(a.thinking_visible, "thinking 跟随目标会话的 meta（有意破例）");
+        assert!(
+            a.thinking_visible,
+            "thinking 跟随目标会话的 meta（有意破例）"
+        );
         assert!(a.follow, "回放后回到贴底");
+    }
+
+    /// **视窗原地不动**：用户往上翻之后，新内容到达**不得**把视窗拽回底部。
+    ///
+    /// 这是「翻到前面却被自动刷回输入处」那个问题的正解：
+    /// 视窗顶部那一行（`top_row`）在新内容到达前后必须**完全相同**。
+    #[test]
+    fn test_detached_view_stays_put_when_new_content_arrives() {
+        let mut a = app();
+        for i in 0..60 {
+            a.transcript.push(TranscriptLine::User(format!("行 {i}")));
+        }
+        let now = Instant::now();
+        let base = a.sync_scroll_state(120, 40, now);
+        assert!(a.follow, "前置：默认贴底");
+
+        // 脱离底部：向上滚 10 行。
+        a.follow = false;
+        a.scroll_offset = 10;
+        let before = a.sync_scroll_state(120, 40, now);
+        assert_eq!(
+            before.top_row,
+            base.max_scroll - 10,
+            "视窗顶部 = 上限 − 偏移"
+        );
+
+        // 新内容到达（流式增量）⇒ 视窗原地不动。
+        a.apply_event(env(AgentEvent::ModelTextDelta {
+            text: "新的一行内容".into(),
+        }));
+        let after = a.sync_scroll_state(120, 40, now);
+        assert_eq!(after.top_row, before.top_row, "新内容到达不得把视窗拽走");
+        assert!(!a.follow, "不得脱离跟随地回到贴底");
+        assert!(a.new_content_below, "脱离底部时提示「下方有新内容」");
+    }
+
+    /// 跳到最新内容 ⇒ 恢复贴底并清掉「有新内容」提示。
+    #[test]
+    fn test_jump_to_end_restores_follow_and_clears_hint() {
+        let mut a = app();
+        for i in 0..60 {
+            a.transcript.push(TranscriptLine::User(format!("行 {i}")));
+        }
+        let now = Instant::now();
+        a.sync_scroll_state(120, 40, now);
+        a.follow = false;
+        a.scroll_offset = 10;
+        a.new_content_below = true;
+
+        a.jump_to_end();
+
+        assert!(a.follow, "跳到底部 ⇒ 恢复贴底");
+        assert_eq!(a.scroll_offset, 0, "跳到底部 ⇒ 偏移归零");
+        assert!(!a.new_content_below, "跳到底部 ⇒ 提示清零");
     }
 
     #[test]

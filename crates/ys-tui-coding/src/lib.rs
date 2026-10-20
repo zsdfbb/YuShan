@@ -39,6 +39,7 @@ mod draw;
 mod events;
 mod format;
 mod input;
+mod layout;
 mod md;
 mod prompter;
 mod run;

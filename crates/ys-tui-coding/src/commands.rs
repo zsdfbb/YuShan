@@ -349,8 +349,33 @@ pub fn help_text() -> String {
         out.push_str(&spec_line(spec));
         out.push('\n');
     }
+    out.push('\n');
+    out.push_str(KEY_HELP);
     out.trim_end().to_string()
 }
+
+/// `/help` 里的**键位**段 —— 导航与输入编辑。
+///
+/// **为什么要有这一段**：滚动键（`↑↓` / `PageUp` / `End` …）此前没有任何界面出口，
+/// 用户只能试 —— 而「跳到最新消息」是高频操作，试不出来就等于没有。
+///
+/// 键位取 **Mac / Linux 通用**的那一套：`Ctrl+↑/↓` 与 `Ctrl+Home/End` 都是
+/// 终端无关的（`CSI 1;5A` 一类）。**不列 `⌘` 组合** —— macOS 终端自己消费 `⌘`，
+/// 字节到不了应用（见 `events.rs` 模块头）。
+const KEY_HELP: &str = "键位：
+  ↑ ↓                滚动对话（脱离底部即停止跟随，新内容不再拽你回去）
+  PageUp / PageDown  翻页（一页 = 视窗高度）
+  End                跳到最新消息
+  Ctrl+↓ / Ctrl+End  跳到最新消息
+  Ctrl+↑ / Ctrl+Home 跳到最早消息
+  Home               输入行首（Ctrl+A 同义）
+  Ctrl+A / Ctrl+E    输入行首 / 行尾
+  ← →                输入光标（Ctrl 或 ⌥ + ← → 按词移动）
+  Enter              提交（Shift/Alt+Enter 或 Ctrl+J 换行）
+  Tab                补全浮层
+  Esc                取消回合 / 清空输入
+  Ctrl+C             取消回合；再按一次退出
+  Ctrl+D             退出";
 
 /// `/help` 的正文（**含 skill 段**）—— 内置命令表之后追加一段 skill 名清单。
 ///
@@ -662,12 +687,7 @@ mod tests {
             "缺 SetModel"
         );
         assert!(
-            has(|r| matches!(
-                r,
-                Request::SetEffort {
-                    effort: Some(_)
-                }
-            )),
+            has(|r| matches!(r, Request::SetEffort { effort: Some(_) })),
             "缺 SetEffort（设定档位）"
         );
         assert!(has(|r| matches!(r, Request::Login { .. })), "缺 Login");
@@ -1044,6 +1064,27 @@ mod tests {
         assert!(a.thinking_visible);
         apply_local(&mut a, LocalAction::Thinking(Some(false)));
         assert!(!a.thinking_visible, "显式 off");
+    }
+
+    /// `/help` 必须列出**键位** —— 滚动键此前没有任何界面出口（用户只能试）。
+    #[test]
+    fn test_help_text_contains_key_bindings() {
+        let text = help_text();
+        assert!(text.contains("键位："), "help 必须有键位段");
+        for key in [
+            "End",
+            "Ctrl+↓",
+            "Ctrl+↑",
+            "Ctrl+Home",
+            "Ctrl+End",
+            "PageUp",
+            "PageDown",
+            "Home",
+        ] {
+            assert!(text.contains(key), "键位段必须列出 {key}");
+        }
+        // `⌘` 组合到不了应用（终端自己消费）⇒ 不得出现在键位表里。
+        assert!(!text.contains('⌘'), "键位表不得列 ⌘ 组合（终端消费不到）");
     }
 
     #[test]

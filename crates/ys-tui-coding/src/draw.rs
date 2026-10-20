@@ -9,15 +9,18 @@
 //! └────────────────────────────────┘
 //! ```
 //!
-//! # 滚动模型（修正旧实现最大的 bug）
+//! # 滚动模型
 //!
-//! 旧 `ui/draw.rs:176-179` 对 assistant **不做 wrap**，每 `TranscriptLine` 算
-//! **1 行** scroll 单位；而外层 `Paragraph` 又会真 wrap —— 二者不一致，滚动位置
-//! 与实际看到的完全错位。
+//! 滚动以 **wrap 后的视觉行**为单位（不是 transcript 条目数）——
+//! 旧实现每条 `TranscriptLine` 算 1 行、而外层 `Paragraph` 又会真 wrap，
+//! 二者不一致，滚动位置与实际看到的完全错位。
 //!
-//! 本实现：**先建完整 `Text`，再用 `Paragraph::line_count(width)` 数 wrap 后的
-//! 视觉行数**（ratatui 内部 `WordWrapper` 的同一实现，故与渲染严格一致），
-//! 滚动以**视觉行**为单位，用 `Paragraph::scroll` 落到画面上。
+//! 折行口径用 ratatui 自己的 `Paragraph::line_count`（内部 `WordWrapper` 的同一实现，
+//! 故与渲染严格一致；**不自写折行** —— CJK 列宽必须与渲染一致）。
+//!
+//! **视窗化**（ADR-0045）：折行结果按**条目**记住（[`crate::layout`]），
+//! 渲染只取视窗覆盖的那些行 ⇒ 滚动与重绘的成本**与会话长度解耦**。
+//! 视窗切片依赖「整段折行 == 逐行折行之和」（N4）。
 
 use std::time::Instant;
 
@@ -99,11 +102,12 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    // 帧时钟：帧内**只有 `draw_transcript` 一处**取产物，但它内部要取两次 ——
-    // `build_text` 拿到产物、随后的 `line_count` 数它的视觉行数。二者必须基于**同一份**
-    // 产物，否则画面按一份、滚动数学按另一份，二者错位（设计 §2.5 边界 ①）。
-    // 故这里只取一次 `now`，一路传下去。
+    // 帧时钟：帧内**只有一处**取时刻（`layout` 同步），一路传下去。
     let now = Instant::now();
+
+    // 同步布局（逐条目的折行记忆）并维护滚动状态 ⇒ 得到视窗顶部的全局视觉行号。
+    // 滚动数学与画面读**同一份**布局，故不会出现「滚动按新、画面按旧」。
+    let scroll = app.sync_scroll_state(area.width, area.height, now);
 
     let chunks = Layout::vertical([
         Constraint::Min(3),                                // Chat
@@ -112,7 +116,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    draw_transcript(frame, chunks[0], app, now);
+    draw_transcript(frame, chunks[0], app, scroll.top_row);
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
 
@@ -163,64 +167,61 @@ fn chat_block() -> Block<'static> {
         .title(" Chat ")
 }
 
+/// Chat 内区几何（**宽、高**）—— 滚动数学与渲染共用同一份。
+///
+/// 需要终端尺寸：wrap 行数依赖宽度、可见行数依赖高度。尺寸太小（[`ui`] 不渲染）时返回 `(0, 0)`。
+pub(crate) fn chat_viewport(app: &App, width: u16, height: u16) -> (u16, u16) {
+    let area = Rect::new(0, 0, width, height);
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return (0, 0);
+    }
+    let chat = chat_area(app, area);
+    let inner = chat_block().inner(chat);
+    (inner.width.max(1), inner.height)
+}
+
 /// 允许的最大 `scroll_offset`（**视觉行**，0 = 贴底）。
 ///
 /// 需要终端尺寸 —— 因为 wrap 行数依赖宽度、可见行数依赖高度。
-/// 尺寸太小（[`ui`] 不渲染）时不滚动。
 ///
 /// **这是事件路径的入口**（↑↓ / resize 时夹取 `scroll_offset`，见 `events.rs` / `run.rs`）；
-/// 该路径没有帧时钟，故这里自取当前时刻。
-///
-/// 它与帧路径（[`ui`] → [`draw_transcript`]）的一致性**不靠共用时钟**：节流状态存在
-/// `RenderCache` 内，同一帧内两处读到的是**同一份**「上次产物」，故即便各自取时刻，
-/// 也不会「滚动按新、画面按旧」（设计 §2.5 边界 ①）。
-pub fn max_scroll_offset(app: &App, width: u16, height: u16) -> usize {
+/// 该路径没有帧时钟，故这里自取当前时刻。同步布局顺带把滚动状态夹到有效范围
+/// （见 [`App::sync_scroll_state`]）。
+pub fn max_scroll_offset(app: &mut App, width: u16, height: u16) -> usize {
     max_scroll_offset_at(app, width, height, Instant::now())
 }
 
 /// [`max_scroll_offset`] 的内部形态：显式传入 `now` —— 令单测能确定性注入时刻、
 /// 不依赖真实时钟（生产的事件路径经 [`max_scroll_offset`] 自取）。
-fn max_scroll_offset_at(app: &App, width: u16, height: u16, now: Instant) -> usize {
-    let area = Rect::new(0, 0, width, height);
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        return 0;
-    }
-    let chat = chat_area(app, area);
-    let inner = chat_block().inner(chat);
-    let inner_w = inner.width.max(1);
-    let inner_h = inner.height as usize;
-    total_rows(app, inner_w, now).saturating_sub(inner_h)
+pub fn max_scroll_offset_at(app: &mut App, width: u16, height: u16, now: Instant) -> usize {
+    app.sync_scroll_state(width, height, now).max_scroll
 }
 
-/// transcript 在 `width` 下 wrap 后的总视觉行数。
-fn total_rows(app: &App, width: u16, now: Instant) -> usize {
-    Paragraph::new(build_text(app, width as usize, now))
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-}
-
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, now: Instant) {
+/// 画对话区 —— **只画视窗覆盖的那些行**（[`crate::layout`]）。
+///
+/// `top_row` 是视窗顶部的**全局视觉行号**（由 [`App::sync_scroll_state`] 给出），
+/// 与滚动数学读的是同一份布局 ⇒ 画面与滚动位置必然一致。
+///
+/// 视窗切片依赖「整段折行 == 逐行折行之和」（N4）—— 故切片后拼起来与整段折行等价。
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize) {
     let block = chat_block();
     let inner = block.inner(area);
-    let inner_w = inner.width.max(1);
     let inner_h = inner.height as usize;
-    let text = build_text(app, inner_w as usize, now);
 
-    let total = Paragraph::new(text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(inner_w);
-    let bottom = total.saturating_sub(inner_h);
-    // follow：贴底；否则从底部向上数 scroll_offset 行
-    let offset = if app.follow {
-        bottom
+    let window = app.layout.borrow().window(top_row, inner_h);
+    // 空 transcript ⇒ 占位一行（与旧实现同形）。
+    let lines = if window.lines.is_empty() && app.transcript.is_empty() {
+        vec![Line::from(Span::styled(
+            "(no messages yet)",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else {
-        bottom.saturating_sub(app.scroll_offset)
+        window.lines
     };
-
-    let para = Paragraph::new(text)
+    let para = Paragraph::new(Text::from(lines))
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((offset.min(u16::MAX as usize) as u16, 0));
+        .scroll((window.skip_rows.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(para, area);
 }
 
@@ -420,19 +421,22 @@ fn prompt_select(
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        lines.extend(filtered[start..start + visible].iter().enumerate().map(
-            |(i, idx)| {
-                let style = if start + i == selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                Line::from(Span::styled(
-                    truncate_to_width(&options[*idx], inner_w),
-                    style,
-                ))
-            },
-        ));
+        lines.extend(
+            filtered[start..start + visible]
+                .iter()
+                .enumerate()
+                .map(|(i, idx)| {
+                    let style = if start + i == selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(
+                        truncate_to_width(&options[*idx], inner_w),
+                        style,
+                    ))
+                }),
+        );
         if filtered.len() > visible {
             lines.push(Line::from(Span::styled(
                 format!("… {}/{}", selected + 1, filtered.len()),
@@ -534,6 +538,11 @@ fn status_text(app: &App, width: usize) -> String {
     };
 
     let mut segs = vec![model];
+    // 「下方有新内容」提示：脱离底部时才有 —— 排在 model 之后、其余段之前，
+    // 于是窄终端下先被剥掉的是 tokens / 轮数 / 时长，提示与 model 都留得住。
+    if app.new_content_below {
+        segs.push("↓ 有新内容".to_string());
+    }
     if app.is_turning {
         if let Some(round) = app.current_round {
             segs.push(format!("第 {round} 轮"));
@@ -564,13 +573,16 @@ fn status_text(app: &App, width: usize) -> String {
 
 /// transcript → 完整的、带样式的文本（**不做 wrap** —— 交给 `Paragraph`）。
 ///
-/// `width` 只用于需要「截断到宽度」的地方（工具失败结果首行）。
-fn build_text(app: &App, width: usize, now: Instant) -> Text<'static> {
+/// **仅测试用**：它是「整段折行」这条参考路径 —— 视窗化渲染（[`crate::layout`]）
+/// 的等价性用例拿它当对照。生产路径不再拼整段文本。
+#[cfg(test)]
+pub(crate) fn build_text(app: &App, width: usize, now: Instant) -> Text<'static> {
     build_text_with(app, width, app.thinking_visible, now)
 }
 
 /// `build_text` 的完整形态：显式传入 thinking 可见性
 /// （TUI 与退出回放共用同一个开关值）。
+#[cfg(test)]
 fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant) -> Text<'static> {
     if app.transcript.is_empty() {
         return Text::from(vec![Line::from(Span::styled(
@@ -584,11 +596,21 @@ fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant
     // 二者都由 `gap_rows` 统一算（两条渲染路径共用同一套规则）。
     let mut prev_class: Option<LineClass> = None;
     let mut has_visible = false;
+    let mut cache = app.md_cache.borrow_mut();
+    cache.sync_len(app.transcript.len());
     for (idx, item) in app.transcript.iter().enumerate() {
         let gap = gap_rows(item, prev_class, has_visible, thinking_visible);
         // 先算再借：`gap_rows` 要读 `lines` 的当前长度，而紧接着要可变借它。
         lines.extend((0..gap).map(|_| Line::from("")));
-        push_transcript_line(&mut lines, item, width, thinking_visible, app, idx, now);
+        push_transcript_line(
+            &mut lines,
+            item,
+            width,
+            thinking_visible,
+            &mut cache,
+            idx,
+            now,
+        );
         // 不可见的条目（隐藏的思考、空 assistant）不推进状态 ——
         // 它们在屏上不存在，不该切块边界。
         if is_visible(item, thinking_visible) {
@@ -614,7 +636,7 @@ fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant
 ///
 /// 只返回**计数**、不代插入（两条渲染路径的目标容器不同：TUI 是 `Vec<Line>`、
 /// 退出回放是 `Vec<String>`）。
-fn gap_rows(
+pub(crate) fn gap_rows(
     item: &TranscriptLine,
     prev_class: Option<LineClass>,
     has_visible_before: bool,
@@ -655,7 +677,7 @@ fn user_gap_rows(item: &TranscriptLine, has_visible_before: bool) -> usize {
 /// 拆成两类会在中间插空白，把一串工具调用切碎。两者在块**内部**的层次差
 /// 由 [`ACTION_INDENT`] / [`ACTION_TOOL_INDENT`] 表达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineClass {
+pub(crate) enum LineClass {
     Prompt,
     Action,
     Content,
@@ -666,7 +688,7 @@ impl LineClass {
     ///
     /// `Summary` / `Error` / `System` 归 [`LineClass::Content`] —— 它们是模型的
     /// **产物或提示**，与 assistant 文本同属「内容」一侧，不该带行动块的缩进。
-    fn of(item: &TranscriptLine) -> Self {
+    pub(crate) fn of(item: &TranscriptLine) -> Self {
         match item {
             TranscriptLine::User(_) => Self::Prompt,
             TranscriptLine::Thinking(_) | TranscriptLine::Tool { .. } => Self::Action,
@@ -697,7 +719,7 @@ impl LineClass {
 /// 若用「产出行数」当判据，两条路径会在**空 assistant** 之后给出不同的留白。
 ///
 /// 不可见的条目**不推进**「上一条类别」—— 它在屏上不存在，不该切块边界。
-fn is_visible(item: &TranscriptLine, thinking_visible: bool) -> bool {
+pub(crate) fn is_visible(item: &TranscriptLine, thinking_visible: bool) -> bool {
     match item {
         TranscriptLine::Thinking(s) => thinking_visible && !s.is_empty(),
         TranscriptLine::Assistant(s) => !s.is_empty(),
@@ -731,31 +753,31 @@ fn block_gap_rows(
     }
 }
 
-fn push_transcript_line(
+/// 一个 transcript 条目 → 它的渲染行（**不含**前置留白）。
+///
+/// `cache` 由调用方持有（`RenderCache` 的 `RefCell` 守卫不得跨调用带出切片 ——
+/// **借用纪律**：`lines_for` 返回的切片生命周期绑在守卫上，必须在守卫作用域内 clone
+/// 进目标，不得带出；不重入 `borrow_mut`）。
+pub(crate) fn push_transcript_line(
     out: &mut Vec<Line<'static>>,
     item: &TranscriptLine,
     width: usize,
     thinking_visible: bool,
-    app: &App,
+    cache: &mut crate::cache::RenderCache,
     idx: usize,
     now: Instant,
 ) {
     if let TranscriptLine::Assistant(s) = item {
-        // assistant markdown 走缓存 + `md::render`（**借用纪律**：`lines_for` 返回的切片
-        // 生命周期绑在守卫上，必须在守卫作用域内 clone 进目标，不得带出；不重入 `borrow_mut`）。
-        {
-            let mut cache = app.md_cache.borrow_mut();
-            cache.sync_len(app.transcript.len());
-            let styles = crate::styles::AssistantStyles;
-            out.extend(cache.lines_for(idx, s, width, styles, now).iter().cloned());
-        }
+        // assistant markdown 走缓存 + `md::render`
+        let styles = crate::styles::AssistantStyles;
+        out.extend(cache.lines_for(idx, s, width, styles, now).iter().cloned());
         return;
     }
     push_non_assistant(out, item, width, thinking_visible);
 }
 
 /// 非 `Assistant` 变体 → 行（TUI 与退出回放共用，行为一致）。
-fn push_non_assistant(
+pub(crate) fn push_non_assistant(
     out: &mut Vec<Line<'static>>,
     item: &TranscriptLine,
     width: usize,
@@ -882,6 +904,21 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
         // 「空产出」不是错误也不是完成：用 ∅ 表示「回合结束了，但模型什么也没给出」。
         StopReason::NoOutput => "∅",
         _ => "?",
+    }
+}
+
+/// `StopReason` → 一个稳定的数值键 —— 供条目内容签名用（见 [`crate::layout`]）。
+///
+/// `StopReason` 没有 `Hash` 派生（且是 `#[non_exhaustive]`），故手工映射；
+/// 未知变体一律落 `_` ⇒ 同一个键（它们渲染出的字符也相同）。
+pub(crate) fn stop_key(stop: &StopReason) -> u64 {
+    match stop {
+        StopReason::Completed => 1,
+        StopReason::MaxRounds => 2,
+        StopReason::Cancelled => 3,
+        StopReason::Truncated => 4,
+        StopReason::NoOutput => 5,
+        _ => 0,
     }
 }
 
@@ -1079,6 +1116,133 @@ mod tests {
         rows_of(app, w, h).concat()
     }
 
+    /// **视窗化渲染 ≡ 整段渲染**（逐行相同）—— 视窗化的核心安全网。
+    ///
+    /// 视窗渲染只取视窗覆盖的那些行再折行；整段渲染把整份 transcript 折一遍再滚。
+    /// 两者必须**逐行相同** —— 否则「滚动后画面错位」这类问题会悄悄回来。
+    ///
+    /// 依赖的不变量是「整段折行 == 逐行折行之和」（N4）。
+    ///
+    /// 覆盖：多个宽度（含 CJK 与表格）、多个滚动位置（含 0 / 中间 / 贴底）、
+    /// thinking 可见与隐藏、空 transcript。
+    #[test]
+    fn test_windowed_render_matches_full_render() {
+        for (w, h) in [(40u16, 20u16), (80, 30), (120, 40)] {
+            for thinking_visible in [false, true] {
+                let mut app = app_with(CodingView::for_test());
+                app.thinking_visible = thinking_visible;
+                app.transcript
+                    .push(TranscriptLine::User("问题：这段代码怎么读？".into()));
+                app.transcript.push(TranscriptLine::Assistant(
+                    "# 标题\n\n这是 **粗体** 与 `code` 的一段中文正文。\n\n- 要点一\n- 要点二\n\n```rust\nfn main() { println!(\"hi\"); }\n```\n".into(),
+                ));
+                app.transcript
+                    .push(TranscriptLine::Thinking("先想想再答。".into()));
+                app.transcript.push(TranscriptLine::User("继续".into()));
+                app.transcript.push(TranscriptLine::Assistant(
+                    "| 名称 | 值 |\n| -- | -- |\n| 中文 | 数字 |\n".into(),
+                ));
+
+                let chat = chat_area(&app, Rect::new(0, 0, w, h));
+                let inner = chat_block().inner(chat);
+                let inner_w = inner.width.max(1);
+                let inner_h = inner.height as usize;
+                let total = Paragraph::new(build_text(&app, inner_w as usize, Instant::now()))
+                    .wrap(Wrap { trim: false })
+                    .line_count(inner_w);
+                let max_scroll = total.saturating_sub(inner_h);
+
+                // 逐个滚动位置比对（贴底 + 中间 + 顶）。
+                let offsets: Vec<usize> = (0..=max_scroll.min(6))
+                    .chain([max_scroll / 2, max_scroll])
+                    .filter(|&o| o <= max_scroll)
+                    .collect();
+                for offset in offsets {
+                    app.follow = false;
+                    app.scroll_offset = offset;
+                    let windowed = chat_inner_rows(&rows_of(&mut app, w, h), &app, w, h);
+                    let full = chat_rows_full(&app, w, h, total.saturating_sub(inner_h + offset));
+                    assert_eq!(
+                        windowed, full,
+                        "w={w} h={h} thinking={thinking_visible} offset={offset}：视窗渲染与整段渲染必须逐行相同"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 视窗**有界**：送进 `Paragraph` 的行数不超过视窗高度 + 1 —— 无论 transcript 多长。
+    ///
+    /// 这是「滚动不再随会话长度变慢」的**结构性**断言（不依赖计时）：
+    /// 视窗化之后，渲染只碰视窗覆盖的那些行。
+    #[test]
+    fn test_window_is_bounded_by_viewport() {
+        let mut app = app_with(CodingView::for_test());
+        for i in 0..500 {
+            app.transcript.push(TranscriptLine::Assistant(
+                format!("第 {i} 条回答。").repeat(20),
+            ));
+        }
+        let (w, h) = (100u16, 40u16);
+        let now = Instant::now();
+        let state = app.sync_scroll_state(w, h, now);
+        assert!(state.max_scroll > 100, "前置：内容远长于一屏");
+
+        // 取若干个滚动位置，每次视窗的行数都必须有界。
+        for offset in [0usize, 1, 50, state.max_scroll / 2, state.max_scroll] {
+            app.follow = false;
+            app.scroll_offset = offset;
+            let inner_h = chat_block()
+                .inner(chat_area(&app, Rect::new(0, 0, w, h)))
+                .height as usize;
+            let window = app
+                .layout
+                .borrow()
+                .window(state.max_scroll.saturating_sub(offset), inner_h);
+            assert!(
+                window.lines.len() <= inner_h + 1,
+                "offset={offset}：视窗行数 {} 超过视窗高度 {inner_h} + 1",
+                window.lines.len()
+            );
+        }
+    }
+
+    /// Chat 内区的行（从整屏字符画里裁出来）。
+    fn chat_inner_rows(rows: &[String], app: &App, w: u16, h: u16) -> Vec<String> {
+        let chat = chat_area(app, Rect::new(0, 0, w, h));
+        let inner = chat_block().inner(chat);
+        (inner.y..inner.bottom())
+            .map(|y| rows[y as usize].clone())
+            .collect()
+    }
+
+    /// **整段渲染**这条参考路径（旧实现）：整份 transcript 折一遍，再按 `top_row` 滚。
+    ///
+    /// 它只渲染 Chat **内区**（外框的标题与边框不在内区里，不影响逐行比对）。
+    fn chat_rows_full(app: &App, w: u16, h: u16, top_row: usize) -> Vec<String> {
+        let chat = chat_area(app, Rect::new(0, 0, w, h));
+        let inner = chat_block().inner(chat);
+        let inner_w = inner.width.max(1);
+        let text = build_text(app, inner_w as usize, Instant::now());
+        let backend = TestBackend::new(inner.width, inner.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let para = Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((top_row.min(u16::MAX as usize) as u16, 0));
+                f.render_widget(para, f.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area().width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect()
+    }
+
     #[test]
     fn test_three_panes_present_with_status_at_bottom() {
         let mut app = app_with(CodingView::for_test());
@@ -1176,7 +1340,7 @@ mod tests {
         ] {
             let mut a = app_with(CodingView::for_test());
             a.transcript.push(TranscriptLine::Assistant("x".repeat(n)));
-            let got = max_scroll_offset(&a, W, H);
+            let got = max_scroll_offset(&mut a, W, H);
             assert_eq!(
                 got,
                 n.div_ceil(inner_w) - inner_h,
@@ -1191,7 +1355,7 @@ mod tests {
         app.transcript.push(TranscriptLine::Assistant(
             "x".repeat(inner_w * (inner_h + 6)),
         ));
-        let max = max_scroll_offset(&app, W, H);
+        let max = max_scroll_offset(&mut app, W, H);
         assert_eq!(max, 6);
         app.follow = false;
         app.scroll_offset = max;
@@ -1296,7 +1460,7 @@ mod tests {
         // `USER_GAP_ROWS` 的算式）：算式跟着常量走，常量被改成 0 时本用例会一起
         // 变成「0 = 0」而照样绿 —— 那就钉不住「两条空白行」这个契约了。
         assert_eq!(
-            max_scroll_offset(&app, W, H),
+            max_scroll_offset(&mut app, W, H),
             58 - inner.height as usize,
             "滚动上限必须含空白行（不含则为 0：20 − 34）"
         );
@@ -2204,7 +2368,7 @@ mod tests {
                 inner.height
             );
             let _ = rows_of(&mut app, 40, h);
-            let _ = max_scroll_offset(&app, 40, h);
+            let _ = max_scroll_offset(&mut app, 40, h);
         }
     }
 
@@ -2239,7 +2403,7 @@ mod tests {
             .wrap(Wrap { trim: false })
             .line_count(inner_w);
         assert_eq!(
-            max_scroll_offset_at(&app, W, H, Instant::now()),
+            max_scroll_offset_at(&mut app, W, H, Instant::now()),
             total.saturating_sub(inner_h),
             "滚动上限 = 总视觉行 - 可见行（35）"
         );
@@ -2297,7 +2461,7 @@ mod tests {
             .line_count(40)
             .saturating_sub(inner_h);
         assert_eq!(
-            max_scroll_offset_at(&app, 40, 40, t1),
+            max_scroll_offset_at(&mut app, 40, 40, t1),
             expected,
             "滚动上限必须按同一份（旧）产物算"
         );

@@ -180,6 +180,9 @@ impl RoundClock {
                     fields.insert("gen_ai.tool.name".to_string(), json!(call.name));
                     fields.insert("gen_ai.tool.call.id".to_string(), json!(call.id.0));
                     fields.insert("gen_ai.tool.call.arguments".to_string(), summary.arguments);
+                    // 命令串指纹（非命令类工具为 `null`）：「重复命令数」的唯一落点；
+                    // 只落指纹、不落正文。
+                    fields.insert("command_fp".to_string(), json!(summary.command_fp));
                     fields.insert(
                         "args_original_bytes".to_string(),
                         json!(summary.original_bytes),
@@ -465,6 +468,7 @@ pub(crate) fn turn_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use serde_json::json;
@@ -503,6 +507,17 @@ mod tests {
 
     fn tool_result() -> AgentEvent {
         tool_result_id("c1")
+    }
+
+    /// 造一条**命令类**工具调用（`bash`），参数带 `command`。
+    fn bash_call(id: &str, command: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            call: ToolCall {
+                id: ToolCallId(id.into()),
+                name: "bash".into(),
+                arguments: json!({ "command": command }),
+            },
+        }
     }
 
     fn tool_result_id(id: &str) -> AgentEvent {
@@ -1132,5 +1147,147 @@ mod tests {
             "None 档只留 keys / bytes，参数投影为空对象"
         );
         assert_eq!(fields["args_truncated"], json!(true));
+    }
+
+    /// `tool_call` 记录带 `command_fp`：命令类工具给数字，非命令类工具给 `null`；
+    /// 记录里**只有指纹、没有命令正文**。
+    ///
+    /// 变异：把 `command_fp` 改成落**命令正文** ⇒ 「正文不得进记录」断言变红。
+    #[test]
+    fn tool_call_record_carries_fingerprint_not_command_body() {
+        let long = format!("cargo test {}", "x".repeat(400));
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe_debug(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        let bash = clock.observe_debug(&env_of(bash_call("c1", &long)), t0 + MS);
+        let read = clock.observe_debug(
+            &env_of(AgentEvent::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId("c2".into()),
+                    name: "read".into(),
+                    arguments: json!({ "path": "a.rs" }),
+                },
+            }),
+            t0 + 2 * MS,
+        );
+
+        let fields = &bash.records[0].fields;
+        assert!(fields["command_fp"].is_u64(), "命令类工具的指纹是数字");
+        let serialized = serde_json::to_string(fields).unwrap();
+        assert!(
+            !serialized.contains(&long),
+            "命令正文不得进记录：{serialized}"
+        );
+        assert_eq!(
+            read.records[0].fields["command_fp"],
+            Value::Null,
+            "非命令类工具无指纹"
+        );
+    }
+
+    /// 合成一轮：2 次**相同**命令 + 1 次**等长异串**命令 + 1 次慢调用（6 s）。
+    ///
+    /// 四项指标都要能从 debug 记录**离线**读出：重复命令数 / 真命令耗时分布 /
+    /// 按工具名分桶的耗时 / 工具阻塞占比。
+    ///
+    /// 变异：把 `command_fp` 换成 `args_original_bytes` ⇒ 「三条不同命令 ⇒ 三个指纹」
+    /// 断言变红（等长异串的参数字节数相同 ⇒ 只剩两个指纹，重复数也会跟着错）。
+    #[test]
+    fn debug_records_expose_repeat_count_and_duration_buckets() {
+        const COMMAND_A: &str = "cargo test --workspace"; // 21 B
+        const COMMAND_TWIN: &str = "cargo test --worktrees"; // 21 B，与 A 等长但异串
+        const COMMAND_SLOW: &str = "cargo build --release --all-targets";
+
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+        let mut records: Vec<DebugRecord> = Vec::new();
+        for (event, offset_ms) in [
+            (AgentEvent::RoundStarted { round: 1 }, 0u64),
+            (bash_call("c1", COMMAND_A), 10),
+            (bash_call("c2", COMMAND_A), 20),
+            (bash_call("c3", COMMAND_TWIN), 30),
+            (bash_call("c4", COMMAND_SLOW), 40),
+            (tool_result_id("c1"), 110),
+            (tool_result_id("c2"), 120),
+            (tool_result_id("c3"), 130),
+            (tool_result_id("c4"), 6040),
+            (AgentEvent::RoundStarted { round: 2 }, 6100),
+        ] {
+            let at = t0 + Duration::from_millis(offset_ms);
+            records.extend(clock.observe_debug(&env_of(event), at).records);
+        }
+
+        let calls: Vec<&DebugRecord> = records
+            .iter()
+            .filter(|record| record.ev == "tool_call")
+            .collect();
+        let results: Vec<&DebugRecord> = records
+            .iter()
+            .filter(|record| record.ev == "tool_result")
+            .collect();
+        assert_eq!(calls.len(), 4, "四次调用");
+        assert_eq!(results.len(), 4, "四条结果");
+
+        // 指标一 · 重复命令数：同一回合内同一条命令串出现 >1 次。
+        let fingerprints: Vec<u64> = calls
+            .iter()
+            .filter_map(|record| record.fields["command_fp"].as_u64())
+            .collect();
+        let distinct: HashSet<u64> = fingerprints.iter().copied().collect();
+        assert_eq!(distinct.len(), 3, "三条不同命令 ⇒ 三个不同指纹");
+        assert_eq!(
+            fingerprints.len() - distinct.len(),
+            1,
+            "重复命令数 = 1（只有命令 A 重复了一次）"
+        );
+
+        // 指标二 · 真命令耗时分布：单条调用耗时超过阈值（5 s）。
+        let slow: Vec<u64> = results
+            .iter()
+            .filter_map(|record| record.fields["duration_ms"].as_u64())
+            .filter(|ms| *ms > 5_000)
+            .collect();
+        assert_eq!(slow, vec![6000], "只有那条慢调用超过 5 s");
+
+        // 指标三 · 按工具名分桶的耗时：`tool_call` 的名字 + `tool_call_id`
+        // 与 `tool_result` 的 `tool_call_id` + `duration_ms` 离线关联。
+        let mut buckets: HashMap<String, u64> = HashMap::new();
+        for call in &calls {
+            let id = call
+                .tool_call_id
+                .as_deref()
+                .expect("tool_call 带 tool_call_id");
+            let name = call.fields["gen_ai.tool.name"]
+                .as_str()
+                .expect("tool_call 带工具名")
+                .to_string();
+            let duration = results
+                .iter()
+                .find(|result| result.tool_call_id.as_deref() == Some(id))
+                .and_then(|result| result.fields["duration_ms"].as_u64())
+                .expect("每个调用都有结果");
+            *buckets.entry(name).or_default() += duration;
+        }
+        assert_eq!(
+            buckets.get("bash"),
+            Some(&6300),
+            "四条调用全经 bash ⇒ 单桶合计 6300 ms"
+        );
+
+        // 指标四 · 工具阻塞占比：`round_end.tools_ms` / 回合墙钟
+        // （整回合的分母在日志里是 `turn_end.elapsed_ms`；此处以本轮墙钟为分母）。
+        let end = records
+            .iter()
+            .find(|record| record.ev == "round_end")
+            .expect("有 round_end 记录");
+        let tools_ms = end.fields["tools_ms"].as_u64().expect("有 tools_ms");
+        let total_ms = end.fields["total_ms"].as_u64().expect("有 total_ms");
+        assert_eq!(tools_ms, 6030, "工具段 = 首个调用 → 末个结果");
+        assert_eq!(total_ms, 6040, "本轮墙钟");
+        assert!(
+            tools_ms as f64 / total_ms as f64 > 0.99,
+            "工具阻塞占比 = {tools_ms}/{total_ms}"
+        );
     }
 }

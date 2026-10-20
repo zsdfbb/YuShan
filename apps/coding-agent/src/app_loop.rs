@@ -52,7 +52,7 @@
 //! `run_turn_once` 开头 —— 它挡的是**上一个请求**残留的 `Abort`，与回合数无关。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
@@ -61,6 +61,7 @@ use ys_event::AgentEvent;
 use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
+use ys_tools_basic::BackgroundTasks;
 use ys_tui_coding::CodingView;
 
 use crate::capabilities;
@@ -72,6 +73,89 @@ use crate::state::StateStore;
 use crate::status::TurnStats;
 use crate::view::build_view;
 use crate::wiring::Wiring;
+
+/// 共享 sweeper 的 tick 间隔 —— 100ms。
+const BG_SWEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 共享 sweeper 的进程级条目 —— (注册表的弱引用, sweeper 任务句柄)。
+type BgSweeperEntry = (Weak<BackgroundTasks>, tokio::task::JoinHandle<()>);
+
+/// 共享 sweeper 的**进程级**守卫 —— 每个后台注册表至多一个 sweeper 任务。
+///
+/// **为什么是进程级而不是每条命令一个**：设计 §4.7 的预算表要求全局 1 个
+/// tokio 任务（100ms tick 调 `sweep()`）⇒ 命令再多也只有 1 个 tick 源。
+/// 注册表本身是进程级的（生产路径一个进程一个注册表）⇒ 生产上就是**全局 1 个**。
+///
+/// **为什么按注册表分别记**：sweeper 只盯它启动时拿到的那个注册表 ⇒ 两个注册表
+/// 共用一个 sweeper 就会漏扫其中一个。注册表可以有多个（测试里每个用例一份），
+/// 故按注册表身份分别记。
+///
+/// **为什么记「当前是否活着」而不是「曾经启过」**：sweeper 任务随它所在的
+/// tokio runtime 结束而消失（测试里每个用例一个 runtime）⇒ 只记「启过」会让
+/// 之后的 runtime 里**永远没有** sweeper。故守卫记的是**当前是否有活着的任务**：
+/// 旧的没了才启新的 —— 任何时刻每个注册表至多一个。
+static BG_SWEEPERS: OnceLock<Mutex<Vec<BgSweeperEntry>>> = OnceLock::new();
+
+/// 启动共享 sweeper —— 该注册表已有活着的就不重复启。
+///
+/// 100ms tick 调 [`BackgroundTasks::sweep`]：回收已退出的子进程、淘汰超出条目
+/// 上限的最旧已完成条目、执行输出上限闸门。
+///
+/// 任务随 tokio runtime 结束而结束（**不引入新的长期信道**）；注册表被丢弃后
+/// 任务自行收摊（它只持**弱引用**）。
+fn ensure_background_sweeper(tasks: Arc<BackgroundTasks>) {
+    let slot = BG_SWEEPERS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 注册表没了 ⇒ 它的 sweeper 也该收摊 ⇒ 条目一并清掉（否则这张表只增不减）。
+    guard.retain(|(weak, _)| weak.strong_count() > 0);
+    let key = Arc::as_ptr(&tasks) as usize;
+    let alive = guard
+        .iter()
+        .any(|(weak, handle)| Weak::as_ptr(weak) as usize == key && !handle.is_finished());
+    if alive {
+        return; // 该注册表已有活着的 sweeper
+    }
+    let weak = Arc::downgrade(&tasks);
+    let task_weak = weak.clone();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(BG_SWEEPER_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Some(tasks) = task_weak.upgrade() else {
+                return; // 注册表没了 ⇒ 收摊
+            };
+            tasks.sweep();
+        }
+    });
+    guard.push((weak, handle));
+}
+
+/// 当前会话 id（后台注册表的会话键）—— `None` = 本接线器不带后台能力。
+fn background_session_id(wiring: &Wiring) -> Option<String> {
+    wiring.backgrounds().map(|context| context.session_id())
+}
+
+/// 杀掉某会话的全部后台命令进程组（**按会话过滤**）。
+///
+/// 接线器不带后台上下文时**静默跳过** —— 清理点不得因为「没有后台能力」而 panic。
+fn kill_background_session(wiring: &Wiring, session: &str) {
+    if let Some(context) = wiring.backgrounds() {
+        context.tasks().kill_all(session);
+    }
+}
+
+/// 丢弃一个会话的后台产物：杀进程组 + 删落盘目录。
+///
+/// `/new` 用它（旧会话整体作废）；`/resume` 只杀进程组、**不删目录** ——
+/// 目标会话的产物还要留着。
+fn discard_session_backgrounds(wiring: &Wiring, session: &str) {
+    if let Some(context) = wiring.backgrounds() {
+        context.tasks().kill_all(session);
+        // 目录删不掉（权限 / 并发占用）**不影响控制流**：残留只占磁盘。
+        let _ = context.tasks().remove_session_dir(session);
+    }
+}
 
 /// 会话文件路径的**进程内快照**：app 循环写、`main` 在 UI 退出后读。
 ///
@@ -229,6 +313,13 @@ pub async fn run(
     // （启动期 `main` 已写 run=0 的 `run_start`）。
     let mut debug_session_id = crate::session_id_for(wiring.session_path());
     let mut debug_run: u64 = 0;
+
+    // **共享 sweeper**：全局 1 个 tokio 任务，100ms tick 调 `sweep()`
+    // （回收已退出的子进程、淘汰超出条目上限的最旧已完成条目、执行输出上限闸门）。
+    // 本接线器不带后台能力时**不启**（无事可扫）。
+    if let Some(context) = wiring.backgrounds() {
+        ensure_background_sweeper(context.tasks().clone());
+    }
 
     // `/thinking` 显示开关的**进程级缓存**：启动时由 meta 初始化，`Request::SetThinking`
     // 单向更新，回合末落 meta。UI 的 `App.thinking_visible` 才是运行期真值，本缓存只
@@ -461,6 +552,15 @@ pub async fn run(
             }
 
             Request::NewSession => {
+                // **清理点（`/new`）**：换会话前先记住**旧**会话 id ——
+                // 会话槽在 `new_session` 内被切到新 id，而注册表条目是按**启动时**
+                // 的槽值打标签的 ⇒ 拿新 id 去清理会**打空**。
+                let old_session = background_session_id(&wiring);
+                // 旧会话整体作废 ⇒ 杀它的后台命令进程组 + 删它的落盘目录。
+                // 落在换会话**之前**：此刻槽里还是旧 id。
+                if let Some(session) = old_session.as_deref() {
+                    discard_session_backgrounds(&wiring, session);
+                }
                 lines = capabilities::new_session(&mut wiring).await;
                 // 新会话 = 新的会话起点（状态行的时长据此重置）。
                 session_started = Instant::now();
@@ -517,11 +617,22 @@ pub async fn run(
             Request::ResumeSession { target } => {
                 // `/resume` 前后的会话路径：相同 ⇒ 追加同一文件；不同 ⇒ 切文件。
                 let path_before = wiring.session_path().map(Path::to_path_buf);
+                // **清理点（`/resume`）**：记住**旧**会话 id —— 恢复成功后槽里
+                // 就是新 id 了，旧会话的命令要按**旧 id** 才能命中。
+                let old_session = background_session_id(&wiring);
                 let (out_lines, resumed) =
                     capabilities::resume_session(&mut config, &mut wiring, &state_store, &target)
                         .await;
                 lines = out_lines;
                 if let Some(r) = resumed {
+                    // 目标会话与当前会话**不同** ⇒ 旧会话的后台命令对新工作区
+                    // 无意义 ⇒ 杀掉（按会话过滤）。同一会话（追加同一文件）
+                    // ⇒ 不动 —— 否则会杀掉本会话自己的命令。
+                    if let Some(old) = old_session.as_deref()
+                        && background_session_id(&wiring).as_deref() != Some(old)
+                    {
+                        kill_background_session(&wiring, old);
+                    }
                     // 提交步的 app 侧一半（§3.3 第 5 步；此后不得再有失败路径）。
                     //
                     // **I9：thinking 三方真值必须一次对齐** —— `thinking_visible` 是本
@@ -873,6 +984,13 @@ async fn run_turn_once(
         .map(|sink| sink.args_mode())
         .unwrap_or(ArgsMode::Head);
     let mut clock = RoundClock::new(args_mode);
+    // 本回合的后台清理句柄 —— **必须在借用 `wiring` 之前取出来**：
+    // 回合内 `ctx.wiring.ports()` 是**可变借用**，持有期间碰不到 `ctx.wiring`。
+    // 会话在回合内不变 ⇒ 会话 id 在回合开头取一次就够。
+    let background = ctx
+        .wiring
+        .backgrounds()
+        .map(|context| (context.tasks().clone(), context.session_id()));
     let outcome = {
         let ports = ctx.wiring.ports();
         ports.events.begin_turn(*ctx.turns);
@@ -912,17 +1030,22 @@ async fn run_turn_once(
                 // 轮边界中途插话 / 中止：UI 写信道 ②，这里泵进
                 // `BoundarySource`，由 `BasicLoop` 在轮边界拉取。
                 Some(b) = ctx.boundary_rx.recv() => {
-                    if matches!(&b, Boundary::Abort)
-                        && let Some(sink) = ctx.debug.as_deref_mut()
-                    {
-                        crate::record_boundary(
-                            sink,
-                            ctx.debug_session_id,
-                            Some(*ctx.turns),
-                            "enqueued",
-                            "abort",
-                            Some("ui"),
-                        );
+                    if matches!(&b, Boundary::Abort) {
+                        // **清理点（abort）**：本会话的后台命令进程组一律杀掉
+                        // （按会话过滤 ⇒ 别的会话不受影响）。
+                        if let Some((tasks, session)) = background.as_ref() {
+                            tasks.kill_all(session);
+                        }
+                        if let Some(sink) = ctx.debug.as_deref_mut() {
+                            crate::record_boundary(
+                                sink,
+                                ctx.debug_session_id,
+                                Some(*ctx.turns),
+                                "enqueued",
+                                "abort",
+                                Some("ui"),
+                            );
+                        }
                     }
                     boundary.push(b)
                 }
@@ -936,6 +1059,11 @@ async fn run_turn_once(
                         "budget exhausted: wall-clock budget of {secs}s elapsed — aborting this turn"
                     ))).await?;
                     boundary.push(Boundary::Abort);
+                    // **清理点（回合预算到点）**：语义与 abort 一致 ——
+                    // 本会话的后台命令进程组一律杀掉（按会话过滤）。
+                    if let Some((tasks, session)) = background.as_ref() {
+                        tasks.kill_all(session);
+                    }
                     if let Some(sink) = ctx.debug.as_deref_mut() {
                         crate::record_boundary(
                             sink,
@@ -1019,6 +1147,23 @@ async fn run_turn_once(
             ctx.request_started.elapsed(),
             remaining,
             turn_cache(&outcome),
+        );
+        // 回合末的后台命令计数 —— **只进 debug 日志**：不进模型上下文、
+        // 不进 transcript（绝不 `Outbound::Output`）。N = 本会话**仍在跑**的
+        // 后台命令数。
+        let running = background
+            .as_ref()
+            .map(|(tasks, session)| tasks.running_handles(session).len())
+            .unwrap_or(0);
+        let mut bg_fields = serde_json::Map::new();
+        bg_fields.insert("running".into(), serde_json::json!(running));
+        crate::debug_record(
+            sink,
+            ctx.debug_session_id,
+            "background_tasks",
+            Some(*ctx.turns),
+            None,
+            bg_fields,
         );
     }
 
@@ -1152,6 +1297,10 @@ mod tests {
         /// 与 app 循环共享的工作区绑定快照（退出行的取数口）。
         worktree: WorktreeHandle,
         tmp: TempDir,
+        /// 后台命令上下文（`None` = 本轮没挂后台能力）——
+        /// 注册表与**会话槽**（槽与接线器共享同一份 ⇒ 清理点与工具看到的
+        /// 会话 id 必然一致）。
+        backgrounds: Option<(Arc<BackgroundTasks>, ys_tools_basic::SessionSlot)>,
     }
 
     impl Harness {
@@ -1193,6 +1342,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .await
     }
@@ -1214,11 +1364,68 @@ mod tests {
             None,
             true,
             true,
+            false,
         )
         .await
     }
 
-    /// 最底层起法：除 `Config` 外还允许改写 [`ys_runtime::AgentBuilder`]
+    /// 起 app 循环并挂上**后台命令上下文**（注册表 + 会话槽）。
+    ///
+    /// 注册表落在 harness 的临时目录里 ⇒ 用例结束随临时目录一起清掉。
+    /// 会话槽与接线器共享**同一份** ⇒ 工具、清理点、测试三方看到的会话 id
+    /// 必然一致。
+    ///
+    /// **调用方必须已持有 `env_lock`**（见 [`BgEnv`]）⇒ harness 的 `env_prelocked`
+    /// 传 `true`（否则它会自己去抢同一把锁 ⇒ 同线程二次加锁死锁）。
+    async fn spawn_app_loop_backgrounds(
+        model: Box<dyn Model>,
+        persistent: bool,
+    ) -> Harness {
+        spawn_app_loop_backgrounds_with(model, persistent, |_, _| {}).await
+    }
+
+    /// 同上，但允许改写 `Config`（第二个参数是临时目录）。
+    async fn spawn_app_loop_backgrounds_with(
+        model: Box<dyn Model>,
+        persistent: bool,
+        tweak: impl FnOnce(&mut Config, &PathBuf),
+    ) -> Harness {
+        spawn_app_loop_full(
+            model,
+            persistent,
+            Vec::new(),
+            tweak,
+            |b| b,
+            |_| None,
+            None,
+            false,
+            true,
+            true,
+        )
+        .await
+    }
+
+    /// 同上，但**打开 debug sink**（调用方须整段持有 `env_lock`）。
+    async fn spawn_app_loop_debug_backgrounds(
+        model: Box<dyn Model>,
+        persistent: bool,
+    ) -> Harness {
+        spawn_app_loop_full(
+            model,
+            persistent,
+            Vec::new(),
+            |_, _| {},
+            |b| b,
+            |_| None,
+            None,
+            true,
+            true,
+            true,
+        )
+        .await
+    }
+
+    /// 最底层起法：除 `Config` 外还允许改写 [`ys_runtime::AgentBuilder>]
     /// （例如把 [`ys_component::RunLimits::max_rounds`] 调到 app 产品默认的
     /// `u32::MAX`）—— 生产侧由 `resolve_limits` 装配的限制，测试在此显式重建。
     ///
@@ -1237,6 +1444,8 @@ mod tests {
         // 调用方**已持有** `env_lock`（debug 测试整段持有，避免并行测试改环境）。
         // 为 `true` 时不再自行加锁 —— 同线程重复加锁会死锁。
         env_prelocked: bool,
+        // 挂上后台命令上下文（注册表 + 会话槽）。
+        with_backgrounds: bool,
     ) -> Harness {
         let tmp = TempDir::new("harness");
         let subagent = subagent(&tmp.0);
@@ -1271,12 +1480,30 @@ mod tests {
         let mut state_store = StateStore::new();
         state_store.set_override(tmp.join("state.json"));
 
-        let wiring = if persistent {
+        let mut wiring = if persistent {
             Wiring::persistent_new(Some(model), Box::new(sink), tmp.join("sessions"))
                 .await
                 .unwrap()
         } else {
             Wiring::ephemeral(Some(model), Box::new(sink))
+        };
+
+        // 后台命令上下文（可选）：注册表落在 harness 的临时目录里 ⇒ 用例结束
+        // 随临时目录一起清掉。`attach_backgrounds` 会把会话槽同步到**当前**会话
+        // ⇒ 工具、清理点、测试三方看到的会话 id 必然一致。
+        let backgrounds = if with_backgrounds {
+            let tasks = Arc::new(BackgroundTasks::new(
+                tmp.join("bg-root"),
+                ys_tools_basic::BgLimits::default(),
+            ));
+            let slot = ys_tools_basic::SessionSlot::new("pending");
+            wiring.attach_backgrounds(crate::wiring::BackgroundContext::new(
+                Arc::clone(&tasks),
+                slot.clone(),
+            ));
+            Some((tasks, slot))
+        } else {
+            None
         };
 
         // 与生产侧同规：debug sink 在 `Wiring` 建好、会话路径已知之后打开，
@@ -1364,6 +1591,7 @@ mod tests {
             session_path,
             worktree,
             tmp,
+            backgrounds,
         }
     }
 
@@ -2349,6 +2577,7 @@ mod tests {
             session_path: _,
             worktree: _,
             tmp,
+            backgrounds: _,
         } = h;
         drop(requests);
         drop(boundaries);
@@ -2788,6 +3017,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .await;
 
@@ -2827,6 +3057,7 @@ mod tests {
             |b| b.limits(ys_component::RunLimits::new(u32::MAX)),
             |_| None,
             None,
+            false,
             false,
             false,
         )
@@ -3220,6 +3451,7 @@ mod tests {
             |b| b,
             |_| None,
             binding,
+            false,
             false,
             false,
         )
@@ -3659,6 +3891,7 @@ mod tests {
             None,
             true,
             true,
+            false,
         )
         .await;
 
@@ -3754,6 +3987,7 @@ mod tests {
             None,
             false,
             true,
+            false,
         )
         .await;
         h.requests.send(prompt("hi")).await.unwrap();
@@ -3763,6 +3997,428 @@ mod tests {
         assert!(
             debug_files(&logs.0).is_empty(),
             "debug 关时不得出现 debug 文件"
+        );
+    }
+
+    // ───────────── 后台命令的清理点（设计 §4.5 的六个清理点之二） ─────────────
+
+    /// 后台用例的**环境隔离**：整段持有 `env_lock`，并把 `YUSHAN_DEBUG` 关掉、
+    /// `YUSHAN_LOG_DIR` 指到临时目录。
+    ///
+    /// **为什么必须整段持有**：后台命令的启动（`sh -c …`）与杀进程组
+    /// （`sh -c "kill -9 -<pgid>"`）都**按 `PATH` 解析 `sh`** ⇒ 别的用例把
+    /// `PATH` 指向空目录的窗口里（`toolset.rs` 的 `set_path`），`sh` 找不到 ⇒
+    /// 启动与清理**双双静默失败**（`kill_group` 的失败是静默的）。
+    /// 读 `PATH` 也要与改写串行 ⇒ 持锁。
+    ///
+    /// 字段顺序即 drop 顺序：先恢复环境（此时锁仍活着），再释放锁。
+    struct BgEnv {
+        _restore: crate::test_env::EnvRestore,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BgEnv {
+        fn set(log_dir: &Path) -> Self {
+            let guard = crate::test_env::env_lock();
+            let restore = crate::test_env::EnvRestore::capture(&[
+                crate::logging::LOG_DIR_ENV,
+                crate::debug_log::DEBUG_ENV,
+            ]);
+            // SAFETY: 持有 env_lock。
+            unsafe {
+                std::env::set_var(crate::logging::LOG_DIR_ENV, log_dir);
+                std::env::set_var(crate::debug_log::DEBUG_ENV, "0");
+            }
+            Self {
+                _restore: restore,
+                _guard: guard,
+            }
+        }
+    }
+
+    /// 用例级收尾：结束时（**含 panic 展开**）杀掉本用例起的后台命令并**收尸**。
+    ///
+    /// 断言用的是**真进程** ⇒ 用例失败时若不收尾就会留下孤儿；被 SIGKILL 的
+    /// 进程还要**收尸**才从进程表消失（僵尸仍占着 pid，`pgrep` 照样看得见）。
+    struct BgCleanup {
+        tasks: Arc<BackgroundTasks>,
+        sessions: Vec<String>,
+        pids: Vec<u32>,
+    }
+
+    impl BgCleanup {
+        fn new(tasks: &Arc<BackgroundTasks>) -> Self {
+            Self {
+                tasks: Arc::clone(tasks),
+                sessions: Vec::new(),
+                pids: Vec::new(),
+            }
+        }
+
+        /// 起一条**真实**的后台命令（`sleep 300`）—— 返回 `(句柄, pid)`。
+        ///
+        /// 用真进程（而不是替身）才能断言「进程存在性」—— 替身只能证明
+        /// 「我们记的账变了」，证明不了「进程真的死了」。
+        fn start(&mut self, session: &str) -> (ys_tools_basic::BgHandle, u32) {
+            self.start_with(session, "sleep 300")
+        }
+
+        /// 起一条**真实**的后台命令（命令可定制）—— 返回 `(句柄, pid)`。
+        fn start_with(
+            &mut self,
+            session: &str,
+            command: &str,
+        ) -> (ys_tools_basic::BgHandle, u32) {
+            let handle = self
+                .tasks
+                .start(session, command, &std::env::temp_dir(), None)
+                .expect("启动后台命令");
+            let pid = self
+                .tasks
+                .snapshot(handle, session)
+                .expect("刚启动的条目应有快照")
+                .pid;
+            if !self.sessions.iter().any(|known| known == session) {
+                self.sessions.push(session.to_string());
+            }
+            self.pids.push(pid);
+            (handle, pid)
+        }
+    }
+
+    impl Drop for BgCleanup {
+        fn drop(&mut self) {
+            for session in &self.sessions {
+                self.tasks.kill_all(session);
+            }
+            for _ in 0..100 {
+                self.tasks.sweep();
+                if self.pids.iter().all(|pid| !process_alive(*pid)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// 探活：进程**是否存在**（POSIX `kill -0` 语义）。
+    ///
+    /// 问内核，不问注册表 —— 注册表的状态是「我们自己记的账」。
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid} 2>/dev/null"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// 等某 pid 的进程**从进程表里消失**（最多 5s）。
+    ///
+    /// 被 SIGKILL 的进程要先被**收尸**才从进程表消失（僵尸仍占着 pid，
+    /// `kill -0` 对它照样成功）⇒ 每轮先让注册表收尸再探活。
+    async fn wait_process_gone(tasks: &BackgroundTasks, pid: u32) {
+        for _ in 0..500 {
+            tasks.sweep();
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("进程 {pid} 仍在：清理点没有把它杀掉");
+    }
+
+    /// **清理点之一（abort）**：UI 中止 ⇒ 本会话的后台命令进程组被杀。
+    ///
+    /// 断言**进程存在性**（不看工具文案）—— 进程表里没有它才算数。
+    ///
+    /// 变异：把 abort 臂里的 `kill_all` 删掉 ⇒ 进程仍在 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn abort_kills_the_background_processes_of_the_current_session() {
+        let logs = TempDir::new("bg_logs");
+        let _env = BgEnv::set(&logs.0);
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop_backgrounds(Box::new(model), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        let (_handle, pid) = cleanup.start(&session);
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        h.boundaries.send(Boundary::Abort).await.unwrap();
+        probe.let_app_task_pump().await;
+        probe.release();
+        let _ = collect_until_view(&mut h).await;
+
+        wait_process_gone(&tasks, pid).await;
+    }
+
+    /// **清理点之二（回合预算到点）**：wall-clock 预算耗尽 ⇒ 与 abort 同一语义。
+    ///
+    /// 变异：把预算臂里的 `kill_all` 删掉 ⇒ 进程仍在 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn budget_exhaustion_kills_the_background_processes_of_the_current_session() {
+        let logs = TempDir::new("bg_logs");
+        let _env = BgEnv::set(&logs.0);
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop_backgrounds_with(Box::new(model), true, |config, tmp| {
+            let path = tmp.join("config.json");
+            std::fs::write(&path, r#"{"max_turn_duration_secs": 1}"#).unwrap();
+            config.load_user_config(&path);
+        })
+        .await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        let (_handle, pid) = cleanup.start(&session);
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+
+        // 等预算到点：app 在回合**仍进行中**发说明行（计时器与回合并发）。
+        let mut msgs = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let m = h.outbound.recv().await.expect("app 循环不应提前收摊");
+                let hit = matches!(&m, Outbound::Output(t) if t.contains("budget exhausted"));
+                msgs.push(m);
+                if hit {
+                    break;
+                }
+            }
+        })
+        .await;
+        probe.let_app_task_pump().await;
+        probe.release();
+        msgs.extend(collect_until_view(&mut h).await);
+
+        wait_process_gone(&tasks, pid).await;
+    }
+
+    /// **清理点之三（`/new`）**：换会话 ⇒ 旧会话的后台命令被杀 **+ 旧会话的
+    /// 输出目录被删**。
+    ///
+    /// 变异：删掉 `/new` 臂里的 `discard_session_backgrounds` ⇒ 进程仍在、
+    /// 目录也还在 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn new_session_kills_background_processes_and_removes_the_output_directory() {
+        let logs = TempDir::new("bg_logs");
+        let _env = BgEnv::set(&logs.0);
+        let model = MockModel::new("mock");
+        model.push_text("hi");
+        let mut h = spawn_app_loop_backgrounds(Box::new(model), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        let (_handle, pid) = cleanup.start(&session);
+        let session_dir = tasks.root().join(&session);
+        assert!(
+            session_dir.is_dir(),
+            "后台命令的会话目录应已建好：{}",
+            session_dir.display()
+        );
+
+        h.requests.send(Request::NewSession).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        wait_process_gone(&tasks, pid).await;
+        assert!(
+            !session_dir.exists(),
+            "/new 后旧会话的输出目录应被删除：{}",
+            session_dir.display()
+        );
+        assert_ne!(
+            slot.get(),
+            session,
+            "/new 后会话槽应指向新会话（旧 id 只会打空清理）"
+        );
+    }
+
+    /// **清理点之四（`/resume`）**：切到别的会话 ⇒ 旧会话的后台命令被杀。
+    ///
+    /// 变异：删掉 `/resume` 臂里的 `kill_background_session` ⇒ 进程仍在 ⇒
+    /// 本用例变红。
+    #[tokio::test]
+    async fn resume_session_kills_the_old_session_background_processes() {
+        let logs = TempDir::new("bg_logs");
+        let _env = BgEnv::set(&logs.0);
+        let mut h = spawn_app_loop_backgrounds_with(
+            Box::new(MockModel::new("mock")),
+            true,
+            |config, _tmp| {
+                config.api_base = Some("http://resume-base/v1".into());
+                config.api_key = Some("sk-resume".into());
+                config.set_model_factory(move |_| Some(Box::new(MockModel::new("resumed"))));
+            },
+        )
+        .await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        let (_handle, pid) = cleanup.start(&session);
+
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.title = Some("目标会话".into());
+        write_target_session(&h, "target-1", &meta, &[user_message("hello")]);
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-1".into(),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        wait_process_gone(&tasks, pid).await;
+        assert_ne!(
+            slot.get(),
+            session,
+            "/resume 后会话槽应指向目标会话"
+        );
+    }
+
+    /// **按会话过滤**：清理本会话 ⇒ **别的会话**的后台命令不受影响。
+    ///
+    /// 这条是「清理点按会话过滤」的全部意义（设计 §4.5）：漏掉的清理点、
+    /// 新增的清理路径都不得波及别的会话。
+    ///
+    /// 变异：把 `kill_all` 的会话过滤去掉（改成全局清空）⇒ 另一个会话的
+    /// 进程也被杀 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn cleaning_one_session_does_not_kill_another_session() {
+        let logs = TempDir::new("bg_logs");
+        let _env = BgEnv::set(&logs.0);
+        let (model, mut probe) = probe_model(ProbePlan::AlwaysToolCall);
+        let mut h = spawn_app_loop_backgrounds(Box::new(model), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        let (_own, own_pid) = cleanup.start(&session);
+        // 另一个会话的条目：注册表按会话过滤 ⇒ 清理本会话不该碰它。
+        let (_other, other_pid) = cleanup.start("other-session");
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        probe.wait_entered(1).await;
+        h.boundaries.send(Boundary::Abort).await.unwrap();
+        probe.let_app_task_pump().await;
+        probe.release();
+        let _ = collect_until_view(&mut h).await;
+
+        wait_process_gone(&tasks, own_pid).await;
+        assert!(
+            process_alive(other_pid),
+            "别的会话的后台命令不该被误杀（清理必须按会话过滤）"
+        );
+
+    }
+
+    /// **共享 sweeper 在跑**：它把已退出的子进程**收尸** —— 不经任何显式
+    /// `sweep()` 调用，进程也从进程表里消失（否则它一直是个僵尸：僵尸仍占着
+    /// pid，`kill -0` 照样成功）。
+    ///
+    /// 变异：删掉 `run` 里的 `ensure_background_sweeper` ⇒ 没人收尸 ⇒
+    /// 进程一直是僵尸 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn the_shared_sweeper_reaps_finished_commands() {
+        let logs = TempDir::new("bg_logs");
+        let _env = BgEnv::set(&logs.0);
+        let model = MockModel::new("mock");
+        let h = spawn_app_loop_backgrounds(Box::new(model), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        // 命令自己跑完 ⇒ 之后只剩「僵尸」与「被收尸」两种状态。
+        let (_handle, pid) = cleanup.start_with(&session, "sleep 0.3");
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "已退出的后台命令应被共享 sweeper 收尸（否则它一直占着 pid）"
+        );
+    }
+
+    /// **回合末的后台计数只进 debug 日志**：不进模型上下文、不进 transcript。
+    ///
+    /// 断言两件事：① debug 文件里有 `background_tasks` 记录且 `running` = 1；
+    /// ② 出站消息里**没有**任何提到后台计数的 `Output`。
+    ///
+    /// 变异：把计数改成 `Outbound::Output` 投递 ⇒ 第二条断言变红；
+    /// 删掉那条 debug 记录 ⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn turn_end_records_the_running_background_count_in_debug_only() {
+        let logs = TempDir::new("bg_debug_logs");
+        let _env = DebugEnv::set(&logs.0);
+
+        let model = MockModel::new("m");
+        model.push_text("done");
+        let mut h = spawn_app_loop_debug_backgrounds(Box::new(model), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        let (_handle, _pid) = cleanup.start(&session);
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let msgs = collect_until_view(&mut h).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, Outbound::Output(t) if t.contains("background"))),
+            "后台计数不得进模型上下文：{msgs:?}"
+        );
+        shutdown(h).await;
+
+        let files = debug_files(&logs.0);
+        assert_eq!(files.len(), 1, "一个会话一个 debug 文件：{files:?}");
+        let records = &files[0].1;
+        let counts: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["ev"].as_str() == Some("background_tasks"))
+            .collect();
+        assert_eq!(
+            counts.len(),
+            1,
+            "一个回合恰一条 `background_tasks` 记录：{records:?}"
+        );
+        assert_eq!(
+            counts[0]["running"].as_u64(),
+            Some(1),
+            "回合末应记下「还有 1 个后台命令在跑」：{counts:?}"
         );
     }
 }

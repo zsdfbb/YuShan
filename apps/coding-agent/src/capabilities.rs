@@ -271,6 +271,13 @@ pub fn set_model(
             out.push("Note: Cannot build model. Check API credentials with /login.".to_string());
         }
     }
+
+    // 窗口值与**来源**一起报：只有数字，用户无从判断它是厂商目录里的实测值还是兜底
+    // 默认值 —— 也无从决定要不要自己写一份 `config.json` 覆盖。值与来源同源
+    // （`Config::context_window_with_source` 一次判定出两个值）。
+    let (window, source) = config.context_window_with_source();
+    out.push(format!("Context window: {window} (source: {source})"));
+
     out
 }
 
@@ -1086,6 +1093,59 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// `/model` 的输出里带**窗口值与来源**；换模型后来源跟着变。
+    ///
+    /// 变异：把输出里的来源硬编码成「user override」⇒ 后两条断言（内建表 / 默认值）变红。
+    #[test]
+    fn test_set_model_reports_context_window_and_source() {
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-x".into());
+        config.provider = Some("deepseek".into());
+
+        // 用户级窗口覆盖：走**已有**的 `config.json` 覆盖机制（用户动作，不改代码路径）。
+        let cfg_dir = temp_dir("user_config");
+        let cfg_path = cfg_dir.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{
+                "context_window": { "deepseek-reasoner": 258400 }
+            }"#,
+        )
+        .unwrap();
+        config.load_user_config(&cfg_path);
+
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(&mut config, &mut wiring, &state, "deepseek-reasoner", None);
+        assert!(
+            out.iter()
+                .any(|l| l == "Context window: 258400 (source: user override)"),
+            "窗口值与来源都要报出来：{out:?}"
+        );
+
+        // 换模型 ⇒ 来源跟着变（内建兜底表）。
+        let out = set_model(&mut config, &mut wiring, &state, "MiniMax-M3", None);
+        assert!(
+            out.iter()
+                .any(|l| l == "Context window: 1000000 (source: builtin table)"),
+            "换模型后来源要跟着变：{out:?}"
+        );
+
+        // 再换到没人报过窗口的模型 ⇒ 兜底默认值。
+        let out = set_model(&mut config, &mut wiring, &state, "my-local-model", None);
+        assert!(
+            out.iter()
+                .any(|l| l == "Context window: 128000 (source: default)"),
+            "未知模型回退默认值：{out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
     }
 
     /// `/logout`：auth 落盘被移除、config 清空、接线器 model 置空、state 复位。

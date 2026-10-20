@@ -164,6 +164,15 @@ fn tool_snippet(name: &str) -> &'static str {
         "write" => "Create or overwrite files",
         "edit" => "Make precise file edits with exact text replacement",
         "bash" => "Execute bash commands",
+        // 后台命令两个工具（`docs/arch/execution-efficiency/design.md` §4.6 的契约文案）。
+        // 清单里必须说清「后台跑 + 立即给句柄」与「取状态 + 增量输出」——
+        // 否则这两行会退化成兜底文案（`Custom tool`），模型看不出它们与 `bash` 的差别。
+        "bash_bg" => {
+            "Start a shell command in the background and get a handle back immediately; the command keeps running while you do other work"
+        }
+        "bash_poll" => {
+            "Check a background command started with bash_bg: returns its state plus the output produced since the last poll"
+        }
         "grep" => {
             "Search file contents for a pattern (respects .gitignore when ripgrep is available)"
         }
@@ -281,6 +290,31 @@ fn tool_guidelines(tools: &[&str]) -> String {
              read that path (read offset=) or grep it for more, and do not refetch the same URL. \
              Pass prompt only when you need an answer rather than the page (e.g. \"how is the auth \
              header built?\"): it costs one extra model call and is slower"
+                .to_string(),
+        );
+    }
+    // 后台命令两条 guideline（`docs/arch/execution-efficiency/design.md` §4.6 的逐字稿）。
+    //
+    // ① 一条同时覆盖三件事：长命令**后台化**、**合批收轮**（与其它调用同一条消息收）、
+    //    **绝不重复执行**（完整输出在磁盘上，要哪段 `grep` 哪段）。
+    // ② 禁 `sleep` 假装在等 —— `sleep 30` 今天是真的睡满 30s。
+    //
+    // 守卫形态与既有 `websearch` / `webfetch` / `subagent` 的「在场才出现」同形：
+    // **两个工具都在场**才追加 —— 第一条本身要求「用 `bash_poll` 收」，
+    // 缺了 `bash_poll` 时那条是指向不存在工具的悬空指令。
+    // 附带效果：子表不含 bg 工具 ⇒ 子 agent 天然看不到这两条。
+    if tools.contains(&"bash_bg") && tools.contains(&"bash_poll") {
+        guidelines.push(
+            "Run a command that takes more than a few seconds with bash_bg, then keep working; \
+             collect it with bash_poll in the same batch as your other calls — the command \
+             runs while you do something else. Never run the same long command twice: its full \
+             output stays on disk, so grep or read that path for the part you missed instead of \
+             re-running it"
+                .to_string(),
+        );
+        guidelines.push(
+            "Never use sleep to wait for something: start it with bash_bg and collect it with \
+             bash_poll"
                 .to_string(),
         );
     }
@@ -1135,6 +1169,159 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 后台命令两条 guideline **只在 `bash_bg` 与 `bash_poll` 都在场时**出现。
+    ///
+    /// 守卫形态与既有 `websearch` / `webfetch` / `subagent` 的「在场才出现」同形。
+    /// **两个都要在场**：第一条本身要求「用 `bash_poll` 收尾」，缺了 `bash_poll`
+    /// 时它是指向不存在工具的悬空指令。
+    ///
+    /// 反向断言（缺席时不得出现）是关键：少了它，一个「无条件把所有 guideline 都塞进去」
+    /// 的实现也能过 —— 而那会让模型看到用不了的工具建议。
+    ///
+    /// 变异：① 把守卫改成无条件 push ⇒ 反向断言变红；
+    /// ② 把 `&&` 改成 `||` ⇒「只给一个工具」那组断言变红；
+    /// ③ 删掉第一条里的「绝不重复执行」半句 ⇒ 关键片段断言变红。
+    #[test]
+    fn background_command_guidelines_appear_only_when_both_bg_tools_present() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let parent = build_system_prompt(
+            Path::new("/tmp"),
+            &[
+                spec("read"),
+                spec("bash"),
+                spec("bash_bg"),
+                spec("bash_poll"),
+            ],
+            &no_skills(),
+        );
+
+        let first = "- Run a command that takes more than a few seconds with bash_bg";
+        let second = "- Never use sleep to wait for something";
+        assert!(
+            parent.contains(first),
+            "父表（有 bg 工具）应给「长命令后台化 + 合批收尾 + 不重复执行」的指引；prompt = {parent}"
+        );
+        assert!(
+            parent.contains(second),
+            "父表（有 bg 工具）应给「不用 sleep 假装在等」的指引；prompt = {parent}"
+        );
+        // 两条**按序**：后台化在前，禁 sleep 在后。
+        let first_at = parent.find(first).expect("第一条应出现");
+        let second_at = parent.find(second).expect("第二条应出现");
+        assert!(
+            first_at < second_at,
+            "两条 guideline 应按序出现（后台化在前，禁 sleep 在后）；prompt = {parent}"
+        );
+
+        // 既有 guideline 全是**纯文本**：无 markdown 强调标记、无句末句号 ——
+        // 提示词里出现 `**` 是噪声（模型读到的是字面字符，不是强调）。
+        for line in parent
+            .lines()
+            .filter(|line| line.starts_with(first) || line.starts_with(second))
+        {
+            assert!(
+                !line.contains("**"),
+                "guideline 不得带 markdown 强调标记；line = {line}"
+            );
+            assert!(
+                !line.ends_with('.'),
+                "guideline 不带句末句号（与既有条目同风格）；line = {line}"
+            );
+        }
+
+        // 关键片段：合批收轮 / 绝不重复执行 / 完整输出在磁盘上。
+        for fragment in [
+            "in the same batch as your other calls",
+            "Never run the same long command twice",
+            "its full output stays on disk",
+            "grep or read that path for the part you missed instead of re-running it",
+            "start it with bash_bg and collect it with bash_poll",
+        ] {
+            assert!(
+                parent.contains(fragment),
+                "父表指引须含关键片段 `{fragment}`；prompt = {parent}"
+            );
+        }
+
+        // 清单里两个新工具必须有**专属** snippet：否则会退化成 `Custom tool`，
+        // 模型在清单那行看不出它们与 `bash` 的差别（漂移守卫的同形要求）。
+        let lines = listed_tool_lines(&parent);
+        for name in ["bash_bg", "bash_poll"] {
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with(&format!("- {name}: ")))
+                .unwrap_or_else(|| panic!("清单里应有 `{name}`；lines = {lines:?}"));
+            assert!(
+                !line.ends_with("Custom tool"),
+                "`{name}` 不得退化成兜底 snippet；line = {line}"
+            );
+        }
+
+        // 只给一个工具 ⇒ 两条**都不出现**（第一条会引用不存在的 `bash_poll`）。
+        for only in [
+            vec![spec("read"), spec("bash"), spec("bash_bg")],
+            vec![spec("read"), spec("bash"), spec("bash_poll")],
+        ] {
+            let partial = build_system_prompt(Path::new("/tmp"), &only, &no_skills());
+            assert!(
+                !partial.contains(first) && !partial.contains(second),
+                "只给 bg 工具之一时两条 guideline 都不得出现；prompt = {partial}"
+            );
+        }
+
+        // 完全没有 bg 工具 ⇒ 两条都不出现。
+        let plain = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("bash")],
+            &no_skills(),
+        );
+        assert!(
+            !plain.contains(first) && !plain.contains(second),
+            "无 bg 工具时两条 guideline 都不得出现；prompt = {plain}"
+        );
+    }
+
+    /// 子 agent 的工具表（基础 9 元）**不含 bg 工具** ⇒ 天然看不到这两条 guideline。
+    ///
+    /// 这与 `subagent` 那组的「在场才出现」同形：子表少一项，父表多一项，
+    /// 提示词各说各话，互不越界。
+    #[test]
+    fn background_command_guidelines_absent_from_child_prompt() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let child = build_system_prompt(
+            Path::new("/tmp"),
+            &[
+                spec("read"),
+                spec("write"),
+                spec("edit"),
+                spec("bash"),
+                spec("grep"),
+                spec("find"),
+                spec("ls"),
+                spec("websearch"),
+                spec("webfetch"),
+            ],
+            &no_skills(),
+        );
+
+        assert!(
+            !child.contains("with bash_bg"),
+            "子提示不得出现后台命令指引；prompt = {child}"
+        );
+        assert!(
+            !child.contains("bash_poll"),
+            "子提示不得出现 bash_poll 相关指引；prompt = {child}"
+        );
+        assert!(
+            !child.contains("Never use sleep to wait for something"),
+            "子提示不得出现「不用 sleep」指引；prompt = {child}"
+        );
     }
 
     #[test]

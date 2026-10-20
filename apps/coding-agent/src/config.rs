@@ -139,6 +139,42 @@ struct UserConfig {
     model_timeout: ModelTimeoutConfig,
 }
 
+/// context window 的**来源**（四级，与 [`Config::context_window_with_source_for`] 一一对应）。
+///
+/// 单说「窗口多大」不说明**可信度**：128000 可能来自厂商目录（保守但真实），也可能来自
+/// 兜底默认值（压根没人报过）。用户看到来源才知道**该不该自己写一份覆盖**。
+///
+/// 来源与窗口值**成对**产出（同一个判定函数）—— 拆开两次判定会漂移，值与来源会对不上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextWindowSource {
+    /// ① 用户级 `config.json` 的 `context_window` 覆盖（最具体，用户说了算）。
+    UserOverride,
+    /// ② **provider 目录**（`/v1/models`）里厂商自己报的窗口。
+    ProviderCatalog,
+    /// ③ 内建兜底表 [`crate::provider::builtin_context_window`]（目录报不出时的第二手来源）。
+    BuiltinTable,
+    /// ④ 兜底默认值（`RunLimits::default().context_window` = 128_000）。
+    Default,
+}
+
+impl ContextWindowSource {
+    /// 面向用户的短标签（`/model` 输出里的 `source: <标签>`）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UserOverride => "user override",
+            Self::ProviderCatalog => "provider catalog",
+            Self::BuiltinTable => "builtin table",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl std::fmt::Display for ContextWindowSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 pub struct Config {
     pub api_base: Option<String>,
     pub api_key: Option<String>,
@@ -233,16 +269,33 @@ impl Config {
     /// 供 subagent 按 `model` 参数取子模型窗口用 —— 子 agent 换模型却继承父窗口是
     /// **静默错**（32k 模型按 1M 判 ⇒ 不压缩 ⇒ 撞窗）。
     pub fn context_window_for(&self, model: &str) -> usize {
+        self.context_window_with_source_for(model).0
+    }
+
+    /// 按**给定模型名**解析 context window **及其来源**（四级，与
+    /// [`Self::context_window_for`] **同一个判定**）。
+    ///
+    /// 窗口值与来源**成对**产出：分开两次判定会漂移 —— 值取自一处、来源取自另一处，
+    /// `/model` 就会显示「窗口 258400（来源：默认）」这种自相矛盾的话。
+    pub fn context_window_with_source_for(&self, model: &str) -> (usize, ContextWindowSource) {
         if let Some(&window) = self.user_config.windows.get(model) {
-            return window;
+            return (window, ContextWindowSource::UserOverride);
         }
         if let Some(window) = self.registry.catalog_context_window(model) {
-            return window;
+            return (window, ContextWindowSource::ProviderCatalog);
         }
         if let Some(window) = crate::provider::builtin_context_window(model) {
-            return window;
+            return (window, ContextWindowSource::BuiltinTable);
         }
-        ys_component::RunLimits::default().context_window
+        (
+            ys_component::RunLimits::default().context_window,
+            ContextWindowSource::Default,
+        )
+    }
+
+    /// 当前 model 的 context window **及其来源**（同 [`Self::context_window_with_source_for`]）。
+    pub fn context_window_with_source(&self) -> (usize, ContextWindowSource) {
+        self.context_window_with_source_for(&self.model)
     }
 
     /// 压缩策略：`config.json` 的比例覆盖叠在 [`ys_component::CompactPolicy::default`] 上。
@@ -584,6 +637,7 @@ fn sanitize_ratio(key: &str, value: Option<serde_json::Value>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ApiModel;
     use crate::test_env::{EnvRestore, env_lock};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -932,6 +986,79 @@ mod tests {
         // 不是「文件里存在任何覆盖就全局生效」）
         config.model = "deepseek-chat".into();
         assert_eq!(config.context_window(), 64_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 窗口值与来源**成对**正确：四级各一条断言。
+    ///
+    /// 变异：把来源硬编码成「user override」（无论走到哪一级都返回
+    /// [`ContextWindowSource::UserOverride`]）⇒ 下面 ② ③ ④ 三条断言同时变红。
+    #[test]
+    fn test_context_window_source_matches_each_level() {
+        // ① 用户级 `config.json` 覆盖（最具体）。
+        let (dir, path) = write_config(
+            "window_source",
+            r#"{
+                "context_window": { "MiniMax-M3": 258400 }
+            }"#,
+        );
+        let mut config = test_config("MiniMax-M3");
+        config.load_user_config(&path);
+
+        assert_eq!(
+            config.context_window_with_source(),
+            (258_400, ContextWindowSource::UserOverride),
+            "① 用户覆盖：值与来源都要对"
+        );
+
+        // ② provider 目录自己报的窗口 —— 压过 ③ 内置表。
+        config.registry.seed_cached_catalog(
+            "https://api.minimax.chat/v1",
+            &[ApiModel {
+                id: "MiniMax-M2.7".into(),
+                owned_by: None,
+                name: None,
+                context_window: Some(400_000),
+            }],
+        );
+        config.model = "MiniMax-M2.7".into();
+        assert_eq!(
+            config.context_window_with_source(),
+            (400_000, ContextWindowSource::ProviderCatalog),
+            "② 目录应压过 ③ 内置表"
+        );
+
+        // ③ 内建兜底表（目录报不出窗口时）。
+        config
+            .registry
+            .seed_cached_catalog("https://api.minimax.chat/v1", &[]);
+        assert_eq!(
+            config.context_window_with_source(),
+            (204_800, ContextWindowSource::BuiltinTable),
+            "③ 内置表：值与来源都要对"
+        );
+
+        // ④ 兜底默认值（谁都没报过）。
+        config.model = "unknown-model-xyz".into();
+        assert_eq!(
+            config.context_window_with_source(),
+            (
+                ys_component::RunLimits::default().context_window,
+                ContextWindowSource::Default
+            ),
+            "④ 未知 model 回退默认值"
+        );
+
+        // 窗口值与来源**必须出自同一次判定**：老接口拿到的值要和成对接口一致。
+        for model in ["MiniMax-M3", "MiniMax-M2.7", "unknown-model-xyz"] {
+            let (window, _) = config.context_window_with_source_for(model);
+            assert_eq!(
+                config.context_window_for(model),
+                window,
+                "窗口值与来源不得漂移：{model}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

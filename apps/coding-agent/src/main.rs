@@ -67,6 +67,7 @@ mod test_env;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
@@ -82,16 +83,42 @@ use ys_protocol::{Boundary, Envelope, LifecyclePolicy, Outbound, QueueBoundarySo
 use ys_runtime::{Agent, AgentBuilder, AgentPorts, BuildError};
 use ys_session::SessionError;
 use ys_tool::Tool;
+use ys_tools_basic::{BackgroundTasks, BgLimits, SessionSlot};
 use ys_tools_web::WebConfig;
 use ys_tui_coding::CodingView;
 
 use channel::{ChannelSink, ChannelStatsHandle};
 use debug_log::{ArgsMode, DebugIds, DebugRecord, DebugSink};
 use round_clock::RoundClock;
-use wiring::Wiring;
+use wiring::{BackgroundContext, Wiring};
 
 /// OTel GenAI semconv 版本：与 `SCHEMA_VERSION` 一起钉死并写进 `run_start`。
 const SEMCONV_VERSION: &str = "otel-genai/1.36.0";
+
+/// 进程级后台命令上下文 —— 注册表 + 会话槽。
+///
+/// **为什么是进程级单例**：注册表对象随进程存活（工具表是**建表期产物** ⇒ 注册表
+/// 不能随会话重建）；而**进程退出路径也要用它** —— 退出原语**不跑析构** ⇒
+/// 清理必须在退出原语之前显式发生，而退出函数是自由函数（拿不到 `Wiring`、
+/// 也拿不到装配工厂）。
+static BACKGROUNDS: OnceLock<BackgroundContext> = OnceLock::new();
+
+/// 进程级后台命令上下文 —— 启动期尚未建立时为 `None`。
+///
+/// 启动早期的退出路径（凭证 / 配置出错）没有后台任务 ⇒ `None` 即「无需清理」。
+pub(crate) fn backgrounds() -> Option<&'static BackgroundContext> {
+    BACKGROUNDS.get()
+}
+
+/// 把进程级后台命令上下文挂到接线器上 —— 会话槽随即同步到**当前**会话。
+///
+/// 三个模式（`-p` / `--json` / TUI）各建一次接线器 ⇒ 各挂一次；挂的是**同一份**
+/// 上下文（注册表与槽都是 `Arc` 共享）⇒ 工具与清理点看到的会话 id 必然一致。
+fn attach_background_context(wiring: &mut Wiring) {
+    if let Some(context) = backgrounds() {
+        wiring.attach_backgrounds(context.clone());
+    }
+}
 
 /// 运行模式。
 #[derive(Debug, PartialEq, Eq)]
@@ -1320,6 +1347,63 @@ fn sweep_fetched(web: &WebConfig, max_age: Duration) {
     let _ = ys_tools_web::sweep(dir, max_age);
 }
 
+/// 后台命令落盘目录里旧会话目录的保留时长：超过即被启动期清理。
+///
+/// 与抓取落盘同一档（7 天）—— 后台输出是**会话级**产物，会话结束即失去意义；
+/// 留几天只为同机排查时能回看。
+const BG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// 启动期清扫后台命令落盘根目录 —— 只删**超龄**的输出文件（及随之空掉的会话目录），
+/// best-effort、静默。
+///
+/// # 为什么只删超龄的
+///
+/// 落盘根目录可能被**同机并行的另一个实例**共用（默认档就是 `<temp>/yushan-bg`）
+/// ⇒ 无条件清空会把别人**在跑**的命令的输出文件删掉（进程还在写，文件却没了）。
+/// 故与 `sweep_fetched` 同策：只清超龄的。
+///
+/// # 为什么必须由 `main` 显式调
+///
+/// 与 `sweep_fetched` 同理：清理放进装配序列会让**测试**删掉用户真实的数据。
+///
+/// 失败静默（照 `logging.rs` 的 best-effort 风格）：清理是**附带动作**，
+/// 它永远不该成为一次启动失败的原因。
+fn sweep_bg_root(root: &Path, max_age: Duration) {
+    let Some(cutoff) = SystemTime::now().checked_sub(max_age) else {
+        return;
+    };
+    let Ok(sessions) = std::fs::read_dir(root) else {
+        return;
+    };
+    for session in sessions.flatten() {
+        let dir = session.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let Ok(meta) = file.metadata() else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            if mtime < cutoff {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+        // 清空的会话目录一并删掉（不留空壳）。
+        if std::fs::read_dir(&dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+}
+
 /// 会话落盘目录 —— **自己的降级绝不产生相对路径**。
 ///
 /// # 四档（优先级从高到低）
@@ -1968,7 +2052,43 @@ fn exit_with_run_end(
             usage,
         });
     }
+    // 后台命令清理**必须在退出原语之前**：退出原语**不跑析构** ⇒
+    // `BackgroundTasks` 的 `Drop` 兜底在此路径**无效**。
+    kill_backgrounds_on_exit();
     std::process::exit(code);
+}
+
+/// 进程退出前的后台命令清理 —— 杀掉**全部**会话的后台进程组。
+///
+/// **为什么必须显式**：退出原语**不跑析构** ⇒ `BackgroundTasks` 的
+/// `Drop` 兜底在此路径**无效** ⇒ 只能在这里显式杀。
+///
+/// **怎么覆盖「全部」**：注册表的 `kill_all` **按会话过滤** ⇒ 逐个会话调。会话 id
+/// 取自落盘目录名（`<bg_root>/<session_id>/`）—— 别的进程的目录也在那儿，但它们的
+/// 条目**不在本进程的注册表里** ⇒ 命中不了 ⇒ 不会误杀别人的进程。
+fn kill_backgrounds_on_exit() {
+    let Some(context) = backgrounds() else {
+        return;
+    };
+    let tasks = context.tasks();
+    // 当前会话先杀（绝大多数情况下的唯一活会话）。
+    tasks.kill_all(&context.session_id());
+    // 再按落盘目录里的会话目录逐个清 —— 覆盖「换过会话但清理点漏了」的情形。
+    for session in bg_session_dirs(tasks.root()) {
+        tasks.kill_all(&session);
+    }
+}
+
+/// 落盘根目录下的**会话目录名** —— 目录名即会话 id。
+fn bg_session_dirs(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect()
 }
 
 /// 启动期要入队的出站序列，按**入队顺序**排列。
@@ -2051,6 +2171,7 @@ fn run_interactive(
             None => Wiring::persistent_new(model, Box::new(sink), sessions_dir).await,
         }
     })?;
+    attach_background_context(&mut wiring);
     let startup_hint = with_session_recovery_hint(startup_hint, wiring.take_recovery());
 
     // 会话路径快照：UI 退出后打印 `session: <id>` 用。启动态在此播种（此刻只有
@@ -2615,13 +2736,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 产物目录清理：只清 Primary 档的超龄文件（`YUSHAN_SUBAGENTS_DIR` 只写不删）。
     subagents_dir.sweep_old();
 
+    // ── 后台命令上下文（**进程级**）──
+    //
+    // 注册表对象建**一次** ⇒ 随工厂冻结（`/resume` 重建 agent 时仍是同一份）、
+    // 随接线器共享（清理点与工具看到同一份）。会话 id 住在**共享槽**里 ——
+    // 工具表是建表期产物 ⇒ 会话 id 只能运行时读；`/new`、`/resume` 换会话时
+    // 由接线器改槽。
+    //
+    // 落盘根目录：`$YUSHAN_BG_DIR`（须绝对路径）或 `<temp_dir>/yushan-bg`。
+    let bg_root = BackgroundTasks::default_root();
+    let backgrounds = BackgroundContext::new(
+        std::sync::Arc::new(BackgroundTasks::new(bg_root.clone(), BgLimits::default())),
+        // 初值只是占位 —— 真正的会话 id 由接线器挂载上下文时写入（工具运行时读槽）。
+        SessionSlot::new("startup"),
+    );
+    // 进程级单例：退出路径也要用它清理（退出原语不跑析构）。
+    let _ = BACKGROUNDS.set(backgrounds.clone());
+    // 落盘目录清理：只删**超龄**的输出文件（默认档可能被同机并行的另一个实例共用）。
+    sweep_bg_root(&bg_root, BG_MAX_AGE);
+
     let factory = assembly::AgentFactory::new(
         web,
         catalogue,
         limits,
         config.max_turn_duration(),
         subagents_dir,
-    );
+    )
+    .with_backgrounds(backgrounds.clone());
     // 一次装配：工具表 / working_dir / system prompt 三者同源于 `workspace`。
     let assembly::BuiltAgent {
         mut agent,
@@ -2629,6 +2770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits: agent_limits,
         hint: tool_hint,
         tool_specs,
+        ..
     } = factory.build(&workspace)?;
 
     // **启动期提示合并成一条**（多行、绝不互相覆盖）：工具降级 + skill 诊断
@@ -2678,6 +2820,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })?;
+            attach_background_context(&mut wiring);
             if let Some(recovery) = wiring.take_recovery() {
                 eprintln!("{}", capabilities::session_recovery_notice(recovery));
             }
@@ -2767,6 +2910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })?;
+            attach_background_context(&mut wiring);
             if let Some(recovery) = wiring.take_recovery() {
                 eprintln!("{}", capabilities::session_recovery_notice(recovery));
             }
@@ -5254,6 +5398,78 @@ mod tests {
             fn_start < at && at < fn_end,
             "唯一一处裸退出原语必须在 `exit_with_run_end` 函数体内"
         );
+    }
+
+    /// **退出路径断言**：后台命令的清理调用与裸退出原语**同在一个函数体内**、
+    /// 且排在它**之前**；裸退出原语在全文件**仍只有一处**。
+    ///
+    /// 断言用的 needle 在运行时拼接 —— 否则 `include_str!` 会把本测试自己的字面量
+    /// 也算进去（永远 > 1）。
+    ///
+    /// 变异：把清理调用移到 `exit_with_debug` **之后**（挪出退出函数体）⇒ 位置断言变红。
+    #[test]
+    fn background_cleanup_runs_before_the_process_exit_primitive() {
+        let exit_needle = ["process", "::", "exit"].concat();
+        let cleanup_needle = ["kill_backgrounds_on_exit", "();"].concat();
+        let source = include_str!("main.rs");
+
+        assert_eq!(
+            source.matches(&exit_needle).count(),
+            1,
+            "裸退出原语在全文件只允许出现一次"
+        );
+        assert_eq!(
+            source.matches(&cleanup_needle).count(),
+            1,
+            "后台清理调用必须**恰好一处**"
+        );
+
+        let cleanup_at = source
+            .find(&cleanup_needle)
+            .expect("必须存在唯一一处清理调用");
+        let exit_at = source.find(&exit_needle).expect("必须存在唯一一处退出原语");
+        let fn_start = source
+            .find("fn exit_with_run_end")
+            .expect("退出函数必须存在");
+        let fn_end = source[fn_start..]
+            .find("\n}\n")
+            .map(|offset| fn_start + offset + 3)
+            .expect("函数体必须闭合");
+        assert!(
+            fn_start < cleanup_at && cleanup_at < exit_at && exit_at < fn_end,
+            "后台清理调用必须与裸退出原语同在 `exit_with_run_end` 函数体内，且**排在它之前**"
+        );
+    }
+
+    /// 启动期清扫：只删**超龄**的输出文件；未超龄的必须留着
+    /// （同机并行的另一个实例可能正在用它）。
+    #[test]
+    fn sweep_bg_root_removes_only_aged_output_files() {
+        let root = unique_tmp_dir("bg_sweep");
+        let aged = root.join("aged-session");
+        let fresh = root.join("fresh-session");
+        std::fs::create_dir_all(&aged).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let aged_file = aged.join("bg1.log");
+        let fresh_file = fresh.join("bg1.log");
+        std::fs::File::create(&aged_file).unwrap();
+        std::fs::File::create(&fresh_file).unwrap();
+        // 把 aged 的输出文件拨到 8 天前（阈值 7 天之外）。
+        std::fs::File::options()
+            .write(true)
+            .open(&aged_file)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+
+        sweep_bg_root(&root, BG_MAX_AGE);
+
+        assert!(!aged_file.exists(), "超龄的输出文件必须被清理");
+        assert!(!aged.exists(), "清空后的会话目录必须被清理");
+        assert!(fresh_file.exists(), "未超龄的输出文件必须留着");
+        assert!(fresh.exists(), "未超龄的会话目录必须留着");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `RoundUsage` 是非终局事件：消费循环不得在它之后提前返回。

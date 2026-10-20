@@ -26,11 +26,11 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
 };
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1062,6 +1062,43 @@ pub(crate) struct ToolArgsSummary {
     pub truncated: bool,
     pub keys: Vec<String>,
     pub redacted_keys: Vec<String>,
+    /// **命令串指纹**（`fnv1a64`）：只对命令类工具给，其余工具为 `None`。
+    ///
+    /// 它是「同一回合内同一条命令串出现 >1 次」的唯一落点：参数投影里的命令串
+    /// 是**有界截断**的（`head` 档为「头 160 B + 尾 64 B」），两条不同的长命令会被
+    /// 投影成同一串 ⇒ 拿投影聚合会误报「重复」。
+    ///
+    /// 只落指纹、不落正文 ⇒ 不泄密、不增体积。
+    pub command_fp: Option<u64>,
+}
+
+/// FNV-1a 64（**不引 `sha2`** —— 指纹的用途是**发现漂移**与离线聚类，不是抗碰撞）。
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 命令类工具名：其 `command` 参数即**命令串**。
+///
+/// 判定按工具名而非参数形状 —— 只有命令类工具才落指纹，其余工具一律 `None`。
+fn is_command_tool(tool: &str) -> bool {
+    matches!(tool.to_ascii_lowercase().as_str(), "bash" | "bash_bg")
+}
+
+/// 命令串指纹：命令类工具给 `Some`，其余工具给 `None`。
+///
+/// 指纹取**脱敏后**的命令串原文：`command` 键不在敏感键名单里，脱敏不改它；
+/// 取脱敏后的值是为了让「指纹不泄密」这条契约不依赖名单的变更。
+fn command_fingerprint(tool: &str, redacted_args: &Value) -> Option<u64> {
+    if !is_command_tool(tool) {
+        return None;
+    }
+    let command = redacted_args.get("command").and_then(Value::as_str)?;
+    Some(fnv1a64(command.as_bytes()))
 }
 
 /// 按工具规则投影参数，再统一脱敏与总预算约束。
@@ -1077,6 +1114,10 @@ pub(crate) fn summarize_tool_args(tool: &str, args: &Value, mode: ArgsMode) -> T
     redact_sensitive(&mut redacted, &mut redacted_keys);
     redacted_keys.sort();
     redacted_keys.dedup();
+
+    // 指纹是**索引**而非内容 ⇒ 任何摘要档位都算（含 `none`）：
+    // 否则「重复命令数」会随档位而变，读数不可比。
+    let command_fp = command_fingerprint(tool, &redacted);
 
     let mut out = Map::new();
     let mut truncated = mode == ArgsMode::None;
@@ -1128,6 +1169,7 @@ pub(crate) fn summarize_tool_args(tool: &str, args: &Value, mode: ArgsMode) -> T
         truncated,
         keys,
         redacted_keys,
+        command_fp,
     }
 }
 
@@ -2386,6 +2428,153 @@ mod tests {
         let short = summarize_tool_args("bash", &json!({ "command": "ls -la" }), ArgsMode::Head);
         assert_eq!(short.arguments["command"], "ls -la");
         assert!(!short.truncated);
+    }
+
+    // ---- 命令串指纹 ----
+
+    /// 指纹取**命令串本身**：同串同指纹；**等长异串**也必须分开。
+    ///
+    /// 变异：把 `command_fp` 换成 `args_original_bytes`（整个参数对象的字节数）
+    /// ⇒ 「等长异串」断言变红（两个参数的字节数相同 ⇒ 指纹相同）。
+    #[test]
+    fn test_command_fingerprint_separates_equal_length_commands() {
+        let first = summarize_tool_args(
+            "bash",
+            &json!({ "command": "cargo test --workspace" }),
+            ArgsMode::Head,
+        );
+        let again = summarize_tool_args(
+            "bash",
+            &json!({ "command": "cargo test --workspace" }),
+            ArgsMode::Head,
+        );
+        assert_eq!(
+            first.command_fp, again.command_fp,
+            "同一条命令串两次 ⇒ 指纹相同"
+        );
+        assert!(first.command_fp.is_some(), "命令类工具必有指纹");
+
+        // 与上面**等长**（21 字节）但异串：参数对象的字节数相同，只有命令串指纹能分开。
+        let twin = summarize_tool_args(
+            "bash",
+            &json!({ "command": "cargo test --worktrees" }),
+            ArgsMode::Head,
+        );
+        assert_ne!(first.command_fp, twin.command_fp, "等长异串 ⇒ 指纹必须不同");
+
+        let shorter =
+            summarize_tool_args("bash", &json!({ "command": "cargo test" }), ArgsMode::Head);
+        assert_ne!(first.command_fp, shorter.command_fp, "不同长度 ⇒ 指纹不同");
+    }
+
+    /// 指纹取**未截断**的命令串：两条**投影完全相同**（头尾一致、中段不同）的长命令
+    /// 必须有不同指纹 —— 否则默认 `head` 档会把它们误判成「重复命令」。
+    #[test]
+    fn test_command_fingerprint_survives_projection_truncation() {
+        let head = "H".repeat(160);
+        let tail = "T".repeat(64);
+        let first = summarize_tool_args(
+            "bash",
+            &json!({ "command": format!("{head}AAA{tail}") }),
+            ArgsMode::Head,
+        );
+        let second = summarize_tool_args(
+            "bash",
+            &json!({ "command": format!("{head}BBB{tail}") }),
+            ArgsMode::Head,
+        );
+        assert_eq!(
+            first.arguments["command"], second.arguments["command"],
+            "两条命令的投影相同（头 160 B + 尾 64 B）"
+        );
+        assert_ne!(
+            first.command_fp, second.command_fp,
+            "投影相同但命令串不同 ⇒ 指纹必须不同"
+        );
+    }
+
+    /// 非命令类工具没有指纹 —— 指纹是**命令串**的摘要，别的东西一律 `None`。
+    #[test]
+    fn test_command_fingerprint_absent_for_non_command_tools() {
+        for tool in [
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "ls",
+            "websearch",
+            "subagent",
+        ] {
+            let summary = summarize_tool_args(
+                tool,
+                &json!({ "path": "a.rs", "command": "ls" }),
+                ArgsMode::Head,
+            );
+            assert_eq!(
+                summary.command_fp, None,
+                "{tool} 不是命令类工具 ⇒ 无指纹（即便参数里有 command 字段）"
+            );
+        }
+
+        assert!(
+            summarize_tool_args("bash", &json!({ "command": "ls" }), ArgsMode::Head)
+                .command_fp
+                .is_some(),
+            "bash 是命令类工具 ⇒ 有指纹"
+        );
+        assert!(
+            summarize_tool_args("bash_bg", &json!({ "command": "ls" }), ArgsMode::Head)
+                .command_fp
+                .is_some(),
+            "bash_bg 是命令类工具 ⇒ 有指纹"
+        );
+        assert_eq!(
+            summarize_tool_args("bash", &json!({ "timeout": 5 }), ArgsMode::Head).command_fp,
+            None,
+            "命令类工具但没有 command 参数 ⇒ 无指纹"
+        );
+    }
+
+    /// 档位不影响指纹：`none` / `head` / `full` 三档给同一个值 ——
+    /// 指纹是**索引**而非内容，故 `none` 档（参数投影为空）也照算。
+    #[test]
+    fn test_command_fingerprint_is_independent_of_args_mode() {
+        let args = json!({ "command": "cargo build" });
+        let head = summarize_tool_args("bash", &args, ArgsMode::Head);
+        let full = summarize_tool_args("bash", &args, ArgsMode::Full);
+        let none = summarize_tool_args("bash", &args, ArgsMode::None);
+
+        assert_eq!(head.command_fp, full.command_fp);
+        assert_eq!(
+            head.command_fp, none.command_fp,
+            "指纹是索引而非内容 ⇒ `none` 档也算"
+        );
+        assert_eq!(none.arguments, json!({}), "`none` 档参数投影仍为空");
+    }
+
+    /// 脱敏在所有档位都生效；指纹**不因脱敏而变** —— `command` 键不在敏感键名单里，
+    /// 脱敏改的是别的键（如 `api_key`）。
+    #[test]
+    fn test_command_fingerprint_survives_redaction() {
+        let args = json!({ "command": "curl -H 'x'", "api_key": "sk-secret" });
+        let mut fingerprint = None;
+        for mode in [ArgsMode::None, ArgsMode::Head, ArgsMode::Full] {
+            let summary = summarize_tool_args("bash", &args, mode);
+            assert_eq!(
+                summary.redacted_keys,
+                vec!["api_key".to_string()],
+                "脱敏在所有档位都生效"
+            );
+            assert!(summary.command_fp.is_some(), "命令类工具必有指纹");
+            fingerprint = summary.command_fp;
+        }
+
+        let clean =
+            summarize_tool_args("bash", &json!({ "command": "curl -H 'x'" }), ArgsMode::Head);
+        assert_eq!(
+            fingerprint, clean.command_fp,
+            "脱敏不触及命令串 ⇒ 指纹与未脱敏时一致"
+        );
     }
 
     /// 多字节 UTF-8：截断必须落在字符边界，不得出现半个字符。

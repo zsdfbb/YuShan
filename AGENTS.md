@@ -57,7 +57,8 @@ YuShan/
 ## 常用命令
 
 - `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（当前实测 **1295 passed / 12 ignored**；数字随开发增长，**别当契约**）
+- `cargo test --workspace` — 全量测试（当前实测 **1513 passed / 12 ignored**；数字随开发增长，**别当契约**）
+- `python3 scripts/cancellation-mutation.py` — **取消链路的变异测试**（ADR-0046）：注入 12 处 bug ⇒ 期望用例变红；一次跑完全部并给汇总表（`--list` 只列清单，数字参数只跑指定编号）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）

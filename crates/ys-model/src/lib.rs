@@ -15,6 +15,7 @@ pub use trait_def::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use ys_core::*;
 
     struct MockEventSink;
@@ -174,5 +175,60 @@ mod tests {
         });
         let back: ModelResponse = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.finish_reason, FinishReason::default());
+    }
+
+    /// N10：`boundary` **不参与序列化** ⇒ 既有序列化字节逐字节不变。
+    ///
+    /// 该字段带 `serde(skip)`；若误改成普通字段，JSON 里会多出 `boundary`
+    /// 键（且 `Arc<dyn BoundarySource>` 无 `Serialize` ⇒ 直接编译失败）。
+    /// 这里钉住的是「挂载边界源**不改变**请求的线上字节」。
+    #[test]
+    fn model_request_serialization_ignores_boundary() {
+        let request = ModelRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            tools: vec![],
+            ..Default::default()
+        };
+        let without_boundary = serde_json::to_string(&request).unwrap();
+
+        let with_boundary = ModelRequest {
+            boundary: Some(Arc::new(ys_protocol::QueueBoundarySource::new())),
+            ..request.clone()
+        };
+        let with_boundary = serde_json::to_string(&with_boundary).unwrap();
+
+        assert_eq!(
+            without_boundary, with_boundary,
+            "挂载边界源不得改变序列化字节"
+        );
+        assert!(
+            !with_boundary.contains("boundary"),
+            "序列化结果不得含 boundary 键：{with_boundary}"
+        );
+    }
+
+    /// N11：`clone` 后 `boundary` 仍是**同一份** `Arc`（`Arc::ptr_eq`）。
+    ///
+    /// 共享语义是取消能生效的前提：loop 侧与 model 侧必须看到**同一个**
+    /// abort 状态；clone 若产生独立副本，模型侧就永远看不到 abort。
+    #[test]
+    fn model_request_clone_keeps_same_boundary_arc() {
+        let boundary: Arc<dyn ys_protocol::BoundarySource> =
+            Arc::new(ys_protocol::QueueBoundarySource::new());
+        let request = ModelRequest {
+            boundary: Some(boundary.clone()),
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        assert!(
+            cloned
+                .boundary
+                .as_ref()
+                .is_some_and(|b| Arc::ptr_eq(b, &boundary)),
+            "clone 后必须仍是同一份 Arc"
+        );
     }
 }

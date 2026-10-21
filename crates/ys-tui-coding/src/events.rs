@@ -712,6 +712,24 @@ mod tests {
         assert!(ch.next_boundary().is_none(), "回合外不投 Abort");
     }
 
+    /// **回归（Esc 不是两段式）**：Ctrl-C 是「取消 → 再按退出」的两段式，
+    /// Esc 只是取消。两段式是 **Ctrl-C 专属**的退出保障；若 Esc 也置
+    /// `abort_requested`，用户按完 Esc 再按 Ctrl-C 就会**直接退出进程**，
+    /// 跳过了「先取消、等它停」这一步。
+    ///
+    /// 变异：把 Esc 分支也置 `abort_requested = true` ⇒ 本测试变红。
+    #[test]
+    fn test_esc_does_not_set_abort_requested() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+
+        handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+
+        assert_eq!(ch.next_boundary().unwrap(), Boundary::Abort);
+        assert!(!a.abort_requested, "Esc 不是两段式，不得置 abort_requested");
+    }
+
     /// **回归（命令在飞时 Esc 要能取消）**：`/login` 这类命令会做一次网络往返
     /// （`/v1/models`，最长 5s，TCP 挂起时更久），而命令不经过 `BasicLoop` —— 没有任何
     /// 人会去读 `Boundary`。若 Esc 只认 `is_turning`，这段时间里按 Esc 就毫无反应，

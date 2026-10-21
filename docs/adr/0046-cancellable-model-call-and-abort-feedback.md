@@ -629,7 +629,8 @@ app.transcript.push(TranscriptLine::System(
 **`abort_requested` 置位？** ⇒ **不置**。`abort_requested` 是 Ctrl-C 两段式的判据
 （`events.rs:132`），Esc 不参与。保持 `Esc` 的现有语义不变 ⇒ **零行为变更**。
 
-**爆炸半径**：`crates/ys-tui-coding/src/events.rs` **1 处 3 行** + 1 条测试。
+**爆炸半径**：`crates/ys-tui-coding/src/events.rs` **1 处 3 行** + 2 条测试
+（一条钉「产生系统行」，一条钉「**不置** `abort_requested`」）。
 
 ### 决策 7：补齐 6 个文件类工具的 abort 探针
 
@@ -724,6 +725,34 @@ if ctx.boundary.is_some_and(|b| b.is_aborted()) { ... 收场 ... }
 ② 把 `ys-loop` 的 `Cancelled` 分流去掉 ⇒ 「不发 `RunFailed`」用例红；
 ③ 把 Esc 的系统行去掉 ⇒ 「Esc 产生系统行」用例红；
 ④ 把「先 append partial 再收场」的顺序反了 ⇒ 「partial 追加进会话历史」用例红。
+
+### 变异实测（2026-10-21）
+
+共 12 处变异，**每处都对应至少一个变红的用例**。
+
+脚本：`scripts/cancellation-mutation.py`（**一次跑完全部 12 处**，跑完给汇总表）。
+用法：`python3 scripts/cancellation-mutation.py`（全部）/ `--list`（只列清单）/ `1 4 7`（只跑指定编号）。
+每个 mutant 跑**包级**测试（`cargo test -p <pkg>`）而非单个具名用例 ⇒ 覆盖更强，且能报出「哪些用例抓住了它」。
+
+| # | 注入的 bug | 变红的用例 |
+|---|---|---|
+| ① | 适配器**发送阶段**的 `select!` 去掉 | `already_aborted_boundary_sends_no_request` 等 2 个 |
+| ② | 适配器**流式阶段**的中止分支去掉 | `cancelled_after_delta_carries_partial_text` 等 2 个 |
+| ③ | `into_partial` 恒返回 `None` | `cancelled_after_delta_carries_partial_text` 等 2 个 |
+| ④ | `into_partial` 多吐 `ToolUse`（带出未完成的工具调用） | `cancelled_with_partial_tool_call_carries_no_tool_use` |
+| ⑤ | 退避退回裸 `sleep`（退避期间不可取消） | `cancellation_during_backoff_returns_promptly` |
+| ⑥ | `ys-loop` 的 `Cancelled` 分流去掉 | `model_cancelled_finishes_with_cancelled_and_never_run_failed` 等 4 个 |
+| ⑦ | 「先 append partial 再收场」的顺序颠倒 | `model_cancelled_appends_partial_before_run_finished` |
+| ⑧ | Esc 的系统行去掉 | `test_esc_while_turning_appends_system_line` |
+| ⑨ | Esc 置 `abort_requested`（破坏「Esc 非两段式」） | `test_esc_does_not_set_abort_requested` |
+| ⑩ | 工具之间的 abort 探针去掉 | `abort_between_tools_stops_the_next_tool` |
+| ⑪ | `boundary` 参与序列化 | `model_request_serialization_ignores_boundary` |
+| ⑫ | `ModelRequest::clone` 产生独立边界副本 | `model_request_clone_keeps_same_boundary_arc` |
+
+**⑦ 的发现**：原 `model_cancelled_partial_is_appended_to_session` 只断言**最终状态**
+（partial 进了会话），**不区分顺序** ⇒ 顺序颠倒后仍绿。故补
+`model_cancelled_appends_partial_before_run_finished`（共享顺序日志同时记录
+`append` 与 `RunFinished`）才把这条契约钉住。
 
 ## 不做什么
 

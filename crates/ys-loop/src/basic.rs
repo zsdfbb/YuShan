@@ -2434,6 +2434,131 @@ mod tests {
         );
     }
 
+    /// N8：工具**之间** abort ⇒ 不再发起下一个工具。
+    ///
+    /// 场景：模型一轮给出两个工具调用；第一个工具执行时向边界投 `Abort` ⇒
+    /// 第二个工具**不得**被执行（探针在 emit `ToolCall` 之前 ⇒ 连事件都不发）。
+    ///
+    /// 变异靶：把 `basic.rs` 串行路径里的 abort 探针删掉 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn abort_between_tools_stops_the_next_tool() {
+        struct AbortingTool {
+            name: String,
+            calls: Arc<AtomicUsize>,
+            boundary: Arc<ys_protocol::QueueBoundarySource>,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for AbortingTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::new(self.name.as_str(), "aborts the turn", serde_json::json!({}))
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: ToolContext<'_>,
+            ) -> Result<CoreToolResult, ys_tool::ToolError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.boundary.push(Boundary::Abort);
+                Ok(CoreToolResult {
+                    content: "aborted".into(),
+                    is_error: false,
+                })
+            }
+        }
+
+        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let registry = ToolRegistry::build(vec![
+            Box::new(AbortingTool {
+                name: "aborting".into(),
+                calls: first_calls.clone(),
+                boundary: boundary.clone(),
+            }),
+            Box::new(CountingNamedTool {
+                name: "second".into(),
+                calls: second_calls.clone(),
+            }),
+        ])
+        .unwrap();
+
+        let model = MultiToolModel::new(&[("aborting", "aborting"), ("second", "second")]);
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            )
+            .with_boundary(boundary.clone());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            first_calls.load(Ordering::SeqCst),
+            1,
+            "第一个工具应执行一次"
+        );
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "abort 之后不得再发起下一个工具"
+        );
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
+        // 探针在 emit `ToolCall` **之前** ⇒ 被中止的那次调用连事件都不发。
+        let second_call_events = events
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::ToolCall { call } if call.name == "second"
+                )
+            })
+            .count();
+        assert_eq!(
+            second_call_events,
+            0,
+            "被中止的工具不得发出 ToolCall 事件，实际事件：{:?}",
+            events.events()
+        );
+    }
+
+    /// 名字可配的计数工具（注册表里的实例与测试持有的计数器必须是**同一个**）。
+    struct CountingNamedTool {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingNamedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(
+                self.name.as_str(),
+                "counts invocations",
+                serde_json::json!({}),
+            )
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreToolResult {
+                content: "ok".into(),
+                is_error: false,
+            })
+        }
+    }
+
     /// 父边界在入口已取消：零模型调用，且只发一条 `RunFinished{Cancelled}`。
     #[tokio::test]
     async fn parent_boundary_pre_cancel_makes_zero_model_calls() {
@@ -2483,6 +2608,317 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// 模型恒返回 `ModelError::Cancelled`（可带 partial）—— 用于钉住「中止不是故障」这条分流。
+    ///
+    /// `partial` 为 `None` 时模拟「中止瞬间尚无可见输出」；`Some(..)` 时模拟
+    /// 「已收到部分文本后被中止」。
+    struct CancellingModel {
+        partial: Option<Message>,
+        calls: AtomicUsize,
+    }
+
+    impl CancellingModel {
+        fn with_partial(text: &str) -> Self {
+            Self {
+                partial: Some(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text: text.into() }],
+                }),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn without_partial() -> Self {
+            Self {
+                partial: None,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for CancellingModel {
+        fn model_id(&self) -> &str {
+            "cancelling"
+        }
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ModelError::Cancelled {
+                partial: self.partial.clone(),
+            })
+        }
+    }
+
+    /// N4：模型返回 `Cancelled` ⇒ 回合以 `RunFinished{Cancelled}` 收场，**不发** `RunFailed`。
+    ///
+    /// 「中止不是故障」是本设计的核心区分：若落回通用 `Err` 分支，消费端会看到
+    /// `RunFailed`（红色失败），与「用户主动取消」的预期矛盾。
+    ///
+    /// 变异靶：把 `basic.rs` 里的 `Cancelled` 分流删掉（落回通用 `Err`）⇒ 本用例变红。
+    #[tokio::test]
+    async fn model_cancelled_finishes_with_cancelled_and_never_run_failed() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = CancellingModel::without_partial();
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RunFailed { .. })),
+            "中止不是故障 ⇒ 不得发 RunFailed，实际事件：{:?}",
+            events.events()
+        );
+        let terminals: Vec<_> = events
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. }
+                )
+            })
+            .collect();
+        assert_eq!(terminals.len(), 1, "终局事件恰好一条");
+        assert!(matches!(
+            terminals[0],
+            AgentEvent::RunFinished {
+                stop_reason: StopReason::Cancelled,
+                ..
+            }
+        ));
+    }
+
+    /// **顺序可观测的 session / sink 替身**。
+    ///
+    /// `Session::append` 与 `EventSink::try_emit` 往**同一个**顺序日志里追加标记，
+    /// 于是「partial 落库」与「`RunFinished` 发出」的先后可直接读出。
+    struct OrderedLog {
+        entries: Mutex<Vec<String>>,
+    }
+
+    impl OrderedLog {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entries: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn entries(&self) -> Vec<String> {
+            self.entries.lock().expect("顺序日志锁").clone()
+        }
+    }
+
+    /// 记录 append 时刻的会话内容是否已含指定文本。
+    struct OrderedSession {
+        inner: MemorySession,
+        log: Arc<OrderedLog>,
+        marker: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for OrderedSession {
+        fn messages(&self) -> &[Message] {
+            self.inner.messages()
+        }
+
+        async fn append(&mut self, message: Message) -> Result<(), ys_session::SessionError> {
+            let has_marker = message
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if *text == self.marker));
+            self.log.entries.lock().expect("顺序日志锁").push(format!(
+                "append:{}",
+                if has_marker { "partial" } else { "other" }
+            ));
+            self.inner.append(message).await
+        }
+    }
+
+    /// 记录终局事件发出时刻，日志里此刻是否已含 partial。
+    struct OrderedSink {
+        log: Arc<OrderedLog>,
+        events: Vec<AgentEvent>,
+    }
+
+    impl EventSink for OrderedSink {
+        fn try_emit(&mut self, event: AgentEvent) -> Result<(), AgentEvent> {
+            if matches!(event, AgentEvent::RunFinished { .. }) {
+                self.log
+                    .entries
+                    .lock()
+                    .expect("顺序日志锁")
+                    .push("RunFinished".to_string());
+            }
+            self.events.push(event);
+            Ok(())
+        }
+
+        fn emit<'a>(
+            &'a mut self,
+            event: AgentEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ys_core::EventError>> + Send + 'a>> {
+            Box::pin(async move {
+                let _ = self.try_emit(event);
+                Ok(())
+            })
+        }
+    }
+
+    /// N5：模型返回 `Cancelled { partial: Some(msg) }` ⇒ 该段文本**落进会话历史**，
+    /// 且**先落库、再收场**。
+    ///
+    /// 变异的反面：partial 是用户已经付费拿到的内容，丢掉它等于白烧 token。
+    ///
+    /// 顺序同样是契约：若先发 `RunFinished`、后 append，消费端可能已认为回合结束
+    /// ⇒ 部分输出丢失（ADR-0046「先追加部分输出、再收场」）。
+    ///
+    /// 变异靶：把 `basic.rs` 里「先 append partial 再收场」的顺序颠倒
+    /// （先 `RunFinished` 后 append）⇒ 本用例变红。
+    #[tokio::test]
+    async fn model_cancelled_partial_is_appended_to_session() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = CancellingModel::with_partial("半句话");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|m| content_has_text(m, "半句话")),
+            "partial 必须落进会话历史，实际会话：{:?}",
+            session.messages()
+        );
+        // `final_message` 同样携带那段文本 —— 消费端据此显示「已产出什么」。
+        assert!(
+            result
+                .final_message
+                .as_ref()
+                .is_some_and(|m| content_has_text(m, "半句话")),
+            "final_message 应是 partial，实际：{:?}",
+            result.final_message
+        );
+    }
+
+    /// N5′：**先 append partial、再发 `RunFinished`** —— 顺序不可颠倒。
+    ///
+    /// 契约来源：ADR-0046「先追加部分输出、再收场」。若顺序反过来，消费端可能
+    /// 已因 `RunFinished` 判定回合结束 ⇒ 随后的 partial 无人接收，白丢已付费的输出。
+    ///
+    /// 变异靶：把 `basic.rs` 里「先 append partial 再收场」的顺序颠倒
+    /// （先 `RunFinished` 后 append）⇒ 本用例变红。
+    #[tokio::test]
+    async fn model_cancelled_appends_partial_before_run_finished() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = CancellingModel::with_partial("半句话");
+        let log = OrderedLog::new();
+        let mut session = OrderedSession {
+            inner: MemorySession::new(),
+            log: log.clone(),
+            marker: "半句话".to_string(),
+        };
+        let mut events = OrderedSink {
+            log: log.clone(),
+            events: Vec::new(),
+        };
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        let entries = log.entries();
+        let partial_at = entries
+            .iter()
+            .position(|e| e == "append:partial")
+            .unwrap_or_else(|| panic!("partial 未落库，顺序日志：{:?}", entries));
+        let finished_at = entries
+            .iter()
+            .position(|e| e == "RunFinished")
+            .unwrap_or_else(|| panic!("未发出 RunFinished，顺序日志：{:?}", entries));
+        assert!(
+            partial_at < finished_at,
+            "partial 必须**先**落库、再发 RunFinished（顺序日志：{:?}）",
+            entries
+        );
+    }
+
+    /// N6：取消后**不再发起下一次模型调用**（模型调用计数 == 1）。
+    ///
+    /// 「取消」若只收场当前轮、循环继续，就会再调一次模型 —— 违背用户意图，
+    /// 也白烧 token。
+    ///
+    /// 变异靶：把 `Cancelled` 分支的 `return` 去掉（落回继续循环）⇒ 本用例变红。
+    #[tokio::test]
+    async fn model_cancelled_stops_after_first_model_call() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = CancellingModel::without_partial();
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            1,
+            "取消后不得再发起模型调用"
+        );
     }
 
     /// 会话里所有 `ToolResult` block（按出现顺序）。

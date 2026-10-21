@@ -1879,6 +1879,15 @@ impl BoundarySource for StoredBoundary {
     }
 }
 
+/// `Debug` 只输出路径 —— 该路径是**测试自己造的文件**，不含用户内容。
+impl std::fmt::Debug for StoredBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredBoundary")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
 /// 只在 [`ArmBoundary::arm`] 之后才报「已取消」的边界源。
 ///
 /// 抓取期与摘要前置探针**都必须**看到「没取消」（否则取消落在抓取期/前置探针上，
@@ -1912,6 +1921,15 @@ impl BoundarySource for ArmBoundary {
 
     fn is_aborted(&self) -> bool {
         self.armed.load(Ordering::SeqCst)
+    }
+}
+
+/// `Debug` 只输出「是否已 arm」—— 该结构体**无任何内容字段**，不泄露抓取结果。
+impl std::fmt::Debug for ArmBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArmBoundary")
+            .field("armed", &self.armed.load(Ordering::SeqCst))
+            .finish()
     }
 }
 

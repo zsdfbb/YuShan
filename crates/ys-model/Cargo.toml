@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ys-core = { path = "../ys-core" }
 ys-event = { path = "../ys-event" }
+ys-protocol = { path = "../ys-protocol" }
 ys-tool = { path = "../ys-tool" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

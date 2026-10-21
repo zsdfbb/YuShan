@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use ys_core::Message;
+use ys_protocol::BoundarySource;
 use ys_tool::ToolSpec;
 
 /// 发送给 model 以完成 completion 的请求。
@@ -13,6 +16,16 @@ pub struct ModelRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// 轮边界控制源（可选）—— 模型调用期间的**中止**通道。
+    ///
+    /// `None` = 不支持中止（适配器不装探针，行为与不挂载时一致）。
+    ///
+    /// **不参与序列化**（`serde(skip)`）⇒ 既有序列化字节逐字节不变。
+    ///
+    /// 共享引用语义：loop 侧与 model 侧看到**同一个** abort 状态
+    /// （`Arc` 是 `Clone` ⇒ clone 后指向同一队列）。
+    #[serde(skip, default)]
+    pub boundary: Option<Arc<dyn BoundarySource>>,
 }
 
 /// provider 的 finish_reason **归一化后**的形态。

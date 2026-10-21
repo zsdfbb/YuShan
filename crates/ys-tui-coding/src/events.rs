@@ -173,6 +173,17 @@ pub fn handle_key(
             // 已经在敲下一条消息，丢掉它比保留更意外。
             if app.is_turning || app.command_in_flight {
                 request_abort(boundaries);
+                // **即时反馈**：abort 是消息，只在轮边界（或适配器的 100ms 轮询）被读到
+                // ⇒ 投出去之后界面可能长时间纹丝不动，用户无从区分「Esc 没生效」与
+                // 「正在取消」。故当场补一条系统行；文案说的是「**已请求**取消」——
+                // 回合此刻**尚未**结束，真正的收场消息随后才到。
+                app.transcript
+                    .push(crate::transcript::TranscriptLine::System(
+                        "已请求取消，正在停止…".into(),
+                    ));
+                // 贴底：这行反馈的意义就是「看得见」，用户往上翻着时它不能停在视窗外
+                // （与 Ctrl-C 的取消反馈同口径）。
+                app.follow = true;
             } else {
                 app.input.clear();
             }
@@ -648,6 +659,57 @@ mod tests {
         a.input.insert_str("/mo");
         handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
         assert!(a.input.text.is_empty(), "idle Esc 清空输入");
+    }
+
+    /// **N7：回合中按 Esc ⇒ transcript 立即多出一条系统行**（即时反馈）。
+    ///
+    /// `Boundary::Abort` 是消息，只在轮边界（或适配器的 100ms 轮询）被读到 ⇒
+    /// 投出去之后界面可能长时间纹丝不动，用户无从区分「Esc 没生效」与「正在取消」。
+    /// 故 Esc 投 abort 的**同一次按键处理内**必须落一条系统行。
+    ///
+    /// 变异：把 Esc 分支里的系统行去掉 ⇒ 本测试变红。
+    #[test]
+    fn test_esc_while_turning_appends_system_line() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+
+        handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+
+        assert_eq!(ch.next_boundary().unwrap(), Boundary::Abort);
+        assert_eq!(a.transcript.len(), 1, "只追加一条：{:?}", a.transcript);
+        let Some(TranscriptLine::System(text)) = a.transcript.last() else {
+            panic!("Esc 后末行必须是系统行：{:?}", a.transcript);
+        };
+        assert!(
+            text.contains("已请求取消"),
+            "系统行必须说「已请求取消」：{text}"
+        );
+        assert!(
+            !text.contains("已取消"),
+            "回合此刻尚未结束，文案不得说成「已取消」：{text}"
+        );
+    }
+
+    /// **回归（回合外按 Esc 不多出系统行）**：idle 时 Esc 的语义是「清空输入」，
+    /// 没有 abort 可投 ⇒ **不得**追加系统行（否则每次清输入都像取消了一次）。
+    ///
+    /// 变异：把系统行移到 `if` 之外（idle 也写）⇒ 本测试变红。
+    #[test]
+    fn test_esc_when_idle_appends_no_system_line() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/mo");
+
+        handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+
+        assert!(a.input.text.is_empty(), "idle Esc 清空输入");
+        assert!(
+            a.transcript.is_empty(),
+            "回合外按 Esc 不该多出系统行：{:?}",
+            a.transcript
+        );
+        assert!(ch.next_boundary().is_none(), "回合外不投 Abort");
     }
 
     /// **回归（命令在飞时 Esc 要能取消）**：`/login` 这类命令会做一次网络往返

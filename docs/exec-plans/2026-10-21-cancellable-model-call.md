@@ -49,7 +49,7 @@
 
 ## 基线
 
-- **基线 ref**: `<Phase 3 开始时由 scripts/baseline.sh 填写>`
+- **基线 ref**: `2a75f35`（含 Phase 3 执行前的 plan 修正；原初始基线 `ed5494d5`）
 - 用途: review 执行 `git diff <基线 ref> -- <files>` 取字节级证据
 
 ## 任务清单
@@ -395,7 +395,7 @@
 
 ## 波次计划（Phase 3 计算后回填）
 
-**基线 ref**：`ed5494d53438201cc3efdde1f98fd2e735f4e57d`（备份分支 `sw-backup/cancellable-model-call`）
+**基线 ref**：`2a75f35`（含 Phase 3 执行前的 plan 修正；原初始基线 `ed5494d5`，备份分支 `sw-backup/cancellable-model-call`）
 
 **合并规则**（R1–R4）：impl 与其配对 test 合并为同一单元（R4，保持上下文连续）⇒ **10 个执行单元**。
 

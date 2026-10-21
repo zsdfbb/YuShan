@@ -71,6 +71,8 @@ pub boundary: Option<Arc<dyn BoundarySource>>,
 
 **代价**：`crates/ys-model/Cargo.toml` 需新增 `ys-protocol = { path = "../ys-protocol" }` 依赖。
 
+> **包名提醒**（`cargo -p` 用的是**包名**，不是目录名）：`adapters/model-openai-compatible/` → `ys-model-openai-compat`；`adapters/tools-web/` → `ys-tools-web`；`apps/coding-agent/` → `ys-coding-agent`。目录名与包名**不一致**，照抄目录名会让 `cargo -p` 报 `package ID specification ... did not match`。
+
 **不成环证明**：`ys-tool` 已依赖 `ys-protocol`，且 `ys-model` 已依赖 `ys-tool` ⇒ `ys-model → ys-protocol` 不引入新环。`ys-protocol` 自身零 tokio（依赖 `ys-core` / `ys-event` / `serde`），符合硬约束。
 
 **否决的替代方案**：

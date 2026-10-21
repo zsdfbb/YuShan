@@ -23,7 +23,11 @@ pub enum Boundary {
 ///
 /// 两个方法都是 `&self`（内可变）：`BasicLoop` 经 `&dyn BoundarySource` 访问，
 /// 而生产者可在 agent 运行期间投递。
-pub trait BoundarySource: Send + Sync {
+///
+/// `Debug` 是 supertrait：带边界的请求结构（如 `ModelRequest`）需要保留
+/// `Debug` 派生 ⇒ 其边界源字段的类型必须可调试。实现者**不得**用派生
+/// 实现 `Debug` —— 派生会把队列里的 steer 消息正文写进日志。
+pub trait BoundarySource: Send + Sync + std::fmt::Debug {
     /// 轮边界：非阻塞拉取下一条边界消息（`Steer` 或 `Abort`），保持入队顺序。
     ///
     /// 无消息时返回 `None`（不阻塞 —— 轮边界是轮询点，不是等待点）。
@@ -35,6 +39,10 @@ pub trait BoundarySource: Send + Sync {
     fn is_aborted(&self) -> bool;
 }
 
+/// 队列内部状态。
+///
+/// **刻意不派生 `Debug`** —— 派生会把 `queue` 里的
+/// `Boundary::Steer(Message)` 正文带进日志 ⇒ 泄露用户内容。
 struct Inner {
     queue: VecDeque<Boundary>,
     aborted: bool,
@@ -93,6 +101,17 @@ impl QueueBoundarySource {
 impl Default for QueueBoundarySource {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for QueueBoundarySource {
+    /// 只输出中止标记与队列长度 —— **不输出队列内容**（避免泄露 steer 正文）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.lock();
+        f.debug_struct("QueueBoundarySource")
+            .field("aborted", &inner.aborted)
+            .field("queued", &inner.queue.len())
+            .finish()
     }
 }
 
@@ -241,5 +260,22 @@ mod tests {
         // 两个方法都是 &self：trait 对象可 Send + Sync，供 &dyn BoundarySource 跨线程共享
         fn assert_send_sync<T: Send + Sync + ?Sized>() {}
         assert_send_sync::<dyn BoundarySource>();
+    }
+
+    #[test]
+    fn test_debug_output_does_not_leak_steer_text() {
+        // N13：Debug 输出只含 aborted / queued，不得含 steer 消息正文
+        const SENTINEL: &str = "SENTINEL_STEER_TEXT_42";
+        let src = QueueBoundarySource::new();
+        src.push(steer_msg(SENTINEL));
+
+        let out = format!("{:?}", src);
+        assert!(
+            !out.contains(SENTINEL),
+            "Debug 输出泄露了 steer 正文：{out}"
+        );
+        assert!(out.contains("aborted"), "缺少 aborted 字段：{out}");
+        assert!(out.contains("queued"), "缺少 queued 字段：{out}");
+        assert!(out.contains("queued: 1"), "queued 应反映队列长度：{out}");
     }
 }

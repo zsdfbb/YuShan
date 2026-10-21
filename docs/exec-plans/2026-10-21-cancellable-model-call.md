@@ -62,11 +62,19 @@
   - `Cargo.toml`：加 `ys-protocol = { path = "../ys-protocol" }`（不成环：`ys-tool` 已依赖 `ys-protocol`，`ys-model` 已依赖 `ys-tool`）。
   - `error.rs`：加 `ModelError::Cancelled { partial: Option<ys_core::Message> }`（`thiserror` 的 `#[error("model call cancelled")]`；`ys_core::Message` 派生 `Debug` ✓；**不加** `#[non_exhaustive]`）。
   - `request.rs`：`ModelRequest` 加 `#[serde(skip, default)] pub boundary: Option<Arc<dyn BoundarySource>>`；`Debug` / `Default` / `Clone` / `Serialize` / `Deserialize` 五个派生**全部保留**（`Debug` 派生的保留依赖 T3 的 `Debug` supertrait ⇒ **T1 单独编译不过，必须与 T3 一起**）。
+  - ⚠️ **`ModelRequest` 有 3 处「穷尽构造点」（无 `..Default::default()`）必须补 `boundary: None`** —— 加字段后这 3 处编译失败：
+    | 位置 | 归属 |
+    |---|---|
+    | `crates/ys-loop/src/summarize.rs:61` | **本任务不属于此文件** ⇒ 该文件由 **T9** 适配（见 T9 描述） |
+    | `adapters/model-openai-compatible/src/lib.rs:1211` | 属 **T12** |
+    | `adapters/model-openai-compatible/src/lib.rs:1244` | 属 **T12** |
+    ⇒ **T1 自身不得越界改这三个文件**（文件集冲突）；但 T1 必须在自己收尾时**报告**这三处待适配。
 - **关键约束**:
   - `Arc<dyn BoundarySource>` 不是 `Serialize` ⇒ 必须 `#[serde(skip, default)]` ⇒ 既有序列化字节逐字节不变。
-  - `Option<Arc<..>>` 的 `Default` 是 `None` ⇒ 既有 `..Default::default()` 构造点**不需要改**。
+  - `Option<Arc<..>>` 的 `Default` 是 `None` ⇒ 既有 `..Default::default()` 构造点**不需要改**（全仓 13 处构造点里 10 处带 `..Default::default()`，只有上列 3 处是穷尽的）。
   - `ModelResponse` **不得**加字段（会改 35 处构造点）。
   - **不得**用「去掉 `Debug` 派生」绕过问题 ⇒ 那是对外 API 缩减（设计计划决策 B′）。
+  - `ys-model` 加 `ys-protocol` 依赖后，`ys-model → ys-protocol` 不成环（`ys-tool` 已依赖 `ys-protocol`）。
 - **关联测试任务**: T2
 - **依赖**: 无
 
@@ -189,7 +197,7 @@
 ### Task 9: crates/ys-loop/ — 取消分支 + 边界源适配 + 工具间探针 [type=impl]
 
 - **涉及目录**: `crates/ys-loop/`
-- **涉及文件**: `crates/ys-loop/src/basic.rs`, `crates/ys-loop/src/lib.rs`（`compact.rs` 已核实无需适配）
+- **涉及文件**: `crates/ys-loop/src/basic.rs`, `crates/ys-loop/src/lib.rs`（`compact.rs` 已核实无需适配）, `crates/ys-loop/src/summarize.rs`
 - **描述**:
   - **边界源适配**（因 T5 改了类型）：
     - `basic.rs:137`、`:174` 的 `is_some_and(|b| b.is_aborted())` 保持可编译（`Option<Arc<dyn BoundarySource>>` 上 `is_some_and` 的 `b: &Arc<dyn BoundarySource>` 自动 deref 到 `&dyn BoundarySource`）；
@@ -197,6 +205,8 @@
     - `basic.rs:670`、`:724` 传给 `ToolContext::new(...)` 的 boundary ⇒ 改 `ctx.boundary.as_deref()`（`ToolContext.boundary` 是 `Option<&dyn BoundarySource>`）⇒ **`ys-tool` 层零改动**。
   - **`with_boundary` 调用点适配（8 处）**：`lib.rs:257`、`:288`、`:408`、`:570`、`:847`、`:928`、`:975` 与 `basic.rs:2405` ⇒ 参数从 `&dyn` / `Option<&dyn>` 改为 `Arc<dyn>` / `Option<Arc<dyn>>`（必要时 `Arc::new(...)`）。
   - **`ModelRequest` 组装处**（`basic.rs:339-358`）挂上 `boundary: ctx.boundary.clone()`。
+  - ⚠️ **`summarize.rs:61` 的 `ModelRequest` 是「穷尽构造点」**（列全了 `messages` / `tools` / `system` / `max_tokens` / `temperature`，**没有** `..Default::default()`）⇒ T1 给 `ModelRequest` 加 `boundary` 字段后，此处编译失败 ⇒ **必须补 `boundary: None`**（摘要调用不挂边界源）。
+    - 该构造点在 `ModelSummarizer::summarize` 内 ⇒ 摘要路径**不参与取消**（与设计一致：取消只作用于主模型调用）。
   - **Step 6 取消分支**（`basic.rs:360-377` 的 match 加一支）：
     1. `Err(ModelError::Cancelled { partial })` ⇒ 若 `partial` 有内容 ⇒ **先** `ctx.session.append(partial)`（与 `:398-401` 同一路径）；
     2. **不发** `RunFailed`；**不发** `RoundUsage`；
@@ -235,8 +245,10 @@
 ### Task 11: adapters/model-openai-compatible/ — 适配器取消实现 [type=impl]
 
 - **涉及目录**: `adapters/model-openai-compatible/`
-- **涉及文件**: `adapters/model-openai-compatible/src/lib.rs`
+- **涉及文件**: `adapters/model-openai-compatible/Cargo.toml`, `adapters/model-openai-compatible/src/lib.rs`
 - **描述**:
+  - ⚠️ **`Cargo.toml` 必须加 `ys-protocol = { path = "../../crates/ys-protocol" }`** —— 适配器当前**不依赖** `ys-protocol`，而 `wait_abort` 的参数类型是 `Option<&dyn BoundarySource>` ⇒ 不加依赖编译失败。
+    - 不成环：`ys-protocol` 只依赖 `ys-core` / `ys-event` / `serde`，不依赖任何 adapter。
   - 新增 `wait_abort(boundary: Option<&dyn BoundarySource>)`：照抄 `adapters/tools-basic/src/bash.rs:101-107` 的形态（100ms 轮询 `is_aborted()`；无 boundary 时 `std::future::pending::<()>().await`）。轮询间隔常量参照 `bash.rs:14` / `exec.rs:29-30` 的 100ms。
   - `AttemptError`（`:312-324`）加第三支 `Cancelled { partial: Option<ys_core::Message> }`。
   - `complete`（`:396-400`）的 `match outcome`：`Err(AttemptError::Cancelled { partial })` ⇒ **立即** `return Err(ModelError::Cancelled { partial })`（不走重试、不 trace 为失败）。
@@ -264,10 +276,14 @@
   - **N1**：已 abort 的 boundary ⇒ `Model::complete` 返回 `ModelError::Cancelled`。
   - **N2**：先吐 delta 再取消 ⇒ `partial` 含已吐文本。
   - **N3**：先吐 tool call 的部分参数再取消 ⇒ `partial` 的 content blocks **全部**是 `Text`，无 `ToolUse`。
+  - ⚠️ **两处「穷尽构造点」必须补 `boundary: None`**（T1 加了 `ModelRequest.boundary` 字段后编译失败）：
+    - `src/lib.rs:1211`（`translate_request` 的 system+user 用例）
+    - `src/lib.rs:1244`（`translate_request` 的 tool 用例）
   - `tests/retry.rs`：确认是否需适配（`ModelRequest::default()` 构造点不受影响；若需适配则改）。
   - 既有测试全部仍绿（`finish` 路径 content blocks 顺序不变、序列化不变）。
 - **验证方法**:
-  - `cargo test -p model-openai-compatible` — 期望全绿
+  - `cargo test -p ys-model-openai-compat` — 期望全绿
+    （⚠️ **包名是 `ys-model-openai-compat`**，不是目录名 `model-openai-compatible`；同理 `tools-web` 的包名是 `ys-tools-web`）
 - **关联 impl**: T11
 - **依赖**: T11
 
@@ -281,8 +297,8 @@
   - `Debug` 输出**不得**包含父队列 / 抓取内容。
   - `adapters/tools-web/` 的**业务代码零改动**。
 - **验证方法**:
-  - `cargo test -p tools-web` — 期望全绿
-  - `cargo build -p tools-web --tests` — 期望无错误
+  - `cargo test -p ys-tools-web` — 期望全绿
+  - `cargo build -p ys-tools-web --tests` — 期望无错误
 - **关联 impl**: T3
 - **依赖**: T3
 
@@ -294,12 +310,23 @@
   - `app_loop.rs:998`：`let boundary = QueueBoundarySource::new();` ⇒ `let boundary = Arc::new(QueueBoundarySource::new());`；`:1004`：`Some(&boundary)` ⇒ `Some(boundary.clone())`。
   - `main.rs`：`:1716` `wiring.ports_with_boundary(Some(&boundary))` ⇒ `Some(boundary.clone())`；`:1723` `AgentPorts::new(..., Some(&boundary))` ⇒ `Some(boundary.clone())`；`:1715` 附近的边界源创建改为 `Arc::new(...)`。
   - `wiring.rs`：`:254` `ports_with_boundary` 的 `boundary` 参数类型改 `Option<Arc<dyn BoundarySource>>`；`:243`（`ports()` 自调用 `ports_with_boundary(None)`）无需改（`None` 仍成立）。
-  - `subagent.rs`：`:427` `AgentPorts::new(..., Some(&child_boundary))` ⇒ 传 `Arc`（`ChildBoundary` 需被 `Arc` 包裹并 clone）；`:70` `ChildBoundary::new(parent)` **签名不变**（仍是 `Option<&'a dyn BoundarySource>`）⇒ 调用点传 `ctx.boundary.as_deref()`；`ChildBoundary`（`:64`）加 `Debug`（因 T3 加了 supertrait）—— **注意** `ChildBoundary` 含 `parent: Option<&'a dyn BoundarySource>` ⇒ 派生 `Debug` 要求 `dyn BoundarySource: Debug`（由 supertrait 提供 ✓），但**手写**更稳：只输出「是否有父」「自身队列长度」。
-  - `subagent.rs:765` `runner.run(prompt, model, ctx.boundary)` ⇒ `ctx.boundary` 已是 `Option<&dyn BoundarySource>`（`ToolContext` 的公开类型未变）⇒ **此行无需改** ⇒ `ys-tool` 零改动 ✓。
+  - `subagent.rs`：`:427` `AgentPorts::new(..., Some(&child_boundary))` ⇒ 传 `Arc`。
+    - ⚠️ **`ChildBoundary<'a>` 必须改成 `ChildBoundary`（去掉 lifetime 参数）**，否则**编译不过**：
+      - 原因：`Arc<dyn BoundarySource>` 默认隐含 `+ 'static`（已用 rustc 最小复现验证：E0597 `parent does not live long enough`）。
+      - 而现形态 `ChildBoundary<'a> { parent: Option<&'a dyn BoundarySource> }` 持**父的借用** ⇒ `Arc<ChildBoundary<'_>>` **不是** `'static` ⇒ 无法 coerce 成 `Arc<dyn BoundarySource>`。
+      - 修法：`ChildBoundary` 的 `parent` 字段改为 `Option<Arc<dyn BoundarySource>>`（**去掉 `'a`**）⇒ 自身成为 `'static` ⇒ `Arc::new(ChildBoundary::new(parent_arc))` 可用。
+      - 连带：`ChildBoundary::new(parent: Option<Arc<dyn BoundarySource>>)` 签名改；`is_aborted` 里的 `self.parent.is_some_and(...)` 改 `self.parent.as_ref().is_some_and(...)`（`Option<Arc<..>>` 非 `Copy` ⇒ 不加 `.as_ref()` 会 E0507）。
+      - 调用点：`:409` `ChildBoundary::new(boundary)` ⇒ 传 `Option<Arc<dyn BoundarySource>>`；`:801`（测试）`ChildBoundary::new(Some(&parent))` ⇒ `Some(parent_arc.clone())`。
+      - **父边界源从哪来**：`SubagentRunner::run` 的 `boundary: Option<&dyn BoundarySource>`（`ys-tool` 层，**签名不变**）⇒ 在 `AppSubagentRunner::run` 内 `boundary` 是借用 ⇒ 需 `Arc::clone` 不可能（只有 `&dyn`）⇒ **解法**：`AppSubagentRunner` 改持 `Option<Arc<dyn BoundarySource>>`（在 `make_runner` 时传入）⇒ `run` 里用 `self.parent_boundary.clone()`。
+        - `make_runner`（`:317`）需增一个 `parent_boundary: Option<Arc<dyn BoundarySource>>` 参数；`app_loop.rs` 建 `runner` 处（`:1000` 附近）与 `main.rs` 建 `runner` 处传入 `Some(boundary.clone())`。
+    - `:70` `ChildBoundary::new` **签名**随之改（见上）。
+    - `ChildBoundary`（`:64`）加 `Debug`（因 T3 加了 supertrait）—— **必须手写**（派生会打印 `parent` 内部结构）：只输出「是否有父」+「自身队列长度」，**不打印父队列内容**。
+  - `subagent.rs:765` `runner.run(prompt, model, ctx.boundary)` ⇒ `ctx.boundary` 是 `Option<&'a dyn BoundarySource>`（`ToolContext` 的公开类型未变）⇒ **此行无需改** ⇒ `ys-tool` 零改动 ✓。
 - **关键约束**:
   - 边界源须**活过整个 turn** ⇒ app 层持有 `Arc`（`Arc<dyn BoundarySource>` 需 `'static`，不能用栈上临时值）。
   - **每回合必须新建边界源** —— `Abort` 的标志位永久置位，复用会立刻取消之后的回合。
   - `ChildBoundary` 的 `Debug` 不得打印父队列内容（避免泄露 steer 消息）。
+  - ⚠️ **子 agent 的父边界源必须一路保持 `Arc`**（`ChildBoundary` 去掉 lifetime + `AppSubagentRunner` 持 `Option<Arc<dyn BoundarySource>>`）⇒ 否则 `Arc<ChildBoundary<'_>>` 非 `'static`，`AgentPorts::new` 收不下（E0597，已用 rustc 最小复现验证）。
 - **关联测试任务**: T15
 - **依赖**: T5, T7, T9
 
@@ -368,23 +395,44 @@
 
 ## 波次计划（Phase 3 计算后回填）
 
+**基线 ref**：`ed5494d53438201cc3efdde1f98fd2e735f4e57d`（备份分支 `sw-backup/cancellable-model-call`）
+
+**合并规则**（R1–R4）：impl 与其配对 test 合并为同一单元（R4，保持上下文连续）⇒ **10 个执行单元**。
+
 | 单元 | 含任务 | 涉及文件 | 依赖 | 波次 | review 档 |
 |---|---|---|---|---|---|
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
-| | | | | | |
+| **U1** | T1+T2 | `ys-model/Cargo.toml`, `ys-model/src/error.rs`, `ys-model/src/request.rs` | U2 | **W1** | deep |
+| **U2** | T3+T4 | `ys-protocol/src/boundary.rs` | 无 | **W0** | deep |
+| **U3** | T5+T6 | `ys-component/src/context.rs` | U1, U2 | **W2** | deep |
+| **U4** | T7+T8 | `ys-runtime/src/agent.rs`, `ys-runtime/src/lib.rs`, `ys-runtime/tests/run_turn_boundary.rs`, `ys-runtime/tests/v0_integration.rs` | U1, U2, U3 | **W3** | deep |
+| **U5** | T9+T10 | `ys-loop/src/basic.rs`, `ys-loop/src/lib.rs`, `ys-loop/src/summarize.rs` | U1, U2, U3, U4 | **W4** | deep |
+| **U6** | T11+T12 | `model-openai-compatible/Cargo.toml`, `model-openai-compatible/src/lib.rs`, `model-openai-compatible/tests/retry.rs` | U1, U2 | **W2** | deep |
+| **U7** | T13 | `tools-web/tests/tools.rs` | U2 | **W2** | shallow |
+| **U8** | T14+T15 | `coding-agent/src/app_loop.rs`, `src/main.rs`, `src/wiring.rs`, `src/subagent.rs`, `tests/e2e_skills.rs`, `tests/e2e_tools.rs` | U3, U4, U5 | **W5** | deep |
+| **U9** | T16+T17 | `ys-tui-coding/src/events.rs` | 无 | **W0** | shallow |
+| **U10** | T18 | 临时注入 mutation 于 `ys-model/`, `ys-loop/`, `ys-tui-coding/`, `model-openai-compatible/` | 全部 | **W6（独占）** | deep |
+
+**波次说明**：
+
+- **W0**：U2（`ys-protocol`）、U9（`ys-tui-coding`）—— 文件集不相交 ⇒ 可并发。
+- **W1**：U1 —— 必须在 U2 之后（依赖 `Debug` supertrait），**不得**与 U2 同波（U1 单独编译必失败）。
+- **W2**：U3（`ys-component`）、U6（适配器）、U7（`tools-web` 测试）—— 三者文件集互不相交 ⇒ 可并发（上限 3）。
+- **W3**：U4（`ys-runtime`）。
+- **W4**：U5（`ys-loop`）。
+- **W5**：U8（`apps/coding-agent`）。
+- **W6**：U10（T18）—— **独占末波**，不得与任何任务并发。
+
+**并发上限 3**：W2 恰好 3 个单元，W0 恰好 2 个 ⇒ 无排队。
 
 > T18 与所有其他任务**文件集相交**（变异测试需临时改动被测文件）⇒ 必须独占末波，不得与任何任务并发。
 >
-> **并发冲突检测提示**（Phase 3 依「涉及文件」列做）：`T3`（`crates/ys-protocol/src/boundary.rs`）与 `T4`（同文件内联测试）**同文件** ⇒ 必须串行；`T1` 与 `T2` 同文件（`crates/ys-model/src/request.rs`）⇒ 串行；`T5` 与 `T6` 同文件 ⇒ 串行；`T7` 与 `T8` 同文件（`crates/ys-runtime/src/lib.rs`、`src/agent.rs`）⇒ 串行；`T9` 与 `T10` 同文件（`crates/ys-loop/src/basic.rs`、`src/lib.rs`）⇒ 串行；`T11` 与 `T12` 同文件 ⇒ 串行；`T14` 与 `T15` 同文件（`apps/coding-agent/src/app_loop.rs`）⇒ 串行；`T16` 与 `T17` 同文件 ⇒ 串行。
+> **并发冲突检测提示**（Phase 3 依「涉及文件」列做）：`T3`（`crates/ys-protocol/src/boundary.rs`）与 `T4`（同文件内联测试）**同文件** ⇒ 同一单元内串行；`T1` 与 `T2` 同文件（`crates/ys-model/src/request.rs`）⇒ 同一单元内串行；`T5` 与 `T6` 同文件 ⇒ 同一单元内串行；`T7` 与 `T8` 同文件（`crates/ys-runtime/src/lib.rs`、`src/agent.rs`）⇒ 同一单元内串行；`T9` 与 `T10` 同文件（`crates/ys-loop/src/basic.rs`、`src/lib.rs`）⇒ 同一单元内串行；`T11` 与 `T12` 同文件 ⇒ 同一单元内串行；`T14` 与 `T15` 同文件（`apps/coding-agent/src/app_loop.rs`）⇒ 同一单元内串行；`T16` 与 `T17` 同文件 ⇒ 同一单元内串行。
 > **关键跨目录依赖**：T1（`ModelRequest` 加 `Arc<dyn BoundarySource>` 字段）单独编译**必然失败** ⇒ **T1 与 T3（`Debug` supertrait）必须同时合入**才能编译 ⇒ Phase 3 不得把二者拆到不同波次而中途尝试编译。
+>
+> **生命周期约束（已用 rustc 最小复现验证）**：`Arc<dyn BoundarySource>` 隐含 `+ 'static` ⇒ `ChildBoundary<'a>`（持父借用）**无法** Arc 化 ⇒ U8 内必须把 `ChildBoundary` 改为持 `Option<Arc<dyn BoundarySource>>`（详见 T14 描述）。
+>
+> **包名提醒**（`cargo -p` 用的是**包名**，不是目录名）：`model-openai-compatible` → `ys-model-openai-compat`；`tools-web` → `ys-tools-web`；`coding-agent` → `ys-coding-agent`。
+
 
 ## 验证清单
 

@@ -171,7 +171,13 @@ impl Wiring {
 
 **`'a` 的语义变化（是放宽，不是收紧）**：`RuntimeContext<'a>` 的 `'a` 仍约束 `model` / `session` / `events` / `subagent` 等借用字段；`boundary` 字段是 `'static` 的 ⇒ **不再受 `'a` 约束**。
 
-**`ChildBoundary::new(parent)` 保持 `Option<&'a dyn BoundarySource>` 不变** ⇒ 调用点传 `ctx.boundary.as_deref()`（`Arc` 的借用生命周期短于 `Arc` 持有期 ⇒ 成立）。
+**`ChildBoundary::new(parent)` 必须改为接收 `Option<Arc<dyn BoundarySource>>`**（原设计以为可保持 `Option<&'a dyn BoundarySource>` 不变 —— **这是错的**）：
+
+- **原因**：`Arc<dyn BoundarySource>` 默认隐含 `+ 'static`；而 `ChildBoundary<'a> { parent: Option<&'a dyn BoundarySource> }` 持**父的借用** ⇒ `Arc<ChildBoundary<'_>>` **不是** `'static` ⇒ 无法 coerce 成 `Arc<dyn BoundarySource>` ⇒ `AgentPorts::new` 收不下。
+- **证据**：已用 rustc 最小复现验证 —— `error[E0597]: parent does not live long enough ... coercion requires that parent is borrowed for 'static`。
+- **修法**：`ChildBoundary` **去掉 `<'a>` 生命周期参数**，`parent` 字段改为 `Option<Arc<dyn BoundarySource>>` ⇒ 自身 `'static` ⇒ `Arc::new(ChildBoundary::new(parent_arc))` 可用。
+- **连带**：`is_aborted` 里 `self.parent.is_some_and(...)` 改 `self.parent.as_ref().is_some_and(...)`（`Option<Arc<..>>` 非 `Copy` ⇒ 不加 `.as_ref()` 会 E0507）。
+- **父边界源如何到达 `ChildBoundary`**：`SubagentRunner::run` 的 `boundary: Option<&dyn BoundarySource>`（`ys-tool` 层，**签名不变**）只有借用 ⇒ 无法从中造 `Arc` ⇒ `AppSubagentRunner` 改为**持** `Option<Arc<dyn BoundarySource>>`（`make_runner` 时传入）⇒ `run` 内用 `self.parent_boundary.clone()`。
 
 #### 决策 B′：`BoundarySource` 加 `Debug` supertrait（`ModelRequest` 的 `Debug` 派生保留）
 
@@ -338,11 +344,13 @@ impl std::fmt::Debug for QueueBoundarySource {
 | `crates/ys-protocol/src/boundary.rs` | `BoundarySource` 加 `Debug` supertrait；`QueueBoundarySource` 手写 `impl Debug`（只输出 aborted 与队列长度） |
 | `crates/ys-component/src/context.rs` | `RuntimeContext.boundary` → `Option<Arc<dyn BoundarySource>>`；`with_boundary` 签名相应改 |
 | `crates/ys-runtime/src/agent.rs` | `AgentPorts.boundary` → `Option<Arc<dyn BoundarySource>>`；`AgentPorts::new` 签名相应改 |
+| `adapters/model-openai-compatible/Cargo.toml` | 新增 `ys-protocol = { path = "../../crates/ys-protocol" }`（适配器当前**不依赖** `ys-protocol`，而 `wait_abort` 需 `BoundarySource`） |
 | `adapters/model-openai-compatible/src/lib.rs` | 新增 `wait_abort`、三处 `select!`、`AttemptError::Cancelled`、`StreamAccumulator::into_partial`、`text_block` |
+| `crates/ys-loop/src/summarize.rs` | `:61` 的 `ModelRequest` 是**穷尽构造点** ⇒ 补 `boundary: None` |
 | `apps/coding-agent/src/app_loop.rs` | 边界源 Arc 化接线（`:998` 建 `Arc`，`:1004` 传 `clone()`） |
 | `apps/coding-agent/src/main.rs` | 边界源 Arc 化接线（`:1716` `ports_with_boundary`、`:1723` `AgentPorts::new`） |
 | `apps/coding-agent/src/wiring.rs` | `ports_with_boundary` 签名改（`:254`）；调用点 `:243` 适配 |
-| `apps/coding-agent/src/subagent.rs` | `:427` `AgentPorts::new` 适配；`:70` `ChildBoundary::new` 传 `as_deref()`；`ChildBoundary` 加 `Debug` |
+| `apps/coding-agent/src/subagent.rs` | `:427` `AgentPorts::new` 适配；`ChildBoundary` **去生命周期参数**、`parent` 改 `Option<Arc<dyn BoundarySource>>`；`ChildBoundary` 加 `Debug` |
 | `crates/ys-tui-coding/src/events.rs` | Esc 分支追加系统行 |
 
 **`Model` trait 签名不变**、`ModelEventSink` 不变、`ModelResponse` 不变、`ContentBlock` 不变（不新增 Thinking 变体）。
@@ -387,11 +395,14 @@ T0+ε       ys-loop: 发 RunFinished{Cancelled}    ← 后收场
 - `crates/ys-loop/src/basic.rs` — `ctx.boundary` 使用点适配（`:137`、`:174`、`:305`、`:670`、`:724`）；Step 6 加 `Cancelled` 分支；工具之间加 abort 探针；`ModelRequest` 组装挂 boundary
 - `crates/ys-loop/src/lib.rs` — **8 处** `with_boundary` 调用点适配（`:257`、`:288`、`:408`、`:570`、`:847`、`:928`、`:975`）；`DecoupledBoundarySource` 加 `Debug`（测试替身）
 - `crates/ys-loop/src/compact.rs` — **已核实无 `ctx.boundary` 使用点 ⇒ 无需适配**
+- `adapters/model-openai-compatible/Cargo.toml` — 加 `ys-protocol` 依赖
 - `adapters/model-openai-compatible/src/lib.rs` — `wait_abort`、三处 `select!`、`AttemptError::Cancelled`、`StreamAccumulator::into_partial`、`text_block` 抽取
+- `crates/ys-loop/src/summarize.rs` — `:61` 的 `ModelRequest` 是**穷尽构造点**（无 `..Default::default()`）⇒ T1 加 `boundary` 字段后必须补 `boundary: None`
 - `apps/coding-agent/src/app_loop.rs` — 边界源 Arc 化接线（`:998` 建 `Arc`、`:1004` 传 `clone()`）
 - `apps/coding-agent/src/main.rs` — `:1716` `ports_with_boundary` + `:1723` `AgentPorts::new`；边界源 Arc 化
 - `apps/coding-agent/src/wiring.rs` — `:254` `ports_with_boundary` 签名改；`:243` 调用点适配
-- `apps/coding-agent/src/subagent.rs` — `:427` `AgentPorts::new` 适配；`:70` `ChildBoundary::new` 传 `as_deref()`；`ChildBoundary` 加 `Debug`
+- `apps/coding-agent/src/subagent.rs` — `:427` `AgentPorts::new` 适配；`ChildBoundary` **去生命周期参数**、`parent` 改 `Option<Arc<dyn BoundarySource>>`（否则 `Arc<ChildBoundary>` 非 `'static`，E0597）；`ChildBoundary` 加 `Debug`
+- `crates/ys-loop/src/summarize.rs` — `:61` 的 `ModelRequest` 是**穷尽构造点**（无 `..Default::default()`）⇒ T1 加 `boundary` 字段后必须补 `boundary: None`
 - `crates/ys-tui-coding/src/events.rs` — Esc 系统行反馈
 
 **测试文件**（**不得漏** —— 它们同样是签名变更的调用点）：
@@ -420,7 +431,7 @@ T0+ε       ys-loop: 发 RunFinished{Cancelled}    ← 后收场
 
 | # | 需求 | 验收方法 | 优先级 |
 |---|---|---|---|
-| N1 | 适配器在已 abort 时返回 `ModelError::Cancelled` | `cargo test -p model-openai-compatible <取消相关测试名>` — 期望返回 `Cancelled` | 必测 |
+| N1 | 适配器在已 abort 时返回 `ModelError::Cancelled` | `cargo test -p ys-model-openai-compat <取消相关测试名>` — 期望返回 `Cancelled` | 必测 |
 | N2 | partial 携带已产生文本 | 同上 — 期望 `partial` 含取消前吐出的文本 | 必测 |
 | N3 | partial 不含 `ToolUse` | 同上 — 期望 `partial` 只含 `ContentBlock::Text` | 必测 |
 | N4 | `ys-loop` 取消 → `RunFinished{Cancelled}` 且**不发** `RunFailed` | `cargo test -p ys-loop <取消相关测试名>` | 必测 |
@@ -532,7 +543,7 @@ T0+ε       ys-loop: 发 RunFinished{Cancelled}    ← 后收场
   - `cargo test -p ys-component`
   - `cargo test -p ys-runtime`
   - `cargo test -p ys-loop`
-  - `cargo test -p model-openai-compatible`
+  - `cargo test -p ys-model-openai-compat`
   - `cargo test -p ys-tui-coding`
   - `cargo test --workspace`（N9 总闸）
   - `cargo clippy --all-targets` / `cargo fmt`

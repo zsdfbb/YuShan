@@ -385,7 +385,7 @@ async fn abort_mid_loop() {
                 Some(&model),
                 &mut session,
                 &mut events,
-                Some(boundary.as_ref()),
+                Some(boundary.clone()),
             ),
         )
         .await

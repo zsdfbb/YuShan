@@ -126,7 +126,12 @@ mod tests {
         let result = agent
             .run_turn(
                 AgentInput::text("go"),
-                AgentPorts::new(Some(&model), &mut session, &mut events, Some(&boundary)),
+                AgentPorts::new(
+                    Some(&model),
+                    &mut session,
+                    &mut events,
+                    Some(std::sync::Arc::new(boundary)),
+                ),
             )
             .await
             .unwrap();

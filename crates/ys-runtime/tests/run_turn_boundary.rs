@@ -144,7 +144,12 @@ async fn preset_abort_cancels_before_appending_user_message() {
     let result = agent
         .run_turn(
             AgentInput::text("go"),
-            AgentPorts::new(Some(&model), &mut session, &mut events, Some(&boundary)),
+            AgentPorts::new(
+                Some(&model),
+                &mut session,
+                &mut events,
+                Some(std::sync::Arc::new(boundary)),
+            ),
         )
         .await
         .unwrap();
@@ -230,7 +235,12 @@ async fn none_boundary_matches_idle_boundary_source() {
     let result_b = agent
         .run_turn(
             AgentInput::text("hi"),
-            AgentPorts::new(Some(&model_b), &mut session_b, &mut events_b, Some(&idle)),
+            AgentPorts::new(
+                Some(&model_b),
+                &mut session_b,
+                &mut events_b,
+                Some(std::sync::Arc::new(idle)),
+            ),
         )
         .await
         .unwrap();
@@ -268,7 +278,7 @@ async fn steer_mid_round_enters_next_request_without_adding_round() {
                 Some(&model),
                 &mut session,
                 &mut events,
-                Some(boundary.as_ref()),
+                Some(boundary.clone()),
             ),
         )
         .await

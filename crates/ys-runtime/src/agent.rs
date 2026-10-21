@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ys_component::{RunLimits, RuntimeContext};
 use ys_event::EventSink;
@@ -27,7 +28,10 @@ pub struct AgentPorts<'a> {
     ///
     /// 取代了旧的 `CancelToken`：取消与插话共享同一条有序通道，由
     /// `BasicLoop` 在**轮**边界拉取。
-    pub boundary: Option<&'a dyn BoundarySource>,
+    ///
+    /// **共享所有权**（`Arc`）而非借用：模型适配器侧需要在 `await` 期间
+    /// 持有**同一份** abort 状态，而它必须 `'static`。
+    pub boundary: Option<Arc<dyn BoundarySource>>,
     /// 一次性派发能力（可选）。`None` = 本回合不支持 `subagent` 派发工具。
     ///
     /// 由接线器每回合构造并注入（照 `boundary` 的先例）—— 「造子执行环境」的能力
@@ -41,7 +45,7 @@ impl<'a> AgentPorts<'a> {
         model: Option<&'a dyn Model>,
         session: &'a mut dyn Session,
         events: &'a mut dyn EventSink,
-        boundary: Option<&'a dyn BoundarySource>,
+        boundary: Option<Arc<dyn BoundarySource>>,
     ) -> Self {
         Self {
             model,
@@ -243,7 +247,12 @@ mod tests {
         let result = agent
             .run_turn(
                 ys_loop::AgentInput::text("go"),
-                AgentPorts::new(Some(&model), &mut session, &mut events, Some(&boundary)),
+                AgentPorts::new(
+                    Some(&model),
+                    &mut session,
+                    &mut events,
+                    Some(Arc::new(boundary)),
+                ),
             )
             .await
             .unwrap();

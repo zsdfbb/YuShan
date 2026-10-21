@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::RunLimits;
 use ys_event::EventSink;
@@ -21,7 +22,11 @@ pub struct RuntimeContext<'a> {
     /// 轮边界控制源（steering + abort 的唯一入口）。
     ///
     /// `None` = 无边界控制，行为与不挂载时逐字节一致（既无插话也无取消）。
-    pub boundary: Option<&'a dyn BoundarySource>,
+    ///
+    /// **共享所有权**（`Arc`）而非借用：模型调用侧的适配器需要持有**同一份**
+    /// abort 状态跨越 `await`，且该状态必须 `'static`（`Arc<dyn BoundarySource>`
+    /// 默认隐含 `+ 'static`）。
+    pub boundary: Option<Arc<dyn BoundarySource>>,
     /// 一次性派发能力（可选）。由接线器经 [`RuntimeContext::with_subagent`] 挂载，
     /// 再经 `BasicLoop` 落到 `ToolContext`。`None` = 本回合不支持派发。
     pub subagent: Option<&'a dyn SubagentRunner>,
@@ -56,7 +61,10 @@ impl<'a> RuntimeContext<'a> {
     }
 
     /// 链式挂载轮边界控制源。`None` 时行为不变。
-    pub fn with_boundary(mut self, boundary: &'a dyn BoundarySource) -> Self {
+    ///
+    /// 收 `Arc` 而非借用：挂载方（app 层）需要**同一份** abort 状态
+    /// 同时被 loop 侧与模型适配器侧看到，而后者必须跨越 `await` 持有它。
+    pub fn with_boundary(mut self, boundary: Arc<dyn BoundarySource>) -> Self {
         self.boundary = Some(boundary);
         self
     }

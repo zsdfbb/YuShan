@@ -253,7 +253,7 @@ impl Wiring {
     /// 之后的回合。
     pub fn ports_with_boundary<'a>(
         &'a mut self,
-        boundary: Option<&'a dyn BoundarySource>,
+        boundary: Option<Arc<dyn BoundarySource>>,
     ) -> AgentPorts<'a> {
         AgentPorts::new(
             self.model.as_deref(),

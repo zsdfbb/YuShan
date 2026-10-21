@@ -995,13 +995,20 @@ async fn run_turn_once(
         let ports = ctx.wiring.ports();
         ports.events.begin_turn(*ctx.turns);
         // 本回合专属的边界源：`Abort` 的标志位随回合作废。
-        let boundary = QueueBoundarySource::new();
+        let boundary = Arc::new(QueueBoundarySource::new());
         // subagent：每回合造一份 runner（派发计数器天然 per-turn；每次派发建新子 Agent）。
-        let runner = ctx
-            .subagent
-            .map(|s| s.make_runner(Some(ctx.config), ports.model, ctx.subagent_totals.clone()));
+        // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`
+        // 透传得到父的中止状态。
+        let runner = ctx.subagent.map(|s| {
+            s.make_runner(
+                Some(ctx.config),
+                ports.model,
+                ctx.subagent_totals.clone(),
+                Some(boundary.clone()),
+            )
+        });
         let mut agent_ports =
-            AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary));
+            AgentPorts::new(ports.model, ports.session, ports.events, Some(boundary.clone()));
         if let Some(r) = &runner {
             agent_ports = agent_ports.with_subagent(r);
         }

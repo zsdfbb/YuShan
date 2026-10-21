@@ -67,7 +67,7 @@ mod test_env;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
@@ -1712,15 +1712,19 @@ async fn run_single_turn(
     let started = Instant::now();
     let deadline = started + budget;
     // 本回合专属的边界源：`Abort` 的标志位随回合作废，绝不跨回合复用。
-    let boundary = QueueBoundarySource::new();
-    let ports = wiring.ports_with_boundary(Some(&boundary));
+    let boundary = Arc::new(QueueBoundarySource::new());
+    let ports = wiring.ports_with_boundary(Some(boundary.clone()));
     ports.events.begin_turn(1);
 
     // subagent 能力：每回合造一份 runner（派发计数器天然 per-turn）。
+    // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`
+    // 透传得到父的中止状态。
     let totals = std::sync::Arc::new(subagent::UsageTotals::default());
-    let runner = subagent.map(|s| s.make_runner(config, ports.model, totals.clone()));
+    let runner = subagent.map(|s| {
+        s.make_runner(config, ports.model, totals.clone(), Some(boundary.clone()))
+    });
     let mut agent_ports =
-        AgentPorts::new(ports.model, ports.session, ports.events, Some(&boundary));
+        AgentPorts::new(ports.model, ports.session, ports.events, Some(boundary.clone()));
     if let Some(r) = &runner {
         agent_ports = agent_ports.with_subagent(r);
     }

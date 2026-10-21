@@ -2418,6 +2418,7 @@ dependencies = [
  "tokio",
  "ys-core",
  "ys-event",
+ "ys-protocol",
  "ys-tool",
 ]
 
@@ -2435,6 +2436,7 @@ dependencies = [
  "ys-core",
  "ys-event",
  "ys-model",
+ "ys-protocol",
  "ys-tool",
 ]
 

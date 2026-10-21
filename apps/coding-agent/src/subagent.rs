@@ -61,13 +61,15 @@ impl CancelCause {
 /// 子 agent 的边界源：`is_aborted` 透传父的；`take()` **只取自己那份**，绝不消费父队列。
 ///
 /// 与 ADR-0022 决策 5 的差异（`take()` 从「恒 None」改为取自己的）记在 ADR-0029 §6 修正 4。
-pub struct ChildBoundary<'a> {
+pub struct ChildBoundary {
     own: Arc<QueueBoundarySource>,
-    parent: Option<&'a dyn BoundarySource>,
+    parent: Option<Arc<dyn BoundarySource>>,
 }
 
-impl<'a> ChildBoundary<'a> {
-    pub fn new(parent: Option<&'a dyn BoundarySource>) -> Self {
+impl ChildBoundary {
+    /// `parent` 必须是 `Arc` —— 边界源要能 coerce 成 `Arc<dyn BoundarySource>`
+    /// （默认隐含 `'static`），而借用父的引用做不到（自身会带上父的生命周期）。
+    pub fn new(parent: Option<Arc<dyn BoundarySource>>) -> Self {
         Self {
             own: Arc::new(QueueBoundarySource::new()),
             parent,
@@ -80,12 +82,21 @@ impl<'a> ChildBoundary<'a> {
     }
 }
 
-impl BoundarySource for ChildBoundary<'_> {
+/// `Debug` 只输出「是否有父」—— **不打印父队列内容**（避免泄露 steer 正文）。
+impl std::fmt::Debug for ChildBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildBoundary")
+            .field("has_parent", &self.parent.is_some())
+            .finish()
+    }
+}
+
+impl BoundarySource for ChildBoundary {
     fn take(&self) -> Option<Boundary> {
         self.own.take()
     }
     fn is_aborted(&self) -> bool {
-        self.own.is_aborted() || self.parent.is_some_and(|p| p.is_aborted())
+        self.own.is_aborted() || self.parent.as_ref().is_some_and(|p| p.is_aborted())
     }
 }
 
@@ -232,6 +243,12 @@ pub struct AppSubagentRunner<'a> {
     max_dispatches: u32,
     dispatched: AtomicU32,
     totals: Arc<UsageTotals>,
+    /// 父回合的边界源（共享所有权）—— 子 agent 的 `ChildBoundary` 要透传它的
+    /// 中止状态。
+    ///
+    /// **必须是 `Arc` 而非借用**：`ChildBoundary` 要能进 `Arc<dyn BoundarySource>`
+    /// （隐含 `'static`），借用父会把它拽出 `'static`。
+    parent_boundary: Option<Arc<dyn BoundarySource>>,
 }
 
 impl<'a> AppSubagentRunner<'a> {
@@ -247,6 +264,7 @@ impl<'a> AppSubagentRunner<'a> {
         web: WebConfig,
         dir: Arc<SubagentsDir>,
         totals: Arc<UsageTotals>,
+        parent_boundary: Option<Arc<dyn BoundarySource>>,
     ) -> Self {
         Self {
             parent_model,
@@ -261,6 +279,7 @@ impl<'a> AppSubagentRunner<'a> {
             max_dispatches: DEFAULT_MAX_DISPATCHES_PER_TURN,
             dispatched: AtomicU32::new(0),
             totals,
+            parent_boundary,
         }
     }
 }
@@ -319,6 +338,7 @@ impl SubagentSetup {
         config: Option<&'a crate::config::Config>,
         parent_model: Option<&'a dyn Model>,
         totals: Arc<UsageTotals>,
+        parent_boundary: Option<Arc<dyn BoundarySource>>,
     ) -> AppSubagentRunner<'a> {
         AppSubagentRunner::new(
             parent_model,
@@ -331,6 +351,7 @@ impl SubagentSetup {
             self.web.clone(),
             self.dir.clone(),
             totals,
+            parent_boundary,
         )
     }
 }
@@ -406,11 +427,14 @@ impl SubagentRunner for AppSubagentRunner<'_> {
             .build()
             .map_err(|e| format!("子 agent 组装失败: {e}"))?;
 
-        let child_boundary = ChildBoundary::new(boundary);
+        let child_boundary = ChildBoundary::new(self.parent_boundary.clone());
+        // 自己那份边界源（watchdog 往这里 `push(Abort)`）。先取出 `Arc` 副本 ——
+        // `child_boundary` 本身要 move 进 `Arc`（供 `AgentPorts` 持有）。
+        let child_own = child_boundary.own();
         // watchdog：到点向**子自己的**边界源 push(Abort)，子在轮边界优雅收尾。
         // 必须 `AbortOnDropHandle` —— 否则外闸 drop 子 future 时该任务会孤儿化并沉睡到预算到点。
         let handle = {
-            let own = child_boundary.own();
+            let own = child_own.clone();
             let budget = self.child_budget;
             tokio::spawn(async move {
                 tokio::time::sleep(budget).await;
@@ -428,7 +452,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                     Some(resolved),
                     &mut session,
                     &mut sink,
-                    Some(&child_boundary),
+                    Some(Arc::new(child_boundary)),
                 ),
             )
             .await;
@@ -444,7 +468,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 let cause = cancel_cause(
                     &stop_reason,
                     is_parent_cancelled(boundary),
-                    child_boundary.own().is_aborted(),
+                    child_own.is_aborted(),
                 );
                 let mut details = Vec::new();
                 let body = transcript_body(
@@ -797,8 +821,8 @@ mod tests {
 
     #[test]
     fn child_boundary_takes_own_and_probes_parent() {
-        let parent = QueueBoundarySource::new();
-        let cb = ChildBoundary::new(Some(&parent));
+        let parent = Arc::new(QueueBoundarySource::new());
+        let cb = ChildBoundary::new(Some(parent.clone()));
         assert!(!cb.is_aborted());
         assert!(cb.take().is_none(), "空队列");
         // 父 abort ⇒ 子探针可见。
@@ -1044,6 +1068,7 @@ mod tests {
             web,
             dir.clone(),
             totals.clone(),
+            None,
         );
 
         let out = runner.run("查 X", None, None).await.unwrap();
@@ -1110,6 +1135,7 @@ mod tests {
             web,
             Arc::new(SubagentsDir::at(base.join("subagents"), false)),
             Arc::new(UsageTotals::default()),
+            None,
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {
             runner.run("t", None, None).await.unwrap();
@@ -1202,6 +1228,7 @@ mod tests {
                 web(),
                 dir(),
                 Arc::new(UsageTotals::default()),
+                None,
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -1225,6 +1252,7 @@ mod tests {
                 web(),
                 dir(),
                 Arc::new(UsageTotals::default()),
+                None,
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -1500,6 +1528,20 @@ mod tests {
         limits: RunLimits,
         child_budget: Duration,
     ) -> AppSubagentRunner<'a> {
+        test_runner_with_parent(model, base, dir, limits, child_budget, None)
+    }
+
+    /// 父边界源**经构造期注入**（而非只经 `run` 的参数）——
+    /// 与生产路径一致：app 层把**同一份 `Arc`** 同时给 `make_runner` 与
+    /// `AgentPorts`，子 agent 的 `ChildBoundary` 才能透传父的中止状态。
+    fn test_runner_with_parent<'a>(
+        model: &'a dyn Model,
+        base: &std::path::Path,
+        dir: Arc<SubagentsDir>,
+        limits: RunLimits,
+        child_budget: Duration,
+        parent_boundary: Option<Arc<dyn BoundarySource>>,
+    ) -> AppSubagentRunner<'a> {
         use ys_tools_web::FetchedDir;
 
         AppSubagentRunner::new(
@@ -1513,6 +1555,7 @@ mod tests {
             WebConfig::offline(FetchedDir::Temp(base.join("fetched"))),
             dir,
             Arc::new(UsageTotals::default()),
+            parent_boundary,
         )
     }
 
@@ -1705,13 +1748,25 @@ mod tests {
         use ys_model::MockModel;
 
         let base = unique_subagent_test_dir("parent_cancel");
-        let parent = QueueBoundarySource::new();
+        let parent = Arc::new(QueueBoundarySource::new());
         parent.push(Boundary::Abort);
         let model = MockModel::new("must-not-run");
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
-        let runner = test_runner(&model, &base, dir, RunLimits::new(2));
+        // 父边界源经**构造期**注入 —— 与生产路径一致（app 层把同一份 `Arc`
+        // 给 `make_runner` 与 `AgentPorts`），子 `ChildBoundary` 才透传得到中止。
+        let runner = test_runner_with_parent(
+            &model,
+            &base,
+            dir,
+            RunLimits::new(2),
+            Duration::from_secs(30),
+            Some(parent.clone()),
+        );
 
-        let out = runner.run("取消", None, Some(&parent)).await.unwrap();
+        let out = runner
+            .run("取消", None, Some(parent.as_ref()))
+            .await
+            .unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
         let diagnostic = out.diagnostic.expect("取消必须有诊断");
         assert!(diagnostic.contains("cause=parent-turn-cancelled"));
@@ -1759,21 +1814,25 @@ mod tests {
             "read",
             serde_json::json!({"path": "note.txt"}),
         );
-        let parent = QueueBoundarySource::new();
+        let parent = Arc::new(QueueBoundarySource::new());
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
-        let runner = test_runner_with_budget(
+        let runner = test_runner_with_parent(
             &model,
             &base,
             dir,
             RunLimits::new(2),
             Duration::from_millis(5),
+            Some(parent.clone()),
         );
 
         let cancel_parent = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             parent.push(Boundary::Abort);
         };
-        let (out, ()) = tokio::join!(runner.run("父取消", None, Some(&parent)), cancel_parent);
+        let (out, ()) = tokio::join!(
+            runner.run("父取消", None, Some(parent.as_ref())),
+            cancel_parent
+        );
         let out = out.unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
         let diagnostic = out.diagnostic.expect("取消必须有诊断");

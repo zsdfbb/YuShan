@@ -14,12 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ys_core::EventError;
-use ys_model::{Model, ModelEvent, ModelEventSink, ModelRequest};
+use ys_model::{Model, ModelError, ModelEvent, ModelEventSink, ModelRequest};
 use ys_model_openai_compat::{
     ModelAttempt, ModelAttemptOutcome, ModelAttemptReason, ModelAttemptRetrySuppressed,
     OpenAICompatibleConfig, OpenAICompatibleModel, RetryConfig, TimeoutConfig,
     compat::ProviderCompat,
 };
+use ys_protocol::{Boundary, QueueBoundarySource};
 
 // ---------------------------------------------------------------------------
 // 本地 mock HTTP 服务
@@ -42,6 +43,10 @@ enum Reply {
     /// 客户端读到 delta 后连接关闭，hyper 判定消息不完整 ⇒ 传输层错误。
     /// 用于「已吐 delta 后断连」。
     SseThenTruncate(Vec<u8>),
+    /// **先睡一段**再回 200 + SSE —— 用于「请求已发出、服务端尚未应答」的窗口。
+    ///
+    /// 头**不**提前发（否则客户端会认为响应头已到，进入流阶段）。
+    DelayThenSse { delay: Duration, sse: Vec<u8> },
 }
 
 /// 极简 HTTP/1.1 mock：第 N 个连接返回第 N 条预设响应（超出则复用最后一条）。
@@ -213,6 +218,18 @@ fn handle_connection(
             // 留出时间让客户端先读到 delta，再关闭（触发「消息不完整」）。
             std::thread::sleep(Duration::from_millis(50));
             Ok(())
+        }
+        Reply::DelayThenSse { delay, sse } => {
+            // 头也延后发：客户端在整个 `delay` 内都停在「等待响应头」，
+            // 即发送阶段的 `select!` 里。
+            std::thread::sleep(*delay);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sse.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(sse)?;
+            stream.flush()
         }
     }
 }
@@ -885,5 +902,331 @@ async fn with_client_injected_client_survives_with_timeouts() {
         origin.request_count(),
         0,
         "请求不应绕过注入的代理直连 origin"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 中止（cancel）—— ADR-0046
+// ---------------------------------------------------------------------------
+
+/// 收集所有 `TextDelta` / `ThinkingDelta` 的 sink（中止用例需要看已吐内容）。
+struct RecordingSink {
+    texts: Vec<String>,
+    thinking: Vec<String>,
+}
+
+impl RecordingSink {
+    fn new() -> Self {
+        Self {
+            texts: Vec::new(),
+            thinking: Vec::new(),
+        }
+    }
+
+    /// 已吐出的正文（拼接）。
+    fn text(&self) -> String {
+        self.texts.concat()
+    }
+}
+
+impl ModelEventSink for RecordingSink {
+    fn emit(&mut self, event: ModelEvent) -> Result<(), EventError> {
+        match event {
+            ModelEvent::TextDelta { text } => self.texts.push(text),
+            ModelEvent::ThinkingDelta { text } => self.thinking.push(text),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// 可控的边界源：**测试**能随时置位 abort。
+///
+/// 用 `QueueBoundarySource`（生产实现）而不是另写一个：这样测试覆盖的
+/// 就是生产路径的语义（`push(Abort)` 即置位）。
+type SharedBoundary = std::sync::Arc<QueueBoundarySource>;
+
+fn boundary() -> SharedBoundary {
+    std::sync::Arc::new(QueueBoundarySource::new())
+}
+
+/// 带 boundary 的请求。
+fn request_with(boundary: &SharedBoundary) -> ModelRequest {
+    ModelRequest {
+        boundary: Some(boundary.clone()),
+        ..ModelRequest::default()
+    }
+}
+
+/// N1：**已 abort 的 boundary** ⇒ `Model::complete` 返回 `ModelError::Cancelled`。
+///
+/// 变异靶：去掉发送阶段的 `select!`（退化为直接 `await`）⇒ 本用例变红
+/// （`complete` 会拿到 200 + SSE 并返回 `Ok`）。
+#[tokio::test]
+async fn already_aborted_boundary_returns_cancelled() {
+    let server = MockServer::start(vec![Reply::Sse(full_sse())]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let boundary = boundary();
+    // **先** abort，再发请求 ⇒ 请求发出前就已中止。
+    boundary.push(Boundary::Abort);
+
+    let result = model.complete(request_with(&boundary), &mut NullSink).await;
+
+    let error = result.expect_err("已 abort 的 boundary 必须返回 Err");
+    assert!(
+        matches!(error, ModelError::Cancelled { .. }),
+        "应是 ModelError::Cancelled，实际：{error:?}"
+    );
+}
+
+/// N1b：**事先已 abort** ⇒ 请求**根本不上线**（`request_count() == 0`）。
+///
+/// 依据：发送阶段的 `select!` 里中止分支在前（`biased`）且**立即就绪**
+/// （`wait_abort` 先探针后睡）⇒ 边界已 abort 时，请求还没发出就被中止。
+///
+/// 变异靶：去掉发送阶段的 `select!`（退化为裸 `await`）⇒ 本用例变红
+/// （请求照发，`request_count()` 变成 1）。
+///
+/// 注意：断言的是「**一个都不发**」而非「至多一个」——
+/// 「至多一个」无法区分「中止前没发」与「中止后重试了一次」。
+#[tokio::test]
+async fn already_aborted_boundary_sends_no_request() {
+    let server = MockServer::start(vec![Reply::Sse(full_sse())]);
+    let model = model_for(&server, fast_retry(3, 10), 30, None);
+
+    let boundary = boundary();
+    boundary.push(Boundary::Abort);
+
+    let result = model.complete(request_with(&boundary), &mut NullSink).await;
+
+    assert!(result.is_err(), "中止必须是 Err");
+    assert_eq!(
+        server.request_count(),
+        0,
+        "事先已 abort ⇒ 请求不得上线（更不得重试）"
+    );
+}
+
+/// N2：**先吐 delta 再取消** ⇒ `partial` 含已吐文本。
+///
+/// 手法：mock server 先发一段带正文的 SSE，**然后保持连接沉默**（不关、不再发），
+/// 测试在收到第一个 delta 后才 push `Abort`。
+///
+/// 变异靶：把 `into_partial` 改成恒返回 `None` ⇒ 本用例变红。
+#[tokio::test]
+async fn cancelled_after_delta_carries_partial_text() {
+    let server = MockServer::start(vec![Reply::SseThenSilence(one_delta_sse())]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let boundary = boundary();
+    let mut sink = RecordingSink::new();
+
+    // 并发：一边跑模型（让它吐 delta），一边在 300ms 后取消。
+    // `join!` 而非 `spawn` ⇒ sink 留在本任务里，事后可断言「确实吐过 delta」。
+    let cancel = {
+        let boundary = boundary.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            boundary.push(Boundary::Abort);
+        }
+    };
+    let (result, ()) = tokio::join!(model.complete(request_with(&boundary), &mut sink), cancel);
+
+    assert!(
+        sink.text().contains("partial"),
+        "前置条件：模型应已吐过 delta，实际：{:?}",
+        sink.text()
+    );
+
+    let error = result.expect_err("取消后必须是 Err");
+    let ModelError::Cancelled { partial } = error else {
+        panic!("应是 ModelError::Cancelled，实际：{error:?}");
+    };
+    let partial = partial.expect("已吐 delta ⇒ partial 必须存在");
+    let text = partial
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ys_core::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        text.contains("partial"),
+        "partial 应含已吐文本，实际：{text:?}"
+    );
+}
+
+/// N3：**先吐 tool call 的部分参数再取消** ⇒ `partial` 的 content blocks
+/// **全部**是 `Text`，无 `ToolUse`。
+///
+/// 理由：中止时未完成的工具调用参数可能残缺，执行它等于拿半个 payload 去改状态。
+///
+/// 手法：先吐一段**正文**，再吐一个**参数只写一半**的 tool call ——
+/// 这样 `partial` 非空（正文在），断言「只有 Text、没有 ToolUse」才有意义。
+///
+/// 变异靶：把 `into_partial` 改成也吐 `ToolUse` ⇒ 本用例变红。
+#[tokio::test]
+async fn cancelled_with_partial_tool_call_carries_no_tool_use() {
+    // 正文 + 参数只写一半的 tool call，随后沉默。
+    let sse = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"before-tool\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n"
+        .to_vec();
+    let server = MockServer::start(vec![Reply::SseThenSilence(sse)]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let boundary = boundary();
+    let mut sink = RecordingSink::new();
+
+    // 并发：跑模型（吐正文 + 半个 tool call）与取消。
+    let cancel = {
+        let boundary = boundary.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            boundary.push(Boundary::Abort);
+        }
+    };
+    let (result, ()) = tokio::join!(model.complete(request_with(&boundary), &mut sink), cancel);
+
+    assert!(
+        sink.text().contains("before-tool"),
+        "前置条件：模型应已吐过正文，实际：{:?}",
+        sink.text()
+    );
+
+    let error = result.expect_err("取消后必须是 Err");
+    let ModelError::Cancelled { partial } = error else {
+        panic!("应是 ModelError::Cancelled，实际：{error:?}");
+    };
+    let partial = partial.expect("已吐正文 ⇒ partial 必须存在");
+    for block in &partial.content {
+        assert!(
+            matches!(block, ys_core::ContentBlock::Text { .. }),
+            "partial 不得含 ToolUse 等非文本块：{block:?}"
+        );
+    }
+    // 反向断言：正文确实在里面（否则「只有 Text」是空断言）。
+    let text = partial
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ys_core::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        text.contains("before-tool"),
+        "partial 应含已吐正文，实际：{text:?}"
+    );
+}
+
+/// N3b：**未吐任何内容就取消** ⇒ `partial` 为 `None`（不是空文本块）。
+#[tokio::test]
+async fn cancelled_before_any_output_has_no_partial() {
+    let server = MockServer::start(vec![Reply::Sse(full_sse())]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let boundary = boundary();
+    boundary.push(Boundary::Abort);
+
+    let result = model.complete(request_with(&boundary), &mut NullSink).await;
+
+    let error = result.expect_err("已 abort 的 boundary 必须返回 Err");
+    let ModelError::Cancelled { partial } = error else {
+        panic!("应是 ModelError::Cancelled，实际：{error:?}");
+    };
+    assert!(partial.is_none(), "尚无可见输出 ⇒ partial 应为 None");
+}
+
+/// N5：**请求已发出、服务端尚未应答**时取消 ⇒ 立即 `Cancelled`（不等应答）。
+///
+/// 场景：mock 收到请求后先睡 3s 才回 200 + SSE。测试在 300ms 时取消 ⇒
+/// `complete` 应**立即**以 `Cancelled` 收场，而不是等 3s 后拿到响应。
+///
+/// 这是发送阶段 `select!` 的**唯一可观测**用例：只有在「请求已上线、
+/// 响应头未到」这个窗口里取消，才能证明发送阶段真的可中止。
+///
+/// 变异靶：把发送阶段的 `select!` 退回裸 `await` ⇒ 本用例变红
+/// （`complete` 会等满 5s，外层 2s 超时 ⇒ 断言失败）。
+#[tokio::test]
+async fn cancellation_while_awaiting_response_headers_returns_promptly() {
+    let server = MockServer::start(vec![Reply::DelayThenSse {
+        delay: Duration::from_secs(3),
+        sse: full_sse(),
+    }]);
+    let model = model_for(&server, fast_retry(0, 10), 30, None);
+
+    let boundary = boundary();
+    let cancel = {
+        let boundary = boundary.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            boundary.push(Boundary::Abort);
+        }
+    };
+    let request = request_with(&boundary);
+    let mut sink = NullSink;
+    // 2s 上限：mock 要 3s 才应答 ⇒ 若发送阶段不可中止，这里会超时。
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async move {
+        tokio::join!(model.complete(request, &mut sink), cancel)
+    })
+    .await
+    .expect("发送阶段必须可中止：不应等服务端的 3s 应答");
+
+    let error = result.expect_err("取消后必须是 Err");
+    assert!(
+        matches!(error, ModelError::Cancelled { .. }),
+        "应是 ModelError::Cancelled，实际：{error:?}"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "请求已发出；取消不应再发第二个请求"
+    );
+}
+
+/// N4：**退避期间取消** ⇒ 立即返回 `Cancelled`，不睡满退避。
+///
+/// 场景：server 回 429 + `Retry-After: 5`（在硬上限内）⇒ 适配器进入 5s 退避；
+/// 测试在退避中 push `Abort` ⇒ `complete` 应**立即**以 `Cancelled` 收场。
+///
+/// 变异靶：把退避的 `select!` 退回裸 `sleep` ⇒ 本用例变红
+/// （`complete` 会睡满 5s，外层 2s 超时 ⇒ 断言失败）。
+#[tokio::test]
+async fn cancellation_during_backoff_returns_promptly() {
+    let server = MockServer::start(vec![json_reply(
+        "429 Too Many Requests",
+        vec![("retry-after", "5".into())],
+        "{\"error\":\"rate limited\"}",
+    )]);
+    // 硬上限 10s > Retry-After 5s ⇒ 真的进入 5s 退避（而不是直接放弃）。
+    let model = model_for(&server, fast_retry(3, 10_000), 30, None);
+
+    let boundary = boundary();
+    let call = {
+        let boundary = boundary.clone();
+        let request = request_with(&boundary);
+        tokio::spawn(async move { model.complete(request, &mut NullSink).await })
+    };
+
+    // 等首个 429 落地、进入退避，再取消。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    boundary.push(Boundary::Abort);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .expect("退避期间取消应立即返回，而不是睡满 5s")
+        .expect("调用 task 应结束");
+
+    let error = result.expect_err("取消后必须是 Err");
+    assert!(
+        matches!(error, ModelError::Cancelled { .. }),
+        "应是 ModelError::Cancelled，实际：{error:?}"
+    );
+    assert_eq!(
+        server.request_count(),
+        1,
+        "退避期间取消 ⇒ 不得再发第二个请求"
     );
 }

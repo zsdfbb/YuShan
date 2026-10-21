@@ -18,6 +18,25 @@ use ys_core::{ContentBlock, EventError, Message, Role, ToolCallId, Usage};
 use ys_model::{
     FinishReason, Model, ModelError, ModelEvent, ModelEventSink, ModelRequest, ModelResponse,
 };
+use ys_protocol::BoundarySource;
+
+/// 挂载了 `boundary` 时的中止轮询间隔 —— 模型调用期间中止的感知延迟上界。
+const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 等到边界发出中止信号。
+///
+/// `None` = 没有边界控制 ⇒ **永不完成**（调用方的 `select!` 只会等另外两个分支）。
+async fn wait_abort(boundary: Option<&dyn BoundarySource>) {
+    match boundary {
+        Some(boundary) => loop {
+            if boundary.is_aborted() {
+                return;
+            }
+            tokio::time::sleep(ABORT_POLL_INTERVAL).await;
+        },
+        None => std::future::pending::<()>().await,
+    }
+}
 
 pub struct OpenAICompatibleConfig {
     pub api_base: String,
@@ -321,6 +340,11 @@ enum AttemptError {
         error: ModelError,
         reason_class: ModelAttemptReason,
     },
+    /// **被中止** —— 不是故障，是用户的意图。
+    ///
+    /// 绝**不**归入 `Retryable`：重试会重放请求，违背用户意图。
+    /// `partial` 是中止瞬间已收到的可见文本（`None` = 尚无可见输出）。
+    Cancelled { partial: Option<Message> },
 }
 
 /// 单次尝试的计时与 HTTP 元数据。错误路径同样携带，便于把“失败前等在哪”落盘。
@@ -411,11 +435,16 @@ impl Model for OpenAICompatibleModel {
         // 3. 有界重试循环。`max_attempts` 是**额外**重试次数，故总尝试数为 max_attempts + 1。
         //    每次尝试用 DeltaWatchingSink 记「本次是否已吐出 delta」——吐过就不许重试。
         let max_attempts = self.retry.max_attempts.saturating_add(1);
+        // 边界源：模型调用期间的中止通道（`None` = 不支持中止）。
+        // 借自 `request` 的 `Arc` ⇒ 生命周期短于 `Arc` 持有期。
+        let boundary = request.boundary.as_deref();
         for attempt in 0..max_attempts {
             let started = Instant::now();
             let (outcome, meta) = {
                 let mut watcher = DeltaWatchingSink::new(&mut *sink);
-                let outcome = self.attempt(&url, &mut chat_request, &mut watcher).await;
+                let outcome = self
+                    .attempt(&url, &mut chat_request, &mut watcher, boundary)
+                    .await;
                 let mut meta = outcome.meta;
                 meta.duration_ms = started.elapsed().as_millis() as u64;
                 meta.stream_started = watcher.emitted;
@@ -441,6 +470,10 @@ impl Model for OpenAICompatibleModel {
                 Ok(response) => {
                     self.trace(&record);
                     return Ok(response);
+                }
+                Err(AttemptError::Cancelled { partial }) => {
+                    // 中止不是失败 ⇒ 不 trace 为失败、不重试。
+                    return Err(ModelError::Cancelled { partial });
                 }
                 Err(AttemptError::Fatal {
                     error,
@@ -483,8 +516,7 @@ impl Model for OpenAICompatibleModel {
                     let delay = match self.backoff_delay(attempt, server_delay) {
                         Ok(delay) => delay,
                         Err(error) => {
-                            record.retry_suppressed =
-                                Some(ModelAttemptRetrySuppressed::BackoffCap);
+                            record.retry_suppressed = Some(ModelAttemptRetrySuppressed::BackoffCap);
                             self.trace(&record);
                             self.log(&format!("retry giving up: {error}"));
                             return Err(error);
@@ -500,7 +532,14 @@ impl Model for OpenAICompatibleModel {
                         self.retry.max_attempts,
                         delay.as_millis()
                     ));
-                    tokio::time::sleep(delay).await;
+                    // 退避期间也要能被中止：否则一个长 `Retry-After` 会把取消请求
+                    // 拖到退避结束才生效。
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = wait_abort(boundary) => {
+                            return Err(ModelError::Cancelled { partial: None });
+                        }
+                    }
                 }
             }
         }
@@ -518,14 +557,39 @@ impl OpenAICompatibleModel {
         url: &str,
         chat_request: &mut ChatCompletionRequest,
         sink: &mut dyn ModelEventSink,
+        boundary: Option<&dyn BoundarySource>,
     ) -> AttemptCall {
         let started = Instant::now();
         let mut meta = AttemptMeta::default();
-        let response = match self.send(url, chat_request).await {
-            Ok(response) => response,
-            Err(error) => {
+        // 发送阶段的中止：请求发出后、服务端应答前被中止 ⇒ 无部分输出。
+        //
+        // `select!` 的结果先落到一个中间枚举再 `match`：`select!` 本身已是
+        // `match` 展开，直接嵌进 `match` 的臂里会破坏解析。
+        enum SendOutcome {
+            Sent(Result<reqwest::Response, reqwest::Error>),
+            Cancelled,
+        }
+        let send_outcome = tokio::select! {
+            // `biased` + **中止分支在前** ⇒ 中止**确定性地**胜出。
+            //
+            // `select!` 默认随机挑选就绪分支 ⇒ 当 abort 与发送**同时**就绪时
+            // 胜负不定（实测会时而发请求、时而中止）。已 abort 的 boundary
+            // 必须**确定性地**走到中止分支 —— 否则请求照发，取消请求形同虚设。
+            biased;
+            _ = wait_abort(boundary) => SendOutcome::Cancelled,
+            result = self.send(url, chat_request) => SendOutcome::Sent(result),
+        };
+        let response = match send_outcome {
+            SendOutcome::Sent(Ok(response)) => response,
+            SendOutcome::Sent(Err(error)) => {
                 return AttemptCall {
                     result: Err(retryable_transport_error(error)),
+                    meta,
+                };
+            }
+            SendOutcome::Cancelled => {
+                return AttemptCall {
+                    result: Err(AttemptError::Cancelled { partial: None }),
                     meta,
                 };
             }
@@ -595,34 +659,61 @@ impl OpenAICompatibleModel {
         // 每次 `stream.next()` 都由流空闲超时包住 —— 黑洞端点「接受连接但不应答」
         // 会让 complete 永久挂起，超时是重试的前置。
         let idle = Duration::from_secs(self.timeouts.idle_secs);
+        // `accumulator` 声明在 `select!` **之外**（栈上存活）⇒ 中止时可取到已收到的
+        // 部分文本。`select!` 只 drop 借用它的闭包 future，不动它本身。
         let mut accumulator =
             StreamAccumulator::new(&mut *sink, self.config.compat.has_reasoning_content);
         let mut first_byte_at = None;
-        let result = match parse_sse_stream(
-            response,
-            idle,
-            |event| accumulator.handle(event),
-            || {
-                first_byte_at.get_or_insert_with(Instant::now);
-            },
-        )
-        .await
-        {
-            // `finish()` 仅在 `StreamEvent::Error` 置位后报错，而该事件只由传输层错误
-            // 产生（见 `stream::parse_sse_stream` 的 `Ok(Some(Err(..)))` 分支）——
-            // 故此处把它的 `Err` 无条件归为可重试是安全的。
-            // sink 自身的 `Err` 不会落到这里：`StreamAccumulator::handle` 内以
-            // `let _ = self.sink.emit(..)` 吞掉它，`handle` 恒返回 `Ok`，从不外抛。
-            // 因此下面 `Err` 分支当前只由流空闲超时（`stream.rs`）到达，
-            // `classify_stream_error` 的 `Fatal` 分支在当前路径下不可达。
-            Ok(()) => accumulator
-                .finish_with_logger(&|message| self.log(message))
-                .map_err(|error| AttemptError::Retryable {
-                    reason: error.to_string(),
-                    reason_class: ModelAttemptReason::Stream,
-                    server_delay: None,
-                }),
-            Err(error) => Err(classify_stream_error(error)),
+        //
+        // `select!` 的结果先落到一个中间枚举再 `match`：
+        // 1. `select!` 本身已是 `match` 展开，直接嵌进 `match` 的臂里会破坏解析；
+        // 2. 两个臂分别要「可变借用 `accumulator`」与「**移走** `accumulator`」，
+        //    放在同一个 `match` 里会同时存活 ⇒ 借用检查不通过。
+        //    拆成两步后，`select!` 结束时借用的 future 已被 drop，移走才合法。
+        enum StreamOutcome {
+            Finished(Result<(), ModelError>),
+            Cancelled,
+        }
+        let stream_outcome = tokio::select! {
+            // `biased` + **中止分支在前** ⇒ 中止**确定性地**胜出。
+            //
+            // 不加 `biased` 时，若 abort 与「流已读完」同时就绪，胜负随机
+            // ⇒ 同一个输入可能时而 `Cancelled`、时而 `Ok`，不可复现。
+            biased;
+            _ = wait_abort(boundary) => StreamOutcome::Cancelled,
+            result = parse_sse_stream(
+                response,
+                idle,
+                |event| accumulator.handle(event),
+                || {
+                    first_byte_at.get_or_insert_with(Instant::now);
+                },
+            ) => StreamOutcome::Finished(result),
+        };
+        let result = match stream_outcome {
+            StreamOutcome::Finished(Ok(())) => {
+                // `finish()` 仅在 `StreamEvent::Error` 置位后报错，而该事件只由传输层错误
+                // 产生（见 `stream::parse_sse_stream` 的 `Ok(Some(Err(..)))` 分支）——
+                // 故此处把它的 `Err` 无条件归为可重试是安全的。
+                // sink 自身的 `Err` 不会落到这里：`StreamAccumulator::handle` 内以
+                // `let _ = self.sink.emit(..)` 吞掉它，`handle` 恒返回 `Ok`，从不外抛。
+                // 因此下面 `Err` 分支当前只由流空闲超时（`stream.rs`）到达，
+                // `classify_stream_error` 的 `Fatal` 分支在当前路径下不可达。
+                accumulator
+                    .finish_with_logger(&|message| self.log(message))
+                    .map_err(|error| AttemptError::Retryable {
+                        reason: error.to_string(),
+                        reason_class: ModelAttemptReason::Stream,
+                        server_delay: None,
+                    })
+            }
+            StreamOutcome::Finished(Err(error)) => Err(classify_stream_error(error)),
+            StreamOutcome::Cancelled => {
+                // 流式阶段被中止 ⇒ 已收到的文本**不丢弃**，作为 partial 交回。
+                Err(AttemptError::Cancelled {
+                    partial: accumulator.into_partial(),
+                })
+            }
         };
         meta.ttfb_ms = first_byte_at.map(|at| at.duration_since(started).as_millis() as u64);
         AttemptCall { result, meta }
@@ -1008,6 +1099,21 @@ impl<'s> StreamAccumulator<'s> {
         self.finish_with_logger(&|_| {})
     }
 
+    /// 取出中止瞬间已收到的**可见文本**，作为 partial 交回。
+    ///
+    /// **只取 `self.text`**（非空才产出）：reasoning 不入 partial
+    /// （与「Thinking 段只 emit」的既有约定一致）。
+    ///
+    /// **不碰 `self.tool_calls`**：中止时未完成的工具调用参数可能残缺，
+    /// 执行它等于拿半个 payload 去改状态 ⇒ partial 里绝不带工具调用。
+    fn into_partial(self) -> Option<Message> {
+        let block = text_block(self.text)?;
+        Some(Message {
+            role: Role::Assistant,
+            content: vec![block],
+        })
+    }
+
     /// 与 [`Self::finish`] 相同，但把工具参数修复等诊断交给注入的 logger。
     fn finish_with_logger(mut self, log: &dyn Fn(&str)) -> Result<ModelResponse, ModelError> {
         if let Some(message) = self.error {
@@ -1022,8 +1128,8 @@ impl<'s> StreamAccumulator<'s> {
         }
 
         let mut content_blocks = Vec::new();
-        if !self.text.is_empty() {
-            content_blocks.push(ContentBlock::Text { text: self.text });
+        if let Some(block) = text_block(std::mem::take(&mut self.text)) {
+            content_blocks.push(block);
         }
         for (_, accumulator) in self.tool_calls {
             // 参数完整（有 name）时才产出；一个调用一个 block。
@@ -1044,6 +1150,18 @@ impl<'s> StreamAccumulator<'s> {
             usage: self.usage.unwrap_or_default(),
             finish_reason: normalize_finish_reason(self.finish_reason),
         })
+    }
+}
+
+/// 空文本 → 无 block；非空 → 一个 [`ContentBlock::Text`]。
+///
+/// 终态构造（[`StreamAccumulator::finish_with_logger`]）与中止时的部分输出
+/// （[`StreamAccumulator::into_partial`]）共用 ⇒ 两条路径的文本形态一致。
+fn text_block(text: String) -> Option<ContentBlock> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(ContentBlock::Text { text })
     }
 }
 
@@ -1219,6 +1337,7 @@ mod tests {
             system: Some("You are helpful.".into()),
             max_tokens: None,
             temperature: None,
+            boundary: None,
         };
 
         let chat_req = translate_request(&request, &config).unwrap();
@@ -1254,6 +1373,7 @@ mod tests {
             system: None,
             max_tokens: None,
             temperature: None,
+            boundary: None,
         };
 
         let chat_req = translate_request(&request, &config).unwrap();

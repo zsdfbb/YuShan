@@ -75,6 +75,9 @@ impl ys_tool::Summarizer for ModelSummarizer<'_> {
             // ⚠️ `temperature` 刻意**不设**：适配器是 `config.X.or(request.X)` 形状，而
             // app 侧写死 `config.temperature = Some(0.7)` ⇒ 在这里设值会被静默覆盖。
             temperature: None,
+            // 摘要调用**不挂边界源** ⇒ 摘要路径不参与取消
+            // （取消只作用于主模型调用）。
+            boundary: None,
         };
 
         // 摘要不进事件系统（工具没有事件出口），流式增量直接丢弃。

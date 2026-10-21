@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use ys_component::RuntimeContext;
 use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
-use ys_event::{emit, AgentEvent, RoundPurpose};
+use ys_event::{AgentEvent, RoundPurpose, emit};
 use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
 use ys_tool::{Tool, ToolContext, ToolError};
@@ -134,7 +134,7 @@ impl AgentLoop for BasicLoop {
         let turn_start = ctx.session.messages().len();
 
         // Step 1：入口边界 —— 检查 abort（非破坏性探针）
-        if ctx.boundary.is_some_and(|b| b.is_aborted()) {
+        if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
             emit(
                 ctx.events,
                 AgentEvent::RunFinished {
@@ -171,7 +171,7 @@ impl AgentLoop for BasicLoop {
         // 主循环
         loop {
             // Step 3：调用 model 前检查 abort
-            if ctx.boundary.is_some_and(|b| b.is_aborted()) {
+            if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
                 emit(
                     ctx.events,
                     AgentEvent::RunFinished {
@@ -302,7 +302,7 @@ impl AgentLoop for BasicLoop {
             // 轮询）总是先行命中并提前返回，本分支几乎不可达；唯一窗口是 Step 4b
             // 上下文压缩 `await` 期间 Abort 才到达 —— 探针已过、消息刚到。保留它是
             // 为了在压缩耗时较长时不至于漏掉一次中止（宁可晚一轮，不可丢失）。
-            if let Some(boundary) = ctx.boundary {
+            if let Some(boundary) = ctx.boundary.as_ref() {
                 while let Some(bnd) = boundary.take() {
                     match bnd {
                         Boundary::Steer(msg) => {
@@ -343,17 +343,15 @@ impl AgentLoop for BasicLoop {
             // 不得走 `try_emit` 快路径（满了会被缓冲进 overflow，冲刷永不发生）。
             //
             // `round` 与终局 `RunFinished.rounds` 同口径（都在本行 `+= 1` 之后取值）。
-            emit(
-                ctx.events,
-                AgentEvent::RoundStarted { round: rounds },
-            )
-            .await
-            .map_err(LoopError::Event)?;
+            emit(ctx.events, AgentEvent::RoundStarted { round: rounds })
+                .await
+                .map_err(LoopError::Event)?;
             let tools = ctx.registry.specs().to_vec();
             let request = ModelRequest {
                 messages: ctx.session.messages().to_vec(),
                 tools,
                 system: ctx.system_prompt.clone(),
+                boundary: ctx.boundary.clone(),
                 ..Default::default()
             };
 
@@ -362,6 +360,34 @@ impl AgentLoop for BasicLoop {
             let model_result = ctx.model.complete(request, &mut forwarder).await;
             let response = match model_result {
                 Ok(response) => response,
+                // 中止**不是故障** ⇒ 不发 `RunFailed`，以 `Cancelled` 收场。
+                Err(ys_model::ModelError::Cancelled { partial }) => {
+                    // 先追加部分输出、再收场：顺序不可颠倒 ——
+                    // 否则消费端可能已认为回合结束 ⇒ 部分输出丢失。
+                    let final_message = partial.clone();
+                    if let Some(partial) = partial {
+                        ctx.session
+                            .append(partial)
+                            .await
+                            .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                    }
+                    emit(
+                        ctx.events,
+                        AgentEvent::RunFinished {
+                            stop_reason: StopReason::Cancelled,
+                            usage: total_usage.clone(),
+                            rounds,
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                    return Ok(RunResult {
+                        stop_reason: StopReason::Cancelled,
+                        usage: total_usage,
+                        rounds,
+                        final_message,
+                    });
+                }
                 Err(e) => {
                     // 返回错误前发出 RunFailed（终止事件不变量）
                     // （同步闭包内无法 await，故把 emit 提到闭包外）
@@ -658,6 +684,17 @@ impl AgentLoop for BasicLoop {
                 // `buffer_unordered` 而非 `spawn`：`Tool::call` 的 future 借了
                 // `&dyn Tool` 与 `ToolContext<'_>`（非 `'static`）；该组合子在单任务内
                 // 并发，完成一个就交出一个，结果在这里按完成顺序立即发出。
+                // 边界源借自**本地副本**而非 `ctx`：`ctx.boundary.as_deref()` 会
+                // 不可变借用 `ctx`，而下方 `let events = &mut *ctx.events;` 要可变借用
+                // 同一结构体 ⇒ 两者直接共存会冲突。先 clone `Arc` 到本地，
+                // 借用只落在本地变量上，`ctx` 得以解放。
+                //
+                // 声明顺序吃紧：`futs` 持有 `tool_ctx`（其中借了 `boundary_ref`）
+                // ⇒ `boundary_arc` 必须**先于** `futs` 声明，否则它先于 `futs` 被 drop
+                // ⇒ 借用指向已析构的值。
+                let boundary_arc = ctx.boundary.clone();
+                let boundary_ref: Option<&dyn ys_protocol::BoundarySource> =
+                    boundary_arc.as_deref();
                 let mut futs = Vec::with_capacity(pending.len());
                 for &i in &pending {
                     let (_, tool_name, tool_args) = &tool_calls[i];
@@ -667,7 +704,7 @@ impl AgentLoop for BasicLoop {
                     // 预算**按工具**算（工具声明值优先 → `limits.bash_timeout` → 300s）
                     // ⇒ 并行批里每个工具拿到**各自**的预算。
                     let mut tool_ctx =
-                        ToolContext::new(ctx.boundary, ctx.cwd.clone(), ctx.workspace_root.clone())
+                        ToolContext::new(boundary_ref, ctx.cwd.clone(), ctx.workspace_root.clone())
                             .with_summarizer(&summarizer)
                             .with_tool_budget(budget);
                     if let Some(runner) = ctx.subagent {
@@ -700,8 +737,23 @@ impl AgentLoop for BasicLoop {
             } else {
                 // 串行路径：**逐个** emit ToolCall → 执行 → emit ToolResult（保持既有
                 // 交错形状 `C1,R1,C2,R2`，既有批次的行为逐字节不变）。
+                // 边界源借自**本地副本**而非 `ctx`（同并行路径的理由：`ctx.events`
+                // 需要可变借用 `ctx`）。
+                let boundary_arc = ctx.boundary.clone();
+                let boundary_ref: Option<&dyn ys_protocol::BoundarySource> =
+                    boundary_arc.as_deref();
                 for &i in &pending {
                     let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
+                    // 工具**之间**的 abort 探针（不轮询）：已中止 ⇒ 不再发起下一个工具。
+                    // 探针放在 emit `ToolCall` **之前** ⇒ 被中止的那次调用连事件都不发，
+                    // 消费端不会看到一个「叫了但没执行」的工具调用。
+                    if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
+                        outcomes[i] = Some(CoreToolResult {
+                            content: "tool not executed: turn cancelled".to_string(),
+                            is_error: true,
+                        });
+                        continue;
+                    }
                     emit(
                         ctx.events,
                         AgentEvent::ToolCall {
@@ -721,7 +773,7 @@ impl AgentLoop for BasicLoop {
                             // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依
                             // （与并行路径同款：预算按工具算）。
                             let mut tool_ctx = ToolContext::new(
-                                ctx.boundary,
+                                boundary_ref,
                                 ctx.cwd.clone(),
                                 ctx.workspace_root.clone(),
                             )
@@ -1145,9 +1197,8 @@ mod tests {
         }
 
         let evts = events.events();
-        let position = |pred: &dyn Fn(&AgentEvent) -> bool| {
-            evts.iter().position(pred).expect("事件应存在")
-        };
+        let position =
+            |pred: &dyn Fn(&AgentEvent) -> bool| evts.iter().position(pred).expect("事件应存在");
         let started_1 = position(&|e| matches!(e, AgentEvent::RoundStarted { round: 1 }));
         let usage_1 = position(&|e| {
             matches!(
@@ -2402,7 +2453,7 @@ mod tests {
                 &mut events,
                 RunLimits::new(3),
             )
-            .with_boundary(&boundary);
+            .with_boundary(std::sync::Arc::new(boundary));
             BasicLoop
                 .run_turn(AgentInput::text("go"), &mut ctx)
                 .await

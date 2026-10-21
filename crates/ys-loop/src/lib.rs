@@ -254,7 +254,7 @@ mod tests {
 
         let result = {
             let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
-                .with_boundary(boundary.as_ref());
+                .with_boundary(boundary.clone());
             BasicLoop
                 .run_turn(AgentInput::text("go"), &mut ctx)
                 .await
@@ -284,8 +284,8 @@ mod tests {
         let registry = ToolRegistry::build(vec![]).unwrap();
         let limits = RunLimits::new(5);
 
-        let mut ctx =
-            make_ctx(&model, &registry, &mut session, &mut events, limits).with_boundary(&boundary);
+        let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
+            .with_boundary(Arc::new(boundary));
         let input = AgentInput::text("go");
         let loop_impl = BasicLoop;
         let result = loop_impl.run_turn(input, &mut ctx).await.unwrap();
@@ -405,7 +405,7 @@ mod tests {
         })])
         .unwrap();
         let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
-            .with_boundary(boundary.as_ref());
+            .with_boundary(boundary.clone());
         let input = AgentInput::text("go");
         let loop_impl = BasicLoop;
         let result = loop_impl.run_turn(input, &mut ctx).await.unwrap();
@@ -567,7 +567,7 @@ mod tests {
 
         let result = {
             let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
-                .with_boundary(boundary.as_ref());
+                .with_boundary(boundary.clone());
             BasicLoop
                 .run_turn(AgentInput::text("go"), &mut ctx)
                 .await
@@ -764,6 +764,16 @@ mod tests {
         }
     }
 
+    /// 只报结构，不报内容：队列里的 steer 消息正文不得进日志。
+    impl std::fmt::Debug for DecoupledBoundarySource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("DecoupledBoundarySource")
+                .field("aborted", &self.aborted.load(Ordering::SeqCst))
+                .field("queued", &self.queue.lock().unwrap().len())
+                .finish()
+        }
+    }
+
     /// 模型的每次 `complete` 都往边界源注入 `Abort`，并返回一个 tool_call
     /// （迫使循环回到轮边界）。
     struct AbortInjectingModel {
@@ -843,8 +853,8 @@ mod tests {
         let registry = ToolRegistry::build(vec![]).unwrap();
         let limits = RunLimits::new(5);
 
-        let mut ctx =
-            make_ctx(&model, &registry, &mut session, &mut events, limits).with_boundary(&boundary);
+        let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
+            .with_boundary(Arc::new(boundary));
         let result = BasicLoop
             .run_turn(AgentInput::text("go"), &mut ctx)
             .await
@@ -925,7 +935,7 @@ mod tests {
         let limits = RunLimits::new(5);
 
         let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
-            .with_boundary(boundary.as_ref());
+            .with_boundary(boundary.clone());
         let result = BasicLoop
             .run_turn(AgentInput::text("go"), &mut ctx)
             .await
@@ -971,8 +981,8 @@ mod tests {
         let registry = ToolRegistry::build(vec![]).unwrap();
         let limits = RunLimits::new(5);
 
-        let mut ctx =
-            make_ctx(&model, &registry, &mut session, &mut events, limits).with_boundary(&boundary);
+        let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits)
+            .with_boundary(Arc::new(boundary));
         let result = BasicLoop
             .run_turn(AgentInput::text("go"), &mut ctx)
             .await

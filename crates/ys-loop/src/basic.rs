@@ -11,7 +11,7 @@ use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolRes
 use ys_event::{AgentEvent, RoundPurpose, emit};
 use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
-use ys_tool::{Tool, ToolContext, ToolError};
+use ys_tool::{Tool, ToolContext, ToolError, ToolRegistry};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
@@ -47,6 +47,57 @@ const TRUNCATED_CONTINUE_PROMPT: &str = "Your previous response was cut off by t
 fn tool_budget(tool: &dyn Tool, limits: &ys_component::RunLimits) -> Duration {
     tool.timeout()
         .unwrap_or_else(|| Duration::from_secs(limits.bash_timeout.unwrap_or(300)))
+}
+
+/// Step 9b 的调度单元。
+///
+/// - `Parallel` = 一段**连续**的并发安全工具（段内 `buffered(n)` 并发、**保序**）；
+/// - `Serial` = 单个非安全工具，是**串行屏障** —— 它左右两段不得与它重叠。
+///
+/// **事件形状**（设计 §3.1）：`[read, read, bash]` ⇒ `C1,C2,R1,R2,C3,R3`。
+/// 于是两条退化路径逐字节不变：全安全批 = 单个 `Parallel` 段（`C…C R…R`）；
+/// 全不安全批 = N 个 `Serial` 段（`C1,R1,C2,R2,…`）。
+#[derive(Debug, PartialEq)]
+enum Segment {
+    Parallel(Vec<usize>),
+    Serial(usize),
+}
+
+/// 把待执行的工具按下标切成「连续只读段 + 串行屏障」。
+///
+/// **边界定义在 `pending` 上，不是 `tool_calls`**：被审批拒绝的工具不进 `pending`
+/// （它一个字节都没执行）⇒ 不是屏障，也不得把两段只读切碎。
+///
+/// **registry 未命中归「非安全」**（沿用既有 `is_some_and` 语义）⇒ 自成 `Serial` 段，
+/// 由该分支给「tool not found」兜底。**不可**把「未命中」当成「不存在所以跨过」——
+/// 否则 `[read, 错名, read]` 会并发，而错名工具仍需一条错误结果。
+fn split_segments(
+    pending: &[usize],
+    tool_calls: &[(ys_core::ToolCallId, String, serde_json::Value)],
+    registry: &ToolRegistry,
+) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+
+    let flush = |run: &mut Vec<usize>, segments: &mut Vec<Segment>| {
+        if !run.is_empty() {
+            segments.push(Segment::Parallel(std::mem::take(run)));
+        }
+    };
+
+    for &i in pending {
+        let safe = registry
+            .get(&tool_calls[i].1)
+            .is_some_and(|t| t.is_concurrency_safe());
+        if safe {
+            run.push(i);
+        } else {
+            flush(&mut run, &mut segments);
+            segments.push(Segment::Serial(i));
+        }
+    }
+    flush(&mut run, &mut segments);
+    segments
 }
 
 /// 执行一次工具调用，并把一切错误形态映射成 `ToolResult`（ADR-0001 错误结果通道）。
@@ -632,13 +683,20 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 9：执行工具调用。**默认串行**；仅当「批次 > 1 **且每一个**工具都声明
-            // `is_concurrency_safe()`」时才走并行 —— 默认 `false` 使既有批次的行为
-            // 逐字节不变（唯一的既有语义变更被默认值完全闸住）。
+            // Step 9：执行工具调用。
+            //
+            // **按「连续只读段」调度**（C5 / `explore-speed` 设计 §4）：把待执行工具切成
+            // `Segment::Parallel`（段内并发、保序）与 `Segment::Serial`（单工具，串行屏障）。
+            // 旧的准入是**全批** all-or-nothing —— 批里只要有一个非安全工具就整批退化串行，
+            // 而 `bash` 占全部工具调用的大头 ⇒ 绝大多数混合批次拿不到任何并行。
+            //
+            // 三条退化路径**逐字节不变**：全安全批 = 单个 `Parallel` 段（`C…C R…R`）；
+            // 全不安全批 = N 个 `Serial` 段（`C1,R1,C2,R2,…`）；单元素同理。
             //
             // 三段式（`ctx.events: &mut dyn EventSink` 不能跨并发任务共享）：
-            //   9a 串行：审批 + emit `ToolCall`（保原顺序）
-            //   9b 执行：all-safe ⇒ `buffer_unordered(n)`（完成即发）；否则原串行
+            //   9a 串行：审批 + 收集 `pending`（被拒的不进 `pending`）
+            //   9b 逐段执行：`Parallel` ⇒ emit 全部 `ToolCall` → 并发执行 → 完成即发
+            //                 `Serial`  ⇒ emit `ToolCall` → 执行 → emit `ToolResult`
             //   9c 保序：连续错误计数 + 组装单条消息（ADR-0001 配对）
             let mut outcomes: Vec<Option<CoreToolResult>> = vec![None; tool_calls.len()];
             let summarizer = ModelSummarizer { model: ctx.model };
@@ -664,124 +722,52 @@ impl AgentLoop for BasicLoop {
                 pending.push(idx);
             }
 
-            // 准入条件里的「每一个」是承重的 —— 它保证混合批次（如 `subagent` + `bash`）
-            // 自动退回串行；今天除 `subagent` 外没有工具声明 `true` ⇒ 既有批次仍走串行。
-            let parallel_ok = pending.len() > 1
-                && pending.iter().all(|&i| {
-                    ctx.registry
-                        .get(&tool_calls[i].1)
-                        .is_some_and(|t| t.is_concurrency_safe())
-                });
-
-            // 9b：执行。
-            if parallel_ok {
-                // 并行路径：先保序 emit 全部 `ToolCall`（否则执行期无法再借 `ctx.events`）。
-                for &i in &pending {
-                    let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
-                    emit(
-                        ctx.events,
-                        AgentEvent::ToolCall {
-                            call: ys_core::ToolCall {
-                                id: tool_call_id.clone(),
-                                name: tool_name.clone(),
-                                arguments: tool_args.clone(),
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(LoopError::Event)?;
-                }
-                // `buffer_unordered` 而非 `spawn`：`Tool::call` 的 future 借了
-                // `&dyn Tool` 与 `ToolContext<'_>`（非 `'static`）；该组合子在单任务内
-                // 并发，完成一个就交出一个，结果在这里按完成顺序立即发出。
-                // 边界源借自**本地副本**而非 `ctx`：`ctx.boundary.as_deref()` 会
-                // 不可变借用 `ctx`，而下方 `let events = &mut *ctx.events;` 要可变借用
-                // 同一结构体 ⇒ 两者直接共存会冲突。先 clone `Arc` 到本地，
-                // 借用只落在本地变量上，`ctx` 得以解放。
-                //
-                // 声明顺序吃紧：`futs` 持有 `tool_ctx`（其中借了 `boundary_ref`）
-                // ⇒ `boundary_arc` 必须**先于** `futs` 声明，否则它先于 `futs` 被 drop
-                // ⇒ 借用指向已析构的值。
-                let boundary_arc = ctx.boundary.clone();
-                let boundary_ref: Option<&dyn ys_protocol::BoundarySource> =
-                    boundary_arc.as_deref();
-                let mut futs = Vec::with_capacity(pending.len());
-                for &i in &pending {
-                    let (_, tool_name, tool_args) = &tool_calls[i];
-                    let tool = ctx.registry.get(tool_name).expect("已确认命中");
-                    let budget = tool_budget(tool, &ctx.limits);
-                    // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依。
-                    // 预算**按工具**算（工具声明值优先 → `limits.bash_timeout` → 300s）
-                    // ⇒ 并行批里每个工具拿到**各自**的预算。
-                    let mut tool_ctx =
-                        ToolContext::new(boundary_ref, ctx.cwd.clone(), ctx.workspace_root.clone())
-                            .with_summarizer(&summarizer)
-                            .with_tool_budget(budget);
-                    if let Some(runner) = ctx.subagent {
-                        tool_ctx = tool_ctx.with_subagent(runner);
-                    }
-                    let name = tool_name.clone();
-                    let args = tool_args.clone();
-                    futs.push(
-                        async move { (i, call_one(tool, name, args, tool_ctx, budget).await) },
-                    );
-                }
-                let n = ctx.limits.max_parallel_tools.max(1);
-                let mut executed = futures_util::stream::iter(futs).buffer_unordered(n);
-                // future 只借 registry / boundary / subagent；events 是另一个字段，
-                // 因而可以在每个结果完成时立即 reborrow 并 await emit。
-                let events = &mut *ctx.events;
-                while let Some((i, result)) = executed.next().await {
-                    let id = tool_calls[i].0.clone();
-                    emit(
-                        events,
-                        AgentEvent::ToolResult {
-                            id,
-                            result: result.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(LoopError::Event)?;
-                    outcomes[i] = Some(result);
-                }
-            } else {
-                // 串行路径：**逐个** emit ToolCall → 执行 → emit ToolResult（保持既有
-                // 交错形状 `C1,R1,C2,R2`，既有批次的行为逐字节不变）。
-                // 边界源借自**本地副本**而非 `ctx`（同并行路径的理由：`ctx.events`
-                // 需要可变借用 `ctx`）。
-                let boundary_arc = ctx.boundary.clone();
-                let boundary_ref: Option<&dyn ys_protocol::BoundarySource> =
-                    boundary_arc.as_deref();
-                for &i in &pending {
-                    let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
-                    // 工具**之间**的 abort 探针（不轮询）：已中止 ⇒ 不再发起下一个工具。
-                    // 探针放在 emit `ToolCall` **之前** ⇒ 被中止的那次调用连事件都不发，
-                    // 消费端不会看到一个「叫了但没执行」的工具调用。
-                    if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
-                        outcomes[i] = Some(CoreToolResult {
-                            content: "tool not executed: turn cancelled".to_string(),
-                            is_error: true,
-                        });
-                        continue;
-                    }
-                    emit(
-                        ctx.events,
-                        AgentEvent::ToolCall {
-                            call: ys_core::ToolCall {
-                                id: tool_call_id.clone(),
-                                name: tool_name.clone(),
-                                arguments: tool_args.clone(),
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(LoopError::Event)?;
-
-                    let result = match ctx.registry.get(tool_name) {
-                        Some(tool) => {
+            // 9b：**逐段**执行。准入从「全批 all-safe」改为「连续只读段并发 + 非安全工具
+            // 作串行屏障」（C5）。
+            let segments = split_segments(&pending, &tool_calls, ctx.registry);
+            for segment in segments {
+                match segment {
+                    Segment::Parallel(indices) => {
+                        // 并行段：先**保序** emit 全部 `ToolCall`（否则执行期无法再借
+                        // `ctx.events`）—— 形状 `C1..Cn`，与旧并行路径逐字节相同。
+                        for &i in &indices {
+                            let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
+                            emit(
+                                ctx.events,
+                                AgentEvent::ToolCall {
+                                    call: ys_core::ToolCall {
+                                        id: tool_call_id.clone(),
+                                        name: tool_name.clone(),
+                                        arguments: tool_args.clone(),
+                                    },
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
+                        }
+                        // `buffer_unordered` 而非 `spawn`：`Tool::call` 的 future 借了
+                        // `&dyn Tool` 与 `ToolContext<'_>`（非 `'static`）；该组合子在单任务内
+                        // 并发，完成一个就交出一个，结果在这里按完成顺序立即发出。
+                        //
+                        // 边界源借自**本地副本**而非 `ctx`：`ctx.boundary.as_deref()` 会
+                        // 不可变借用 `ctx`，而下方 `let events = &mut *ctx.events;` 要可变借用
+                        // 同一结构体 ⇒ 两者直接共存会冲突。先 clone `Arc` 到本地，
+                        // 借用只落在本地变量上，`ctx` 得以解放。
+                        //
+                        // 声明顺序吃紧：`futs` 持有 `tool_ctx`（其中借了 `boundary_ref`）
+                        // ⇒ `boundary_arc` 必须**先于** `futs` 声明，否则它先于 `futs` 被 drop
+                        // ⇒ 借用指向已析构的值。
+                        let boundary_arc = ctx.boundary.clone();
+                        let boundary_ref: Option<&dyn ys_protocol::BoundarySource> =
+                            boundary_arc.as_deref();
+                        let mut futs = Vec::with_capacity(indices.len());
+                        for &i in &indices {
+                            let (_, tool_name, tool_args) = &tool_calls[i];
+                            let tool = ctx.registry.get(tool_name).expect("已确认命中");
                             let budget = tool_budget(tool, &ctx.limits);
-                            // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依
-                            // （与并行路径同款：预算按工具算）。
+                            // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依。
+                            // 预算**按工具**算（工具声明值优先 → `limits.bash_timeout` → 300s）
+                            // ⇒ 并行批里每个工具拿到**各自**的预算。
                             let mut tool_ctx = ToolContext::new(
                                 boundary_ref,
                                 ctx.cwd.clone(),
@@ -792,25 +778,104 @@ impl AgentLoop for BasicLoop {
                             if let Some(runner) = ctx.subagent {
                                 tool_ctx = tool_ctx.with_subagent(runner);
                             }
-                            call_one(tool, tool_name.clone(), tool_args.clone(), tool_ctx, budget)
-                                .await
+                            let name = tool_name.clone();
+                            let args = tool_args.clone();
+                            futs.push(async move {
+                                (i, call_one(tool, name, args, tool_ctx, budget).await)
+                            });
                         }
-                        None => CoreToolResult {
-                            content: format!("tool not found: {tool_name}"),
-                            is_error: true,
-                        },
-                    };
+                        // **全批算一次**上限（与旧并行路径同一语义）；
+                        // 段的有效并发 = `min(n, 段长)`。
+                        let n = ctx.limits.max_parallel_tools.max(1);
+                        let mut executed = futures_util::stream::iter(futs).buffer_unordered(n);
+                        // future 只借 registry / boundary / subagent；events 是另一个字段，
+                        // 因而可以在每个结果完成时立即 reborrow 并 await emit。
+                        let events = &mut *ctx.events;
+                        while let Some((i, result)) = executed.next().await {
+                            let id = tool_calls[i].0.clone();
+                            emit(
+                                events,
+                                AgentEvent::ToolResult {
+                                    id,
+                                    result: result.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
+                            outcomes[i] = Some(result);
+                        }
+                    }
+                    Segment::Serial(i) => {
+                        // 串行屏障：**逐个** emit ToolCall → 执行 → emit ToolResult
+                        // （保持既有交错形状 `C1,R1`，旧串行路径逐字节不变）。
+                        let boundary_arc = ctx.boundary.clone();
+                        let boundary_ref: Option<&dyn ys_protocol::BoundarySource> =
+                            boundary_arc.as_deref();
+                        let (tool_call_id, tool_name, tool_args) = &tool_calls[i];
+                        // abort 探针（不轮询）：已中止 ⇒ 不再发起这个工具。
+                        // 探针放在 emit `ToolCall` **之前** ⇒ 被中止的那次调用连事件都不发，
+                        // 消费端不会看到一个「叫了但没执行」的工具调用。
+                        if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
+                            outcomes[i] = Some(CoreToolResult {
+                                content: "tool not executed: turn cancelled".to_string(),
+                                is_error: true,
+                            });
+                            continue;
+                        }
+                        emit(
+                            ctx.events,
+                            AgentEvent::ToolCall {
+                                call: ys_core::ToolCall {
+                                    id: tool_call_id.clone(),
+                                    name: tool_name.clone(),
+                                    arguments: tool_args.clone(),
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(LoopError::Event)?;
 
-                    emit(
-                        ctx.events,
-                        AgentEvent::ToolResult {
-                            id: tool_call_id.clone(),
-                            result: result.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(LoopError::Event)?;
-                    outcomes[i] = Some(result);
+                        let result = match ctx.registry.get(tool_name) {
+                            Some(tool) => {
+                                let budget = tool_budget(tool, &ctx.limits);
+                                // 外层预算挂进 `ToolContext` ⇒ 工具内**始终**有 deadline 可依
+                                // （与并行路径同款：预算按工具算）。
+                                let mut tool_ctx = ToolContext::new(
+                                    boundary_ref,
+                                    ctx.cwd.clone(),
+                                    ctx.workspace_root.clone(),
+                                )
+                                .with_summarizer(&summarizer)
+                                .with_tool_budget(budget);
+                                if let Some(runner) = ctx.subagent {
+                                    tool_ctx = tool_ctx.with_subagent(runner);
+                                }
+                                call_one(
+                                    tool,
+                                    tool_name.clone(),
+                                    tool_args.clone(),
+                                    tool_ctx,
+                                    budget,
+                                )
+                                .await
+                            }
+                            None => CoreToolResult {
+                                content: format!("tool not found: {tool_name}"),
+                                is_error: true,
+                            },
+                        };
+
+                        emit(
+                            ctx.events,
+                            AgentEvent::ToolResult {
+                                id: tool_call_id.clone(),
+                                result: result.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(LoopError::Event)?;
+                        outcomes[i] = Some(result);
+                    }
                 }
             }
 
@@ -2049,11 +2114,15 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 2, "两个 safe 工具应真的并发");
     }
 
-    /// §4.4-3：**混合批次**（一个 safe 一个 unsafe）⇒ 退回串行。
+    /// **[safe, unsafe]**：非安全工具是**串行屏障**，两侧不重叠。
     ///
-    /// 变异自检：把准入条件从「每一个都 safe」写成「至少一个 safe」⇒ 本用例变红。
+    /// C5 之后形状仍是 `C1,R1,C2,R2` —— 但成因变了：`a` 自成**单元素并行段**
+    /// （`Parallel([0])` ⇒ `C,R` 相邻），`b` 是 `Serial(1)`。
+    /// 这与旧「整批退化串行」的输出一致，故本用例保留为**回归钩子**。
+    ///
+    /// 变异自检：把 `Segment::Parallel` 的 emit 顺序改成「先全部 R 再 C」⇒ 变红。
     #[tokio::test]
-    async fn mixed_batch_falls_back_to_serial() {
+    async fn mixed_batch_keeps_barrier_and_no_overlap() {
         let (registry, _, peak) = conc_tool_registry(&[("a", true, 60), ("b", false, 60)]);
         let model = MultiToolModel::new(&[("1", "a"), ("2", "b")]);
         let (order, _) = run_batch(&registry, &model, 4).await;
@@ -2065,7 +2134,96 @@ mod tests {
                 ("C", "2".into()),
                 ("R", "2".into())
             ],
-            "混合批次必须退回串行"
+            "屏障两侧不得重叠：单元素段 = C,R 相邻"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// **C5 的核心收益**：`[safe, safe, unsafe]` ⇒ 前两个**真的并发**。
+    ///
+    /// 旧准入是**全批** all-or-nothing ⇒ 批里有一个非安全工具就整批串行。
+    /// 现在切成 `Parallel([0,1]) + Serial(2)` ⇒ 形状 `C1,C2,R1,R2,C3,R3`，峰值并发 2。
+    ///
+    /// 变异：把 `split_segments` 改成「整批全 safe 才给并行段」（旧逻辑）⇒
+    /// 形状变成 `C1,R1,C2,R2,C3,R3` 且峰值 1 ⇒ 两条断言都变红。
+    #[tokio::test]
+    async fn leading_safe_run_is_parallel_before_the_barrier() {
+        let (registry, _, peak) =
+            conc_tool_registry(&[("a", true, 200), ("b", true, 200), ("c", false, 200)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b"), ("3", "c")]);
+        let (order, _) = run_batch(&registry, &model, 4).await;
+
+        assert_eq!(
+            order,
+            vec![
+                ("C", "1".into()),
+                ("C", "2".into()),
+                ("R", "1".into()),
+                ("R", "2".into()),
+                ("C", "3".into()),
+                ("R", "3".into())
+            ],
+            "前两个连着发、结果紧随其后；屏障单独一段：{order:?}"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "两个 safe 工具必须真的并发（旧实现会整批串行 ⇒ 峰值 1）"
+        );
+    }
+
+    /// **registry 未命中 ⇒ 归「非安全」**（设计 §4.1-2），自成 `Serial` 段。
+    ///
+    /// 两条理由：
+    ///  1. `[read, 错名, read]` **不得**并发 —— 错名工具仍需一条 `tool not found` 结果；
+    ///  2. 防 panic：并行段里对已确认命中的工具用 `.expect("已确认命中")`，
+    ///     若把未命中当安全，它会被放进并行段 ⇒ **直接 panic**。
+    ///
+    /// 变异：把 `.unwrap_or_default()` 判成「未命中 ⇒ safe」⇒ 本用例 panic/变红。
+    #[tokio::test]
+    async fn unknown_tool_in_batch_is_a_barrier_not_parallel() {
+        // registry 只有 `a` / `c`；模型却调了不存在的 `nope` 夹在中间。
+        let (registry, _, peak) = conc_tool_registry(&[("a", true, 60), ("c", true, 60)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "nope"), ("3", "c")]);
+        let (order, _) = run_batch(&registry, &model, 4).await;
+
+        assert_eq!(
+            order,
+            vec![
+                ("C", "1".into()),
+                ("R", "1".into()),
+                ("C", "2".into()),
+                ("R", "2".into()),
+                ("C", "3".into()),
+                ("R", "3".into())
+            ],
+            "未命中工具必须是串行屏障：{order:?}"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "屏障两侧不得并发");
+    }
+
+    /// **[safe, unsafe, safe]** ⇒ 两段各一个元素 ⇒ 完全不并行（屏障把只读切碎）。
+    ///
+    /// 这是设计的**已知代价**（§3.2：`[read, bash, read]` 新旧事件流完全相同）。
+    /// 钉住它，防止有人为了「提高并行度」把屏障跨过去（那会让写操作与读操作重叠）。
+    #[tokio::test]
+    async fn safe_runs_separated_by_barrier_do_not_parallelize() {
+        let (registry, _, peak) =
+            conc_tool_registry(&[("a", true, 60), ("b", false, 60), ("c", true, 60)]);
+        let model = MultiToolModel::new(&[("1", "a"), ("2", "b"), ("3", "c")]);
+        let (order, _) = run_batch(&registry, &model, 4).await;
+
+        assert_eq!(
+            order,
+            vec![
+                ("C", "1".into()),
+                ("R", "1".into()),
+                ("C", "2".into()),
+                ("R", "2".into()),
+                ("C", "3".into()),
+                ("R", "3".into())
+            ],
+            "屏障两侧的两段各只有一个元素 ⇒ 不并发"
         );
         assert_eq!(peak.load(Ordering::SeqCst), 1);
     }

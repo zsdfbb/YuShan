@@ -12,6 +12,15 @@ use ys_core::Message;
 pub enum Boundary {
     /// 掌舵：运行期间的注入，追加进会话后进入本轮 `ModelRequest`。
     Steer(Message),
+    /// **后台子 agent 的结果**：与 [`Self::Steer`] 走**同一条**处理路径
+    /// （append 进会话 + 进本轮 `ModelRequest`），只区别于**来源**。
+    ///
+    /// 携带句柄是为了让消费端（`BasicLoop` → `AgentEvent::DeferredResult` → UI）
+    /// 能标明「这条是哪个后台任务的结果」，而 `Steer` 没有这个需要。
+    ///
+    /// **为什么不做成 `Steer` 的复用**：`Steer` 会被渲染成**用户行**；异步结果是
+    /// 系统产物，混在一起会让用户看到自己没说过的话被画成自己的发言。
+    Deferred { handle: String, message: Message },
     /// 中止：当前 turn 以 `StopReason::Cancelled` 收场。
     Abort,
 }

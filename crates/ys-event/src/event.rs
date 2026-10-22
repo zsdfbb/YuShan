@@ -22,6 +22,21 @@ pub enum AgentEvent {
     UserMessage {
         message: Message,
     },
+    /// **后台子 agent 的结果**注入到会话时发出。
+    ///
+    /// 与 [`Self::UserMessage`] **同类但不同源**：两者都往会话里追加一条消息、都会进入
+    /// 下一轮的 `ModelRequest`，差别只在**谁产生的** ——
+    /// `UserMessage` 是用户敲的（或 `Steer` 插话），本事件是**系统**注入的异步结果。
+    ///
+    /// **为什么必须分开**：UI 把 `UserMessage` 渲染成**用户行**。若异步结果复用它，
+    /// 用户会看到自己从没说过的话被画成自己的发言。分开之后 UI 才能用不同的行样式。
+    ///
+    /// **非终局**：不影响 `-p` / `--json` 消费循环的退出条件。
+    DeferredResult {
+        /// 产生这条结果的后台派发句柄（`sa1` / `sa2` …）——供 UI 标明来源。
+        handle: String,
+        message: Message,
+    },
     /// 一轮开始：每轮**模型调用之前**发出一次。
     ///
     /// **非终局**：终局事件仍只有 `RunFinished` / `RunFailed`，本事件不影响

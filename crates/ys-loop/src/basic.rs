@@ -375,6 +375,18 @@ impl AgentLoop for BasicLoop {
                                 .await
                                 .map_err(LoopError::Event)?;
                         }
+                        // 后台子 agent 的结果：与 `Steer` **同一条处理路径**（append + 进本轮
+                        // `ModelRequest`），只换成 `DeferredResult` 事件 ⇒ UI 才不会把它
+                        // 画成「用户说的话」。
+                        Boundary::Deferred { handle, message } => {
+                            ctx.session
+                                .append(message.clone())
+                                .await
+                                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                            emit(ctx.events, AgentEvent::DeferredResult { handle, message })
+                                .await
+                                .map_err(LoopError::Event)?;
+                        }
                         Boundary::Abort => {
                             emit(
                                 ctx.events,

@@ -964,6 +964,80 @@ mod tests {
         assert_eq!(terminal_count, 1, "exactly one terminal event");
     }
 
+    /// **第 1–2 步的核心**：`Boundary::Deferred` 走与 `Steer` **同一条**处理路径
+    /// （append 进会话 + 进下一轮 `ModelRequest`），但发出的是 `DeferredResult` 事件。
+    ///
+    /// 承重的是**事件类型必须分开**：UI 把 `UserMessage` 渲染成用户行 —— 异步结果若复用它，
+    /// 用户会看到自己从没说过的话被画成自己的发言。
+    ///
+    /// 变异：① 把 `Deferred` 分支的 `DeferredResult` 改成 `UserMessage` ⇒ 第 3 断言变红；
+    ///       ② 删掉 `session.append` ⇒ 第 2 断言变红。
+    #[tokio::test]
+    async fn deferred_result_is_appended_and_emitted_as_its_own_event() {
+        let model = MockModel::new("m");
+        model.push_tool_call("echo", serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let boundary = DecoupledBoundarySource::new();
+        boundary.push(Boundary::Deferred {
+            handle: "sa1".into(),
+            message: Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "DEFERRED-BODY".into(),
+                }],
+            },
+        });
+        let registry = ToolRegistry::build(vec![Box::new(EchoTool)]).unwrap();
+        let mut ctx = make_ctx(
+            &model,
+            &registry,
+            &mut session,
+            &mut events,
+            RunLimits::new(5),
+        )
+        .with_boundary(Arc::new(boundary));
+        let result = BasicLoop
+            .run_turn(AgentInput::text("go"), &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.stop_reason, StopReason::Completed);
+
+        // 1) 正文进了会话（下一轮 `ModelRequest` 能看到）。
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|m| content_has_text(m, "DEFERRED-BODY")),
+            "Deferred 的内容必须 append 进会话"
+        );
+
+        // 2) 事件是 `DeferredResult` 且**带句柄** —— 且**没有** `UserMessage` 混进来。
+        let deferred: Vec<&AgentEvent> = events
+            .events()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::DeferredResult { .. }))
+            .collect();
+        assert_eq!(deferred.len(), 1, "应恰好一条 DeferredResult");
+        match deferred[0] {
+            AgentEvent::DeferredResult { handle, message } => {
+                assert_eq!(handle, "sa1", "必须带上产出它的句柄（UI 要标明来源）");
+                assert!(content_has_text(message, "DEFERRED-BODY"));
+            }
+            _ => unreachable!(),
+        }
+        // 注意：回合的**初始输入**本身也会发一条 `UserMessage`（Step 2）⇒ 不能断言
+        // 「一条都没有」，只能断言「**Deferred 的正文**没有借 `UserMessage` 出现」。
+        assert!(
+            !events.events().iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessage { message } if content_has_text(message, "DEFERRED-BODY")
+            )),
+            "Deferred **不得**伪装成 UserMessage（那会被 UI 画成用户自己说的话）"
+        );
+    }
+
     // Task 3-3：Abort 抵达前已排队的 Steer 仍先被消费（保序），随后才中止
     #[tokio::test]
     async fn test_steer_before_abort_is_consumed_in_order() {

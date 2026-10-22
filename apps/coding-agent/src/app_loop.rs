@@ -777,6 +777,10 @@ pub async fn run(
 /// - `Steer` 等与命令无关的边界消息直接丢弃：命令不是回合，没有轮边界可以装它；
 ///   命令结束后下一回合的起点也会把它排空（`run_turn_once` 头部的排空），
 ///   故丢弃不改变任何已有语义；
+/// - `Deferred`（后台子 agent 结果）**同样丢弃**，且断言它不会到这里：
+///   后台任务随**回合**存活（runner 是回合块内的局部量），而本函数只在**命令**处理
+///   期间被等待 —— 两者不重叠。若真到达，说明生命周期契约被破坏，本处丢弃**不静默**：
+///   见下面的 `debug_assert`；
 /// - 边界信道关闭（UI 没了）—— 不再有取消入口，交 future 自己收场。
 async fn cancel_on_abort<F: std::future::Future>(
     fut: F,
@@ -788,7 +792,16 @@ async fn cancel_on_abort<F: std::future::Future>(
             out = &mut fut => return Some(out),
             msg = boundary_rx.recv() => match msg {
                 Some(Boundary::Abort) => return None,
-                Some(_) => continue,
+                Some(Boundary::Deferred { .. }) => {
+                    // 不该到这里（后台任务只活在回合内，本函数只在命令期间等待）。
+                    // **不静默**：debug 构建下直接暴露生命周期契约被破坏。
+                    debug_assert!(
+                        false,
+                        "Deferred 在命令期间到达 = 后台任务的存活期跨过了回合边界"
+                    );
+                    continue;
+                }
+                Some(Boundary::Steer(_)) => continue,
                 None => return Some(fut.await),
             },
         }
@@ -1060,6 +1073,9 @@ async fn run_turn_once(
     // 丢掉 = 静默吞掉用户消息。保留下来泵进本回合的边界源，它会在本回合第一个
     // 轮边界被取走并 append 进会话 ⇒ 语义从「插话」自然退化为「下一回合的早到输入」，
     // 但**内容一个字不丢**。
+    //
+    // `Deferred`（后台子 agent 的结果）同理保留：那是**子 agent 已经跑完产出的内容**，
+    // 丢掉等于白烧一次派发。
     let mut carry_over: Vec<Boundary> = Vec::new();
     while let Ok(b) = ctx.boundary_rx.try_recv() {
         if !matches!(b, Boundary::Abort) {

@@ -113,7 +113,10 @@ impl Tool for ReadTool {
             .map(|(i, line)| format!("{:>6}\t{line}", start + i + 1))
             .collect();
 
-        let truncated = ys_tool::head_lines(&formatted, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
+        // C7：`read` 用**更窄**的结果预算（默认 8 KiB，可经
+        // `YUSHAN_RESULT_BUDGET_BYTES` 覆盖）—— 见 `ys_tool::read_result_budget`。
+        let budget = ys_tool::read_result_budget();
+        let truncated = ys_tool::head_lines(&formatted, ys_tool::MAX_LINES, budget);
 
         // 软阈值（**仅未硬截断时**）：整段结果偏大就提示模型「用 offset/limit 读更窄的区间」。
         // 与下方「Showing lines …」互斥 —— 后者只在被截断时出现，故不会出现两个方括号块。
@@ -162,7 +165,7 @@ impl ReadTool {
         limit: Option<usize>,
     ) -> Result<ToolResult, ToolError> {
         let mut out = String::new();
-        let mut budget = ys_tool::MAX_BYTES;
+        let mut budget = ys_tool::read_result_budget();
         let mut any_ok = false;
 
         for t in targets {
@@ -188,7 +191,7 @@ impl ReadTool {
                         out.push_str(&format!(
                             "\n[truncated at {} bytes across the batch — read this file \
                              separately with offset/limit for more]\n",
-                            ys_tool::MAX_BYTES
+                            ys_tool::read_result_budget()
                         ));
                     }
                     out.push('\n');
@@ -613,13 +616,57 @@ mod tests {
     /// 变异：去掉 `else if rendered_bytes >= ys_tool::SOFT_RESULT_BYTES` 分支 → 本用例变红。
     /// 变异：把该分支写在 `if shown_end < total_lines` 之前（恒附）→ 「未截断时不得出现续读通知」
     /// 与本用例的 `contains("result is large")` 组合会暴露两个块并存的形态。
+    /// **C7**：`read` 的硬闸门是 **8 KiB**（比 `bash` 的 50 KiB 窄），
+    /// 且截断后**必须**给出可续读的 offset 通知。
+    ///
+    /// 依据：实测 `read` 占全部工具结果字节 40.8%，是最大单一贡献者；
+    /// 而它的截断**完全可恢复**（`offset` 续读），风险最低。
+    ///
+    /// 变异：把预算换回 `MAX_BYTES`（50 KiB）⇒ 30 KiB 的文件不再被截断 ⇒ 变红。
+    #[tokio::test]
+    async fn read_caps_result_at_narrower_budget_than_bash() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file = dir.join("wide.txt");
+        // 100 行 × ~307 B ≈ 30 KiB ⇒ 超 16 KiB 预算、但远小于 50 KiB。
+        tokio::fs::write(&file, format!("{}\n", "y".repeat(300)).repeat(100))
+            .await
+            .unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let result = tool
+            .call(json!({ "path": "wide.txt" }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.len() < ys_tool::MAX_BYTES,
+            "结果应远小于 50 KiB 硬闸门（说明走的是 16 KiB 预算），实际 {} B",
+            result.content.len()
+        );
+        assert!(
+            result.content.contains("Showing lines"),
+            "截断后必须给续读通知（否则模型无从继续）：{}",
+            result.content.chars().rev().take(160).collect::<String>()
+        );
+        assert!(
+            result.content.contains("Use offset="),
+            "续读通知必须带 offset：{}",
+            result.content.chars().rev().take(160).collect::<String>()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn test_read_large_range_gets_soft_size_notice() {
         let dir = test_dir();
         let _ = tokio::fs::create_dir_all(&dir).await;
         let file = dir.join("big.txt");
-        // 40 行 × ~307 B（6 位行号 + Tab + 300 字符）≈ 12 KiB ∈ [8 KiB, 50 KiB)：
-        // **未**触发硬截断，应出软提示。
+        // ⚠️ C7 之后 `read` 的硬闸门是 **16 KiB**（不是 50 KiB）⇒ 本用例必须造
+        // `[SOFT_RESULT_BYTES, 16 KiB)` 区间内的内容：否则要么测不到软提示（太小），
+        // 要么被硬截断（太大）。40 行 × ~307 B ≈ 12 KiB ∈ 区间内。
         let content = format!("{}\n", "x".repeat(300)).repeat(40);
         tokio::fs::write(&file, &content).await.unwrap();
 

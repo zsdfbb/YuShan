@@ -26,6 +26,41 @@ pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
 /// grep 单行渲染的最大字符数。
 pub const GREP_MAX_LINE_CHARS: usize = 500;
+/// `read` 的**默认**单次结果字节预算（C6/C7）。
+///
+/// **为什么 `read` 需要比 [`MAX_BYTES`] 更窄**：实测（真实会话 `1792579023_125340094`）
+/// `read` 占全部工具结果字节的 **40.8%**（118 次 / 823 KB），是最大的单一贡献者；
+/// 且它的截断**完全可恢复** —— 结果里自带
+/// `[Showing lines X-Y of Z. Use offset=N to continue.]`，模型据此续读即可。
+///
+/// 反向：`bash` **不**收窄（它同样走 [`MAX_BYTES`]）—— 实测 `bash` 结果中位仅 1,221 B，
+/// 50 KB 上限**从未被撞到**（0/560），收窄它省不到 3%；而构建日志的**尾部**恰恰
+/// 是错误所在（`bash` 用 `tail()` 保尾），截断风险高于收益。
+///
+/// **必须大于 [`SOFT_RESULT_BYTES`]**：软阈值提示只在**未**硬截断时出现
+/// （两者互斥），预算若等于软阈值，「结果偏大、建议收窄」这条提示对 `read` 就成死代码。
+///
+/// 实测影响面（16 KiB）：`read` 里约 **5%** 的调用会被截断，可省约 **13%** 的 read 字节。
+/// ⚠️ **收益未经实跑 A/B 验证** —— 截断会让模型多读几次（每次一轮模型往返），
+/// 净收益取决于「省下的输入 token」能否抵消「多出的轮数」。
+/// 可用 [`RESULT_BUDGET_ENV`] 在不重编译的前提下做 A/B。
+pub const READ_RESULT_BUDGET_BYTES: usize = 16 * 1024;
+
+/// 覆盖 [`READ_RESULT_BUDGET_BYTES`] 的环境变量名（A/B 用）。
+///
+/// 值被**钳制**在 `[512, MAX_BYTES]`：设成 0 会让每次 `read` 只回一行，
+/// 设成天文数字等于取消预算 —— 两者都不该由环境变量引入。
+pub const RESULT_BUDGET_ENV: &str = "YUSHAN_RESULT_BUDGET_BYTES";
+
+/// 取当前的 `read` 结果字节预算：环境变量覆盖（钳制后）→ 否则默认值。
+pub fn read_result_budget() -> usize {
+    std::env::var(RESULT_BUDGET_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(512, MAX_BYTES))
+        .unwrap_or(READ_RESULT_BUDGET_BYTES)
+}
+
 /// **软阈值**：单条工具结果达到此字节数即值得提醒模型「结果偏大、建议收窄」。
 ///
 /// 与 [`MAX_BYTES`]（硬闸门，超出即截断）刻意区分 —— 软阈值**不改变内容**，只影响是否附一条提示。
@@ -218,12 +253,7 @@ pub struct HeadTail {
 ///
 /// **跳过量口径**：`omitted_bytes` = 源文本中**未出现在展示内容里**的字节数 ⇒ 恒等式
 /// `omitted_bytes + head.len() + tail.len() == 源文本字节数`。
-pub fn head_tail(
-    text: &str,
-    max_lines: usize,
-    max_bytes: usize,
-    head_bytes: usize,
-) -> HeadTail {
+pub fn head_tail(text: &str, max_lines: usize, max_bytes: usize, head_bytes: usize) -> HeadTail {
     let lines: Vec<&str> = text.lines().collect();
     let total_lines = lines.len();
 
@@ -277,7 +307,9 @@ pub fn head_tail(
     let head_lines_shown = if head_is_prefix { 1 } else { head_shown };
 
     // 跳过量 = 源文本字节数 − 展示内容字节数（展示内容 = 头 + 尾，两段互不重叠）。
-    let omitted_bytes = text.len().saturating_sub(head.len() + tail_trunc.content.len());
+    let omitted_bytes = text
+        .len()
+        .saturating_sub(head.len() + tail_trunc.content.len());
 
     HeadTail {
         head,
@@ -338,6 +370,72 @@ mod tests {
     /// 生成 `n` 行、每行恰好 `width` 个 ASCII 字符，且逐行内容可辨识（便于断言起点）。
     fn lines_of(n: usize, width: usize) -> Vec<String> {
         (0..n).map(|i| format!("{i:0width$}")).collect()
+    }
+
+    /// **不变式**：`read` 的预算必须**大于**软阈值。
+    ///
+    /// 软阈值提示与硬截断**互斥**（截断时出续读提示、否则出软提示）⇒
+    /// 预算若 ≤ 软阈值，「结果偏大、建议收窄」这条对 `read` 就成**死代码**。
+    ///
+    /// 变异：把 `READ_RESULT_BUDGET_BYTES` 调到 8 KiB（= 软阈值）⇒ 变红。
+    #[test]
+    fn read_budget_exceeds_soft_threshold() {
+        // 三个操作数都是编译期常量 ⇒ 用 `const { assert!(..) }`（与上一条软阈值不变式同形），
+        // 既让约束在编译期判定，也避开 `clippy::assertions_on_constants`。
+        const {
+            assert!(
+                READ_RESULT_BUDGET_BYTES > SOFT_RESULT_BYTES,
+                "read 预算必须大于软阈值，否则软提示分支不可达"
+            );
+            assert!(
+                READ_RESULT_BUDGET_BYTES <= MAX_BYTES,
+                "read 预算不得宽于硬闸门"
+            );
+        }
+    }
+
+    /// `YUSHAN_RESULT_BUDGET_BYTES` 覆盖**必被钳制**在 `[512, MAX_BYTES]`。
+    ///
+    /// 理由：设成 `0` 会让每次 `read` 只回一行；设成天文数字等于取消预算 ——
+    /// 两者都不该由环境变量引入。
+    ///
+    /// 变异：去掉 `.clamp(512, MAX_BYTES)` ⇒ 本用例的「0」与「超大值」两段变红。
+    ///
+    /// ⚠️ 本用例改**进程级环境变量**，故整段持 [`crate::test_env`] 的锁（见 `AGENTS.md`
+    /// 「测试隔离」）；`ys-tool` 无该模块时为单测加本地互斥。
+    #[test]
+    fn read_result_budget_env_is_clamped() {
+        // 本 crate 无 `test_env` 模块 ⇒ 用一把本地静音锁把同一进程内的读环境用例串起来。
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev = std::env::var_os(RESULT_BUDGET_ENV);
+        // SAFETY: 持有上面那把锁，且本 crate 内只有本用例读写该变量。
+        unsafe {
+            std::env::set_var(RESULT_BUDGET_ENV, "0");
+        }
+        assert_eq!(read_result_budget(), 512, "0 必须钳到下限 512");
+
+        // SAFETY: 同上。
+        unsafe {
+            std::env::set_var(RESULT_BUDGET_ENV, "999999999");
+        }
+        assert_eq!(read_result_budget(), MAX_BYTES, "超大值必须钳到硬闸门");
+
+        // 非法值 ⇒ 回落默认。
+        // SAFETY: 同上。
+        unsafe {
+            std::env::set_var(RESULT_BUDGET_ENV, "abc");
+        }
+        assert_eq!(read_result_budget(), READ_RESULT_BUDGET_BYTES);
+
+        // SAFETY: 同上。
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(RESULT_BUDGET_ENV, v),
+                None => std::env::remove_var(RESULT_BUDGET_ENV),
+            }
+        }
     }
 
     /// 不变式：软阈值必须**小于**硬闸门 —— 否则「先提示、后截断」的两段语义会塌成一段。
@@ -700,14 +798,8 @@ mod tests {
 
         assert!(!t.head.is_empty(), "单行超预算也必须给出前缀");
         assert!(t.head.len() <= head_budget, "前缀不得超过头部预算");
-        assert!(
-            !t.head.contains('\u{FFFD}'),
-            "前缀不得切在多字节字符中间"
-        );
-        assert!(
-            text.starts_with(&t.head),
-            "前缀必须落在首行之内"
-        );
+        assert!(!t.head.contains('\u{FFFD}'), "前缀不得切在多字节字符中间");
+        assert!(text.starts_with(&t.head), "前缀必须落在首行之内");
         assert_eq!(t.omitted_bytes + t.head.len() + t.tail.len(), text.len());
     }
 
@@ -734,7 +826,10 @@ mod tests {
 
         // 恒等式：源文本字节 = 展示内容字节 + 跳过量。
         assert_eq!(text.len(), t.head.len() + t.omitted_bytes + t.tail.len());
-        assert_eq!(without.len(), t2.head.len() + t2.omitted_bytes + t2.tail.len());
+        assert_eq!(
+            without.len(),
+            t2.head.len() + t2.omitted_bytes + t2.tail.len()
+        );
     }
 
     #[test]

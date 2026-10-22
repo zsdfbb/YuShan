@@ -99,6 +99,7 @@ pub fn build_view(
         total_output_tokens: stats.total_output_tokens,
         turn_count: stats.turn_count,
         session_started,
+        executed: stats.executed,
         message_count: wiring.session_messages().len(),
         tools: agent.tool_names(),
         // skill 候选：**只透传三个显示字段**（`command` / `label` / `description`）。
@@ -301,6 +302,8 @@ mod tests {
             output_tokens: 2,
             ..Default::default()
         });
+        // 执行时长也要透传（**两个口径各自独立**）。
+        stats.record_elapsed(std::time::Duration::from_secs(95));
 
         let cfg = Config::from_env().unwrap();
         let mut state = StateStore::new();
@@ -327,6 +330,11 @@ mod tests {
         assert_eq!(view.turn_count, 2);
         assert_eq!(view.tools, vec!["read".to_string()]);
         assert_eq!(view.session_started, started);
+        assert_eq!(
+            view.executed,
+            std::time::Duration::from_secs(95),
+            "执行时长必须从 TurnStats 透传到快照（否则 /status 永远显示 0）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -94,6 +94,13 @@ pub struct CodingView {
     pub turn_count: u32,
     /// 会话起点（`session_duration_str` 由此派生；`/new` 后换新）。
     pub session_started: Instant,
+    /// **执行时长**累计（Σ 各回合实际占用的墙钟）。
+    ///
+    /// 与 [`Self::session_started`] 派生的**存活时长**是两个口径：二者之差 =
+    /// 用户不在时 TUI 空等输入的时长（**不是缺陷，是事实**）。
+    ///
+    /// 由 app 侧每回合累加后快照推来 —— TUI 只显示，不自己计时。
+    pub executed: std::time::Duration,
     /// 会话历史条数（含 pending）。
     pub message_count: usize,
     pub tools: Vec<String>,
@@ -129,6 +136,7 @@ impl Default for CodingView {
             total_output_tokens: 0,
             turn_count: 0,
             session_started: Instant::now(),
+            executed: std::time::Duration::ZERO,
             message_count: 0,
             tools: Vec::new(),
             skills: Vec::new(),
@@ -161,6 +169,11 @@ impl CodingView {
     /// 每次调用现算（`Instant` 无「序列化」概念，快照里的必然是起点）。
     pub fn session_duration_str(&self) -> String {
         format_duration(self.session_started.elapsed().as_secs())
+    }
+
+    /// **执行时长**的可读形式（Σ 回合实际占用）。
+    pub fn executed_duration_str(&self) -> String {
+        format_duration(self.executed.as_secs())
     }
 
     /// 状态行左侧的模型段：`None` → `(no model)`。
@@ -199,6 +212,7 @@ impl CodingView {
             total_output_tokens: 0,
             turn_count: 0,
             session_started: Instant::now(),
+            executed: std::time::Duration::ZERO,
             message_count: 0,
             tools: vec!["read".into(), "write".into()],
             // 两条 skill：`command` 与 `label` 故意不同 —— 覆盖「补全用目录名、

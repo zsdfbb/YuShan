@@ -359,8 +359,14 @@ pub async fn run(
                         &stats,
                         session_started,
                     );
-                    send_or_flush(&out_tx, Outbound::View(view), &mut debug, &stats, run_rounds)
-                        .await?;
+                    send_or_flush(
+                        &out_tx,
+                        Outbound::View(view),
+                        &mut debug,
+                        &stats,
+                        run_rounds,
+                    )
+                    .await?;
                 }
                 continue;
             }
@@ -420,6 +426,10 @@ pub async fn run(
                     Ok(outcome) => match outcome {
                         Ok(result) => {
                             ctx.stats.record(&result.usage);
+                            // **执行口径**的时长累加：与上面的 usage 同一位置 ⇒
+                            // 「token 统计」与「时长统计」覆盖同一批回合。
+                            // 失败回合也计入（模型跑过了就是占用了墙钟）⇒ 见下。
+                            ctx.stats.record_elapsed(ctx.request_started.elapsed());
                             // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
                             let model = ctx.wiring.model_id().map(str::to_string);
                             // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
@@ -440,10 +450,15 @@ pub async fn run(
                                 logging::log(&format!("failed to persist session meta: {e}"));
                             }
                         }
-                            // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
-                            // Error 行，这里不再往 transcript 重复刷一条，只落日志。
-                            // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
-                            Err(e) => logging::log(&format!("turn {} failed: {e}", ctx.turns)),
+                        // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
+                        // Error 行，这里不再往 transcript 重复刷一条，只落日志。
+                        // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
+                        // **但时长要计入**：模型跑过了就是占用了墙钟 ⇒
+                        // 执行口径必须包含失败回合，否则「跑失败的时长」凭空消失。
+                        Err(e) => {
+                            ctx.stats.record_elapsed(ctx.request_started.elapsed());
+                            logging::log(&format!("turn {} failed: {e}", ctx.turns));
+                        }
                     },
                     Err(e) => {
                         let rounds = *ctx.run_rounds;
@@ -468,10 +483,13 @@ pub async fn run(
 
             Request::SetEffort { effort } => {
                 // 设置照常保存 + 重建 model；不支持的 provider 由能力函数给出 warning。
+                let before = model_snapshot(&config);
                 lines = capabilities::set_effort(&mut config, &mut wiring, effort);
+                record_model_change(&mut debug, &debug_session_id, &before, &config, "effort");
             }
 
             Request::SetModel { model, provider } => {
+                let before = model_snapshot(&config);
                 lines = capabilities::set_model(
                     &mut config,
                     &mut wiring,
@@ -479,6 +497,7 @@ pub async fn run(
                     &model,
                     provider.as_deref(),
                 );
+                record_model_change(&mut debug, &debug_session_id, &before, &config, "model");
             }
 
             Request::Login {
@@ -505,9 +524,7 @@ pub async fn run(
                         {
                             None => {
                                 logging::log(&format!("login {base}: cancelled by user (Esc)"));
-                                lines = vec![
-                                    "Login cancelled. Nothing was changed.".to_string(),
-                                ];
+                                lines = vec!["Login cancelled. Nothing was changed.".to_string()];
                             }
                             Some(fetched) => {
                                 let catalog = match fetched {
@@ -720,7 +737,14 @@ pub async fn run(
             &stats,
             session_started,
         );
-        send_or_flush(&out_tx, Outbound::View(view), &mut debug, &stats, run_rounds).await?;
+        send_or_flush(
+            &out_tx,
+            Outbound::View(view),
+            &mut debug,
+            &stats,
+            run_rounds,
+        )
+        .await?;
     }
 }
 
@@ -881,6 +905,71 @@ fn count_round(env: &Envelope, observed: &mut u32) {
     }
 }
 
+/// O1：换模型 / 换思考档位**前**的快照。
+///
+/// 承重的是「**前后两个快照都记**」—— 只记新的那份，就看不出「换过」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelSnapshot {
+    provider: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// 读当前的 provider / model / **实际生效**的思考档位。
+///
+/// 用 [`Config::effective_reasoning_effort`]（而非 `reasoning_effort`）——
+/// 请求里发的是**生效值**（`/effort` 覆盖优先），记配置默认值会与实际请求不符。
+fn model_snapshot(config: &Config) -> ModelSnapshot {
+    ModelSnapshot {
+        provider: config.provider.clone(),
+        model: Some(config.model.clone()),
+        effort: config.effective_reasoning_effort(),
+    }
+}
+
+/// O1：换模型 / 换思考档位时写一条 `model_changed` 事件。
+///
+/// **为什么需要它**：`run_start` 是**启动快照**（`main.rs` 的一次性写入），
+/// **不反映运行期的 `/model` / `/login` 切换** ⇒ 光看 `run_start` 会误以为
+/// 整个会话都跑在启动时那个 provider 上（真实会话里两者常常不同）。
+///
+/// **不重发 `run_start`**：那是 **run 级**事件（`run` 序号 + `begin_run`），
+/// 重发会破坏 run 的划分与 `run_end` 的配对 ⇒ 另起一个事件类型。
+///
+/// 载荷取**前后两份快照** + **实际下发的 effort**（`None` = provider 不支持该字段）。
+fn record_model_change(
+    debug: &mut Option<DebugSink>,
+    session_id: &str,
+    before: &ModelSnapshot,
+    config: &Config,
+    cause: &str,
+) {
+    let Some(sink) = debug.as_mut() else {
+        return;
+    };
+    let after = model_snapshot(config);
+    // 没变就不记（避免 `/effort` 设成同值也刷一条）。
+    if before == &after {
+        return;
+    }
+    let mut fields = serde_json::Map::new();
+    fields.insert("cause".into(), serde_json::json!(cause));
+    fields.insert("from_provider".into(), serde_json::json!(before.provider));
+    fields.insert("from_model".into(), serde_json::json!(before.model));
+    fields.insert("to_provider".into(), serde_json::json!(after.provider));
+    fields.insert("to_model".into(), serde_json::json!(after.model));
+    // **实际下发的 effort**（`None` = 该 provider 不接受该字段 ⇒ 请求里不带）。
+    fields.insert(
+        "reasoning_effort".into(),
+        serde_json::json!(config.effective_reasoning_effort()),
+    );
+    fields.insert(
+        "supports_reasoning_effort".into(),
+        serde_json::json!(config.supports_reasoning_effort()),
+    );
+    crate::debug_record(sink, session_id, "model_changed", None, None, fields);
+}
+
 /// 本回合用于日志与 `cumulative_rounds` 的轮数：**成功取 `RunResult`，失败取事件流累计**。
 ///
 /// 抽成纯函数只为可测 —— 内联在 `run_turn_once` 里时，「失败取 `observed`」这一步
@@ -1007,8 +1096,12 @@ async fn run_turn_once(
                 Some(boundary.clone()),
             )
         });
-        let mut agent_ports =
-            AgentPorts::new(ports.model, ports.session, ports.events, Some(boundary.clone()));
+        let mut agent_ports = AgentPorts::new(
+            ports.model,
+            ports.session,
+            ports.events,
+            Some(boundary.clone()),
+        );
         if let Some(r) = &runner {
             agent_ports = agent_ports.with_subagent(r);
         }
@@ -1384,10 +1477,7 @@ mod tests {
     ///
     /// **调用方必须已持有 `env_lock`**（见 [`BgEnv`]）⇒ harness 的 `env_prelocked`
     /// 传 `true`（否则它会自己去抢同一把锁 ⇒ 同线程二次加锁死锁）。
-    async fn spawn_app_loop_backgrounds(
-        model: Box<dyn Model>,
-        persistent: bool,
-    ) -> Harness {
+    async fn spawn_app_loop_backgrounds(model: Box<dyn Model>, persistent: bool) -> Harness {
         spawn_app_loop_backgrounds_with(model, persistent, |_, _| {}).await
     }
 
@@ -1413,10 +1503,7 @@ mod tests {
     }
 
     /// 同上，但**打开 debug sink**（调用方须整段持有 `env_lock`）。
-    async fn spawn_app_loop_debug_backgrounds(
-        model: Box<dyn Model>,
-        persistent: bool,
-    ) -> Harness {
+    async fn spawn_app_loop_debug_backgrounds(model: Box<dyn Model>, persistent: bool) -> Harness {
         spawn_app_loop_full(
             model,
             persistent,
@@ -2105,6 +2192,107 @@ mod tests {
         }
     }
 
+    /// O1：换模型后 debug 日志里必须有一条 `model_changed` 事件。
+    ///
+    /// 承重的是「**运行期换模型这件事本身要可观测**」——
+    /// `run_start` 只是**启动快照**，不反映 `/model` / `/login` 的切换。
+    ///
+    /// 变异：删掉 `record_model_change(...)` 调用 ⇒ 变红。
+    #[tokio::test]
+    async fn model_switch_is_observable_in_debug_log() {
+        // `env_lock` 的 guard **不能跨 await**（clippy: MutexGuard held across await）
+        // ⇒ 只在**取环境变量前**持锁，取完立即放。
+        let log_dir = {
+            let _guard = crate::test_env::env_lock();
+            crate::logging::resolve_log_dir().expect("测试环境应有日志目录")
+        };
+        let model = MockModel::new("mock");
+        model.push_text("a");
+        let mut h = spawn_app_loop_debug(Box::new(model), false, Vec::new()).await;
+
+        // debug 文件的落点：会话 id 决定文件名；无会话路径时退化为
+        // `debug-<pid>-<ts>.jsonl` ⇒ **扫目录**找本进程刚写的那个。
+
+        h.requests
+            .send(Request::SetModel {
+                model: "another-model".into(),
+                provider: Some("deepseek".into()),
+            })
+            .await
+            .unwrap();
+        // 换模型后会刷一次 view；收它以确保处理完。
+        let _ = collect_until_view(&mut h).await;
+
+        // **只认本进程新建的文件** —— 扫整个目录会命中**上一次运行的残留**
+        // （残留里也有 `model_changed`）⇒ 变异测试就漏网了。
+        // 判据：文件名含本进程 pid（无会话路径时的 fallback 命名）。
+        let pid = std::process::id().to_string();
+        let started = std::time::Instant::now();
+        // debug writer 是异步线程 ⇒ 轮询等文件出现。
+        let mut found = false;
+        for _ in 0..100 {
+            if let Ok(entries) = std::fs::read_dir(&log_dir.path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    if !name.contains(&pid) {
+                        continue;
+                    }
+                    if let Ok(text) = std::fs::read_to_string(&path)
+                        && text.contains("model_changed")
+                    {
+                        found = true;
+                        // 载荷必须带**前后**两份快照 + 实际下发的 effort。
+                        assert!(text.contains("from_provider"), "缺 from_provider");
+                        assert!(text.contains("to_model"), "缺 to_model");
+                        assert!(
+                            text.contains("reasoning_effort"),
+                            "缺 reasoning_effort（实际下发值）"
+                        );
+                        break;
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "换模型后应有 model_changed 事件；日志目录：{log_dir:?}（已等 {started:?}）"
+        );
+    }
+
+    /// A1 的端到端不变量：跑完一个回合后，**执行时长**必须大于零。
+    ///
+    /// 承重的是「累加点在回合末」—— 若漏掉（或只记成功不记失败），
+    /// 执行口径会**小于**真实占用 ⇒ `/status` 的两个口径失去意义。
+    ///
+    /// 变异：删掉 `ctx.stats.record_elapsed(...)` ⇒ 变红。
+    #[tokio::test]
+    async fn executed_duration_grows_after_a_turn() {
+        let model = MockModel::new("mock");
+        model.push_text("a");
+        let mut h = spawn_with_mock(model).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+
+        assert!(
+            view.executed > std::time::Duration::ZERO,
+            "跑完一个回合后执行时长必须大于零（实际 {:?}）",
+            view.executed
+        );
+    }
+
     /// 3. `Boundary::Steer` 中途注入：该消息出现在**后续轮**的 `ModelRequest` 里
     ///    （第 1 轮请求发出时它还不在），并以 `UserMessage` 事件转发给 UI。
     #[tokio::test]
@@ -2777,7 +2965,6 @@ mod tests {
             "残留的 Abort 不该影响本回合：{msgs:?}"
         );
     }
-
 
     // ─────────────────── `/skill-name` 展开（T12，唯一接线点） ───────────────────
 
@@ -3797,10 +3984,7 @@ mod tests {
             "turn_end",
             "run_end",
         ] {
-            assert!(
-                evs.contains(&expected),
-                "缺少 `{expected}` 记录：{evs:?}"
-            );
+            assert!(evs.contains(&expected), "缺少 `{expected}` 记录：{evs:?}");
         }
         assert_eq!(
             evs.iter().filter(|ev| **ev == "turn_start").count(),
@@ -3820,7 +4004,9 @@ mod tests {
             "逐轮文本行应照旧：{text_log}"
         );
         assert!(
-            text_log.lines().any(|line| line.contains(" turn=1 rounds=")),
+            text_log
+                .lines()
+                .any(|line| line.contains(" turn=1 rounds=")),
             "回合文本行应照旧：{text_log}"
         );
     }
@@ -3905,11 +4091,7 @@ mod tests {
         h.requests.send(prompt("hi")).await.unwrap();
         let _ = collect_until_view(&mut h).await;
         let session = h.session_path.get().expect("持久会话应有路径");
-        let id = session
-            .file_stem()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let id = session.file_stem().unwrap().to_string_lossy().into_owned();
 
         h.requests
             .send(Request::ResumeSession { target: id })
@@ -3926,7 +4108,11 @@ mod tests {
             .filter(|record| record["ev"] == "run_start")
             .map(|record| record["run"].as_u64().unwrap())
             .collect();
-        assert_eq!(runs.len(), 2, "启动 + `/resume` 各一条 `run_start`：{runs:?}");
+        assert_eq!(
+            runs.len(),
+            2,
+            "启动 + `/resume` 各一条 `run_start`：{runs:?}"
+        );
         assert!(runs[1] > runs[0], "`/resume` 的 run 必须递增：{runs:?}");
     }
 
@@ -4071,11 +4257,7 @@ mod tests {
         }
 
         /// 起一条**真实**的后台命令（命令可定制）—— 返回 `(句柄, pid)`。
-        fn start_with(
-            &mut self,
-            session: &str,
-            command: &str,
-        ) -> (ys_tools_basic::BgHandle, u32) {
+        fn start_with(&mut self, session: &str, command: &str) -> (ys_tools_basic::BgHandle, u32) {
             let handle = self
                 .tasks
                 .start(session, command, &std::env::temp_dir(), None)
@@ -4294,11 +4476,7 @@ mod tests {
         let _ = collect_until_view(&mut h).await;
 
         wait_process_gone(&tasks, pid).await;
-        assert_ne!(
-            slot.get(),
-            session,
-            "/resume 后会话槽应指向目标会话"
-        );
+        assert_ne!(slot.get(), session, "/resume 后会话槽应指向目标会话");
     }
 
     /// **按会话过滤**：清理本会话 ⇒ **别的会话**的后台命令不受影响。
@@ -4337,7 +4515,6 @@ mod tests {
             process_alive(other_pid),
             "别的会话的后台命令不该被误杀（清理必须按会话过滤）"
         );
-
     }
 
     /// **共享 sweeper 在跑**：它把已退出的子进程**收尸** —— 不经任何显式

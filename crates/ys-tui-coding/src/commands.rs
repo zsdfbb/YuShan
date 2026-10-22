@@ -474,7 +474,10 @@ pub fn status_text(view: &CodingView) -> String {
         format!("tokens     {tokens}"),
         format!("turns      {}", view.turn_count),
         format!("messages   {}", view.message_count),
+        // **两个时长口径**：`duration` = 存活（进程起止），`executed` = 执行（Σ 回合实际占用）。
+        // 二者之差是「用户不在时 TUI 空等输入」的时长 —— **不是缺陷，是事实** ⇒ 分开报。
         format!("duration   {}", view.session_duration_str()),
+        format!("executed   {}", view.executed_duration_str()),
         format!("logged in  {logged_in}"),
         format!(
             "known      {}",
@@ -863,6 +866,32 @@ mod tests {
 
         view.effort = Some(EffortLevel::XHigh);
         assert_eq!(line(&view), "effort: xhigh", "用规范拼写而非 Debug 名");
+    }
+
+    /// A1 的用户可见面：`/status` 必须**同时**报两个时长口径。
+    ///
+    /// 只有一个「duration」行 ⇒ 用户会把「存活 15 小时」误读成「干了 15 小时」；
+    /// 实测确有会话执行 3.22 h / 存活 15.10 h 的形态 ⇒ 两个口径必须分开。
+    ///
+    /// 变异：删掉 `executed` 行 ⇒ 变红。
+    #[test]
+    fn status_text_reports_both_duration_notions() {
+        let mut view = CodingView::for_test();
+        view.executed = std::time::Duration::from_secs(3 * 3600 + 12 * 60);
+
+        let text = status_text(&view);
+        let duration = text
+            .lines()
+            .find(|l| l.starts_with("duration "))
+            .expect("`/status` 应有 duration 行");
+        let executed = text
+            .lines()
+            .find(|l| l.starts_with("executed "))
+            .expect("`/status` 应有 executed 行（执行口径）");
+
+        assert_eq!(duration, "duration   0s", "存活行仍由 session_started 派生");
+        assert_eq!(executed, "executed   3h12m", "执行行显示 Σ 回合实际占用");
+        assert_ne!(duration, executed, "两个口径必须分行显示，不能合并成一行");
     }
 
     /// 空白与大小写：`/model` 无参**必须**走浮层，绝不直发 SetModel。

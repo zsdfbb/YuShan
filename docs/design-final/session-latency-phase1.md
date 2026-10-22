@@ -88,7 +88,27 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 **为什么降级是安全的**：thinking 至少是**模型为这段历史写的文字**，
 比「压缩失败、历史原地不动（并带 92k 上下文重试）」更有用。
 
-## 变异测试（12 处，全部被抓到）
+## B4 的关键行为（**与 ADR-0017 决策 10 有差异**）
+
+**摘要请求现在复用「活对话前缀 + 末尾一条 user 指令」**：
+- `system` = **活对话的 system**（与主调用**逐字相同**）⇒ 前缀不断 ⇒ 命中 KV cache；
+- `messages` = **待摘要段**（`0..keep_from`，是主调用消息的**真前缀**）+ **末尾追加的摘要指令**
+  （作 `Role::User` 消息 —— **不是** system：system 一旦不同，前缀就断了）；
+- `tools` = **空**；`max_tokens` / `temperature` 不设。
+
+⚠️ **与 ADR 决策 10 的差异**：ADR 说要「复用 `tools` + `tool_choice: none`」。
+本实现**不复用 `tools`** ⇒ **不需要** `tool_choice`（`ModelRequest` 无此字段）：
+摘要模型看不到工具表 ⇒ **不可能**回 tool call ⇒ 不会触发 B-2。
+
+**实测依据**（真实会话 `1792579023_125340094`，8 次压缩调用的 cache 命中）：
+前 6 次**只有 0.3%**（186 / 64949）—— 因为旧形状是**独立请求**（system 被换掉 ⇒
+第一个 token 就不同 ⇒ 整段未命中）；后 2 次 98.7% / 99.1%（那两次的摘要段恰好是
+上次压缩后的保留段 ⇒ 前缀恰好相同）。⇒ **B4 正是补上这 6 次的缺口**。
+
+**`Agent::system_prompt()` getter**（ADR-0007 风格）—— `/compact` 用它取活对话的 system
+⇒ 与自动压缩**同一口径**。
+
+## 变异测试（16 处，全部被抓到）
 
 | # | 变异 | 断言 |
 |---|---|---|
@@ -104,6 +124,10 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 | M10 | 删掉 thinking 降级分支 | `compact::reasoning_only_response_falls_back_to_thinking` |
 | M11 | sink 不收 `ThinkingDelta` | 同上 |
 | M12 | 「两者都空」的判定改成永远成功 | `compact::empty_response_without_thinking_still_fails` |
+| M13 | `system` 不复用活对话（换回 summary prompt） | `compact::summary_request_reuses_live_prefix_with_trailing_instruction` |
+| M14 | 不追加末尾 user 指令 | 同上 |
+| M15 | 指令插在**最前**（破坏前缀） | 同上 |
+| M16 | 摘要请求带上 `tools` | 同上 |
 
 ⚠️ **一个测试设计教训（已踩）**：M4 最初**漏网** ——
 `/status` 的测试用 `CodingView::for_test()` **手工设** `executed`，绕过了 `build_view` 的传递链

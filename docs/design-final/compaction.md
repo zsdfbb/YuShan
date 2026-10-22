@@ -107,8 +107,13 @@ trigger_at(w)  = min( floor(w*trigger_ratio), w - effective_reserve ).max(keep +
 **最初落地版曾是逐字 Codewhale 的 `COMPACT_PROMPT`**（bullet 式 handoff 指令）——内容要点对，但
 **没有结构**：接手模型拿到的是一坨 bullet，无从预期「哪段在哪」；改成固定节骨架后才有可预期的
 解析结构（详见「偏离」8）。
-**摘要调用刻意仍是「独立 `ModelRequest` + `policy.summary_system_prompt`、`tools: vec![]`、`max_tokens` 不设」**：
-「复用活对话前缀 + `tool_choice`（K-1）」是**片 2** 的事（有单测 `summary_request_shape_is_unchanged_in_this_slice` 钉住本片没越界）。
+**摘要调用现在复用「活对话前缀 + 末尾一条 user 指令」（B4 / ADR-0017 决策 10）**：
+`system` = **活对话的 system**（与主调用**逐字相同**）、`messages` = **待摘要段**（主调用消息的
+**真前缀**）+ **末尾追加的摘要指令**（作 `Role::User` 消息，**不是** system —— system 一旦不同，
+前缀就断了）、`tools: vec![]`、`max_tokens` 不设。
+**为何 `tools` 仍为空**：摘要模型看不到工具表 ⇒ **不可能**回 tool call ⇒ **不需要** `tool_choice`
+（`ModelRequest` 无此字段）⇒ 避开了 ADR 决策 10 里「必须同时传 `tool_choice: none`」那个前提。
+单测 `summary_request_reuses_live_prefix_with_trailing_instruction` 钉住这三条。
 `max_tokens` 不设是因为摘要交由 provider 自身的模型上限（app 的 config 级 `max_tokens` 为 `None`，
 见 ADR-0036）—— 不设比设一个偏小的值更稳：摘要若被截断会丢失被压缩的历史，反而违背压缩的目的。
 
@@ -186,8 +191,11 @@ emit 的事件会躺在 `sink_rx` 直到下个 `Prompt` 才转发 → 顺序错�
    之后、下一次 `Prompt` 之前，view 里显示的仍是旧窗口。
 8. **[已关闭]** `docs/design-final/coding-agent-tui.md` 里「`/compact` 仍是 `clear_session` 占位」
    （该文件 §8、§10 两处）的叙述**已随本刀更新为真压缩**。
-9. **片 2 未做**：K-1（摘要复用活对话前缀 + `tool_choice`）、K-2（`Usage` 缓存字段 `cache_read_tokens`）、
-   压缩超时。`tool_choice` 要动 `ys-model` 公开 API，须单独评审。
+9. **片 2 部分已做**（2026-10-22）：**K-1 已做**（B4）—— 摘要复用活对话前缀，
+   但**不复用 `tools`** ⇒ **不需要 `tool_choice`**（见上）。
+   **K-2 已做**（缓存读数）—— `prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`
+   两家方言都认，归一化在 `ChatUsage::cache_tokens()`。
+   **仍未做**：压缩超时。
 
 ## 测试资产
 

@@ -611,8 +611,16 @@ pub async fn run(
                 // 固定开销取自 **agent 自己持有的** `limits` ⇒ 与自动压缩**同一口径**
                 // （`/compact` 若用自己的配置值，两条路径报的数字会不同口径）。
                 let fixed = agent.fixed_prompt_tokens();
-                lines = capabilities::compact(&mut wiring, &policy, config.context_window(), fixed)
-                    .await;
+                // 活对话的 system（同理取自 agent）⇒ 摘要请求复用前缀、命中 KV cache。
+                let live_system = agent.system_prompt().map(str::to_string);
+                lines = capabilities::compact(
+                    &mut wiring,
+                    &policy,
+                    config.context_window(),
+                    fixed,
+                    live_system.as_deref(),
+                )
+                .await;
             }
 
             Request::Export { path } => {

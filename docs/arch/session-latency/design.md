@@ -573,6 +573,21 @@ impl SubagentHandle {
 按 skill 约定，接口级细节留给 `design-an-interface`。**本设计已定死的是**：模块边界、
 数据流、四个关键接口的**形状与语义**，以及各措施的**验收口径**。
 
+### 6.6 B4 的解法与 ADR-0017 决策 10 有差异（⚠️ 已偏离）
+
+ADR 决策 10 说「摘要调用复用**活对话 + 一条末尾 user 指令**」，并**要求**同时传
+`tool_choice: "none"`（理由：复用 `tools` 会让模型有可能回 tool call）。
+
+**本实现的差异**：摘要请求**不复用 `tools`** ⇒ **不需要** `tool_choice`
+（`ModelRequest` 无此字段）⇒ 避开了「动 `ys-model` 公开 API」那一步。
+
+**为什么不复用 tools**：摘要模型看到工具表就**可能**回 tool call ⇒ 触发 B-2（空摘要）。
+不带 tools ⇒ **结构上不可能**回 tool call ⇒ B-3 的 thinking 降级只是**兜底**。
+
+**实测依据**（真实会话 8 次压缩调用的 cache 命中）：旧形状 0.3%（186 / 64949）
+—— system 被换掉 ⇒ 第一个 token 就不同 ⇒ 整段未命中；后 2 次 98.7% / 99.1%
+（那两次的摘要段恰好是上次压缩后的保留段 ⇒ 前缀恰好相同）⇒ **B4 补的正是前 6 次的缺口**。
+
 ---
 
 ## 7. 各措施的验收口径
@@ -586,7 +601,7 @@ impl SubagentHandle {
 | **B1** | **压缩事件 token 口径修正** | `estimated_tokens_after` 与真实占用的偏差 **< 2k**（当前实测低估 ~10k） | 单测：对真实会话回放 |
 | **B2** | `keep_budget` 是否含固定开销（**算法口径决策**） | 压后真实占用 ≤ `keep_budget` | 单测 + 决策记录 |
 | **B3** | 摘要 `tool_choice: none` | 构造「模型回 tool-call」的替身 ⇒ 压缩**不再失败** | 变异测试（删掉 `tool_choice` ⇒ 红） |
-| **B4** | 摘要复用活前缀 | 摘要调用的 `cache_hit > 0` | debug 日志 `round_usage.cache_read` |
+| **B4** | 摘要复用活前缀（✅ **已做**，解法与 ADR 决策 10 有差异） | 摘要调用的 `cache_hit > 0`（实测旧形状 0.3% ⇒ 新形状应显著上升） | debug 日志 `round_usage.cache_read` |
 | **C1** | `grep` 多目标 | 一次调用覆盖 N 个路径；`bash` 里 grep 占比下降 | 单测 + 实跑统计 |
 | **C2** | `read` 目录/glob | 一次调用读多文件；分块 `read` 次数下降 | 单测 + 实跑统计 |
 | **C3** | `cd` 剥离 | 剥离后命令行为等价（**逐条等价性测试**）；`cd` 去别处**不受影响** | 变异测试 + 单测 |
@@ -679,7 +694,7 @@ impl SubagentHandle {
 | B1 | **修正压缩事件 token 口径**（`TokenLedger` 已落地，此处只修口径） | 第一期 A1 | `compact.rs` 两行 + 事件 doc |
 | B2 | `keep_budget` 是否含固定开销（**先决策**，见 §6.4） | — | 算法口径决策 + 实现 |
 | B3 | 摘要 `tool_choice: none` | — | 压缩失败归零 |
-| B4 | 摘要复用活前缀 | B3 | `cache_hit > 0` |
+| B4 | 摘要复用活前缀（✅ 已做） | B3 | `cache_hit > 0` |
 
 **验收**：压缩后 40 轮输入不回到 90k；压缩失败次数 3 → 0。
 

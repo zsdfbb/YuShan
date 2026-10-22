@@ -360,11 +360,15 @@ pub async fn new_session(wiring: &mut Wiring) -> Vec<String> {
 /// `fixed_prompt_tokens` 是**每轮固定开销**（system prompt + 工具表 spec）的估算 ——
 /// 它每次请求都重发却不在会话消息里 ⇒ 压缩后的**真实占用** = 会话估算 **+ 本值**。
 /// 传 `0` 会让报出的数字**低估**（与自动压缩不同口径 ⇒ 不可取）。
+///
+/// `live_system` 是**活对话的 system prompt**（B4 / ADR-0017 决策 10）——
+/// 摘要请求用它作 `system` ⇒ 前缀与主调用**逐字相同** ⇒ 命中 KV cache。
 pub async fn compact(
     wiring: &mut Wiring,
     policy: &ys_component::CompactPolicy,
     window: usize,
     fixed_prompt_tokens: usize,
+    live_system: Option<&str>,
 ) -> Vec<String> {
     // model 与会话必须**同时**借出：`Wiring::ports` 是唯一的同时借出口
     // （分开借会被借用检查器拦下 —— model 的不可变借用压着 session 的可变借用）。
@@ -382,7 +386,16 @@ pub async fn compact(
         return vec!["Nothing to compact.".to_string()];
     };
 
-    match ys_loop::execute(messages, &plan, model, policy, fixed_prompt_tokens).await {
+    match ys_loop::execute(
+        messages,
+        &plan,
+        model,
+        policy,
+        fixed_prompt_tokens,
+        live_system,
+    )
+    .await
+    {
         Ok(outcome) => {
             let before = outcome.estimated_tokens_before;
             let after = outcome.estimated_tokens_after;
@@ -1274,6 +1287,7 @@ mod tests {
             &ys_component::CompactPolicy::default(),
             3000,
             0,
+            None,
         )
         .await;
 
@@ -1333,6 +1347,7 @@ mod tests {
             &ys_component::CompactPolicy::default(),
             3000,
             0,
+            None,
         )
         .await;
 
@@ -1377,6 +1392,7 @@ mod tests {
             &ys_component::CompactPolicy::default(),
             3000,
             0,
+            None,
         )
         .await;
 
@@ -1418,6 +1434,7 @@ mod tests {
             &ys_component::CompactPolicy::default(),
             3000,
             0,
+            None,
         )
         .await;
 

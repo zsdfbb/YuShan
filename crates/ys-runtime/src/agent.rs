@@ -162,6 +162,16 @@ impl Agent {
         self.limits.fixed_prompt_tokens
     }
 
+    /// 返回**活对话的 system prompt**（`None` = 未设置）。
+    ///
+    /// **为什么需要暴露**：压缩的摘要调用要**复用活对话前缀**才能命中 KV cache
+    /// （B4 / ADR-0017 决策 10）⇒ 摘要请求的 `system` 必须与主调用**逐字相同**。
+    ///
+    /// ADR-0007 保留：只读查询，不依赖 `&mut Agent`。
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
+    }
+
     /// 设置 model 的 context window 大小（运行期刷新）。
     ///
     /// **为什么需要**：`/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍。

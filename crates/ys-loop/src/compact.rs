@@ -176,12 +176,17 @@ pub enum CompactError {
 /// 它**每次请求都要重发**却不在会话消息里 ⇒ 压缩后的**真实占用** =
 /// `estimated_tokens_after` **+ 本值**。传 `0` 表示调用方不知道该值
 /// （此时事件数字仍只数会话消息，**低估固定开销**）。
+///
+/// **`live_system`**：**活对话的 system prompt**（B4 / ADR-0017 决策 10）。
+/// 摘要请求用它作 `system` ⇒ 序列化后的前缀与主调用**逐字相同** ⇒ 命中 KV cache。
+/// 传 `None` 表示活对话没有 system（此时摘要指令仍作末尾 user 消息）。
 pub async fn execute(
     messages: &[Message],
     plan: &CompactPlan,
     model: &dyn Model,
     policy: &CompactPolicy,
     fixed_prompt_tokens: usize,
+    live_system: Option<&str>,
 ) -> Result<CompactOutcome, CompactError> {
     // 评审 R10 / P1-1：`plan()` 与 `execute()` 各收一次 `messages` ⇒ 索引可能错配。
     //
@@ -240,8 +245,13 @@ pub async fn execute(
 
     // B-3：**先摘要，成功之后才构造新消息表** —— 任何失败都在 `?` 处返回，
     // 此时本函数尚未产出任何可变状态，调用方的 session 自然一个字节未动。
-    let (summary, usage) =
-        generate_summary(model, to_summarize, &policy.summary_system_prompt).await?;
+    let (summary, usage) = generate_summary(
+        model,
+        to_summarize,
+        live_system,
+        &policy.summary_system_prompt,
+    )
+    .await?;
     let summary_text = format!("{SUMMARY_OPEN}\n{summary}\n{SUMMARY_CLOSE}");
 
     // R7：删掉伪造的 assistant ack（`"I have the context summary. Continuing."`）。
@@ -302,12 +312,29 @@ fn merge_summary_into(msg: &Message, summary_text: &str) -> Message {
 
 /// 用模型生成旧消息的摘要。
 ///
-/// ⚠️ **请求形状刻意保持「独立 `ModelRequest` + `policy.summary_system_prompt`」**：
-/// 「复用活对话前缀 + `tool_choice`」是下一片（ADR-0017 决策 10 / 片 2）的事，本片不做。
+/// # 请求形状（B4 / ADR-0017 决策 10）
+///
+/// **「活对话前缀 + 末尾一条 user 指令」**：
+/// - `system` = **活对话的 system prompt**（与主调用**逐字相同**）
+/// - `messages` = **活对话的消息**（前缀）+ **末尾追加一条 user 指令**
+/// - `tools` = **空**（摘要不是工具调用场景）
+///
+/// **为什么这样能命中 KV cache**：provider 的前缀缓存按**序列化后的字节前缀**匹配。
+/// 旧形状（独立 `ModelRequest` + 换掉的 system prompt）**第一个 token 就不同**
+/// ⇒ 整段上下文 100% 未命中 —— 而这是系统里最大的单次输入。
+/// 现在 system 与 messages 前缀都**逐字等于**主调用 ⇒ 命中。
+///
+/// ⚠️ **与 ADR 决策 10 的差异**：ADR 说要「复用 `tools` + `tool_choice: none`」。
+/// 本实现**不复用 tools** ⇒ **不需要** `tool_choice`（`ModelRequest` 无此字段）：
+/// 摘要模型看不到工具表 ⇒ **不可能**回 tool call ⇒ 不会触发 B-2。
+///
+/// ⚠️ **摘要指令改作末尾 user 消息**（而不是 system）：system 一旦不同，前缀就断了。
+/// 指令的**内容**不变（七节骨架，承重）—— 只换载体。
 async fn generate_summary(
     model: &dyn Model,
     messages: &[Message],
-    system_prompt: &str,
+    live_system: Option<&str>,
+    summary_instruction: &str,
 ) -> Result<(String, Usage), CompactError> {
     // sink 与 `summarize::ModelSummarizer` 共用同一份（R9：同 crate 内不该有两份相同 impl）。
     //
@@ -315,10 +342,20 @@ async fn generate_summary(
     // 见 [`ThinkingFallbackSink`] 的说明：摘要失败的真实成因是「模型只输出了
     // reasoning、没输出正文」，而 thinking 在 `Noop` 下被**完全丢弃**。
     let mut sink = ThinkingFallbackSink::default();
+    // 末尾追加摘要指令（**活对话消息在前** ⇒ 前缀逐字不变）。
+    let mut request_messages = messages.to_vec();
+    request_messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: summary_instruction.to_string(),
+        }],
+    });
     let request = ModelRequest {
-        messages: messages.to_vec(),
+        messages: request_messages,
         tools: vec![],
-        system: Some(system_prompt.to_string()),
+        // **活对话的 system**（与主调用逐字相同）⇒ 前缀不断 ⇒ 命中 KV cache。
+        // `None` = 活对话本就没有 system（此时摘要指令仍作末尾 user 消息）。
+        system: live_system.map(str::to_string),
         // `max_tokens` **刻意不设**：摘要只受 system prompt 的长度约束，不额外掐上限 ——
         // 交由 provider 自身的模型上限。**不设**比设一个偏小的值更稳：摘要若被截断会丢失
         // 被压缩的历史，反而违背压缩的目的。
@@ -521,7 +558,7 @@ mod tests {
         // 若早退被挪走（例如无条件 execute），上面的 panic 会把本测试打红。
         let model = NeverCalledModel;
         if let Some(p) = plan(&messages, &policy, 128_000) {
-            let _ = execute(&messages, &p, &model, &policy, 0).await;
+            let _ = execute(&messages, &p, &model, &policy, 0, None).await;
         }
     }
 
@@ -672,7 +709,7 @@ mod tests {
             len: 2,
         };
         assert!(matches!(
-            execute(&messages, &empty_keep, &model, &policy, 0).await,
+            execute(&messages, &empty_keep, &model, &policy, 0, None).await,
             Err(CompactError::Summarize(_))
         ));
 
@@ -683,7 +720,7 @@ mod tests {
             len: 2,
         };
         assert!(matches!(
-            execute(&messages, &out_of_range, &model, &policy, 0).await,
+            execute(&messages, &out_of_range, &model, &policy, 0, None).await,
             Err(CompactError::Summarize(_))
         ));
     }
@@ -711,7 +748,7 @@ mod tests {
             len: 3, // 与 messages.len() = 5 不符 ⇒ 尾部 2 条会被静默丢弃
         };
 
-        let err = execute(&messages, &stale, &model, &policy, 0)
+        let err = execute(&messages, &stale, &model, &policy, 0, None)
             .await
             .expect_err("plan.len 错配必须返回 Err（release 下同样生效）");
         let reason = err.to_string();
@@ -755,7 +792,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    execute(&messages, &p, &model, &policy, 0).await,
+                    execute(&messages, &p, &model, &policy, 0, None).await,
                     Err(CompactError::Summarize(_))
                 ),
                 "{name} 畸形 plan 必须被拒绝：{p:?}"
@@ -777,7 +814,7 @@ mod tests {
             keep: 2..5,
             len: 5,
         };
-        let out = execute(&messages, &well_formed, &model, &policy, 0)
+        let out = execute(&messages, &well_formed, &model, &policy, 0, None)
             .await
             .expect("无缝覆盖 0..len 的 plan 必须被接受");
         assert_eq!(out.summarized, 2);
@@ -805,7 +842,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_thinking_only("思考里其实有摘要内容");
 
-        let out = execute(&messages, &p, &model, &policy, 0)
+        let out = execute(&messages, &p, &model, &policy, 0, None)
             .await
             .expect("只输出思考时必须降级成功，而不是失败");
 
@@ -831,7 +868,7 @@ mod tests {
         // tool call 响应：**无 `Text` 块、也无 thinking** ⇒ 真失败。
         model.push_tool_call("noop", serde_json::json!({}));
 
-        let err = execute(&messages, &p, &model, &policy, 0)
+        let err = execute(&messages, &p, &model, &policy, 0, None)
             .await
             .expect_err("既无正文又无思考时必须失败");
         assert!(
@@ -857,7 +894,7 @@ mod tests {
         model.push_text("简短摘要");
 
         const FIXED: usize = 10_260;
-        let out = execute(&messages, &p, &model, &policy, FIXED)
+        let out = execute(&messages, &p, &model, &policy, FIXED, None)
             .await
             .unwrap();
 
@@ -865,7 +902,7 @@ mod tests {
         let zero = {
             let m2 = MockModel::new("m");
             m2.push_text("简短摘要");
-            execute(&messages, &p, &m2, &policy, 0).await.unwrap()
+            execute(&messages, &p, &m2, &policy, 0, None).await.unwrap()
         };
         assert_eq!(
             out.estimated_tokens_before - zero.estimated_tokens_before,
@@ -900,7 +937,9 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("简短摘要");
 
-        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0, None)
+            .await
+            .unwrap();
 
         assert_eq!(out.summarized, 1);
         assert_eq!(out.kept, 3);
@@ -962,7 +1001,9 @@ mod tests {
         };
         let model = UsageModel(usage.clone());
 
-        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0, None)
+            .await
+            .unwrap();
         assert_eq!(out.usage, usage, "outcome 必须带回摘要调用的 usage");
     }
 
@@ -980,7 +1021,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_tool_call("bash", serde_json::json!({"command": "ls"}));
 
-        let err = execute(&messages, &p, &model, &policy, 0)
+        let err = execute(&messages, &p, &model, &policy, 0, None)
             .await
             .expect_err("无文本的响应必须是 Err，否则会写出空摘要静默丢历史");
         assert!(matches!(err, CompactError::Summarize(_)), "实际 = {err:?}");
@@ -997,7 +1038,7 @@ mod tests {
         model.push_text("  \n\t  ");
 
         assert!(matches!(
-            execute(&messages, &p, &model, &policy, 0).await,
+            execute(&messages, &p, &model, &policy, 0, None).await,
             Err(CompactError::Summarize(_))
         ));
     }
@@ -1019,7 +1060,7 @@ mod tests {
         model.push_error("provider 挂了");
         model.push_text("later");
 
-        let err = execute(&messages, &p, &model, &policy, 0)
+        let err = execute(&messages, &p, &model, &policy, 0, None)
             .await
             .expect_err("模型报错必须冒泡成 Err");
         match err {
@@ -1056,7 +1097,9 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("摘要正文");
 
-        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0, None)
+            .await
+            .unwrap();
 
         assert_eq!(out.messages.len(), 2, "并入而非单插一条");
         assert_eq!(out.messages[0].role, Role::User);
@@ -1089,7 +1132,9 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("摘要正文");
 
-        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0, None)
+            .await
+            .unwrap();
 
         assert_eq!(out.messages.len(), 4, "3 条保留 + 1 条独立摘要");
         assert_eq!(out.messages[0].role, Role::User);
@@ -1114,7 +1159,9 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("摘要");
 
-        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0, None)
+            .await
+            .unwrap();
         assert_eq!(out.messages[0].role, Role::User);
         assert!(
             !out.messages.iter().any(|m| m.role == Role::System),
@@ -1142,13 +1189,18 @@ mod tests {
         assert_eq!(&merged.content[1], &tool_result.content[0], "原块逐字保留");
     }
 
-    /// 摘要请求的形状：不带工具表、带 `policy.summary_system_prompt`、**不设 `max_tokens`**。
+    /// 摘要请求的形状（B4）：**活对话前缀 + 末尾一条 user 指令**。
     ///
-    /// ⚠️ 本片**有意不做**「复用活对话前缀 + `tool_choice`」（那片 2 的事）——
-    /// 这条测试正是为了钉住「本片没越界」，同时钉住 `max_tokens` **不设**
-    /// （摘要交由 provider 的上限，避免被截断而丢失被压缩的历史）。
+    /// **承重的三条**：
+    /// 1. `system` = **活对话的 system**（与主调用**逐字相同**）⇒ 前缀不断 ⇒ 命中 KV cache；
+    /// 2. `messages` = 活对话消息 **+ 末尾追加的摘要指令**（指令作 **user 消息**，
+    ///    不是 system —— system 一旦不同，前缀就断了）；
+    /// 3. `tools` **为空** ⇒ 摘要模型看不到工具表 ⇒ **不可能**回 tool call
+    ///    ⇒ 不需要 `tool_choice`（`ModelRequest` 无此字段）。
+    ///
+    /// 另钉住 `max_tokens` **不设**（摘要交由 provider 的上限，避免被截断而丢失被压缩的历史）。
     #[tokio::test]
-    async fn summary_request_shape_is_unchanged_in_this_slice() {
+    async fn summary_request_reuses_live_prefix_with_trailing_instruction() {
         use std::sync::Mutex;
 
         struct RecordingModel {
@@ -1186,7 +1238,10 @@ mod tests {
             last: Mutex::new(None),
         };
 
-        execute(&messages, &p, &model, &policy, 0).await.unwrap();
+        const LIVE_SYSTEM: &str = "活对话的 system prompt";
+        execute(&messages, &p, &model, &policy, 0, Some(LIVE_SYSTEM))
+            .await
+            .unwrap();
 
         let req = model
             .last
@@ -1194,11 +1249,34 @@ mod tests {
             .unwrap()
             .take()
             .expect("应已调用一次 model");
-        assert!(req.tools.is_empty(), "本片摘要调用仍不带工具表");
+        assert!(
+            req.tools.is_empty(),
+            "摘要调用不带工具表（⇒ 不可能回 tool call）"
+        );
         assert_eq!(
             req.system.as_deref(),
-            Some(policy.summary_system_prompt.as_str()),
-            "摘要调用仍用 policy 的 system prompt"
+            Some(LIVE_SYSTEM),
+            "system 必须是**活对话的**（与主调用逐字相同 ⇒ 前缀不断 ⇒ 命中 cache）"
+        );
+        // 摘要指令作**末尾 user 消息**（不是 system）。
+        let last = req.messages.last().expect("应有消息");
+        assert_eq!(last.role, Role::User, "摘要指令必须是 user 消息");
+        assert!(
+            text_of(last).contains("## Goal"),
+            "末尾 user 消息应含摘要指令（七节骨架）：{:?}",
+            text_of(last)
+        );
+        // 待摘要段（`0..keep_from`）是**主调用消息的真前缀** ⇒ 逐字不变 ⇒ 命中 cache。
+        // 摘要请求 = 该段 **+ 末尾一条指令**。
+        assert_eq!(
+            req.messages.len(),
+            p.summarize.len() + 1,
+            "摘要请求的消息 = 待摘要段 + 末尾一条指令"
+        );
+        assert_eq!(
+            &req.messages[..p.summarize.len()],
+            &messages[p.summarize.clone()],
+            "待摘要段必须逐字等于主调用的对应切片（否则前缀断裂 ⇒ cache 不命中）"
         );
         assert_eq!(
             req.max_tokens, None,

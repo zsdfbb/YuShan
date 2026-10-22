@@ -338,9 +338,18 @@ fn tool_guidelines(tools: &[&str]) -> String {
              sub-agent does NOT see this conversation, so `prompt` must be fully self-contained"
                 .to_string(),
         );
+        // **成批派发是机制事实，不是风格建议**：同一条消息里的多个 `subagent` 调用进同一个
+        // 并行段（`is_concurrency_safe == true`，`BasicLoop` Step 9 的 `Segment::Parallel`）
+        // ⇒ 真并发；而**一轮一个**会一个跑完才轮到下一个 ⇒ 串行 N 倍。
+        // 实测（会话 `1792579023_125340094` turn 16）：3 个派发分在 3 轮里，
+        // 串行 1,831 s；同一批只需 965 s。
+        //
+        // 这条**替换**了原先只讲「规模」的那句 —— 前缀成本按字节计，不新增条目。
         guidelines.push(
-            "Scale the dispatch: one subagent is enough for a simple lookup; dispatch several in \
-             one message only for genuinely independent sub-tasks"
+            "Scale the dispatch: one subagent is enough for a simple lookup. For genuinely \
+             independent sub-tasks, send ALL the `subagent` calls in ONE message — a single \
+             batch runs concurrently, whereas one call per round runs them one after another \
+             (N times slower)"
                 .to_string(),
         );
         guidelines.push(
@@ -1093,6 +1102,18 @@ mod tests {
                 ys_component::DEFAULT_MAX_PARALLEL_TOOLS
             )),
             "并发槽位数须写进 guideline，且取自常量单一真值；prompt = {parent}"
+        );
+        // **成批派发**必须明写「放同一条消息里」——不是风格问题，是机制事实：
+        // 同批进 `Segment::Parallel` 才真并发；一轮一个 = 串行 N 倍。
+        //
+        // 实测依据（turn 16）：3 个派发分 3 轮 ⇒ 1,831 s；同批只需 965 s。
+        //
+        // 变异：把「send ALL the `subagent` calls in ONE message」删掉，只留「scale」
+        // 语义 ⇒ 变红。
+        assert!(
+            parent.contains("in ONE message")
+                && parent.contains("one call per round runs them one after another"),
+            "必须说明「同批并发、一轮一个串行」这个机制后果；prompt = {parent}"
         );
 
         let child = build_system_prompt(&dir, &[spec("read")], &cat);

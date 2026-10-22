@@ -1039,6 +1039,7 @@ use crate::round_clock::{RoundClock, turn_cache, turn_line};
 ///
 /// **函数第一步就是排空边界信道**：上一回合结束后才到的 `Abort` 在语义上已是废的
 /// （UI 的 `is_turning` 复位最长滞后一个 poll 周期），**上一回合的取消不得取消本回合**。
+/// 但 `Steer` **不能一起丢** —— 它是用户输入正文，保留下来交给本回合（见排空处注释）。
 ///
 /// **`Abort` 永久置位**（模块注释 ③）：下面的 `QueueBoundarySource::new()` 只防标志位
 /// 复用，防不了**队列里那条已投递的边界消息** —— 故排空必须在新建边界源**之前**。
@@ -1049,8 +1050,22 @@ async fn run_turn_once(
     ctx: &mut TurnCtx<'_>,
     input: AgentInput,
 ) -> Result<TurnOutcome, AppLoopError> {
-    // 排空上一回合残留的边界消息（含 `Abort`）—— 契约见函数头。
-    while ctx.boundary_rx.try_recv().is_ok() {}
+    // 排空上一回合残留的边界消息 —— **只丢 `Abort`，保留 `Steer`**。
+    //
+    // `Abort` 必须丢：上一回合的取消**不得**取消本回合（它的标志位已永久置位，
+    // 队列里那条已投递的消息是本回合唯一的补救点）。
+    //
+    // `Steer` **不能丢**：那是**用户输入的正文**。它会出现在这里只有一个原因 ——
+    // 用户在上回合**最后一个轮边界之后**才敲进来，`BasicLoop` 没来得及取。
+    // 丢掉 = 静默吞掉用户消息。保留下来泵进本回合的边界源，它会在本回合第一个
+    // 轮边界被取走并 append 进会话 ⇒ 语义从「插话」自然退化为「下一回合的早到输入」，
+    // 但**内容一个字不丢**。
+    let mut carry_over: Vec<Boundary> = Vec::new();
+    while let Ok(b) = ctx.boundary_rx.try_recv() {
+        if !matches!(b, Boundary::Abort) {
+            carry_over.push(b);
+        }
+    }
 
     // 回合号从 1 起（`begin_turn` 把它带进 `Envelope.turn`）。
     *ctx.turns += 1;
@@ -1097,6 +1112,10 @@ async fn run_turn_once(
         ports.events.begin_turn(*ctx.turns);
         // 本回合专属的边界源：`Abort` 的标志位随回合作废。
         let boundary = Arc::new(QueueBoundarySource::new());
+        // 把上回合末尾没取走的 `Steer` 交给本回合（用户输入不能丢 —— 见函数头的排空契约）。
+        for b in carry_over.drain(..) {
+            boundary.push(b);
+        }
         // subagent：每回合造一份 runner（派发计数器天然 per-turn；每次派发建新子 Agent）。
         // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`
         // 透传得到父的中止状态。
@@ -2282,6 +2301,56 @@ mod tests {
             view.executed > std::time::Duration::ZERO,
             "跑完一个回合后执行时长必须大于零（实际 {:?}）",
             view.executed
+        );
+    }
+
+    /// **上回合末尾没取走的 `Steer` 不得被丢弃** —— 它是用户输入正文。
+    ///
+    /// 场景：用户在上回合**最后一个轮边界之后**才敲进来 ⇒ `BasicLoop` 没来得及取 ⇒
+    /// 它躺在 `boundary_rx` 里。下一个 `Request::Prompt` 到达时，`run_turn_once` 的
+    /// 排空循环若「见消息就丢」，用户那句话就**静默消失**了。
+    ///
+    /// 修法：排空**只丢 `Abort`**，`Steer` 带进本回合的边界源 ⇒ 在**第一个轮边界**
+    /// （模型调用之前）被取走并 append ⇒ 语义自然从「插话」退化为「下一回合的早到输入」，
+    /// 内容一个字不丢。
+    ///
+    /// 变异：把排空改回 `while try_recv().is_ok() {}`（全丢）⇒ 本用例变红。
+    #[tokio::test]
+    async fn leftover_steer_is_carried_into_the_next_turn() {
+        const MARKER: &str = "CARRIED-OVER-STEER";
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[1, 2]));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        // 回合 1：正常跑完。**第 1 次 `complete` 恒阻塞在 gate 上**（probe 的约定）⇒
+        // 必须显式放行，否则整个用例卡死在第 1 轮。
+        h.requests.send(prompt("first")).await.unwrap();
+        probe.wait_entered(1).await;
+        probe.release();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        // 回合 1 已结束 ⇒ 现在投的 Steer 没有任何轮边界去取它。
+        h.boundaries
+            .send(Boundary::Steer(user_message(MARKER)))
+            .await
+            .unwrap();
+        // 给 app 循环一个 poll 周期把它收进边界队列（它此刻不在回合内，只入队）。
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 回合 2：排空时**必须**把上面那条 Steer 带进来。
+        h.requests.send(prompt("second")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let requests = probe.requests();
+        assert!(
+            requests.len() >= 2,
+            "应至少跑两轮（两个回合）：{}",
+            requests.len()
+        );
+        assert!(
+            has_text(&requests[1], MARKER),
+            "回合 2 的第 1 轮请求里必须已经带上被携带过来的 Steer（不能丢用户输入）"
         );
     }
 

@@ -70,6 +70,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::Sender;
+use ys_core::Message;
 use ys_protocol::{Boundary, Request};
 
 use crate::app::{App, message_text};
@@ -329,8 +330,24 @@ fn dispatch(
     match action {
         Action::None => {}
         Action::Request(req) => {
-            // 只有普通消息才本地回显 + 进 turn 态；`/new` 之类不动 transcript
+            // **回合进行中的普通消息 ⇒ steering 插话**（不排到下一回合）。
+            //
+            // 通路两端本来就是齐的：`BasicLoop` 在**轮边界**取 `Boundary::Steer(msg)` 后
+            // append 进会话并 emit `UserMessage`；TUI 的 `apply_event` 在
+            // `is_turning == true` 时把这条 `UserMessage` 渲染成**用户行**。
+            // 缺的只是生产者 —— 就是这里。
+            //
+            // **为什么不是「排到下一回合」**：那要等本回合彻底结束（可能是一个 965 秒的
+            // 工具调用）才轮到，用户的追问在这段时间里完全无效。
+            //
+            // 只对 `Request::Prompt` 生效：`/new` / `/model` 这类**控制操作**仍走
+            // `Request`（它们改的是接线器状态，不能当「插话」塞进对话）。
             if let Request::Prompt(msg) = &req {
+                if app.is_turning {
+                    app.note_steered(message_text(msg));
+                    send_steer(boundaries, msg.clone());
+                    return;
+                }
                 app.begin_local_turn(message_text(msg));
             }
             send_request(app, requests, req);
@@ -364,6 +381,18 @@ fn send_request(app: &mut App, requests: &Sender<Request>, req: Request) {
     if requests.blocking_send(req).is_err() {
         // app 线程已消失 —— 没有对话对象了，收摊（恢复仍由 run 无条件执行）
         app.should_quit = true;
+    }
+}
+
+/// 回合中插话：投 `Boundary::Steer` 给 `BasicLoop` 的**轮边界**。
+///
+/// 与 [`request_abort`] 同一形态（`try_send` + 满则 `blocking_send`）：
+/// 队列满时**绝不静默丢掉用户输入** —— 消费者只在轮边界拉，短期内必满。
+fn send_steer(boundaries: &Sender<Boundary>, message: Message) {
+    if let Err(err) = boundaries.try_send(Boundary::Steer(message)) {
+        // 队列满（消费者只在轮边界拉）⇒ 退化为阻塞投递。
+        // Disconnected 时阻塞版立即返回 Err，不会挂住 UI 线程（此时 app 已收摊）。
+        let _ = boundaries.blocking_send(err.into_inner());
     }
 }
 
@@ -791,6 +820,106 @@ mod tests {
         handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
         assert!(ch.next_boundary().is_none(), "收场后的 Esc 不再投 Abort");
         assert!(a.input.text.is_empty(), "收场后的 Esc 回到清空输入");
+    }
+
+    /// **回合中提交普通消息 ⇒ 走 `Boundary::Steer`，不走 `Request::Prompt`**。
+    ///
+    /// 承重的三点：
+    ///  1. 边界信道收到 `Steer`，且正文就是用户敲的那句；
+    ///  2. **请求信道一条都没有** —— 否则它会排到本回合之后才生效（可能是一个 965 秒
+    ///     的工具调用），追问在这段时间里完全无效；
+    ///  3. 本地**立即回显**用户行（否则工具跑 16 分钟就 16 分钟看不到自己刚发的消息），
+    ///     并登记一次回声抑制（底下 `BasicLoop` 在轮边界 emit 的 `UserMessage` 是它的回声）。
+    ///
+    /// 变异：把 `if app.is_turning` 删掉（恒走 `begin_local_turn` + `Request::Prompt`）
+    /// ⇒ 断言 1、2 变红。
+    #[test]
+    fn submit_while_turning_is_steered_not_queued() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        a.input.insert_str("还有个小问题");
+
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+
+        match ch.next_boundary().expect("回合中提交必须投边界消息") {
+            Boundary::Steer(msg) => {
+                assert_eq!(message_text(&msg), "还有个小问题", "正文必须原样带过去");
+            }
+            other => panic!("应是 Steer，得到 {other:?}"),
+        }
+        assert!(
+            ch.next_request().is_none(),
+            "插话**不得**同时发 `Request::Prompt`（那会排到本回合之后才生效）"
+        );
+        assert!(a.is_turning, "插话不改回合态");
+        assert_eq!(a.suppress_user_echo, 1, "必须抑制那条回声，避免画两遍");
+        assert_eq!(
+            a.transcript
+                .last()
+                .map(|l| matches!(l, TranscriptLine::User(_))),
+            Some(true),
+            "必须本地立即回显（否则要等到下一个轮边界才可见）"
+        );
+    }
+
+    /// **回合中提交插话不得重置回合态**（时钟 / 轮号 / 已按下的 Ctrl-C）。
+    ///
+    /// 变异：把 `note_steered` 换成 `begin_local_turn` ⇒ 三条断言全红。
+    #[test]
+    fn steered_message_does_not_reset_turn_state() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        a.abort_requested = true;
+        a.current_round = Some(7);
+        let started = a.turn_started_at;
+        a.input.insert_str("插一句");
+
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+
+        assert_eq!(a.turn_started_at, started, "回合时钟不得重置");
+        assert_eq!(a.current_round, Some(7), "轮号不得清空");
+        assert!(a.abort_requested, "已按下的 Ctrl-C 不得被插话清除");
+    }
+
+    /// 空闲时提交**仍是** `Request::Prompt`（既有行为逐字节不变）。
+    ///
+    /// 变异：把 `app.is_turning` 判成恒真 ⇒ 变红。
+    #[test]
+    fn submit_while_idle_still_sends_a_prompt_request() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("正常提问");
+
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+
+        match ch.next_request().expect("空闲提交应发请求") {
+            Request::Prompt(msg) => assert_eq!(message_text(&msg), "正常提问"),
+            other => panic!("应是 Prompt，得到 {other:?}"),
+        }
+        assert!(ch.next_boundary().is_none(), "空闲提交不该投边界消息");
     }
 
     /// `Request::Prompt` **不**进入在飞态：回合有自己的取消路径（`is_turning`）。

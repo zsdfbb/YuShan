@@ -411,6 +411,24 @@ impl App {
         self.scroll_offset = 0;
     }
 
+    /// 本地回显一条**回合中插话**（steering）。
+    ///
+    /// 与 [`Self::begin_local_turn`] 的差别是**只回显、不动回合态**：
+    /// 插话是**本回合内的额外输入**，不是新回合 ⇒ 绝不能
+    /// `turn_started_at = now` / `current_round = None` / `abort_requested = false`
+    /// （那会把回合时钟、轮号、已按下的 Ctrl-C 全部重置 —— 用户看到的是
+    /// 「回合重新开始了」）。
+    ///
+    /// **回显即时**：插话真正进上下文要等到下一个**轮边界**（工具执行期间不在边界上），
+    /// 若只在事件到达时画，工具跑 16 分钟就 16 分钟看不到自己刚发的消息。
+    ///
+    /// **抑制回声**：底下那条 `UserMessage` 事件就是这条的回声（`BasicLoop` 在
+    /// 轮边界 append 后 emit），靠 `suppress_user_echo` 抑制掉，避免出现两遍。
+    pub fn note_steered(&mut self, text: String) {
+        self.transcript.push(TranscriptLine::User(text));
+        self.suppress_user_echo += 1;
+    }
+
     /// 推进 Working 动画相位。
     pub fn tick_working(&mut self) {
         self.working_dot = (self.working_dot + 1) % WORKING_DOTS;

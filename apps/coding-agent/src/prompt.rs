@@ -322,6 +322,17 @@ fn tool_guidelines(tools: &[&str]) -> String {
                 .to_string(),
         );
     }
+    // 异步派发：**结果自动送达，不要 poll**。只在工具在场时出现（子表没有它）。
+    if tools.contains(&"subagent_async") {
+        guidelines.push(
+            "Use subagent_async instead of subagent when you want to dispatch several sub-tasks \
+             or keep answering the user while a sub-agent works: it returns a handle immediately \
+             and the result is delivered to you automatically when it finishes — do NOT poll for \
+             it. Keep doing your own part after dispatching; if you end the turn before it \
+             finishes, that sub-agent is cancelled and its result is lost"
+                .to_string(),
+        );
+    }
     if tools.contains(&"subagent") {
         // 防失控 + 防重复劳动（来源：Anthropic 多 agent 博客的量化经验，见
         // `docs/arch/subagent/research.md` §2.9）。措辞要点：
@@ -1103,6 +1114,33 @@ mod tests {
             )),
             "并发槽位数须写进 guideline，且取自常量单一真值；prompt = {parent}"
         );
+        // **异步派发**的指引只在 `subagent_async` 在场时出现（子表没有它）。
+        //
+        // 承重的两句：① 结果**自动送达、不要 poll**；② **别在它跑完前结束回合**
+        //（回合末不等异步子 agent ⇒ 结束即取消，结果丢失）。
+        //
+        // 变异：删掉「do NOT poll for it」或「if you end the turn before it finishes」
+        // ⇒ 变红。
+        let with_async = build_system_prompt(
+            &dir,
+            &[spec("read"), spec("subagent"), spec("subagent_async")],
+            &cat,
+        );
+        assert!(
+            with_async.contains("do NOT poll for it"),
+            "必须说明「结果自动送达、不要 poll」；prompt = {with_async}"
+        );
+        assert!(
+            with_async.contains("if you end the turn before it finishes")
+                && with_async.contains("cancelled"),
+            "必须说明「回合结束即取消、结果丢失」；prompt = {with_async}"
+        );
+        let without = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
+        assert!(
+            !without.contains("do NOT poll for it"),
+            "`subagent_async` 不在场时不该出现它的指引；prompt = {without}"
+        );
+
         // **成批派发**必须明写「放同一条消息里」——不是风格问题，是机制事实：
         // 同批进 `Segment::Parallel` 才真并发；一轮一个 = 串行 N 倍。
         //

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::Value;
 use ys_component::RunLimits;
-use ys_core::{ContentBlock, StopReason, ToolCallId, Usage};
+use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId, Usage};
 use ys_event::{AgentEvent, CollectingSink};
 use ys_loop::AgentInput;
 use ys_model::Model;
@@ -249,6 +249,11 @@ pub struct AppSubagentRunner<'a> {
     /// **必须是 `Arc` 而非借用**：`ChildBoundary` 要能进 `Arc<dyn BoundarySource>`
     /// （隐含 `'static`），借用父会把它拽出 `'static`。
     parent_boundary: Option<Arc<dyn BoundarySource>>,
+    /// 后台结果回投的落点（**具体类型**，因为要用 `push` 而 trait 只有 `take`/`is_aborted`）。
+    ///
+    /// 与 `parent_boundary` 指向**同一个对象**（生产路径上由 `app_loop` 同时传入），
+    /// 只是多留一份具体类型以便 `Boundary::Deferred` 入队。
+    result_sink: Option<Arc<QueueBoundarySource>>,
 }
 
 impl<'a> AppSubagentRunner<'a> {
@@ -265,6 +270,7 @@ impl<'a> AppSubagentRunner<'a> {
         dir: Arc<SubagentsDir>,
         totals: Arc<UsageTotals>,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
+        result_sink: Option<Arc<QueueBoundarySource>>,
     ) -> Self {
         Self {
             parent_model,
@@ -280,6 +286,7 @@ impl<'a> AppSubagentRunner<'a> {
             dispatched: AtomicU32::new(0),
             totals,
             parent_boundary,
+            result_sink,
         }
     }
 }
@@ -339,6 +346,7 @@ impl SubagentSetup {
         parent_model: Option<Arc<dyn Model>>,
         totals: Arc<UsageTotals>,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
+        result_sink: Option<Arc<QueueBoundarySource>>,
     ) -> AppSubagentRunner<'a> {
         AppSubagentRunner::new(
             parent_model,
@@ -352,6 +360,7 @@ impl SubagentSetup {
             self.dir.clone(),
             totals,
             parent_boundary,
+            result_sink,
         )
     }
 }
@@ -370,6 +379,105 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let _ = boundary;
 
         // fail-closed：未支持按名构造模型时**绝不静默回退到父模型**。
+        let resolved = self.resolve_model(model)?;
+        self.take_dispatch_slot()?;
+        let child_limits = self.child_limits_for(model);
+
+        // 执行交给 owned 的 `ChildTask` —— 同步 `run` 与异步 `spawn` **共用同一份**
+        // 执行逻辑（否则两条路径的行为会漂移：结果打包、诊断、usage 上卷全在手写两份）。
+        Ok(self
+            .child_task(resolved, child_limits)
+            .execute(prompt.to_string())
+            .await)
+    }
+
+    /// **后台派发**：回合内解析模型 + 查额度（两者都要读 `config`，不能带进后台），
+    /// 之后把 owned 的 `ChildTask` 交给 `tokio::spawn`。
+    ///
+    /// 任务完成时把结果作为 `Boundary::Deferred` **推进父边界源** ⇒ `BasicLoop` 在
+    /// 下一个轮边界 append 进会话并 emit `DeferredResult`。**模型不需要 poll。**
+    ///
+    /// # 生命周期（与同步 `run` 的**有意差异**）
+    ///
+    /// **回合末不等异步子 agent**。父回合结束 ⇒ `BasicLoop` 不再拉边界源 ⇒
+    /// 推进去的 `Deferred` 无人消费；任务本身仍受 `child_budget` watchdog 约束，
+    /// 最迟在预算到点以 `Cancelled` 收尾（转录照写）。⇒ 不存在孤儿。
+    ///
+    /// 这条差异是**设计选择**：异步派发的价值是「父回合能继续」，不是「结果必然送达」。
+    /// 要保证拿到结果就用同步的 `subagent`。
+    fn spawn(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        _boundary: Option<&dyn BoundarySource>,
+    ) -> Result<String, String> {
+        let resolved = self.resolve_model(model)?;
+        self.take_dispatch_slot()?;
+        let child_limits = self.child_limits_for(model);
+        let sink = self
+            .result_sink
+            .clone()
+            .ok_or_else(|| "本回合未挂载结果回投通道（异步派发不可用）".to_string())?;
+
+        // 句柄 = 本回合第 N 次派发（`take_dispatch_slot` 已自增 ⇒ 直接取当前值）。
+        // 只用于让模型 / UI 区分是哪个后台任务，**不需要全局唯一**。
+        let handle = format!("sa{}", self.dispatched.load(Ordering::Relaxed));
+        let task = self.child_task(resolved, child_limits);
+        let prompt = prompt.to_string();
+        let handle_for_task = handle.clone();
+
+        tokio::spawn(async move {
+            let outcome = task.execute(prompt).await;
+            // 渲染成一条消息推进边界源。角色用 `User` 沿压缩摘要的先例
+            // （ADR-0017 决策 12：系统注入走 `User`）—— **区分来源靠事件类型**
+            // （`DeferredResult`），不是靠角色。
+            sink.push(Boundary::Deferred {
+                handle: handle_for_task,
+                message: Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: render_outcome_text(&outcome),
+                    }],
+                },
+            });
+        });
+        Ok(handle)
+    }
+}
+
+/// 把一次派发的结果渲染成**纯文本**（供 `Boundary::Deferred` 的消息正文）。
+///
+/// 与工具结果那份（`SubagentTool::call` 里的拼装）内容是同一套：
+/// 诊断前缀 → 摘要 → 转录指针。抽成函数是为了两条路径**不漂移**。
+fn render_outcome_text(out: &SubagentOutcome) -> String {
+    let mut content = String::new();
+    if let Some(d) = &out.diagnostic {
+        content.push_str(d);
+    }
+    if !out.summary.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&out.summary);
+    }
+    if let Some(a) = &out.artifact {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&format!("[full transcript: {a}]"));
+    }
+    content
+}
+
+impl AppSubagentRunner<'_> {
+    /// 把「一次派发」需要的**全部输入**收成 [`ChildTask`]。
+    ///
+    /// `model` / `child_limits` 由调用方**在回合内**解析好（解析要读 `config`，
+    /// 而 `config` 是借用、不可 `'static`）⇒ 收成的 `ChildTask` 只含 owned 字段。
+    /// 解析要用的模型（`model` 参数 → 缓存 / 构造；`None` → 父模型）。
+    ///
+    /// 抽出来是因为 `run` 与 `spawn` **都要**它，而 fail-closed 纪律不能写两遍。
+    fn resolve_model(&self, model: Option<&str>) -> Result<Arc<dyn Model>, String> {
         let owned: Option<Arc<dyn Model>> = match model {
             None => None,
             Some(name) => {
@@ -397,15 +505,17 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 }
             }
         };
-        let resolved: Arc<dyn Model> = match owned {
-            Some(m) => m,
+        match owned {
+            Some(m) => Ok(m),
             None => self
                 .parent_model
                 .clone()
-                .ok_or_else(|| "无可用模型（未登录 / 未配置）".to_string())?,
-        };
+                .ok_or_else(|| "无可用模型（未登录 / 未配置）".to_string()),
+        }
+    }
 
-        // 每回合派发总量上限（ADR-0022 决策 15）。
+    /// 占用一个**本回合**派发额度（同步与后台派发**共用**同一个计数器）。
+    fn take_dispatch_slot(&self) -> Result<(), String> {
         let n = self.dispatched.fetch_add(1, Ordering::Relaxed);
         if n >= self.max_dispatches {
             return Err(format!(
@@ -413,28 +523,19 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 self.max_dispatches
             ));
         }
-
-        // 子换 model ⇒ 窗口必须按**子模型**取（继承父窗口是**静默错**：32k 模型按 1M 判
-        // ⇒ 不压缩 ⇒ 撞窗）。默认继承时不改（与父同值）。
-        let mut child_limits = self.child_limits.clone();
-        if let (Some(cfg), Some(name)) = (self.config, model) {
-            child_limits.context_window = cfg.context_window_for(name);
-        }
-
-        // 执行交给 owned 的 `ChildTask` —— 同步 `run` 与异步 `spawn` **共用同一份**
-        // 执行逻辑（否则两条路径的行为会漂移：结果打包、诊断、usage 上卷全在手写两份）。
-        Ok(self
-            .child_task(resolved, child_limits)
-            .execute(prompt.to_string())
-            .await)
+        Ok(())
     }
-}
 
-impl AppSubagentRunner<'_> {
-    /// 把「一次派发」需要的**全部输入**收成 [`ChildTask`]。
-    ///
-    /// `model` / `child_limits` 由调用方**在回合内**解析好（解析要读 `config`，
-    /// 而 `config` 是借用、不可 `'static`）⇒ 收成的 `ChildTask` 只含 owned 字段。
+    /// 子换 model ⇒ 窗口必须按**子模型**取（继承父窗口是**静默错**：32k 模型按 1M
+    /// 判 ⇒ 不压缩 ⇒ 撞窗）。默认继承时不改（与父同值）。
+    fn child_limits_for(&self, model: Option<&str>) -> RunLimits {
+        let mut limits = self.child_limits.clone();
+        if let (Some(cfg), Some(name)) = (self.config, model) {
+            limits.context_window = cfg.context_window_for(name);
+        }
+        limits
+    }
+
     fn child_task(&self, model: Arc<dyn Model>, child_limits: RunLimits) -> ChildTask {
         ChildTask {
             model,
@@ -892,6 +993,79 @@ impl Tool for SubagentTool {
     }
 }
 
+/// **后台**派发工具：立刻返回句柄，子 agent 在后台跑；**结果会自动注入会话**。
+///
+/// 存在的理由（实测，会话 `1792579023_125340094`）：同步派发把父回合钉死 ——
+/// 14 次派发累计阻塞 **3,605 s**，最长一次 **965 s**；而 turn 16 的三次派发
+/// 分在**三轮**里（965 / 511 / 355 s）⇒ 串行 1,831 s，同一批只需 965 s。
+///
+/// **不需要 poll**：完成时结果作为 `Boundary::Deferred` 注入，`BasicLoop` 在下一个
+/// 轮边界 append 进会话 ⇒ 模型不必记句柄、也不可能「忘记取」。
+pub struct SubagentAsyncTool;
+
+impl SubagentAsyncTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SubagentAsyncTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for SubagentAsyncTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "subagent_async",
+            "Start a sub-agent in the background and get a handle back immediately; it keeps \
+             working while you do other things, and its result is delivered to you \
+             automatically when it finishes — you do NOT need to poll. Prefer this over \
+             `subagent` when you want to dispatch several sub-tasks at once, or when you want \
+             to keep answering the user while the sub-agent works",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "3-5 word label for the user (shown in the tool line)"},
+                    "prompt": {"type": "string", "description": "Complete self-contained task; the sub-agent does NOT see this conversation"},
+                    "model": {"type": "string", "description": "Optional model override"}
+                },
+                "required": ["description", "prompt"]
+            }),
+        )
+    }
+
+    /// 只登记后台任务（不跑子 agent）⇒ 与其它只读工具一样可并发。
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value, ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
+        let prompt = input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("`prompt` 必填".into()))?;
+        let model = input.get("model").and_then(|v| v.as_str());
+        let runner = ctx
+            .subagent
+            .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
+        let handle = runner
+            .spawn(prompt, model, ctx.boundary)
+            .map_err(ToolError::Execution)?;
+        Ok(ToolResult {
+            content: format!(
+                "Started sub-agent in the background.\nhandle: {handle}\n\
+                 Its result will be delivered to you automatically when it finishes — do NOT \
+                 poll for it. Keep working on your own part now. It is cancelled if this turn \
+                 ends before it finishes."
+            ),
+            is_error: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1148,6 +1322,7 @@ mod tests {
             dir.clone(),
             totals.clone(),
             None,
+            None,
         );
 
         let out = runner.run("查 X", None, None).await.unwrap();
@@ -1214,6 +1389,7 @@ mod tests {
             web,
             Arc::new(SubagentsDir::at(base.join("subagents"), false)),
             Arc::new(UsageTotals::default()),
+            None,
             None,
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {
@@ -1308,6 +1484,7 @@ mod tests {
                 dir(),
                 Arc::new(UsageTotals::default()),
                 None,
+                None,
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -1331,6 +1508,7 @@ mod tests {
                 web(),
                 dir(),
                 Arc::new(UsageTotals::default()),
+                None,
                 None,
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
@@ -1623,6 +1801,7 @@ mod tests {
             dir,
             Arc::new(UsageTotals::default()),
             None,
+            None,
         )
     }
 
@@ -1661,7 +1840,88 @@ mod tests {
             dir,
             Arc::new(UsageTotals::default()),
             parent_boundary,
+            None,
         )
+    }
+
+    /// **异步派发的核心**：`spawn` 立刻返回句柄，完成后结果作为 `Boundary::Deferred`
+    /// **自动推进父边界源**（不需要 poll）。
+    ///
+    /// 承重三点：
+    ///  1. `spawn` **不阻塞**（子模型慢 200ms，但 `spawn` 立刻返回）；
+    ///  2. 结果**自动**出现在边界源里，且带句柄；
+    ///  3. 正文含子 agent 的摘要（不是空消息）。
+    ///
+    /// 变异：① 删掉 `sink.push(...)` ⇒ 第 2 点变红；
+    ///       ② 把 `spawn` 改成 `run().await` ⇒ 第 1 点变红。
+    #[tokio::test]
+    async fn spawn_pushes_deferred_result_without_polling() {
+        use std::sync::Arc as StdArc;
+
+        use ys_model::MockModel;
+        use ys_protocol::QueueBoundarySource;
+
+        let base = unique_subagent_test_dir("spawn_deferred");
+        std::fs::create_dir_all(&base).unwrap();
+
+        let model = MockModel::new("m");
+        model.push_text("ASYNC-SUMMARY-MARKER");
+        let sink = StdArc::new(QueueBoundarySource::new());
+
+        let runner = AppSubagentRunner::new(
+            Some(Arc::new(model)),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            "child prompt".to_string(),
+            RunLimits::new(3),
+            Duration::from_secs(30),
+            base.clone(),
+            WebConfig::offline(ys_tools_web::FetchedDir::Temp(base.join("fetched"))),
+            Arc::new(SubagentsDir::at(base.join("artifacts"), false)),
+            Arc::new(UsageTotals::default()),
+            Some(sink.clone()),
+            Some(sink.clone()),
+        );
+
+        // ① `spawn` 立刻返回（不等子 agent 跑完）。
+        let started = Instant::now();
+        let handle = runner.spawn("查一下", None, None).expect("应能启动");
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "spawn 必须立刻返回（实际 {:?}）",
+            started.elapsed()
+        );
+        assert_eq!(handle, "sa1", "首个句柄应为 sa1");
+
+        // ② 等后台任务把结果推进边界源（轮询 `take`，最多 5 秒）。
+        let mut got = None;
+        for _ in 0..250 {
+            if let Some(b) = sink.take() {
+                got = Some(b);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let Some(Boundary::Deferred { handle, message }) = got else {
+            panic!("完成后必须自动推进一条 Boundary::Deferred（不需要 poll）");
+        };
+        assert_eq!(handle, "sa1", "Deferred 必须带产出它的句柄");
+
+        // ③ 正文含子 agent 的摘要。
+        let text: String = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("ASYNC-SUMMARY-MARKER"),
+            "Deferred 正文应包含子 agent 的摘要，实际：{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

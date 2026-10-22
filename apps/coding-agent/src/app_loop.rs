@@ -1144,6 +1144,8 @@ async fn run_turn_once(
                 model_arc.clone(),
                 ctx.subagent_totals.clone(),
                 Some(boundary.clone()),
+                // 后台结果回投到**同一份**边界源（`Deferred` 在轮边界被取走）。
+                Some(boundary.clone()),
             )
         });
         let mut agent_ports = AgentPorts::new(

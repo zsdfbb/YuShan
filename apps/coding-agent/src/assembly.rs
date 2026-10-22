@@ -163,7 +163,11 @@ impl AgentFactory {
                 context.session().clone(),
             )));
         }
+        // **追加顺序是契约**：`subagent_async` 必须排在 `subagent` **之后** ——
+        // 子表（= 基础 9 元）仍是父表 JSON 的**字节前缀**（`toolset.rs` 的
+        // `prefix_fingerprint_is_anchored_and_stable` 钉住这条）。
         tools.push(Box::new(SubagentTool::new(subagent.outer_timeout())));
+        tools.push(Box::new(crate::subagent::SubagentAsyncTool::new()));
         let specs: Vec<_> = tools.iter().map(|t| t.spec()).collect();
         // `run_start` 的工具元数据：名字 + spec 的 JSON 字节数（不记内容）。
         let tool_specs: Vec<(String, usize)> = specs
@@ -277,12 +281,13 @@ mod tests {
                 "bash_bg".to_string(),
                 "bash_poll".to_string(),
                 "subagent".to_string(),
+                "subagent_async".to_string(),
             ])
             .collect();
         assert_eq!(
             built_short.agent.tool_names(),
             expected,
-            "父表应为 9 基础 + bash_bg + bash_poll + subagent（末位）"
+            "父表应为 9 基础 + bash_bg + bash_poll + subagent + subagent_async（后两者追加在末位）"
         );
         assert_eq!(
             built_long.agent.tool_names(),
@@ -331,12 +336,12 @@ mod tests {
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert_eq!(parent_names.len(), 12, "真实父表应为 12 元");
+        assert_eq!(parent_names.len(), 13, "真实父表应为 13 元");
         assert_eq!(built.child_specs.len(), 9, "真实子表应为 9 元");
         assert_eq!(
             built.agent.tool_names().len(),
-            12,
-            "注册进 agent 的父表应为 12 元"
+            13,
+            "注册进 agent 的父表应为 13 元"
         );
         assert!(
             !built.child_specs.iter().any(|spec| spec.name == "bash_bg"),
@@ -351,16 +356,18 @@ mod tests {
             "父表 JSON 必须以子表 JSON 去末尾 `]` 开头（前缀不变量）"
         );
 
-        // 追加段（子表之后的那几项）必须是 `bash_bg` + `bash_poll` + `subagent`
-        // —— 顺序即契约：两个后台工具排在派发工具**之前**。
+        // 追加段（子表之后的那几项）必须是
+        // `bash_bg` + `bash_poll` + `subagent` + `subagent_async`
+        // —— 顺序即契约：两个后台工具排在派发工具**之前**；`subagent_async`
+        // 排在 `subagent` **之后**（新增项只能往后加，否则已缓存的父前缀提前断掉）。
         let appended = &parent_json[child_json.len() - 1..];
         let tail: Vec<ys_tool::ToolSpec> = built.parent_specs[built.child_specs.len()..].to_vec();
         assert_eq!(
             tail.iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<&str>>(),
-            vec!["bash_bg", "bash_poll", "subagent"],
-            "父表的追加段必须是 bg×2 + subagent（顺序即契约）"
+            vec!["bash_bg", "bash_poll", "subagent", "subagent_async"],
+            "父表的追加段必须是 bg×2 + subagent + subagent_async（顺序即契约）"
         );
         let tail_json = serde_json::to_string(&tail).unwrap();
         assert_eq!(
@@ -389,15 +396,18 @@ mod tests {
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
+        // **派发工具族必须在末位**（顺序固定）——子表（基础 9 元）仍是父表 JSON 的
+        // 字节前缀。`subagent_async` 必须排在 `subagent` **之后**，不得插在中间
+        // （那会让已缓存的父前缀提前断掉）。
         assert_eq!(
-            parent_names.last().copied(),
-            Some("subagent"),
-            "`subagent` 必须仍是父表末位"
+            &parent_names[parent_names.len() - 2..],
+            &["subagent", "subagent_async"],
+            "派发工具族必须按 [subagent, subagent_async] 收尾"
         );
         assert_eq!(
             built.agent.tool_names().last().map(String::as_str),
-            Some("subagent"),
-            "注册进 agent 的父表末位也必须是 `subagent`"
+            Some("subagent_async"),
+            "注册进 agent 的父表末位也必须是 `subagent_async`"
         );
 
         let _ = std::fs::remove_dir_all(&base);

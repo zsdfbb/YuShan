@@ -48,6 +48,33 @@ pub trait SubagentRunner: Send + Sync {
         model: Option<&str>,
         boundary: Option<&dyn BoundarySource>,
     ) -> Result<SubagentOutcome, String>;
+
+    /// **后台派发**：立刻返回句柄，子 agent 在后台跑；**结果会自动注入会话**。
+    ///
+    /// `Err` = **启动失败**（模型名解析失败 / 本回合额度用尽）。与 [`Self::run`] 同一
+    /// fail-closed 纪律：绝不静默回退到父模型。
+    ///
+    /// # 结果怎么回来 —— **不是 poll**
+    ///
+    /// 实现方在完成时把结果作为 `Boundary::Deferred` **推进父回合的边界源**，
+    /// `BasicLoop` 在下一个**轮边界**把它 append 进会话并 emit `DeferredResult`。
+    /// 模型不必轮询、也不可能「忘记取」。
+    ///
+    /// # 生命周期契约（**结构保证，不靠自觉**）
+    ///
+    /// 后台任务的存活期**不超过创建它的 runner**。runner 随回合结束被 drop ⇒
+    /// 未完成的任务一律取消。⇒ **回合末不等异步子 agent** —— 这与同步 `run` 的语义
+    /// 差异是**有意**的：异步派发的价值是「父回合能继续」，不是「结果一定送达」。
+    ///
+    /// 默认实现 = 不支持（返回 `Err`）⇒ 只挂同步派发的实现方不必改。
+    fn spawn(
+        &self,
+        _prompt: &str,
+        _model: Option<&str>,
+        _boundary: Option<&dyn BoundarySource>,
+    ) -> Result<String, String> {
+        Err("本实现不支持后台派发".to_string())
+    }
 }
 
 #[cfg(test)]

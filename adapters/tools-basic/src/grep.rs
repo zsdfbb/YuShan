@@ -95,15 +95,20 @@ impl Tool for GrepTool {
             "Search file contents for a pattern. Returns matching lines with file paths and line \
              numbers. Respects .gitignore when ripgrep (rg) is available; the POSIX fallback \
              (grep -r) does NOT and instead skips .git/target/node_modules/dist/build/.venv. \
-             A `glob` containing '/' (e.g. 'src/*.rs') matches at any depth under `path` when rg \
-             is available; the POSIX fallback rejects such globs (use a basename glob like \
-             '*.rs' there). Returns at most `limit` matches (default 100); long lines are cut to \
-             500 chars and output is capped at 2000 lines / 50KB.",
+             A `glob` containing '/' (e.g. 'src/*.rs') matches at any depth under the search \
+             target when rg is available; the POSIX fallback rejects such globs (use a basename \
+             glob like '*.rs' there). Returns at most `limit` matches (default 100); long lines \
+             are cut to 500 chars and output is capped to 2000 lines / 50KB.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Search pattern (regex or literal string)" },
-                    "path": { "type": "string", "description": "Directory or file to search (default: the workspace root). Relative paths resolve against the workspace root." },
+                    "path": { "type": "string", "description": "Single directory or file to search (default: the workspace root). Relative paths resolve against the workspace root. For several targets use `paths` instead - do NOT chain greps through bash." },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Several directories/files to search in ONE call (e.g. [\"crates/a\", \"docs\"]). Relative paths resolve against the workspace root. Supersedes `path`. Prefer this over chaining `grep a && grep b` through bash."
+                    },
                     "glob": { "type": "string", "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" },
                     "ignoreCase": { "type": "boolean", "description": "Case-insensitive search (default: false)" },
                     "literal": { "type": "boolean", "description": "Treat pattern as literal string instead of regex (default: false)" },
@@ -125,8 +130,46 @@ impl Tool for GrepTool {
         let pattern = input["pattern"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing 'pattern'".into()))?;
+        // **多目标**：`paths` 非空时优先（`path` 被它覆盖）。
+        //
+        // 存在理由（实测）：真实会话里 316 条 bash 命令含 grep，其中 56 条在**一条命令里
+        // 串了多个 grep**（`grep a && grep b`）或给了**多个目标目录**
+        // （`grep -rn pat dir1 dir2 dir3`）—— 结构化 `grep` 只吃一个 `path`，
+        // 模型只能退回 bash，代价是丢掉 `.gitignore` 语义与统一截断形态。
+        let targets: Vec<String> = input
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         let path = input["path"].as_str().unwrap_or(".");
-        let path_notice = absolute_notice("grep", path, &self.workspace);
+        let multi = targets.len() >= 2;
+        // 单目标：保持既有取数（`path`，缺省 `.`）；多目标：用 `paths`。
+        let search_paths: Vec<std::path::PathBuf> = if multi {
+            targets.iter().map(|t| self.workspace.join(t)).collect()
+        } else {
+            vec![self.workspace.join(path)]
+        };
+        // 相对化根：**多目标时用 workspace**（所有目标都在其下 ⇒ 回显带目标前缀，
+        // 不会出现「三个目标下的 `lib.rs` 看起来同名」的歧义）；
+        // 单目标时沿用该目标本身（**既有行为逐字节不变**）。
+        let rel_root = if multi {
+            self.workspace.clone()
+        } else {
+            search_paths[0].clone()
+        };
+        // 绝对路径提示：多目标时查第一条绝对路径。
+        let notice_probe = if multi {
+            targets.first().map(String::as_str).unwrap_or(path)
+        } else {
+            path
+        };
+        let path_notice = absolute_notice("grep", notice_probe, &self.workspace);
         let glob = input["glob"].as_str();
         let ignore_case = input["ignoreCase"].as_bool().unwrap_or(false);
         let literal = input["literal"].as_bool().unwrap_or(false);
@@ -136,8 +179,6 @@ impl Tool for GrepTool {
         let context_clamped = requested_context > MAX_CONTEXT;
         // `limit` 至少为 1：0 会让「已截断」判定恒真、并产出 `Use limit=0 for more` 这类废话。
         let limit = (input["limit"].as_u64().unwrap_or(DEFAULT_LIMIT as u64) as usize).max(1);
-
-        let search_root = self.workspace.join(path);
 
         let (label, argv, native) = match &self.backends.rg {
             Some(rg) => {
@@ -160,7 +201,7 @@ impl Tool for GrepTool {
                 }
                 (
                     "ripgrep",
-                    rg_argv(pattern, &search_root, glob, ignore_case, literal, context),
+                    rg_argv(pattern, &search_paths, glob, ignore_case, literal, context),
                     Some(rg.as_path()),
                 )
             }
@@ -183,7 +224,7 @@ impl Tool for GrepTool {
                 }
                 (
                     "grep",
-                    grep_argv(pattern, &search_root, glob, ignore_case, literal, context),
+                    grep_argv(pattern, &search_paths, glob, ignore_case, literal, context),
                     None,
                 )
             }
@@ -200,7 +241,7 @@ impl Tool for GrepTool {
         )
         .await?;
 
-        let entries = parse(&bounded.stdout, native.is_some(), &search_root);
+        let entries = parse(&bounded.stdout, native.is_some(), &rel_root);
 
         Ok(attach_notice(
             self.build_result(&bounded, &entries, limit, context, context_clamped, label),
@@ -327,7 +368,7 @@ impl GrepTool {
 /// **绝不省路径参数**（F3）：`rg` 在非 tty 下会改读 stdin，挂到 deadline。
 fn rg_argv(
     pattern: &str,
-    path: &Path,
+    paths: &[std::path::PathBuf],
     glob: Option<&str>,
     ignore_case: bool,
     literal: bool,
@@ -354,7 +395,10 @@ fn rg_argv(
     }
     argv.push("--".into());
     argv.push(pattern.into());
-    argv.push(path.to_string_lossy().into_owned());
+    // **多目标**：rg 原生接受多个搜索路径（`rg PATTERN d1 d2 d3`）。
+    for p in paths {
+        argv.push(p.to_string_lossy().into_owned());
+    }
     argv
 }
 
@@ -383,7 +427,7 @@ fn normalize_rg_glob(glob: &str) -> String {
 /// 排除目录**只作用于降级路径**：`rg` 自带 `.gitignore`，POSIX `grep` 没有。
 fn grep_argv(
     pattern: &str,
-    path: &Path,
+    paths: &[std::path::PathBuf],
     glob: Option<&str>,
     ignore_case: bool,
     literal: bool,
@@ -408,7 +452,10 @@ fn grep_argv(
     }
     argv.push("--".into());
     argv.push(pattern.into());
-    argv.push(path.to_string_lossy().into_owned());
+    // **多目标**：GNU grep 也接受多个搜索路径（`grep -rn PATTERN d1 d2`）。
+    for p in paths {
+        argv.push(p.to_string_lossy().into_owned());
+    }
     argv
 }
 
@@ -641,6 +688,90 @@ mod tests {
         }
         std::fs::write(path, &buf).unwrap();
         buf.len()
+    }
+
+    // ── ⓪ C1：多目标（`paths`）─────────────────────────────────────────────
+
+    /// **C1**：`paths` 把多个目标一次带给 rg（而不是让模型串 bash）。
+    ///
+    /// 承重的三点：
+    ///  1. **argv 真的带上了每个目标** —— 假 `rg` 用 `printf '...%s...' "$*"` 把
+    ///     **收到的全部参数**写进命中文本，故断言文本里同时出现两个目标
+    ///     （光看回显路径验不出 argv —— 早期版本的假 rg 忽略 argv，变异漏网）；
+    ///  2. 回显路径相对化到 **workspace**（不是第一个目标）⇒ 多目标的文件名不歧义；
+    ///  3. 退出码 0 ⇒ 不报错。
+    ///
+    /// 变异：① `search_paths` 只取第一个目标 ⇒ 断言 1 变红；
+    ///       ② `argv` 只推第一个路径 ⇒ 断言 1 变红；
+    ///       ③ `rel_root` 换成第一个目标 ⇒ 断言 2 变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_target_paths_reach_rg_argv_and_relativize_to_workspace() {
+        let dir = test_dir("multi_target");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(ws.join("crates/a")).unwrap();
+        std::fs::create_dir_all(ws.join("docs")).unwrap();
+
+        // 假 rg：一行合法 `rg --json` 命中事件，`text` 用 `$*` 填（= 收到的全部参数）。
+        // 路径用**绝对**形态（在 workspace 下）⇒ 相对化根不同会给出不同回显。
+        let abs = ws.join("crates/a/f.txt");
+        let rg = fake_bin(
+            &dir,
+            "rg",
+            &format!(
+                "printf '{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"{}\"}},\
+                 \"line_number\":7,\"lines\":{{\"text\":\"%s\"}}}}}}\\n' \"$*\"\nexit 0\n",
+                abs.display()
+            ),
+        );
+
+        let tool = rg_tool(&rg, &ws);
+        let res = call(
+            &tool,
+            json!({ "pattern": "x", "paths": ["crates/a", "docs"] }),
+        )
+        .await;
+        assert!(!res.is_error, "多目标不应报错：{}", res.content);
+
+        // ① argv 含**两个**目标（不是只有第一个）。
+        assert!(
+            res.content.contains("crates/a") && res.content.contains("docs"),
+            "argv 必须同时带上两个目标，实际：{}",
+            res.content
+        );
+        // ② 相对化到 workspace ⇒ 带 `crates/a/` 前缀（单目标会被剥掉）。
+        assert!(
+            res.content.contains("crates/a/f.txt"),
+            "多目标应相对化到 workspace（带目标前缀），实际：{}",
+            res.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 单目标：**既有行为逐字节不变**（相对化根仍是该目标本身）。
+    ///
+    /// 变异：把 `rel_root` 无条件改成 workspace ⇒ 本用例与既有用例一起变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_target_still_relativizes_to_that_target() {
+        let dir = test_dir("single_target");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(ws.join("crates/a")).unwrap();
+
+        let abs = ws.join("crates/a/f.txt");
+        let out = rg_match_jsonl(&abs.to_string_lossy(), 7, "hit");
+        let rg = fake_bin(&dir, "rg", &format!("cat <<'EOF'\n{out}\nEOF\nexit 0\n"));
+
+        let tool = rg_tool(&rg, &ws);
+        let res = call(&tool, json!({ "pattern": "x", "path": "crates/a" })).await;
+        assert!(!res.is_error, "{}", res.content);
+        // 单目标：相对化根 = 该目标 ⇒ **不带** `crates/a/` 前缀。
+        assert!(
+            !res.content.contains("crates/a/"),
+            "单目标应相对化到该目标本身（既有行为不变），实际：{}",
+            res.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── ① 退出码四态（设计 §1.4）：**先看 stop，再看 code** ────────────────

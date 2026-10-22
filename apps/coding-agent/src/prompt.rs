@@ -241,7 +241,9 @@ fn tool_guidelines(tools: &[&str]) -> String {
             "To inspect several files or directories, send several tool calls in one message — \
              read-only calls in a batch run in parallel. For a whole directory or a glob, one \
              shell loop is fine and beats enumerating paths by hand; keep single-file reads on \
-             the structured tools"
+             the structured tools. To search several targets at once, pass `grep` a `paths` \
+             array in ONE call instead of chaining `grep a && grep b` through bash — chaining \
+             loses .gitignore semantics and the unified truncation form"
                 .to_string(),
         );
     }

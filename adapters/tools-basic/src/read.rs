@@ -27,6 +27,11 @@ impl Tool for ReadTool {
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to read. Relative paths resolve against the workspace root; use an absolute path only for files outside it." },
                     "offset": { "type": "number", "description": "Line number to start reading from (1-indexed)" },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Several files to read in ONE call (e.g. [\"Cargo.toml\", \"README.md\"]). Relative paths resolve against the workspace root. Supersedes `path`. Prefer this over chaining `cat a && cat b` through bash."
+                    },
                     "limit": { "type": "number", "description": "Maximum number of lines to read" }
                 },
                 "required": ["path"]
@@ -41,11 +46,33 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, input: Value, _ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        let path = input["path"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("missing 'path'".into()))?;
         let offset = input["offset"].as_u64().map(|v| v as usize);
         let limit = input["limit"].as_u64().map(|v| v as usize);
+
+        // **多文件**：`paths` 给出 >=2 个目标时一次读完（实测动机：真实会话里
+        // 10 条 bash 用 `cat a && cat b && cat c` 串读多个文件 —— 结构化 `read`
+        // 只吃一个 `path`，模型只能退回 bash，丢掉统一截断与 notice 形态）。
+        //
+        // 单文件（含只给 `path`）走下面的既有路径，**输出逐字节不变**。
+        let targets: Vec<String> = input
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if targets.len() >= 2 {
+            return self.read_many(&targets, offset, limit).await;
+        }
+
+        let path = input["path"]
+            .as_str()
+            .or_else(|| targets.first().map(String::as_str))
+            .ok_or_else(|| ToolError::InvalidInput("missing 'path'".into()))?;
         let path_notice = absolute_notice("read", path, &self.workspace);
 
         let abs_path = self.workspace.join(path);
@@ -115,6 +142,92 @@ impl Tool for ReadTool {
             path_notice.as_deref(),
         ))
     }
+}
+
+impl ReadTool {
+    /// 一次读**多个**文件：逐文件渲染后拼接，**共享**一个字节预算。
+    ///
+    /// 形态：每个文件前加一行 `=== <path> ===` 分隔头（否则多文件输出无法区分边界）。
+    ///
+    /// **单文件失败不拖垮整批**：该文件位置写一行 `[read failed: <err>]` 并继续 ——
+    /// 与 bash 的 `cat a && cat b`（前一个失败即中断）**不同**，这是有意的：
+    /// 一次要读多个文件时，一个不存在不该让另外几个白读。
+    ///
+    /// **字节预算**：`MAX_BYTES` 是**整批**上限（不是每文件）⇒ 多读几个文件不会
+    /// 把上下文撑爆；超预算的文件在 `=== path ===` 头之后被截断并附续读提示。
+    async fn read_many(
+        &self,
+        targets: &[String],
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ToolResult, ToolError> {
+        let mut out = String::new();
+        let mut budget = ys_tool::MAX_BYTES;
+        let mut any_ok = false;
+
+        for t in targets {
+            let header = format!("=== {t} ===");
+            out.push_str(&header);
+            out.push('\n');
+
+            let abs = self.workspace.join(t);
+            match tokio::fs::read_to_string(&abs).await {
+                Err(e) => {
+                    out.push_str(&format!("[read failed: {e}]\n\n"));
+                    budget = budget.saturating_sub(header.len() + 2);
+                    continue;
+                }
+                Ok(content) => {
+                    any_ok = true;
+                    let body = render_one(&content, offset, limit);
+                    // 按剩余预算截断（`head_lines` 兜住行数上限）。
+                    let lines: Vec<String> = body.lines().map(str::to_string).collect();
+                    let truncated = ys_tool::head_lines(&lines, ys_tool::MAX_LINES, budget);
+                    out.push_str(&truncated.content);
+                    if truncated.shown_lines < lines.len() {
+                        out.push_str(&format!(
+                            "\n[truncated at {} bytes across the batch — read this file \
+                             separately with offset/limit for more]\n",
+                            ys_tool::MAX_BYTES
+                        ));
+                    }
+                    out.push('\n');
+                    budget = budget.saturating_sub(truncated.content.len() + 1);
+                }
+            }
+        }
+
+        if !any_ok {
+            return Ok(ToolResult {
+                content: out.trim_end().to_string(),
+                is_error: true,
+            });
+        }
+        Ok(ToolResult {
+            content: out.trim_end().to_string(),
+            is_error: false,
+        })
+    }
+}
+
+/// 把文件内容渲染成 `{行号:>6}\t{内容}`（可按 `offset`/`limit` 取区间）。
+///
+/// 单文件路径（`call`）与多文件路径（`read_many`）**共用**同一份渲染 ——
+/// 否则两条路径的行号/区间语义会漂移。
+fn render_one(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total == 0 {
+        return String::new();
+    }
+    let start = offset.unwrap_or(1).saturating_sub(1).min(total);
+    let end = limit.map(|l| (start + l).min(total)).unwrap_or(total);
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{line}", start + i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -241,6 +354,115 @@ mod tests {
         assert!(result.content.contains("line1"));
         assert!(result.content.contains("line2"));
         assert!(result.content.contains("line3"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// **C2**：`paths` 一次读多个文件，带分隔头，且单文件失败不拖垮整批。
+    ///
+    /// 承重三点：
+    ///  1. 两个文件的内容**都**出现；
+    ///  2. 每个文件前有 `=== <path> ===` 分隔头（否则多文件输出无法区分边界）；
+    ///  3. 某个目标不存在时**其余仍被读出**（与 `cat a && cat b` 的中断语义不同，有意为之）。
+    ///
+    /// 变异：① 多文件分支改成只读第一个 ⇒ 断言 1 变红；
+    ///       ② 不写分隔头 ⇒ 断言 2 变红；
+    ///       ③ 遇错即 `return` ⇒ 断言 3 变红。
+    #[tokio::test]
+    async fn multi_file_reads_in_one_call_with_headers() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        tokio::fs::write(dir.join("a.txt"), "alpha\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("b.txt"), "beta\n").await.unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let ctx = make_ctx();
+
+        let result = tool
+            .call(json!({ "paths": ["a.txt", "b.txt"] }), ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error, "多文件读不应报错：{}", result.content);
+        assert!(
+            result.content.contains("alpha"),
+            "缺 a.txt 内容：{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("beta"),
+            "缺 b.txt 内容：{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("=== a.txt ===") && result.content.contains("=== b.txt ==="),
+            "每个文件前必须有分隔头：{}",
+            result.content
+        );
+
+        // 缺失的文件不拖垮整批。
+        let ctx2 = make_ctx();
+        let partial = tool
+            .call(json!({ "paths": ["a.txt", "missing.txt", "b.txt"] }), ctx2)
+            .await
+            .unwrap();
+        assert!(
+            partial.content.contains("alpha") && partial.content.contains("beta"),
+            "某个目标缺失时其余文件仍应被读出：{}",
+            partial.content
+        );
+        assert!(
+            !partial.is_error,
+            "部分成功时不该标成整批失败：{}",
+            partial.content
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 单文件路径**逐字节不变**（不含分隔头、行号形态不变）。
+    ///
+    /// 变异：让单文件也走 `read_many` ⇒ 多出分隔头 ⇒ 变红。
+    #[tokio::test]
+    async fn single_file_read_has_no_header() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        tokio::fs::write(dir.join("one.txt"), "only\n")
+            .await
+            .unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let result = tool
+            .call(json!({ "path": "one.txt" }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(
+            !result.content.contains("=== "),
+            "单文件不应有分隔头：{}",
+            result.content
+        );
+        assert!(result.content.contains("only"));
+        assert!(
+            result.content.starts_with("     1\t"),
+            "单文件行号形态必须不变：{}",
+            result.content
+        );
+
+        // `paths` **只有一个元素**时也必须退化为单文件形态（无分隔头）——
+        // 否则「多目标」的阈值判断（`>= 2`）被改成 `>= 1` 时没人抓。
+        let one = tool
+            .call(json!({ "paths": ["one.txt"] }), make_ctx())
+            .await
+            .unwrap();
+        assert!(
+            !one.content.contains("=== "),
+            "`paths` 单元素应退化为单文件形态（无分隔头）：{}",
+            one.content
+        );
+        assert!(one.content.starts_with("     1\t"), "{}", one.content);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

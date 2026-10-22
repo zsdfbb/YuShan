@@ -159,8 +159,16 @@ emit 的事件会躺在 `sink_rx` 直到下个 `Prompt` 才转发 → 顺序错�
 
 ## 已知遗留 / 后续
 
-1. **估算器未与真实 usage 对账，且不计 system prompt / 工具表**（系统性低估）——
-   第二刀 `TokenLedger` 的目标，**须赶在 skills（D1）之前完成**。skills 落地会再加 ~9k 输入，低估风险放大。
+1. **[部分已关闭] 估算器不计 system prompt / 工具表** —— **触发判定侧已关闭**：
+   `RunLimits.fixed_prompt_tokens`（由 `apps/coding-agent/src/main.rs` 的 `fixed_prompt_tokens()`
+   按 system prompt + 工具表 spec 算出）**已存在**，且 `crates/ys-loop/src/basic.rs` 的 Step 4b
+   已把它计入判定（`estimated + fixed > trigger`）⇒ **压缩的「该不该触发」不再漏算固定开销**。
+   **但「压完还剩多少」的口径仍漏算**：`crates/ys-loop/src/compact.rs` 的
+   `estimated_tokens_before/after` 只数会话消息 ⇒ `ContextCompacted` 事件的数字
+   **系统性低估固定开销**（实测 8 次压缩一致低估 8,785~11,658 token，均值 ~10,260）。
+   ⇒ 剩余工作是**修正事件口径**，并决策 **`keep_budget` 的切分是否应含固定开销**
+   （当前不含 ⇒ 压完真实占用 = 保留段 + 固定开销，**必然超预算** ⇒ 这是回弹的真实机理）。
+   依据：`docs/arch/session-latency/review.md` §R2。
 2. **`replace_all` 先赋值后 flush**（`self.messages = messages; flush_to_file()`）：落盘失败时内存领先磁盘。
    有 `Err` 上报、可自愈，且与既有 `append` / `clear` **同形**（都是「先改内存后落盘」）。
 3. **`plan()` 只约束保留段自洽**：若会话**首条**就是 `ToolResult`，它不受 P1-2 保护（正常会话不会这样）。

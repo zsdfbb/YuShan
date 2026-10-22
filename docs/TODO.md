@@ -98,6 +98,20 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 ## D. 其他尾巴
 
+- **PTC（程序化工具调用）—— 长期方向，本轮明确不做**（ADR-0048 决策）：
+  模型写一段代码调工具、**只有 curated 结果进模型历史** ⇒ N 次工具调用收敛为**一轮**模型往返。
+  是四家同类（deepseek-harness `core/tools/src/ptc.ts:1-8`）里**唯一能改变轮次数量级**的机制，
+  本仓零。**不做它的理由**：需执行边界，与本仓「不做安全（沙箱/隔离/权限/审批由上层解决）」
+  的硬约束正面冲突，且约 2,500+ 行。**触发重开的条件**：上层项目给出执行边界，
+  或轮数差距（同题对照 codex 6 轮 vs 我们 33 轮）成为主要瓶颈。
+  设计依据 `docs/arch/session-latency/design.md` §4.3 决策点 1。
+- **`docs/arch/session-latency/` 的 D2（subagent 工具表约束）未做**：子 agent 现状拿到与父
+  **完全相同的 9 个工具**（`apps/coding-agent/src/subagent.rs:421`），需按角色换表
+  （ADR-0022 D14 已裁定「能力 = 创建时给的工具表」）。**但受前缀指纹锚约束**
+  （`apps/coding-agent/src/toolset.rs:568`）⇒ 须**装配期预建多张表**，
+  不可把角色做成 `subagent` 工具入参（会动 `ToolSpec`、破「子表 JSON 是父表字节前缀」）。
+  另需满足 D15「提示词不可见 + 执行时拒绝」双实现。**需先走 `arch-design`**。
+
 - **`toolset.rs` 的 `PATH` 改写会波及不持锁的用例**：`apps/coding-agent/src/toolset.rs:193`
   的 `set_path` 把进程 `PATH` 指向空目录（它自己持 `env_lock` + RAII 还原，纪律是对的），
   但**别的**用例若要 `spawn` 一个按 `PATH` 解析的二进制（`sh` 等）而**不持同一把锁**，

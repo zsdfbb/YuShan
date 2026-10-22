@@ -108,7 +108,34 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 **`Agent::system_prompt()` getter**（ADR-0007 风格）—— `/compact` 用它取活对话的 system
 ⇒ 与自动压缩**同一口径**。
 
-## 变异测试（16 处，全部被抓到）
+## C 组（工具形态，C1–C7）— 全部落地
+
+| # | 措施 | 落点 | 实测依据 |
+|---|---|---|---|
+| **C1** | `grep` 多目标 `paths` | `adapters/tools-basic/src/grep.rs` | 316 条 bash 含 grep，56 条串了多个 |
+| **C2** | `read` 多文件 `paths` | `adapters/tools-basic/src/read.rs` | 10 条 bash 用 `cat a && cat b` |
+| **C3** | 冗余 `cd <ws>` **真剥离** | `adapters/tools-basic/src/bash.rs` | 554/560（99%）带前缀 |
+| **C4** | 长命令指引**点名**构建/测试 | `apps/coding-agent/src/prompt.rs` | 44 次 `cargo test` 走 bash，`bash_bg` 仅 7 次 |
+| **C5** | 连续只读段调度 | `crates/ys-loop/src/basic.rs` + **ADR-0040** | 97% 的多调用轮拿不到并行 |
+| **C6** | 结果预算是**可配**的（`YUSHAN_RESULT_BUDGET_BYTES`） | `crates/ys-tool/src/truncate.rs` | 为 A/B 留口子 |
+| **C7** | `read` 预算收窄到 **16 KiB** | `crates/ys-tool/src/truncate.rs` + `read.rs` | read 占字节 40.8%；50 KiB 从未撞到 |
+
+### C6/C7 被实测否掉的两个方向（重要）
+
+| 候选 | 实测结论 |
+|---|---|
+| 降 `read` 的 50 KiB 硬闸门 | **从未撞到**（0/118 次）⇒ 单改它等于没改 |
+| 给 `bash` 也加预算 | 中位仅 1,221 B，8 KiB 上限只省 **3%**；而构建日志**尾部**正是错误所在（`bash` 用 `tail()` 保尾）⇒ 风险 > 收益 |
+
+⇒ 只有 `read` 值得收窄（占 40.8% 字节、截断可恢复）。16 KiB 下约 **5%** 的 read 被截断、
+省约 **13%** read 字节。⚠️ **收益仍待实跑 A/B**（截断会增加轮数，抵消多少未知）。
+
+### 一个设计陷阱（已钉住）
+
+软阈值提示与硬截断**互斥** ⇒ 预算若等于软阈值（8 KiB），软提示对 `read` 成**死代码**。
+故预算必须**严格大于**软阈值（取 16 KiB），由 `const { assert!(..) }` 在编译期钉住。
+
+## 变异测试（35 处，全部被抓到）
 
 | # | 变异 | 断言 |
 |---|---|---|
@@ -128,6 +155,12 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 | M14 | 不追加末尾 user 指令 | 同上 |
 | M15 | 指令插在**最前**（破坏前缀） | 同上 |
 | M16 | 摘要请求带上 `tools` | 同上 |
+| M17–M19 | grep 多目标（只取第一个 / 相对化根 / argv 只推一个） | `grep::multi_target_*` + `single_target_*` |
+| M20–M23 | read 多文件（只读一个 / 无分隔头 / 遇错中断 / 单文件走多文件分支） | `read::multi_file_reads_*` + `single_file_*` |
+| M24–M27 | `cd` 剥离（不剥 / 文案 / 逃生口 / 误剥有位移） | `bash::plan_cd_strip_*` |
+| M28–M29 | 长命令点名（删列表 / 只点一部分） | `prompt::background_command_*` |
+| M30–M31 | 分段调度（回旧逻辑 / 未命中当安全） | `basic::leading_safe_run_*` + `unknown_tool_*` |
+| M32–M35 | read 预算（换回 50 KiB / 等于软阈值 / env 不钳 / 宽于硬闸门） | `read::read_caps_result_*` + `truncate::read_*` |
 
 ⚠️ **一个测试设计教训（已踩）**：M4 最初**漏网** ——
 `/status` 的测试用 `CodingView::for_test()` **手工设** `executed`，绕过了 `build_view` 的传递链

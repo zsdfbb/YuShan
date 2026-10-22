@@ -609,8 +609,8 @@ ADR 决策 10 说「摘要调用复用**活对话 + 一条末尾 user 指令**�
 | **D1** | subagent 异步化 | 派发后父回合**立即继续**；结果在后续轮次拿到 | 单测（事件序 + 时序） |
 | **O1** | `run_start` 反映运行期换模型 | 换模型后有事件记录新 provider / effort | 单测 |
 | **C5** | 分段并行（降级为「消除退化」） | 21 个混合轮不再退化串行 | 变异测试（ADR-0040） |
-| **C6** | **工具结果体积预算**（⚠️ 新增自 §1.1，**待实跑验证**） | 单次工具结果 ≤ 预算；超限走**截断 + 定位指针**（不丢内容可寻址性） | 单测 + **实跑 A/B**（`fact/1`）；⚠️ 离线重放**不可信** |
-| **C7** | **`read` 默认收窄**（⚠️ 新增自 §1.1，**待实跑验证**） | `read` 单次中位从 4,720 B 降到 ≤2 KB；分块 `read` 次数**不上升** | 单测 + **实跑 A/B** |
+| **C6** | **工具结果预算可配**（✅ 已落地：`YUSHAN_RESULT_BUDGET_BYTES`） | 值被钳制在 `[512, MAX_BYTES]` | 单测（`read_result_budget_env_is_clamped`） |
+| **C7** | **`read` 默认收窄到 16 KiB**（✅ 已落地） | 截断后必有 `Use offset=` 续读通知；预算严格大于软阈值 | 单测（`read_caps_result_at_narrower_budget_than_bash`）；⚠️ **收益仍待实跑 A/B** |
 | **D2** | subagent 工具表约束（**另案**） | 只读子 agent 的表里**没有** `bash`/`write` | 需先 `arch-design` |
 
 ### 7.1 验收口径的前提（⚠️ 补自 review.md）
@@ -708,17 +708,17 @@ ADR 决策 10 说「摘要调用复用**活对话 + 一条末尾 user 指令**�
 
 | # | 项 | 依赖 | 产出 |
 |---|---|---|---|
-| C1 | `grep` 多目标 | — | `grep.rs`（⚠️ 同步更新前缀指纹锚，review.md R3） |
-| C2 | `read` 目录/glob | — | `read.rs`（同上） |
+| C1 | `grep` 多目标 ✅ **已落地** | — | `grep.rs`（⚠️ 同步更新前缀指纹锚，review.md R3） |
+| C2 | `read` 多文件（`paths`）✅ **已落地** | — | `read.rs`（同上） |
 | C3 | `cd` 剥离（**复用 `redundant_root_cd()`**） | 第一期 R1 补 | `bash.rs` + 等价性测试 |
-| C4 | 长命令走 `bash_bg`（**机制已存在** ⇒ 主要成本在 guideline 引导） | — | `prompt.rs` 引导 |
+| C4 | 长命令走 `bash_bg`（**仅改 guideline**）✅ **已落地** | — | `prompt.rs` 引导 |
 | — | guideline 同步改 | C1/C2 | `prompt.rs`（**必须同批**） |
 
 **第三期-B · 异步化**（C5 + D1）
 
 | # | 项 | 依赖 | 产出 |
 |---|---|---|---|
-| C5 | 分段并行（消除退化） | C1/C2 | ADR-0040 + `basic.rs` |
+| C5 | 分段并行 ✅ **已落地（ADR-0040）** | C1/C2 | ADR-0040 + `basic.rs` |
 | D1 | subagent 异步化（**需先定形态**，review.md R4） | — | `subagent.rs` + `SubagentHandle` |
 
 **验收**：`bash` 占比下降；分块 `read` 次数下降；subagent 派发后父回合立即继续。

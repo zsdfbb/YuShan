@@ -202,6 +202,40 @@ fn render_result(
 /// 故这条 `cd` 不产生任何位移，判定的唯一用途是**在结果里回一行事实**（模型无从
 /// 核对「我在哪」，只能自己每轮钉一次位置）。
 ///
+/// 决定这次调用**实际执行哪条命令**，以及要不要回一行事实注记。
+///
+/// 返回 `(实际执行的命令, 注记)`：
+/// - 冗余前缀 **且** 逃生口关闭 ⇒ `(tail, "…was removed")` —— **真的剥离**；
+/// - 冗余前缀 **但** 逃生口打开 ⇒ `(原命令, "…changed nothing")` —— 旧行为；
+/// - 非冗余（含 `cd` 去别处）⇒ `(原命令, None)` —— **完全不动**。
+///
+/// **抽成纯函数**是为了可直接单测「剥离与否」这件事 —— 走 `call` 只能看到
+/// 命令输出，而 `cd <ws> && X` 与 `X` 在当前目录相同时**输出完全一样** ⇒
+/// 无法从输出判别是否剥离（注入假 `sh` 又要改进程 `PATH`，与并行测试冲突）。
+fn plan_cd_strip<'a>(
+    command: &'a str,
+    workspace: &Path,
+    keep_cd: bool,
+) -> (&'a str, Option<String>) {
+    match redundant_root_cd(command, workspace) {
+        Some(tail) if !keep_cd => (
+            tail,
+            Some(format!(
+                "[bash: this shell already started in {}; the leading cd was removed]",
+                workspace.display()
+            )),
+        ),
+        Some(_) => (
+            command,
+            Some(format!(
+                "[bash: this shell already started in {}; the leading cd changed nothing]",
+                workspace.display()
+            )),
+        ),
+        None => (command, None),
+    }
+}
+
 /// 只认**第一段**的 `cd <path> && 余下`：`<path>` 允许裸串 / 单引号 / 双引号；
 /// `余下` 必须非空（`cd <目录> &&` 是语法错误，不是零位移）。两侧 `canonicalize`
 /// 后比较，任一侧失败则退化为「相对路径按 `workspace` 拼接后字面比较」（此时
@@ -210,43 +244,39 @@ fn render_result(
 /// **不认**：`cd ~/…`、`cd $VAR`、`cd -`、`;` 分隔，以及 `cd <目录>` 之后不带命令的
 /// 裸 `cd` —— 前几者要展开才知道指向何处，后者没有「下文命令」可省，报了没意义。
 /// 指向 workspace **子目录**的 `cd` 是有意义的位移，一律不认。
-fn redundant_root_cd(command: &str, workspace: &Path) -> bool {
+fn redundant_root_cd<'a>(command: &'a str, workspace: &Path) -> Option<&'a str> {
     let rest = command.trim_start();
-    let Some(after) = rest.strip_prefix("cd") else {
-        return false;
-    };
+    let after = rest.strip_prefix("cd")?;
     // `cd` 之后必须是空白，否则是 `cdrom` / `cdparanoia` 这类命令词的开头
     if !after.starts_with(char::is_whitespace) {
-        return false;
+        return None;
     }
-    let Some((token, tail)) = take_shell_token(after.trim_start()) else {
-        return false;
-    };
+    let (token, tail) = take_shell_token(after.trim_start())?;
     // 只认 `&&` 分隔：`;` 后的命令与这条 `cd` 不在同一「若非成功则不执行」链上。
     // 其后必须**真的有命令** —— `cd <目录> &&` 会被 `sh` 判为语法错误，不是零位移的 no-op。
-    let Some(rest) = tail.trim_start().strip_prefix("&&") else {
-        return false;
-    };
+    let rest = tail.trim_start().strip_prefix("&&")?;
     if rest.trim().is_empty() {
-        return false;
+        return None;
     }
 
     let target = Path::new(token);
     // 空串（`cd "" && …`）在 `sh` 里是**失败**的切目录，不是 no-op；且
     // `workspace.join("")` 会退化成 `workspace/`，若不加这道守卫会被误判成冗余。
     if target.as_os_str().is_empty() {
-        return false;
+        return None;
     }
     let resolved = if target.is_absolute() {
         target.to_path_buf()
     } else {
         workspace.join(target)
     };
-    match (resolved.canonicalize(), workspace.canonicalize()) {
+    let same = match (resolved.canonicalize(), workspace.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         // 任一侧解析不到（目录不存在等）⇒ 退化为字面比较：宁可少说一行，不说错一句
         _ => resolved == workspace,
-    }
+    };
+    // 返回**余下的命令**（`&&` 之后）。调用方据此执行剥离后的命令。
+    same.then(|| rest.trim_start())
 }
 
 /// 从头切出一个 shell 词：裸串读到空白或 shell 元字符（`&;|<>()`），
@@ -340,19 +370,26 @@ impl Tool for BashTool {
             _ => {}
         }
 
-        // 命令以 `cd <本目录> && …` 开头 ⇒ 结果里回一行事实（判定规则见
-        // [`redundant_root_cd`]）。命令**照原样执行**，本变量只影响结果文案。
-        // `[bash: …]` 前缀标明这句是**工具说的**，不是命令输出（命令可以打印任意文本）。
-        let note = redundant_root_cd(command, &self.workspace).then(|| {
-            format!(
-                "[bash: this shell already started in {}; the leading cd changed nothing]",
-                self.workspace.display()
-            )
-        });
+        // **冗余 `cd` 前缀：剥离后再执行**（C3）。
+        //
+        // 判定复用 [`redundant_root_cd`]（ADR-0039 已实现：canonicalize 比对、引号处理、
+        // `cd <目录> &&` 语法错误排除）。旧行为是「照原样执行 + 回一行事实」，但实测
+        // 该注记**没能降低前缀率**（真实会话 560 条 bash 里 554 条仍带前缀，99%）⇒
+        // 改为**真的剥离**：工作目录本来就是 workspace，`cd <workspace>` 是零位移。
+        //
+        // **逃生口**：`YUSHAN_KEEP_CD=1` 保留旧行为（只注记、不剥离）—— 万一某条命令
+        // 依赖「`cd` 出现在命令行里」本身（如脚本自省 `$0`/`$@`），可关掉。
+        //
+        // ⚠️ **守卫不可省**：真实会话里 **7 条**命令是 `cd <其它目录> && …`（如
+        // `cd ~/.yushan/skills/x && ls`）—— 那是**有意义的位移**，`redundant_root_cd`
+        // 的 canonicalize 比对会放过它们。这也修正了 ADR-0039 的样本结论
+        //（「无一条是 cd 去别处」在本次样本不成立）。
+        let keep_cd = std::env::var_os("YUSHAN_KEEP_CD").is_some_and(|v| !v.is_empty() && v != "0");
+        let (effective_command, note) = plan_cd_strip(command, &self.workspace, keep_cd);
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg(command)
+            .arg(effective_command)
             .current_dir(&self.workspace)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -450,12 +487,9 @@ impl Tool for BashTool {
         };
 
         match outcome {
-            Ok((stdout, stderr, exit_code)) => Ok(render_result(
-                &stdout,
-                &stderr,
-                exit_code,
-                note.as_deref(),
-            )),
+            Ok((stdout, stderr, exit_code)) => {
+                Ok(render_result(&stdout, &stderr, exit_code, note.as_deref()))
+            }
             Err(outcome) => {
                 // 中止 / 超时 / 等待失败：先杀进程组（含孙进程），再杀子进程兜底，最后收尸
                 terminate(&mut child, pid).await;
@@ -468,9 +502,9 @@ impl Tool for BashTool {
                         "Command timed out after {} seconds",
                         deadline_secs(deadline)
                     )),
-                    WaitOutcome::Failed(msg) => ToolError::Execution(format!(
-                        "Failed to wait for command: {msg}"
-                    )),
+                    WaitOutcome::Failed(msg) => {
+                        ToolError::Execution(format!("Failed to wait for command: {msg}"))
+                    }
                 })
             }
         }
@@ -1347,7 +1381,13 @@ mod tests {
             "cd . && ls".to_string(),
             format!("cd {abs} && cd sub && ls"),
         ] {
-            assert!(redundant_root_cd(&cmd, &ws), "应判为冗余：{cmd}");
+            let tail = redundant_root_cd(&cmd, &ws);
+            assert!(tail.is_some(), "应判为冗余：{cmd}");
+            // 剥离后的余下命令**必须以 `ls` 结尾**（前缀确实被摘掉了）。
+            assert!(
+                tail.is_some_and(|t| t.ends_with("ls")),
+                "剥离结果应是 `&& ` 之后的命令：{cmd} ⇒ {tail:?}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1393,17 +1433,65 @@ mod tests {
             format!("cd {abs} ; ls"),
             format!("cd {abs} &&"),
         ] {
-            assert!(!redundant_root_cd(&cmd, &ws), "不应判为冗余：{cmd}");
+            assert!(
+                redundant_root_cd(&cmd, &ws).is_none(),
+                "不应判为冗余：{cmd}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 走完整 `call` 路径：冗余 `cd` 的那一次在结果里回一行**工具自撰的事实**，
+    /// **C3 的核心**：冗余前缀**真的被剥离**，且注记文案随之改变。
+    ///
+    /// 走纯函数而非 `call`：`cd <ws> && X` 与 `X` 在当前目录相同时**输出完全一样**
+    /// ⇒ 从 `call` 的输出无法判别是否剥离；注入假 `sh` 又得改进程 `PATH`
+    /// （与同 crate 的并行用例冲突）。
+    ///
+    /// 变异：① `Some(tail) if !keep_cd` 分支返回 `command` ⇒ 第 ① 段变红；
+    ///       ② 注记文案写回 "changed nothing" ⇒ 第 ① 段变红。
+    #[test]
+    fn plan_cd_strip_actually_strips_redundant_prefix() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = dir.canonicalize().unwrap();
+        let abs = ws.display().to_string();
+
+        // ① 冗余 + 逃生口关闭 ⇒ 执行**剥离后**的命令，注记说 removed。
+        let cmd = format!("cd {abs} && echo hi");
+        let (effective, note) = plan_cd_strip(&cmd, &ws, false);
+        assert_eq!(effective, "echo hi", "必须真的剥离");
+        let note = note.expect("冗余时应回一行事实");
+        assert!(note.contains("was removed"), "注记应说明已剥离：{note}");
+
+        // ② 冗余 + 逃生口打开 ⇒ 原样执行，注记说 changed nothing（旧行为）。
+        let (effective, note) = plan_cd_strip(&cmd, &ws, true);
+        assert_eq!(effective, cmd, "逃生口打开时必须原样执行");
+        let note = note.expect("仍应回一行事实");
+        assert!(note.contains("changed nothing"), "{note}");
+
+        // ③ 非冗余（`cd` 去**别处**）⇒ 完全不动、不注记。
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let other = format!("cd {abs}/sub && ls");
+        let (effective, note) = plan_cd_strip(&other, &ws, false);
+        assert_eq!(effective, other, "有位移的 cd 绝不剥离");
+        assert!(note.is_none(), "非冗余不该注记");
+
+        // ④ 无 `cd` 前缀 ⇒ 不动、不注记。
+        let (effective, note) = plan_cd_strip("echo hi", &ws, false);
+        assert_eq!(effective, "echo hi");
+        assert!(note.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 走完整 `call` 路径：冗余 `cd` **被剥掉**（C3），结果里回一行**工具自撰的事实**，
     /// 其余调用一概没有；且命令自身的输出**逐字节不变**，`is_error` 语义不变。
     ///
     /// 变异：① 删掉 `render_result` 里的注记追加 ⇒ 第 ②③④ 段全红；
-    /// ② 把追加改成 `insert_str(0, …)` ⇒ 「退码行仍在最后一行」变红。
+    /// ② 把追加改成 `insert_str(0, …)` ⇒ 「退码行仍在最后一行」变红；
+    /// ③ 把 `effective_command` 换回 `command`（即不剥离）⇒ 仍绿（注记照旧）——
+    ///    这一条**由 `plan_cd_strip_actually_strips_redundant_prefix` 单独钉住**。
     #[tokio::test]
     async fn test_redundant_cd_note_is_added_only_when_the_cd_has_no_displacement() {
         let dir = test_dir();
@@ -1411,7 +1499,7 @@ mod tests {
         let ws = dir.canonicalize().unwrap();
         let abs = ws.display().to_string();
         let note =
-            format!("[bash: this shell already started in {abs}; the leading cd changed nothing]");
+            format!("[bash: this shell already started in {abs}; the leading cd was removed]");
         let tool = BashTool::new(ws.clone());
 
         // ① 无前缀 ⇒ 无注记，输出就是命令输出
@@ -1488,7 +1576,7 @@ mod tests {
         );
         assert!(
             result.content.ends_with(&format!(
-                "[bash: this shell already started in {abs}; the leading cd changed nothing]"
+                "[bash: this shell already started in {abs}; the leading cd was removed]"
             )),
             "注记应在最末"
         );
@@ -1778,7 +1866,10 @@ mod tests {
             msg.contains("Command timed out after 0 seconds"),
             "文案须逐字写生效值（0s），实际：{msg}"
         );
-        assert!(!msg.contains("after 1 seconds"), "文案不得把 0 抬到 1：{msg}");
+        assert!(
+            !msg.contains("after 1 seconds"),
+            "文案不得把 0 抬到 1：{msg}"
+        );
         assert!(
             elapsed < Duration::from_secs(3),
             "生效 deadline 为 0 ⇒ 必须立刻返回，实际耗时 {elapsed:?}"

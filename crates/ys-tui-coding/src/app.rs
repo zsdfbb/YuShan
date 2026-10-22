@@ -370,6 +370,25 @@ impl App {
                 )));
                 self.note_appended_below();
             }
+            AgentEvent::DeferredResult { handle, message } => {
+                // 后台子 agent 的结果注入会话。**这不是终局事件** —— 回合仍在跑
+                // （`BasicLoop` 会在下一个轮边界把它 append 进会话并继续），
+                // 故只推一行系统提示，**不调** `finish_turn`。
+                //
+                // **只显示首行**：摘要有 8 KiB 上限（`MAX_SUMMARY_BYTES`），整段塞进
+                // transcript 会把它刷满。模型看的是完整正文（已进会话），用户看的是
+                // 「哪个后台任务回来了 + 一眼摘要」。
+                let text = message_text(&message);
+                let head = text
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("(empty)")
+                    .trim();
+                self.transcript.push(TranscriptLine::System(format!(
+                    "↓ {handle} finished: {head}"
+                )));
+                self.note_appended_below();
+            }
             AgentEvent::ResponseTruncated { dropped_tool_calls } => {
                 // 非终局事件：有工具调用时循环会**继续**（那批工具被作废、未执行），
                 // 故这里只推一行警告、**不调** `finish_turn`。
@@ -648,6 +667,49 @@ mod tests {
         snapshot.thinking_visible = false;
         a.apply_outbound(Outbound::View(snapshot));
         assert!(a.thinking_visible, "快照不得覆盖运行期真值");
+    }
+
+    /// **异步子 agent 的结果到达**：渲染一行系统提示，且**不结束回合**。
+    ///
+    /// 承重三点：
+    ///  1. 出现一行 System 行，含句柄与摘要首行；
+    ///  2. **只显示首行** —— 摘要有 8 KiB 上限，整段塞进 transcript 会刷满
+    ///     （模型看的是完整正文，它在会话里）；
+    ///  3. **不调 `finish_turn`** —— 这是非终局事件，回合仍在跑。
+    ///
+    /// 变异：① 删掉这个分支 ⇒ 第 1 点变红（事件被 `_ => {}` 吞掉，用户看不到任何反馈）；
+    ///       ② 改成显示整段 ⇒ 第 2 点变红；③ 调 `finish_turn()` ⇒ 第 3 点变红。
+    #[test]
+    fn deferred_result_renders_one_line_and_keeps_turn_running() {
+        let mut a = app();
+        // 模拟「回合进行中」：`RoundStarted` 只设轮号，不置 `is_turning` ⇒
+        // 用 `begin_local_turn` 造出真实的回合态。
+        a.begin_local_turn("先问一句".into());
+        assert!(a.is_turning, "先确认处于回合内");
+
+        let long = format!("首行摘要\n{}", "填充内容".repeat(500));
+        a.apply_event(env(AgentEvent::DeferredResult {
+            handle: "sa1".into(),
+            message: Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: long }],
+            },
+        }));
+
+        let last = a.transcript.last().expect("应有新行");
+        match last {
+            TranscriptLine::System(s) => {
+                assert!(s.contains("sa1"), "必须标明是哪个后台任务：{s}");
+                assert!(s.contains("首行摘要"), "应带上摘要首行：{s}");
+                assert!(
+                    !s.contains("填充内容"),
+                    "只显示首行（摘要有 8 KiB 上限，整段会刷屏）：{s}"
+                );
+                assert!(s.lines().count() <= 1, "必须压成一行：{s}");
+            }
+            other => panic!("应是 System 行，得到 {other:?}"),
+        }
+        assert!(a.is_turning, "非终局事件不得结束回合");
     }
 
     fn env(event: AgentEvent) -> Envelope {

@@ -356,10 +356,15 @@ pub async fn new_session(wiring: &mut Wiring) -> Vec<String> {
 /// `policy` 与 `window` 由 app 侧从 `config` 取（与 agent 读的是同一份配置）：
 /// 手动 `/compact` **不等自动触发阈值** —— 用户点了就压。窗口参与的是
 /// 「保留多少」（`policy.keep_budget(window)`），不是「是否触发」。
+///
+/// `fixed_prompt_tokens` 是**每轮固定开销**（system prompt + 工具表 spec）的估算 ——
+/// 它每次请求都重发却不在会话消息里 ⇒ 压缩后的**真实占用** = 会话估算 **+ 本值**。
+/// 传 `0` 会让报出的数字**低估**（与自动压缩不同口径 ⇒ 不可取）。
 pub async fn compact(
     wiring: &mut Wiring,
     policy: &ys_component::CompactPolicy,
     window: usize,
+    fixed_prompt_tokens: usize,
 ) -> Vec<String> {
     // model 与会话必须**同时**借出：`Wiring::ports` 是唯一的同时借出口
     // （分开借会被借用检查器拦下 —— model 的不可变借用压着 session 的可变借用）。
@@ -377,7 +382,7 @@ pub async fn compact(
         return vec!["Nothing to compact.".to_string()];
     };
 
-    match ys_loop::execute(messages, &plan, model, policy).await {
+    match ys_loop::execute(messages, &plan, model, policy, fixed_prompt_tokens).await {
         Ok(outcome) => {
             let before = outcome.estimated_tokens_before;
             let after = outcome.estimated_tokens_after;
@@ -1264,7 +1269,13 @@ mod tests {
         let before = wiring.session_messages().to_vec();
         assert_eq!(before.len(), 6);
 
-        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+        let out = compact(
+            &mut wiring,
+            &ys_component::CompactPolicy::default(),
+            3000,
+            0,
+        )
+        .await;
 
         let after = wiring.session_messages();
         assert!(
@@ -1317,7 +1328,13 @@ mod tests {
         seed(&mut wiring, 6, 100).await;
         let before = wiring.session_messages().to_vec();
 
-        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+        let out = compact(
+            &mut wiring,
+            &ys_component::CompactPolicy::default(),
+            3000,
+            0,
+        )
+        .await;
 
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].contains("no model configured"), "{out:?}");
@@ -1355,7 +1372,13 @@ mod tests {
         let path = wiring.session_path().unwrap().to_path_buf();
         let file_before = std::fs::read(&path).unwrap();
 
-        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+        let out = compact(
+            &mut wiring,
+            &ys_component::CompactPolicy::default(),
+            3000,
+            0,
+        )
+        .await;
 
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].contains("Compaction failed"), "{out:?}");
@@ -1390,7 +1413,13 @@ mod tests {
         seed(&mut wiring, 1, 100).await;
         let before = wiring.session_messages().to_vec();
 
-        let out = compact(&mut wiring, &ys_component::CompactPolicy::default(), 3000).await;
+        let out = compact(
+            &mut wiring,
+            &ys_component::CompactPolicy::default(),
+            3000,
+            0,
+        )
+        .await;
 
         assert_eq!(out, vec!["Nothing to compact.".to_string()], "{out:?}");
         assert_eq!(wiring.session_messages(), before.as_slice());
@@ -1744,10 +1773,8 @@ mod tests {
         });
 
         // 接线器里先放一个旧实例，确认它被替换（而不是「本来就为空」）。
-        let mut wiring = Wiring::ephemeral(
-            Some(Box::new(DummyModel)),
-            Box::new(CollectingSink::new()),
-        );
+        let mut wiring =
+            Wiring::ephemeral(Some(Box::new(DummyModel)), Box::new(CollectingSink::new()));
 
         let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
 
@@ -1789,10 +1816,8 @@ mod tests {
         let (mut config, dir) = test_config();
         config.api_base = None;
         config.api_key = None;
-        let mut wiring = Wiring::ephemeral(
-            Some(Box::new(DummyModel)),
-            Box::new(CollectingSink::new()),
-        );
+        let mut wiring =
+            Wiring::ephemeral(Some(Box::new(DummyModel)), Box::new(CollectingSink::new()));
         assert_eq!(wiring.model_id(), Some("dummy"), "测试前提");
 
         let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
@@ -1986,11 +2011,7 @@ mod tests {
         let built = build_candidate_model(&mut cfg, &choice, Some(EffortLevel::Max));
 
         assert!(built.is_none(), "factory 恒 None ⇒ 构建失败");
-        assert_eq!(
-            cfg.effort,
-            Some(EffortLevel::Low),
-            "构建失败必须还原旧档位"
-        );
+        assert_eq!(cfg.effort, Some(EffortLevel::Low), "构建失败必须还原旧档位");
         assert_eq!(cfg.provider.as_deref(), Some("old-provider"));
         assert_eq!(cfg.api_base.as_deref(), Some("https://old.example"));
         assert_eq!(cfg.api_key.as_deref(), Some("old-key"));

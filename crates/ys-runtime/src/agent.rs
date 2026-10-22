@@ -149,6 +149,19 @@ impl Agent {
         self.limits.context_window
     }
 
+    /// 返回**每轮固定开销**的 token 估算（system prompt + 工具表 spec）。
+    ///
+    /// 这部分**每次请求都要重发**，却既不在会话消息里、也不参与压缩切分
+    /// ⇒ 压缩后的「真实占用」= 会话消息估算 **+ 本值**。
+    ///
+    /// **为什么需要暴露**：`/compact`（app 侧第二个调用方）要按**同一口径**
+    /// 报「压完还剩多少」⇒ 需要与自动压缩**同一个**数。
+    ///
+    /// ADR-0007 保留：只读查询，不依赖 `&mut Agent`。
+    pub fn fixed_prompt_tokens(&self) -> usize {
+        self.limits.fixed_prompt_tokens
+    }
+
     /// 设置 model 的 context window 大小（运行期刷新）。
     ///
     /// **为什么需要**：`/login`、`/model` 会在运行中换 provider/model，窗口差可达 16 倍。

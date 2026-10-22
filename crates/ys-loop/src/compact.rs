@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! plan(messages, policy, window) -> Option<CompactPlan>   // 纯函数、同步、无 IO，变异测试主靶
-//! execute(messages, &plan, model, policy).await           // 唯一 await 点（一次 model 调用）
+//! execute(messages, &plan, model, policy, fixed).await     // 唯一 await 点（一次 model 调用）
 //! ```
 //!
 //! ⚠️ **承重耦合（ADR-0017 决策 1）**：`plan()` 是纯同步函数、**绝不碰 model**，且必须在
@@ -140,8 +140,11 @@ pub struct CompactOutcome {
     /// 新消息表（摘要 + 保留段）—— 调用方拿它 `session.replace_all(...)`
     pub messages: Vec<Message>,
     /// 压缩前的**估算** token 数（启发式，非 provider 真实 usage）
+    ///
+    /// **含每轮固定开销**（system prompt + 工具表 spec）⇒ 与**真实占用**同口径。
+    /// ⚠️ 命名里的 `estimated_` 前缀仍然承重：这两项是**估算**，不是 provider 真实 usage。
     pub estimated_tokens_before: usize,
-    /// 压缩后的**估算** token 数
+    /// 压缩后的**估算** token 数（**同样含固定开销** ⇒ 与真实占用同口径）
     pub estimated_tokens_after: usize,
     /// 被摘要掉的消息条数
     pub summarized: usize,
@@ -170,11 +173,17 @@ pub enum CompactError {
 /// 一个字节都不动 —— 旧实现在这里 `clear()` + 写一行
 /// `[Compression failed — proceeding with truncated history]`，把几十万 token 的历史
 /// 换成一行占位符，那是**静默失忆**而不是降级。
+///
+/// **`fixed_prompt_tokens`**：每轮固定开销（system prompt + 工具表 spec）的 token 估算。
+/// 它**每次请求都要重发**却不在会话消息里 ⇒ 压缩后的**真实占用** =
+/// `estimated_tokens_after` **+ 本值**。传 `0` 表示调用方不知道该值
+/// （此时事件数字仍只数会话消息，**低估固定开销**）。
 pub async fn execute(
     messages: &[Message],
     plan: &CompactPlan,
     model: &dyn Model,
     policy: &CompactPolicy,
+    fixed_prompt_tokens: usize,
 ) -> Result<CompactOutcome, CompactError> {
     // 评审 R10 / P1-1：`plan()` 与 `execute()` 各收一次 `messages` ⇒ 索引可能错配。
     //
@@ -228,7 +237,8 @@ pub async fn execute(
         ));
     }
 
-    let estimated_tokens_before = crate::token::estimate_session_tokens(messages);
+    let estimated_tokens_before =
+        crate::token::estimate_session_tokens(messages) + fixed_prompt_tokens;
 
     // B-3：**先摘要，成功之后才构造新消息表** —— 任何失败都在 `?` 处返回，
     // 此时本函数尚未产出任何可变状态，调用方的 session 自然一个字节未动。
@@ -256,7 +266,7 @@ pub async fn execute(
         out.extend(to_keep.iter().cloned());
     }
 
-    let estimated_tokens_after = crate::token::estimate_session_tokens(&out);
+    let estimated_tokens_after = crate::token::estimate_session_tokens(&out) + fixed_prompt_tokens;
     Ok(CompactOutcome {
         messages: out,
         estimated_tokens_before,
@@ -464,7 +474,7 @@ mod tests {
         // 若早退被挪走（例如无条件 execute），上面的 panic 会把本测试打红。
         let model = NeverCalledModel;
         if let Some(p) = plan(&messages, &policy, 128_000) {
-            let _ = execute(&messages, &p, &model, &policy).await;
+            let _ = execute(&messages, &p, &model, &policy, 0).await;
         }
     }
 
@@ -615,7 +625,7 @@ mod tests {
             len: 2,
         };
         assert!(matches!(
-            execute(&messages, &empty_keep, &model, &policy).await,
+            execute(&messages, &empty_keep, &model, &policy, 0).await,
             Err(CompactError::Summarize(_))
         ));
 
@@ -626,7 +636,7 @@ mod tests {
             len: 2,
         };
         assert!(matches!(
-            execute(&messages, &out_of_range, &model, &policy).await,
+            execute(&messages, &out_of_range, &model, &policy, 0).await,
             Err(CompactError::Summarize(_))
         ));
     }
@@ -654,7 +664,7 @@ mod tests {
             len: 3, // 与 messages.len() = 5 不符 ⇒ 尾部 2 条会被静默丢弃
         };
 
-        let err = execute(&messages, &stale, &model, &policy)
+        let err = execute(&messages, &stale, &model, &policy, 0)
             .await
             .expect_err("plan.len 错配必须返回 Err（release 下同样生效）");
         let reason = err.to_string();
@@ -698,7 +708,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    execute(&messages, &p, &model, &policy).await,
+                    execute(&messages, &p, &model, &policy, 0).await,
                     Err(CompactError::Summarize(_))
                 ),
                 "{name} 畸形 plan 必须被拒绝：{p:?}"
@@ -720,7 +730,7 @@ mod tests {
             keep: 2..5,
             len: 5,
         };
-        let out = execute(&messages, &well_formed, &model, &policy)
+        let out = execute(&messages, &well_formed, &model, &policy, 0)
             .await
             .expect("无缝覆盖 0..len 的 plan 必须被接受");
         assert_eq!(out.summarized, 2);
@@ -728,6 +738,51 @@ mod tests {
     }
 
     // ==================== execute()：快乐路径 ====================
+
+    /// B1 的承重不变量：**压缩事件的 token 口径必须与「真实占用」同口径**。
+    ///
+    /// 「真实占用」= 会话消息估算 **+ 每轮固定开销**（system prompt + 工具表 spec）。
+    /// 那部分**每次请求都重发**却不在会话消息里 ⇒ 只数会话消息会**系统性低估**
+    /// （实测 8 次压缩一致低估 8,785~11,658 token，均值 ~10,260）。
+    ///
+    /// 变异：删掉 `+ fixed_prompt_tokens` ⇒ 变红。
+    #[tokio::test]
+    async fn estimated_tokens_include_fixed_prompt_overhead() {
+        let policy = CompactPolicy::default();
+        let messages = conversation(4, 100);
+        let p = plan(&messages, &policy, 3000).expect("应产出计划");
+
+        let model = MockModel::new("m");
+        model.push_text("简短摘要");
+
+        const FIXED: usize = 10_260;
+        let out = execute(&messages, &p, &model, &policy, FIXED)
+            .await
+            .unwrap();
+
+        // 口径自洽：**两个数都含固定开销** ⇒ 差值不受它影响。
+        let zero = {
+            let m2 = MockModel::new("m");
+            m2.push_text("简短摘要");
+            execute(&messages, &p, &m2, &policy, 0).await.unwrap()
+        };
+        assert_eq!(
+            out.estimated_tokens_before - zero.estimated_tokens_before,
+            FIXED,
+            "before 必须比「不计固定开销」时多出固定开销"
+        );
+        assert_eq!(
+            out.estimated_tokens_after - zero.estimated_tokens_after,
+            FIXED,
+            "after 必须比「不计固定开销」时多出固定开销"
+        );
+        // 「压完还剩多少」= after **已含**固定开销 ⇒ 不再低估。
+        assert!(
+            out.estimated_tokens_after >= FIXED,
+            "after 应至少等于固定开销（真实占用含它）：{}",
+            out.estimated_tokens_after
+        );
+    }
 
     /// 快乐路径：`after < before`、摘要恰好 1 条、保留段与输入切片**逐字相同**。
     ///
@@ -744,7 +799,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("简短摘要");
 
-        let out = execute(&messages, &p, &model, &policy).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
 
         assert_eq!(out.summarized, 1);
         assert_eq!(out.kept, 3);
@@ -806,7 +861,7 @@ mod tests {
         };
         let model = UsageModel(usage.clone());
 
-        let out = execute(&messages, &p, &model, &policy).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
         assert_eq!(out.usage, usage, "outcome 必须带回摘要调用的 usage");
     }
 
@@ -824,7 +879,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_tool_call("bash", serde_json::json!({"command": "ls"}));
 
-        let err = execute(&messages, &p, &model, &policy)
+        let err = execute(&messages, &p, &model, &policy, 0)
             .await
             .expect_err("无文本的响应必须是 Err，否则会写出空摘要静默丢历史");
         assert!(matches!(err, CompactError::Summarize(_)), "实际 = {err:?}");
@@ -841,7 +896,7 @@ mod tests {
         model.push_text("  \n\t  ");
 
         assert!(matches!(
-            execute(&messages, &p, &model, &policy).await,
+            execute(&messages, &p, &model, &policy, 0).await,
             Err(CompactError::Summarize(_))
         ));
     }
@@ -863,7 +918,7 @@ mod tests {
         model.push_error("provider 挂了");
         model.push_text("later");
 
-        let err = execute(&messages, &p, &model, &policy)
+        let err = execute(&messages, &p, &model, &policy, 0)
             .await
             .expect_err("模型报错必须冒泡成 Err");
         match err {
@@ -900,7 +955,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("摘要正文");
 
-        let out = execute(&messages, &p, &model, &policy).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
 
         assert_eq!(out.messages.len(), 2, "并入而非单插一条");
         assert_eq!(out.messages[0].role, Role::User);
@@ -933,7 +988,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("摘要正文");
 
-        let out = execute(&messages, &p, &model, &policy).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
 
         assert_eq!(out.messages.len(), 4, "3 条保留 + 1 条独立摘要");
         assert_eq!(out.messages[0].role, Role::User);
@@ -958,7 +1013,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("摘要");
 
-        let out = execute(&messages, &p, &model, &policy).await.unwrap();
+        let out = execute(&messages, &p, &model, &policy, 0).await.unwrap();
         assert_eq!(out.messages[0].role, Role::User);
         assert!(
             !out.messages.iter().any(|m| m.role == Role::System),
@@ -1030,7 +1085,7 @@ mod tests {
             last: Mutex::new(None),
         };
 
-        execute(&messages, &p, &model, &policy).await.unwrap();
+        execute(&messages, &p, &model, &policy, 0).await.unwrap();
 
         let req = model
             .last

@@ -608,7 +608,11 @@ pub async fn run(
                 // 窗口与策略都取自 `config` —— 与 agent 每回合用的那份同源
                 // （`/compact` 是用户显式触发的压缩，不等自动触发阈值）。
                 let policy = config.compact_policy();
-                lines = capabilities::compact(&mut wiring, &policy, config.context_window()).await;
+                // 固定开销取自 **agent 自己持有的** `limits` ⇒ 与自动压缩**同一口径**
+                // （`/compact` 若用自己的配置值，两条路径报的数字会不同口径）。
+                let fixed = agent.fixed_prompt_tokens();
+                lines = capabilities::compact(&mut wiring, &policy, config.context_window(), fixed)
+                    .await;
             }
 
             Request::Export { path } => {

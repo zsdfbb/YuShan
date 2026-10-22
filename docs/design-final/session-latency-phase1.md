@@ -11,15 +11,24 @@
 ② 换模型 / 换思考档位写一条 `model_changed` **debug 事件**（`run_start` 只是启动快照，不反映运行期切换）；
 ③ 压缩参数调优的**离线验证**已做，结论是「调参不是杠杆」。
 
+第二期第一刀落地 **B1**：压缩事件的 token 口径**计入每轮固定开销** ⇒
+「压完还剩多少」不再**系统性低估 ~10k**。
+
 ## 落点
 
 ```
 apps/coding-agent/src/status.rs      TurnStats 增 executed: Duration + record_elapsed()
 apps/coding-agent/src/app_loop.rs    回合末累加时长（成功与失败两条路径都算）
                                      + model_snapshot() / record_model_change()
+                                     + /compact 臂取 agent.fixed_prompt_tokens()
 apps/coding-agent/src/view.rs        build_view 透传 stats.executed
+apps/coding-agent/src/capabilities.rs /compact 增 fixed_prompt_tokens 参数
 crates/ys-tui-coding/src/view.rs     CodingView 增 executed + executed_duration_str()
 crates/ys-tui-coding/src/commands.rs /status 增「executed」行
+crates/ys-loop/src/compact.rs         execute() 增 fixed_prompt_tokens 参数
+                                     + estimated_tokens_before/after 计入它
+crates/ys-loop/src/basic.rs          自动压缩调用点传 ctx.limits.fixed_prompt_tokens
+crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-0007 风格）
 ```
 
 ## 关键行为（实现期定死，勿凭直觉改）
@@ -44,7 +53,22 @@ crates/ys-tui-coding/src/commands.rs /status 增「executed」行
   `supports_reasoning_effort`。
 - **没变就不记**（`/effort` 设成同值不刷事件）。
 
-## 变异测试（7 处，全部被抓到）
+## B1 的关键行为（实现期定死）
+
+**压缩事件的 token 口径**：`estimated_tokens_before/after` 现在**含每轮固定开销**
+（system prompt + 工具表 spec）⇒ 与「真实占用」**同口径**。
+
+**为什么必须含**：那部分**每次请求都重发**却不在会话消息里 ⇒ 只数会话消息会
+**系统性低估**（实测 8 次压缩一致低估 8,785~11,658 token，均值 ~10,260）。
+
+**`execute()` 签名变了**（加了 `fixed_prompt_tokens: usize`）—— `pub` API，但
+`ys-loop` 内部调用点 + app 侧 `/compact` 都已同步；传 `0` 表示「调用方不知道该值」
+（此时数字仍只数会话消息 ⇒ 低估）。
+
+**`/compact` 的固定开销取自 `agent.fixed_prompt_tokens()`**（不是自己算）⇒
+与自动压缩**同一口径**；`Agent` 新增该 getter（ADR-0007 风格的只读查询）。
+
+## 变异测试（9 处，全部被抓到）
 
 | # | 变异 | 断言 |
 |---|---|---|
@@ -55,6 +79,8 @@ crates/ys-tui-coding/src/commands.rs /status 增「executed」行
 | M5 | 删掉 `SetModel` 臂的 `record_model_change` | `app_loop::model_switch_is_observable_in_debug_log` |
 | M6 | `record_model_change` 永远提前返回 | 同上 |
 | M7 | `executed_duration_str` 恒返回 0 | `commands::status_text_reports_both_duration_notions` |
+| M8 | `estimated_tokens_after` 不计固定开销 | `compact::estimated_tokens_include_fixed_prompt_overhead` |
+| M9 | `estimated_tokens_before` 不计固定开销 | 同上 |
 
 ⚠️ **一个测试设计教训（已踩）**：M4 最初**漏网** ——
 `/status` 的测试用 `CodingView::for_test()` **手工设** `executed`，绕过了 `build_view` 的传递链

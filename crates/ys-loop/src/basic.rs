@@ -243,7 +243,7 @@ impl AgentLoop for BasicLoop {
                     && estimated + fixed > trigger
                     && let Some(plan) = compact::plan(messages, policy, window)
                 {
-                    match compact::execute(messages, &plan, ctx.model, policy).await {
+                    match compact::execute(messages, &plan, ctx.model, policy, fixed).await {
                         Ok(outcome) => {
                             // 成本口径必须先于写回上报：摘要调用的 token 已经真实消耗，
                             // 若 `replace_all` 失败会提前 `?` 返回 —— 放在写回前，写回失败

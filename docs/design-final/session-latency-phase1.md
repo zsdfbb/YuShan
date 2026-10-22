@@ -11,8 +11,10 @@
 ② 换模型 / 换思考档位写一条 `model_changed` **debug 事件**（`run_start` 只是启动快照，不反映运行期切换）；
 ③ 压缩参数调优的**离线验证**已做，结论是「调参不是杠杆」。
 
-第二期第一刀落地 **B1**：压缩事件的 token 口径**计入每轮固定开销** ⇒
-「压完还剩多少」不再**系统性低估 ~10k**。
+第二期落地两刀：**B1** 压缩事件的 token 口径**计入每轮固定开销** ⇒
+「压完还剩多少」不再**系统性低估 ~10k**；**B3** 摘要失败**降级到思考内容**
+⇒ 消除实测的 3 次「压缩失败」（真实成因**不是** tool-call ⇒ 设计原定的
+`tool_choice: none` **解决不了**，已换解法）。
 
 ## 落点
 
@@ -68,7 +70,25 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 **`/compact` 的固定开销取自 `agent.fixed_prompt_tokens()`**（不是自己算）⇒
 与自动压缩**同一口径**；`Agent` 新增该 getter（ADR-0007 风格的只读查询）。
 
-## 变异测试（9 处，全部被抓到）
+## B3 的关键行为（**解法与设计原定不同**）
+
+**真实成因**（实测 3 次压缩失败，真实会话 `1792579023_125340094`）：
+3 次的 `model_attempt` 全部 `outcome=success` / `http=200` ⇒ **模型确实回了**。
+适配器把 reasoning 走 `ThinkingDelta`、**不进** `ContentBlock::Text`
+⇒ 若模型该次**只输出思考、没输出正文**，终态就**没有** `Text` block
+⇒ 旧实现报「the model returned no text」。
+
+⚠️ **设计原定的 `tool_choice: none` 解决不了**：
+摘要请求本来就 `tools: vec![]`（适配器在空表时**不发** `tools` 字段）
+⇒ 模型**不可能**回 tool_call ⇒ 失败与 tool-choice 无关。
+
+**采用���解法**：摘要调用改用**收集型 sink**（`ThinkingFallbackSink`），
+正文为空时**降级到思考内容**；**既无正文又无思考**才报失败（B-2 语义保住）。
+
+**为什么降级是安全的**：thinking 至少是**模型为这段历史写的文字**，
+比「压缩失败、历史原地不动（并带 92k 上下文重试）」更有用。
+
+## 变异测试（12 处，全部被抓到）
 
 | # | 变异 | 断言 |
 |---|---|---|
@@ -81,6 +101,9 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 | M7 | `executed_duration_str` 恒返回 0 | `commands::status_text_reports_both_duration_notions` |
 | M8 | `estimated_tokens_after` 不计固定开销 | `compact::estimated_tokens_include_fixed_prompt_overhead` |
 | M9 | `estimated_tokens_before` 不计固定开销 | 同上 |
+| M10 | 删掉 thinking 降级分支 | `compact::reasoning_only_response_falls_back_to_thinking` |
+| M11 | sink 不收 `ThinkingDelta` | 同上 |
+| M12 | 「两者都空」的判定改成永远成功 | `compact::empty_response_without_thinking_still_fails` |
 
 ⚠️ **一个测试设计教训（已踩）**：M4 最初**漏网** ——
 `/status` 的测试用 `CodingView::for_test()` **手工设** `executed`，绕过了 `build_view` 的传递链
@@ -89,6 +112,12 @@ crates/ys-runtime/src/agent.rs        Agent::fixed_prompt_tokens() getter（ADR-
 ⚠️ **另一个教训（已踩）**：`model_switch_is_observable_in_debug_log` 最初扫**整个日志目录**找
 `model_changed` ⇒ 会命中**上一次运行的残留文件** ⇒ M5 漏网。
 修法：**只认文件名含本进程 pid 的文件**。
+
+⚠️ **第三个教训（已踩，且表现为 flaky）**：该用例最初用**默认日志目录**
+（`~/.yushan/logs`）⇒ 同进程内**并行测试**的 debug 文件名都是
+`debug-<pid>-<ts>.jsonl` ⇒ **撞名互相覆盖** ⇒ 用例 **2/3 次失败**。
+修法：照既有 debug 用例的模式，把 `YUSHAN_LOG_DIR` 指到**临时目录**
+（`TempDir::new` + `DebugEnv::set`）⇒ 连跑 5 次全绿。
 
 ## 第二期及以后：不在本文件范围
 

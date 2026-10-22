@@ -30,8 +30,6 @@ use ys_component::CompactPolicy;
 use ys_core::{ContentBlock, Message, Role, Usage};
 use ys_model::{Model, ModelRequest};
 
-use crate::summarize::NoopModelEventSink;
-
 /// 摘要文本的包裹标记（pi / Codewhale 同形：一条 `Role::User` 角色的摘要 checkpoint）。
 const SUMMARY_OPEN: &str = "[Context Summary]";
 const SUMMARY_CLOSE: &str = "[/Context Summary]";
@@ -312,7 +310,11 @@ async fn generate_summary(
     system_prompt: &str,
 ) -> Result<(String, Usage), CompactError> {
     // sink 与 `summarize::ModelSummarizer` 共用同一份（R9：同 crate 内不该有两份相同 impl）。
-    let mut sink = NoopModelEventSink;
+    //
+    // ⚠️ 但**这里要用收集型 sink**而不是 `NoopModelEventSink` ——
+    // 见 [`ThinkingFallbackSink`] 的说明：摘要失败的真实成因是「模型只输出了
+    // reasoning、没输出正文」，而 thinking 在 `Noop` 下被**完全丢弃**。
+    let mut sink = ThinkingFallbackSink::default();
     let request = ModelRequest {
         messages: messages.to_vec(),
         tools: vec![],
@@ -341,10 +343,55 @@ async fn generate_summary(
 
     // B-2：空（或全空白）响应是**失败**，不是「成功的空摘要」。旧实现这里 `Ok(String::new())`，
     // 于是模型回 tool call（响应无 `Text` 块）时写出空摘要 —— 历史被静默丢掉。
-    if text.trim().is_empty() {
-        return Err(CompactError::Summarize("the model returned no text".into()));
-    }
+    //
+    // ⚠️ **降级顺序**：先试**思考内容**（thinking），再判失败。
+    //
+    // **为什么需要降级**：适配器把 reasoning 走 `ThinkingDelta`、**不进** `Text` block
+    // ⇒ 若模型该次**只输出了思考、没输出正文**，终态就**没有** `Text` block
+    // ⇒ 旧实现报「the model returned no text」。
+    // 实测（真实会话 `1792579023_125340094`）3 次压缩失败的 `model_attempt` 全部
+    // `outcome=success` / `http=200` ⇒ **模型确实回了、只是回的不是正文**。
+    //
+    // **降级是安全的**：thinking 至少是**模型为这段历史写的文字** ⇒ 比「压缩失败、
+    // 历史原地不动」更有用（后者会带 92k 上下文重试）。
+    let text = if text.trim().is_empty() {
+        let fallback = sink.take_thinking();
+        if fallback.trim().is_empty() {
+            return Err(CompactError::Summarize("the model returned no text".into()));
+        }
+        fallback
+    } else {
+        text
+    };
     Ok((text, usage))
+}
+
+/// 收集**思考内容**的 sink —— 摘要失败时的降级来源。
+///
+/// **为什么不用 `NoopModelEventSink`**：那会把 thinking **完全丢弃** ⇒
+/// 「模型只输出思考、没输出正文」时无从降级（实测 3 次压缩失败即此形态）。
+///
+/// **只收 `ThinkingDelta`**：`TextDelta` 不收 —— 正文由 `ModelResponse.message` 提供，
+/// 收两份会重复。
+#[derive(Default)]
+struct ThinkingFallbackSink {
+    thinking: String,
+}
+
+impl ThinkingFallbackSink {
+    /// 取走已收集的思考内容（**一次性**）。
+    fn take_thinking(&mut self) -> String {
+        std::mem::take(&mut self.thinking)
+    }
+}
+
+impl ys_model::ModelEventSink for ThinkingFallbackSink {
+    fn emit(&mut self, event: ys_model::ModelEvent) -> Result<(), ys_core::EventError> {
+        if let ys_model::ModelEvent::ThinkingDelta { text } = event {
+            self.thinking.push_str(&text);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +786,60 @@ mod tests {
 
     // ==================== execute()：快乐路径 ====================
 
+    /// B3（修正版）的承重不变量：**模型只输出思考、无正文时，压缩必须降级成功**。
+    ///
+    /// **真实成因**（实测 3 次压缩失败）：`model_attempt` 全部 `outcome=success` /
+    /// `http=200` ⇒ 模型**确实回了**，只是回的是**思考内容**（适配器把 reasoning 走
+    /// `ThinkingDelta`、**不进** `Text` block）⇒ 终态无 `Text` block
+    /// ⇒ 旧实现报「the model returned no text」。
+    ///
+    /// ⚠️ 这**不是** tool-call 问题 ⇒ `tool_choice: none` 解决不了。
+    ///
+    /// 变异：把降级分支删掉（直接报错）⇒ 变红。
+    #[tokio::test]
+    async fn reasoning_only_response_falls_back_to_thinking() {
+        let policy = CompactPolicy::default();
+        let messages = conversation(4, 100);
+        let p = plan(&messages, &policy, 3000).expect("应产出计划");
+
+        let model = MockModel::new("m");
+        model.push_thinking_only("思考里其实有摘要内容");
+
+        let out = execute(&messages, &p, &model, &policy, 0)
+            .await
+            .expect("只输出思考时必须降级成功，而不是失败");
+
+        // 降级后的摘要**含思考内容**。
+        assert!(
+            text_of(&out.messages[0]).contains("思考里其实有摘要内容"),
+            "摘要应降级为思考内容：{:?}",
+            text_of(&out.messages[0])
+        );
+        assert_eq!(out.summarized, 1);
+    }
+
+    /// 反面：**既无正文、又无思考** ⇒ 仍然失败（B-2 的语义不能被降级破坏）。
+    ///
+    /// 变异：把「两者都空 ⇒ 失败」的判定改成永远成功 ⇒ 变红。
+    #[tokio::test]
+    async fn empty_response_without_thinking_still_fails() {
+        let policy = CompactPolicy::default();
+        let messages = conversation(4, 100);
+        let p = plan(&messages, &policy, 3000).expect("应产出计划");
+
+        let model = MockModel::new("m");
+        // tool call 响应：**无 `Text` 块、也无 thinking** ⇒ 真失败。
+        model.push_tool_call("noop", serde_json::json!({}));
+
+        let err = execute(&messages, &p, &model, &policy, 0)
+            .await
+            .expect_err("既无正文又无思考时必须失败");
+        assert!(
+            err.to_string().contains("no text"),
+            "错误信息应说明「没有文本」，实际：{err}"
+        );
+    }
+
     /// B1 的承重不变量：**压缩事件的 token 口径必须与「真实占用」同口径**。
     ///
     /// 「真实占用」= 会话消息估算 **+ 每轮固定开销**（system prompt + 工具表 spec）。
@@ -931,7 +1032,7 @@ mod tests {
         assert_eq!(messages, before, "失败时输入消息表必须逐字未变");
 
         // execute 只消费了那一条错误响应 —— 队列里剩下的响应仍在。
-        let mut sink = NoopModelEventSink;
+        let mut sink = ThinkingFallbackSink::default();
         let resp = model
             .complete(ModelRequest::default(), &mut sink)
             .await

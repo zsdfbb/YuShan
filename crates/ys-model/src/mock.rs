@@ -22,6 +22,15 @@ pub enum MockResponse {
         name: String,
         arguments: serde_json::Value,
     },
+    /// **只输出思考内容、无正文**的响应。
+    ///
+    /// 终态 message 的 `content` **无 `Text` 块** —— 与「模型只回 reasoning、
+    /// 没回正文」的真实形态同构（适配器把 reasoning 走 `ThinkingDelta`、
+    /// 不进 `Text` block）。
+    ///
+    /// 存在理由：摘要调用在**没有正文**时必须能降级到思考内容
+    /// （否则报「the model returned no text」而白丢一次满载调用）。
+    ThinkingOnly(String),
 }
 
 /// 返回预设响应（pre-programmed）的测试 model。
@@ -52,6 +61,17 @@ impl MockModel {
             name: name.into(),
             arguments,
         });
+    }
+
+    /// 压入一个**只输出思考、无正文**的响应。
+    ///
+    /// 终态 `content` 无 `Text` 块；思考内容经 `ThinkingDelta` 发出
+    /// ⇒ 与「模型只回 reasoning」的真实形态同构。
+    pub fn push_thinking_only(&self, text: impl Into<String>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push(MockResponse::ThinkingOnly(text.into()));
     }
 
     /// 压入一个错误响应。
@@ -119,6 +139,18 @@ impl Model for MockModel {
                     },
                     usage: Usage::default(),
                     finish_reason: FinishReason::ToolCalls,
+                })
+            }
+            MockResponse::ThinkingOnly(text) => {
+                // 只发 `ThinkingDelta`、**不发** `TextDelta` —— 终态无 `Text` 块。
+                sink.emit(ModelEvent::ThinkingDelta { text })?;
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
                 })
             }
             MockResponse::Error(msg) => Err(ModelError::Provider(msg)),

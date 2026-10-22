@@ -2201,21 +2201,19 @@ mod tests {
     /// 承重的是「**运行期换模型这件事本身要可观测**」——
     /// `run_start` 只是**启动快照**，不反映 `/model` / `/login` 的切换。
     ///
+    /// ⚠️ **必须把 `YUSHAN_LOG_DIR` 指到临时目录**：默认档是 `~/.yushan/logs`
+    /// ⇒ 同进程内并行测试的 debug 文件名都是 `debug-<pid>-<ts>.jsonl` ⇒ **撞名互相覆盖**
+    /// ⇒ 用例变成 flaky（实测 2/3 次失败）。
+    ///
     /// 变异：删掉 `record_model_change(...)` 调用 ⇒ 变红。
     #[tokio::test]
     async fn model_switch_is_observable_in_debug_log() {
-        // `env_lock` 的 guard **不能跨 await**（clippy: MutexGuard held across await）
-        // ⇒ 只在**取环境变量前**持锁，取完立即放。
-        let log_dir = {
-            let _guard = crate::test_env::env_lock();
-            crate::logging::resolve_log_dir().expect("测试环境应有日志目录")
-        };
+        let logs = TempDir::new("model_changed_logs");
+        let _env = DebugEnv::set(&logs.0);
+
         let model = MockModel::new("mock");
         model.push_text("a");
         let mut h = spawn_app_loop_debug(Box::new(model), false, Vec::new()).await;
-
-        // debug 文件的落点：会话 id 决定文件名；无会话路径时退化为
-        // `debug-<pid>-<ts>.jsonl` ⇒ **扫目录**找本进程刚写的那个。
 
         h.requests
             .send(Request::SetModel {
@@ -2226,41 +2224,26 @@ mod tests {
             .unwrap();
         // 换模型后会刷一次 view；收它以确保处理完。
         let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
 
-        // **只认本进程新建的文件** —— 扫整个目录会命中**上一次运行的残留**
-        // （残留里也有 `model_changed`）⇒ 变异测试就漏网了。
-        // 判据：文件名含本进程 pid（无会话路径时的 fallback 命名）。
-        let pid = std::process::id().to_string();
-        let started = std::time::Instant::now();
         // debug writer 是异步线程 ⇒ 轮询等文件出现。
         let mut found = false;
         for _ in 0..100 {
-            if let Ok(entries) = std::fs::read_dir(&log_dir.path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                        continue;
-                    }
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default();
-                    if !name.contains(&pid) {
-                        continue;
-                    }
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && text.contains("model_changed")
-                    {
-                        found = true;
-                        // 载荷必须带**前后**两份快照 + 实际下发的 effort。
-                        assert!(text.contains("from_provider"), "缺 from_provider");
-                        assert!(text.contains("to_model"), "缺 to_model");
-                        assert!(
-                            text.contains("reasoning_effort"),
-                            "缺 reasoning_effort（实际下发值）"
-                        );
-                        break;
-                    }
+            for (_path, records) in debug_files(&logs.0) {
+                if records
+                    .iter()
+                    .any(|r| r.get("ev").and_then(|e| e.as_str()) == Some("model_changed"))
+                {
+                    found = true;
+                    // 载荷必须带**前后**两份快照 + 实际下发的 effort。
+                    let raw = serde_json::to_string(&records).unwrap();
+                    assert!(raw.contains("from_provider"), "缺 from_provider");
+                    assert!(raw.contains("to_model"), "缺 to_model");
+                    assert!(
+                        raw.contains("reasoning_effort"),
+                        "缺 reasoning_effort（实际下发值）"
+                    );
+                    break;
                 }
             }
             if found {
@@ -2268,10 +2251,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(
-            found,
-            "换模型后应有 model_changed 事件；日志目录：{log_dir:?}（已等 {started:?}）"
-        );
+        assert!(found, "换模型后应有 model_changed 事件；目录：{:?}", logs.0);
     }
 
     /// A1 的端到端不变量：跑完一个回合后，**执行时长**必须大于零。

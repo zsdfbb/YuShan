@@ -309,9 +309,11 @@ fn tool_guidelines(tools: &[&str]) -> String {
         guidelines.push(
             "Run a command that takes more than a few seconds with bash_bg, then keep working; \
              collect it with bash_poll in the same batch as your other calls — the command \
-             runs while you do something else. Never run the same long command twice: its full \
-             output stays on disk, so grep or read that path for the part you missed instead of \
-             re-running it"
+             runs while you do something else. This includes builds and test suites: \
+             `cargo build`, `cargo check`, `cargo test`, `cargo clippy`, `make`, `npm test`, \
+             `npm install`, `pytest` — do NOT hold the turn open waiting for them in bash. \
+             Never run the same long command twice: its full output stays on disk, so grep or \
+             read that path for the part you missed instead of re-running it"
                 .to_string(),
         );
         guidelines.push(
@@ -1202,6 +1204,7 @@ mod tests {
         );
 
         let first = "- Run a command that takes more than a few seconds with bash_bg";
+        let named = "`cargo test`";
         let second = "- Never use sleep to wait for something";
         assert!(
             parent.contains(first),
@@ -1210,6 +1213,15 @@ mod tests {
         assert!(
             parent.contains(second),
             "父表（有 bg 工具）应给「不用 sleep 假装在等」的指引；prompt = {parent}"
+        );
+        // **点名具体命令**（C4）：抽象措辞「超过几秒」模型自判不出来 ——
+        // 实测 44 次 `cargo test` + 24 次 `cargo build/check` 走了 bash，
+        // 而 bash_bg 只用了 7 次。
+        //
+        // 变异：删掉点名列表（回到抽象措辞）⇒ 变红。
+        assert!(
+            parent.contains(named) && parent.contains("`cargo build`"),
+            "必须点名构建/测试命令（否则模型不会把它们认作「长命令」）；prompt = {parent}"
         );
         // 两条**按序**：后台化在前，禁 sleep 在后。
         let first_at = parent.find(first).expect("第一条应出现");

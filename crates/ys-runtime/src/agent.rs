@@ -216,8 +216,8 @@ mod tests {
     #[test]
     fn test_context_window_default() {
         let agent = test_agent();
-        // RunLimits::default() 的 context_window = 128_000
-        assert_eq!(agent.context_window(), 128_000);
+        // RunLimits::default() 的 context_window = 1_000_000
+        assert_eq!(agent.context_window(), 1_000_000);
     }
 
     #[test]

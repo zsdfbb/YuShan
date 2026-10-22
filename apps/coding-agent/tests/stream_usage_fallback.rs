@@ -173,6 +173,20 @@ fn serve_once(
     }
     body.truncate(content_length);
     let body = String::from_utf8_lossy(&body).to_string();
+
+    // **目录请求与 chat 请求分流**：`--json` / `-p` 启动时会拉一次 `/v1/models`
+    // （为解析厂商自报的 context window），它**不是**模型调用，不该计入
+    // 「发了几次 chat 请求」的断言。
+    let request_path = headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("");
+    if request_path.ends_with("/models") {
+        let payload = br#"{"data":[{"id":"test-model","context_window":128000}]}"#;
+        return write_response(&mut stream, "200 OK", "application/json", payload);
+    }
+
     bodies.lock().unwrap().push(body.clone());
 
     let has_stream_options = body.contains("stream_options");

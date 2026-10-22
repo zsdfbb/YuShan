@@ -1062,13 +1062,20 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
   | ① | `~/.yushan/config.json` 的 `context_window` 覆盖 | `user override` |
   | ② | provider 目录（`/v1/models`）自报的窗口 | `provider catalog` |
   | ③ | 内建兜底表 `KNOWN_MODEL_WINDOWS`（`apps/coding-agent/src/provider.rs:488`） | `builtin table` |
-  | ④ | `RunLimits::default().context_window` = 128000 | `default` |
+  | ④ | `RunLimits::default().context_window` = 1000000 | `default` |
 
 - `/model` 的输出追加一行 `Context window: <值> (source: <标签>)`
   （`apps/coding-agent/src/capabilities.rs:279`）；走 `Outbound::Output` → transcript，**绝不 print**。
 - 内建兜底表是**精确匹配**，只收录 `MiniMax-M3` / `MiniMax-M2.7`；其余模型落 ④。
   用户级覆盖的 JSON 键是 `context_window`（内部字段名才叫 `windows`，
   `apps/coding-agent/src/config.rs:31`）。
+- **② 级的目录在三种模式下的到达方式不同**（窗口能否命中 ② 级的关键）：
+  - TUI：起屏后**后台**拉目录（`run_interactive` 的 2b 段），到手后由 `app_loop`
+    每回合重算窗口。
+  - `-p` / `--json`：**同步**拉一次当前端点的目录（`main.rs` 的「`-p` / `--json`：
+    **同步**拉一次」段），在 `resolve_limits` **之前**写入 registry。一次性模式
+    只跑一个回合，后台任务来不及送达 ⇒ 不同步拉就整个停在 ④。拉取失败
+    **静默降级**到 ④（拉目录只为把窗口估准，不为选模型）。
 
 ### 19.4 两个新工具的形态
 

@@ -141,7 +141,7 @@ struct UserConfig {
 
 /// context window 的**来源**（四级，与 [`Config::context_window_with_source_for`] 一一对应）。
 ///
-/// 单说「窗口多大」不说明**可信度**：128000 可能来自厂商目录（保守但真实），也可能来自
+/// 单说「窗口多大」不说明**可信度**：1000000 可能来自厂商目录（保守但真实），也可能来自
 /// 兜底默认值（压根没人报过）。用户看到来源才知道**该不该自己写一份覆盖**。
 ///
 /// 来源与窗口值**成对**产出（同一个判定函数）—— 拆开两次判定会漂移，值与来源会对不上。
@@ -153,7 +153,7 @@ pub enum ContextWindowSource {
     ProviderCatalog,
     /// ③ 内建兜底表 [`crate::provider::builtin_context_window`]（目录报不出时的第二手来源）。
     BuiltinTable,
-    /// ④ 兜底默认值（`RunLimits::default().context_window` = 128_000）。
+    /// ④ 兜底默认值（`RunLimits::default().context_window` = 1_000_000）。
     Default,
 }
 
@@ -253,7 +253,7 @@ impl Config {
     /// ① `~/.yushan/config.json` 里该 model 的覆盖（最具体，用户说了算）
     /// ② **provider 目录里的 `context_window`**（厂商在 `/v1/models` 里自己报的）
     /// ③ 内置兜底表 [`crate::provider::builtin_context_window`]（仅目录报不出窗口的模型）
-    /// ④ `RunLimits::default().context_window` = 128_000（兜底）
+    /// ④ `RunLimits::default().context_window` = 1_000_000（兜底）
     ///
     /// **每回合都要重算**：`/login`、`/model` 会在运行中换 model，只在启动时算一次
     /// 会让「登到 1M 模型后仍按 128k 压缩」的 bug 复活。
@@ -950,8 +950,8 @@ mod tests {
     ///
     /// 三个探针的选取都是「能区分相邻两级」的，不是随手挑的：
     /// - `MiniMax-M3` 内置 1M，config.json 覆盖 555_000 ⇒ **① 压过 ②**
-    /// - `MiniMax-M2.7` 只在内置表（204_800 ≠ 128_000 默认）⇒ **② 压过 ③**
-    /// - `unknown-model` 两处都无 ⇒ **③ 兜底 128_000**
+    /// - `MiniMax-M2.7` 只在内置表（204_800 ≠ 1_000_000 默认）⇒ **② 压过 ③**
+    /// - `unknown-model` 两处都无 ⇒ **③ 兜底 1_000_000**
     ///
     /// 变异自检：把 `context_window()` 里 ① ② 的顺序倒过来（内置表盖过 config.json），
     /// 第一条断言即变红。
@@ -978,7 +978,7 @@ mod tests {
         config.model = "unknown-model".into();
         assert_eq!(
             config.context_window(),
-            128_000,
+            1_000_000,
             "③ 未知 model 回退 RunLimits 默认"
         );
 
@@ -1073,7 +1073,7 @@ mod tests {
         let mut config = test_config("deepseek-chat");
         config.load_user_config(&path);
 
-        assert_eq!(config.context_window(), 128_000);
+        assert_eq!(config.context_window(), 1_000_000);
         assert_eq!(
             config.compact_policy(),
             ys_component::CompactPolicy::default()
@@ -1152,7 +1152,7 @@ mod tests {
             config.model = bad.into();
             assert_eq!(
                 config.context_window(),
-                128_000,
+                1_000_000,
                 "非法条目 {bad} 应被丢弃（回退默认），而非生效"
             );
         }
@@ -1259,7 +1259,7 @@ mod tests {
         config.load_user_config(&path_b);
         assert_eq!(
             config.context_window(),
-            128_000,
+            1_000_000,
             "第二次加载必须整体替换，旧覆盖不得残留"
         );
 

@@ -38,11 +38,16 @@ crates/ys-runtime/src/agent.rs       Agent::context_window() / set_context_windo
 
 ## 关键行为（实现期定死，勿凭直觉改）
 
-**三级窗口解析链（优先级从高到低，按 `model` 不按 `provider`）**：
+**四级窗口解析链（优先级从高到低，按 `model` 不按 `provider`）**：
 ① `~/.yushan/config.json` 的 `context_window[model]`（校验为正整数）→
-② 内置表 `provider::builtin_context_window(model)` → ③ `RunLimits::default().context_window` = **128_000**。
+② **provider 目录**（`/v1/models`）自报的 `context_window` →
+③ 内置表 `provider::builtin_context_window(model)` →
+④ `RunLimits::default().context_window` = **1_000_000**。
 `Config::context_window()` 每次调用重算；`app_loop` 在每个 `Request::Prompt` 开头
 `agent.set_context_window(config.context_window())` —— **单一刷新点**（不散在 login/set_model）。
+
+**④ 取 1M 而非更小的值**：压缩是**保守动作**（提前压 ⇒ 只是多花一次摘要调用），
+而窗口**估小了**会直接顶到服务端上限 ⇒ 400 报错。两者不对称，故兜底取**偏大**的一侧。
 
 **阈值公式（`compact.rs`，默认值 0.85 / 0.10 / 0.01 / 0.10 / 4096 / headroom 1024）**：
 

@@ -1015,7 +1015,7 @@ where
 /// 二者因此不可能漂移（设计 §1.5）。
 ///
 /// **`limits` 必须由调用方传入**（U6b 接线）：此前本函数从不调 `.limits()`，
-/// `AgentBuilder` 落回 `RunLimits::default()` ⇒ `context_window` 恒为 128_000 ——
+/// `AgentBuilder` 落回 `RunLimits::default()` ⇒ `context_window` 恒为兜底默认值 ——
 /// 这正是「1M 模型在 11 万 token 就被压缩」的根因。传给 `build_agent` 的
 /// `context_window` 只是**启动时初值**：TUI 模式下 `app_loop` 每回合按当前 model
 /// 重算（`/login` / `/model` 能在运行中换到 16 倍窗口的模型）。
@@ -1047,7 +1047,7 @@ pub(crate) fn build_agent(
 /// # 依赖顺序
 ///
 /// 调用方必须在 **provider/model 恢复之后**调用：`context_window()` 按 `config.model`
-/// 查表（`config.json` 覆盖 > 内置表 > 默认 128_000），恢复逻辑会改写 `config.model`。
+/// 查表（`config.json` 覆盖 > 目录 > 内置表 > 兜底默认值），恢复逻辑会改写 `config.model`。
 ///
 /// `RunLimits` 是 `#[non_exhaustive]`：跨 crate **不能**用结构体字面量，
 /// 只能 `default()` + 字段赋值。
@@ -1625,6 +1625,23 @@ fn adopt_first_catalog_model(
     cache.insert(base.trim_end_matches('/').to_string(), models);
     config.registry.apply_model_cache(cache);
     Ok(())
+}
+
+/// 把一份目录并入 registry 的目录缓存（**不改 `config.model`**）。
+///
+/// 与 [`adopt_first_catalog_model`] 的差别只有「动不动模型名」：那函数在**没有**
+/// 模型名时拿目录的第一条当起始模型；本函数在模型名**已定**时只补目录。
+///
+/// 供 `-p` / `--json` 的**窗口解析**用：厂商目录里报的 `context_window` 是窗口的
+/// 第一手来源（`Config::context_window_for` 的 ② 级），没有目录就只能落到兜底值。
+fn seed_catalog_only(
+    config: &mut config::Config,
+    base: &str,
+    models: Vec<provider::ApiModel>,
+) {
+    let mut cache = provider::ModelCache::new();
+    cache.insert(base.trim_end_matches('/').to_string(), models);
+    config.registry.apply_model_cache(cache);
 }
 
 /// `-p` / `--json` 单回合收尾：由 meta 播种统计、`record(usage)` 后写穿 meta，
@@ -2618,6 +2635,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             provider::FetchModelsResult::NetworkError(_) => {
                 return Err(catalog_unavailable(base.as_str(), "网络不可达").into());
+            }
+        }
+    }
+
+    // `-p` / `--json`：**同步**拉一次当前端点的目录，让窗口解析能命中 ② 级
+    // （厂商在 `/v1/models` 里自报的 `context_window`）。
+    //
+    // TUI 模式不需要这一步：它起屏后在后台拉目录（`run_interactive` 的 2b 段），
+    // 目录到手后由 `app_loop` 每回合重算窗口。而一次性模式**只跑一个回合**——
+    // 后台任务来不及送达，窗口会整个停在兜底值（模型报 1M 却按 128k 压缩）。
+    //
+    // **失败不致命**：网络不通 / 鉴权失败时静默降级到兜底窗口，只落日志。
+    // 拉目录是为了**把窗口估准**，不是为了选模型（模型名此时已定）——
+    // 拉不到不该拦住一次正常运行。
+    if matches!(args.mode, Mode::Print(_) | Mode::Json(_))
+        && let (Some(base), Some(key)) = (config.api_base.clone(), config.api_key.clone())
+        && !base.is_empty()
+    {
+        match rt.block_on(provider::ProviderRegistry::fetch_models(&base, &key)) {
+            provider::FetchModelsResult::Success(models) if !models.is_empty() => {
+                seed_catalog_only(&mut config, &base, models);
+            }
+            provider::FetchModelsResult::Success(_) => {
+                // 空目录视同拉不到（与 `fetch_all` 的处理一致）。
+            }
+            provider::FetchModelsResult::AuthError(e) => {
+                crate::logging::log(&format!("model refresh {base}: auth error: {e}"));
+            }
+            provider::FetchModelsResult::NetworkError(e) => {
+                crate::logging::log(&format!("model refresh {base}: network error: {e}"));
             }
         }
     }
@@ -4121,11 +4168,11 @@ mod tests {
     ///     「1M 模型在 11 万 token 就被压缩」的根因（压缩阈值按错误的窗口算）。
     ///
     ///     变异：删掉 `build_agent` 里的 `.limits(limits)` → 断言变红
-    ///     （`128_000 != 1_000_000`）。
+    ///     （`262_144 != 1_000_000`）。
     #[test]
     fn build_agent_applies_context_window_from_limits() {
         let mut limits = ys_component::RunLimits::default();
-        limits.context_window = 1_000_000;
+        limits.context_window = 262_144;
         limits.compaction.trigger_ratio = 0.5;
 
         let agent = build_agent(String::new(), PathBuf::from("."), Vec::new(), limits)
@@ -4133,7 +4180,7 @@ mod tests {
 
         assert_eq!(
             agent.context_window(),
-            1_000_000,
+            262_144,
             "传入的 limits.context_window 必须生效，否则压缩按错误的窗口触发"
         );
         // 反证：这个值确实不同于「落回默认」的结果（不是恒真断言）
@@ -4152,12 +4199,12 @@ mod tests {
     /// 而本刀修的 bug（1M 模型按 128k 压缩）会**悄悄复活**。本用例直接调
     /// [`resolve_limits`]，把装配这一步钉住。
     ///
-    /// 断言**刻意选与默认值不同的数**：窗口 `262_144 ≠ 128_000`、触发比例
+    /// 断言**刻意选与默认值不同的数**：窗口 `262_144 ≠ 1_000_000`、触发比例
     /// `0.5 ≠ 0.85`（`CompactPolicy::default`）。若取默认值，两个值都能区分开，
     /// 断言不会恒真。
     ///
     /// 变异：把 `resolve_limits` 改成直接 `return RunLimits::default()` →
-    /// 本用例变红（`context_window` 落回 128_000、`trigger_ratio` 落回 0.85）。
+    /// 本用例变红（`context_window` 落回 1_000_000、`trigger_ratio` 落回 0.85）。
     #[test]
     fn resolve_limits_reads_window_and_policy_from_config() {
         // `Config::from_env` 会 `getenv` 四个凭证 key，而 `config.rs` 的用例正在
@@ -4193,7 +4240,7 @@ mod tests {
         assert_ne!(
             limits.context_window,
             ys_component::RunLimits::default().context_window,
-            "若等于默认 128_000，说明装配没引用 config"
+            "若等于默认 1_000_000，说明装配没引用 config"
         );
         assert_eq!(
             limits.compaction.trigger_ratio, 0.5,

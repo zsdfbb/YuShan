@@ -16,6 +16,11 @@ pub struct RunLimits {
     /// Bash 命令超时毫秒数（None = 无默认超时）
     pub bash_timeout: Option<u64>,
     /// model context window 大小（以 token 计）
+    ///
+    /// 默认 **1_000_000**。目录（provider 自报）是第一手来源；本值是**兜底**，
+    /// 取 1M 而非更小的数，是因为压缩是**保守动作**（提前压 ⇒ 只是多花一次摘要
+    /// 调用），而窗口**估小了**会直接顶到服务端上限 ⇒ 400 报错。两者不对称，
+    /// 故兜底取**偏大**的一侧。
     pub context_window: usize,
     /// context 压缩策略（阈值与保留预算；算法在 `ys-loop`）
     pub compaction: CompactPolicy,
@@ -62,7 +67,7 @@ impl Default for RunLimits {
         Self {
             max_rounds: 10,
             bash_timeout: None,
-            context_window: 128_000,
+            context_window: 1_000_000,
             compaction: CompactPolicy::default(),
             // 0 是**承重**默认值：老调用方（不设该字段）的压缩行为逐字节不变。
             fixed_prompt_tokens: 0,

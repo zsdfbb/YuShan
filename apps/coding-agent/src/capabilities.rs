@@ -1139,7 +1139,7 @@ mod tests {
         let out = set_model(&mut config, &mut wiring, &state, "my-local-model", None);
         assert!(
             out.iter()
-                .any(|l| l == "Context window: 128000 (source: default)"),
+                .any(|l| l == "Context window: 1000000 (source: default)"),
             "未知模型回退默认值：{out:?}"
         );
 

@@ -58,8 +58,9 @@ model 先于 wiring）。网关只要求对话内稳定，故同一进程内 `/n
 
 **context window 留空**：网关的 `/v1/models` **不返回** `context_window` 字段，
 `KNOWN_MODEL_WINDOWS` 也不收录 go 的模型（那是「端点报不出窗口」时的兜底表，且它与
-网关在售的模型名对不上）—— 宁可回退 128_000（提前压缩），也不编造一个可能让上下文
-溢出的值。需要更大窗口的模型（如 `deepseek-v4-pro`）请写 `~/.yushan/config.json` 覆盖。
+网关在售的模型名对不上）—— 宁可回退**兜底默认值**（`RunLimits::default()` = 1_000_000），
+也不编造一个可能让上下文溢出的值。需要更大窗口的模型（如 `deepseek-v4-pro`）请写
+`~/.yushan/config.json` 覆盖。
 
 ## 两条配置路径（都已实测跑通）
 

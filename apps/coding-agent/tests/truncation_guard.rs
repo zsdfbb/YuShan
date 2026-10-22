@@ -215,14 +215,9 @@ impl MockServer {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        // 超出脚本长度的请求回最后一段（正常路径不该发生）。
-                        let body = script
-                            .get(served)
-                            .or_else(|| script.last())
-                            .cloned()
-                            .unwrap_or_default();
-                        served += 1;
-                        let _ = serve_once(stream, &body, &bodies_thread);
+                        // 脚本按**chat 请求**的序号分配：目录请求（`/v1/models`）在
+                        // `serve_once` 内部分流，**不消耗**脚本段。
+                        let _ = serve_once(stream, &script, &mut served, &bodies_thread);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
@@ -272,7 +267,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// 处理一个连接：读请求行/头/体，记录 body，回一段 SSE。
 fn serve_once(
     mut stream: TcpStream,
-    sse: &str,
+    script: &[String],
+    served: &mut usize,
     bodies: &Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
     // 监听 socket 是非阻塞的（accept 轮询 stop 标志需要）。在 macOS/BSD 上
@@ -314,6 +310,34 @@ fn serve_once(
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(content_length);
+
+    // **目录请求与 chat 请求分流**：`--json` / `-p` 启动时会拉一次 `/v1/models`
+    // （为解析厂商自报的 context window），它**不是**模型调用 —— 既不该计入
+    // 「发了几次 chat 请求」的断言，也不该消耗脚本段。
+    let request_path = headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("");
+    if request_path.ends_with("/models") {
+        let payload = br#"{"data":[{"id":"test-model","context_window":128000}]}"#;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(payload)?;
+        return stream.flush();
+    }
+
+    // 超出脚本长度的请求回最后一段（正常路径不该发生）。
+    let sse = script
+        .get(*served)
+        .or_else(|| script.last())
+        .cloned()
+        .unwrap_or_default();
+    *served += 1;
+
     bodies
         .lock()
         .unwrap()

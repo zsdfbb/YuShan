@@ -572,14 +572,14 @@ mod tests {
         clock.observe(&env_of(tool_call()), t0 + 320 * MS);
         clock.observe(&env_of(tool_result()), t0 + 370 * MS);
 
-        let mut lines = clock
-            .observe(
-                &env_of(AgentEvent::RoundStarted { round: 2 }),
-                t0 + 400 * MS,
-            );
+        let mut lines = clock.observe(
+            &env_of(AgentEvent::RoundStarted { round: 2 }),
+            t0 + 400 * MS,
+        );
 
         assert_eq!(
-            lines.remove(0), "round=1 ttft_ms=100 gen_ms=220 tools_ms=50 total_ms=370",
+            lines.remove(0),
+            "round=1 ttft_ms=100 gen_ms=220 tools_ms=50 total_ms=370",
             "三段口径：排队+prefill / 解码 / 工具"
         );
     }
@@ -596,17 +596,19 @@ mod tests {
         clock.observe(&env_of(text_delta()), t0 + 100 * MS);
         clock.observe(&env_of(text_delta()), t0 + 300 * MS);
 
-        let mut lines = clock
-            .observe(
-                &env_of(AgentEvent::RunFinished {
-                    stop_reason: StopReason::Completed,
-                    usage: Usage::default(),
-                    rounds: 1,
-                }),
-                t0 + 320 * MS,
-            );
+        let mut lines = clock.observe(
+            &env_of(AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 1,
+            }),
+            t0 + 320 * MS,
+        );
 
-        assert_eq!(lines.remove(0), "round=1 ttft_ms=100 gen_ms=200 tools_ms=0 total_ms=300");
+        assert_eq!(
+            lines.remove(0),
+            "round=1 ttft_ms=100 gen_ms=200 tools_ms=0 total_ms=300"
+        );
     }
 
     /// **完全不流式的轮**（模型一个字符都不吐、直接给工具调用）必须仍被计时。
@@ -626,17 +628,19 @@ mod tests {
         // 没有任何 `Model*Delta`，直接就是工具调用。
         clock.observe(&env_of(tool_call()), t0 + 1780 * MS);
 
-        let mut lines = clock
-            .observe(
-                &env_of(AgentEvent::RunFinished {
-                    stop_reason: StopReason::Completed,
-                    usage: Usage::default(),
-                    rounds: 1,
-                }),
-                t0 + 1790 * MS,
-            );
+        let mut lines = clock.observe(
+            &env_of(AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 1,
+            }),
+            t0 + 1790 * MS,
+        );
 
-        assert_eq!(lines.remove(0), "round=1 ttft_ms=1780 gen_ms=0 tools_ms=0 total_ms=1780");
+        assert_eq!(
+            lines.remove(0),
+            "round=1 ttft_ms=1780 gen_ms=0 tools_ms=0 total_ms=1780"
+        );
     }
 
     /// **逐调用耗时**：轮级 `tools_ms` 是首末之差，答不了「这轮的 N 秒花在哪一个调用上」。

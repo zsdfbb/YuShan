@@ -222,10 +222,9 @@ impl Config {
         // （`YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连时）。
         let model = std::env::var("YUSHAN_MODEL").unwrap_or_default();
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-        let reasoning_effort = parse_reasoning_effort(
-            std::env::var("YUSHAN_REASONING_EFFORT").ok().as_deref(),
-        )
-        .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_string()));
+        let reasoning_effort =
+            parse_reasoning_effort(std::env::var("YUSHAN_REASONING_EFFORT").ok().as_deref())
+                .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_string()));
 
         Ok(Self {
             api_base,
@@ -760,10 +759,7 @@ mod tests {
 
         // SAFETY: 持有 env_lock。
         unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", " LoW ") };
-        assert_eq!(
-            Config::from_env().unwrap().reasoning_effort(),
-            Some("low")
-        );
+        assert_eq!(Config::from_env().unwrap().reasoning_effort(), Some("low"));
 
         // SAFETY: 持有 env_lock。
         unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", "please-think-harder") };

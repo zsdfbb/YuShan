@@ -171,7 +171,9 @@ impl AgentFactory {
             .map(|spec| {
                 (
                     spec.name.clone(),
-                    serde_json::to_string(spec).map(|json| json.len()).unwrap_or(0),
+                    serde_json::to_string(spec)
+                        .map(|json| json.len())
+                        .unwrap_or(0),
                 )
             })
             .collect();
@@ -181,8 +183,12 @@ impl AgentFactory {
         let mut limits = self.limits.clone();
         limits.fixed_prompt_tokens = fixed_prompt_tokens(&system_prompt, &specs);
 
-        let agent =
-            crate::build_agent(system_prompt, workspace.to_path_buf(), tools, limits.clone())?;
+        let agent = crate::build_agent(
+            system_prompt,
+            workspace.to_path_buf(),
+            tools,
+            limits.clone(),
+        )?;
         Ok(BuiltAgent {
             agent,
             subagent,
@@ -203,7 +209,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ys_tools_basic::{BgLimits, BackgroundTasks, SessionSlot};
+    use ys_tools_basic::{BackgroundTasks, BgLimits, SessionSlot};
     use ys_tools_web::FetchedDir;
 
     use crate::subagent::SubagentsDir;
@@ -348,8 +354,7 @@ mod tests {
         // 追加段（子表之后的那几项）必须是 `bash_bg` + `bash_poll` + `subagent`
         // —— 顺序即契约：两个后台工具排在派发工具**之前**。
         let appended = &parent_json[child_json.len() - 1..];
-        let tail: Vec<ys_tool::ToolSpec> =
-            built.parent_specs[built.child_specs.len()..].to_vec();
+        let tail: Vec<ys_tool::ToolSpec> = built.parent_specs[built.child_specs.len()..].to_vec();
         assert_eq!(
             tail.iter()
                 .map(|spec| spec.name.as_str())

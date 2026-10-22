@@ -1108,6 +1108,9 @@ async fn run_turn_once(
         .backgrounds()
         .map(|context| (context.tasks().clone(), context.session_id()));
     let outcome = {
+        // 模型取**共享所有权**副本（异步派发的后台任务要 `'static`）；在 `ports()`
+        // 的可变借用之前取，避免借用冲突。
+        let model_arc = ctx.wiring.model_arc();
         let ports = ctx.wiring.ports();
         ports.events.begin_turn(*ctx.turns);
         // 本回合专属的边界源：`Abort` 的标志位随回合作废。
@@ -1122,7 +1125,7 @@ async fn run_turn_once(
         let runner = ctx.subagent.map(|s| {
             s.make_runner(
                 Some(ctx.config),
-                ports.model,
+                model_arc.clone(),
                 ctx.subagent_totals.clone(),
                 Some(boundary.clone()),
             )

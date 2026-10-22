@@ -141,12 +141,7 @@ fn canonical(path: &Path) -> PathBuf {
 /// 校验是**必须**的：`path_for` 直接把它拼进路径，未校验的 `../x` 会把落点带出
 /// ys 目录，使 `create` 在任意位置建树。
 pub fn validate_name(name: &str) -> Result<(), WorktreeError> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-    {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
         return Err(WorktreeError::InvalidName(name.to_string()));
     }
     Ok(())
@@ -202,7 +197,11 @@ pub fn auto_name() -> String {
         .saturating_add(now.subsec_nanos() as u64);
     let key = loop {
         let last = LAST.load(Ordering::Relaxed);
-        let next = if now > last { now } else { last.saturating_add(1) };
+        let next = if now > last {
+            now
+        } else {
+            last.saturating_add(1)
+        };
         if LAST
             .compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -268,13 +267,19 @@ pub fn create(repo: &Path, name: Option<&str>) -> Result<Entry, WorktreeError> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let mut out = git(&root, &["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
+    let mut out = git(
+        &root,
+        &["worktree", "add", "-b", &branch, &path_str, "HEAD"],
+    )?;
     if !out.ok {
         // 仅当落点**已被登记为工作树、但其目录不存在**（用户 `rm -rf` 过树）才 prune 并
         // 重试一次；分支 / 落点与既有条目冲突时 prune 无效（还可能误清别的登记），直接报错。
         if is_stale_registration(&root, &path) {
             let _ = git(&root, &["worktree", "prune"]);
-            out = git(&root, &["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
+            out = git(
+                &root,
+                &["worktree", "add", "-b", &branch, &path_str, "HEAD"],
+            )?;
         }
         if !out.ok {
             let msg = reason(&out);
@@ -489,7 +494,10 @@ mod tests {
         let (secs, nanos) = a.split_once('_').expect("应含下划线分隔");
         assert!(secs.chars().all(|c| c.is_ascii_digit()), "秒应为数字：{a}");
         assert_eq!(nanos.len(), 9, "纳秒应为 9 位零填充：{a}");
-        assert!(nanos.chars().all(|c| c.is_ascii_digit()), "纳秒应为数字：{a}");
+        assert!(
+            nanos.chars().all(|c| c.is_ascii_digit()),
+            "纳秒应为数字：{a}"
+        );
     }
 
     /// `validate_name` 拒绝空 / 路径分隔符 / `.` / `..`，接受普通名。
@@ -606,11 +614,18 @@ mod tests {
         // 成功：落点上已存在同名目录（`attach_target` 只认 `is_dir`）。
         let want = path_for(&repo, "feat").unwrap();
         std::fs::create_dir_all(&want).unwrap();
-        assert_eq!(attach_target(&repo, "feat").unwrap(), want, "应返回既有树路径");
+        assert_eq!(
+            attach_target(&repo, "feat").unwrap(),
+            want,
+            "应返回既有树路径"
+        );
 
         // 失败：树不存在。
         assert!(
-            matches!(attach_target(&repo, "ghost"), Err(WorktreeError::NotFound(_))),
+            matches!(
+                attach_target(&repo, "ghost"),
+                Err(WorktreeError::NotFound(_))
+            ),
             "不存在的树应报 NotFound"
         );
 
@@ -737,11 +752,15 @@ mod tests {
             let text = e.to_string();
             assert!(!text.is_empty(), "文案不应为空");
         }
-        assert!(WorktreeError::InvalidName("bad/name".into())
-            .to_string()
-            .contains("bad/name"));
-        assert!(WorktreeError::Git("fatal: boom".into())
-            .to_string()
-            .contains("fatal: boom"));
+        assert!(
+            WorktreeError::InvalidName("bad/name".into())
+                .to_string()
+                .contains("bad/name")
+        );
+        assert!(
+            WorktreeError::Git("fatal: boom".into())
+                .to_string()
+                .contains("fatal: boom")
+        );
     }
 }

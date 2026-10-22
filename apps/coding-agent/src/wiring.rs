@@ -39,7 +39,12 @@ use ys_tools_basic::{BackgroundTasks, SessionSlot};
 ///   `sessions_dir/{id}.jsonl`。
 /// - **一次性**（[`Wiring::ephemeral`]，仅测试）：`MemorySession`，不落盘、不恢复。
 pub struct Wiring {
-    model: Option<Box<dyn Model>>,
+    /// 当前模型。**用 `Arc` 而非 `Box`** —— 异步派发的后台任务需要 `'static` 地持有它
+    /// （`subagent_bg` 在回合内启动、在后台跑，不能借用 `Wiring`）。
+    ///
+    /// 构造 / `set_model` 的入参**仍是 `Box<dyn Model>`**（调用方不必改），
+    /// 在边界上转成 `Arc` —— 不给每个调用点加负担。
+    model: Option<Arc<dyn Model>>,
     session: Box<dyn Session>,
     events: Box<dyn EventSink>,
     /// 会话落盘目录；`None` = 一次性会话。
@@ -96,7 +101,7 @@ impl Wiring {
     #[cfg(test)]
     pub fn ephemeral(model: Option<Box<dyn Model>>, events: Box<dyn EventSink>) -> Self {
         Self {
-            model,
+            model: model.map(Arc::from),
             session: Box::new(MemorySession::new()),
             events,
             sessions_dir: None,
@@ -144,7 +149,7 @@ impl Wiring {
         let path = path.unwrap_or_else(|| sessions_dir.join(format!("{}.jsonl", new_session_id())));
         let session = JsonlSession::open(&path).await?;
         Ok(Self {
-            model,
+            model: model.map(Arc::from),
             session: Box::new(session),
             events,
             sessions_dir: Some(sessions_dir),
@@ -268,13 +273,20 @@ impl Wiring {
     }
 
     /// 当前模型标识（构造 `CodingView` 快照用）。
+    /// 当前模型的**共享所有权**副本 —— 异步派发的后台任务用它持有 `'static` 的模型。
+    ///
+    /// `None` = 未配置模型（与 [`Self::is_configured`] 同义）。
+    pub fn model_arc(&self) -> Option<Arc<dyn Model>> {
+        self.model.clone()
+    }
+
     pub fn model_id(&self) -> Option<&str> {
         self.model.as_deref().map(|m| m.model_id())
     }
 
     /// 替换模型（`/login`、`/logout`、`/model` 经此，不再伸手进 Agent）。
     pub fn set_model(&mut self, model: Option<Box<dyn Model>>) {
-        self.model = model;
+        self.model = model.map(Arc::from);
     }
 
     /// 当前会话消息（构造 `CodingView` 快照用）。

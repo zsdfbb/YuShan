@@ -80,10 +80,7 @@ pub(crate) fn debug_enabled(_cli_flag: bool) -> bool {
 ///
 /// 无 session 文件（会话尚未落盘）时用 `debug-<pid>-<unix_ms>.jsonl`；
 /// 本函数不读取环境变量。
-pub(crate) fn debug_path_for(
-    session_path: Option<&Path>,
-    log_dir: &logging::LogDir,
-) -> PathBuf {
+pub(crate) fn debug_path_for(session_path: Option<&Path>, log_dir: &logging::LogDir) -> PathBuf {
     let name = session_path
         .and_then(Path::file_stem)
         .and_then(|stem| stem.to_str())
@@ -460,12 +457,7 @@ impl DebugSink {
 
 impl DebugHandle {
     /// 记录一条事件（与 [`DebugSink::record`] 同一实现）。
-    pub(crate) fn record(
-        &self,
-        ev: &'static str,
-        ids: DebugIds<'_>,
-        fields: Map<String, Value>,
-    ) {
+    pub(crate) fn record(&self, ev: &'static str, ids: DebugIds<'_>, fields: Map<String, Value>) {
         record_with(&self.ctx, ev, ids, fields);
     }
 }
@@ -539,10 +531,7 @@ impl ModelTraceRouter {
         );
         fields.insert(
             "ttfb_ms".into(),
-            attempt
-                .ttfb_ms
-                .map(|ms| json!(ms))
-                .unwrap_or(Value::Null),
+            attempt.ttfb_ms.map(|ms| json!(ms)).unwrap_or(Value::Null),
         );
         fields.insert(
             "response_headers_ms".into(),
@@ -584,58 +573,63 @@ impl ModelTraceRouter {
 }
 
 /// 记录路径的唯一实现：两个入口（sink / handle）只在调用者身份上不同。
-fn record_with(ctx: &RecordContext, ev: &'static str, ids: DebugIds<'_>, fields: Map<String, Value>) {
-        let dt_ms = ctx.start.elapsed().as_millis() as u64;
-        let t_ms = ctx.run_start_unix_ms.saturating_add(dt_ms);
-        let seq = ctx.stats.seq.fetch_add(1, Ordering::Relaxed);
-        let order = ctx.take_order();
+fn record_with(
+    ctx: &RecordContext,
+    ev: &'static str,
+    ids: DebugIds<'_>,
+    fields: Map<String, Value>,
+) {
+    let dt_ms = ctx.start.elapsed().as_millis() as u64;
+    let t_ms = ctx.run_start_unix_ms.saturating_add(dt_ms);
+    let seq = ctx.stats.seq.fetch_add(1, Ordering::Relaxed);
+    let order = ctx.take_order();
 
-        let hot_start = Instant::now();
-        #[cfg(test)]
-        {
-            let delay_ms = SLOW_SERIALIZE_MS.with(|cell| cell.get());
-            if delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(delay_ms));
-            }
+    let hot_start = Instant::now();
+    #[cfg(test)]
+    {
+        let delay_ms = SLOW_SERIALIZE_MS.with(|cell| cell.get());
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
         }
+    }
 
-        let mut record = fields;
-        record.insert("schema".to_string(), json!(SCHEMA_VERSION));
-        record.insert("ev".to_string(), json!(ev));
-        record.insert("t_ms".to_string(), json!(t_ms));
-        record.insert("dt_ms".to_string(), json!(dt_ms));
-        record.insert("seq".to_string(), json!(seq));
-        record.insert("run".to_string(), json!(ctx.run));
-        record.insert("session_id".to_string(), json!(ids.session_id));
-        if let Some(turn) = ids.turn {
-            record.insert("turn".to_string(), json!(turn));
-        }
-        if let Some(round) = ids.round {
-            record.insert("round".to_string(), json!(round));
-        }
-        if let Some(tool_call_id) = ids.tool_call_id {
-            record.insert("tool_call_id".to_string(), json!(tool_call_id));
-        }
+    let mut record = fields;
+    record.insert("schema".to_string(), json!(SCHEMA_VERSION));
+    record.insert("ev".to_string(), json!(ev));
+    record.insert("t_ms".to_string(), json!(t_ms));
+    record.insert("dt_ms".to_string(), json!(dt_ms));
+    record.insert("seq".to_string(), json!(seq));
+    record.insert("run".to_string(), json!(ctx.run));
+    record.insert("session_id".to_string(), json!(ids.session_id));
+    if let Some(turn) = ids.turn {
+        record.insert("turn".to_string(), json!(turn));
+    }
+    if let Some(round) = ids.round {
+        record.insert("round".to_string(), json!(round));
+    }
+    if let Some(tool_call_id) = ids.tool_call_id {
+        record.insert("tool_call_id".to_string(), json!(tool_call_id));
+    }
 
-        match serde_json::to_string(&record) {
-            Ok(mut line) => {
-                line.push('\n');
-                match ctx.tx.try_send(LineMessage { order, line }) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        ctx.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Disconnected(_)) => {}
+    match serde_json::to_string(&record) {
+        Ok(mut line) => {
+            line.push('\n');
+            match ctx.tx.try_send(LineMessage { order, line }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    ctx.stats.dropped.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-            Err(_) => {
-                // 序列化失败同样是「记录缺失」，必须可解释。
-                ctx.stats.serde_failures.fetch_add(1, Ordering::Relaxed);
+                Err(TrySendError::Disconnected(_)) => {}
             }
         }
-        ctx.stats
-            .hot_path_ns
-            .fetch_add(hot_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Err(_) => {
+            // 序列化失败同样是「记录缺失」，必须可解释。
+            ctx.stats.serde_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    ctx.stats
+        .hot_path_ns
+        .fetch_add(hot_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 impl RecordContext {
@@ -709,7 +703,9 @@ impl DebugSink {
                 stop_reason: meta.stop_reason.to_string(),
                 rounds: meta.rounds,
                 exit_code: meta.exit_code,
-                usage: meta.usage.and_then(|usage| serde_json::to_value(usage).ok()),
+                usage: meta
+                    .usage
+                    .and_then(|usage| serde_json::to_value(usage).ok()),
                 run: self.ctx.run,
                 t_ms,
                 dt_ms,
@@ -2134,7 +2130,10 @@ mod tests {
             ArgsMode::Head,
         )
         .unwrap();
-        sink.ctx.stats.serde_failures.fetch_add(3, Ordering::Relaxed);
+        sink.ctx
+            .stats
+            .serde_failures
+            .fetch_add(3, Ordering::Relaxed);
         sink.flush("RunFinished");
 
         let lines = buffer.lines();

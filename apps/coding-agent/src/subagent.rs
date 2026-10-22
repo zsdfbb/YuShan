@@ -227,7 +227,7 @@ pub(crate) type SubagentModelCache = Arc<Mutex<HashMap<(String, Option<String>),
 
 /// app 侧的派发实现：每回合构造一份（计数器天然 per-turn）。
 pub struct AppSubagentRunner<'a> {
-    parent_model: Option<&'a dyn Model>,
+    parent_model: Option<Arc<dyn Model>>,
     /// 按名构造模型用（`model` 参数）；`None` = 未接线 ⇒ 指定模型名一律 fail-closed。
     config: Option<&'a crate::config::Config>,
     /// 按「模型名 + 构建时档位」缓存实例（跨派发复用连接池 + TLS）；缓存持
@@ -254,7 +254,7 @@ pub struct AppSubagentRunner<'a> {
 impl<'a> AppSubagentRunner<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        parent_model: Option<&'a dyn Model>,
+        parent_model: Option<Arc<dyn Model>>,
         config: Option<&'a crate::config::Config>,
         model_cache: SubagentModelCache,
         child_prompt: String,
@@ -336,7 +336,7 @@ impl SubagentSetup {
     pub fn make_runner<'a>(
         &self,
         config: Option<&'a crate::config::Config>,
-        parent_model: Option<&'a dyn Model>,
+        parent_model: Option<Arc<dyn Model>>,
         totals: Arc<UsageTotals>,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
     ) -> AppSubagentRunner<'a> {
@@ -364,7 +364,10 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         model: Option<&str>,
         boundary: Option<&dyn BoundarySource>,
     ) -> Result<SubagentOutcome, String> {
-        let started = Instant::now();
+        // `boundary` 参数保留在 trait 签名里（`ToolContext` 的通用挂载点），但
+        // 本实现用 `self.parent_boundary`（生产路径上两者是同一个 `Arc`）——
+        // 它要跟着 `ChildTask` 进后台，故从构造期注入的那份取。
+        let _ = boundary;
 
         // fail-closed：未支持按名构造模型时**绝不静默回退到父模型**。
         let owned: Option<Arc<dyn Model>> = match model {
@@ -394,10 +397,11 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 }
             }
         };
-        let resolved: &dyn Model = match &owned {
-            Some(m) => &**m,
+        let resolved: Arc<dyn Model> = match owned {
+            Some(m) => m,
             None => self
                 .parent_model
+                .clone()
                 .ok_or_else(|| "无可用模型（未登录 / 未配置）".to_string())?,
         };
 
@@ -410,22 +414,99 @@ impl SubagentRunner for AppSubagentRunner<'_> {
             ));
         }
 
-        // 每次派发建**一个全新子 Agent**（`Agent::run_turn` 取 `&mut self`，实例不可共享）。
-        // 子换模型 ⇒ 窗口必须按**子模型**取（继承父窗口是**静默错**：32k 模型按 1M 判
+        // 子换 model ⇒ 窗口必须按**子模型**取（继承父窗口是**静默错**：32k 模型按 1M 判
         // ⇒ 不压缩 ⇒ 撞窗）。默认继承时不改（与父同值）。
         let mut child_limits = self.child_limits.clone();
         if let (Some(cfg), Some(name)) = (self.config, model) {
             child_limits.context_window = cfg.context_window_for(name);
         }
 
+        // 执行交给 owned 的 `ChildTask` —— 同步 `run` 与异步 `spawn` **共用同一份**
+        // 执行逻辑（否则两条路径的行为会漂移：结果打包、诊断、usage 上卷全在手写两份）。
+        Ok(self
+            .child_task(resolved, child_limits)
+            .execute(prompt.to_string())
+            .await)
+    }
+}
+
+impl AppSubagentRunner<'_> {
+    /// 把「一次派发」需要的**全部输入**收成 [`ChildTask`]。
+    ///
+    /// `model` / `child_limits` 由调用方**在回合内**解析好（解析要读 `config`，
+    /// 而 `config` 是借用、不可 `'static`）⇒ 收成的 `ChildTask` 只含 owned 字段。
+    fn child_task(&self, model: Arc<dyn Model>, child_limits: RunLimits) -> ChildTask {
+        ChildTask {
+            model,
+            child_prompt: self.child_prompt.clone(),
+            child_limits,
+            child_budget: self.child_budget,
+            workspace: self.workspace.clone(),
+            web: self.web.clone(),
+            dir: self.dir.clone(),
+            totals: self.totals.clone(),
+            parent_boundary: self.parent_boundary.clone(),
+        }
+    }
+}
+
+/// 一次子 agent 执行的**全部 owned 输入** ⇒ 满足 `'static`，可交给 `tokio::spawn`。
+///
+/// 存在的理由：`AppSubagentRunner` 持有 `config` 的**借用**，不能跨任务存活；
+/// 而异步派发的后台任务必须比回合活得久（至少活到父回合结束）。把执行所需的
+/// 所有东西搬进本结构，借用就留在回合内。
+struct ChildTask {
+    model: Arc<dyn Model>,
+    child_prompt: String,
+    child_limits: RunLimits,
+    child_budget: Duration,
+    workspace: PathBuf,
+    web: WebConfig,
+    dir: Arc<SubagentsDir>,
+    totals: Arc<UsageTotals>,
+    parent_boundary: Option<Arc<dyn BoundarySource>>,
+}
+
+impl ChildTask {
+    /// 跑完一个子 agent，返回结果。
+    ///
+    /// **永远返回 `Ok`**：子 agent「跑完了但没跑好」走 `stop_reason` + `diagnostic`
+    /// （ADR-0001 错误结果通道），只有「建不起来」（工具表装配失败）才是 `Err` 语义 ——
+    /// 那种情形在这里折成 `Cancelled` + 诊断文本，与既有 `run` 的 `Err` 分支同形。
+    async fn execute(self, prompt: String) -> SubagentOutcome {
+        let started = Instant::now();
+        let parent_cancelled_probe = self.parent_boundary.clone();
         let (tools, _hint) = crate::toolset::build_tools(&self.workspace, self.web.clone());
-        let mut child = AgentBuilder::new()
+        let mut child = match AgentBuilder::new()
             .tools(tools)
-            .limits(child_limits)
+            .limits(self.child_limits.clone())
             .working_dir(self.workspace.clone(), self.workspace.clone())
             .system_prompt(self.child_prompt.clone())
             .build()
-            .map_err(|e| format!("子 agent 组装失败: {e}"))?;
+        {
+            Ok(child) => child,
+            Err(e) => {
+                // 建不起来：留一份最小转录 + 诊断，语义与「跑起来但失败」一致。
+                let stop_reason = StopReason::Cancelled;
+                let cause = Some(CancelCause::Unknown);
+                let details = vec![format!("子 agent 组装失败: {e}")];
+                let diagnostic = run_diagnostic(&stop_reason, cause, 0, &details);
+                let artifact = self
+                    .dir
+                    .write_transcript(&format!(
+                        "# 子 agent 未启动\n\n{}\n",
+                        diagnostic.as_deref().unwrap_or("(无诊断)")
+                    ))
+                    .ok();
+                return SubagentOutcome {
+                    summary: String::new(),
+                    artifact: artifact.map(|p| p.display().to_string()),
+                    stop_reason,
+                    diagnostic,
+                    usage: Usage::default(),
+                };
+            }
+        };
 
         let child_boundary = ChildBoundary::new(self.parent_boundary.clone());
         // 自己那份边界源（watchdog 往这里 `push(Abort)`）。先取出 `Arc` 副本 ——
@@ -449,7 +530,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
             .run_turn(
                 AgentInput::text(format!("{prompt}{CHILD_TASK_SUFFIX}")),
                 AgentPorts::new(
-                    Some(resolved),
+                    Some(&*self.model),
                     &mut session,
                     &mut sink,
                     Some(Arc::new(child_boundary)),
@@ -459,7 +540,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let elapsed_ms = trusted_elapsed_ms(started);
         let raw_tool_results = collect_raw_tool_results(sink.events());
 
-        let outcome = match result {
+        match result {
             Ok(run) => {
                 self.totals.add(&run.usage);
                 let summary =
@@ -467,7 +548,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                 let stop_reason = run.stop_reason;
                 let cause = cancel_cause(
                     &stop_reason,
-                    is_parent_cancelled(boundary),
+                    is_parent_cancelled(parent_cancelled_probe.as_deref()),
                     child_own.is_aborted(),
                 );
                 let mut details = Vec::new();
@@ -524,11 +605,9 @@ impl SubagentRunner for AppSubagentRunner<'_> {
                     usage: Usage::default(),
                 }
             }
-        };
-        Ok(outcome)
+        }
     }
 }
-
 fn trusted_elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
@@ -1058,7 +1137,7 @@ mod tests {
         let web = WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
         let totals = Arc::new(UsageTotals::default());
         let runner = AppSubagentRunner::new(
-            Some(&model),
+            Some(Arc::new(model)),
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "你是子 agent".to_string(),
@@ -1125,7 +1204,7 @@ mod tests {
         }
         let web = WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
         let runner = AppSubagentRunner::new(
-            Some(&model),
+            Some(Arc::new(model)),
             None,
             Arc::new(Mutex::new(HashMap::new())),
             String::new(),
@@ -1512,40 +1591,66 @@ mod tests {
         dir
     }
 
-    fn test_runner<'a>(
-        model: &'a dyn Model,
+    /// 测试构造：`model` **按值**传入（runner 现在持有 `Arc<dyn Model>`，
+    /// 异步派发的后台任务需要 `'static`）⇒ 调用方不再写 `&model`。
+    fn test_runner(
+        model: impl Model + 'static,
         base: &std::path::Path,
         dir: Arc<SubagentsDir>,
         limits: RunLimits,
-    ) -> AppSubagentRunner<'a> {
+    ) -> AppSubagentRunner<'static> {
         test_runner_with_budget(model, base, dir, limits, Duration::from_secs(30))
     }
 
-    fn test_runner_with_budget<'a>(
-        model: &'a dyn Model,
+    /// 同 [`test_runner`]，但 `model` 已包成 `Arc` —— 供「跑完之后还要查 model 录到的请求」
+    /// 的用例（`RecordingModel` 含 `Mutex` ⇒ 不可 Clone，只能共享）。
+    fn test_runner_arc(
+        model: Arc<dyn Model>,
+        base: &std::path::Path,
+        dir: Arc<SubagentsDir>,
+        limits: RunLimits,
+    ) -> AppSubagentRunner<'static> {
+        use ys_tools_web::FetchedDir;
+        AppSubagentRunner::new(
+            Some(model),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            "child prompt".to_string(),
+            limits,
+            Duration::from_secs(30),
+            base.to_path_buf(),
+            WebConfig::offline(FetchedDir::Temp(base.join("fetched"))),
+            dir,
+            Arc::new(UsageTotals::default()),
+            None,
+        )
+    }
+
+    fn test_runner_with_budget(
+        model: impl Model + 'static,
         base: &std::path::Path,
         dir: Arc<SubagentsDir>,
         limits: RunLimits,
         child_budget: Duration,
-    ) -> AppSubagentRunner<'a> {
+    ) -> AppSubagentRunner<'static> {
         test_runner_with_parent(model, base, dir, limits, child_budget, None)
     }
 
     /// 父边界源**经构造期注入**（而非只经 `run` 的参数）——
     /// 与生产路径一致：app 层把**同一份 `Arc`** 同时给 `make_runner` 与
     /// `AgentPorts`，子 agent 的 `ChildBoundary` 才能透传父的中止状态。
-    fn test_runner_with_parent<'a>(
-        model: &'a dyn Model,
+    fn test_runner_with_parent(
+        model: impl Model + 'static,
         base: &std::path::Path,
         dir: Arc<SubagentsDir>,
         limits: RunLimits,
         child_budget: Duration,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
-    ) -> AppSubagentRunner<'a> {
+    ) -> AppSubagentRunner<'static> {
         use ys_tools_web::FetchedDir;
 
         AppSubagentRunner::new(
-            Some(model),
+            Some(Arc::new(model)),
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "child prompt".to_string(),
@@ -1569,7 +1674,7 @@ mod tests {
         model.push_tool_call("read", serde_json::json!({"path": "note.txt"}));
         model.push_text("FULL_TRACE_FINAL_TEXT_MARKER");
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
-        let runner = test_runner(&model, &base, dir, RunLimits::new(4));
+        let runner = test_runner(model, &base, dir, RunLimits::new(4));
 
         let out = runner.run("读文件", None, None).await.unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -1610,7 +1715,7 @@ mod tests {
         std::fs::write(base.join("big.txt"), big).unwrap();
         std::fs::write(base.join("small.txt"), "SECOND_TOOL_RESULT\n").unwrap();
 
-        let model = RecordingModel::new("recording");
+        let model = Arc::new(RecordingModel::new("recording"));
         model
             .push_tool_call("call-big", "read", serde_json::json!({"path": "big.txt"}))
             .push_tool_call(
@@ -1622,7 +1727,7 @@ mod tests {
         let mut limits = RunLimits::new(5);
         limits.max_turn_tool_result_tokens = 1;
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
-        let runner = test_runner(&model, &base, dir, limits);
+        let runner = test_runner_arc(model.clone(), &base, dir, limits);
 
         let out = runner.run("预算回归", None, None).await.unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -1663,7 +1768,7 @@ mod tests {
             )
             .push_text("DUPLICATE_ID_FINAL_TEXT");
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
-        let runner = test_runner(&model, &base, dir, RunLimits::new(5));
+        let runner = test_runner(model, &base, dir, RunLimits::new(5));
 
         let out = runner.run("重复 id", None, None).await.unwrap();
         let body = std::fs::read_to_string(out.artifact.expect("应写转录")).unwrap();
@@ -1688,7 +1793,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_error("provider failed\nsecond line\r\u{7}");
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
-        let runner = test_runner(&model, &base, dir, RunLimits::new(2));
+        let runner = test_runner(model, &base, dir, RunLimits::new(2));
 
         let out = runner.run("失败", None, None).await.unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
@@ -1719,7 +1824,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("WRITE_FAILURE_SUMMARY_MARKER");
         let runner = test_runner(
-            &model,
+            model,
             &base,
             Arc::new(SubagentsDir::at(blocker, false)),
             RunLimits::new(2),
@@ -1755,7 +1860,7 @@ mod tests {
         // 父边界源经**构造期**注入 —— 与生产路径一致（app 层把同一份 `Arc`
         // 给 `make_runner` 与 `AgentPorts`），子 `ChildBoundary` 才透传得到中止。
         let runner = test_runner_with_parent(
-            &model,
+            model,
             &base,
             dir,
             RunLimits::new(2),
@@ -1786,7 +1891,7 @@ mod tests {
         );
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner_with_budget(
-            &model,
+            model,
             &base,
             dir,
             RunLimits::new(2),
@@ -1817,7 +1922,7 @@ mod tests {
         let parent = Arc::new(QueueBoundarySource::new());
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner_with_parent(
-            &model,
+            model,
             &base,
             dir,
             RunLimits::new(2),

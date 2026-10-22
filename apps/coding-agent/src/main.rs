@@ -255,18 +255,16 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 debug = true;
                 idx += 1;
             }
-            "--resume" => {
-                match argv.get(idx + 1).filter(|t| !t.starts_with('-')) {
-                    Some(id) => {
-                        resume = Resume::Id(id.clone());
-                        idx += 2;
-                    }
-                    None => {
-                        resume = Resume::Pick;
-                        idx += 1;
-                    }
+            "--resume" => match argv.get(idx + 1).filter(|t| !t.starts_with('-')) {
+                Some(id) => {
+                    resume = Resume::Id(id.clone());
+                    idx += 2;
                 }
-            }
+                None => {
+                    resume = Resume::Pick;
+                    idx += 1;
+                }
+            },
             f if f.starts_with("--resume=") => {
                 return Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）".into());
             }
@@ -577,9 +575,7 @@ pub(crate) struct DebugTap<'a> {
 ///
 /// `Option::as_deref_mut` 在这里是恒等操作（clippy `needless_option_as_deref`），
 /// 而 `if let Some(sink) = debug` 会移动整个 `Option`、后续无法再用 —— 故显式再借。
-fn reborrow_sink<'a, 'b>(
-    debug: &'a mut Option<&'b mut DebugSink>,
-) -> Option<&'a mut DebugSink>
+fn reborrow_sink<'a, 'b>(debug: &'a mut Option<&'b mut DebugSink>) -> Option<&'a mut DebugSink>
 where
     'b: 'a,
 {
@@ -742,7 +738,8 @@ fn special_event_record(env: &Envelope) -> Option<DebugRecord> {
             fields.insert(
                 "estimated_delta".into(),
                 json!(
-                    (*estimated_tokens_before as i64).saturating_sub(*estimated_tokens_after as i64)
+                    (*estimated_tokens_before as i64)
+                        .saturating_sub(*estimated_tokens_after as i64)
                 ),
             );
             fields.insert("summarized".into(), json!(summarized));
@@ -753,9 +750,7 @@ fn special_event_record(env: &Envelope) -> Option<DebugRecord> {
             fields.insert("reason".into(), json!(reason));
             "context_compaction_failed"
         }
-        AgentEvent::ResponseTruncated {
-            dropped_tool_calls,
-        } => {
+        AgentEvent::ResponseTruncated { dropped_tool_calls } => {
             fields.insert("dropped_tool_calls".into(), json!(dropped_tool_calls));
             "response_truncated"
         }
@@ -1634,11 +1629,7 @@ fn adopt_first_catalog_model(
 ///
 /// 供 `-p` / `--json` 的**窗口解析**用：厂商目录里报的 `context_window` 是窗口的
 /// 第一手来源（`Config::context_window_for` 的 ② 级），没有目录就只能落到兜底值。
-fn seed_catalog_only(
-    config: &mut config::Config,
-    base: &str,
-    models: Vec<provider::ApiModel>,
-) {
+fn seed_catalog_only(config: &mut config::Config, base: &str, models: Vec<provider::ApiModel>) {
     let mut cache = provider::ModelCache::new();
     cache.insert(base.trim_end_matches('/').to_string(), models);
     config.registry.apply_model_cache(cache);
@@ -1730,6 +1721,9 @@ async fn run_single_turn(
     let deadline = started + budget;
     // 本回合专属的边界源：`Abort` 的标志位随回合作废，绝不跨回合复用。
     let boundary = Arc::new(QueueBoundarySource::new());
+    // 模型取**共享所有权**副本（异步派发的后台任务要 `'static`）；在 `ports` 的
+    // 可变借用之前取，避免借用冲突。
+    let model_arc = wiring.model_arc();
     let ports = wiring.ports_with_boundary(Some(boundary.clone()));
     ports.events.begin_turn(1);
 
@@ -1738,10 +1732,19 @@ async fn run_single_turn(
     // 透传得到父的中止状态。
     let totals = std::sync::Arc::new(subagent::UsageTotals::default());
     let runner = subagent.map(|s| {
-        s.make_runner(config, ports.model, totals.clone(), Some(boundary.clone()))
+        s.make_runner(
+            config,
+            model_arc.clone(),
+            totals.clone(),
+            Some(boundary.clone()),
+        )
     });
-    let mut agent_ports =
-        AgentPorts::new(ports.model, ports.session, ports.events, Some(boundary.clone()));
+    let mut agent_ports = AgentPorts::new(
+        ports.model,
+        ports.session,
+        ports.events,
+        Some(boundary.clone()),
+    );
     if let Some(r) = &runner {
         agent_ports = agent_ports.with_subagent(r);
     }
@@ -1981,7 +1984,9 @@ async fn run_json_mode(
             rx,
             io::stdout(),
             write_json_envelope,
-            debug.as_deref_mut().map(|sink| DebugTap { sink, session_id }),
+            debug
+                .as_deref_mut()
+                .map(|sink| DebugTap { sink, session_id }),
         ),
     );
 
@@ -2681,8 +2686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limits = resolve_limits(&config);
     // 适配器尝试读数只在 debug 实际开启时注入：关闭路径连路由器与回调也不分配，
     // 保持“零文件、零线程、零额外分配”。文件打开后再 attach 当前会话。
-    let model_trace =
-        debug_log::debug_enabled(args.debug).then(debug_log::ModelTraceRouter::new);
+    let model_trace = debug_log::debug_enabled(args.debug).then(debug_log::ModelTraceRouter::new);
 
     // 注册 model factory（适配器特有的构建逻辑）
     let trace_for_main = model_trace.clone();
@@ -3781,12 +3785,11 @@ mod tests {
         tx.send(env(finished())).await.unwrap();
 
         let mut out = CountingWriter::default();
-        let result =
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                consume_print_events(rx, &mut out, None, "test-session"),
-            )
-            .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            consume_print_events(rx, &mut out, None, "test-session"),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -4762,8 +4765,8 @@ mod tests {
             None,
             &stats,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let meta = wiring.meta().unwrap();
         assert_eq!(
@@ -4822,9 +4825,18 @@ mod tests {
         );
 
         // 3) Some(None) ⇒ 清除。
-        finalize_turn_meta(&mut wiring, None, None, None, None, Some(None), None, &stats)
-            .await
-            .unwrap();
+        finalize_turn_meta(
+            &mut wiring,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            None,
+            &stats,
+        )
+        .await
+        .unwrap();
         assert_eq!(wiring.meta().unwrap().effort, None, "Some(None) 应清除");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5579,7 +5591,9 @@ mod tests {
             serde_json::from_str::<Value>(line).expect("每行必须是一个完整 JSON 对象");
         }
         assert!(
-            content.lines().any(|line| line.contains("\"ev\":\"probe\"")),
+            content
+                .lines()
+                .any(|line| line.contains("\"ev\":\"probe\"")),
             "flush 前的记录必须已落盘：{content}"
         );
 

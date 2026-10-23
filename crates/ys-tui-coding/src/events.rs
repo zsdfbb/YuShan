@@ -49,6 +49,7 @@
 //! | `Ctrl-A` / `Ctrl-E` | **输入行首 / 行尾** |
 //! | `End` / `Ctrl-End` / `Ctrl-Down` | **跳到最新消息**（`scroll_offset = 0`、`follow = true`） |
 //! | `Ctrl-Home` / `Ctrl-Up` | **跳到最早消息** |
+//! | 滚轮 / 触控板上下滑 | **逐视觉行滚动聊天**（与 `↑` 的「历史为空」回落同一语义） |
 //!
 //! 即：`↑↓` 归 readline 意义上的**输入历史**，聊天滚动主用 **`PageUp` / `PageDown`**
 //! （逐页）与 **`Ctrl+↑` / `Ctrl+↓`**（跳到最早 / 最新）。`↑` 的取历史**不设前置条件**
@@ -86,8 +87,27 @@
 //!
 //! **补全浮层打开时上下归浮层**（设计 §2.4）—— 焦点在浮层上，历史的上下让位；
 //! 浮层因其他键关闭时那一下会**交还给正常处理**，历史的上下随即生效。
+//!
+//! # 滚轮：为什么它归聊天而不归输入历史
+//!
+//! 终端不把滚轮当鼠标，而是译成 `↑` / `↓` 字节（macOS 触控板同理）—— 于是鼠标一旦
+//! 归终端解释，滚轮就跟着 `↑↓` 落到**输入历史**上：滑动触控板翻出来的是上一条提交的
+//! 文本，不是对话。这是「键位表里没有滚轮」的必然后果，不是任何一处绑错。
+//!
+//! 因此本模块**接管鼠标**（`run.rs` 开 `EnableMouseCapture`，退出序列关掉），让滚轮
+//! 在应用内成为独立语义：**滚轮 = 滚聊天**，与输入历史完全无关。代价与边界：
+//!
+//! - **终端原生选择失效**：手机模式与绝大多数终端在鼠标捕获期间不响应拖选，用户要
+//!   `⇧`+拖选（iTerm2 / Terminal.app / WezTerm 都支持强制原生选择）或走 `/copy`。
+//! - **只处理滚动**：`Down` / `Up`（键按下）、`Moved`（悬停）一律忽略 —— 不绑点击，
+//!   也就不会与拖选抢事件。
+//! - **左右滚动忽略**：聊天是单列竖排，水平分量没有语义。
+//! - **步长 = 1 视觉行**（不是 `PageUp` 的一页）：`ScrollUp` / `ScrollDown` 是离散的
+//!   「滚一格」事件，触控板滑动会被终端合批成多个事件；按行算才跟手。
+//! - **模态浮层不吃滚轮**：浮层自己读事件（`run.rs` 的 `Prompter` 实现），它 `_ => {}`
+//!   掉鼠标 —— 浮层内容不滚动，捕获仍开着只为不丢状态。
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use tokio::sync::mpsc::Sender;
 use ys_core::Message;
 use ys_protocol::{Boundary, Request};
@@ -109,8 +129,26 @@ pub fn handle_event(
         Event::Key(key) => handle_key(key, app, requests, boundaries, width, height),
         // bracketed paste：多行粘贴**不得**被当多次提交
         Event::Paste(text) => app.input.insert_str(&text),
+        // 滚轮 / 触控板：**滚聊天**，与 `↑↓` 的历史语义无关（见模块文档）。
+        // 其余鼠标事件（按下 / 松开 / 拖动 / 悬停）一律忽略 —— 不绑点击，避免与
+        // 用户在终端里的原生拖选抢事件。
+        Event::Mouse(m) => handle_mouse(m.kind, app, width, height),
         // 尺寸变化由 ratatui 在下次 draw 时自动响应（wrap 行数随之重算）
         Event::Resize(_, _) => {}
+        _ => {}
+    }
+}
+
+/// 鼠标事件：只认**滚轮上下**，其余忽略（见模块文档「滚轮」段）。
+///
+/// 步长取 **1 视觉行** —— 与 `↑` 在「历史为空」时的回落一致，方向也一致
+/// （`ScrollUp` 往旧内容、`ScrollDown` 往新）。触摸板的连续滑动会被终端合批成多个
+/// 事件，每个走一行即可；不乘倍率，否则 macOS 那种一次滑动几十个事件的终端会飞过头。
+pub fn handle_mouse(kind: MouseEventKind, app: &mut App, width: u16, height: u16) {
+    match kind {
+        MouseEventKind::ScrollUp => scroll(app, width, height, 1),
+        MouseEventKind::ScrollDown => scroll(app, width, height, -1),
+        // 水平滚动没有语义（对话是单列竖排）；按键 / 拖拽 / 悬停不绑任何动作。
         _ => {}
     }
 }
@@ -1549,6 +1587,99 @@ mod tests {
         assert_eq!(a.input.cursor, 3);
         assert!(!a.history.is_browsing(), "还原草稿同时退出浏览态");
         assert_eq!(a.scroll_offset, 0, "还原草稿那一下不再多滚一次");
+    }
+
+    /// **滚轮滚的是聊天，不是输入历史** —— 这正是接管鼠标的理由。
+    ///
+    /// 关键前提：`history` **非空**（否则 `ScrollUp` 与「`↑` 回落滚动」看起来一样，
+    /// 反而抓不到「滚轮误入历史」这个 bug）。
+    ///
+    /// 变异：
+    /// - 把 `handle_mouse` 的 `ScrollUp` 改成 `app.history.prev(..)` ⇒ 输入框断言红；
+    /// - 把步长改成 `page_rows(..)` ⇒ 精确的 +1 / -1 断言红；
+    /// - 把 `ScrollDown` 也接到历史 ⇒ 贴底断言红。
+    #[test]
+    fn test_wheel_scrolls_chat_and_never_input_history() {
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.history.record("旧的一次提交");
+        assert_eq!(a.scroll_offset, 0);
+
+        // 向上滑：一事件 = 一视觉行，输入框与历史浏览态都不动。
+        handle_mouse(MouseEventKind::ScrollUp, &mut a, 120, 40);
+        assert_eq!(a.scroll_offset, 1, "滚轮步长 = 1 视觉行");
+        assert!(!a.follow, "向上滑即脱离跟随");
+        assert!(a.input.text.is_empty(), "滚轮不得把历史填进输入框");
+        assert!(!a.history.is_browsing(), "滚轮不进入历史浏览态");
+
+        // 再向上：逐行累加，不是整页。
+        handle_mouse(MouseEventKind::ScrollUp, &mut a, 120, 40);
+        assert_eq!(a.scroll_offset, 2);
+
+        // 向下滑：回到贴底并恢复跟随。
+        for _ in 0..2 {
+            handle_mouse(MouseEventKind::ScrollDown, &mut a, 120, 40);
+        }
+        assert_eq!(a.scroll_offset, 0, "向下滑回到最新");
+        assert!(a.follow, "回到底部即恢复跟随");
+        assert!(a.input.text.is_empty(), "全程不碰输入框");
+    }
+
+    /// 水平滚动 / 按键 / 悬停 / 拖动一律**不动视窗**（不绑点击才能保留终端原生拖选）。
+    ///
+    /// 变异：把 `_` 臂改成任意滚动（如统一 `scroll(app, .., 1)`）⇒ 本用例红。
+    #[test]
+    fn test_other_mouse_events_are_ignored() {
+        use crossterm::event::MouseButton;
+
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.follow = false;
+        a.scroll_offset = 5;
+
+        for kind in [
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+        ] {
+            handle_mouse(kind, &mut a, 120, 40);
+            assert_eq!(a.scroll_offset, 5, "{kind:?} 不得改变滚动位置");
+            assert!(!a.follow, "{kind:?} 不得恢复跟随");
+        }
+    }
+
+    /// `Event::Mouse` 经 `handle_event` 分派到滚轮处理（不是被 `_ => {}` 吞掉）。
+    ///
+    /// 变异：删掉 `handle_event` 里的 `Event::Mouse(..)` 臂 ⇒ 滚动断言红。
+    #[test]
+    fn test_handle_event_routes_mouse_to_scroll() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+
+        handle_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 1, "鼠标事件必须进入滚动处理");
     }
 
     /// `↑↓` 归历史之后，聊天滚动仍有 `PageUp` / `PageDown` 这个入口。

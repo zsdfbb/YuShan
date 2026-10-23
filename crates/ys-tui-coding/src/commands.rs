@@ -365,6 +365,7 @@ pub fn help_text() -> String {
 const KEY_HELP: &str = "键位：
   ↑ ↓                输入框为空时 ↑ 取回历史（↓ 还原草稿）；否则滚动对话
   PageUp / PageDown  翻页（一页 = 视窗高度）
+  滚轮 / 触控板上下   逐行滚动对话（不影响输入历史）
   End                跳到最新消息
   Ctrl+↓ / Ctrl+End  跳到最新消息
   Ctrl+↑ / Ctrl+Home 跳到最早消息
@@ -1108,6 +1109,7 @@ mod tests {
             "Ctrl+End",
             "PageUp",
             "PageDown",
+            "滚轮",
             "Home",
         ] {
             assert!(text.contains(key), "键位段必须列出 {key}");

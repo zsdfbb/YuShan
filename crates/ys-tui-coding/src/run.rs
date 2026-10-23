@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -124,11 +124,15 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 fn setup_terminal() -> Result<Term, TuiError> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
+    // 鼠标捕获：**只为滚轮**（`events::handle_mouse`）。开着它终端就不再拿滚轮
+    // 自己滚 scrollback / 发 `↑↓`，滚轮因此归聊天而不是输入历史（见 `events.rs`
+    // 模块文档「滚轮」段）。代价：终端原生拖选失效，用户须 `⇧`+拖选。
     if let Err(e) = execute!(
         out,
         EnterAlternateScreen,
         DisableLineWrap,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     ) {
         // 半途失败别把终端留在 raw mode
         let _ = disable_raw_mode();
@@ -557,15 +561,15 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(
     let _ = terminal.show_cursor();
 }
 
-/// 终端状态恢复的字节序列：开换行 / 退 alt-screen / 关括号粘贴 / 弹键盘增强。
+/// 终端状态恢复的字节序列：开换行 / 退 alt-screen / 关括号粘贴 / 关鼠标捕获 / 弹键盘增强。
 ///
 /// 抽成自由函数，让**正常退出**（[`exit_payload`]）与**异常退出**（panic hook）共用同一份
 /// 序列 —— 两处若各写一遍，改一处必漏另一处。
 ///
 /// **顺序**（与抽取前逐字节一致）：`EnableLineWrap` → `LeaveAlternateScreen` →
-/// `DisableBracketedPaste` → `PopKeyboardEnhancementFlags`。四条命令各改一个**互不相干**的
-/// 终端模式位，除「`LeaveAlternateScreen` 在回放之前」外彼此无先后依赖（回放段的落点靠
-/// `?1049l` 恢复的光标，见 [`exit_payload`]）；此顺序沿用既有实现，不另作调整。
+/// `DisableBracketedPaste` → `DisableMouseCapture` → `PopKeyboardEnhancementFlags`。五条命令各改
+/// 一个**互不相干**的终端模式位，除「`LeaveAlternateScreen` 在回放之前」外彼此无先后依赖
+/// （回放段的落点靠 `?1049l` 恢复的光标，见 [`exit_payload`]）；此顺序沿用既有实现，不另作调整。
 ///
 /// 只含**字节序列**：`disable_raw_mode()` 是系统调用（改 termios），无法塞进这里，
 /// 由两个调用方各自按需发出（见 [`restore_terminal`] 与 [`restore_terminal_on_panic`]）。
@@ -577,6 +581,7 @@ fn restore_sequence() -> String {
         EnableLineWrap,
         LeaveAlternateScreen,
         DisableBracketedPaste,
+        DisableMouseCapture,
         PopKeyboardEnhancementFlags
     );
     String::from_utf8_lossy(&restore).into_owned()
@@ -849,9 +854,11 @@ mod tests {
         );
     }
 
-    /// N9 ①：恢复序列必须含退 alt-screen / 开换行 / 关括号粘贴 / 弹键盘增强这四条 ——
-    /// 缺任一条，panic 后终端都会停在 alt-screen、关闭换行、括号粘贴模式，或把键盘增强
-    /// 标志泄漏进 shell（用户只能 `reset`）。
+    /// N9 ①：恢复序列必须含退 alt-screen / 开换行 / 关括号粘贴 / 关鼠标捕获 / 弹键盘增强，
+    /// 缺任一条，panic 后终端都会停在 alt-screen、关闭换行、括号粘贴或鼠标捕获模式，或把
+    /// 键盘增强标志泄漏进 shell（用户只能 `reset`）。
+    ///
+    /// 鼠标捕获这一条尤其不能漏：开着退出后，用户在主屏里的原生拖选会全部失效。
     ///
     /// 字节值取自 `crossterm` 0.29 实测（非凭记忆）；`disable_raw_mode()` 是**系统调用**
     /// （改 termios），不在本字节序列内，故无从在此断言 —— 它由
@@ -862,6 +869,10 @@ mod tests {
         assert!(seq.contains("\x1b[?1049l"), "须退出 alt-screen：{seq:?}");
         assert!(seq.contains("\x1b[?7h"), "须开启换行：{seq:?}");
         assert!(seq.contains("\x1b[?2004l"), "须关闭括号粘贴：{seq:?}");
+        assert!(
+            seq.contains("\x1b[?1006l") && seq.contains("\x1b[?1000l"),
+            "须关闭鼠标捕获（否则退出后拖选失效）：{seq:?}"
+        );
         assert!(
             seq.contains("\x1b[<1u"),
             "须弹出键盘增强标志（否则泄漏进 shell）：{seq:?}"

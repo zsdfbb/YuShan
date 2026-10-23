@@ -13,7 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
+use ys_core::{ContentBlock, Message, Role};
 use ys_tool::{MAX_BYTES, MAX_LINES, head_tail};
+
+use crate::background::{BgCompletion, BgState};
 
 /// 头部占用的字节份额 —— 头部拿 1/4，其余留给尾部。
 ///
@@ -21,8 +24,8 @@ use ys_tool::{MAX_BYTES, MAX_LINES, head_tail};
 /// 尾部通常是报错与汇总，信息密度更高）。
 pub const HEAD_BYTES: usize = MAX_BYTES / 4;
 
-/// 轮询工具名 —— 「完整输出」提示行的前缀。
-const POLL_TOOL: &str = "bash_poll";
+/// 「完整输出」提示行的前缀 —— 后台命令（不是某个取状态工具）。
+const BG_PREFIX: &str = "bg";
 
 /// 一次后台命令输出的组装结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +92,7 @@ pub fn assemble(
         lines.push(note.to_string());
     }
     lines.push(format!(
-        "[{POLL_TOOL}] full output: {}",
+        "[{BG_PREFIX}] full output: {}",
         output_path.display()
     ));
 
@@ -100,6 +103,91 @@ pub fn assemble(
         skipped_bytes: trimmed.omitted_bytes,
         skipped_lines: trimmed.omitted_lines,
         output_path: output_path.to_path_buf(),
+    }
+}
+
+/// 把一条完成项渲染成**注入会话**的消息正文。
+///
+/// 这是后台结果正文的**唯一渲染点**：注册表在锁外回调它（见
+/// [`crate::background::BackgroundTasks::set_completion_renderer`]）。
+///
+/// # 四种形态
+///
+/// | 情形 | 首行 |
+/// |---|---|
+/// | 正常结束 | `finished (exit 0) in 27.4s` |
+/// | 非零退码 | `finished (exit 2) in 3.1s` |
+/// | 被 harness 杀掉 | `killed after 900s (lifetime exceeded)` |
+/// | 输出文件不在了 | `output no longer readable …` |
+///
+/// **「被杀」与「命令自己失败」必须用不同措辞**：模型会把前者误报成「测试挂了」，
+/// 而那是 harness 的干预，不是命令的结论。
+///
+/// **文件不可读时必须说出口**：静默地给空正文会让模型以为「命令没有输出」，
+/// 那是静默的谎；不知所措地不投递则等于丢结果。所以明说「有结果，但内容没了」。
+pub fn render_completion(c: &BgCompletion) -> Message {
+    let handle = c.handle.label();
+    let mut lines: Vec<String> = Vec::new();
+
+    // 首行：句柄 + 命令 + 结局。命令折成一行（多行命令会让首行占好几行）。
+    let command = c.command.lines().next().unwrap_or("").trim();
+    let command = if c.command.lines().count() > 1 {
+        format!("{command} …")
+    } else {
+        command.to_string()
+    };
+    let verdict = match c.state {
+        BgState::Exited(Some(code)) => {
+            format!("finished (exit {code}) in {:.1}s", c.elapsed.as_secs_f64())
+        }
+        // `None` = 被信号杀死（不是 harness 杀的）。信号号不在本类型里，
+        // 故只陈述「死于信号」这一事实，不猜是哪个。
+        BgState::Exited(None) => {
+            format!(
+                "terminated by a signal after {:.1}s (not by the harness)",
+                c.elapsed.as_secs_f64()
+            )
+        }
+        // 「被杀」的两种成因：存活上限、输出超限。后者由输出文件大小反推。
+        BgState::Killed => {
+            let size = std::fs::metadata(&c.output_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if size >= crate::background::BgLimits::default().max_output_bytes {
+                format!(
+                    "killed: output exceeded {} (harness limit)",
+                    format_bytes(size)
+                )
+            } else {
+                format!(
+                    "killed after {:.0}s (harness limit)",
+                    c.elapsed.as_secs_f64()
+                )
+            }
+        }
+        // 已终态才会被投递；这里只是防守（不与 `BgState` 的其它分支矛盾）。
+        BgState::Running => format!("still running after {:.1}s", c.elapsed.as_secs_f64()),
+    };
+    lines.push(format!("[{handle}] {command} — {verdict}"));
+
+    // 正文：输出读不出来时给明确的「不可读」形态。
+    match std::fs::read_to_string(&c.output_path) {
+        Ok(text) if !text.trim().is_empty() => {
+            let assembled = assemble(&text, &handle, &c.output_path, None);
+            lines.push(assembled.content);
+        }
+        Ok(_) => lines.push(format!("[{handle}] (no output)")),
+        Err(_) => lines.push(format!(
+            "[{handle}] output no longer readable (removed by /new or eviction) — \
+             the command did run; only its captured output is gone"
+        )),
+    }
+
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: lines.join("\n"),
+        }],
     }
 }
 
@@ -121,7 +209,12 @@ pub fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
     use super::*;
+    use crate::background::BgHandle;
 
     /// 生成 `n` 行、每行恰好 `width` 个 ASCII 字符，逐行内容可辨识。
     fn lines_of(n: usize, width: usize) -> Vec<String> {
@@ -204,7 +297,8 @@ mod tests {
     #[test]
     fn the_pending_note_is_placed_between_the_omission_report_and_the_path() {
         let text = lines_of(3_000, 40).join("\n");
-        let note = "[bg7] 还有 12 B 待交付（末行未换行，命令结束后整行交付）—— 完整输出见 /tmp/bg7.log";
+        let note =
+            "[bg7] 还有 12 B 待交付（末行未换行，命令结束后整行交付）—— 完整输出见 /tmp/bg7.log";
         let out = assemble(&text, "bg7", Path::new("/tmp/bg7.log"), Some(note));
 
         let lines: Vec<&str> = out.content.lines().collect();
@@ -266,5 +360,212 @@ mod tests {
         assert!(out.skipped_lines > 0, "被跳过的行必须报出");
 
         // 变异：把预算常量调大（如 `MAX_BYTES * 2`）⇒ 第一条断言变红。
+    }
+
+    // ---------- `render_completion`：四种形态 ----------
+
+    /// 渲染用例的临时文件序号 —— 与 `process::id()` 一起保证并行不撞名。
+    ///
+    /// `SystemTime::as_nanos()` 在 macOS 只到微秒级，并行测试会撞名 ⇒ 互删文件。
+    static RENDER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// 造一条指向临时文件的完成项，返回 `(完成项, 临时文件路径)`。
+    ///
+    /// `bytes` 为 `None` ⇒ **不建文件**，模拟「输出已被 `/new` 或淘汰删掉」。
+    /// 耗时固定 27.4s：`.1s` 与 `.0s` 两种写法都能逐字断言。
+    fn completion_with_output(state: BgState, bytes: Option<&[u8]>) -> (BgCompletion, PathBuf) {
+        let seq = RENDER_SEQ.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "ys_bg_output_test_{}_{seq}.log",
+            std::process::id()
+        ));
+        if let Some(bytes) = bytes {
+            std::fs::write(&path, bytes).expect("写临时输出文件失败");
+        }
+        let completion = BgCompletion {
+            handle: BgHandle(7),
+            state,
+            elapsed: Duration::from_millis(27_400),
+            command: "cargo build".to_string(),
+            cwd: std::env::temp_dir(),
+            output_path: path.clone(),
+        };
+        (completion, path)
+    }
+
+    /// 一条完成正文的文本 —— 它必须**恰好是一个文本块**（注入会话的就是这段字）。
+    fn body_of(message: &Message) -> String {
+        match message.content.as_slice() {
+            [ContentBlock::Text { text }] => text.clone(),
+            other => panic!("完成正文必须恰好是一个文本块：{other:?}"),
+        }
+    }
+
+    /// **正常结束**：首行报退码与耗时，正文给真输出，末行给完整输出路径。
+    ///
+    /// 变异①：耗时改成 `{:.0}s` ⇒ 「含 `in 27.4s`」第一条断言变红。
+    /// 变异②：正文不读输出文件 ⇒ 「含真输出」断言变红。
+    /// 变异③：不拼 `full output:` 行 ⇒ 最后一条断言变红。
+    #[test]
+    fn a_normal_exit_reports_the_code_the_elapsed_time_the_output_and_the_path() {
+        let (completion, path) =
+            completion_with_output(BgState::Exited(Some(0)), Some(b"build ok\n2 warnings\n"));
+
+        let body = body_of(&render_completion(&completion));
+        let first = body.lines().next().expect("正文至少有一行");
+        assert!(
+            first.contains("finished (exit 0)"),
+            "首行必须报出退码：{first}"
+        );
+        assert!(first.contains("in 27.4s"), "首行必须报出耗时：{first}");
+        assert!(
+            body.contains("build ok") && body.contains("2 warnings"),
+            "正文必须含命令的全部输出：{body}"
+        );
+        assert!(
+            body.contains(&format!("full output: {}", path.display())),
+            "正文必须给出完整输出路径：{body}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **非零退码**：退码同样写在首行 —— 完成项是 `User` 消息，**没有 `is_error` 位**
+    /// ⇒ 「失败」只能由措辞携带。
+    ///
+    /// 变异：首行固定写 `exit 0` ⇒ 本用例变红。
+    #[test]
+    fn a_non_zero_exit_reports_the_actual_code() {
+        let (completion, path) =
+            completion_with_output(BgState::Exited(Some(2)), Some(b"error: one test failed\n"));
+
+        let body = body_of(&render_completion(&completion));
+        let first = body.lines().next().expect("正文至少有一行");
+        assert!(
+            first.contains("finished (exit 2)"),
+            "首行必须报出真实退码：{first}"
+        );
+        assert!(
+            body.contains("error: one test failed"),
+            "正文必须含报错输出：{body}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **被信号杀死**（不是 harness 杀的）：措辞必须与「命令自己失败」不同，
+    /// 且**不得**出现 `finished (exit` —— 否则模型会把信号致死误报成退码结论。
+    ///
+    /// 变异：把 `Exited(None)` 并到 `Exited(Some(code))` 分支 ⇒ 首行出现 `exit` 字样 ⇒ 变红。
+    #[test]
+    fn a_signal_death_is_told_apart_from_an_exit_code() {
+        let (completion, path) = completion_with_output(BgState::Exited(None), Some(b"partial\n"));
+
+        let body = body_of(&render_completion(&completion));
+        let first = body.lines().next().expect("正文至少有一行");
+        assert!(
+            first.contains("terminated by a signal"),
+            "首行必须说清是被信号打死：{first}"
+        );
+        assert!(
+            !first.contains("finished (exit"),
+            "信号致死不得被写成退码结论：{first}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **被 harness 杀掉**（输出文件小 ⇒ 不是输出超限）⇒ 首行为「存活上限」。
+    ///
+    /// 关键断言是**不出现** `finished (exit`：模型会把被杀误报成「命令失败了」，
+    /// 而那是 harness 的干预，不是命令的结论。
+    ///
+    /// 变异①：`Killed` 走 `Exited` 分支 ⇒ 「不得出现 `finished (exit`」断言变红。
+    /// 变异②：`killed after` 里不写耗时 ⇒ 第一条断言变红。
+    #[test]
+    fn a_killed_command_is_reported_as_killed_not_as_a_failure() {
+        let (completion, path) = completion_with_output(BgState::Killed, Some(b"still working\n"));
+
+        let body = body_of(&render_completion(&completion));
+        let first = body.lines().next().expect("正文至少有一行");
+        assert!(
+            first.contains("killed after 27s"),
+            "首行必须说清是被 harness 杀掉并报出耗时：{first}"
+        );
+        assert!(
+            !body.contains("finished (exit"),
+            "被杀不得被误报成退码结论：{body}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **被 harness 杀掉（输出超限）**：首行为 `output exceeded`，与「存活上限」区分开。
+    ///
+    /// 变异：`Killed` 分支不看输出文件大小、一律写 `killed after` ⇒ 本用例变红。
+    #[test]
+    fn a_kill_caused_by_the_output_cap_says_so() {
+        // 恰好等于默认输出上限（2 MiB）⇒ 走「输出超限」归因。
+        let limit = crate::background::BgLimits::default().max_output_bytes as usize;
+        let (completion, path) = completion_with_output(BgState::Killed, Some(&vec![b'x'; limit]));
+
+        let body = body_of(&render_completion(&completion));
+        let first = body.lines().next().expect("正文至少有一行");
+        assert!(
+            first.contains("output exceeded"),
+            "首行必须归因为输出超限：{first}"
+        );
+        assert!(
+            !first.contains("killed after"),
+            "输出超限不得被写成存活上限：{first}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **输出文件已不可读** ⇒ 正文必须明说「有结果，但内容没了」。
+    ///
+    /// 空正文是**静默的谎**（模型会以为命令没有输出）；不投递则等于丢结果。
+    ///
+    /// 变异：`Err(_)` 分支给空正文 ⇒ 第一条断言变红。
+    #[test]
+    fn a_missing_output_file_is_reported_as_no_longer_readable() {
+        let (completion, path) = completion_with_output(BgState::Exited(Some(0)), None);
+
+        let body = body_of(&render_completion(&completion));
+        assert!(
+            body.contains("output no longer readable"),
+            "文件不可读必须明说（不得给空正文）：{body}"
+        );
+        assert!(!body.trim().is_empty(), "不可读形态也必须有正文");
+        assert!(
+            body.lines()
+                .next()
+                .unwrap_or_default()
+                .contains("finished (exit 0)"),
+            "首行仍须报出结局（结果是真的，只是内容没了）：{body}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **输出文件存在但为空** ⇒ `(no output)` —— 与「不可读」严格区分。
+    ///
+    /// 变异：把 `Ok(_)`（空文本）并到 `Err(_)` 分支 ⇒ 正文出现 `no longer readable` ⇒ 变红。
+    #[test]
+    fn an_empty_output_file_is_reported_as_no_output() {
+        let (completion, path) = completion_with_output(BgState::Exited(Some(0)), Some(b""));
+
+        let body = body_of(&render_completion(&completion));
+        assert!(
+            body.contains("(no output)"),
+            "空输出必须说 `(no output)`：{body}"
+        );
+        assert!(
+            !body.contains("no longer readable"),
+            "空输出不得被说成「不可读」：{body}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -128,6 +128,15 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
+- **bg-notify 的 R1 技术债：投递机制不外溢**（ADR `docs/arch/bg-notify/adr-bg-notify.md`）：
+  「落点格 + `Delivery` 三态 + take/claim/Finish」现在长在 `adapters/tools-basic/src/background.rs`
+  上，只为后台 `bash` 一个生产用例服务。**触发重开的条件**：出现**第二个**后台任务类型
+  （MCP 长任务、后台 LSP、后台 subagent 的另一种形态）⇒ 那时把这三块抽成
+  `ys-protocol` 的 `DeferredSink`（候选 B 的 §2.2）。不抽的代价：那 30 行会被复制第二遍。
+- **`kill_group` 仍是同步 fork**：已从锁内挪到锁外（ADR 同上），但仍是
+  `Command::new("sh")...status()` 的同步等待。`proc_group::kill_group_async` 已存在，
+  要彻底解决需把 `sweep` / `snapshot` 的签名改异步。
+
 - **PTC（程序化工具调用）—— 长期方向，本轮明确不做**（ADR-0048 决策）：
   模型写一段代码调工具、**只有 curated 结果进模型历史** ⇒ N 次工具调用收敛为**一轮**模型往返。
   是四家同类（deepseek-harness `core/tools/src/ptc.ts:1-8`）里**唯一能改变轮次数量级**的机制，

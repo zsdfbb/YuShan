@@ -128,11 +128,13 @@ fn merge_hints(search: Option<String>, web: Option<String>) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
 
     use ys_runtime::AgentBuilder;
     use ys_tool::AutoApprove;
+    use ys_tools_basic::{BackgroundTasks, BgLimits, SessionSlot};
     use ys_tools_web::{Backend, FetchedDir, Kind};
 
     use crate::test_env::{EnvRestore, env_lock};
@@ -531,6 +533,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 真实 `bash_bg` 的 `spec()` —— 父表追加段的第一项。
+    ///
+    /// 用真工具而不手写 `ToolSpec`：锚点要钉的是**模型真看到的那份 schema**。
+    /// 注册表落在临时目录里（绝不碰真实的 `YUSHAN_BG_DIR`），且本用例不启动任何进程。
+    fn bash_bg_spec(workspace: &Path) -> ys_tool::ToolSpec {
+        let tasks = Arc::new(BackgroundTasks::new(
+            workspace.join("bg"),
+            BgLimits::default(),
+        ));
+        ys_tools_basic::BashBgTool::new(tasks, workspace.to_path_buf(), SessionSlot::new("anchor"))
+            .spec()
+    }
+
     /// 在 `dir` 下写一个**超龄**（mtime = 8 天前）且名字**符合落盘命名形状**的文件，
     /// 返回其路径 —— 供「装配不清理」这类断言做**真会命中 sweep 判据**的靶子。
     fn write_aged_fetched(dir: &Path, final_url: &str) -> PathBuf {
@@ -585,7 +600,7 @@ mod tests {
     }
 
     /// 断言三件：
-    ///  1. 工具表恰 9 个、顺序 == [`EXPECTED_ORDER`]；
+    ///  1. 基础表（子 agent 的工具表）恰 9 个、顺序 == [`EXPECTED_ORDER`]；
     ///  2. **同一份工具表构造两次，序列化后逐字节相同**（ADR-0022 决策 19 的抖动面：
     ///     子 agent 每次派发都重建表，`spec()` 若非纯函数会让子自己的缓存跨派发抖动）；
     ///  3. 系统提示（空 skill catalogue）的指纹可复现。
@@ -598,26 +613,33 @@ mod tests {
 
         let (tools, _) = build_tools(&dir, offline_web());
         let specs: Vec<ys_tool::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
-        assert_eq!(specs.len(), 9, "工具表应为 9 个");
+        assert_eq!(specs.len(), 9, "基础表应为 9 个（子 agent 的表）");
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, expected_order(), "顺序即语义");
 
         let json = serde_json::to_string(&specs).unwrap();
         let fp_tools = fnv1a64(json.as_bytes());
 
-        // 刀 4 后的**重锚**：父表 = 这 9 元 + 派发工具（末位）⇒ 10 元，且父 JSON 是
-        // 子 JSON 的**字节前缀 + 追加项**（子表命中父的前缀缓存）。
+        // **父表锚点**：父表 = 这 9 元 + `bash_bg` + 派发工具（末位）⇒ **11 元**，且父 JSON
+        // 是子 JSON 的**字节前缀 + 追加项**（子表命中父的前缀缓存）。
+        //
+        // 两个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
+        // 真看到的那份 schema。`subagent_async` 由 `assembly.rs` 再追加在更后面，不进本锚点。
         let mut parent_specs = specs.clone();
+        parent_specs.push(bash_bg_spec(&dir));
         parent_specs.push(crate::subagent::SubagentTool::new(Duration::from_secs(60)).spec());
         assert_eq!(
             parent_specs.len(),
-            10,
-            "父表应为 10 元（9 基础 + subagent）"
+            11,
+            "父表应为 11 元（9 基础 + bash_bg + subagent）"
         );
         assert_eq!(
-            parent_specs.last().unwrap().name,
-            "subagent",
-            "派发工具必须追加在**末位**（否则子表不再是父的字节前缀）"
+            parent_specs[parent_specs.len() - 2..]
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["bash_bg", "subagent"],
+            "追加段顺序即契约：后台工具在派发工具**之前**（否则子表不再是父的字节前缀）"
         );
         let parent_json = serde_json::to_string(&parent_specs).unwrap();
         assert!(

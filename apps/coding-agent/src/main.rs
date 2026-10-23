@@ -2800,16 +2800,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 工具表是建表期产物 ⇒ 会话 id 只能运行时读；`/new`、`/resume` 换会话时
     // 由接线器改槽。
     //
+    // **只在交互式 TUI 下挂载**：`-p` / `--json` 是单回合，回合结束即退出 ⇒
+    // `Boundary::Deferred` 只在 `BasicLoop` 的轮边界被消费，无人回收 ⇒
+    // 转后台的命令结果会永远丢失（且超时会被报成「成功」）。这三种模式下
+    // `BashTool` 拿不到注册表 ⇒ 超时走原路径（杀进程组 + 明确报错）。
+    //
     // 落盘根目录：`$YUSHAN_BG_DIR`（须绝对路径）或 `<temp_dir>/yushan-bg`。
     let bg_root = BackgroundTasks::default_root();
-    let backgrounds = BackgroundContext::new(
-        std::sync::Arc::new(BackgroundTasks::new(bg_root.clone(), BgLimits::default())),
-        // 初值只是占位 —— 真正的会话 id 由接线器挂载上下文时写入（工具运行时读槽）。
-        SessionSlot::new("startup"),
-    );
-    // 进程级单例：退出路径也要用它清理（退出原语不跑析构）。
-    let _ = BACKGROUNDS.set(backgrounds.clone());
+    let backgrounds = if matches!(args.mode, Mode::Interactive) {
+        let tasks = std::sync::Arc::new(BackgroundTasks::new(bg_root.clone(), BgLimits::default()));
+        // 完成正文的渲染回调 —— 进程级装一次。渲染要读输出文件（锁外做），
+        // 且正文口径只有 `bg_output` 一处；未装载时清扫**不投递**（回 `Pending`）。
+        tasks.set_completion_renderer(ys_tools_basic::render_completion);
+        let context = BackgroundContext::new(
+            tasks,
+            // 初值只是占位 —— 真正的会话 id 由接线器挂载上下文时写入（工具运行时读槽）。
+            SessionSlot::new("startup"),
+        );
+        // 进程级单例：退出路径也要用它清理（退出原语不跑析构）。
+        let _ = BACKGROUNDS.set(context.clone());
+        Some(context)
+    } else {
+        None
+    };
     // 落盘目录清理：只删**超龄**的输出文件（默认档可能被同机并行的另一个实例共用）。
+    // 与是否挂载无关 —— 别的实例写下的旧文件同样该扫地。
     sweep_bg_root(&bg_root, BG_MAX_AGE);
 
     let factory = assembly::AgentFactory::new(
@@ -2818,8 +2833,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
         config.max_turn_duration(),
         subagents_dir,
-    )
-    .with_backgrounds(backgrounds.clone());
+    );
+    let factory = match &backgrounds {
+        Some(context) => factory.with_backgrounds(context.clone()),
+        None => factory,
+    };
     // 一次装配：工具表 / working_dir / system prompt 三者同源于 `workspace`。
     let assembly::BuiltAgent {
         mut agent,

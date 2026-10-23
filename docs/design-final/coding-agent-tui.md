@@ -1012,19 +1012,23 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
 - 真实终端的「翻页跟手」观感仍是 `MANUAL_ACK` 项（见 §10）。
 ## 19. 后台命令执行（execution-efficiency）— as-built
 
-本节只记**已成立**的事实。切片 1 的两个工具**已注册**（父表 12 元，见 §19.1）；
-仍在收口的条目在对应小节写明现状；落盘目录契约见
+> ⚠️ **本轮已被 §20 部分取代**：`bash_poll` 已删除，结果回收从「模型轮询」改为
+> 「完成时自动注入」。本节保留**仍然成立**的部分（落盘目录、输出上限、进程组清理、
+> `bash_bg` 的启动语义），凡提到 `bash_poll` / 轮询 / 增量交付 / 父表 12 元的描述**以 §20 为准**。
+
+本节只记**已成立**的事实。落盘目录契约见
 `docs/arch/execution-efficiency/design.md` §4.5。
 
 ### 19.1 父/子工具表元素数
 
-- **父表 = 12 元**：基础 9 元（`apps/coding-agent/src/toolset.rs:88` 的 `build_tools`）+
-  `bash_bg` + `bash_poll` + `SubagentTool` **追加末位**（`apps/coding-agent/src/assembly.rs`
-  的 `AgentFactory::build()`）；两个后台工具排在 `subagent` **之前** —— 顺序即契约。
-- **子表 = 9 元**（不含 `bash_bg` / `bash_poll` / `subagent`）⇒ 派发**结构上**不可能递归，
+- **父表 = 11 元**：基础 9 元（`apps/coding-agent/src/toolset.rs:88` 的 `build_tools`）+
+  `bash_bg` + `SubagentTool` **追加末位**（`apps/coding-agent/src/assembly.rs`
+  的 `AgentFactory::build()`）；`bash_bg` 排在 `subagent` **之前** —— 顺序即契约。
+  （`bash_poll` 已删除，见 §20。）
+- **子表 = 9 元**（不含 `bash_bg` / `subagent`）⇒ 派发**结构上**不可能递归，
   子 agent 天然没有后台能力。
 - 前缀性质：子表 JSON 是父表 JSON 的**字节前缀**（父表 = 子表去掉末尾 `]` +
-  追加段 `,{bash_bg…},{bash_poll…},{subagent…}]`）⇒ 命中 prompt cache。
+  追加段 `,{bash_bg…},{subagent…}]`）⇒ 命中 prompt cache。
   真实装配产物的字节级断言在 `apps/coding-agent/src/assembly.rs` 的
   `real_parent_table_keeps_the_child_table_as_its_byte_prefix`（元素数 + 前缀 + 追加段逐字节）
   与 `real_parent_table_ends_with_the_subagent_tool`（末位）。
@@ -1169,3 +1173,70 @@ beta
   `assemble(text, handle_label, output_path, pending_note)` 是**唯一真源** ——
   行的顺序是「头 → 省略标记 → 尾 → 未送达报出 → 待交付提示 → 完整输出路径」；
   `bg_tools` 只提供「待交付」提示的**措辞**（读域知识），**插入位置**由 `assemble` 决定。
+
+## 20. 后台命令完成通知（bg-notify）— as-built
+
+**ADR**：[`0050`/`adr-bg-notify`](../arch/bg-notify/adr-bg-notify.md)（状态 accepted）。
+**设计**：[`docs/arch/bg-notify/design.md`](../arch/bg-notify/design.md)。
+**本节取代 §19 里关于「模型显式轮询」的描述** —— `bash_poll` 已删除。
+
+### 20.1 形态
+
+后台命令结束时，由既有的 100ms sweeper 把结果 `push` 成 `Boundary::Deferred`；
+`BasicLoop` 在下一个轮边界 append 进会话并 emit `AgentEvent::DeferredResult`
+⇒ 模型**不需要轮询**。`Boundary::Deferred` 与 `DeferredResult` 是既有机制，
+异步 subagent 早就在用同一条路径。
+
+**父表 = 11 元**：基础 9 元 + `bash_bg` + `SubagentTool`（`bash_poll` 已删）。
+子表仍是 9 元 ⇒ 子 agent 无后台能力。
+
+### 20.2 三个部件
+
+| 部件 | 位置 | 职责 |
+|---|---|---|
+| 落点格 | `BackgroundTasks.deferred` | 每回合由 `app_loop` 用 `bind_deferred` 绑；RAII 守卫 drop 时解绑 |
+| 投递状态机 | `Delivery::{Pending, InFlight, Delivered}` | 与 `BgState` **正交**；`repair_inflight` 在每 tick 开头把超 2 tick 的 `InFlight` 回退 |
+| 正文渲染 | `bg_output::render_completion` | 唯一渲染点。**无 `is_error` 位** —— 失败与被杀靠措辞区分 |
+
+**为什么落点每回合刷新**：工具表是进程级的，边界源每回合新建。存启动那刻的 `Arc`
+会在回合切换后把结果推进一个无人消费的队列（看起来成功，实则永久沉底）。
+
+### 20.3 锁纪律
+
+`sweep()` **三段式**：
+1. 段 1（持锁）：`repair_inflight` + `enforce_output_cap`（标记）+ `reap` + `claim_completions`
+   —— **不 fork、不读输出文件**（`try_wait` / `stat` 除外）；
+2. 段 2（无锁）：`kill_outside` + `deliver`（渲染要读文件，最多 50 KiB）；
+3. 段 3（持锁）：淘汰超额完成项。
+
+`snapshot()` / `mark_and_kill_expired()` 同规：锁内标记、锁外杀。
+
+### 20.4 名额
+
+| 计数 | 上限 | 超限 |
+|---|---|---|
+| 在跑 | 4（`max_running`） | `bash_bg` 同步报错 |
+| 未投出的完成项 | 8（独立计数） | 淘汰最旧的（删输出文件） |
+
+两者**不再共享**名额 —— 否则「启动构建 → 回合结束 → 下回合再启动」这种正常用法
+会把滞留的结果挤掉。
+
+### 20.5 `bash` 超时转后台
+
+已挂后台能力时（**仅交互式 TUI**），`bash` 的 deadline 到点不再杀进程组，而是：
+`adopt_pid` 登记 → watcher **接管既有的两个排空任务**（管道已被它们 `take()` 走，
+不能再 `child.stdout.take()`）→ 等进程退出 → `mark_finished` 推终态 → 下一 tick 投递。
+
+`-p` / `--json` 模式**不挂**后台能力（`main.rs` 的 `Mode::Interactive` 判断）
+⇒ 超时走原路径（杀进程组 + `ToolError::Timeout`）。
+
+### 20.6 跨回合补投
+
+回合先结束时完成项留在注册表（`Pending`），下一回合开头由 `app_loop` 补投，
+**每回合最多 2 条**（`BG_CATCHUP_PER_TURN`）；超出部分继续留表。
+
+### 20.7 已知缺口
+
+- 「锁内不读输出文件」只有人工审查，缺自动化探针（渲染是外挂 `fn` 指针，黑盒）。
+- `BG_CATCHUP_PER_TURN` 的限流逻辑在回合循环体内，未抽成可测函数。
+- `kill_group` 仍是同步 fork（已挪到锁外，但未异步化）。

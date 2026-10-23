@@ -1,17 +1,29 @@
-//! 后台命令执行（`bash_bg` → `bash_poll`）的集成验收。
+//! 后台命令执行（`bash_bg` → 完成时**自动注入**）的集成验收。
 //!
-//! 被测的是**真实进程链路**：直接构造 [`BackgroundTasks`] + [`BashBgTool`] /
-//! [`BashPollTool`]，在临时目录里跑完整链路 —— 启动、真进程、增量交付、退码、
-//! 进程组清理。**不需要模型、不需要凭证、不引新依赖。**
+//! 被测的是**真实进程链路**：直接构造 [`BackgroundTasks`] + [`BashBgTool`]，在临时目录里
+//! 跑完整链路 —— 启动、真进程、收尸、退码、正文渲染、进程组清理。**不需要模型、不需要凭证、
+//! 不引新依赖。**
+//!
+//! # 结果的取回方式
+//!
+//! 模型面**没有轮询工具**：命令结束时由 sweeper 把结果 `push` 成 `Boundary::Deferred`，
+//! 在下一个轮边界自动进会话。故本文件取结果的路径是**生产路径**的两步 ——
+//! [`BackgroundTasks::snapshot`]（等它离开 `Running`）+
+//! [`BackgroundTasks::take_completions`]（认领完成项）—— 然后交给**唯一渲染点**
+//! [`render_completion`] 断言正文。
+//!
+//! 这里**不驱动 sweeper 与边界源**（那两条由 `app_loop.rs` 的单元测试负责，见
+//! `the_shared_sweeper_reaps_finished_commands`）：本文件验的是「真进程 → 完成项 → 正文」
+//! 这一段，投递的恰好一次 / 未绑定留表 / 补投限流都属于注册表与接线器的职责范围。
 //!
 //! # 覆盖的契约
 //!
 //! | 用例 | 契约 |
 //! |---|---|
 //! | `starting_a_background_command_returns_a_handle_before_it_finishes` | 启动**不等命令结束** |
-//! | `polling_delivers_only_the_bytes_that_were_not_delivered_yet` | 增量交付 + **不重复交付** |
-//! | `polling_after_the_command_finished_reports_the_exit_code` | 终态给**退码** |
-//! | `a_non_zero_exit_code_is_reported_as_an_error` | 退码 ≠ 0 ⇒ `is_error == true` |
+//! | `the_completion_carries_the_real_output_and_the_exit_code` | 终态给**退码** + 真输出 + 完整路径 |
+//! | `a_non_zero_exit_code_is_reported_in_the_completion_body` | 退码 ≠ 0 **写在正文里**（消息没有 error 位） |
+//! | `a_second_start_gets_a_fresh_handle` | 句柄**不复用** |
 //! | `cleaning_up_the_session_leaves_no_running_process` | 清理后**进程数 = 0** |
 //! | `oversized_output_reports_the_skipped_bytes_and_the_full_output_path` | 裁剪**报出**跳过量与完整路径 |
 //! | `a_handle_from_another_session_is_reported_as_unknown` | **跨会话句柄不命中** |
@@ -32,15 +44,18 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::time::sleep;
-use ys_core::ToolResult;
+use ys_core::Message;
 use ys_tool::{Tool, ToolContext};
-use ys_tools_basic::{BashBgTool, BashPollTool, BackgroundTasks, BgLimits, SessionSlot};
+use ys_tools_basic::{
+    BackgroundTasks, BashBgTool, BgCompletion, BgHandle, BgLimits, BgState, SessionSlot,
+    render_completion,
+};
 
 /// 临时目录名的进程内序号 —— 与 `process::id()` 一起保证并行不撞名。
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -55,7 +70,7 @@ const CASE_LIMIT: Duration = Duration::from_secs(40);
 /// 启动后观察「进程是否还在跑」的最长时间。
 const GONE_LIMIT: Duration = Duration::from_secs(10);
 
-/// 一个后台命令的测试环境 —— 注册表、两个工具、临时目录。
+/// 一个后台命令的测试环境 —— 注册表、启动工具、临时目录。
 struct Fixture {
     /// 落盘根目录（注册表的 root）。
     root: PathBuf,
@@ -67,32 +82,26 @@ struct Fixture {
     backgrounds: Arc<BackgroundTasks>,
     /// 启动工具。
     bg: BashBgTool,
-    /// 轮询工具。
-    poll: BashPollTool,
 }
 
 impl Fixture {
     /// 搭一套环境 —— 注册表额度用 [`BgLimits::default`]。
     fn new(prefix: &str) -> Self {
         let seq = DIR_SEQ.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
-            "ys_bg_test_{prefix}_{}_{seq}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("ys_bg_test_{prefix}_{}_{seq}", std::process::id()));
         let workspace = root.join("ws");
         std::fs::create_dir_all(&workspace).expect("创建临时工作目录失败");
         let session = format!("sess-{seq}");
         let backgrounds = Arc::new(BackgroundTasks::new(root.clone(), BgLimits::default()));
         let slot = SessionSlot::new(session.clone());
-        let bg = BashBgTool::new(backgrounds.clone(), workspace.clone(), slot.clone());
-        let poll = BashPollTool::new(backgrounds.clone(), slot.clone());
+        let bg = BashBgTool::new(backgrounds.clone(), workspace.clone(), slot);
         Self {
             root,
             workspace,
             session,
             backgrounds,
             bg,
-            poll,
         }
     }
 
@@ -102,7 +111,7 @@ impl Fixture {
     }
 
     /// 启动一条后台命令，返回 `(句柄, 启动结果文本)`。
-    async fn start(&self, command: &str) -> (String, String) {
+    async fn start(&self, command: &str) -> (BgHandle, String) {
         let result = guarded(
             "bash_bg 调用",
             CASE_LIMIT,
@@ -111,27 +120,43 @@ impl Fixture {
         .await
         .expect("bash_bg 应成功返回");
         assert!(!result.is_error, "启动不应是错误：{}", result.content);
-        let handle = field(&result.content, "handle").expect("结果里应有句柄");
-        (handle, result.content)
+        let label = field(&result.content, "handle").expect("结果里应有句柄");
+        (handle_of(&label), result.content)
     }
 
-    /// 轮询一条后台命令。
-    async fn poll(&self, handle: &str, wait_seconds: u64) -> ToolResult {
-        guarded(
-            "bash_poll 调用",
-            CASE_LIMIT,
-            self.poll
-                .call(json!({ "handle": handle, "wait_seconds": wait_seconds }), self.ctx()),
-        )
-        .await
-        .expect("bash_poll 应成功返回")
+    /// 等一条命令离开 `Running`，再**按生产路径**认领它的完成项。
+    ///
+    /// 等待用 [`BackgroundTasks::snapshot`]（它顺带收尸并执行输出上限闸门 ⇒ 与被测链路
+    /// 同一口径）；认领用 [`BackgroundTasks::take_completions`]，取得后立刻
+    /// [`BackgroundTasks::finish_delivery`] 落状态 —— 与 `app_loop` 的补投顺序一致。
+    async fn completion(&self, handle: BgHandle) -> BgCompletion {
+        let deadline = Instant::now() + CASE_LIMIT;
+        loop {
+            match self.backgrounds.snapshot(handle, &self.session) {
+                Some(snapshot) if snapshot.state != BgState::Running => break,
+                Some(_) => {}
+                None => panic!("句柄 {handle:?} 已从注册表消失（被淘汰？）"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "命令 {handle:?} 在 {CASE_LIMIT:?} 内没有结束"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        let mut claimed = self.backgrounds.take_completions(&self.session);
+        let index = claimed
+            .iter()
+            .position(|candidate| candidate.handle == handle)
+            .unwrap_or_else(|| panic!("{handle:?} 已是终态，却取不到完成项"));
+        let candidate = claimed.remove(index);
+        self.backgrounds.finish_delivery(handle, true);
+        candidate
     }
 
-    /// 某个句柄的输出文件路径。
-    fn output_path(&self, handle: &str) -> PathBuf {
-        self.root
-            .join(&self.session)
-            .join(format!("{handle}.log"))
+    /// 某条命令的**模型可见正文**（首行 + 正文拼成一段）。
+    async fn rendered(&self, handle: BgHandle) -> String {
+        text_of(&render_completion(&self.completion(handle).await))
     }
 }
 
@@ -154,9 +179,31 @@ async fn guarded<T>(label: &str, limit: Duration, future: impl Future<Output = T
 /// 从工具结果文本里取 `key: value` 形态的字段。
 fn field(content: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}: ");
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix).map(|value| value.trim().to_string()))
+    content.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .map(|value| value.trim().to_string())
+    })
+}
+
+/// `bg7` ⇒ `BgHandle(7)`（句柄号是模型可见的那部分，故从文案反解）。
+fn handle_of(label: &str) -> BgHandle {
+    let digits = label
+        .strip_prefix("bg")
+        .unwrap_or_else(|| panic!("句柄形态应是 bgN：{label}"));
+    BgHandle(digits.parse().expect("句柄号应是数字"))
+}
+
+/// 一条消息的正文（`content` 文本块拼起来）。
+fn text_of(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .map(|block| match block {
+            ys_core::ContentBlock::Text { text } => text.clone(),
+            other => panic!("完成正文只应有文本块，得到 {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 进程是否**还在跑** —— 僵尸态（`Z`）已经不在执行，不算「还在跑」。
@@ -206,13 +253,18 @@ async fn wait_for_output(path: &Path, needle: &str, limit: Duration) -> String {
             return text;
         }
         if Instant::now() >= deadline {
-            panic!("输出文件在 {limit:?} 内没有出现 {needle:?}：{}", path.display());
+            panic!(
+                "输出文件在 {limit:?} 内没有出现 {needle:?}：{}",
+                path.display()
+            );
         }
         sleep(Duration::from_millis(25)).await;
     }
 }
 
 /// 启动**不等命令结束**就返回句柄。
+///
+/// 变异：把 `start` 改成等到进程退出再返回 ⇒ 第二条断言（实测耗时 < 3s）变红。
 #[tokio::test]
 async fn starting_a_background_command_returns_a_handle_before_it_finishes() {
     let fixture = Fixture::new("start");
@@ -220,7 +272,7 @@ async fn starting_a_background_command_returns_a_handle_before_it_finishes() {
     let (handle, content) = fixture.start("sleep 5; echo done").await;
     let elapsed = started.elapsed();
 
-    assert!(handle.starts_with("bg"), "句柄形态应是 bgN：{handle}");
+    assert_eq!(handle, BgHandle(1), "首个句柄应是 bg1");
     assert!(
         elapsed < Duration::from_secs(3),
         "启动**不等命令结束**（命令要跑 5s），实测 {elapsed:?}"
@@ -230,80 +282,93 @@ async fn starting_a_background_command_returns_a_handle_before_it_finishes() {
         content.contains("output:"),
         "结果里应有输出文件路径：{content}"
     );
-}
-
-/// 轮询只交付**尚未交付**的字节 —— 第二次轮询不重复，第三次没有新字节。
-#[tokio::test]
-async fn polling_delivers_only_the_bytes_that_were_not_delivered_yet() {
-    let fixture = Fixture::new("incremental");
-    let (handle, _) = fixture.start("echo alpha; sleep 3; echo beta").await;
-    let output_path = fixture.output_path(&handle);
-
-    // 等第一段真的落盘 —— 不靠睡固定时长赌时序。
-    wait_for_output(&output_path, "alpha", CASE_LIMIT).await;
-
-    let first = fixture.poll(&handle, 0).await;
-    assert!(first.content.contains("alpha"), "第一次轮询应拿到增量：{}", first.content);
     assert!(
-        !first.content.contains("beta"),
-        "还没产生的输出不该出现：{}",
-        first.content
-    );
-
-    // 第二次轮询：等命令结束 ⇒ 拿到第二段，且**不重复**第一段。
-    let second = fixture.poll(&handle, 15).await;
-    assert!(second.content.contains("beta"), "第二次轮询应拿到新段：{}", second.content);
-    assert!(
-        !second.content.contains("alpha"),
-        "已送达的字节不得重复送达：{}",
-        second.content
-    );
-
-    // 第三次：文件已到尾 ⇒ 没有新字节。
-    let third = fixture.poll(&handle, 0).await;
-    assert!(
-        third.content.contains("0 B new"),
-        "已交付完后再轮询应是 0 字节新：{}",
-        third.content
-    );
-    assert!(
-        !third.content.contains("alpha") && !third.content.contains("beta"),
-        "已送达的字节不得重复送达：{}",
-        third.content
+        content.contains("do NOT poll for it"),
+        "模型面无轮询工具 ⇒ 文案必须禁止轮询：{content}"
     );
 }
 
-/// 命令结束后轮询拿到**退码**。
+/// 终态正文给出**退码**、**真输出**、**完整输出路径**。
+///
+/// 变异①：`render_completion` 不读输出文件（正文留空）⇒ 「含真输出」断言变红。
+/// 变异②：`reap` 不落 `Exited(Some(code))` ⇒ 首行变成「被信号杀掉」⇒ 退码断言变红。
 #[tokio::test]
-async fn polling_after_the_command_finished_reports_the_exit_code() {
-    let fixture = Fixture::new("exitcode");
-    let (handle, _) = fixture.start("echo hi; exit 0").await;
+async fn the_completion_carries_the_real_output_and_the_exit_code() {
+    let fixture = Fixture::new("output");
+    let (handle, _) = fixture.start("echo hi-from-bg; exit 0").await;
 
-    let result = fixture.poll(&handle, 15).await;
-    assert!(
-        result.content.contains("exit code 0"),
-        "应报出退码 0：{}",
-        result.content
+    let completion = fixture.completion(handle).await;
+    assert_eq!(
+        completion.state,
+        BgState::Exited(Some(0)),
+        "正常结束应落 Exited(Some(0))"
     );
-    assert!(!result.is_error, "退码 0 不算错误：{}", result.content);
+
+    let body = text_of(&render_completion(&completion));
+    assert!(
+        body.lines()
+            .next()
+            .unwrap_or_default()
+            .contains("finished (exit 0)"),
+        "首行必须报出退码：{body}"
+    );
+    assert!(
+        body.contains("hi-from-bg"),
+        "正文必须含命令的真输出：{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "full output: {}",
+            completion.output_path.display()
+        )),
+        "正文必须给出完整输出路径：{body}"
+    );
 }
 
-/// 退码 ≠ 0 ⇒ 结果是**错误**。
+/// 退码 ≠ 0 也必须**写在正文里** —— 完成项是注入会话的一条 `User` 消息，
+/// **没有 `is_error` 位** ⇒ 「失败」这条信息只能由措辞携带。
+///
+/// 变异：`render_completion` 只写「finished」不写退码 ⇒ 第二条断言变红。
 #[tokio::test]
-async fn a_non_zero_exit_code_is_reported_as_an_error() {
+async fn a_non_zero_exit_code_is_reported_in_the_completion_body() {
     let fixture = Fixture::new("nonzero");
     let (handle, _) = fixture.start("echo boom; exit 3").await;
 
-    let result = fixture.poll(&handle, 15).await;
-    assert!(result.is_error, "退码 3 应算错误：{}", result.content);
+    let completion = fixture.completion(handle).await;
+    assert_eq!(completion.state, BgState::Exited(Some(3)));
+
+    let body = text_of(&render_completion(&completion));
     assert!(
-        result.content.contains("exit code 3"),
-        "应报出退码 3：{}",
-        result.content
+        body.lines()
+            .next()
+            .unwrap_or_default()
+            .contains("finished (exit 3)"),
+        "退码必须写进首行：{body}"
+    );
+    assert!(body.contains("boom"), "正文必须含命令的真输出：{body}");
+}
+
+/// 句柄**不复用**：第一条结束后再启动，拿到的是新号。
+///
+/// 变异：把句柄号改成「复用最小空闲号」⇒ 第二条断言变红（会拿到 bg1）。
+#[tokio::test]
+async fn a_second_start_gets_a_fresh_handle() {
+    let fixture = Fixture::new("reuse");
+    let (first, _) = fixture.start("true").await;
+    fixture.completion(first).await;
+
+    let (second, content) = fixture.start("true").await;
+    assert_ne!(first, second, "句柄不得复用，实得 {first:?} / {second:?}");
+    assert_eq!(second, BgHandle(2), "句柄号应单调递增");
+    assert!(
+        content.contains("handle: bg2"),
+        "启动结果里的句柄名应与注册表一致：{content}"
     );
 }
 
 /// 清理会话后**没有进程还在跑**。
+///
+/// 变异：`kill_all` 去掉会话之外的过滤或干脆不杀 ⇒ 探活断言变红。
 #[tokio::test]
 async fn cleaning_up_the_session_leaves_no_running_process() {
     let fixture = Fixture::new("cleanup");
@@ -320,7 +385,7 @@ async fn cleaning_up_the_session_leaves_no_running_process() {
         wait_until_gone(pid, GONE_LIMIT).await,
         "清理后 pid {pid} 仍在跑"
     );
-    // 句柄仍在注册表里，但条目已是终态。
+    // 条目仍在注册表里，但已不在跑。
     assert!(
         fixture
             .backgrounds
@@ -328,101 +393,117 @@ async fn cleaning_up_the_session_leaves_no_running_process() {
             .is_empty(),
         "清理后不该还有在跑的句柄"
     );
-    assert!(!handle.is_empty());
+    assert_eq!(handle, BgHandle(1));
 }
 
-/// 输出超限 ⇒ 结果里报出**跳过的字节数**与**完整输出路径**。
+/// 输出超限 ⇒ 正文里报出**跳过的字节数**与**完整输出路径**。
+///
+/// 变异：`assemble` 不报裁量、不拼路径 ⇒ 后两条断言变红。
 #[tokio::test]
 async fn oversized_output_reports_the_skipped_bytes_and_the_full_output_path() {
     let fixture = Fixture::new("trim");
     // 3000 行 × 71 字节 ≈ 208 KiB ⇒ 超过展示预算（50 KiB / 2000 行）。
     let (handle, content) = fixture.start(LOUD_COMMAND).await;
-    let output_path = field(&content, "output").expect("结果里应有输出路径");
+    let output_path = PathBuf::from(field(&content, "output").expect("结果里应有输出路径"));
 
-    let result = fixture.poll(&handle, 20).await;
-    let produced = std::fs::metadata(&output_path).expect("输出文件应存在").len();
+    let body = fixture.rendered(handle).await;
+    let produced = std::fs::metadata(&output_path)
+        .expect("输出文件应存在")
+        .len();
     assert!(
         produced > 100 * 1024,
         "产出应远超展示预算，实测 {produced} 字节"
     );
     assert!(
-        result.content.len() < produced as usize,
-        "展示内容应被裁剪过：结果 {} 字节 vs 产出 {produced} 字节",
-        result.content.len()
+        body.len() < produced as usize,
+        "展示内容应被裁剪过：正文 {} 字节 vs 产出 {produced} 字节",
+        body.len()
     );
     assert!(
-        result.content.contains(&output_path),
-        "结果里应给出完整输出路径：{}",
-        result.content
+        body.contains(&format!("full output: {}", output_path.display())),
+        "正文里应给出完整输出路径：{body}"
     );
     assert!(
-        result.content.contains("未送达") || result.content.contains("skipped"),
-        "结果里应报出未送达的字节数：{}",
-        result.content
+        body.contains("未送达"),
+        "正文里应报出未送达的字节数：{body}"
     );
 }
 
 /// 跨会话的句柄**不命中** —— 表现为「未知句柄」。
+///
+/// 迁移后模型面没有取状态工具，故这条契约落在**注册表的会话核对**上
+/// （`app_loop` 用它把「未知句柄」讲给模型）。
+///
+/// 变异：`snapshot` / `claim_completions` 去掉会话条件 ⇒ 前两条断言变红。
 #[tokio::test]
 async fn a_handle_from_another_session_is_reported_as_unknown() {
     let fixture = Fixture::new("crosssession");
-    let (handle, _) = fixture.start("echo secret; sleep 5").await;
+    let (handle, _) = fixture.start("echo secret; sleep 60").await;
 
-    // 另一个会话的槽 ⇒ 同一条注册表，但会话不匹配。
-    let other_slot = SessionSlot::new("sess-other");
-    let other_poll = BashPollTool::new(fixture.backgrounds.clone(), other_slot);
-    let result = guarded(
-        "跨会话轮询",
-        CASE_LIMIT,
-        other_poll.call(json!({ "handle": handle }), fixture.ctx()),
-    )
-    .await
-    .expect("跨会话轮询应返回结果而不是报错");
-
-    assert!(result.is_error, "跨会话句柄应是错误：{}", result.content);
+    // 另一个会话 ⇒ 同一份注册表，但会话不匹配。
     assert!(
-        result.content.contains("unknown handle"),
-        "跨会话句柄应是「未知句柄」：{}",
-        result.content
+        fixture.backgrounds.snapshot(handle, "sess-other").is_none(),
+        "跨会话的句柄不得命中（对模型表现为未知句柄）"
     );
     assert!(
-        !result.content.contains("secret"),
-        "跨会话不得泄漏别的会话的输出：{}",
-        result.content
+        fixture
+            .backgrounds
+            .take_completions("sess-other")
+            .is_empty(),
+        "跨会话取不到任何完成项（否则会泄漏别的会话的输出）"
+    );
+    assert!(
+        !fixture.root.join("sess-other").exists(),
+        "别的会话不该被写下输出目录"
+    );
+
+    // 本会话照旧命中 —— 否则上一条断言可能是「什么都没写」而非「会话过滤生效」。
+    assert!(
+        fixture
+            .backgrounds
+            .snapshot(handle, &fixture.session)
+            .is_some(),
+        "同一会话必须命中"
     );
 }
 
 /// 内核侧的写盘限额是**粗闸门** ⇒ 正常写几 MiB 的命令**不被杀**。
+///
+/// 变异：把内核限额设成输出上限 ⇒ 命令吃 `SIGXFSZ` ⇒ 退码与落盘大小两条断言变红。
 #[tokio::test]
 async fn a_command_that_writes_several_megabytes_to_disk_is_not_killed() {
     let fixture = Fixture::new("bigwrite");
     let (handle, _) = fixture
-        .start("dd if=/dev/zero of=build.bin bs=1024 count=4096; echo wrote")
+        .start("dd if=/dev/zero of=build.bin bs=1024 count=4096 2>/dev/null; echo wrote")
         .await;
 
-    let result = fixture.poll(&handle, 20).await;
-    assert!(
-        !result.is_error,
-        "正常写盘不该被内核限额杀掉：{}",
-        result.content
+    let completion = fixture.completion(handle).await;
+    assert_eq!(
+        completion.state,
+        BgState::Exited(Some(0)),
+        "正常写盘不该被内核限额杀掉"
     );
-    assert!(
-        result.content.contains("exit code 0"),
-        "应正常跑完：{}",
-        result.content
-    );
-    assert!(result.content.contains("wrote"), "应拿到命令输出：{}", result.content);
+    let body = text_of(&render_completion(&completion));
+    assert!(body.contains("wrote"), "应拿到命令输出：{body}");
+
     let written = std::fs::metadata(fixture.workspace.join("build.bin"))
         .expect("落盘文件应存在")
         .len();
-    assert!(written >= 4 * 1024 * 1024, "落盘应完整，实测 {written} 字节");
+    assert!(
+        written >= 4 * 1024 * 1024,
+        "落盘应完整，实测 {written} 字节"
+    );
 }
 
 /// 杀进程组 ⇒ **孙进程也不在**（先杀后收 + 进程组）。
+///
+/// 变异：`kill_group` 只杀 leader（不带 `-pid` 进程组）⇒ 孙进程探活断言变红。
 #[tokio::test]
 async fn killing_the_command_group_leaves_no_orphan_grandchild() {
     let fixture = Fixture::new("grandchild");
-    let (handle, content) = fixture.start("sleep 60 & echo $! > grandchild.pid; sleep 60").await;
+    let (_, content) = fixture
+        .start("sleep 60 & echo $! > grandchild.pid; sleep 60")
+        .await;
     let leader: u32 = field(&content, "pid")
         .expect("结果里应有 pid")
         .parse()
@@ -455,5 +536,53 @@ async fn killing_the_command_group_leaves_no_orphan_grandchild() {
         wait_until_gone(grandchild, GONE_LIMIT).await,
         "清理后孙进程 pid {grandchild} 仍在跑 —— 进程组没被杀干净"
     );
-    assert!(!handle.is_empty());
+}
+
+/// 慢速写输出的命令在**跑着的时候**就被输出闸门杀掉 —— 顺带证明
+/// `wait_for_output` 观察到的中间态**不是**终态（因此下面那条断言才有意义）。
+///
+/// 变异：把 `enforce_output_cap` 的 `stat` 闸门去掉（只留内核粗闸门）⇒ 输出
+/// 会一路写到内核限额（64 MiB）才被杀 ⇒ 本用例的「文件停在 2 MiB 量级」断言变红。
+#[tokio::test]
+async fn the_output_cap_kills_a_runaway_command_while_it_is_still_writing() {
+    let fixture = Fixture::new("cap");
+    // 每 1s 写 1 MiB、共 8 块 ⇒ 远慢于闸门节奏（20ms 一查）⇒ 一定在「还在写」时被抓到；
+    // 而全部写完是 8 MiB ⇒ 被闸门兜住的证据是「文件停在 2 MiB 量级」。
+    let (handle, content) = fixture
+        .start(
+            "i=0; while [ \"$i\" -lt 8 ]; do \
+             dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\\000' 'x'; \
+             sleep 1; i=$((i+1)); done",
+        )
+        .await;
+    let output_path = PathBuf::from(field(&content, "output").expect("结果里应有输出路径"));
+
+    // 先等它真的写出点东西 —— 证明命令在跑而不是立刻失败。
+    wait_for_output(&output_path, "xxxx", CASE_LIMIT).await;
+
+    let completion = fixture.completion(handle).await;
+    assert_eq!(
+        completion.state,
+        BgState::Killed,
+        "输出超限必须被 harness 杀掉（不是静默截断，也不是正常结束）"
+    );
+
+    // 「被杀」与「命令自己失败」必须用不同措辞 —— 模型会把前者误报成「测试挂了」。
+    let body = text_of(&render_completion(&completion));
+    assert!(
+        body.lines()
+            .next()
+            .unwrap_or_default()
+            .contains("output exceeded"),
+        "首行必须说清是输出超限被杀：{body}"
+    );
+
+    // 闸门是「轮询式」的 ⇒ 杀到之前可能又落了一块（1 MiB）⇒ 上界留一块的余量。
+    let size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(
+        (2 * 1024 * 1024..=4 * 1024 * 1024).contains(&size),
+        "闸门必须把输出兜在 2 MiB 附近（而不是任它写到 8 MiB），实测 {size} 字节"
+    );
 }

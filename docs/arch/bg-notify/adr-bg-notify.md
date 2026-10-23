@@ -8,7 +8,13 @@
 
 ## Status
 
-proposed（2026-10-23，rev2）
+accepted（2026-10-23）。已实现，见 [`review-impl.md`](./review-impl.md) 与 `docs/design-final/coding-agent-tui.md` §20。
+
+> **实现期修正（两处）**
+> ① `render_completion` 返回 `Message`，**没有 `is_error` 位** —— 失败与被杀只能靠**措辞**
+> 区分（design §2.7 已回写）；
+> ② `bash` 超时转后台的 watcher 原设计打算重新 `take()` 管道，但管道已被排空任务
+> 持有 ⇒ 改为**接管那两个任务**。未发现这一点会让超时后的输出全部丢失。
 
 > **rev2 变更**（据 `docs/arch/bg-notify/review.md`）：
 > ① `sweep()` 拆三分段（锁内列收集 / 锁外 fork+渲染 / 锁内置态）；

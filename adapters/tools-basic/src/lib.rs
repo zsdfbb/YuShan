@@ -1,5 +1,5 @@
-pub mod bash;
 pub mod background;
+pub mod bash;
 pub mod bg_output;
 pub mod bg_tools;
 pub mod edit;
@@ -11,11 +11,12 @@ pub mod proc_group;
 pub mod read;
 pub mod write;
 
-pub use bash::BashTool;
 pub use background::{
-    BgError, BgHandle, BgLimits, BgSnapshot, BgState, BackgroundTasks, SessionSlot,
+    BackgroundTasks, BgCompletion, BgError, BgHandle, BgLimits, BgSnapshot, BgState, SessionSlot,
 };
-pub use bg_tools::{BashBgTool, BashPollTool};
+pub use bash::BashTool;
+pub use bg_output::render_completion;
+pub use bg_tools::BashBgTool;
 pub use edit::EditTool;
 pub use find::FindTool;
 pub use grep::GrepTool;

@@ -38,7 +38,7 @@ use std::time::Duration;
 use ys_component::RunLimits;
 use ys_runtime::{Agent, BuildError};
 use ys_tool::Tool;
-use ys_tools_basic::{BashBgTool, BashPollTool};
+use ys_tools_basic::{BashBgTool, BashTool};
 use ys_tools_web::WebConfig;
 
 use crate::prompt;
@@ -83,7 +83,7 @@ pub struct BuiltAgent {
     pub tool_specs: Vec<(String, usize)>,
     /// 真实**父表**的 spec（装配产物）—— assembly 级断言用。
     ///
-    /// 父表 = 基础 9 元 + `bash_bg` + `bash_poll` + `subagent`（末位）。
+    /// 父表 = 基础 9 元 + `bash_bg` + `subagent` + `subagent_async`（后两者末位）。
     #[cfg(test)]
     pub parent_specs: Vec<ys_tool::ToolSpec>,
     /// 真实**子表**的 spec（装配产物）—— assembly 级断言用。
@@ -146,20 +146,28 @@ impl AgentFactory {
             self.subagents_dir.clone(),
         );
 
-        // 父表 = 基础 9 元 + `bash_bg` + `bash_poll` + 派发工具**追加末位**
+        // 父表 = 基础 9 元 + `bash_bg` + 派发工具**追加末位**
         // （子 tools JSON 仍是父的字节前缀 ⇒ 命中缓存）。
         //
-        // **插入位置是契约**：两个后台工具必须排在 `subagent` **之前** ⇒ 父表的前 9 项
+        // **插入位置是契约**：`bash_bg` 必须排在 `subagent` **之前** ⇒ 父表的前 9 项
         // 逐字节等于子表 ⇒ 父 JSON 仍以子 JSON 去末尾 `]` 开头。
+        //
+        // 后台命令的结果由注册表的清扫路径**主动投递**（`Boundary::Deferred`）——
+        // 模型不需要轮询工具，故父表里没有 `bash_poll`。
         let mut tools: Vec<Box<dyn Tool>> = base_tools;
         if let Some(context) = &self.backgrounds {
+            // **父表的 `bash` 换上挂了后台能力的版本**：超时不杀进程组，改为过继给
+            // 注册表，结果由完成通知送达。位置不能动 —— 它仍在第 4 位，否则父表
+            // 的前 9 项就不再逐字节等于子表（缓存前缀契约）。
+            if let Some(bash) = tools.iter_mut().find(|t| t.spec().name == "bash") {
+                *bash = Box::new(
+                    BashTool::new(workspace.to_path_buf())
+                        .with_backgrounds(context.tasks().clone(), context.session().clone()),
+                );
+            }
             tools.push(Box::new(BashBgTool::new(
                 context.tasks().clone(),
                 workspace.to_path_buf(),
-                context.session().clone(),
-            )));
-            tools.push(Box::new(BashPollTool::new(
-                context.tasks().clone(),
                 context.session().clone(),
             )));
         }
@@ -279,7 +287,6 @@ mod tests {
             .map(|s| s.to_string())
             .chain([
                 "bash_bg".to_string(),
-                "bash_poll".to_string(),
                 "subagent".to_string(),
                 "subagent_async".to_string(),
             ])
@@ -287,7 +294,7 @@ mod tests {
         assert_eq!(
             built_short.agent.tool_names(),
             expected,
-            "父表应为 9 基础 + bash_bg + bash_poll + subagent + subagent_async（后两者追加在末位）"
+            "父表应为 9 基础 + bash_bg + subagent + subagent_async（后两者追加在末位）"
         );
         assert_eq!(
             built_long.agent.tool_names(),
@@ -315,15 +322,15 @@ mod tests {
     }
 
     /// **assembly 级断言** —— 真实父表 12 元 / 子表 9 元；父表 JSON 以子表 JSON
-    /// 去末尾 `]` 开头；`subagent` 仍是末位。
+    /// 去末尾 `]` 开头；派发工具族收尾。
     ///
     /// **为什么必须是 assembly 级**：`toolset` 里那条 9 元顺序用例**自拼父表**
     /// （自己在子表后面追加 `subagent`）⇒ 往父表里插新工具后它照样全绿，
     /// 却已经不再描述真实父表。本用例断言的是**装配产物本身**（`build` 的真实输出），
     /// 不是另拼一份。
     ///
-    /// 变异：把 `bash_bg` / `bash_poll` 插到 `subagent` **之后** ⇒ 本用例的追加段
-    /// 断言与 `real_parent_table_ends_with_the_subagent_tool` 的末位断言**同时**变红。
+    /// 变异：把 `bash_bg` 插到 `subagent` **之后** ⇒ 本用例的追加段断言与
+    /// `real_parent_table_ends_with_the_subagent_tool` 的末位断言**同时**变红。
     #[test]
     fn real_parent_table_keeps_the_child_table_as_its_byte_prefix() {
         let base = unique_dir("parent_prefix");
@@ -336,12 +343,12 @@ mod tests {
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert_eq!(parent_names.len(), 13, "真实父表应为 13 元");
+        assert_eq!(parent_names.len(), 12, "真实父表应为 12 元");
         assert_eq!(built.child_specs.len(), 9, "真实子表应为 9 元");
         assert_eq!(
             built.agent.tool_names().len(),
-            13,
-            "注册进 agent 的父表应为 13 元"
+            12,
+            "注册进 agent 的父表应为 12 元"
         );
         assert!(
             !built.child_specs.iter().any(|spec| spec.name == "bash_bg"),
@@ -357,8 +364,8 @@ mod tests {
         );
 
         // 追加段（子表之后的那几项）必须是
-        // `bash_bg` + `bash_poll` + `subagent` + `subagent_async`
-        // —— 顺序即契约：两个后台工具排在派发工具**之前**；`subagent_async`
+        // `bash_bg` + `subagent` + `subagent_async`
+        // —— 顺序即契约：后台工具排在派发工具**之前**；`subagent_async`
         // 排在 `subagent` **之后**（新增项只能往后加，否则已缓存的父前缀提前断掉）。
         let appended = &parent_json[child_json.len() - 1..];
         let tail: Vec<ys_tool::ToolSpec> = built.parent_specs[built.child_specs.len()..].to_vec();
@@ -366,25 +373,25 @@ mod tests {
             tail.iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<&str>>(),
-            vec!["bash_bg", "bash_poll", "subagent", "subagent_async"],
-            "父表的追加段必须是 bg×2 + subagent + subagent_async（顺序即契约）"
+            vec!["bash_bg", "subagent", "subagent_async"],
+            "父表的追加段必须是 bash_bg + subagent + subagent_async（顺序即契约）"
         );
         let tail_json = serde_json::to_string(&tail).unwrap();
         assert_eq!(
             appended,
             format!(",{}", &tail_json[1..]),
-            "父表 JSON 的追加段必须逐字节等于 bg×2 + subagent 的序列化"
+            "父表 JSON 的追加段必须逐字节等于 bash_bg + 派发工具族的序列化"
         );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **assembly 级断言（末位）** —— `subagent` 仍是父表**末位**。
+    /// **assembly 级断言（末位）** —— 派发工具族收尾。
     ///
     /// 派发工具永远追加在最后 ⇒ 子表（基础 9 元）既是父表的**前缀**，又与末位相距
-    /// 三项（`bash_bg` / `bash_poll` / `subagent`）。
+    /// 两项（`bash_bg` / `subagent`）。
     ///
-    /// 变异：把两个后台工具插到 `subagent` **之后** ⇒ 本用例变红。
+    /// 变异：把 `bash_bg` 插到 `subagent` **之后** ⇒ 本用例变红。
     #[test]
     fn real_parent_table_ends_with_the_subagent_tool() {
         let base = unique_dir("parent_last");

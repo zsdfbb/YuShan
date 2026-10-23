@@ -123,11 +123,35 @@ async fn wait_deadline(deadline: Option<(Instant, Duration)>) {
 
 pub struct BashTool {
     workspace: PathBuf,
+    /// 后台注册表 —— `Some` 时超时**不杀进程，改为过继**给后台并由完成通知送达。
+    ///
+    /// 装配期决定：交互式 TUI 挂载（有回合循环消费 `Boundary::Deferred`），
+    /// `-p` / `--json` 不挂（单回合，结果无人接收）。
+    backgrounds: Option<(
+        std::sync::Arc<crate::background::BackgroundTasks>,
+        crate::background::SessionSlot,
+    )>,
 }
 
 impl BashTool {
     pub fn new(workspace: PathBuf) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            backgrounds: None,
+        }
+    }
+
+    /// 挂载后台能力 —— 超时将**过继**给注册表，而不是杀掉进程组。
+    ///
+    /// 带上 `SessionSlot` 是因为注册表按会话隔离条目，而会话 id 只能运行时读
+    /// （工具表是建表期产物 ⇒ 不能冻在工具里）。
+    pub fn with_backgrounds(
+        mut self,
+        backgrounds: std::sync::Arc<crate::background::BackgroundTasks>,
+        session: crate::background::SessionSlot,
+    ) -> Self {
+        self.backgrounds = Some((backgrounds, session));
+        self
     }
 }
 
@@ -490,8 +514,57 @@ impl Tool for BashTool {
             Ok((stdout, stderr, exit_code)) => {
                 Ok(render_result(&stdout, &stderr, exit_code, note.as_deref()))
             }
+            // **超时转后台**：进程不杀，过继给注册表，结果由完成通知送达。
+            //
+            // 前提：已挂载后台能力（交互式 TUI）。`-p` / `--json` 不挂 ——
+            // 那些模式没有回合循环消费 `Boundary::Deferred`，转后台等于丢结果，
+            // 故它们走下面的原路径（杀进程组 + 明确报错）。
+            Err(WaitOutcome::TimedOut(deadline)) if self.backgrounds.is_some() => {
+                let (tasks, slot) = self.backgrounds.as_ref().expect("已断言 Some");
+                let tasks = tasks.clone();
+                let session = slot.get();
+                // 过继：只登记 pid（tokio 的 `Child` 无法转 std，收尸交给 watcher）。
+                let Some(pid) = pid else {
+                    return Err(ToolError::Execution(
+                        "command timed out but its pid is unknown — cannot hand it off".into(),
+                    ));
+                };
+                let handle =
+                    tasks.adopt_pid(pid, &session, command.to_string(), self.workspace.clone());
+
+                // watcher：接管**已经在跑**的排空任务（它们已 `take()` 走管道 ⇒
+                // 再也拿不到 `child.stdout`），等两者都结束 + 进程退出后推终态。
+                // 顺序必须是「先排空再 wait」：孙进程持写端时 `read_to_end` 不返回，
+                // 而 `wait` 也可能因此迟迟不返回 —— 与阶段 A/B 的既有纪律一致。
+                tokio::spawn(async move {
+                    let mut child = child;
+                    let (out, err) = tokio::join!(out_task, err_task);
+                    let tail_out = out.unwrap_or_default();
+                    let tail_err = err.unwrap_or_default();
+                    if !tail_out.is_empty() || !tail_err.is_empty() {
+                        let mut tail = String::new();
+                        tail.push_str(&String::from_utf8_lossy(&tail_out));
+                        tail.push_str(&String::from_utf8_lossy(&tail_err));
+                        tasks.append_output(handle, &tail);
+                    }
+                    let code = child.wait().await.ok().and_then(|s| s.code());
+                    tasks.mark_finished(handle, code);
+                });
+
+                Ok(ToolResult {
+                    content: format!(
+                        "Command exceeded its {}s timeout and is now running in the background.\n\
+                         handle: {}\n\
+                         Its result will be delivered to you automatically when it finishes — \
+                         do NOT poll for it. Keep working on your own part now.",
+                        deadline_secs(deadline),
+                        handle.label()
+                    ),
+                    is_error: false,
+                })
+            }
             Err(outcome) => {
-                // 中止 / 超时 / 等待失败：先杀进程组（含孙进程），再杀子进程兜底，最后收尸
+                // 中止 / 超时（未挂后台能力）/ 等待失败：先杀进程组（含孙进程），再杀子进程兜底，最后收尸
                 terminate(&mut child, pid).await;
                 // 已丢弃输出，读取任务不必再等（孙进程可能仍持写端）
                 out_task.abort();
@@ -587,6 +660,123 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("exited with code 42"));
     }
+
+    /// **超时转后台**：已挂后台能力时，超时**不杀进程**，而是过继给注册表并返回句柄。
+    ///
+    /// 事件路径：`bash(sleep 30, timeout 1)` ⇒ 1s 后返回 `Ok`（`is_error: false`）
+    /// + 文案含「handle: bgN」「do NOT poll」；随后进程仍在跑，由 watcher 收尾。
+    ///
+    /// 变异：① 去掉那个 `if self.backgrounds.is_some()` 守卫 ⇒ 走回 `terminate`，
+    /// 本用例的 `Ok` 断言变红；② 文案改成不报错就返回成功但不给句柄 ⇒ `handle:` 断言红。
+    #[tokio::test]
+    async fn test_bash_timeout_hands_off_to_background_when_mounted() {
+        let dir = std::env::temp_dir().join(format!(
+            "ys-bash-adopt-{}-{}",
+            std::process::id(),
+            ADOPT_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = std::sync::Arc::new(crate::background::BackgroundTasks::new(
+            dir.clone(),
+            crate::background::BgLimits::default(),
+        ));
+        let slot = crate::background::SessionSlot::new("adopt-test");
+        let tool = BashTool::new(dir.clone()).with_backgrounds(tasks.clone(), slot);
+
+        let input = json!({ "command": "sleep 30", "timeout": 1 });
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.call(input, make_ctx()))
+            .await
+            .expect("超时应由工具自己发现")
+            .expect("已挂后台 ⇒ 超时应返回 Ok（转后台），不是 Err");
+
+        assert!(!result.is_error, "转后台不是错误");
+        assert!(
+            result.content.contains("handle: bg"),
+            "必须告诉模型句柄；实际 = {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("do NOT poll"),
+            "必须明确禁止轮询；实际 = {}",
+            result.content
+        );
+
+        // 进程没被杀：注册表里有一条仍在跑（或刚结束）的条目。
+        assert!(
+            !tasks.running_handles("adopt-test").is_empty(),
+            "过继的条目应仍在注册表里"
+        );
+
+        // 收拾：杀掉那条，避免留下 30s 的 sleep。
+        tasks.kill_all("adopt-test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 超时**之后**写出的输出也必须落盘 —— watcher 要接管既有的排空任务。
+    ///
+    /// 变异：让 watcher 重新 `child.stdout.take()`（管道已被排空任务 `take()` 走 ⇒
+    /// 恒 `None`）⇒ 尾部那段丢失，本用例的 `late` 断言变红。
+    #[tokio::test]
+    async fn test_handed_off_command_keeps_output_written_after_the_timeout() {
+        let dir = std::env::temp_dir().join(format!(
+            "ys-bash-adopt-tail-{}-{}",
+            std::process::id(),
+            ADOPT_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks = std::sync::Arc::new(crate::background::BackgroundTasks::new(
+            dir.clone(),
+            crate::background::BgLimits::default(),
+        ));
+        let tool = BashTool::new(dir.clone()).with_backgrounds(
+            tasks.clone(),
+            crate::background::SessionSlot::new("tail-test"),
+        );
+
+        // 1s 超时；超时**后**才打印 `late` ⇒ 只有在 watcher 接管管道时才可能读到。
+        let input = json!({
+            "command": "sleep 2; echo late",
+            "timeout": 1
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.call(input, make_ctx()))
+            .await
+            .expect("超时应由工具自己发现")
+            .expect("已挂后台 ⇒ 应转后台");
+        assert!(!result.is_error);
+
+        // 等 watcher 收尾（进程 2s 后才退出，多等一会儿）。
+        let h0 = tasks
+            .running_handles("tail-test")
+            .first()
+            .copied()
+            .expect("过继后应有一条在跑条目");
+        let path0 = tasks.output_path_of(h0).expect("条目应有输出路径");
+        let mut text = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tasks.sweep();
+            let handles = tasks.running_handles("tail-test");
+            let done = handles.iter().all(|h| {
+                tasks
+                    .snapshot(*h, "tail-test")
+                    .is_some_and(|s| s.state != crate::background::BgState::Running)
+            });
+            if done {
+                text = std::fs::read_to_string(&path0).unwrap_or_default();
+                break;
+            }
+        }
+        assert!(
+            text.contains("late"),
+            "超时之后写出的输出必须落盘（watcher 要接管既有排空任务）；实际 = {text:?}"
+        );
+
+        tasks.kill_all("tail-test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 序列号 —— 临时目录名要含「进程内原子序号 + pid」（并行测试会撞名）。
+    static ADOPT_TEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     #[tokio::test]
     async fn test_bash_timeout() {

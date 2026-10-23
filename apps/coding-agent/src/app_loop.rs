@@ -61,7 +61,7 @@ use ys_event::AgentEvent;
 use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
-use ys_tools_basic::BackgroundTasks;
+use ys_tools_basic::{BackgroundTasks, render_completion};
 use ys_tui_coding::CodingView;
 
 use crate::capabilities;
@@ -76,6 +76,12 @@ use crate::wiring::Wiring;
 
 /// 共享 sweeper 的 tick 间隔 —— 100ms。
 const BG_SWEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 每个回合开头最多补投多少条**已完成的**后台结果。
+///
+/// 超出部分留在注册表里（仍为 `Pending`）⇒ 后续回合继续补投。
+/// 一次灌完会把回合开头变成噪音，而且模型也处理不了十条并发的结果。
+const BG_CATCHUP_PER_TURN: usize = 2;
 
 /// 共享 sweeper 的进程级条目 —— (注册表的弱引用, sweeper 任务句柄)。
 type BgSweeperEntry = (Weak<BackgroundTasks>, tokio::task::JoinHandle<()>);
@@ -1134,6 +1140,32 @@ async fn run_turn_once(
         // 把上回合末尾没取走的 `Steer` 交给本回合（用户输入不能丢 —— 见函数头的排空契约）。
         for b in carry_over.drain(..) {
             boundary.push(b);
+        }
+        // 绑定本回合的**后台结果投递落点**（RAII：函数体内多处 `?` 提前返回，
+        // 手动解绑必漏）。注册表是进程级的，而边界源每回合新建 ⇒ 落点只能逐回合绑。
+        // 守卫在本块末尾 drop（早于随后的回合末事件排空）⇒ 排空期间不再有新投递。
+        let _bg_binding = background
+            .as_ref()
+            .map(|(tasks, _)| tasks.bind_deferred(boundary.clone()));
+        // 上一回合（或落点未绑的那一瞬）攺下的完成项：**一次性补投**。
+        // 每回合最多补投 [`BG_CATCHUP_PER_TURN`] 条 —— 其余留在表里（仍为 `Pending`），
+        // 于后续回合继续补投：一次灌十条会把回合开头变成噪音。
+        //
+        // 取出的条目已被认领（`InFlight`）⇒ **每条都必须落状态**，否则它会卡到
+        // 下一 tick 的修复才重投。渲染总是给出正文（输出读不出时是「不可读」形态），
+        // 故这里不存「空正文」分支：空正文会让模型以为「命令没有输出」。
+        if let Some((tasks, session)) = background.as_ref() {
+            for candidate in tasks
+                .take_completions(session)
+                .into_iter()
+                .take(BG_CATCHUP_PER_TURN)
+            {
+                boundary.push(Boundary::Deferred {
+                    handle: candidate.handle.label(),
+                    message: render_completion(&candidate),
+                });
+                tasks.finish_delivery(candidate.handle, true);
+            }
         }
         // subagent：每回合造一份 runner（派发计数器天然 per-turn；每次派发建新子 Agent）。
         // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`

@@ -217,14 +217,22 @@ pub struct BgCompletion {
 
 ### 2.7 正文渲染（含 `Unreadable`，P1-3）
 
-`bg_output::render_completion(&BgCompletion) -> Message`，三种形态：
+`bg_output::render_completion(&BgCompletion) -> Message`。
 
-| 情形 | 正文 | `is_error` |
-|---|---|---|
-| 正常结束 | `[bg7] cargo build — finished (exit 0) in 27.4s` + 尾部摘要（≤50 KiB）+ `[full output: path]` | false |
-| 非零退码 | `finished (exit 2)` + 摘要 + 路径 | **true** |
-| 被杀 | `killed after 900s (lifetime exceeded)` 或 `killed: output exceeded 2 MiB` | **true** |
-| **文件已不可读**（P1-3） | `[bg7] cargo build — finished (exit 0), output no longer readable (removed by /new or eviction)` | 按退码 |
+> **as-built 修正**：旧版本表有一列 `is_error`，但 `render_completion` 返回的是
+> `Message`（注入会话的正文），**没有 error 位**。失败与被杀只能在**措辞**上区分 ——
+> 所以「被 harness 杀掉」与「命令自己非零退码」必须用不同字句（下表两行），
+> 否则模型会把前者误报成后者。
+
+| 情形 | 首行正文 |
+|---|---|
+| 正常结束 | `[bg7] cargo build — finished (exit 0) in 27.4s` + 尾部摘要（≤50 KiB）+ `[bg full output: path]` |
+| 非零退码 | `finished (exit 2) in 3.1s` + 摘要 + 路径 |
+| 被信号杀死 | `terminated by a signal after 3.1s (not by the harness)` |
+| 被 harness 杀掉（存活上限） | `killed after 900s (harness limit)` |
+| 被 harness 杀掉（输出超限） | `killed: output exceeded 2.1 MiB (harness limit)` |
+| **输出已不可读**（P1-3） | `output no longer readable (removed by /new or eviction) — the command did run; only its captured output is gone` |
+| 命令无输出 | `(no output)`（与「不可读」刻意区分） |
 
 **为什么必须有 `Unreadable`**：没有它时，渲染失败只能二选一 —— 不投（模型以为没结果）
 或投空（模型以为命令无输出）。两者都是**静默的谎**。明确说「有结果但内容没了」，

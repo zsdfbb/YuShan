@@ -18,4 +18,7 @@ futures = "0.3"
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+# 测试用 tokio。**不要加 `test-util`**：它只在带 dev 依赖的构建里出现，会让
+# `cargo build` 与 `cargo test` 之间的 tokio 编译单元不一致，每次切换都要重编
+# 整棵依赖树（实测 7~14s）。
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

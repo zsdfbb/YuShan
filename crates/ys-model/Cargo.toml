@@ -16,4 +16,8 @@ thiserror = "2"
 serde_json = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+# 测试用 tokio。**不要写 `full`，也不要加 `test-util`**：这两个 feature 只在
+# 带 dev 依赖的构建里出现，会让 `cargo build` 与 `cargo test`（或 `--tests`）
+# 之间的 tokio 编译单元不一致 —— 每次切换都要重编整棵依赖树（实测 7~14s）。
+# 保持与 `[dependencies]` 的 feature 并集一致（或为其子集）即无切换成本。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }

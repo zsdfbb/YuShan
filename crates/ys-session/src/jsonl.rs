@@ -340,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_jsonl_session_create_and_append() {
-        let path = std::env::temp_dir().join("test_jsonl_new.jsonl");
+        let path = temp_path("new");
         let _ = tokio::fs::remove_file(&path).await;
 
         {
@@ -385,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_jsonl_session_clear() {
-        let path = std::env::temp_dir().join("test_jsonl_clear.jsonl");
+        let path = temp_path("clear");
         let _ = tokio::fs::remove_file(&path).await;
 
         {
@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_jsonl_session_corrupt_line_skipped() {
-        let path = std::env::temp_dir().join("test_jsonl_corrupt.jsonl");
+        let path = temp_path("corrupt");
         let _ = tokio::fs::remove_file(&path).await;
 
         // 先写一行损坏数据，后跟一条有效行
@@ -462,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_jsonl_session_new_file() {
-        let path = std::env::temp_dir().join("test_jsonl_nonexistent.jsonl");
+        let path = temp_path("nonexistent");
         let _ = tokio::fs::remove_file(&path).await;
 
         let session = JsonlSession::open(&path).await.unwrap();

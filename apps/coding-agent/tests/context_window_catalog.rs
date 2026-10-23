@@ -114,6 +114,32 @@ fn serve_once(mut stream: TcpStream, behavior: CatalogBehavior) -> std::io::Resu
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("");
 
+    // **必须把请求体读完**（按 `Content-Length`）—— 否则它留在 socket 缓冲区里，
+    // 服务端直接回响应 + 关闭连接 ⇒ 客户端读 body 时拿到 RST ⇒
+    // reqwest 报 `error decoding response body`（表现为 SSE 流在首字节前失败、
+    // 被当成可重试 ⇒ 白等 6 次指数退避）。
+    //
+    // 其余 mock（`truncation_guard` / `debug_log` / `budget_exit` /
+    // `stream_usage_fallback`）都这么读；本文件原先漏了 ⇒ 两个用例恒失败。
+    let content_length = headers
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    body.truncate(content_length);
+
     if request_path.ends_with("/models") {
         return match behavior {
             CatalogBehavior::ReportsOneMeg => {

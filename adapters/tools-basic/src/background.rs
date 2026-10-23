@@ -339,7 +339,7 @@ impl fmt::Display for BgError {
                 write!(f, "background io error at {}: {source}", path.display())
             }
             // 措辞只指向**调用方真能做的动作** —— 模型面没有 kill 入口
-            // （`bash_bg` 只能 start、`bash_poll` 只能 poll）⇒ 只能「等一条跑完」。
+            // （`bash_bg` 只能 start，结果由完成通知送达）⇒ 只能「等一条跑完」。
             BgError::TooManyRunning { limit } => write!(
                 f,
                 "too many background commands are running ({limit}) — \

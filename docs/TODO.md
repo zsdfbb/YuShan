@@ -69,11 +69,40 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 | 项 | ADR（accepted） | 全仓源码证据 | 计划 |
 |---|---|---|---|
-| **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15） | grep `follow_up` / `FollowUp` = **0** | `docs/design-plans/2026-09-15-follow-up.md` |
+| **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15）；**协议格已由 ADR-0047 备好**（`Delivery{origin: System}`） | grep `follow_up` / `FollowUp` = **0** | `docs/design-plans/2026-09-15-follow-up.md`；协议见 `docs/adr/0047` |
 | **长程 todo + `ToolPlugin` 装配缝** | ADR-0024（`:7`）supersede 0021 决策 5；ADR-0021（`:7`）决策 ③ | grep `ToolPlugin` = **0**、`todo.json` = **0**、`should_inject` = **0**；`adapters/tools-basic/src/` 只有 7 个文件工具，无 `todo.rs` | `docs/arch/long-horizon-todo/design.md`、`docs/arch/hooks-and-plugins/design.md` |
 
 **这两项相互咬合**（0024 的推动判据「有未完成项」依赖 0014 的 follow-up 机制），
 宜按 **follow-up → todo** 的顺序推进。
+
+**Follow-up 的根因（已查明，2026-10-22 核实）**：「排到下一回合」这一路**不是缺实现，是缺协议格**——
+ADR-0013 删掉了旧 `Inbox` 的 `follow_up` 路（`docs/adr/0013-cancel-token-removal-boundary-source.md:37`），
+而 `Boundary` 枚举只有 `Steer` / `Abort` 两格（`crates/ys-protocol/src/boundary.rs:12-16`）。
+ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义时协议已被收敛掉。
+详见 `docs/arch/input-delivery-latency/context.md`。
+
+⚠️ **本段描述的是 2026-10-22 上午的 as-built，当日傍晚已部分过时**：
+「回合中提交的输入被排到整个回合结束」「`Steer` 在生产侧无生产者」这两条**已不成立** ——
+`8a08bd6` 接上了 `Steer` 生产者（回合中提交普通消息 ⇒ 投 `Boundary::Steer`），
+并把回合头部排空从「无差别丢弃」改为「只丢 `Abort`、保留 `Steer`」。
+
+**仍然成立的那一半**：**「下一回合」语义仍缺协议格与队列** ——
+`Boundary` 仍无 `NextTurn` 一格，app 侧无跨回合队列 ⇒ 系统发起的 follow-up 无处可去。
+`grep follow_up / FollowUp` 仍为 **0**。
+
+**根因的解法已定（2026-10-22，ADR-0047）**：
+投递去向做成协议一等公民（`DeliveryTarget` / `Delivery`，`ys-protocol` 新文件），
+队列住在 **app 侧**（`app_loop`）**跨回合存活** ⇒ 既是「绝不丢失」的保证，
+也是 follow-up 缺的**协议格**（`Delivery{origin: System}`）。
+⇒ 本条从「代码零落地」变为「**协议已备，实现待做**」。
+
+**已落地的相关修复（2026-10-22，ADR-0049）**：
+「模型正要收尾时到达的插话**静默消失**」这个丢消息故障已修 ——
+轮边界拉取抽成 `drain_boundary(ctx)`，在**每轮开头**与**收场前**两处调用
+⇒「轮边界总是存在」成为真不变量，ADR-0047 决策 1 的依据成立。
+详见 `docs/adr/0049-final-answer-boundary-drain.md`。
+
+设计与变更清单：`docs/arch/input-delivery-latency/design.md` §6。
 
 **未落地但已在别处补上的**：ADR-0021 的前置条件「prefix 指纹测试」已由 subagent 刀 0 于
 `apps/coding-agent/src/toolset.rs:592` 一带补齐，**不再计入**。
@@ -93,6 +122,7 @@ ADR-0022（accepted）`:132-133` 同文）。
 | `docs/arch/tool-call-efficiency/` | Q1 范围、Q2 多目标参数面、Q3 布局快照、Q4 验收口径、Q5 措辞归属 | `context.md:199` |
 | `docs/arch/etf-display-tool/` | 报告目录是否可配、ECharts CDN 降级；**`adapters/tools-finance` crate 不存在**（`Cargo.toml` 成员表无此项） | `context.md:99` |
 | `docs/arch/prompt-delivery/notes.md` | 唯一未决项：**产品内置 vs 项目可配** | `notes.md:98`（文档头自标「状态：未决」） |
+| `docs/arch/input-delivery-latency/` | ⚠️ **部分已解**（2026-10-22）：<br>· ✅ **G2**（F2）已修 —— 「模型正要收尾时到达的插话静默消失」已修，见 `docs/adr/0049-final-answer-boundary-drain.md`；<br>· ✅ **G4**（F4）已解 —— 随 `8a08bd6` 落地；<br>· ⬜ **G1 / G3 / G5 / G6** 未做 —— app 侧 `Delivery` 队列、降级投递的触发机制、`origin` 是否外送、状态机载体；<br>· ⬜ 设计 §7 仍有 **3 项「待用户确认」**（命令与消息谁先 / 回合中命令是否即时拒绝 / 投递状态显示落点） | `review.md` §7 闸门表、`docs/adr/0047-input-delivery-target-and-queue.md`、`docs/adr/0049-final-answer-boundary-drain.md` |
 
 ---
 

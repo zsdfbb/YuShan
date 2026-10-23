@@ -295,9 +295,12 @@ Loop：按什么规则推进
 
 静态插件直接注册 Rust Hook，动态插件通过 ABI 注册 Hook Adapter。第一版只支持启动时注册，不支持 Agent 运行期间热插拔或热卸载。
 
-> **状态（2026-09-15）**：Hook 系统**有意推迟** —— 见 [ADR-0014](../adr/0014-follow-up-without-hook-system.md)。
-> 当前只实现 `app_loop` 层的 **follow-up（追问）**（设计见 `docs/design-plans/2026-09-15-follow-up.md`），
-> 不建通用 hook。本节规范保持有效，待第二个真实消费者出现再落地。
+> **状态（2026-10-22 更新）**：Hook 系统**有意推迟** —— 见 [ADR-0014](adr/0014-follow-up-without-hook-system.md)。
+> `app_loop` 层的 **follow-up（追问）**（设计见 `docs/design-plans/2026-09-15-follow-up.md`）
+> **代码尚未落地**（全仓 grep `follow_up` / `FollowUp` = 0）⇒
+> 本节规范保持有效，待第二个真实消费者出现再落地。
+> **其协议格（跨回合投递队列）已由 [ADR-0047](adr/0047-input-delivery-target-and-queue.md) 备好**
+> —— `Delivery{origin: System}`，队列住在 app 侧且跨回合存活。
 
 ## 7. 静态组合
 

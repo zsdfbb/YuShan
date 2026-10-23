@@ -376,6 +376,7 @@ flowchart TB
 | **`Abort` 入队即置位** | `is_aborted()` 立刻为真（供「随时探针」），但**照常入队**（保序，`take` 仍会交还）；标记**不随 `take` 清除** |
 | **每回合必须新建 `BoundarySource`** | 标记永久置位，复用会让「上一回合的取消」立刻取消之后每个回合；app 循环还须在空闲期丢弃残留边界消息 |
 | **消息只存一份** | 不再有 pending 队列 = 转移模型；消息经 `Session::append` 落历史 |
+| **投递去向显式**（ADR-0047） | 回合中提交的用户输入经 `Boundary::Steer` **下一轮**生效；app 侧另有跨回合队列承担「下一回合」语义（系统 follow-up）。详见 `docs/adr/0047-input-delivery-target-and-queue.md` |
 
 ### `BoundarySource` 与 Abort 语义
 

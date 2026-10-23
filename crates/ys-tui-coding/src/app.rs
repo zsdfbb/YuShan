@@ -13,6 +13,7 @@ use ys_protocol::{Envelope, Outbound, Request, SessionSummary};
 
 use crate::commands::PromptKind;
 use crate::completion::CompletionState;
+use crate::history::InputHistory;
 use crate::input::InputBuffer;
 use crate::transcript::{TranscriptLine, replay_lines, summarize_tool_args};
 use crate::view::CodingView;
@@ -40,6 +41,11 @@ pub struct App {
     /// `None` = **还没同步过**：首次同步不补偿（此前没有「上一帧的行号空间」可对）。
     last_total_rows: Option<usize>,
     pub input: InputBuffer,
+    /// 会话内输入历史（`↑` / `↓` 取回，不落盘）。
+    ///
+    /// **不随 `/resume` 回放重置**：它记的是「本进程里敲过什么」，与当前打开哪个
+    /// 会话无关；清掉只会让用户重敲。
+    pub history: InputHistory,
     pub completion: Option<CompletionState>,
     /// 命令要开模态浮层（`/login` / `/model` 无参）—— **由 `run.rs` 消费**。
     ///
@@ -130,6 +136,7 @@ impl App {
             new_content_below: false,
             last_total_rows: None,
             input: InputBuffer::new(),
+            history: InputHistory::new(),
             completion: None,
             pending_prompt: None,
             pending_sessions: None,

@@ -115,7 +115,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 | 目录 | 卡点 | 指针 |
 |---|---|---|
-| `docs/arch/input-history/` | 8 个未决问题；**Q4 与现行 as-built 硬冲突**（`Up`/`Down` 现归聊天滚动，`crates/ys-tui-coding/src/events.rs:187`） | `context.md:139` |
+| `docs/arch/input-history/` | ⚠️ **会话内部分已解**（2026-10-23）：**仅进程内、不落盘、不跨会话** —— 输入框空时 `↑` 取回、`↓` 还原草稿（`crates/ys-tui-coding/src/history.rs`）。<br>· ✅ Q4（键位）已裁决：输入框为空/浏览态归历史，否则归聊天滚动；<br>· ⬜ Q2 / Q3 / Q5–Q8 未做：跨会话持久化、按 cwd 分片、去重上限以外的规则、隐私过滤、落盘时机、归属层 | `context.md:139` |
 | `docs/arch/bash-cwd-contract/` | Q7（短路路径是否补 cwd，会改「用户全权接管提示词」契约）、Q8（头部信息块收哪几项） | `context.md:747` |
 | `docs/arch/llm-api-unavailable/` | `ModelError` 是否加变体（breaking，需确认外部影响面）、错误文案形态、超时后会话状态、Ctrl-C 语义 | `context.md:161` |
 | `docs/arch/per-turn-model-switch/` | 形态未定：B1 内联指令 vs B2 workflow 文件；回合归因形态未定 | `context.md:179` |

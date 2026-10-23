@@ -2,6 +2,7 @@
 //!
 //! 键位集：**Enter 提交或填入补全（`Shift`/`Alt` + Enter 换行，`Ctrl-J` 亦可，见下）/
 //! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / Esc 取消或清空输入 / 上下翻页滚动 /
+//! `↑` 在输入框为空时取会话内历史（`↓` 往回还原草稿）/
 //! 左右与 Home·Delete 归输入光标（`Ctrl`·`⌥` + 左右 = 按词移动）/ Ctrl-A·Ctrl-E
 //! 输入行首·行尾 / Tab 开补全浮层**。
 //!
@@ -39,13 +40,21 @@
 //! | 键 | 归属 |
 //! |---|---|
 //! | `Up` / `Down` / `PageUp` / `PageDown` | **聊天滚动**（`App::scroll_offset`） |
+//! | `Up`（输入框为空 / 已在翻历史） | **取回会话内历史**（[`crate::history`]） |
+//! | `Down`（翻历史期间） | **往新翻，越过最新一条即还原草稿** |
 //! | `Left` / `Right` / `Delete` / `Home` | **输入光标**（`InputBuffer`） |
 //! | `Ctrl`·`⌥` + `Left` / `Right`（或 `⌥b` / `⌥f`） | **输入按词移动** |
 //! | `Ctrl-A` / `Ctrl-E` | **输入行首 / 行尾** |
 //! | `End` / `Ctrl-End` / `Ctrl-Down` | **跳到最新消息**（`scroll_offset = 0`、`follow = true`） |
 //! | `Ctrl-Home` / `Ctrl-Up` | **跳到最早消息** |
 //!
-//! 即：竖直方向 = 聊天，水平方向 = 输入。`Home`/`End` 这一对**不做对称绑定** ——
+//! 即：竖直方向**默认** = 聊天，水平方向 = 输入。`↑` 有一个前置判据 ——
+//! **输入框为空（或已进入翻历史）且历史非空**时取历史，否则照旧滚聊天。这样
+//! 「刚发完一条、想拿回上一条改改再发」与「边写边往上翻」都不必换键：前者输入框
+//! 恰好是空的，后者输入框里恰好有字。`↓` 更保守：**只在翻历史期间**归历史，
+//! 其余一律滚动 —— 向下回到最新内容是高频操作，不宜依赖历史是否为空。
+//!
+//! `Home`/`End` 这一对**不做对称绑定** ——
 //! `End` 早在 T5 就钉住了「跳回聊天底部」的语义（有测试），`Home` 之前空着，
 //! 于是给输入行首。理由：聊天滚动已有 4 个键（且退回底部是高频操作），而输入
 //! 行首此前**无键可用**（`Home` 是唯一自然的候选）。输入的「行尾」因此**不占 `End`**：
@@ -187,6 +196,10 @@ pub fn handle_key(
                 app.follow = true;
             } else {
                 app.input.clear();
+                // 清空输入框 = 放弃这一轮翻找 ⇒ **退出浏览态**。不清的话游标会留在
+                // 某个旧条目上：此后 `↓` 会把早已丢掉的草稿还回来，而新敲的内容
+                // 也不会被当成草稿（进不了 `prev` 的存草稿分支）。
+                app.history.reset_nav();
             }
         }
         // Shift/Alt+Enter 换行（Alt 是 macOS Terminal.app 的兜底，设计 §2.3）
@@ -214,9 +227,29 @@ pub fn handle_key(
         KeyCode::End => app.jump_to_end(),
         KeyCode::Up if ctrl => jump_to_start(app, width, height),
         KeyCode::Down if ctrl => app.jump_to_end(),
-        KeyCode::Up => scroll(app, width, height, 1),
+        // `↑` / `↓`：**先问历史，再退聊天滚动**。
+        //
+        // 取历史的条件是「输入框为空」（或已处于浏览态）且历史非空 —— 那正是
+        // 「刚提交完、想拿回上一条」的时刻。输入框里有字时 `↑` 仍是聊天滚动，
+        // 所以「边写边翻聊天」不受影响；历史为空时也照旧回落成滚动。
+        KeyCode::Up => {
+            if let Some(text) = recall_prev(app) {
+                set_input(app, &text);
+            } else {
+                scroll(app, width, height, 1);
+            }
+        }
         KeyCode::PageUp => scroll(app, width, height, page_rows(app, width, height)),
-        KeyCode::Down => scroll(app, width, height, -1),
+        KeyCode::Down => {
+            // `↓` 只在**浏览态**里归历史；否则一律聊天滚动（向下是高频操作）。
+            if app.history.is_browsing()
+                && let Some(text) = app.history.next_entry()
+            {
+                set_input(app, &text);
+                return;
+            }
+            scroll(app, width, height, -1);
+        }
         KeyCode::PageDown => scroll(app, width, height, -page_rows(app, width, height)),
         // Tab：输入 `/` 开头时按前缀开补全浮层（无命中 / 不以 `/` 开头 = no-op）。
         // 候选含 skill（与 `submit` 的解析同源，见模块文档）。
@@ -304,16 +337,40 @@ fn scroll(app: &mut App, width: u16, height: u16, delta: isize) {
     app.follow = next == 0;
 }
 
-/// 提交输入：命令分发（[`commands::parse_with_skills`]，含 skill 名）或普通消息。
+/// 提交输入：记历史 + 命令分发（[`commands::parse_with_skills`]，含 skill 名）或普通消息。
 fn submit(app: &mut App, requests: &Sender<Request>, boundaries: &Sender<Boundary>) {
     let text = app.input.take();
     app.completion = None;
     if text.trim().is_empty() {
+        // 空提交也把输入框清空了 ⇒ 浏览态一并结束（见 Esc 分支的同一条理由）。
+        // 注意不能靠 `record` 办这事：它只在非空时被调。
+        app.history.reset_nav();
         return;
     }
+    // 记的是**用户原样提交的文本**（`/` 命令、多行原文都不改写）。
+    app.history.record(&text);
     // 先把 `Action` 算出来（只读借 `app.view.skills`）再 dispatch（可变借 `app`）
     let action = commands::parse_with_skills(&text, &app.view.skills);
     dispatch(app, requests, boundaries, action);
+}
+
+/// 把一段历史文本回填进输入框（光标落到末尾）。
+///
+/// 走 [`InputBuffer::clear`] + [`InputBuffer::insert_str`]：`cursor` 是 char 索引，
+/// 直接改 `text` 会让光标与多字节内容错位。
+fn set_input(app: &mut App, text: &str) {
+    app.input.clear();
+    app.input.insert_str(text);
+}
+
+/// `↑` 的取历史分支：只有「输入框为空或已在浏览态」且历史非空时才成立。
+///
+/// 返回 `None` = 不归历史，调用方照旧滚聊天。
+fn recall_prev(app: &mut App) -> Option<String> {
+    if !app.history.is_browsing() && !app.input.text.is_empty() {
+        return None;
+    }
+    app.history.prev(&app.input.text)
 }
 
 /// 分派一个**已解析**的 [`Action`]。
@@ -1372,6 +1429,193 @@ mod tests {
     }
 
     /// 既有测试的补充：`End` 之后 `Left` 仍作用于输入 —— 两个键不互相串味。
+    /// `↑` / `↓` **取历史**：输入框空时 `↑` 拿回上一条提交，`↓` 一路上回到
+    /// 「进入浏览前的草稿」并退出浏览态；之后上下键又回到聊天滚动。
+    ///
+    /// 变异：① 去掉 `recall_prev` 的「输入框为空」判据 ⇒ 写着的字被吃掉，第二条断言红；
+    /// ② 去掉 `next()` 的草稿还原 ⇒ 草稿断言红；③ `record` 不退出浏览态 ⇒ 第三条断言红。
+    #[test]
+    fn test_up_down_recall_submitted_history_then_restore_draft() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+
+        // 提交两条（回车路径）。第二条提交后输入框为空。
+        for text in ["第一条", "第二条"] {
+            a.input.insert_str(text);
+            handle_key(
+                press(KeyCode::Enter),
+                &mut a,
+                &ch.req_tx,
+                &ch.bnd_tx,
+                120,
+                40,
+            );
+            a.is_turning = false; // 本用例只关心历史，不模拟回合结束事件
+        }
+        assert!(a.input.text.is_empty());
+        assert_eq!(a.scroll_offset, 0);
+
+        // 输入框空 ⇒ ↑ 取最新一条，**不滚聊天**。
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "第二条");
+        assert_eq!(a.input.cursor, 3, "光标到末尾");
+        assert_eq!(a.scroll_offset, 0, "取历史不带动聊天");
+
+        // 继续 ↑ ⇒ 更旧一条（此时输入框非空，但已在浏览态，仍归历史）。
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "第一条");
+        // 到头部再 ↑：停在原地，仍不滚动。
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "第一条");
+        assert_eq!(a.scroll_offset, 0);
+
+        // ↓ 往新翻：回到「第二条」，再 ↓ 越过最新 ⇒ 退出浏览态、输入框清回草稿。
+        handle_key(
+            press(KeyCode::Down),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.text, "第二条");
+        handle_key(
+            press(KeyCode::Down),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.input.text.is_empty(), "草稿是空串 ⇒ 回到空输入框");
+        assert!(!a.history.is_browsing());
+
+        // 退出浏览态后 ↓ 又归聊天滚动。
+        handle_key(
+            press(KeyCode::Down),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "已在底部，↓ 不再往下");
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "第二条", "输入框空 ⇒ ↑ 又取历史（先于滚动）");
+    }
+
+    /// 输入框里有字时 `↑` / `↓` **仍是聊天滚动** —— 历史不得抢走「边写边翻看」。
+    #[test]
+    fn test_up_down_still_scroll_when_input_has_text() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.input.insert_str("正在写");
+        a.input.insert_str("\n第二行");
+        let cursor = a.input.cursor;
+        a.history.record("旧的一次提交");
+
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.scroll_offset, 1, "输入框有字 ⇒ 滚聊天");
+        assert_eq!(a.input.text, "正在写\n第二行", "输入不被历史覆盖");
+        assert_eq!(a.input.cursor, cursor);
+
+        handle_key(
+            press(KeyCode::Down),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "回到贴底");
+        assert!(a.follow);
+    }
+
+    /// 历史为空时 `↑` 仍是聊天滚动（新会话、什么都没发过的场景）。
+    #[test]
+    fn test_up_scrolls_when_history_empty() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        assert!(a.history.is_empty());
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.scroll_offset, 1);
+        assert!(a.input.text.is_empty());
+    }
+
+    /// Esc 清空输入框时**必须退出浏览态** —— 否则游标停在半路上，下一次 `↑`
+    /// 会接着往更旧走，而不是从最新一条重新开始。
+    ///
+    /// 变异：删掉 Esc idle 分支里的 `reset_nav()` ⇒ 最后一条断言红（拿到 "one"）。
+    #[test]
+    fn test_esc_clearing_input_leaves_history_browsing() {
+        let ch = channels();
+        let mut a = app();
+        for t in ["one", "two", "three"] {
+            a.history.record(t);
+        }
+
+        // 输入框空着 ⇒ ↑ 从最新一条开始，连按往旧走。
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "three");
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "two");
+        assert!(a.history.is_browsing());
+
+        // Esc 清空 ⇒ 同时退出浏览态。
+        handle_key(press(KeyCode::Esc), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert!(a.input.text.is_empty());
+        assert!(!a.history.is_browsing(), "Esc 清空后不得再处于浏览态");
+
+        // 再按 ↑：必须从**最新**一条重新开始，而不是接着往旧走。
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "three", "Esc 后 ↑ 应回到最新一条");
+    }
+
+    /// 空白提交也清空了输入框 ⇒ 同样要退出浏览态（`record` 不会被调用）。
+    ///
+    /// 变异：删掉 `submit` 空白分支里的 `reset_nav()` ⇒ 最后一条断言红。
+    #[test]
+    fn test_blank_submit_leaves_history_browsing() {
+        let ch = channels();
+        let mut a = app();
+        for t in ["one", "two"] {
+            a.history.record(t);
+        }
+
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "two");
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "one");
+        assert!(a.history.is_browsing());
+
+        // 改成空白再提交：不产请求，但要退出浏览态。
+        a.input.clear();
+        a.input.insert_str("   ");
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.input.text.is_empty());
+        assert!(ch.next_request().is_none(), "空白不提交");
+        assert!(!a.history.is_browsing(), "空白提交后不得再处于浏览态");
+
+        handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.text, "two", "空白提交后 ↑ 应回到最新一条");
+    }
+
     #[test]
     fn test_end_then_left_keeps_input_cursor_semantics() {
         let ch = channels();

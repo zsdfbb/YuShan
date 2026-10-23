@@ -363,7 +363,7 @@ pub fn help_text() -> String {
 /// 终端无关的（`CSI 1;5A` 一类）。**不列 `⌘` 组合** —— macOS 终端自己消费 `⌘`，
 /// 字节到不了应用（见 `events.rs` 模块头）。
 const KEY_HELP: &str = "键位：
-  ↑ ↓                滚动对话（脱离底部即停止跟随，新内容不再拽你回去）
+  ↑ ↓                输入框为空时 ↑ 取回历史（↓ 还原草稿）；否则滚动对话
   PageUp / PageDown  翻页（一页 = 视窗高度）
   End                跳到最新消息
   Ctrl+↓ / Ctrl+End  跳到最新消息

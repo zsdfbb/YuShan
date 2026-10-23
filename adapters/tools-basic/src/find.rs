@@ -207,6 +207,13 @@ fn build_result(bounded: &Bounded, search_root: &Path, limit: usize, label: &str
     }
     match bounded.stop {
         Stop::Aborted => notices.push("Search aborted".into()),
+        // 插话提前收口：如实说明搜索**没跑完**，不得让它看起来像「无结果」。
+        Stop::Steered => notices.push(
+            "Search stopped early because the user sent a message — results are incomplete. \
+             That message will enter your context as soon as this batch of tool calls finishes; \
+             read it before re-running the search"
+                .into(),
+        ),
         Stop::TimedOut => notices.push(format!(
             "Search timed out after {}s, results may be incomplete",
             DEADLINE.as_secs()

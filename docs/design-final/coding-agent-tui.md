@@ -92,7 +92,7 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 | 信道 | 类型 | 方向 | 目的地 / 消费时机 | 容量 |
 |---|---|---|---|---|
 | ① Request | `ys_protocol::Request` | UI → app | app 线程 `recv().await`（**回合边界**） | 64 |
-| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`take`）；模型调用前 / 工具轮询用 `is_aborted` | 64 |
+| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`take`）；模型调用前 / 工具轮询用 `is_aborted` / `has_pending_steer` | 64 |
 | ③ Outbound | `ys_protocol::Outbound<CodingView>` | app → UI | UI 事件循环 `try_recv` 排空 | 1024 |
 
 **为何 ② 必须独立于 ①**：回合跑动时 app 线程阻塞在 `agent.run_turn()` 里，不可能 `recv` ①；
@@ -186,9 +186,21 @@ impl QueueBoundarySource {
 
 **工具级取消载体**：`ToolContext.cancel: &CancelToken` → `ToolContext.boundary: Option<&dyn BoundarySource>`
 （`ys-component::ToolContext`，构造函数 `ToolContext::new(boundary, cwd, workspace_root)`）。
-`BashTool` 在挂载 `boundary` 时**以 100ms 间隔轮询 `is_aborted()`**，命中则杀**进程组**
-（`sh -c "kill -9 -{pid}"`，不引 libc）并返回中止错误；未挂载时行为与改动前完全一致（有测试钉住）。
-`timeout` 语义在挂载 `boundary` 时仍生效。
+`BashTool` 在挂载 `boundary` 时**以 100ms 间隔轮询**两个信号：
+
+- `is_aborted()` 命中 ⇒ 杀**进程组**（`sh -c "kill -9 -{pid}"`，不引 libc）并返回中止错误；
+- `has_pending_steer()` 命中（用户插话）⇒ 同样杀进程组、停止等待，但返回**成功结果**：
+  已捕获的 stdout/stderr 照给，末尾说明「命令因插话提前中止，插话将在本批工具调用结束后
+  进入上下文」。插话**不被工具消费**，仍由轮边界 `take`。
+
+于是「长工具跑多久，插话就等多久」这一延迟被压到**一个轮询周期**（100ms 量级）。
+未挂载 `boundary` 时行为与改动前完全一致（有测试钉住）。`timeout` 语义在挂载 `boundary`
+时仍生效。
+
+**UI 侧的两个时刻要分开说**（`App::note_steered`）：提交后立即画用户行 + 紧跟一条系统行
+「已插话：将在当前工具调用结束后生效」。用户行只证明「已送达」，不代表「模型已看到」——
+把两者混为一谈，用户会以为模型故意忽略自己。用 `TranscriptLine::System` 而不是新增
+`App` 字段：屏幕上就是它该在的地方，不必多一份投影状态。
 
 **每回合新建 `QueueBoundarySource`**（**实现 ≠ design 伪代码**，见 §8）：`Abort` 会**永久**置位
 `is_aborted`，复用同一个源会让「上一回合的取消」把之后每个回合立刻取消。app 循环顶部还有
@@ -284,7 +296,9 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 `InputBuffer.cursor` 是 **char 索引**，退格走字节边界求区间再 `replace_range` —— 修掉了旧
 `ui/events.rs:131` 的 `cursor - 1` 落在多字节字符中间导致的**中文退格 panic**。
 
-**键位归属**：竖直方向归聊天（`Up/Down/PageUp/PageDown`），水平方向归输入（`Left/Right/Delete/Home`）；
+**键位归属**：`Up/Down` 归**输入历史**（readline 语义：`Up` 拿更旧一条、`Down` 往新并在越过最新时还原草稿），
+聊天滚动让给 `PageUp/PageDown`（逐页）与 `Ctrl+Up/Ctrl+Down`（跳到最早 / 最新）；
+水平方向归输入（`Left/Right/Delete/Home`）；
 `Ctrl`·`⌥` + 左右（或 `⌥b` / `⌥f`）让输入光标**按词**移动，`Ctrl-A` / `Ctrl-E` 到**输入行首 / 行尾**。
 `End` 回聊天底部（早于 `Home` 绑定，故不做对称）—— 输入行尾**不占 `End`**，走 `Ctrl-E`。
 补全浮层打开时上下归浮层。
@@ -456,7 +470,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 | 落点 | 条数 | 覆盖 |
 |---|---|---|
-| `crates/ys-protocol` | 28 | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
+| `crates/ys-protocol` | 46（其中 `boundary` 18） | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `has_pending_steer`（只看 Steer、不消费、不泄露正文、默认 false）/ `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
 | `crates/ys-tui-coding` | 242（**当前值**） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消）；**本轮 md 渲染 +30**（逐项见 §9.4） |
 | `crates/ys-runtime/tests/run_turn_boundary.rs` | 5 | `run_turn` + `AgentPorts` 带 `BoundarySource` 的轮边界语义（跨 crate，不反向依赖 app） |
 | `apps/coding-agent/src/app_loop.rs` | 2 | Prompt → 事件（turn 从 1）→ View；`NewSession` → Output + 刷新快照；**残留 `Abort` 被空闲期丢弃**（变异测试钉住） |
@@ -687,9 +701,16 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 - 三条入口（TUI `app_loop` / `-p` / `--json`）**每回合**造一份 `AppSubagentRunner`（派发计数器因此天然 per-turn），经 `AgentPorts::with_subagent` → `RuntimeContext.subagent` → `ToolContext.subagent` 三跳送达工具。
 - 一次派发：建**全新子 `Agent`**（`Agent::run_turn` 取 `&mut self`，实例不可共享） + `MemorySession` + 本地 `CollectingSink`（**子事件只用于本地转录，不进父事件流**）+ `ChildBoundary`。
-- **取消**：`ChildBoundary::take()` 只取自己那份、`is_aborted()` = 自己 **或** 父 —— 父 Abort 经探针向下传播，子吃不到父的 `Steer`。
+- **取消**：`ChildBoundary::take()` 只取自己那份、`is_aborted()` = 自己 **或** 父 —— 父 Abort 经探针向下传播，子吃不到父的 `Steer`；
+  `has_pending_steer()` **恒 `false`**（不透传）—— 插话是给父模型的输入，若透传，父的插话会表现为
+  「子 agent 的命令莫名提前中止」并让孩子那边生成一条语义矛盾的「用户插话了」结果。
 - **子预算**：watchdog（`tokio::spawn(sleep(budget) → 子边界源 push(Abort))`，用 **`AbortOnDropHandle`** 防孤儿任务）；子预算与主 agent 同值 ⇒ 真实天花板是父回合那条 deadline。
 - **超时**：`Tool::timeout()` 的优先级链（工具声明 → `bash_timeout` → 300s）；`subagent` 的外闸 = 子预算 + 60s 宽限，**构造期由 `Config` 注入**（ADR-0029 修正 2）。
+- **插话**：同步 `subagent` 的 `call` 用 `tokio::select!` 同时等 `runner.run(..)` 与「父边界源上的
+  `has_pending_steer()` 轮询」（`STEER_POLL_INTERVAL = 100ms`，与 `tools-basic` 同口径）。命中则
+  **放弃等待** —— drop 掉 `runner` future ⇒ 子回合取消（其内部子进程靠 `kill_on_drop` 收尸）——
+  并返回 `is_error: false` 的结果说清「派发被插话中止、子 agent 未完成」。插话不被消费，
+  仍由父轮的轮边界 `take`。`subagent_async` **不需此机制**（它本来就不阻塞父回合）。
 
 ### 13.3 结果与产物
 
@@ -981,10 +1002,14 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 |---|---|
 | `End` / `Ctrl-End` / `Ctrl-Down` | 跳到最新消息 |
 | `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息 |
-| `↑` | 输入框**为空**（或已在翻历史）时**取回会话内历史**；否则逐视觉行滚动 |
-| `↓` | 翻历史期间：上一行还原草稿并退出浏览态；否则逐视觉行滚动（脱离底部即停止跟随） |
-| `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1** |
+| `↑` | **取回会话内历史**（历史非空即取，输入框是否已有字不影响；首次按下把现有内容存成草稿）；历史为空时回落逐视觉行滚动 |
+| `↓` | 浏览态内：往新一条，越过最新即还原草稿并退出浏览态；否则逐视觉行滚动（脱离底部即停止跟随） |
+| `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1**（聊天滚动的主入口） |
 | `Home` | 输入行首（**裸** `Home` 归输入光标，与 `End` 刻意不对称） |
+
+多行输入框里**上下不移动输入光标**（`InputBuffer` 只有一个 char 索引，无列位置概念）——
+要回到行首 / 行尾、跨行移动或按词移动，用 `Home`、`Ctrl-A` / `Ctrl-E`、`Left` / `Right`、
+`Ctrl`·`⌥` + 左右。
 
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
@@ -997,8 +1022,8 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
 
 - **只记进程内的提交原文**（`events::submit` 在非空白时才调 `record`）—— 含 `/` 命令与多行原文，不改写。**不落盘、不跨会话、不跨 `--resume`**。
 - **`/new` / `/resume` 都不清空它**：它记的是「本进程里敲过什么」，与当前打开哪个会话无关。
-- **走廊规则**：`↑` 只在「输入框为空（或已在翻历史）且历史非空」时取历史，否则归滚动；`↓` **只在浏览态**归历史。输入框有字时两个键行为完全不变。
-- **草稿**：进入浏览时存下输入框原文，`↓` 越过最新一条就还原它并退出浏览态（readline 语义）。
+- **走廊规则**：`↑` 只要**历史非空**就取历史（与输入框是否已有内容无关）；历史为空时回落成逐视觉行滚动。`↓` **只在浏览态**归历史，其余一律滚动 —— 聊天滚动的主入口是 `PageUp` / `PageDown` 与 `Ctrl+↑/↓`。
+- **草稿**：首次进入浏览时存下输入框原文（含多行 / CJK，原样），`↓` 越过最新一条就还原它并退出浏览态（readline 语义）。
 - **去重与上限**：与上一条逐字相同的**不重复入栈**；`MAX_ENTRIES = 200`，超出丢最旧。
 
 **范围外**（未做）：跨会话持久化（`~/.yushan/`）、按 cwd 分片、隐私过滤（密钥/大粘贴）、`Ctrl-R` 搜索。未决问题见 `docs/arch/input-history/context.md` 的 Q2 / Q3 / Q5–Q8，台账 `docs/TODO.md` §C。

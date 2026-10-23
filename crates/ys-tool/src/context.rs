@@ -7,9 +7,10 @@ use crate::summarizer::Summarizer;
 
 #[non_exhaustive]
 pub struct ToolContext<'a> {
-    /// 轮边界控制源（工具可轮询 `is_aborted()` 以感知中止）。
+    /// 轮边界控制源（工具可轮询 `is_aborted()` 感知中止、`has_pending_steer()` 感知
+    /// 用户插话）。
     ///
-    /// `None` = 无边界控制；工具应视作「未中止」。
+    /// `None` = 无边界控制；工具应视作「未中止、无插话」。
     pub boundary: Option<&'a dyn BoundarySource>,
     pub cwd: PathBuf,
     pub workspace_root: PathBuf,

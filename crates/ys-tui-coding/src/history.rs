@@ -141,23 +141,44 @@ mod tests {
 
     /// `↓` 往新走，越过最新一条 ⇒ 还原**进入浏览前**的草稿并退出浏览态。
     ///
-    /// 变异：`next()` 直接返回空串而不还草稿 ⇒ 草稿断言红。
+    /// 草稿的来源也在这里钉住：输入框**非空**时首次 `prev` 就把它完整存下（含多行与
+    /// CJK，不按行切），所以「边写边翻历史」不会丢已敲的内容。
+    ///
+    /// 变异：① `prev` 的 `None` 分支不存草稿 ⇒ `draft` 断言红；
+    /// ② `next_entry` 直接返回空串而不还草稿 ⇒ 草稿断言红。
     #[test]
     fn test_next_restores_draft_and_leaves_browsing() {
         let mut h = InputHistory::new();
         h.record("one");
         h.record("two");
 
-        assert_eq!(h.prev("写到一半的话").as_deref(), Some("two"));
+        let draft = "写到一半的话\n第二行";
+        assert_eq!(h.prev(draft).as_deref(), Some("two"));
+        assert_eq!(h.draft, draft, "首次 prev 即把输入框现有内容存成草稿");
         assert_eq!(h.prev("two").as_deref(), Some("one"));
         assert_eq!(h.next_entry().as_deref(), Some("two"));
         assert_eq!(
             h.next_entry().as_deref(),
-            Some("写到一半的话"),
-            "越过最新返回草稿"
+            Some(draft),
+            "越过最新返回草稿（原样多行）"
         );
         assert!(!h.is_browsing());
+        assert!(h.draft.is_empty(), "退出浏览态即丢弃草稿");
         assert_eq!(h.next_entry(), None, "退出浏览态后 ↓ 归聊天滚动");
+    }
+
+    /// 历史只有一条时，`prev` 拿它、`next_entry` 直接还草稿 —— 不返回空串。
+    ///
+    /// 变异：`next_entry` 越过最新时返回空串 ⇒ 草稿断言红。
+    #[test]
+    fn test_single_entry_browse_roundtrip_keeps_draft() {
+        let mut h = InputHistory::new();
+        h.record("唯一一条");
+
+        assert_eq!(h.prev("没写完").as_deref(), Some("唯一一条"));
+        assert_eq!(h.prev("唯一一条").as_deref(), Some("唯一一条"), "到头停住");
+        assert_eq!(h.next_entry().as_deref(), Some("没写完"));
+        assert!(!h.is_browsing());
     }
 
     /// 相邻重复不入栈（连按 Enter 只留一条），中间夹别的仍会入栈。

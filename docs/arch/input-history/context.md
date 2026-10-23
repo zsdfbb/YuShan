@@ -97,14 +97,14 @@ apps/coding-agent           接线器（app_loop / capabilities / wiring / sessi
 |---|---|---|
 | `docs/arch/tui-stack-revisit/design.md:92` | 「**历史**（↑↓，持久化 `~/.yushan/history`）｜ rustyline 内建 —— **↑↓ 从「滚动」还给历史**」 | 该方案要把 ↑↓ 从聊天滚动改归历史 |
 | `docs/arch/tui-pi-codewhale-borrow/design.md:262` | 「历史文件持久化 ｜ rustyline 自带 `~/.yushan/history`，**不做**」 | 明确列入**不做** |
-| `docs/design-final/coding-agent-tui.md:253` | 「竖直方向归聊天（`Up/Down/PageUp/PageDown`）」 | 现行 as-built 决策 |
-| `crates/ys-tui-coding/src/events.rs:24`（模块文档表） | `Up`/`Down`/`PageUp`/`PageDown` = **聊天滚动** | 代码即契约 |
+| `docs/design-final/coding-agent-tui.md:253` | 「竖直方向归聊天（`Up/Down/PageUp/PageDown`）」 | **已改为**：`↑↓` 归历史，滚动让给 `PageUp/PageDown` 与 `Ctrl+↑↓` |
+| `crates/ys-tui-coding/src/events.rs:24`（模块文档表） | `Up`/`Down`/`PageUp`/`PageDown` = **聊天滚动** | **已改为**：`↑` 取历史（历史为空才回落滚动），`Down` 仅浏览态内归历史 |
 | `docs/arch/tui-resident-status/improvements-p1-p2-p3.md:197,273` | 「13. 输入历史（↑/↓）… **rustyline**」 | 旧提案绑死 rustyline（已随 `645e339` 删除） |
 | `docs/arch/coding-agent-tui/tui-repl-context.md:94` | 「`rustyline` ｜ 行编辑 ｜ **已删除，需重新引入**」 | 引入 rustyline 才能白拿 history —— 但那是一次大替换 |
 | `docs/arch/gap-closure/context.md:524`（Q7） | 「rustyline 是否替换 ratatui …… 本轮已决定**先不动**」 | 待决方向，未被采纳 |
 
 **结论**：本需求不是「补一块空缺」，而是**要推翻两条已记录的「不做」并重划键位归属**。这必须由
-`arch-design` 显式裁决（见后）。
+`arch-design` 显式裁决（见后）。**键位归属已裁决**（Q4，见下）：采纳 readline 语义。
 
 ## 需求范围
 
@@ -143,10 +143,13 @@ apps/coding-agent           接线器（app_loop / capabilities / wiring / sessi
 - [ ] **Q1 范围**：只记「敲进输入框的原始文本」（含 `/` 命令），还是也要能回看/搜索整段回合（含 assistant 与工具输出）？
 - [ ] **Q2 全局还是按项目**：单一全局文件（跨所有 cwd 共享，如 `~/.yushan/` 下），还是按 cwd 分片（同一仓库内共享）？
 - [ ] **Q3 只进程内还是跨会话持久化**？若持久化，落在 `~/.yushan/`（与 `state.json` / `logs/` 同级）可接受吗？文件名（`history` / `input-history.jsonl`）？
-- [ ] **Q4 键位**（**与现行 as-built 冲突，必须裁决**）：`Up/Down` 现在归聊天滚动（`events.rs:166-169`）。候选：
-      (a) 输入框**为空**时 `Up/Down` 取历史，非空时仍滚聊天（readline 常见）；
-      (b) 专用键 `Alt+↑/Alt+↓`（或 `Ctrl-P/Ctrl-N`），`Up/Down` 完全不动；
-      (c) `Ctrl-R` 开搜索浮层（更重，需新模态）。
+- [x] **Q4 键位**（**与旧 as-built 冲突，已裁决**）：`Up/Down` 原本归聊天滚动。**采纳 (a) 的强化版 = readline 语义**：
+      `↑` **只要历史非空就取历史**（不再看输入框是否为空 —— 首次按下把输入框现有内容存成草稿，
+      `↓` 越过最新一条即原样还原并退出浏览态）；`↓` 只在浏览态内归历史。
+      聊天滚动因此改由 **`PageUp` / `PageDown`**（逐页）与 **`Ctrl+↑` / `Ctrl+↓`**（跳到最早 / 最新）承担，
+      退出底部另用 `End` / `Ctrl-End` / `Ctrl-Down`。**不采用** (b) 专用键（`Alt+↑↓` / `Ctrl-P/N` 在 Termux
+      等终端上并非处处可发）与 (c) `Ctrl-R` 搜索浮层（那是独立的范围内新增项，本需求明确不做搜索 UI）。
+      未决项只剩**持久化**相关的 Q2 / Q3 / Q5–Q8。
 - [ ] **Q5 去重与上限**：相邻去重 + 保留最近 N 条（如 500）够吗？超限是截断尾部还是环形重写？
 - [ ] **Q6 过滤/隐私**：输入可能含密钥或大段粘贴代码，是否要「跳过疑似密钥行」「限制单条长度」「禁止多行入库」之类的规则？
 - [ ] **Q7 落盘时机**：每次 `submit` 追加（同步小 IO，可能阻塞 UI 一瞬），还是退出时批量写（崩溃即丢）？
@@ -157,5 +160,6 @@ apps/coding-agent           接线器（app_loop / capabilities / wiring / sessi
 
 - 用 `arch-design` 做方案设计，重点裁决 **Q4（键位冲突）** 与 **Q8（归属层）** —— 二者决定是否触到
   `ys-protocol` / 既有键位 as-built 文档。
-- 若采纳键位改动，需同步更新 `docs/design-final/coding-agent-tui.md:253` 与 `events.rs` 模块文档表。
+- ~~若采纳键位改动，需同步更新 `docs/design-final/coding-agent-tui.md:253` 与 `events.rs` 模块文档表。~~
+  **已随 Q4 裁决完成**（`↑↓` 归历史、`PageUp/PageDown` + `Ctrl+↑↓` 归滚动）。
 - 若落盘形态未定，可先做**进程内 + 注入式存储 trait** 的最小版（`prototype`），验证翻历史的手感后再定持久化。

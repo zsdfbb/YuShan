@@ -1,8 +1,8 @@
 //! crossterm 事件 → [`App`] 状态迁移 + 对 app 线程的请求（`Request` / `Boundary`）。
 //!
 //! 键位集：**Enter 提交或填入补全（`Shift`/`Alt` + Enter 换行，`Ctrl-J` 亦可，见下）/
-//! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / Esc 取消或清空输入 / 上下翻页滚动 /
-//! `↑` 在输入框为空时取会话内历史（`↓` 往回还原草稿）/
+//! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / Esc 取消或清空输入 /
+//! `↑` 取会话内历史（`↓` 往新还原草稿）/ `PageUp`·`PageDown` 与 `Ctrl+↑`·`Ctrl+↓` 滚聊天 /
 //! 左右与 Home·Delete 归输入光标（`Ctrl`·`⌥` + 左右 = 按词移动）/ Ctrl-A·Ctrl-E
 //! 输入行首·行尾 / Tab 开补全浮层**。
 //!
@@ -33,26 +33,35 @@
 //! 它本地立即生效后，再把 UI 运行期真值经 [`Request::SetThinking`] **单向**同步给
 //! app 作持久化镜像（设计 §5.1 / §5.6）。
 //!
-//! # 方向键的取舍：上下归聊天、左右归输入
+//! # 方向键的取舍：上下归历史、左右归输入、翻页归聊天
 //!
-//! 方向键只有 4 个，却要服务两个焦点（聊天滚动 + 输入光标）。本模块的划分：
+//! 方向键只有 4 个，却要服务三个焦点（输入历史 + 输入光标 + 聊天滚动）。本模块的划分：
 //!
 //! | 键 | 归属 |
 //! |---|---|
-//! | `Up` / `Down` / `PageUp` / `PageDown` | **聊天滚动**（`App::scroll_offset`） |
-//! | `Up`（输入框为空 / 已在翻历史） | **取回会话内历史**（[`crate::history`]） |
-//! | `Down`（翻历史期间） | **往新翻，越过最新一条即还原草稿** |
+//! | `Up`（历史非空） | **取回会话内历史**（[`crate::history`]），一路往旧走 |
+//! | `Up`（历史为空） | 回落成逐行滚动（新会话里不能没有滚动入口） |
+//! | `Down`（浏览态内） | **往新翻，越过最新一条即还原草稿并退出浏览态** |
+//! | `Down`（其余情形） | 逐行滚动（向下回到最新是高频操作，不依赖历史） |
+//! | `PageUp` / `PageDown` | **聊天滚动（翻页）**：步长 = 视窗高度 − 1 |
 //! | `Left` / `Right` / `Delete` / `Home` | **输入光标**（`InputBuffer`） |
 //! | `Ctrl`·`⌥` + `Left` / `Right`（或 `⌥b` / `⌥f`） | **输入按词移动** |
 //! | `Ctrl-A` / `Ctrl-E` | **输入行首 / 行尾** |
 //! | `End` / `Ctrl-End` / `Ctrl-Down` | **跳到最新消息**（`scroll_offset = 0`、`follow = true`） |
 //! | `Ctrl-Home` / `Ctrl-Up` | **跳到最早消息** |
 //!
-//! 即：竖直方向**默认** = 聊天，水平方向 = 输入。`↑` 有一个前置判据 ——
-//! **输入框为空（或已进入翻历史）且历史非空**时取历史，否则照旧滚聊天。这样
-//! 「刚发完一条、想拿回上一条改改再发」与「边写边往上翻」都不必换键：前者输入框
-//! 恰好是空的，后者输入框里恰好有字。`↓` 更保守：**只在翻历史期间**归历史，
-//! 其余一律滚动 —— 向下回到最新内容是高频操作，不宜依赖历史是否为空。
+//! 即：`↑↓` 归 readline 意义上的**输入历史**，聊天滚动主用 **`PageUp` / `PageDown`**
+//! （逐页）与 **`Ctrl+↑` / `Ctrl+↓`**（跳到最早 / 最新）。`↑` 的取历史**不设前置条件**
+//! —— 输入框里正写着字也照取，`InputHistory` 会把现有内容存成草稿，`↓` 越过最新一条
+//! 就原样还回来。这样「刚发完一条、想拿回上一条改改再发」与「写到一半去翻旧提交」
+//! 是同一个动作。唯一例外：**历史为空**时 `↑` 回落成逐行滚动，否则新会话里 `↑` 什么都
+//! 不做。`↓` 更保守：**只在浏览态内**归历史，其余一律滚动 —— 向下回到最新内容不宜
+//! 依赖历史是否为空。
+//!
+//! 多行输入框里**上下不再移动输入光标** —— 这是 `↑↓` 归历史的必然代价，且 `InputBuffer`
+//! 本就只维护单个 char 索引（无「上下移动」的列位置概念）。要回到当前行的行首 / 行尾、
+//! 跨行跳转或按词移动，用 `Home`（行首）、`Ctrl-A` / `Ctrl-E`（行首 / 行尾）、
+//! `Left` / `Right`、`Ctrl`/`⌥` + 左右（按词）。
 //!
 //! `Home`/`End` 这一对**不做对称绑定** ——
 //! `End` 早在 T5 就钉住了「跳回聊天底部」的语义（有测试），`Home` 之前空着，
@@ -75,7 +84,8 @@
 //! `Ctrl-E` —— 绑这两个即等价于「⌘ + 左右」可用。按词移动另给 `Ctrl`/`⌥` + 左右
 //! 与 `⌥b`/`⌥f`（后者是 Terminal.app 映射 ⌥← 的形态）。
 //!
-//! **补全浮层打开时上下归浮层**（设计 §2.4）—— 焦点在浮层上，聊天滚动让位。
+//! **补全浮层打开时上下归浮层**（设计 §2.4）—— 焦点在浮层上，历史的上下让位；
+//! 浮层因其他键关闭时那一下会**交还给正常处理**，历史的上下随即生效。
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::Sender;
@@ -211,7 +221,7 @@ pub fn handle_key(
         KeyCode::Char('j') if ctrl => app.input.insert_char('\n'),
         KeyCode::Backspace => app.input.backspace(),
         KeyCode::Delete => app.input.delete_forward(),
-        // 左右归**输入光标**（上下归聊天滚动 —— 见模块文档的取舍表）。
+        // 左右归**输入光标**（上下归历史、翻页归聊天 —— 见模块文档的取舍表）。
         // 带 Ctrl / Alt 时**按词**移动：macOS 的 ⌥←/⌥→ 与多数终端的 Ctrl+←/Ctrl+→
         // 都落到这一支（终端各自发 `ESC[1;5D` 或 `ESC b` 这类序列，crossterm 解出
         // 的就是 Left/Right + 修饰键）。终端的键映射若把 ⌘← 发成别的，见 Ctrl-A/E。
@@ -229,11 +239,12 @@ pub fn handle_key(
         KeyCode::Down if ctrl => app.jump_to_end(),
         // `↑` / `↓`：**先问历史，再退聊天滚动**。
         //
-        // 取历史的条件是「输入框为空」（或已处于浏览态）且历史非空 —— 那正是
-        // 「刚提交完、想拿回上一条」的时刻。输入框里有字时 `↑` 仍是聊天滚动，
-        // 所以「边写边翻聊天」不受影响；历史为空时也照旧回落成滚动。
+        // readline 语义：历史非空就取历史，**与输入框是否已有内容无关** —— 首次按下
+        // 由 `InputHistory::prev` 把输入框现有内容存成草稿，`↓` 越过最新一条时还回来。
+        // 一个例外：历史为空时 `↑` 仍回落成逐行滚动（新会话里不能没有滚动入口）。
+        // 聊天滚动的常备入口因此归 `PageUp` / `PageDown` 与 `Ctrl+↑/↓`（见模块文档）。
         KeyCode::Up => {
-            if let Some(text) = recall_prev(app) {
+            if let Some(text) = app.history.prev(&app.input.text) {
                 set_input(app, &text);
             } else {
                 scroll(app, width, height, 1);
@@ -242,6 +253,7 @@ pub fn handle_key(
         KeyCode::PageUp => scroll(app, width, height, page_rows(app, width, height)),
         KeyCode::Down => {
             // `↓` 只在**浏览态**里归历史；否则一律聊天滚动（向下是高频操作）。
+            // 退出浏览态那一下已经交出了草稿，**不再多滚一次**（`return`）。
             if app.history.is_browsing()
                 && let Some(text) = app.history.next_entry()
             {
@@ -333,7 +345,7 @@ fn scroll(app: &mut App, width: u16, height: u16, delta: isize) {
         app.scroll_offset.saturating_sub(delta.unsigned_abs())
     };
     app.scroll_offset = next;
-    // 回到底部即恢复跟随（与旧 TUI 的 Down/PageDown 语义一致）
+    // 回到底部即恢复跟随（`↓` / `PageDown` / `End` 共用这一条）
     app.follow = next == 0;
 }
 
@@ -361,16 +373,6 @@ fn submit(app: &mut App, requests: &Sender<Request>, boundaries: &Sender<Boundar
 fn set_input(app: &mut App, text: &str) {
     app.input.clear();
     app.input.insert_str(text);
-}
-
-/// `↑` 的取历史分支：只有「输入框为空或已在浏览态」且历史非空时才成立。
-///
-/// 返回 `None` = 不归历史，调用方照旧滚聊天。
-fn recall_prev(app: &mut App) -> Option<String> {
-    if !app.history.is_browsing() && !app.input.text.is_empty() {
-        return None;
-    }
-    app.history.prev(&app.input.text)
 }
 
 /// 分派一个**已解析**的 [`Action`]。
@@ -921,8 +923,14 @@ mod tests {
         assert_eq!(
             a.transcript
                 .last()
-                .map(|l| matches!(l, TranscriptLine::User(_))),
+                .map(|l| matches!(l, TranscriptLine::System(s) if s.contains("已插话"))),
             Some(true),
+            "用户行之后须紧跟一条系统行：区分「已送达」与「模型尚未看到」"
+        );
+        assert!(
+            a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::User(t) if t.contains("还有个小问题"))),
             "必须本地立即回显（否则要等到下一个轮边界才可见）"
         );
     }
@@ -1404,8 +1412,10 @@ mod tests {
         assert_eq!(a.input.cursor, 3, "End 不动输入光标");
     }
 
-    /// 多行输入：光标上下移动**不属于**输入（那是聊天滚动），
+    /// 多行输入：光标上下移动**不属于**输入（那是聊天滚动/历史），
     /// 因此输入区只能靠 Home/Left 回到行首 —— 行为必须自洽。
+    ///
+    /// 本用例的历史为空，故 `↑` 回落成滚动，输入框不受影响。
     #[test]
     fn test_up_down_do_not_touch_input_cursor() {
         let ch = channels();
@@ -1425,15 +1435,14 @@ mod tests {
             120,
             40,
         );
-        assert_eq!(a.input.cursor, before, "上下键只滚聊天");
+        assert_eq!(a.input.cursor, before, "上下键不动输入光标");
     }
 
-    /// 既有测试的补充：`End` 之后 `Left` 仍作用于输入 —— 两个键不互相串味。
     /// `↑` / `↓` **取历史**：输入框空时 `↑` 拿回上一条提交，`↓` 一路上回到
     /// 「进入浏览前的草稿」并退出浏览态；之后上下键又回到聊天滚动。
     ///
-    /// 变异：① 去掉 `recall_prev` 的「输入框为空」判据 ⇒ 写着的字被吃掉，第二条断言红；
-    /// ② 去掉 `next()` 的草稿还原 ⇒ 草稿断言红；③ `record` 不退出浏览态 ⇒ 第三条断言红。
+    /// 变异：① `prev` 的 `None` 分支不存草稿 ⇒ 草稿断言红；
+    /// ② 去掉 `next()` 的草稿还原 ⇒ 草稿断言红；③ `record` 不退出浏览态 ⇒ 重取断言红。
     #[test]
     fn test_up_down_recall_submitted_history_then_restore_draft() {
         let ch = channels();
@@ -1464,7 +1473,7 @@ mod tests {
         assert_eq!(a.input.cursor, 3, "光标到末尾");
         assert_eq!(a.scroll_offset, 0, "取历史不带动聊天");
 
-        // 继续 ↑ ⇒ 更旧一条（此时输入框非空，但已在浏览态，仍归历史）。
+        // 继续 ↑ ⇒ 更旧一条（输入框此刻非空，照样归历史）。
         handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
         assert_eq!(a.input.text, "第一条");
         // 到头部再 ↑：停在原地，仍不滚动。
@@ -1504,26 +1513,29 @@ mod tests {
         );
         assert_eq!(a.scroll_offset, 0, "已在底部，↓ 不再往下");
         handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
-        assert_eq!(a.input.text, "第二条", "输入框空 ⇒ ↑ 又取历史（先于滚动）");
+        assert_eq!(a.input.text, "第二条", "历史非空 ⇒ ↑ 又取历史（先于滚动）");
     }
 
-    /// 输入框里有字时 `↑` / `↓` **仍是聊天滚动** —— 历史不得抢走「边写边翻看」。
+    /// 输入框里有字时 `↑` **照样取历史**（readline 语义）：首次按下先把输入框现有
+    /// 内容存成草稿，`↓` 越过最新一条即把它还回来。
+    ///
+    /// 变异：恢复「输入框非空则 `↑` 只滚聊天」的闸门 ⇒ 前两条断言红
+    /// （输入框仍是「正在写」、`scroll_offset` 变成 1）。
     #[test]
-    fn test_up_down_still_scroll_when_input_has_text() {
+    fn test_up_recalls_history_even_when_input_has_text() {
         let ch = channels();
         let mut a = app();
         for i in 0..80 {
             a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
         }
         a.input.insert_str("正在写");
-        a.input.insert_str("\n第二行");
-        let cursor = a.input.cursor;
         a.history.record("旧的一次提交");
 
         handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
-        assert_eq!(a.scroll_offset, 1, "输入框有字 ⇒ 滚聊天");
-        assert_eq!(a.input.text, "正在写\n第二行", "输入不被历史覆盖");
-        assert_eq!(a.input.cursor, cursor);
+        assert_eq!(a.input.text, "旧的一次提交", "输入框有字也取历史");
+        assert_eq!(a.input.cursor, 6, "回填后光标落到末尾");
+        assert_eq!(a.scroll_offset, 0, "取历史不带动聊天");
+        assert!(a.history.is_browsing());
 
         handle_key(
             press(KeyCode::Down),
@@ -1533,7 +1545,47 @@ mod tests {
             120,
             40,
         );
-        assert_eq!(a.scroll_offset, 0, "回到贴底");
+        assert_eq!(a.input.text, "正在写", "越过最新一条 ⇒ 还原草稿");
+        assert_eq!(a.input.cursor, 3);
+        assert!(!a.history.is_browsing(), "还原草稿同时退出浏览态");
+        assert_eq!(a.scroll_offset, 0, "还原草稿那一下不再多滚一次");
+    }
+
+    /// `↑↓` 归历史之后，聊天滚动仍有 `PageUp` / `PageDown` 这个入口。
+    ///
+    /// 变异：删掉 `PageUp` 分支（或让它改去取历史）⇒ 滚动断言红。
+    #[test]
+    fn test_page_up_down_still_scroll_when_history_takes_arrows() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.history.record("旧的一次提交");
+        assert_eq!(a.scroll_offset, 0);
+
+        handle_key(
+            press(KeyCode::PageUp),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.scroll_offset > 0, "PageUp 仍归聊天滚动");
+        assert!(!a.follow, "向上滚即脱离跟随");
+        assert!(a.input.text.is_empty(), "PageUp 不碰输入框");
+        assert!(!a.history.is_browsing(), "PageUp 不进入浏览态");
+
+        handle_key(
+            press(KeyCode::PageDown),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "PageDown 回到贴底");
         assert!(a.follow);
     }
 

@@ -49,6 +49,68 @@ fn tool_budget(tool: &dyn Tool, limits: &ys_component::RunLimits) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(limits.bash_timeout.unwrap_or(300)))
 }
 
+/// 轮边界拉取的**结果**。
+enum BoundaryDrain {
+    /// 没有待处理的边界消息。
+    Empty,
+    /// 至少取到一条 `Steer` / `Deferred` —— 已 append 进会话并发出对应事件。
+    /// `Abort` 在这里被消化成 `Cancelled` 收场（见 [`drain_boundary`]）。
+    Consumed,
+    /// 命中 `Abort`：调用方须以 `Cancelled` 收场。
+    Aborted,
+}
+
+/// 轮边界：拉取中途插话（steering）、后台结果（deferred）与中止（abort），保持入队顺序。
+///
+/// 不增 rounds、不改 turn —— `Steer` 是轮内的额外输入，不是新一轮。
+///
+/// **收场前也要调用**：模型给出**最终答复**（无工具调用）那条路不经过下一轮，
+/// 若不在收场前拉一次，这段窗口内到达的 `Steer` / `Deferred` 会随边界源一起销毁 ——
+/// 用户在模型正要收尾时插的话会**静默消失**。故收场前补一次拉取，
+/// 取到 `Steer` 就**继续本轮循环**（模型下一轮就能看到它），让「轮边界总是存在」
+/// 成为真的不变量，而不是「下一轮才有边界」。
+///
+/// `Abort` 在这里被消化成 `Cancelled` 收场（调用方据 [`BoundaryDrain::Aborted`] 收尾）。
+async fn drain_boundary(ctx: &mut RuntimeContext<'_>) -> Result<BoundaryDrain, LoopError> {
+    let Some(boundary) = ctx.boundary.as_ref() else {
+        return Ok(BoundaryDrain::Empty);
+    };
+    let mut consumed = false;
+    while let Some(bnd) = boundary.take() {
+        match bnd {
+            Boundary::Steer(msg) => {
+                ctx.session
+                    .append(msg.clone())
+                    .await
+                    .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                emit(ctx.events, AgentEvent::UserMessage { message: msg })
+                    .await
+                    .map_err(LoopError::Event)?;
+                consumed = true;
+            }
+            // 后台子 agent 的结果：与 `Steer` **同一条处理路径**（append + 进本轮
+            // `ModelRequest`），只换成 `DeferredResult` 事件 ⇒ UI 才不会把它
+            // 画成「用户说的话」。
+            Boundary::Deferred { handle, message } => {
+                ctx.session
+                    .append(message.clone())
+                    .await
+                    .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+                emit(ctx.events, AgentEvent::DeferredResult { handle, message })
+                    .await
+                    .map_err(LoopError::Event)?;
+                consumed = true;
+            }
+            Boundary::Abort => return Ok(BoundaryDrain::Aborted),
+        }
+    }
+    Ok(if consumed {
+        BoundaryDrain::Consumed
+    } else {
+        BoundaryDrain::Empty
+    })
+}
+
 /// Step 9b 的调度单元。
 ///
 /// - `Parallel` = 一段**连续**的并发安全工具（段内 `buffered(n)` 并发、**保序**）；
@@ -363,49 +425,25 @@ impl AgentLoop for BasicLoop {
             // 轮询）总是先行命中并提前返回，本分支几乎不可达；唯一窗口是 Step 4b
             // 上下文压缩 `await` 期间 Abort 才到达 —— 探针已过、消息刚到。保留它是
             // 为了在压缩耗时较长时不至于漏掉一次中止（宁可晚一轮，不可丢失）。
-            if let Some(boundary) = ctx.boundary.as_ref() {
-                while let Some(bnd) = boundary.take() {
-                    match bnd {
-                        Boundary::Steer(msg) => {
-                            ctx.session
-                                .append(msg.clone())
-                                .await
-                                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-                            emit(ctx.events, AgentEvent::UserMessage { message: msg })
-                                .await
-                                .map_err(LoopError::Event)?;
-                        }
-                        // 后台子 agent 的结果：与 `Steer` **同一条处理路径**（append + 进本轮
-                        // `ModelRequest`），只换成 `DeferredResult` 事件 ⇒ UI 才不会把它
-                        // 画成「用户说的话」。
-                        Boundary::Deferred { handle, message } => {
-                            ctx.session
-                                .append(message.clone())
-                                .await
-                                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-                            emit(ctx.events, AgentEvent::DeferredResult { handle, message })
-                                .await
-                                .map_err(LoopError::Event)?;
-                        }
-                        Boundary::Abort => {
-                            emit(
-                                ctx.events,
-                                AgentEvent::RunFinished {
-                                    stop_reason: StopReason::Cancelled,
-                                    usage: total_usage.clone(),
-                                    rounds,
-                                },
-                            )
-                            .await
-                            .map_err(LoopError::Event)?;
-                            return Ok(RunResult {
-                                stop_reason: StopReason::Cancelled,
-                                usage: total_usage,
-                                rounds,
-                                final_message: None,
-                            });
-                        }
-                    }
+            match drain_boundary(ctx).await? {
+                BoundaryDrain::Empty | BoundaryDrain::Consumed => {}
+                BoundaryDrain::Aborted => {
+                    emit(
+                        ctx.events,
+                        AgentEvent::RunFinished {
+                            stop_reason: StopReason::Cancelled,
+                            usage: total_usage.clone(),
+                            rounds,
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                    return Ok(RunResult {
+                        stop_reason: StopReason::Cancelled,
+                        usage: total_usage,
+                        rounds,
+                        final_message: None,
+                    });
                 }
             }
 
@@ -564,6 +602,32 @@ impl AgentLoop for BasicLoop {
                     }
 
                     // 续写一次仍被截断：诚实收场，**不得**伪装成 Completed（那是静默的谎）。
+                    //
+                    // **收场前也要拉一次轮边界** —— 与下面的正常收场路径同理由：
+                    // 这段窗口内到达的插话不能随边界源一起销毁。
+                    match drain_boundary(ctx).await? {
+                        BoundaryDrain::Empty => {}
+                        // 取到插话 ⇒ 先把它交给模型看（模型还没说完，这正是它该看到的东西）。
+                        BoundaryDrain::Consumed => continue,
+                        BoundaryDrain::Aborted => {
+                            emit(
+                                ctx.events,
+                                AgentEvent::RunFinished {
+                                    stop_reason: StopReason::Cancelled,
+                                    usage: total_usage.clone(),
+                                    rounds,
+                                },
+                            )
+                            .await
+                            .map_err(LoopError::Event)?;
+                            return Ok(RunResult {
+                                stop_reason: StopReason::Cancelled,
+                                usage: total_usage,
+                                rounds,
+                                final_message: None,
+                            });
+                        }
+                    }
                     let final_msg = if text_content.is_empty() {
                         None
                     } else {
@@ -665,6 +729,38 @@ impl AgentLoop for BasicLoop {
                         .await
                         .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
                     continue;
+                }
+
+                // **收场前再拉一次轮边界** —— 这是「轮边界总是存在」这条不变量成立的地方。
+                //
+                // 没有这一步，模型在**给出最终答复**这段窗口里到达的 `Steer` / `Deferred`
+                // 会随本回合的边界源一起销毁 ⇒ 用户在模型正要收尾时插的话**静默消失**，
+                // 且下一个回合也不会带上（那层兼底只排 UI→app 信道，盖不到已 pump 进
+                // 边界源的消息）。
+                //
+                // 取到插话就**继续本轮循环**：模型下一轮就能看到它，用户不必等整个回合结束。
+                match drain_boundary(ctx).await? {
+                    BoundaryDrain::Empty => {}
+                    // 有插话/后台结果 ⇒ 继续本轮，让模型接着看得到它。
+                    BoundaryDrain::Consumed => continue,
+                    BoundaryDrain::Aborted => {
+                        emit(
+                            ctx.events,
+                            AgentEvent::RunFinished {
+                                stop_reason: StopReason::Cancelled,
+                                usage: total_usage.clone(),
+                                rounds,
+                            },
+                        )
+                        .await
+                        .map_err(LoopError::Event)?;
+                        return Ok(RunResult {
+                            stop_reason: StopReason::Cancelled,
+                            usage: total_usage,
+                            rounds,
+                            final_message: None,
+                        });
+                    }
                 }
 
                 let stop_reason = if empty_output {
@@ -3675,6 +3771,187 @@ mod tests {
                 "终局事件的 stop_reason 必须同值（payload={payload:?}）"
             );
         }
+    }
+
+    // ==================== 收场前的轮边界拉取 ====================
+
+    /// 在**模型调用期间**往边界源投一条 `Steer` 的替身 model。
+    ///
+    /// 第一次 `complete` 调用时把 `Steer` 推进边界源（模拟「用户在模型正要收尾时插话」），
+    /// 之后回**纯文本**（无工具调用）⇒ 走 `tool_calls.is_empty()` 那条**收场**路径。
+    struct SteerDuringFinalModel {
+        boundary: Arc<ys_protocol::QueueBoundarySource>,
+        steer_text: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Model for SteerDuringFinalModel {
+        fn model_id(&self) -> &str {
+            "steer-during-final"
+        }
+
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // 模型**正在生成最终答复**时，用户插话。
+                self.boundary.push(Boundary::Steer(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: self.steer_text.clone(),
+                    }],
+                }));
+            }
+            Ok(ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "final answer".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// **收场前必须拉一次轮边界** —— 否则「模型正要收尾时到达的插话」会**静默消失**。
+    ///
+    /// 故障形态：模型直接给最终答复（无工具调用）那条路**不经过下一轮**，
+    /// 若不在收场前拉一次边界源，这段窗口内到达的 `Steer` 会随边界源一起销毁 ——
+    /// 用户插的话既不生效、下一回合也不会带上（那层兜底只排 UI→app 信道，
+    /// 盖不到已 pump 进边界源的消息）。
+    ///
+    /// 本用例钉住三件事：
+    /// ① 插话**进了会话**（没被销毁）；
+    /// ② 回合**继续跑了一轮**（`rounds == 2`）⇒ 模型下一轮就能看到它；
+    /// ③ 插话出现在**第二轮**的模型请求里。
+    ///
+    /// 变异：把收场前的 `drain_boundary(ctx).await?` 整段删掉 ⇒
+    /// ①「会话里有插话」与 ③「第二轮请求含插话」两条断言同时变红。
+    #[tokio::test]
+    async fn steer_arriving_during_final_answer_is_not_lost() {
+        const MARKER: &str = "STEER-DURING-FINAL";
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
+        let model = SteerDuringFinalModel {
+            boundary: boundary.clone(),
+            steer_text: MARKER.to_string(),
+            calls: AtomicUsize::new(0),
+        };
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            )
+            .with_boundary(boundary.clone());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|m| content_has_text(m, MARKER)),
+            "插话必须进了会话（不能随边界源一起销毁）：{:?}",
+            session.messages()
+        );
+        assert_eq!(
+            result.rounds, 2,
+            "取到插话就继续本轮 ⇒ 模型下一轮就能看到它（不能一轮就收场）"
+        );
+        assert!(
+            events.events().iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessage { message }
+                    if content_has_text(message, MARKER)
+            )),
+            "插话必须发出 UserMessage 事件（UI 靠它把本地行标为已生效）：{:?}",
+            events.events()
+        );
+    }
+
+    /// 收场前的边界拉取遇到 `Abort` ⇒ 回合以 `Cancelled` 收场（不是 `Completed`）。
+    ///
+    /// 变异：把收场前分支里的 `BoundaryDrain::Aborted` 当成 `Empty` 处理 ⇒
+    /// `stop_reason` 断言变红。
+    #[tokio::test]
+    async fn abort_arriving_during_final_answer_cancels_the_turn() {
+        struct AbortDuringFinalModel {
+            boundary: Arc<ys_protocol::QueueBoundarySource>,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Model for AbortDuringFinalModel {
+            fn model_id(&self) -> &str {
+                "abort-during-final"
+            }
+
+            async fn complete(
+                &self,
+                _request: ModelRequest,
+                _sink: &mut dyn ModelEventSink,
+            ) -> Result<ModelResponse, ModelError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    self.boundary.push(Boundary::Abort);
+                }
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "final answer".into(),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                })
+            }
+        }
+
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
+        let model = AbortDuringFinalModel {
+            boundary: boundary.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            )
+            .with_boundary(boundary.clone());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Cancelled,
+            "收场前命中 Abort ⇒ 必须以 Cancelled 收场（不能伪装成 Completed）"
+        );
     }
 
     // ==================== 空响应重试（第二批） ====================

@@ -4687,4 +4687,37 @@ mod tests {
             "回合末应记下「还有 1 个后台命令在跑」：{counts:?}"
         );
     }
+
+    /// **回合内插话在模型给出最终答复时也不丢**（app 层端到端）。
+    ///
+    /// 模型直接给最终答复（无工具调用）那条路不经过下一轮 ⇒ 插话必须被**收场前**的
+    /// 轮边界拉取接住，否则它随本回合的边界源一起销毁。
+    ///
+    /// 变异：把 `crates/ys-loop/src/basic.rs` 收场前的 `drain_boundary` 跳过 ⇒ 本用例红。
+    #[tokio::test]
+    async fn steer_during_final_answer_reaches_the_model() {
+        const MARKER: &str = "STEER-DURING-FINAL";
+        let (model, mut probe) = probe_model(ProbePlan::CompleteAtCalls(&[1]));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        // 等第 1 次 model 调用开始（此刻卡在 gate 上）。
+        probe.wait_entered(1).await;
+        // 模型正在生成最终答复时，用户插话。
+        h.boundaries
+            .send(Boundary::Steer(user_message(MARKER)))
+            .await
+            .unwrap();
+        probe.let_app_task_pump().await;
+        probe.release();
+
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let reqs = probe.requests();
+        assert!(
+            reqs.iter().any(|r| has_text(r, MARKER)),
+            "插话必须被模型看到（不能随边界源销毁）：{reqs:?}"
+        );
+    }
 }

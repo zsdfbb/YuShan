@@ -325,8 +325,7 @@ fn help_early_exit_creates_no_debug_files_with_default_debug_on() {
         debug_files.is_empty(),
         "help 早退不得建立 debug 文件：{debug_files:?}"
     );
-    let home_debug_files =
-        debug_jsonl_files(&roots.home.join(".yushan").join("logs"));
+    let home_debug_files = debug_jsonl_files(&roots.home.join(".yushan").join("logs"));
     assert!(
         home_debug_files.is_empty(),
         "help 早退不得绕过 Override 写进 HOME：{home_debug_files:?}"

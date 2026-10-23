@@ -353,7 +353,8 @@ mod tests {
             Request::NewSession
         );
         assert_eq!(
-            serde_json::from_value::<Request>(json!({ "SetModel": { "model": "gpt-4o" } })).unwrap(),
+            serde_json::from_value::<Request>(json!({ "SetModel": { "model": "gpt-4o" } }))
+                .unwrap(),
             Request::SetModel {
                 model: "gpt-4o".into(),
                 provider: None,
@@ -365,10 +366,8 @@ mod tests {
         );
         // `SetEffort` 是加法式新增，线格式同样为外部标签 + 小写档位拼写。
         assert_eq!(
-            serde_json::from_value::<Request>(
-                json!({ "SetEffort": { "effort": "xhigh" } })
-            )
-            .unwrap(),
+            serde_json::from_value::<Request>(json!({ "SetEffort": { "effort": "xhigh" } }))
+                .unwrap(),
             Request::SetEffort {
                 effort: Some(EffortLevel::XHigh),
             }

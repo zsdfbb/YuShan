@@ -138,14 +138,14 @@ pub fn resolve_prompt(
         // provider 后再送进协议：app 侧因此**不必**从模型名猜归属（猜会猜错：
         // 两个 provider 的目录里可能有逐字同名的 id）。
         PromptKind::PickModel => {
-            let labels: Vec<String> = view.available_models.iter().map(ModelEntry::label).collect();
-            let picked = prompter.select("Select model", labels.clone(), PROMPT_PAGE_SIZE)?;
-            // 反解不出 ⇒ 视图在问答期间变了这类不可能情形：当作取消，什么都不改。
-            let Some(entry) = view
+            let labels: Vec<String> = view
                 .available_models
                 .iter()
-                .find(|e| e.label() == picked)
-            else {
+                .map(ModelEntry::label)
+                .collect();
+            let picked = prompter.select("Select model", labels.clone(), PROMPT_PAGE_SIZE)?;
+            // 反解不出 ⇒ 视图在问答期间变了这类不可能情形：当作取消，什么都不改。
+            let Some(entry) = view.available_models.iter().find(|e| e.label() == picked) else {
                 return Err(PromptError::Cancelled);
             };
             if entry.model.trim().is_empty() {
@@ -265,10 +265,7 @@ fn session_label(summary: &SessionSummary, now: SystemTime, is_current: bool) ->
 
 /// mtime → 相对时间的中文短语（**显示用**，未来时间按「刚刚」处理）。
 fn relative_time(mtime: SystemTime, now: SystemTime) -> String {
-    let secs = now
-        .duration_since(mtime)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
     match secs {
         0..=59 => "刚刚".to_string(),
         60..=3_599 => format!("{} 分钟前", secs / 60),
@@ -783,8 +780,8 @@ mod tests {
         let label_b = session_label(&sessions[1], now, false);
         let p = FakePrompter::with_answers(vec![Ok(label_b)]);
 
-        let outcome = resolve_session_pick_at(&p, &sessions, None, now)
-            .expect("选中一个会话应产出请求");
+        let outcome =
+            resolve_session_pick_at(&p, &sessions, None, now).expect("选中一个会话应产出请求");
         assert_eq!(
             outcome,
             PromptOutcome::Request(Request::ResumeSession {
@@ -880,6 +877,9 @@ mod tests {
         assert_eq!(at(3_600), "1 小时前");
         assert_eq!(at(90_000), "1 天前");
         // 未来时间（时钟回拨）按「刚刚」，不 panic、不出负数
-        assert_eq!(relative_time(UNIX_EPOCH + Duration::from_secs(100), UNIX_EPOCH), "刚刚");
+        assert_eq!(
+            relative_time(UNIX_EPOCH + Duration::from_secs(100), UNIX_EPOCH),
+            "刚刚"
+        );
     }
 }

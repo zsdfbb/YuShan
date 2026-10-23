@@ -272,16 +272,11 @@ fn parse_debug_text(text: &str) -> Option<Reading> {
                         .saturating_add(json_u128(&value, "backoff_ms").unwrap_or(0));
                 }
             }
-            Some("round_usage")
-                if value.get("purpose").and_then(Value::as_str) == Some("turn") =>
-            {
+            Some("round_usage") if value.get("purpose").and_then(Value::as_str) == Some("turn") => {
                 let input = json_u128(&value, "gen_ai.usage.input_tokens").unwrap_or(0);
-                let hit =
-                    json_u128(&value, "gen_ai.usage.cache_read.input_tokens").unwrap_or(0);
+                let hit = json_u128(&value, "gen_ai.usage.cache_read.input_tokens").unwrap_or(0);
                 reading.cache_hit = reading.cache_hit.saturating_add(hit);
-                reading.cache_miss = reading
-                    .cache_miss
-                    .saturating_add(input.saturating_sub(hit));
+                reading.cache_miss = reading.cache_miss.saturating_add(input.saturating_sub(hit));
             }
             Some("run_end") => return saw_round.then_some(reading),
             _ => {}
@@ -355,8 +350,12 @@ fn run_once(
         // base 覆盖（协议面 A/B）：`YUSHAN_BENCH_BASE` 未设置 ⇒ 不动继承的 base。
         .envs(base_override())
         .stdin(Stdio::null())
-        .stdout(Stdio::from(std::fs::File::create(run_dir.join("stdout.txt")).ok()?))
-        .stderr(Stdio::from(std::fs::File::create(run_dir.join("stderr.txt")).ok()?))
+        .stdout(Stdio::from(
+            std::fs::File::create(run_dir.join("stdout.txt")).ok()?,
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(run_dir.join("stderr.txt")).ok()?,
+        ))
         .spawn()
         .ok()?;
     let pid = child.id();
@@ -743,7 +742,20 @@ fn summary_header() -> String {
 
 /// 汇总表的一行。
 fn summary_row(row: &Summary, protocol: Protocol) -> String {
-    let (name, wall, rounds, ttft, gen_ms, tools, attempts, retries, retry_wait, hit, miss, quality) = row;
+    let (
+        name,
+        wall,
+        rounds,
+        ttft,
+        gen_ms,
+        tools,
+        attempts,
+        retries,
+        retry_wait,
+        hit,
+        miss,
+        quality,
+    ) = row;
     format!(
         "{name:<10} {proto_label:<9} {:>8} {rounds:>5} {ttft:>10} {gen_ms:>10} {tools:>10} {qual_label:>4} {attempts:>9} {retries:>8} {retry_wait:>12} {:>7}",
         secs(*wall),
@@ -1164,7 +1176,10 @@ fn quality_bit_checks_evidence_against_the_workspace() {
     let good = "见 docs/a.md:2 与 crates/demo/src/lib.rs:3";
     assert_eq!(quality_of(good, &root, Some(&spec)), Quality::Pass);
     // 引用数不足 ⇒ 不过
-    assert_eq!(quality_of("见 docs/a.md:2", &root, Some(&spec)), Quality::Fail);
+    assert_eq!(
+        quality_of("见 docs/a.md:2", &root, Some(&spec)),
+        Quality::Fail
+    );
     // 引用指向不存在的行 ⇒ 部分过
     assert_eq!(
         quality_of(

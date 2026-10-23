@@ -100,8 +100,7 @@ mod tests {
     /// 旧 JSON（无该键）反序列化为 `None`。
     #[test]
     fn reasoning_tokens_deserialize_missing_key() {
-        let usage: Usage =
-            serde_json::from_str(r#"{"input_tokens":1,"output_tokens":2}"#).unwrap();
+        let usage: Usage = serde_json::from_str(r#"{"input_tokens":1,"output_tokens":2}"#).unwrap();
         assert_eq!(usage.reasoning_tokens, None);
     }
 

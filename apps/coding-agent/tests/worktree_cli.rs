@@ -236,7 +236,12 @@ fn git(dir: &Path, args: &[&str]) -> Output {
     Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["-c", "user.name=ys-test", "-c", "user.email=ys-test@example.com"])
+        .args([
+            "-c",
+            "user.name=ys-test",
+            "-c",
+            "user.email=ys-test@example.com",
+        ])
         .args(args)
         .output()
         .expect("spawn git（测试环境应装有 git）")
@@ -266,7 +271,11 @@ fn init_repo(dir: &Path) {
 fn create(sb: &Sandbox, name: &str) -> (PathBuf, String) {
     let out = run(sb, &sb.repo, &["worktree", "create", name]);
     let (_, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "create {name} 应成功；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "create {name} 应成功；stderr:\n{stderr}"
+    );
     (created_path(&stderr), stderr)
 }
 
@@ -293,12 +302,19 @@ fn n1_create_makes_worktree_and_branch() {
     let out = run(&sb, &sb.repo, &["worktree", "create", "feat"]);
     let (stdout, stderr) = streams(&out);
 
-    assert_eq!(out.status.code(), Some(0), "create 应 exit(0)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "create 应 exit(0)；stderr:\n{stderr}"
+    );
     assert!(
         stdout.is_empty(),
         "create 的输出属于诊断，应全走 stderr；stdout:\n{stdout:?}"
     );
-    assert!(stderr.contains("worktree: feat"), "stderr 应含 `worktree: feat`：\n{stderr}");
+    assert!(
+        stderr.contains("worktree: feat"),
+        "stderr 应含 `worktree: feat`：\n{stderr}"
+    );
 
     let tree = created_path(&stderr);
     assert!(tree.is_dir(), "打印的树路径应是目录：{tree:?}");
@@ -315,7 +331,10 @@ fn n1_create_makes_worktree_and_branch() {
         .lines()
         .filter_map(|l| l.strip_prefix("worktree "))
         .any(|p| canonical(Path::new(p.trim())) == want);
-    assert!(found, "git worktree list 应含新树路径 {want:?}；实际：\n{listed}");
+    assert!(
+        found,
+        "git worktree list 应含新树路径 {want:?}；实际：\n{listed}"
+    );
 
     let branch = git(&sb.repo, &["branch", "--list", "worktree-feat"]);
     assert!(
@@ -341,7 +360,11 @@ fn n2_create_without_name_autonames_uniquely() {
     for _ in 0..2 {
         let out = run(&sb, &sb.repo, &["worktree", "create"]);
         let (_, stderr) = streams(&out);
-        assert_eq!(out.status.code(), Some(0), "自动命名 create 应成功；stderr:\n{stderr}");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "自动命名 create 应成功；stderr:\n{stderr}"
+        );
         let name = created_name(&stderr);
         assert!(!name.is_empty(), "自动命名不应为空：\n{stderr}");
         let path = created_path(&stderr);
@@ -366,7 +389,11 @@ fn n3_create_outside_repo_hard_fails() {
     let out = run(&sb, &sb.plain, &["worktree", "create", "x"]);
     let (stdout, stderr) = streams(&out);
 
-    assert_ne!(out.status.code(), Some(0), "非 git 目录应硬失败；stderr:\n{stderr}");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "非 git 目录应硬失败；stderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("NotARepo"),
         "stderr 应给出明确原因（NotARepo）：\n{stderr}"
@@ -388,7 +415,11 @@ fn n4_invalid_names_rejected_without_side_effects() {
     for bad in ["../evil", "a/b"] {
         let out = run(&sb, &sb.repo, &["worktree", "create", bad]);
         let (_, stderr) = streams(&out);
-        assert_ne!(out.status.code(), Some(0), "非法名 `{bad}` 应失败；stderr:\n{stderr}");
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "非法名 `{bad}` 应失败；stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains("InvalidName"),
             "非法名 `{bad}` 的 stderr 应含 `InvalidName`：\n{stderr}"
@@ -413,15 +444,26 @@ fn n5_list_shows_names_and_paths_and_empty_repo_is_ok() {
     // 空仓：退出码 0、stdout 为空（仓库头走 stderr）。
     let empty = run(&sb, &sb.repo, &["worktree", "list"]);
     let (empty_out, empty_err) = streams(&empty);
-    assert_eq!(empty.status.code(), Some(0), "空仓 list 应 exit(0)；stderr:\n{empty_err}");
-    assert!(empty_out.is_empty(), "空仓 list 的 stdout 应为空：{empty_out:?}");
+    assert_eq!(
+        empty.status.code(),
+        Some(0),
+        "空仓 list 应 exit(0)；stderr:\n{empty_err}"
+    );
+    assert!(
+        empty_out.is_empty(),
+        "空仓 list 的 stdout 应为空：{empty_out:?}"
+    );
 
     let (feat_path, _) = create(&sb, "feat");
     let (bug_path, _) = create(&sb, "bug");
 
     let out = run(&sb, &sb.repo, &["worktree", "list"]);
     let (stdout, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "list 应 exit(0)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "list 应 exit(0)；stderr:\n{stderr}"
+    );
 
     for name in ["feat", "bug"] {
         assert!(
@@ -432,7 +474,10 @@ fn n5_list_shows_names_and_paths_and_empty_repo_is_ok() {
     for path in [&feat_path, &bug_path] {
         let want = canonical(path);
         let want = want.to_str().unwrap();
-        assert!(stdout.contains(want), "list 的 stdout 应含路径 {want:?}：\n{stdout}");
+        assert!(
+            stdout.contains(want),
+            "list 的 stdout 应含路径 {want:?}：\n{stdout}"
+        );
     }
 }
 
@@ -507,7 +552,11 @@ fn n6_remove_refuses_dirty_and_keeps_branch() {
 
     let clean = run(&sb, &sb.repo, &["worktree", "remove", "feat"]);
     let (_, clean_err) = streams(&clean);
-    assert_eq!(clean.status.code(), Some(0), "干净树 remove 应 exit(0)；stderr:\n{clean_err}");
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "干净树 remove 应 exit(0)；stderr:\n{clean_err}"
+    );
     assert!(!tree.exists(), "remove 后树目录应消失：{tree:?}");
 
     let branch = git(&sb.repo, &["branch", "--list", "worktree-feat"]);
@@ -599,12 +648,20 @@ fn n8_attach_degrades_without_panicking() {
         "树不存在应打降级警告；stderr:\n{m_err}"
     );
     assert!(!m_err.contains("panicked"), "降级不得 panic：\n{m_err}");
-    assert_ne!(missing.status.code(), Some(101), "降级不得以 panic 收场：\n{m_err}");
+    assert_ne!(
+        missing.status.code(),
+        Some(101),
+        "降级不得以 panic 收场：\n{m_err}"
+    );
     assert!(
         m_err.contains("No model configured"),
         "降级后应继续走到启动路径（无凭证 ⇒ 早退）；stderr:\n{m_err}"
     );
-    assert_eq!(missing.status.code(), Some(1), "无凭证早退应为 exit(1)；stderr:\n{m_err}");
+    assert_eq!(
+        missing.status.code(),
+        Some(1),
+        "无凭证早退应为 exit(1)；stderr:\n{m_err}"
+    );
 
     // 情形二：在**非 git** 目录 attach。
     let nongit = run(&sb, &sb.plain, &["worktree", "attach", "ghost", "-p", "hi"]);
@@ -614,8 +671,16 @@ fn n8_attach_degrades_without_panicking() {
         "非 git 目录应打降级警告；stderr:\n{n_err}"
     );
     assert!(!n_err.contains("panicked"), "降级不得 panic：\n{n_err}");
-    assert_ne!(nongit.status.code(), Some(101), "降级不得以 panic 收场：\n{n_err}");
-    assert_eq!(nongit.status.code(), Some(1), "无凭证早退应为 exit(1)；stderr:\n{n_err}");
+    assert_ne!(
+        nongit.status.code(),
+        Some(101),
+        "降级不得以 panic 收场：\n{n_err}"
+    );
+    assert_eq!(
+        nongit.status.code(),
+        Some(1),
+        "无凭证早退应为 exit(1)；stderr:\n{n_err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -635,8 +700,8 @@ struct SseServer {
 
 impl SseServer {
     fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind 回环 SSE mock（沙箱可能禁止 bind）");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind 回环 SSE mock（沙箱可能禁止 bind）");
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
@@ -761,9 +826,19 @@ fn n9_exit_lines_report_worktree_only_when_attached() {
         .env("YUSHAN_MODEL", "mock-model");
     let out = run_cmd(cmd, &["worktree", "attach", "feat", "-p", "hi"]);
     let (stdout, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "成功回合应 exit(0)；stderr:\n{stderr}");
-    assert!(stdout.contains("hi"), "stdout 应为模型文本；stdout:\n{stdout:?}");
-    assert!(stderr.contains("session: "), "stderr 应含 `session: <id>`：\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "成功回合应 exit(0)；stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hi"),
+        "stdout 应为模型文本；stdout:\n{stdout:?}"
+    );
+    assert!(
+        stderr.contains("session: "),
+        "stderr 应含 `session: <id>`：\n{stderr}"
+    );
     assert!(
         stderr.contains("worktree: feat"),
         "worktree 会话的 stderr 应含 `worktree: feat`：\n{stderr}"
@@ -777,8 +852,15 @@ fn n9_exit_lines_report_worktree_only_when_attached() {
         .env("YUSHAN_MODEL", "mock-model");
     let out = run_cmd(cmd, &["-p", "hi"]);
     let (_, plain_err) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "成功回合应 exit(0)；stderr:\n{plain_err}");
-    assert!(plain_err.contains("session: "), "stderr 应含 `session: <id>`：\n{plain_err}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "成功回合应 exit(0)；stderr:\n{plain_err}"
+    );
+    assert!(
+        plain_err.contains("session: "),
+        "stderr 应含 `session: <id>`：\n{plain_err}"
+    );
     assert!(
         !plain_err.contains("worktree: "),
         "非 worktree 会话**不得**打 `worktree:` 行：\n{plain_err}"
@@ -807,12 +889,19 @@ fn attach_warns_when_main_repo_has_project_config_only() {
 
     let out = run(&sb, &sb.repo, &["worktree", "attach", "feat", "-p", "hi"]);
     let (_, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(1), "无凭证应早退 exit(1)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "无凭证应早退 exit(1)；stderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("本会话中不可见"),
         "主仓有 `.yushan/` 时 attach 应打缺失警告；stderr:\n{stderr}"
     );
-    assert!(!stderr.contains("panicked"), "警告路径不得 panic：\n{stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "警告路径不得 panic：\n{stderr}"
+    );
 
     // 情形二：主仓无 `.yushan/` ⇒ 不打。
     let sb2 = Sandbox::new("attach_cfg_no");
@@ -821,7 +910,11 @@ fn attach_warns_when_main_repo_has_project_config_only() {
 
     let out = run(&sb2, &sb2.repo, &["worktree", "attach", "feat", "-p", "hi"]);
     let (_, stderr2) = streams(&out);
-    assert_eq!(out.status.code(), Some(1), "无凭证应早退 exit(1)；stderr:\n{stderr2}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "无凭证应早退 exit(1)；stderr:\n{stderr2}"
+    );
     assert!(
         !stderr2.contains("本会话中不可见"),
         "主仓无 `.yushan/` 时**不得**打缺失警告；stderr:\n{stderr2}"
@@ -894,7 +987,11 @@ fn u3_resume_restores_recorded_worktree() {
     with_mock(&mut cmd, &api_base);
     let out = run_cmd(cmd, &["-p", "--resume", &id, "hi"]);
     let (_, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "恢复回合应 exit(0)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "恢复回合应 exit(0)；stderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("已恢复到工作树：feat"),
         "应告知恢复到工作树：\n{stderr}"
@@ -926,7 +1023,11 @@ fn u3_resume_reports_missing_recorded_worktree() {
     let out = run_cmd(cmd, &["-p", "--resume", &id, "hi"]);
     let (_, stderr) = streams(&out);
     assert!(!stderr.contains("panicked"), "缺失树不得 panic：\n{stderr}");
-    assert_ne!(out.status.code(), Some(101), "缺失树不得以 panic 收场：\n{stderr}");
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "缺失树不得以 panic 收场：\n{stderr}"
+    );
     assert!(
         stderr.contains("记录的工作树已不存在"),
         "应告知记录的工作树已不存在：\n{stderr}"
@@ -954,9 +1055,16 @@ fn u3_explicit_attach_wins_over_recorded_worktree() {
     let mut cmd = command(&sb, &sb.repo);
     cmd.args(["worktree", "attach", "bug", "-p", "--resume", &id, "hi"]);
     with_mock(&mut cmd, &api_base);
-    let out = run_cmd(cmd, &["worktree", "attach", "bug", "-p", "--resume", &id, "hi"]);
+    let out = run_cmd(
+        cmd,
+        &["worktree", "attach", "bug", "-p", "--resume", &id, "hi"],
+    );
     let (_, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "成功回合应 exit(0)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "成功回合应 exit(0)；stderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("已按显式 attach 使用"),
         "显式 attach 与记录不同时应说明：\n{stderr}"
@@ -1046,7 +1154,11 @@ fn main_repo_is_resolved_from_inside_linked_worktree() {
     // 在树内跑 list。
     let out = run(&sb, &tree, &["worktree", "list"]);
     let (stdout, stderr) = streams(&out);
-    assert_eq!(out.status.code(), Some(0), "树内 list 应 exit(0)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "树内 list 应 exit(0)；stderr:\n{stderr}"
+    );
 
     let main = canonical(&sb.repo);
     assert!(
@@ -1100,7 +1212,11 @@ fn no_arg_attach_reports_zero_and_two_candidates() {
         zero_err.contains("还没有工作树") && zero_err.contains("worktree create"),
         "0 棵时应提示先 `worktree create`：\n{zero_err}"
     );
-    assert_eq!(zero.status.code(), Some(1), "无凭证应早退 exit(1)：\n{zero_err}");
+    assert_eq!(
+        zero.status.code(),
+        Some(1),
+        "无凭证应早退 exit(1)：\n{zero_err}"
+    );
 
     // 2 棵：列出两个候选（名字 + 路径）。
     let (feat, _) = create(&sb, "feat");
@@ -1116,10 +1232,7 @@ fn no_arg_attach_reports_zero_and_two_candidates() {
         "应说明候选数量：\n{two_err}"
     );
     for (name, path) in [("feat", &feat), ("bug", &bug)] {
-        assert!(
-            two_err.contains(name),
-            "候选应含名字 `{name}`：\n{two_err}"
-        );
+        assert!(two_err.contains(name), "候选应含名字 `{name}`：\n{two_err}");
         let p = canonical(path);
         assert!(
             two_err.contains(p.to_str().unwrap()),
@@ -1127,5 +1240,9 @@ fn no_arg_attach_reports_zero_and_two_candidates() {
             p.display()
         );
     }
-    assert_eq!(two.status.code(), Some(1), "无凭证应早退 exit(1)：\n{two_err}");
+    assert_eq!(
+        two.status.code(),
+        Some(1),
+        "无凭证应早退 exit(1)：\n{two_err}"
+    );
 }

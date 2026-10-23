@@ -241,10 +241,7 @@ mod tests {
     fn test_agent_event_round_started_serde_roundtrip() {
         let started = AgentEvent::RoundStarted { round: 7 };
         let json = serde_json::to_string(&started).unwrap();
-        assert!(
-            json.contains("round"),
-            "字段名是对外契约，不得改名：{json}"
-        );
+        assert!(json.contains("round"), "字段名是对外契约，不得改名：{json}");
         let back: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(started, back);
     }

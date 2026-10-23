@@ -349,7 +349,11 @@ fn resume_continues_target_session_and_replays_history() {
     );
     let (stdout, stderr) = streams(&out);
 
-    assert_eq!(out.status.code(), Some(0), "成功回合应 exit(0)；stderr:\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "成功回合应 exit(0)；stderr:\n{stderr}"
+    );
     assert_eq!(
         stdout.trim(),
         "ok",
@@ -376,7 +380,10 @@ fn resume_continues_target_session_and_replays_history() {
     // 续写**同一文件**：新消息 append 进目标文件、历史不丢。
     let path = roots.sessions_dir.join(format!("{id}.jsonl"));
     let content = std::fs::read_to_string(&path).unwrap();
-    assert!(content.contains(new_task), "新消息应写进目标会话文件：{content}");
+    assert!(
+        content.contains(new_task),
+        "新消息应写进目标会话文件：{content}"
+    );
     assert!(content.contains(hist), "恢复的历史不得丢失：{content}");
 
     // 不新建会话文件 —— 仍是同一个目标文件。

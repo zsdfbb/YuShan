@@ -94,7 +94,10 @@ mod tests {
         // 新首行：带 `workspace` 键 ⇒ Some。
         let with = r#"{"type":"meta","workspace":"/tmp/yushan/tree","created_at":7}"#;
         let meta: SessionMeta = serde_json::from_str(with).unwrap();
-        assert_eq!(meta.workspace.as_deref(), Some(Path::new("/tmp/yushan/tree")));
+        assert_eq!(
+            meta.workspace.as_deref(),
+            Some(Path::new("/tmp/yushan/tree"))
+        );
 
         // 显式 `null` 亦按 None 处理（serde 的 Option 语义）。
         let null = r#"{"type":"meta","workspace":null,"created_at":7}"#;

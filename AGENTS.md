@@ -56,8 +56,15 @@ YuShan/
 
 ## 常用命令
 
-- `cargo build` / `cargo test` / `cargo clippy --all-targets` / `cargo fmt`
-- `cargo test --workspace` — 全量测试（当前实测 **1541 passed / 12 ignored**；数字随开发增长，**别当契约**；⚠️ `context_window_catalog` 的 2 个用例依赖 mock server，可能因网络环境失败）
+- `cargo build` / `cargo clippy --all-targets` / `cargo fmt`
+- **`./scripts/par-test.sh` —— 全量测试的唯一入口，必须用它**
+  - `cargo test --workspace` **串行**跑各测试二进制（总耗时 = 各二进制之和），实测 **≈34s**；
+    本脚本跨二进制并行（默认 8 路），**≈7.4s**，用例完全相同。
+  - 选项：`--jobs N` 改并行度、`-- --ignored` 透传给每个二进制、`--no-build` 跳过构建。
+  - 失败时退出码非 0，完整输出落在 `$TMPDIR/yushan-par-test-keep-*.log`。
+  - ⚠️ 直接跑 `cargo test --workspace` **不算跑过测试**；只在需要 cargo 原生输出（如 `--ignored` 的 e2e、基准）时单独用它。
+- `cargo nextest run --workspace` — 已装（`~/.cargo/bin`）。每用例独立进程、隔离更严，但本机 fork 贵 ⇒ **≈14.1s**，比脚本慢；需要重试 / 慢测试报告时用它。
+- `./scripts/build-baseline.sh <label>` — 构建耗时基线（冷 / 改底层 crate / 改叶文件 / 无改动），对比构建配置收益用
 - `python3 scripts/cancellation-mutation.py` — **取消链路的变异测试**（ADR-0046）：注入 12 处 bug ⇒ 期望用例变红；一次跑完全部并给汇总表（`--list` 只列清单，数字参数只跑指定编号）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）

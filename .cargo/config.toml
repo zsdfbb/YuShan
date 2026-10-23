@@ -1,0 +1,23 @@
+# Cargo 源与构建配置。
+#
+# ## 为什么用国内镜像
+#
+# `index.crates.io` / `static.crates.io` 在部分网络环境下**连不上或极慢**
+# （实测 `curl config.json` 15s 超时，而阿里云 0.15s）。这会让 `cargo fetch` /
+# `cargo install` 卡到超时重试，看起来像「构建很慢」，实际是卡在网络上。
+#
+# 用 **sparse 协议**（`sparse+https://`）而非 git 索引：只需按需拉单个 crate 的
+# 索引片段，不必克隆 100MB+ 的整套索引。
+#
+# 注意：这里只改**本项目**（`.cargo/config.toml` 会覆盖 `~/.cargo/config.toml`）。
+# 想在整台机器生效，把下面 `[source.*]` 段搬到 `~/.cargo/config.toml`。
+
+[source.crates-io]
+replace-with = "aliyun"
+
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[net]
+# 网络抖动时多试几次再放弃（默认 2 次）。
+retry = 5

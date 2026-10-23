@@ -29,6 +29,16 @@ use crate::proc_group::kill_group_async;
 /// 中止 / 上限轮询间隔 —— 与 `bash.rs::ABORT_POLL_INTERVAL` 一致：中止的感知延迟上界。
 const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 轮询间隔与「距 deadline 剩余时间」的收敛规则。
+///
+/// 每次轮询睡的时长取二者**较小值**：没有它，轮询永远睡满
+/// [`ABORT_POLL_INTERVAL`]，超时感知会比 deadline 晚最多一个整间隔（即
+/// 「120ms deadline 却 200ms 才返回」）。抽成纯函数是为了能用确定性单测钉住
+/// 这条规则本身，而不是在实际耗时上赌调度余量。
+fn poll_nap(deadline: Duration, elapsed: Duration) -> Duration {
+    ABORT_POLL_INTERVAL.min(deadline.saturating_sub(elapsed))
+}
+
 /// 每次 `read` 的缓冲区大小（同时是 stdout 累积的粒度）。
 const STREAM_CHUNK: usize = 8 * 1024;
 
@@ -310,7 +320,7 @@ pub async fn run_bounded(
         }
 
         // 按剩余时间收敛，避免超时被轮询间隔拉长
-        let nap = ABORT_POLL_INTERVAL.min(deadline.saturating_sub(started.elapsed()));
+        let nap = poll_nap(deadline, started.elapsed());
         tokio::time::sleep(nap).await;
     };
 
@@ -480,12 +490,12 @@ mod tests {
 
     /// `TimedOut`：**小 deadline** 下断言返回耗时贴近 deadline。
     ///
-    /// 这里刻意用 120ms（而非 review 里判别力不足的 500ms）：主循环的收敛式
-    /// `nap = min(100ms, 剩余)` 与「固定 100ms 睡」在 120ms 上分得很开 ——
-    /// 收敛时在 ~120ms 返回，退化为固定睡眠时会在 t≈100ms 睡满后于 t≈200ms 才察觉。
+    /// 收敛规则本身由 [`poll_nap_*`] 的确定性单测钉住；本用例只验**端到端**行为
+    /// （`Stop::TimedOut` 与「比固定睡眠退化要早」），故上界留得较宽：
+    /// 收敛时 ≈120ms，固定睡眠退化时 ≈200ms。阈值取中间值靠上，兼顾两边。
     ///
-    /// 变异：把 `let nap = ABORT_POLL_INTERVAL.min(deadline.saturating_sub(..))`
-    /// 改成恒 `ABORT_POLL_INTERVAL` → 耗时 ~200ms > 170ms → 本用例红。
+    /// 上界不能取得太紧（曾用 170ms）：在并行跑多个测试二进制时，tokio 定时器
+    /// 的调度延迟会把 120ms 推到 180ms 以上，造成与被测行为无关的偶发失败。
     #[tokio::test]
     async fn test_run_bounded_timeout_converges_to_small_deadline() {
         let dir = test_dir("timeout");
@@ -513,9 +523,9 @@ mod tests {
             "不得早于 deadline 收场，实际 {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_millis(170),
+            elapsed < Duration::from_millis(400),
             "超时必须按剩余时间收敛到 deadline（{deadline:?}）；实际 {elapsed:?} —— \
-             若 ~200ms 说明收敛被轮询间隔拉长"
+             若远大于 deadline 说明收敛被轮询间隔拉长"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -821,5 +831,35 @@ echo "stderr padding padding padding padding padding" 1>&2; i=$((i+1)); done"#;
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(mode);
         std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    // ── `poll_nap`：收敛规则（确定性，不赌调度） ──
+    //
+    // 变异：把 `ABORT_POLL_INTERVAL.min(..)` 改成直接返回 `ABORT_POLL_INTERVAL`
+    // → 下面第一条变红。
+
+    /// 剩余时间**少于**一个轮询间隔时，必须只睡剩余那么多。
+    #[test]
+    fn poll_nap_converges_to_remaining_time() {
+        let interval = ABORT_POLL_INTERVAL;
+        let deadline = Duration::from_millis(120);
+
+        // 已过 100ms，只剩 20ms：必须睡 20ms，而不是整 100ms。
+        assert_eq!(
+            poll_nap(deadline, Duration::from_millis(100)),
+            Duration::from_millis(20),
+            "剩余时间可惜时必须收敛到它，否则超时会晚一个整间隔"
+        );
+
+        // 剩得比间隔多：睡满间隔（不必提前醒）。
+        assert_eq!(poll_nap(deadline, Duration::from_millis(0)), interval);
+
+        // 已过 deadline：睡 0（调用方下一轮就会看到 `elapsed >= deadline` 并退出）。
+        assert_eq!(poll_nap(deadline, deadline), Duration::ZERO);
+        assert_eq!(
+            poll_nap(deadline, Duration::from_millis(500)),
+            Duration::ZERO,
+            "超过 deadline 后 saturating_sub 必须归零，不能回绕成巨大的睡眠"
+        );
     }
 }

@@ -177,7 +177,12 @@ struct MockServer {
 
 impl MockServer {
     fn start(steps: Vec<Step>) -> Self {
-        Self::start_with_delays(steps.into_iter().map(|step| (step, Duration::ZERO)).collect())
+        Self::start_with_delays(
+            steps
+                .into_iter()
+                .map(|step| (step, Duration::ZERO))
+                .collect(),
+        )
     }
 
     /// 带逐请求延迟的版本：用于让 wall-clock 预算在模型调用**进行中**到点。
@@ -594,9 +599,23 @@ fn normalize_log(text: &str) -> String {
                 None => line.to_string(),
             };
             if line.starts_with("[t] round=") || line.starts_with("[t] tools round=") {
-                line.chars()
-                    .map(|ch| if ch.is_ascii_digit() { '#' } else { ch })
-                    .collect()
+                // 逐轮耗时按**字段**归一化，不能逐字符替换数字：
+                // 那样位数会留下来（`ttft_ms=11` → `##`，`ttft_ms=2` → `#`），
+                // 于是「10ms 以上」与「10ms 以下」被判成两份不同结构 —— 真实调度
+                // 一跨过 10ms 就偶发失败，与被测行为无关。
+                line.split(' ')
+                    .map(|token| match token.split_once('=') {
+                        // 纯数字值（含可能的单位后缀，如 `elapsed=0s`）整体替换成一个占位符
+                        Some((key, value))
+                            if !value.is_empty()
+                                && value.chars().next().unwrap().is_ascii_digit() =>
+                        {
+                            format!("{key}=#")
+                        }
+                        _ => token.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
             } else if line.starts_with("[t] turn=") {
                 // 两次独立进程的整数秒读数可能跨秒（`elapsed=0s` vs `1s`），
                 // 只归一化这两个**时间**字段；rounds / cumulative / cache 仍精确比较。
@@ -707,6 +726,27 @@ fn t1_debug_off_creates_no_debug_file_and_keeps_existing_diagnostics() {
         normalize_log(&off_text),
         normalize_log(&on_text),
         "debug 开关不得改变既有诊断输出\n--- off ---\n{off_text}\n--- on ---\n{on_text}"
+    );
+}
+
+/// [`normalize_log`] 的归一化必须与**数字位数无关**。
+///
+/// 变异：把 `round=` 行的处理改回「逐字符把数字换成 `#`」→ 下面两份输入会
+/// 归一化成 `ttft_ms=#` 与 `ttft_ms=##`，断言变红。真实调度只要让 ttft 跨过
+/// 10ms 就会触发这个差异（与本用例测的行为完全无关）。
+#[test]
+fn normalize_log_ignores_timing_digit_width() {
+    let fast = "[1792732381] turn=1 rounds=1 elapsed=0s cumulative_rounds=1 \
+                budget_remaining=172799s cache_hit=- cache_miss=-\n\
+                [1792732381] round=1 ttft_ms=2 gen_ms=0 tools_ms=0 total_ms=2";
+    let slow = "[1792732382] turn=1 rounds=1 elapsed=0s cumulative_rounds=1 \
+                budget_remaining=172799s cache_hit=- cache_miss=-\n\
+                [1792732382] round=1 ttft_ms=113 gen_ms=97 tools_ms=1205 total_ms=1415";
+
+    assert_eq!(
+        normalize_log(fast),
+        normalize_log(slow),
+        "耗时字段的值（含位数）不得参与比较；只有行结构与其余字段才该比"
     );
 }
 
@@ -985,7 +1025,10 @@ fn t5_debug_file_is_complete_and_structured() {
     for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line)
             .unwrap_or_else(|e| panic!("`--json` stdout 必须是合法 JSON：{e}: {line}"));
-        assert!(value.get("event").is_some(), "stdout 只应有 Envelope：{line}");
+        assert!(
+            value.get("event").is_some(),
+            "stdout 只应有 Envelope：{line}"
+        );
         assert!(
             !line.contains("yushan.debug/1"),
             "debug 记录不得混入 stdout：{line}"
@@ -1002,7 +1045,10 @@ fn t5_debug_file_is_complete_and_structured() {
 
     // flush 后以完整 JSON 行结尾（T5 的 P0 部分）。
     let raw = std::fs::read(path).unwrap();
-    assert!(raw.ends_with(b"\n"), "debug 文件必须以换行结尾（最后一行完整）");
+    assert!(
+        raw.ends_with(b"\n"),
+        "debug 文件必须以换行结尾（最后一行完整）"
+    );
 
     let records = debug_records(path);
     assert!(!records.is_empty(), "debug 文件不得为空");
@@ -1015,7 +1061,10 @@ fn t5_debug_file_is_complete_and_structured() {
     assert_eq!(run_end["rounds"], json!(1));
     assert_eq!(run_end["exit_code"], json!(0));
     assert_eq!(run_end["stop_reason"], json!("RunFinished"));
-    assert!(run_end["duration_ms"].is_u64(), "run_end 必须有 duration_ms");
+    assert!(
+        run_end["duration_ms"].is_u64(),
+        "run_end 必须有 duration_ms"
+    );
     assert_eq!(run_end["usage"]["input_tokens"], json!(11));
     assert_eq!(run_end["usage"]["reasoning_tokens"], json!(4));
     assert_eq!(run_end["debug"]["dropped"], json!(0));
@@ -1055,10 +1104,7 @@ fn t5_debug_file_is_complete_and_structured() {
         "round_end",
         "turn_end",
     ] {
-        assert!(
-            names.contains(&expected),
-            "缺少 {expected} 记录：{names:?}"
-        );
+        assert!(names.contains(&expected), "缺少 {expected} 记录：{names:?}");
     }
     // 允许名单而非「名字不含 delta」：后者会放过任何新造的增量类记录名。
     const ALLOWED: [&str; 8] = [
@@ -1094,7 +1140,10 @@ fn t5_debug_file_is_complete_and_structured() {
     assert_eq!(attempt["max_attempts"], json!(6));
     assert_eq!(attempt["outcome"], json!("success"));
     assert_eq!(attempt["http_status"], json!(200));
-    assert!(attempt["ttfb_ms"].is_u64(), "成功尝试应有 ttfb_ms：{attempt}");
+    assert!(
+        attempt["ttfb_ms"].is_u64(),
+        "成功尝试应有 ttfb_ms：{attempt}"
+    );
     assert_eq!(attempt["retried"], json!(false));
 }
 
@@ -1156,7 +1205,12 @@ fn budget_abort_records_enqueued_and_observed() {
     // 响应是工具调用 ⇒ 工具执行后，下一轮边界看到 Abort ⇒ Cancelled。
     let server = MockServer::start_with_delays(vec![
         (
-            Step::tool_call("call_1", "bash", r#"{"command":"echo ok"}"#, UsageSpec::NONE),
+            Step::tool_call(
+                "call_1",
+                "bash",
+                r#"{"command":"echo ok"}"#,
+                UsageSpec::NONE,
+            ),
             Duration::from_millis(2500),
         ),
         (Step::text("done", UsageSpec::NONE), Duration::ZERO),

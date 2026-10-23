@@ -69,7 +69,7 @@
 | 原始理由 | 现状 |
 |---|---|
 | 侧栏 / 多组件布局 | **status/footer 面板默认关闭**（`ui/app.rs:90-91`：`show_status: false` / `show_footer: false`） |
-| 鼠标 | **明确砍掉** |
+| 鼠标 | **已部分反转**（[ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)：滚轮滚聊天）；点击 / 拖拽 / 悬停仍砍 |
 | 独立滚动区 | 设计未要求；TUI 定位「简洁 coding 界面」 |
 | 持久位置（sticky footer） | 面板默认不显示 → 无需 sticky |
 

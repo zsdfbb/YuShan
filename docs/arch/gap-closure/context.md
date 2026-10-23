@@ -391,7 +391,9 @@ apps/coding-agent config/provider/commands/ui/view/state
 
 - **Markdown 渲染 / Diff Viewer / Theme / 鼠标事件 / 可配快捷键**：纯 UI 花活。TUI 定位为「简洁 coding 界面」，这些不纳入；不影响后台 agent 能力。
   > **2026-10-09 修订**：**Markdown 渲染**已解除（coding agent 的主要产出即 markdown 文本，属核心内容通道而非花活），
-  > 见 [ADR-0030](../../adr/0030-tui-markdown-render.md)；**Diff Viewer / Theme / 鼠标 / 可配快捷键仍砍**。
+  > 见 [ADR-0030](../../adr/0030-tui-markdown-render.md)；**Diff Viewer / Theme / 可配快捷键仍砍**。
+  > **2026-10-23 再一次修订**：**鼠标滚轮**已做（滚聊天，见 [ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)）；
+  > 点击 / 拖拽 / 悬停仍砍。
 - **Session 树分支**：独立 adapter crate（`session-jsonl-tree`），不修改现有 `JsonlSession`；本轮只做平面 `JsonlSession` 接入，树结构留给后续。
 - **动态插件系统 / Client-Server RPC / Lanes**：报告 Tier 4 已明确跳过，符合静态组合哲学。
 - **安全/沙箱/审批**：设计文档「不做安全」，`ToolRegistry` 仍只按名查找。

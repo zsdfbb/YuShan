@@ -145,7 +145,7 @@ Rust 实现就一个 `enum CompletionKind { SlashCmd, SlashArg(&'static str), Pa
 | 流式增量 | `Markdown` 组件 + `(text, width)` 缓存 | `streaming_thinking.rs:35` 100ms debounce 重新 wrap + `markdown_render.rs:898` | **直接 `print!` 每块 delta 写 stdout** |
 | Markdown | `marked` 替换 + 自定义着色器 1k 行 | 自研 tag-parse 4k 行 | **不做**（origin 已砍） |
 | 代码块 | 语法高亮（推测 chroma） | syntax 渲染 | **不打高亮**（或做最小款：识别 fenced block 加 `\x1b[36m`，约 10 行） |
-| 滚动 | `ScrollView` 完整 viewport | `pager/` 子模块 + `live_transcript` | **终端原生 scrollback** |
+| 滚动 | `ScrollView` 完整 viewport | `pager/` 子模块 + `live_transcript` | **视窗化渲染 + 键盘/滚轮滚动**（[ADR-0045](../../adr/0045-tui-scroll-viewport.md) / [ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)；不再是「终端原生 scrollback」） |
 | 单元 | typed cell（`User/Assistant/Tool/Reasoning/Diff/...`） | typed history cell | `TranscriptLine` enum 已是 typed |
 
 **借鉴判断**：

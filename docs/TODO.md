@@ -128,6 +128,15 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
+- **TUI 鼠标：只做了滚轮**（[ADR-0050](../adr/0050-tui-mouse-wheel-scroll.md)）：
+  - ⬜ **模态浮层里的滚轮**：浮层自己读事件（`crates/ys-tui-coding/src/run.rs` 的
+    `Prompter` 实现），`_ => {}` 掉鼠标 ⇒ 会话列表 / 模型列表超过一屏时**无法滚动**，
+    只能靠方向键逐项移动（跨屏时会自动跟高亮）。补法：在 `select_modal` 的匹配里加
+    `Event::Mouse` 臂改 `top` / 高亮。依据：ADR 风险表的「模态浮层里的滚轮」一行标**未做**。
+  - ⬜ **`⇧`+拖选可用性的人工确认**：捕获期间裸拖选失效，`⇧`+拖选在 iTerm2 /
+    Terminal.app / WezTerm / VSCode 集成终端下的实际表现均**未验证**（ADR-0050 的
+    `MANUAL_ACK` 项）。不达标时的退路：只在滚轮事件发生时才临时关捕获（成本高，需实测）。
+
 - **bg-notify 的 R1 技术债：投递机制不外溢**（ADR `docs/arch/bg-notify/adr-bg-notify.md`）：
   「落点格 + `Delivery` 三态 + take/claim/Finish」现在长在 `adapters/tools-basic/src/background.rs`
   上，只为后台 `bash` 一个生产用例服务。**触发重开的条件**：出现**第二个**后台任务类型

@@ -283,7 +283,7 @@ fn status_symbol(stop: &StopReason) -> String { ... }  // 改 pub(super)
 | 1 | ratatui 版本 | **0.29 + crossterm 0.28 + 升级 inquire 到 0.8** |
 | 2 | 保留 rustyline fallback | **是**（`--no-tui` flag） |
 | 3 | transcript 滚动 | **默认 follow + 滚动手动禁用** |
-| 4 | 鼠标支持 | **v0 不要**，但 `events.rs` 预留 `handle_mouse` stub |
+| 4 | 鼠标支持 | **v0 不要**（当初预留 `handle_mouse` stub，后随重构删除）；**滚轮已于 2026-10-23 落地**（[ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)），点击 / 拖拽仍不做 |
 | 5 | status panel 宽度 | **30% 固定** |
 | 6 | binary size | **+700KB release，可接受**（5.7M → 6.4M） |
 | 7 | AppView 字段扩展 | **不扩展**（transcript / scroll / input 归 App） |

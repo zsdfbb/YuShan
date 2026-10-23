@@ -66,6 +66,7 @@ YuShan/
 - `cargo nextest run --workspace` — 已装（`~/.cargo/bin`）。每用例独立进程、隔离更严，但本机 fork 贵 ⇒ **≈14.1s**，比脚本慢；需要重试 / 慢测试报告时用它。
 - `./scripts/build-baseline.sh <label>` — 构建耗时基线（冷 / 改底层 crate / 改叶文件 / 无改动），对比构建配置收益用
 - `python3 scripts/cancellation-mutation.py` — **取消链路的变异测试**（ADR-0046）：注入 12 处 bug ⇒ 期望用例变红；一次跑完全部并给汇总表（`--list` 只列清单，数字参数只跑指定编号）
+- `python3 scripts/wheel-mutation.py` — **滚轮接管的变异测试**（ADR-0050）：注入 6 处 bug ⇒ 期望用例变红
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）

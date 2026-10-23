@@ -268,6 +268,10 @@ ModelTextDelta ─► App::apply_event ─► append_stream(Assistant)      app.
 
 **机制**：无鼠标处理，用户用**终端原生选择**；原生选择复制屏幕上实际字形，**应用无法过滤**。
 
+> ⚠️ **前提已变**（[ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)）：TUI 现在开
+> `EnableMouseCapture`（为滚轮），捕获期间**多数终端不再响应裸拖选**，须 `⇧`+拖选或 `/copy`。
+> 本节其余结论（字形即所见、表格框线会被拷贝、代码块无左侧 gutter）仍然有效。
+
 | 位置 | 决定 | 库现状 |
 |---|---|---|
 | Chat 窗格边框 | **只留顶部标题线**（`draw.rs:125` 的 `Block::bordered()` → `Borders::TOP`）；**几何随之变化，见下** | 本仓改动 |

@@ -56,7 +56,12 @@
 | 状态 | **一行**：turn 中 spinner（`\r` 原地刷），turn 后摘要 | turn 期间 / 结束 |
 | 候选 | rustyline 内建列表（含参数说明） | Tab 或输入 `/` 时 |
 
-**没有**：常驻面板、侧栏、状态栏、滚动区、鼠标、主题。
+**没有**：常驻面板、侧栏、状态栏、滚动区、主题。
+
+> 鼠标一项已由 [ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md) 部分反转（**仅滚轮**）。
+> 本文其余部分描述的是 **rustyline 时代**的形态，其中「无滚动区」「主屏文本流自然滚动」
+> 已被后续的 ratatui 视窗化实现（[ADR-0045](../../adr/0045-tui-scroll-viewport.md)）取代 ——
+> 保留作**当时的取舍记录**，不是 as-built。
 
 ---
 
@@ -151,7 +156,7 @@ execute!(stdout, PushKeyboardEnhancementFlags(
 | 全屏 / alt-screen | 有（后加，**造成 scrollback 回归**，需逃生口） | ratatui | **不做** |
 | 富对话渲染（markdown / 高亮 / diff 卡片） | 有（重写 Ink 渲染引擎） | 有 | **markdown 做；高亮 / diff 卡片不做**（[ADR-0030](../../adr/0030-tui-markdown-render.md) 修订：markdown 红线已解除） |
 | 常驻状态栏 / 侧栏 / 模式指示 | 有 | 有（`underwater.rs` 做 chrome） | **不做**（`/status` 按需） |
-| 鼠标 | 有 | 有 | **不做**（终端原生选择/复制够用） |
+| 鼠标 | 有 | 有 | **只做滚轮**（滚聊天，[ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)）；点击 / 拖拽 / 悬停不做 |
 | 审批弹窗 | 有 | 有 | 用 `inquire` 在真终端做（已有 `Prompter` 抽象） |
 | 主题 / 多语言 | 有 | 有（五语言 + 主题选择器） | **不做** |
 | 多行输入 / Shift+Enter | 有（`/terminal-setup`） | 有 | **做** |

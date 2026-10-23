@@ -148,6 +148,10 @@ tokio::join!(agent.run(ports, &inbox), 消费者(rx))    ← -p/--json 已是这
 **产品层红线**（`gap-closure/context.md:10-11` 已正式砍掉）：
 - Markdown 渲染、Diff Viewer、Theme、**鼠标**、可配快捷键
 
+> ⚠️ **两条已被后续 ADR 反转**：[ADR-0030](../../adr/0030-tui-markdown-render.md)（markdown 渲染）、
+> [ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)（**仅滚轮**；点击 / 拖拽仍砍）。
+> Diff Viewer / Theme / 可配快捷键仍成立。
+
 **字段层**（`tui-status-display/context.md:111-117` 已否决）
 - cache 命中率、cost 美元、context 占比、git branch、thinking level、extension status
 - **`tui-pi-codewhale-borrow` §10 想引入的 `ctx% · $cost · ttft · tok/s` 属此类，不得重新引入**（见「矛盾」§D）

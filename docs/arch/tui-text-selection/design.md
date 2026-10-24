@@ -79,11 +79,34 @@ C：`DRAG_TICK = 16ms` + `step = clamp(1 + held_ms/40, 1, 8)` ⇒ 200 行约 **0
 | 文件 | 改动 | 行数 |
 |---|---|---|
 | `layout.rs` | **纯追加**：`EntryMemo.rev` / `TranscriptLayout.rev` / `revision_range()` / `window_rows()` | ~40 || `events.rs` | `handle_mouse` 收整个 `MouseEvent`；三态分派；`scroll()` 改 `pub(crate)` 并清选区；`Resize` 清选区 | ~60 |
-| `draw.rs` | 抽 `window_lines()`；`ui()` 末尾挂 `draw_selection()` | ~35 |
+| `draw.rs` | 抽 `chat_inner()` 唯一几何来源；新增 `chat_inner_rect()`；`ui()` 末尾挂 `draw_selection()` | ~35 |
 | `run.rs` | `DRAG_TICK` 可变 poll 周期；鼠标批次合并；`drag_tick()` 调用 | ~30 |
 | `app.rs` | `pub selection: selection::Selection` + 默认 + `jump_to_*` 里 `clear()` | ~15 |
 
 既有函数**签名一律不动**（`ui` / `draw_transcript` / `window` / `sync` 全部保持原样）。
+
+### 2.1b 内区几何：新增 `chat_inner_rect()`（Phase 1 核实时发现的设计盲区）
+
+`handle_mouse` 要把 crossterm 的 `(column, row)` 转成内区相对坐标，就必须知道内区左上角在屏幕的
+**绝对位置**。而 `chat_viewport()`（`draw.rs:173`）只返回 `(w, h)`，不返回原点；它依赖的
+`chat_area()` / `chat_block()` 又都是**私有** `fn`。
+
+不能把两个私有函数提 `pub(crate)` 让 `events.rs` 自己拼三段 —— `draw.rs:159` 已立纪律：
+
+> 内区几何的**唯一来源** —— … **宽度与高度的逐项扣减都只发生在这一个调用里**，故绝不逐处手写减法。
+
+且 `chat_viewport` 已经被迫把三段拼了一遍（只为给 `events.rs` 拿宽高）。故追加一个**内部唯一来源**：
+
+```rust
+/// 内区几何的**唯一**来源；两个 `pub(crate)` 包装都与它共用，不得另写第二条链路。
+fn chat_inner(app: &App, area: Rect) -> Option<Rect>;   // None = 尺寸低于 MIN_*
+
+pub(crate) fn chat_viewport(app: &App, w: u16, h: u16) -> (u16, u16);        // 既有签名不动
+pub(crate) fn chat_inner_rect(app: &App, w: u16, h: u16) -> Option<Rect>;   // 新增，给 events.rs
+```
+
+`chat_inner_rect` 返回屏幕绝对坐标的 `Rect`（含 `x`/`y`），`events.rs` 用它做
+`rel_x = column - rect.x`、`rel_y = row - rect.y`，落在 `rect` 外则 clamp + 设 `edge`。
 
 ### 2.2 核心类型
 

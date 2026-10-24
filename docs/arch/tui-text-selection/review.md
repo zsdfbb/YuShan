@@ -1,5 +1,30 @@
 # ADR-0051 / tui-text-selection 设计质量审核
 
+# ADR-0051 / tui-text-selection 设计质量审核
+
+> **修复记录（Phase 1 放行后追写）**
+>
+> 本报告的 R1 / R2 已在实现前**修进 `design.md`**，但仍保留原文与当时的判定 ——
+> 删掉论证会让后人看不懂为什么要做那两个选择。
+>
+> | ID | 原判定 | 当前状态 | 修复位置 |
+> |---|---|---|---|
+> | R1 选区不按内容裁剪 | 🔴 必现 | ✅ **已吸收** | `design.md` §2.4「提取必须按内容裁剪」 |
+> | R2 `window_rows()` 无签名 | 🔴 会返工 | ✅ **已吸收** | `design.md` §2.2b（含「共用遍历」纪律） |
+> | R3 限流是推论 | 🟡 | ✅ 已吸收 | `design.md` §6 加 `recomputed_entries` 闸门 |
+> | R5 借 `App` 结构 | 🟡 | ✅ 已吸收 | `design.md` §2.6 签名定为 `&mut App` |
+> | R6 夹取顺序 | 🟡 | ✅ 已吸收 | `design.md` §2.5 先 `follow=false` 再 `scroll()` |
+> | R4 内存 ×2 | 🟡 | ✅ 已记录 | `design.md` §5 代价表 |
+> | — | — | 🆕 新发现 | `design.md` §2.1b `chat_inner_rect()`（核实 Phase 1 时发现） |
+>
+> **MANUAL_ACK 处置**：真实终端手感（拖拽跟手、自动滚动速率）不阻塞 —— 客观部分由
+> `perf_drag_steady` / `perf_drag_scroll200` / `perf_extract_200rows` 三个 `#[ignore]` 基准
+> 作替代闸门，主观部分本不应进测试合同。
+>
+> 下面保留审核当时的原始全文。
+
+---
+
 审核对象：`docs/arch/tui-text-selection/design.md`（配套 `context.md` 与
 `docs/adr/0051-tui-text-selection.md`）。维度：全量（可行性 / 可维护性 / 可理解性 / 性能与可靠性）。
 

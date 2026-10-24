@@ -112,7 +112,7 @@ static COMMANDS: [CommandSpec; 14] = [
     },
     CommandSpec {
         name: "compact",
-        description: "压缩上下文",
+        description: "压缩上下文（回合中则在下一轮边界执行）",
         arg_hint: None,
     },
     CommandSpec {

@@ -351,7 +351,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | `/logout` | — | `Logout` |
 | `/new` | — | `NewSession` |
 | `/resume [id]` | 无参时**浮层列出现有会话**供选择（Esc 取消、空列表只提示）；有参直切 | `ListSessions` / `ResumeSession` |
-| `/compact` | — | `Compact` |
+| `/compact` | 空闲 ⇒ 直发；**回合中 ⇒ 改投 `Boundary::Compact`**（轮边界执行，见 ADR-0052） | `Compact` |
 | `/export [path]` | — | `Export` |
 
 **`Prompter` trait 保留**（design §3 注；死的只是 `InquirePrompter`）：
@@ -364,6 +364,11 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 `Outbound::Output`。**本模块绝不 print**（TUI 起屏后 stderr/stdout 会冲掉整屏）。
 `new_session` / `compact` 是 `async`（碰 `Session`），`export` 是**同步**（见 §8）。
 
+> **回合中投递**：`/compact` 是**唯一**按 `is_turning` 分流去向的命令 —— 空闲走 `Request::Compact`
+> （外层循环立即处理），回合中改投 `Boundary::Compact`（下一个轮边界执行），并在提交时当场
+> 补一行「已请求压缩，将在下一轮边界执行…」。理由：`request_rx` 只在回合之间被消费，
+> 回合中投 `Request` 要等整个回合跑完（实测 7 分钟）。见 ADR-0052。
+>
 > **降级语义**：`/compact` **已接真压缩**（`capabilities::compact` → `ys_loop::plan` + `execute`：
 > 摘要成一条 checkpoint、尾部原样保留）；四条路径里**三条失败（无 model / 无事可压 / 摘要失败）
 > 都不碰 session 一个字节**，各给一行明确提示 —— 靠「什么都不做」而非「清空」降级。`/copy` 无剪贴板；
@@ -531,6 +536,10 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
 | `apps/coding-agent/src/app_loop.rs` | `SetEffort` 臂产出 `Output` + 刷新 `View.effort`；`None` 清除覆盖后视图回到默认 `high`；`every_request_variant_is_handled` 覆盖该变体；回合末写入 / `/new` 保留 | 漏 `SetEffort` 臂 ⇒ `match` 不穷尽编译失败；只改 config 不刷视图 ⇒ `set_effort_updates_view`；回合末不写 ⇒ meta 用例 |
 | `apps/coding-agent/src/{main,view}.rs` | `finalize_turn_meta` 三态（写入 / 清除 / 不写）；启动期 `restore_effort_from_meta`；`CodingView.effort` 透传**有效**档位（覆盖或配置默认） | 无条件写 ⇒ 三态用例；视图写死 `None` ⇒ `test_build_view_passes_effort` |
 | `crates/ys-tui-coding/src/{commands,events}.rs` | 命令表 14 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例 |
+| `crates/ys-protocol/src/boundary.rs` | `Compact` 不置 `aborted`、参与 FIFO、`Debug` 不泄露正文、`has_pending_steer` **包含** `Compact` | 把 `push` 的 `Abort` 判定放宽到 `Compact` ⇒ abort 用例；扫描改回只匹配 `Steer(_)` ⇒ 探针用例 |
+| `crates/ys-loop/src/basic.rs` | 轮边界收到 `Compact` ⇒ 就地压（**不判阈值**）+ `purpose=Compaction` 上报 + 本轮只跑一轮；**收场前**收到 `Compact` ⇒ 压了但 `rounds` 不增 | 删 `Boundary::Compact` 臂 ⇒ 不压缩；把它设成 `consumed = true` ⇒ `rounds` 1→2 |
+| `crates/ys-tui-coding/src/events.rs` | 回合中 `/compact` ⇒ 投 `Boundary::Compact`、**不**投 `Request`、当场出一行反馈；空闲 `/compact` ⇒ 仍投 `Request::Compact` | 删 `is_turning` 分流分支 ⇒ 回合中用例；去掉守卫 ⇒ 空闲用例 |
+| `apps/coding-agent/src/app_loop.rs` | 回合中投 `Boundary::Compact` ⇒ 本回合出站序列里出现 `ContextCompacted`（不等回合结束） | 删 `Compact` 臂 ⇒ 不压缩 ⇒ 红 |
 | `scripts/doc-consistency.sh` | architecture.md 命令表含 `/effort` 且计数为 14 条 | 计数回退 / 命令表漏行 ⇒ 脚本非零退出 |
 
 ---

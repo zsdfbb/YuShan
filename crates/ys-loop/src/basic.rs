@@ -60,19 +60,27 @@ enum BoundaryDrain {
     Aborted,
 }
 
-/// 轮边界：拉取中途插话（steering）、后台结果（deferred）与中止（abort），保持入队顺序。
+/// 轮边界：拉取中途插话（steering）、后台结果（deferred）、手动压缩请求与中止
+/// （abort），保持入队顺序。
 ///
 /// 不增 rounds、不改 turn —— `Steer` 是轮内的额外输入，不是新一轮。
 ///
 /// **收场前也要调用**：模型给出**最终答复**（无工具调用）那条路不经过下一轮，
-/// 若不在收场前拉一次，这段窗口内到达的 `Steer` / `Deferred` 会随边界源一起销毁 ——
-/// 用户在模型正要收尾时插的话会**静默消失**。故收场前补一次拉取，
-/// 取到 `Steer` 就**继续本轮循环**（模型下一轮就能看到它），让「轮边界总是存在」
-/// 成为真的不变量，而不是「下一轮才有边界」。
+/// 若不在收场前拉一次，这段窗口内到达的 `Steer` / `Deferred` / `Compact` 会随边界源
+/// 一起销毁 —— 用户在模型正要收尾时插的话会**静默消失**。故收场前补一次拉取，
+/// 取到 `Steer` / `Deferred` 就**继续本轮循环**（模型下一轮就能看到它），让「轮边界
+/// 总是存在」成为真的不变量，而不是「下一轮才有边界」。
 ///
 /// `Abort` 在这里被消化成 `Cancelled` 收场（调用方据 [`BoundaryDrain::Aborted`] 收尾）。
-async fn drain_boundary(ctx: &mut RuntimeContext<'_>) -> Result<BoundaryDrain, LoopError> {
-    let Some(boundary) = ctx.boundary.as_ref() else {
+///
+/// `rounds` 只用于 `RoundUsage { purpose: Compaction }` 的轮号（与自动压缩同口径）。
+async fn drain_boundary(
+    ctx: &mut RuntimeContext<'_>,
+    rounds: u32,
+) -> Result<BoundaryDrain, LoopError> {
+    // **先克隆 `Arc` 再循环**：`Compact` 要 `&mut ctx`（压缩本体写 session / 发事件），
+    // 若仍借用 `ctx.boundary` 会与它冲突。克隆只加一次引用计数。
+    let Some(boundary) = ctx.boundary.clone() else {
         return Ok(BoundaryDrain::Empty);
     };
     let mut consumed = false;
@@ -101,6 +109,12 @@ async fn drain_boundary(ctx: &mut RuntimeContext<'_>) -> Result<BoundaryDrain, L
                     .map_err(LoopError::Event)?;
                 consumed = true;
             }
+            // 手动 `/compact`：就地压一次。**不设 `consumed`** —— 压缩只缩短会话、
+            // 不带来新的模型输入，而 `Consumed` 在三处调用点的语义都是「模型有新东西
+            // 要看 ⇒ 继续循环」。设了它会让收场路径凭空多跑一轮空模型调用。
+            Boundary::Compact => {
+                run_compaction(ctx, rounds).await?;
+            }
             Boundary::Abort => return Ok(BoundaryDrain::Aborted),
         }
     }
@@ -109,6 +123,84 @@ async fn drain_boundary(ctx: &mut RuntimeContext<'_>) -> Result<BoundaryDrain, L
     } else {
         BoundaryDrain::Empty
     })
+}
+
+/// 执行一次压缩：`plan` → `execute` → 写回 → 发事件。**不判触发阈值**（调用方决定）。
+///
+/// 两个调用方：自动压缩（Step 4b，自己判阈值）与手动 `/compact`
+/// （`Boundary::Compact`，用户点了就压）。两者共用这一份实现 ⇒ 事件 / 成本口径 /
+/// 失败语义不可能漂移。
+///
+/// 返回是否真的压了：`false` = `plan()` 返回 `None`（消息太少 / 无合法切点）。
+///
+/// 失败语义（B-3）：**session 一个字节都不动**，只发 `ContextCompactionFailed`。
+async fn run_compaction(ctx: &mut RuntimeContext<'_>, rounds: u32) -> Result<bool, LoopError> {
+    let policy = &ctx.limits.compaction;
+    let window = ctx.limits.context_window;
+    let fixed = ctx.limits.fixed_prompt_tokens;
+    let messages = ctx.session.messages();
+    let Some(plan) = compact::plan(messages, policy, window) else {
+        return Ok(false);
+    };
+    match compact::execute(
+        messages,
+        &plan,
+        ctx.model,
+        policy,
+        fixed,
+        // **活对话的 system**（B4）：与主调用逐字相同 ⇒ 命中 KV cache。
+        ctx.system_prompt.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            // 成本口径必须先于写回上报：摘要调用的 token 已经真实消耗，
+            // 若 `replace_all` 失败会提前 `?` 返回 —— 放在写回前，写回失败
+            // 也不丢成本口径；顺序上仍在 `ContextCompacted` 之前。
+            emit(
+                ctx.events,
+                AgentEvent::RoundUsage {
+                    purpose: RoundPurpose::Compaction,
+                    // 压缩发生在 `RoundStarted` **之前** ⇒ 记它正在准备的下一轮，
+                    // 与随后发出的 `RoundStarted.round` 同口径（不差一）。
+                    round: rounds.saturating_add(1),
+                    usage: outcome.usage,
+                },
+            )
+            .await
+            .map_err(LoopError::Event)?;
+            // 写回由**调用方**做（`execute` 不持有 session，评审 R3）。
+            ctx.session
+                .replace_all(outcome.messages)
+                .await
+                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+            emit(
+                ctx.events,
+                AgentEvent::ContextCompacted {
+                    estimated_tokens_before: outcome.estimated_tokens_before,
+                    estimated_tokens_after: outcome.estimated_tokens_after,
+                    summarized: outcome.summarized,
+                    kept: outcome.kept,
+                },
+            )
+            .await
+            .map_err(LoopError::Event)?;
+            Ok(true)
+        }
+        Err(e) => {
+            // B-3：失败 ⇒ **session 一个字节都不动**，本轮照常继续。
+            // 旧实现会 `clear()` + 写一行占位符 —— 那是静默失忆，不是降级。
+            emit(
+                ctx.events,
+                AgentEvent::ContextCompactionFailed {
+                    reason: e.to_string(),
+                },
+            )
+            .await
+            .map_err(LoopError::Event)?;
+            Ok(false)
+        }
+    }
 }
 
 /// Step 9b 的调度单元。
@@ -331,14 +423,16 @@ impl AgentLoop for BasicLoop {
             // 的既有测试 `every_request_variant_is_handled` 会走到这里，它安全**只因为**
             // 会话太小 ⇒ 不满足触发阈值 / `plan()` 返回 `None` ⇒ `MockModel` 的响应队列
             // 不被消费（空队列 `remove(0)` 会 panic）。
+            //
+            // 这里只判**是否自动触发**；压缩本体与手动 `/compact`（`Boundary::Compact`）
+            // 共用 [`run_compaction`] ⇒ 事件 / 成本口径 / 失败语义不可能漂移。
             {
                 let policy = &ctx.limits.compaction;
                 let window = ctx.limits.context_window;
                 // 每回合固定开销（system prompt + 工具表）：每次请求都要重发，会话里
                 // 数不到，但真实占着窗口。判定必须把它算进去（U1），否则压缩系统性晚触发。
                 let fixed = ctx.limits.fixed_prompt_tokens;
-                let messages = ctx.session.messages();
-                let estimated = crate::token::estimate_session_tokens(messages);
+                let estimated = crate::token::estimate_session_tokens(ctx.session.messages());
                 let trigger = policy.trigger_at(window);
 
                 // ⚠️ R5 边界：`fixed >= trigger` ⇒ **直接跳过压缩**。
@@ -348,71 +442,14 @@ impl AgentLoop for BasicLoop {
                 //      但 `estimated + fixed` 恒在阈值之上 ⇒ 每轮都压、每轮都不解渴；
                 //   ② 小窗口下更糟 —— 压到最简后请求照样溢出，白烧一次摘要调用。
                 //
-                // 位置约束（承重，ADR-0017 决策 1）：本早退与下面的 `plan()` 都必须留在
+                // **本早退只属于自动路径**：手动 `/compact` 是用户显式要求 ⇒ 不判阈值。
+                //
+                // 位置约束（承重，ADR-0017 决策 1）：本早退与下面的压缩都必须留在
                 // Step 6 的 `ctx.model.complete` **之前**。`apps/coding-agent/src/app_loop.rs`
                 // 的 `every_request_variant_is_handled` 会走到这里，它安全**只因为**
                 // 不触发 model 调用（`MockModel` 空队列 `remove(0)` 会 panic）。
-                if fixed < trigger
-                    && estimated + fixed > trigger
-                    && let Some(plan) = compact::plan(messages, policy, window)
-                {
-                    match compact::execute(
-                        messages,
-                        &plan,
-                        ctx.model,
-                        policy,
-                        fixed,
-                        // **活对话的 system**（B4）：与主调用逐字相同 ⇒ 命中 KV cache。
-                        ctx.system_prompt.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(outcome) => {
-                            // 成本口径必须先于写回上报：摘要调用的 token 已经真实消耗，
-                            // 若 `replace_all` 失败会提前 `?` 返回 —— 放在写回前，写回失败
-                            // 也不丢成本口径；顺序上仍在 `ContextCompacted` 之前。
-                            emit(
-                                ctx.events,
-                                AgentEvent::RoundUsage {
-                                    purpose: RoundPurpose::Compaction,
-                                    // 压缩发生在 `RoundStarted` **之前** ⇒ 记它正在准备的下一轮，
-                                    // 与随后发出的 `RoundStarted.round` 同口径（不差一）。
-                                    round: rounds.saturating_add(1),
-                                    usage: outcome.usage,
-                                },
-                            )
-                            .await
-                            .map_err(LoopError::Event)?;
-                            // 写回由**调用方**做（`execute` 不持有 session，评审 R3）。
-                            ctx.session
-                                .replace_all(outcome.messages)
-                                .await
-                                .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
-                            emit(
-                                ctx.events,
-                                AgentEvent::ContextCompacted {
-                                    estimated_tokens_before: outcome.estimated_tokens_before,
-                                    estimated_tokens_after: outcome.estimated_tokens_after,
-                                    summarized: outcome.summarized,
-                                    kept: outcome.kept,
-                                },
-                            )
-                            .await
-                            .map_err(LoopError::Event)?;
-                        }
-                        Err(e) => {
-                            // B-3：失败 ⇒ **session 一个字节都不动**，本轮照常继续。
-                            // 旧实现会 `clear()` + 写一行占位符 —— 那是静默失忆，不是降级。
-                            emit(
-                                ctx.events,
-                                AgentEvent::ContextCompactionFailed {
-                                    reason: e.to_string(),
-                                },
-                            )
-                            .await
-                            .map_err(LoopError::Event)?;
-                        }
-                    }
+                if fixed < trigger && estimated + fixed > trigger {
+                    run_compaction(ctx, rounds).await?;
                 }
             }
 
@@ -425,7 +462,7 @@ impl AgentLoop for BasicLoop {
             // 轮询）总是先行命中并提前返回，本分支几乎不可达；唯一窗口是 Step 4b
             // 上下文压缩 `await` 期间 Abort 才到达 —— 探针已过、消息刚到。保留它是
             // 为了在压缩耗时较长时不至于漏掉一次中止（宁可晚一轮，不可丢失）。
-            match drain_boundary(ctx).await? {
+            match drain_boundary(ctx, rounds).await? {
                 BoundaryDrain::Empty | BoundaryDrain::Consumed => {}
                 BoundaryDrain::Aborted => {
                     emit(
@@ -605,7 +642,7 @@ impl AgentLoop for BasicLoop {
                     //
                     // **收场前也要拉一次轮边界** —— 与下面的正常收场路径同理由：
                     // 这段窗口内到达的插话不能随边界源一起销毁。
-                    match drain_boundary(ctx).await? {
+                    match drain_boundary(ctx, rounds).await? {
                         BoundaryDrain::Empty => {}
                         // 取到插话 ⇒ 先把它交给模型看（模型还没说完，这正是它该看到的东西）。
                         BoundaryDrain::Consumed => continue,
@@ -739,7 +776,7 @@ impl AgentLoop for BasicLoop {
                 // 边界源的消息）。
                 //
                 // 取到插话就**继续本轮循环**：模型下一轮就能看到它，用户不必等整个回合结束。
-                match drain_boundary(ctx).await? {
+                match drain_boundary(ctx, rounds).await? {
                     BoundaryDrain::Empty => {}
                     // 有插话/后台结果 ⇒ 继续本轮，让模型接着看得到它。
                     BoundaryDrain::Consumed => continue,
@@ -1183,6 +1220,25 @@ mod tests {
                     },
                     content: vec![ContentBlock::Text {
                         text: "x".repeat(400),
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// 预置 `count` 条各 `chars` 字符的交替消息（每 4 个 ASCII 字节 ≈ 1 token）。
+    async fn seed_session_of(session: &mut MemorySession, count: usize, chars: usize) {
+        for i in 0..count {
+            session
+                .append(Message {
+                    role: if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    content: vec![ContentBlock::Text {
+                        text: "x".repeat(chars),
                     }],
                 })
                 .await
@@ -3831,7 +3887,7 @@ mod tests {
     /// ② 回合**继续跑了一轮**（`rounds == 2`）⇒ 模型下一轮就能看到它；
     /// ③ 插话出现在**第二轮**的模型请求里。
     ///
-    /// 变异：把收场前的 `drain_boundary(ctx).await?` 整段删掉 ⇒
+    /// 变异：把收场前的 `drain_boundary(ctx, rounds).await?` 整段删掉 ⇒
     /// ①「会话里有插话」与 ③「第二轮请求含插话」两条断言同时变红。
     #[tokio::test]
     async fn steer_arriving_during_final_answer_is_not_lost() {
@@ -4392,6 +4448,174 @@ mod tests {
             Some(Duration::from_secs(300)),
             "工具与 limits 都未声明 ⇒ 外层预算回落 300s"
         );
+    }
+
+    // ── 手动压缩（`Boundary::Compact`）────────────────────────────
+
+    /// 轮边界收到 `Compact` ⇒ **就地压一次**，且本轮照常继续（模型被调用一次）。
+    ///
+    /// 会话预置成「**大于保留预算、远小于触发阈值**」⇒ 一次同时证明两件事：
+    /// ① 压缩真的变小了；② 手动压缩**不判阈值**（自动路径在这个会话上不会触发）。
+    ///
+    /// 变异：
+    /// - 删掉 `drain_boundary` 的 `Boundary::Compact` 臂 ⇒ 不压缩 ⇒ 本用例红；
+    /// - 给手动路径套上 `fixed < trigger && estimated + fixed > trigger` ⇒ 本用例红
+    ///   （会话未达阈值 ⇒ 不压缩）。
+    #[tokio::test]
+    async fn boundary_compact_compacts_without_waiting_for_threshold() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = UsageModel::new();
+        model.push_text("SUMMARY", Usage::default());
+        model.push_text("done", usage_with_reasoning(7));
+
+        // 20 条 × 4000 字符 ≈ 20 × 1000 token = 20000 token。
+        // 窗口 100000 ⇒ 保留预算 10000、触发点 85000 ⇒ **不达阈值**但可压。
+        let mut session = MemorySession::new();
+        seed_session_of(&mut session, 20, 4000).await;
+
+        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
+        boundary.push(ys_protocol::Boundary::Compact);
+
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(100_000, 0),
+            )
+            .with_boundary(boundary.clone());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert!(
+            has_compacted(&events),
+            "轮边界收到 Compact 必须压缩（不看阈值）：{:?}",
+            events.events()
+        );
+        let (before_tokens, after_tokens) = events
+            .events()
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ContextCompacted {
+                    estimated_tokens_before,
+                    estimated_tokens_after,
+                    ..
+                } => Some((*estimated_tokens_before, *estimated_tokens_after)),
+                _ => None,
+            })
+            .expect("必须发 ContextCompacted");
+        assert!(
+            after_tokens < before_tokens,
+            "压缩后估算 token 应变小：~{before_tokens} → ~{after_tokens}"
+        );
+        assert_eq!(
+            compaction_usages(&events).len(),
+            1,
+            "摘要调用的成本必须按 purpose=Compaction 上报：{:?}",
+            events.events()
+        );
+        assert_eq!(result.rounds, 1, "压缩不带来新输入 ⇒ 只跑本轮这一轮");
+    }
+
+    /// **收场前**收到 `Compact` ⇒ 压了，但**不得**多跑一轮。
+    ///
+    /// 这是「`Compact` 不算 `Consumed`」这条承重决定的钉子：`Consumed` 在三处调用点
+    /// 的语义都是「模型有新东西要看 ⇒ 继续循环」，而压缩只缩短会话、不带来新输入。
+    /// 若把 `Compact` 算成 `Consumed`，收场路径会 `continue` 出一轮**没有任何新输入**
+    /// 的模型调用。
+    ///
+    /// 构造方式：用自定义模型在**自己的 `complete()` 里**投 `Compact` —— 于是它必定
+    /// 落在本次模型调用**之后**、收场前那次 drain 之前，时机确定。
+    ///
+    /// 变异：把 `drain_boundary` 的 `Compact` 臂改成 `consumed = true` ⇒ 本用例红
+    /// （模型被调用两次）。
+    #[tokio::test]
+    async fn compact_arriving_during_final_answer_does_not_add_a_round() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
+        let model = CompactOnCompleteModel {
+            boundary: boundary.clone(),
+            calls: Mutex::new(0),
+        };
+
+        let mut session = MemorySession::new();
+        seed_session_of(&mut session, 20, 4000).await;
+
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(100_000, 0),
+            )
+            .with_boundary(boundary.clone());
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert!(
+            has_compacted(&events),
+            "收场前收到 Compact 仍必须压缩：{:?}",
+            events.events()
+        );
+        // ⚠️ 不能数模型调用次数：摘要本身也是一次模型调用（`compact::execute`）。
+        // 承重的是 `rounds` —— 它是「模型轮」的计数，压缩不占轮。
+        assert_eq!(
+            result.rounds, 1,
+            "收场前收到 Compact 不得凭空多跑一轮：rounds = {}",
+            result.rounds
+        );
+    }
+
+    /// 在自己的 `complete()` 里投 `Boundary::Compact` 的模型：每次调用都回一句终稿。
+    ///
+    /// 用它可以**确定性地**把 `Compact` 放在「本轮模型调用之后、收场前排空之前」。
+    struct CompactOnCompleteModel {
+        boundary: Arc<ys_protocol::QueueBoundarySource>,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for CompactOnCompleteModel {
+        fn model_id(&self) -> &str {
+            "compact-on-complete"
+        }
+
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            // **只在第一次调用时投一次**：每次都投会让「收场前压缩」不断产生新的
+            // 待压缩请求，若消费端误把 Compact 当 Consumed 就会无限续轮。
+            let first = {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                *n == 1
+            };
+            if first {
+                self.boundary.push(ys_protocol::Boundary::Compact);
+            }
+            Ok(ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
     }
 
     /// 源码级钉子：并行与串行**两处**构造点都要挂预算 ⇒ 源码里那条挂载调用的

@@ -447,6 +447,23 @@ fn dispatch(
                 }
                 app.begin_local_turn(message_text(msg));
             }
+            // **回合中的 `/compact` 走轮边界**（信道 ②），不排进 `request_rx`。
+            //
+            // `request_rx` 只在**回合之间**被消费 ⇒ 回合中投的 `Request::Compact`
+            // 要等整个回合跑完（可能几分钟）。压缩本就是轮边界动作（自动压缩就在
+            // `BasicLoop` 的轮边界）⇒ 回合中改投 `Boundary::Compact`，下一轮边界
+            // 立即执行。
+            //
+            // 当场补一行反馈：事件要等压缩真跑完才到，而用户此刻需要知道「敲进去了」。
+            if matches!(req, Request::Compact) && app.is_turning {
+                app.transcript
+                    .push(crate::transcript::TranscriptLine::System(
+                        "已请求压缩，将在下一轮边界执行…".into(),
+                    ));
+                app.follow = true;
+                send_boundary(boundaries, Boundary::Compact);
+                return;
+            }
             send_request(app, requests, req);
         }
         Action::Quit => app.should_quit = true,
@@ -486,9 +503,15 @@ fn send_request(app: &mut App, requests: &Sender<Request>, req: Request) {
 /// 与 [`request_abort`] 同一形态（`try_send` + 满则 `blocking_send`）：
 /// 队列满时**绝不静默丢掉用户输入** —— 消费者只在轮边界拉，短期内必满。
 fn send_steer(boundaries: &Sender<Boundary>, message: Message) {
-    if let Err(err) = boundaries.try_send(Boundary::Steer(message)) {
-        // 队列满（消费者只在轮边界拉）⇒ 退化为阻塞投递。
-        // Disconnected 时阻塞版立即返回 Err，不会挂住 UI 线程（此时 app 已收摊）。
+    send_boundary(boundaries, Boundary::Steer(message));
+}
+
+/// 投一条边界消息（轮边界信道 ②）。
+///
+/// `try_send` + 满则 `blocking_send`：队列满时**绝不静默丢掉** —— 消费者只在
+/// 轮边界拉，短期内必满。`Disconnected` 时阻塞版立即返回 `Err`，不会挂住 UI 线程。
+fn send_boundary(boundaries: &Sender<Boundary>, boundary: Boundary) {
+    if let Err(err) = boundaries.try_send(boundary) {
         let _ = boundaries.blocking_send(err.into_inner());
     }
 }
@@ -998,6 +1021,76 @@ mod tests {
         assert_eq!(a.turn_started_at, started, "回合时钟不得重置");
         assert_eq!(a.current_round, Some(7), "轮号不得清空");
         assert!(a.abort_requested, "已按下的 Ctrl-C 不得被插话清除");
+    }
+
+    /// **回合中 `/compact` ⇒ 走 `Boundary::Compact`，不走 `Request::Compact`**。
+    ///
+    /// 承重的三点：
+    ///  1. 边界信道收到 `Compact` —— 它在下一个轮边界立即执行；
+    ///  2. **请求信道一条都没有** —— 否则要等整个回合跑完（可能几分钟）；
+    ///  3. 本地**立即出反馈行** —— 压缩事件要等真跑完才到，用户此刻需要知道敲进去了。
+    ///
+    /// 变异：把 `dispatch` 里那个 `matches!(req, Request::Compact) && app.is_turning`
+    /// 分支删掉 ⇒ 断言 1、2 变红（退回排队路径）。
+    #[test]
+    fn compact_while_turning_goes_to_boundary() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        a.input.insert_str("/compact");
+
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+
+        assert_eq!(
+            ch.next_boundary().expect("回合中 /compact 必须投边界消息"),
+            Boundary::Compact,
+        );
+        assert!(
+            ch.next_request().is_none(),
+            "回合中 /compact **不得**发 `Request::Compact`（那要等整个回合结束）"
+        );
+        assert!(
+            a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::System(s) if s.contains("已请求压缩"))),
+            "必须当场给一行反馈：压缩事件要等真跑完才到"
+        );
+        assert!(a.is_turning, "请求压缩不改回合态");
+    }
+
+    /// **空闲时 `/compact` 仍走 `Request::Compact`**（外层循环立即处理，无需等轮边界）。
+    ///
+    /// 变异：把 `app.is_turning` 守卫去掉（恒走边界）⇒ 本用例红。
+    #[test]
+    fn compact_while_idle_stays_a_request() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/compact");
+
+        handle_key(
+            press(KeyCode::Enter),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+
+        assert_eq!(
+            ch.next_request().expect("空闲 /compact 应发请求"),
+            Request::Compact
+        );
+        assert!(
+            ch.next_boundary().is_none(),
+            "空闲路径不该投边界消息（没有轮边界可等）"
+        );
     }
 
     /// 空闲时提交**仍是** `Request::Prompt`（既有行为逐字节不变）。

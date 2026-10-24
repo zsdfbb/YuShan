@@ -808,6 +808,10 @@ async fn cancel_on_abort<F: std::future::Future>(
                     continue;
                 }
                 Some(Boundary::Steer(_)) => continue,
+                // 命令不是回合，没有轮边界可以消费压缩请求 ⇒ 丢弃。
+                // 与 `Steer` 同理：命令结束后下一回合的起点会排空残留，
+                // 故丢弃不改变任何已有语义（用户重敲一次即可）。
+                Some(Boundary::Compact) => continue,
                 None => return Some(fut.await),
             },
         }
@@ -1082,6 +1086,9 @@ async fn run_turn_once(
     //
     // `Deferred`（后台子 agent 的结果）同理保留：那是**子 agent 已经跑完产出的内容**，
     // 丢掉等于白烧一次派发。
+    //
+    // `Compact`（手动压缩请求）同样保留：用户敲的 `/compact` 不能因为「恰好跨了
+    // 回合边界」就静默失效 —— 它会在本回合第一个轮边界被取走并执行。
     let mut carry_over: Vec<Boundary> = Vec::new();
     while let Ok(b) = ctx.boundary_rx.try_recv() {
         if !matches!(b, Boundary::Abort) {
@@ -2946,6 +2953,46 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, AgentEvent::ContextCompacted { .. })),
             "回合开头必须按 config 刷新窗口（8000）→ 触发自动压缩：{msgs:?}"
+        );
+    }
+
+    /// **回合中的 `/compact` 在回合内执行**，不等回合结束。
+    ///
+    /// 这是本改动的端到端钉子：`Compact` 走**边界信道**（轮边界）而不是请求信道
+    /// （只在回合之间消费）。用「回合 1 的回复把会话养大 + 回合 2 里投 Compact」
+    /// 构造：若 `Compact` 仍走请求信道，它会排到回合 2 **结束之后**，本用例在
+    /// 回合 2 的出站序列里就看不到 `ContextCompacted`。
+    ///
+    /// 变异：把 `drain_boundary` 的 `Compact` 臂删掉（只认 `Steer`）⇒ 不压缩 ⇒ 红。
+    #[tokio::test]
+    async fn compact_in_flight_runs_within_the_turn() {
+        let model = MockModel::new("mock");
+        // 回合 1：把历史养到远超触发点。
+        model.push_text("a".repeat(28_000)); // ≈7000 token
+        // 回合 2：摘要 + 正式回复（顺序取决于压缩在本轮的位置：Step 4b 自动压缩
+        // 会先跑，但本用例窗口足够大、不自动触发 ⇒ 只有手动压缩一次）。
+        model.push_text("SUMMARY");
+        model.push_text("done");
+
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+        assert!(
+            !has_compaction(&msgs),
+            "回合 1 太小（默认窗口 128k，触发点 108k），不该压缩：{msgs:?}"
+        );
+
+        // 回合 2 进行中投 Compact —— 边界信道，下一轮边界执行。
+        h.requests.send(prompt("hi")).await.unwrap();
+        h.boundaries.send(Boundary::Compact).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        assert!(
+            has_compaction(&msgs),
+            "回合中的 Compact 必须在本回合内执行（轮边界），不得排到回合之后：{msgs:?}"
         );
     }
 

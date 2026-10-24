@@ -31,6 +31,7 @@
 |---|---|---|---|
 | `Request::Prompt(Message)` | `app_loop` 外层循环（`apps/coding-agent/src/app_loop.rs`） | **整个回合结束后** | TUI `submit()`（`crates/ys-tui-coding/src/events.rs`） |
 | `Boundary::Steer(Message)` | `BasicLoop` 轮边界（`crates/ys-loop/src/basic.rs`） | 下一轮模型调用前 | ✅ **已接上**（`8a08bd6`） |
+| `Boundary::Compact` | 同上 | 下一轮边界（**回合中立即压**，不等回合结束） | ✅ **已接上**（ADR-0052） |
 
 回合内的 `select!`（`apps/coding-agent/src/app_loop.rs`）只监听 `sink_rx`
 与 `boundary_rx`，**不监听 `request_rx`** ⇒ 回合中提交的 `Request::Prompt`

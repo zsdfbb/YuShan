@@ -149,7 +149,7 @@ flowchart LR
 | 信道 | 类型 | 方向 | 目的地 / 消费时机 | 容量 |
 |---|---|---|---|---|
 | ① Request | `ys_protocol::Request` | UI → app | app 线程 `recv().await`（**回合边界**） | 64 |
-| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`take`）；模型调用前 / 工具轮询用 `is_aborted` | 64 |
+| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`take`）；模型调用前 / 工具轮询用 `is_aborted`。变体：`Steer` / `Deferred` / `Compact` / `Abort` | 64 |
 | ③ Outbound | `ys_protocol::Outbound<CodingView>` | app → UI | UI 事件循环 `try_recv` 排空 | 1024 |
 
 **为何 ② 必须独立于 ①**：回合跑动时 app 线程阻塞在 `agent.run_turn()` 里，**不可能** `recv` ①；
@@ -282,6 +282,7 @@ TUI 按 `ToolCallId` 回填，不依赖 `ToolResult` 事件顺序。当前声明
 |---|---|---|---|
 | **回合**（Turn） | 一个回合开始前 | ① `Request::Prompt` | 「等它跑完再说」—— 排队等下一趟 |
 | **轮**（Round） | 每次模型调用前 | ② `Boundary::Steer` | 「agent 正在跑，我插句话」—— 中途掌舵 |
+| **轮**（Round） | 每次模型调用前 | ② `Boundary::Compact` | 「正在跑的回合里压一次上下文」—— 手动 `/compact` 的回合中投递路径（ADR-0052） |
 
 回合边界的拉取在 `app_loop::run` 里（`recv().await`）；轮边界的拉取在 `BasicLoop::run_turn`
 主循环里（否则 `AgentLoop` 就该感知信道，破坏分层）。
@@ -355,7 +356,7 @@ flowchart TB
 
     subgraph IN["两条边界（取代旧 Inbox）"]
         REQ["① Request（回合边界）<br/>Prompt / SetModel / Login / Logout<br/>/ NewSession / Compact / Export"]
-        BND["② Boundary（轮边界）<br/>Steer(Message) / Abort"]
+        BND["② Boundary（轮边界）<br/>Steer(Message) / Deferred / Compact / Abort"]
     end
 
     REQ -->|Prompt| TURN["app_loop 跑一个 turn"]
@@ -787,7 +788,7 @@ flowchart TB
 | `/logout` | — | `Logout` |
 | `/new` | — | `NewSession` |
 | `/resume [id]` | 无参时**浮层选择**（会话列表，Esc 取消）；有参**直切** | `ListSessions` / `ResumeSession` |
-| `/compact` | — | `Compact` |
+| `/compact` | 空闲 ⇒ 立即压；**回合中 ⇒ 改投 `Boundary::Compact`**，下一个轮边界执行（ADR-0052） | `Compact` |
 | `/export [path]` | — | `Export` |
 
 **`Prompter` trait 保留**：`select` / `text` 是「选择器可测」的答案。**决策逻辑**抽在纯函数

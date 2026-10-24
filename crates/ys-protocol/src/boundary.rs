@@ -21,6 +21,15 @@ pub enum Boundary {
     /// **为什么不做成 `Steer` 的复用**：`Steer` 会被渲染成**用户行**；异步结果是
     /// 系统产物，混在一起会让用户看到自己没说过的话被画成自己的发言。
     Deferred { handle: String, message: Message },
+    /// **手动请求压缩**（`/compact`）：在**下一个轮边界**执行，不等回合结束。
+    ///
+    /// 走边界信道而非请求信道的理由：压缩本来就是轮边界动作（自动压缩在
+    /// `BasicLoop` 的 Step 4b，模型调用之前），而请求信道只在回合之间被消费 ⇒
+    /// 回合中投的 `Request::Compact` 要等整个回合跑完，可能长达几分钟。
+    ///
+    /// **不改变 `consumed` 语义**：压缩只缩短会话、不带来新的模型输入 ⇒
+    /// 消费端不得因此额外跑一轮。
+    Compact,
     /// 中止：当前 turn 以 `StopReason::Cancelled` 收场。
     Abort,
 }
@@ -47,11 +56,15 @@ pub trait BoundarySource: Send + Sync + std::fmt::Debug {
     /// 可重复调用；与 `take` 互不影响（`take` 不会清除该标记）。
     fn is_aborted(&self) -> bool;
 
-    /// 非破坏性探针：队列里是否有**尚未消费的用户插话**（`Boundary::Steer`）。
+    /// 非破坏性探针：队列里是否有**尚未消费的、需要打断工具的边界消息**
+    /// （`Boundary::Steer` / `Boundary::Compact`）。
     ///
     /// 供**长工具**在运行期间轮询：命中即提前收口，让 `BasicLoop` 尽快回到轮边界
-    /// 消费插话。`Steer` 的生效点仍是轮边界（`take` + append），本探针只缩短
-    /// 「等工具」的时间，**不改变插话语义**。
+    /// 消费它们。两者的生效点仍是轮边界（`take`），本探针只缩短「等工具」的时间，
+    /// **不改变语义**。
+    ///
+    /// `Compact` 算在内：不打断的话，一个跑十几分钟的工具会让 `/compact` 同样等
+    /// 十几分钟 —— 那正是本变体要消除的延迟。
     ///
     /// **默认 `false` = 本实现不暴露插话状态**（例如子 agent 的边界源刻意不透传
     /// 父队列）—— 工具据此退回「跑到自然结束」。
@@ -116,7 +129,8 @@ impl QueueBoundarySource {
         self.lock().aborted
     }
 
-    /// 队列里是否有未消费的 `Steer`（[`BoundarySource::has_pending_steer`] 的实现）。
+    /// 队列里是否有未消费的 `Steer` / `Compact`（[`BoundarySource::has_pending_steer`]
+    /// 的实现）。
     ///
     /// 只做一次 `matches!` 扫描，**不拷贝消息正文**；`Abort` / `Deferred` 一律不算 ——
     /// 它们不需要打断正在跑的工具。
@@ -124,7 +138,7 @@ impl QueueBoundarySource {
         self.lock()
             .queue
             .iter()
-            .any(|b| matches!(b, Boundary::Steer(_)))
+            .any(|b| matches!(b, Boundary::Steer(_) | Boundary::Compact))
     }
 
     /// 队列是否为空。
@@ -325,6 +339,64 @@ mod tests {
         assert!(out.contains("aborted"), "缺少 aborted 字段：{out}");
         assert!(out.contains("queued"), "缺少 queued 字段：{out}");
         assert!(out.contains("queued: 1"), "queued 应反映队列长度：{out}");
+    }
+
+    // ── `Compact`（手动压缩走轮边界） ──────────────────────────────
+
+    /// `Compact` 入队**不置** `aborted`：它只要求压缩，不要求收场。
+    ///
+    /// 变异：把 `push` 的 `matches!(boundary, Boundary::Abort)` 放宽成也匹配
+    /// `Compact` ⇒ 本用例红（回合会被误取消）。
+    #[test]
+    fn test_compact_does_not_set_abort_flag() {
+        let src = QueueBoundarySource::new();
+        src.push(Boundary::Compact);
+        assert!(!src.is_aborted(), "Compact 不得置 abort 标记");
+        assert_eq!(src.take(), Some(Boundary::Compact), "Compact 仍可取回");
+    }
+
+    /// `Compact` 参与 FIFO：与 `Steer` / `Abort` 混排时按入队顺序交还。
+    #[test]
+    fn test_compact_preserves_fifo_order() {
+        let src = QueueBoundarySource::new();
+        src.push(steer_msg("a"));
+        src.push(Boundary::Compact);
+        src.push(Boundary::Abort);
+
+        assert_eq!(src.take(), Some(steer_msg("a")));
+        assert_eq!(src.take(), Some(Boundary::Compact));
+        assert_eq!(src.take(), Some(Boundary::Abort));
+        assert_eq!(src.take(), None);
+    }
+
+    /// `Debug` 不得因为新变体而泄露内容（`Compact` 无正文，但契约仍要钉住）。
+    #[test]
+    fn test_debug_with_compact_still_has_no_body() {
+        const SENTINEL: &str = "SENTINEL_COMPACT_7";
+        let src = QueueBoundarySource::new();
+        src.push(steer_msg(SENTINEL));
+        src.push(Boundary::Compact);
+
+        let out = format!("{:?}", src);
+        assert!(!out.contains(SENTINEL), "Debug 泄露了正文：{out}");
+        assert!(out.contains("queued: 2"), "queued 应反映长度：{out}");
+    }
+
+    /// `has_pending_steer` **包含** `Compact`：不打断的话，一个跑十几分钟的
+    /// 工具会让 `/compact` 同样等十几分钟 —— 那正是本变体要消除的延迟。
+    ///
+    /// 变异：把扫描改回只匹配 `Steer(_)` ⇒ 本用例红。
+    #[test]
+    fn test_has_pending_steer_includes_compact() {
+        let src = QueueBoundarySource::new();
+        assert!(!src.has_pending_steer());
+        src.push(Boundary::Compact);
+        assert!(
+            src.has_pending_steer(),
+            "Compact 也应打断长工具，让轮边界尽快取走它"
+        );
+        assert_eq!(src.take(), Some(Boundary::Compact));
+        assert!(!src.has_pending_steer(), "取走后不得再报");
     }
 
     // ── 插话探针（长工具提前收口的依据） ────────────────────────────

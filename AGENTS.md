@@ -56,7 +56,18 @@ YuShan/
 
 ## 常用命令
 
-- `cargo build` / `cargo clippy --all-targets` / `cargo fmt`
+- **`./scripts/cargo-build.sh` —— 构建 / 检查的入口，改代码后用它而不是裸 `cargo`**
+  - 等价用法：`./scripts/cargo-build.sh [<子命令>] [cargo 参数...]`；首参不是子命令时补 `build`
+    （`--tests` ⇒ `cargo build --tests`，`check -p ys-loop` ⇒ 原样透传）。退出码原样透传。
+  - 它做的事：检查 `target/debug/deps` 条目数，超阈值（默认 **400,000**）就
+    `cargo clean -p` **全部 workspace 成员**（实测 5.54s，81,500 → 928 条目），再跑 cargo。
+    ⚠️ 不清外部依赖 —— 那 248 个包的重编才是冷构建成本的大头。
+  - 动机：rustc 增量编译**从不删旧的 `.rcgu.o`**，改 `ys-core` 每次 +6,247 个。
+    堆到 92 万时瓶颈变成文件系统 ⇒ 改 `ys-core` 的增量 4.20s → **163s**、全量测试
+    7.55s → **184s**、全量 `cargo clean` 要 **92s**。清完即回到正常。
+  - 选项：`CARGO_GUARD_LIMIT` 改阈值（`0` 关闭）、`CARGO_GUARD_KEEP` 保留指定 crate、
+    `CARGO_GUARD_QUIET` 不打印清理信息。
+- `cargo clippy --all-targets` / `cargo fmt`
 - **`./scripts/par-test.sh` —— 全量测试的唯一入口，必须用它**
   - `cargo test --workspace` **串行**跑各测试二进制（总耗时 = 各二进制之和），实测 **≈34s**；
     本脚本跨二进制并行（默认 8 路），**≈7.4s**，用例完全相同。

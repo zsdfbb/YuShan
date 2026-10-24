@@ -164,3 +164,154 @@
 - 若接受调试信息降级，把 `[profile.test] debug = "line-tables-only"` 写进根 `Cargo.toml` 即可。
 - 慢测试定位：`cargo nextest run --workspace` 已在手边；若发现某用例 >2s，优先看它的
   `sleep` / 墙钟断言。
+
+---
+
+## 2026-10-24 追加探查（macOS / 解耦可行性）
+
+> 环境：macOS arm64、10 核（4P+6E）、rustc 1.99。**本节的耗时数字尚未测**（见第 6 条）；
+> 下面都是静态勘察结论与决策记录。
+
+### 1. 构建缓存处于病态状态（必须先清理）
+
+- `target` 总计约 **24 GB**；`target/debug/deps` 有 **932,030 个文件**。
+- 其中 `*.rcgu.o` **925,912 个（约 22 GB）**，最早 2026-09-13、最新 2026-10-24；
+  同目录另有 426 个可执行文件、1,010 个 `.rlib`、2,121 个 `.rmeta`。
+- `.rcgu.o` 是链接前的中转对象，正常情况下会被 rustc 清理；成规模残留高度疑似
+  「构建在链接/中途被杀死」。**测量前先 `cargo clean`**，否则基线不可信。
+- 维护约定：长冷构建放前台并给足超时；不要让构建被超时 kill 后继续累积。
+
+### 2. app 是最大的单一编译单元
+
+- `apps/coding-agent`：src **30,176 行**（22 文件）+ `tests/` **9,730 行**（16 文件）；
+  `apps/coding-agent/Cargo.toml` **没有 lib target**，只有 bin `ys-coding-agent`。
+- `cargo test --no-run` 会把该 bin 编译两次（bin 目标 + bin test harness，428 个单测）；
+  app 约一半行数是内联 `#[cfg(test)]` 测试。
+- 近 6 个月文件级 churn：`main.rs` 54、`app_loop.rs` 37、`prompt.rs` 26、
+  `crates/ys-loop/src/basic.rs` 25、`config.rs` 22、TUI `events.rs`/`app.rs` 各 20。
+
+### 3. 测试目标与忽略用例
+
+- `par-test.sh` 当前发现 **39 个测试二进制**；11 个 app 集成测试通过
+  `env!("CARGO_BIN_EXE_ys-coding-agent")` 启动 34 MB 的真实二进制。
+- `tests/e2e_tools.rs` 与 `tests/e2e_skills.rs` 各只有 1 个 `#[ignore]` 用例；
+  `adapters/tools-web/tests/harvest.rs` 的 5 个用例全 `#[ignore]` —— 这三个文件
+  适合用 `required-features` 移出默认构建。
+- **`tests/e2e_bench.rs` 不能整文件移出**：它有 12 个 `#[test]`，只有 `bench_report`
+  一个 `#[ignore]`，其余是活跃的解析/环境测试。要省只能把 `bench_report` 拆到新文件再 gate。
+
+### 4. 解耦判断
+
+- **值得拆**：`apps/coding-agent` 按依赖深度拆成 4 个产品 lib + 薄 bin
+  （`ys-coding-base` → `ys-coding-domain` → `ys-coding-app` → `ys-coding-cli`）。
+  高频编辑的 `main.rs`/`app_loop.rs` 会落进小得多的编译单元。
+- **不值得拆**：
+  - `ys-core`（504 行、churn 低，`Message` 几乎全仓使用；拆了收益小于成本）。
+    这推翻了本文件前面「减少 `ys-core` 被依赖面」的后续建议：真正的高杠杆是 app crate。
+  - `ys-tui-coding` 内部（`app ↔ commands ↔ completion ↔ draw ↔ events` 是密集环）。
+  - 按事件域拆 `ys-event`（所有消费方都持有完整 `AgentEvent`）。
+- **通用组件**（回答「哪些应该放 `./crates`」）：
+  - `channel.rs`（666 行）是唯一现在就能干净下沉的通用件 →
+    可选新增 `crates/ys-event-channel`（只是 `EventSink` 的 tokio 传输实现；
+    `Envelope`/`LifecyclePolicy` 仍在零 tokio 的 `ys-protocol`；不是复活 ADR-0013
+    删除的旧 `ys-channel`）。
+  - `test_env.rs`（59 行）→ dev-only `crates/ys-test-support`。
+  - `debug_log`/`round_clock`/`logging`、`wiring`、`provider`、`subagent` 仍带
+    产品/adapter 耦合，列二期/三期；一期不硬拆。
+  - `sessions`/`status`/`state`/`help`/`worktree` 与 `config`/`skills`/`prompt`/
+    `toolset`/`assembly`/`capabilities`/`view`/`app_loop` 属产品层，留 app。
+
+### 5. 构建/测试配置结论
+
+- 根 `Cargo.toml` 目前**没有任何 `[profile]` 段**。
+- 已确认 Cargo 语义：`[profile.dev.package."*"]` 只作用于**非 workspace 成员**
+  （官方文档：for all dependencies (but not any workspace member)），因此可以只关
+  第三方依赖的 debug，自己的 crate 保留完整调试信息。
+- 冷构建由 248 个外部依赖主导；内部拆 crate 对冷构建帮助有限，主要收益来自
+  「第三方依赖 `debug = false`」+ 清缓存。全量测试**执行**时间需单独测关键路径。
+
+### 6. 待办：本机基线尚未测
+
+plan mode 下不能跑构建，因此 **macOS 上的增量/冷构建/测试执行数字都还没有**。
+下一步先按上面第 1 条清理 `target`，再用扩展后的 `scripts/build-baseline.sh`
+测量，之后才能判断验收目标是否可达。
+
+---
+
+## 2026-10-25 本机基线已测（结算 §6 待办）
+
+环境：macOS arm64、Apple M4 10 核、负载 5.26。全部为前台运行。
+
+### 1. 清理前（病态）vs 清理后
+
+| 场景 | 清理前 | **清理后** | 提升 | §4.2 文档基线（Android 8 核） |
+|---|---:|---:|---:|---:|
+| 冷构建 `--tests` | — | **24.96s** | — | 75–176s |
+| noop | 0.35s | **0.24s** | — | 0.32s |
+| 改叶子 `app_loop.rs` 后增量 | 4.68s | **0.98s** | 4.8× | 3.6s |
+| 改 `ys-core` 后增量 | 163s | **4.20s** | 39× | 11.0s |
+| `par-test.sh`（39 个二进制） | 184s | **7.55s** | 24× | 7.4s |
+
+`cargo clean` 本身耗时 **92.39s**，移除 **967,797 文件 / 65.1 GiB**（`du` 报 24G 是严重低估）。
+
+**判据证据**：清理前两个红字场景的 `user` / `sys` 严重失衡——改 `ys-core` 是
+`user 15.09s` / `sys 104.75s`，测试执行是 `user 6.03s` / `sys 21.82s`。
+真正的编译只占十几秒，其余全是**文件系统**在为 92 万个目录项付代价。
+
+### 2. §4 的「值得拆 app」判断缺乏本机证据
+
+清理后：改 `ys-core`（底层，12 个 crate 依赖它）**4.20s** vs 改 `app_loop.rs`（叶）**0.98s**，
+差距仅 **3.2s**。把 30k 行 app 拆成 4 层能拿回其中一部分，但**同一份收益已被清理的 39× 覆盖**。
+⇒ 拆分的立项理由（构建慢）在本机不成立。若要继续拆，须换理由（如两产品复用）。
+
+**未测项**：§4 的拆 crate 方案未做实测对比，故「拆分无收益」是本机测量下的**阶段性结论**，
+不是终局判定。
+
+### 3. `.rcgu.o` 的真实成因：正常增量就在堆积（此条推翻 §1 的「疑似被 kill」）
+
+| 实验 | `.o` 变化 |
+|---|---|
+| 连续 10 次改 `ys-core` | 13,357 → **75,827**（每次 **+6,247**） |
+| 连续 5 次改 `app_loop.rs` | 75,827 → 78,387（每次 **+512**） |
+
+**正常增量构建从不删旧的 `.rcgu.o`**，不需要「被 kill」。按 +6,247/次 推算，
+92 万 ≈ 140 次 `ys-core` 级构建，即**数天正常开发量**，而非异常。
+
+（§1 记的 `RLIMIT_FSIZE` 让链接失败，仍会加速堆积，但不是必要条件。）
+
+**体积 vs 数量**：`.o` 逻辑大小 4.87 GB，但 `du` 报 `deps` 仅 1.2G —— APFS 对零填充的
+`.o` 做了透明压缩。**瓶颈是文件数，不是字节数**（清理 92s 里 `user` 只有 0.72s）。
+
+### 4. 清理方案实测（`cargo clean -p` 三个档次）
+
+| 清理对象 | 耗时 | 条目变化 | 之后的构建 |
+|---|---:|---|---:|
+| 1 个 crate（`ys-coding-agent`） | **2.17s** | 51,938 → 49,632 | 6.92s |
+| 4 个高 churn crate | 2.17s | 51,938 → 45,953 | 8.69s |
+| **全部 14 个 workspace 成员** | **5.54s** | 81,500 → **928** | **16.04s** |
+| 对照：全量 `cargo clean` | 92s | → 0 | 24.96s |
+
+**为什么清全部成员**：清 4 个只降 6 千（未清的 crate 同样在堆）；清全部 14 个降到 928。
+外部依赖（248 个包）**不清**——它们的重编才是冷构建成本的大头。
+
+**手删 `.o` 也安全**（实测）：删 `ys_loop` 的 3,732 个之后，no-op 构建仍 0.08s、
+二进制照常运行、`.o` 不被重建；下次真正重编时只补回当前需要的 **311** 个。
+⇒ 一个 crate 正常只需 311 个，3,732 是约 12 次构建的累积。
+
+### 5. 已落地：`scripts/cargo-build.sh`
+
+构建/检查的统一入口（`AGENTS.md` 已列为改代码后的默认命令）：
+先查 `deps` 条目数，超阈值（默认 **400,000**）就 `cargo clean -p` **全部 workspace 成员**
+（包名从成员表派生，不硬编码），然后透传 cargo 子命令与参数、**退出码原样返回**。
+
+- 检查成本 **0.11s**，故每次都查；清理成本 5.54s + 下次构建多付 11.84s（4.20 → 16.04）。
+- 阈值 400,000 ≈ 干净态（7,294）的 55 倍 ⇒ 正常开发约 **63 次 `ys-core` 级构建**才触发一次。
+- **先清理、再构建**：单次构建净增 6,247，构建后查到的数字已含本次增量，那时再清等于
+  刚建完就拆掉。
+- `scripts/par-test.sh` 的构建步骤也改走它（测试构建是同一批 `.o` 的生产者）。
+
+### 6. 仍未做
+
+- §4 的 4 层拆分**未实测**（本机数据显示收益已被清理吃掉，但没做对照测量）。
+- `debug = "line-tables-only"`（§未澄清问题 1）仍未决。
+- §3 的三个 `#[ignore]` 测试文件裁剪进 `required-features` 仍未做。

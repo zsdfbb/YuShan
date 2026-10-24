@@ -69,8 +69,11 @@ mkdir -p "$FAILED" || exit 1
 trap 'rm -f "$EXES"; rm -rf "$FAILED"' EXIT
 
 # ── 1) 构建并取出全部测试二进制 ──
+#
+# 走 `cargo-build.sh` 而不是裸 `cargo`：测试构建同样是 `.rcgu.o` 的生产者，
+# 而它是 agent 最常跑的一类命令（一次 `--tests` 就净增数千条目）。
 if [ "$DO_BUILD" -eq 1 ]; then
-  if ! cargo test --workspace --no-run --message-format=json 2>"$WORK/yushan-par-test-build.$$.err" \
+  if ! ./scripts/cargo-build.sh test --workspace --no-run --message-format=json 2>"$WORK/yushan-par-test-build.$$.err" \
     | python3 -c '
 import sys, json
 for line in sys.stdin:

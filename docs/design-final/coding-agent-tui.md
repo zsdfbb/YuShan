@@ -731,6 +731,16 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 - **`model` 参数**：按名构造（`Config::build_model_for`）+ `Arc<dyn Model>` 缓存（复用连接池/TLS）；构造失败 **fail-closed**，绝不静默回退父模型。
 - **usage 上卷**：子 usage 累加进 `Arc<UsageTotals>`，回合末 drain 并追加进 `RunResult.usage` ⇒ `TurnStats` / meta / 退出码看到真实总消耗。
 
+### 13.3b 异步派发（`subagent_async`）的投递
+
+- **派发即返回**：`SubagentAsyncTool` 只登记后台任务（`tokio::spawn`），立刻回句柄 `sa{N}`；取消机制**不适用**（它本来就不阻塞父回合）。
+- **任务是真的分离**：`spawn` 的 `JoinHandle` 被丢弃、没有 abort 路径 ⇒ 父回合结束后子 agent **继续运行**（实测转录在回合结束后 2~6 分钟才落盘）。「回合结束即取消」从来不是实现行为。
+- **结果跨回合送达**：完成结果交给 `PendingResults`（**进程级**、`Arc` 跨工作区重建共享）——
+  - 本回合**已绑定**落点（`SubagentSetup::bind_results`，守卫活到回合块末）⇒ 直接 `push` 成 `Boundary::Deferred`，`BasicLoop` 在轮边界 append 并 emit `DeferredResult`；
+  - **未绑定**（回合已结束）⇒ 留表（上限 `MAX_PENDING_RESULTS = 32`，超限淘汰最旧并留日志），由**下一回合开头**一次性补投。
+- **补投不限流**（与后台命令的 `BG_CATCHUP_PER_TURN = 2` 不同）：派发数量已被 `DEFAULT_MAX_DISPATCHES_PER_TURN` 封顶，且每条结果都在等一个明确答复 —— 限流只会让模型继续误以为「还没回来」。
+- **提示词据此约束模型行为**：`subagent_async` 在场时的 guideline 明确「结束回合不丢结果，下一回合开头送达」，并禁止未核实就声称「还在跑」。
+
 ### 13.4 并行批（Step 9）
 
 - 准入：批次 `len > 1` **且每一个**工具都 `is_concurrency_safe()` ⇒ 走 `futures_util::stream::iter(..).buffer_unordered(max_parallel_tools.max(1))`（单任务内并发、完成即交出一个结果、不需 `'static`）；否则**原串行路径**。`max_parallel_tools = 0` 钳为 1。

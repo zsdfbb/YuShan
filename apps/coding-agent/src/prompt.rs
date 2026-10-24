@@ -323,8 +323,10 @@ fn tool_guidelines(tools: &[&str]) -> String {
             "Use subagent_async instead of subagent when you want to dispatch several sub-tasks \
              or keep answering the user while a sub-agent works: it returns a handle immediately \
              and the result is delivered to you automatically when it finishes — do NOT poll for \
-             it. Keep doing your own part after dispatching; if you end the turn before it \
-             finishes, that sub-agent is cancelled and its result is lost"
+             it. Keep doing your own part after dispatching. If you end the turn before it \
+             finishes, the sub-agent keeps running and its result is delivered at the start of \
+             your next turn — so never claim a dispatched sub-agent is still running without \
+             checking, and never re-dispatch the same work"
                 .to_string(),
         );
     }
@@ -1111,10 +1113,12 @@ mod tests {
         );
         // **异步派发**的指引只在 `subagent_async` 在场时出现（子表没有它）。
         //
-        // 承重的两句：① 结果**自动送达、不要 poll**；② **别在它跑完前结束回合**
-        //（回合末不等异步子 agent ⇒ 结束即取消，结果丢失）。
+        // 承重的三句：① 结果**自动送达、不要 poll**；② 结束回合**不会**丢结果 ——
+        // 子 agent 继续跑，结果在**下一回合开头**送达（投递表跨回合，见
+        // `subagent::PendingResults`）；③ **不得谎报状态**：没核实就别声称还在跑
+        // （真实事故：模型连答两次「还在跑」，而子 agent 早已完成）。
         //
-        // 变异：删掉「do NOT poll for it」或「if you end the turn before it finishes」
+        // 变异：删掉「do NOT poll for it」/「delivered at the start of your next turn」
         // ⇒ 变红。
         let with_async = build_system_prompt(
             &dir,
@@ -1126,9 +1130,13 @@ mod tests {
             "必须说明「结果自动送达、不要 poll」；prompt = {with_async}"
         );
         assert!(
-            with_async.contains("if you end the turn before it finishes")
-                && with_async.contains("cancelled"),
-            "必须说明「回合结束即取消、结果丢失」；prompt = {with_async}"
+            with_async.contains("If you end the turn before it finishes")
+                && with_async.contains("delivered at the start of your next turn"),
+            "必须说明「结束回合不丢结果，下一回合开头送达」；prompt = {with_async}"
+        );
+        assert!(
+            with_async.contains("never claim a dispatched sub-agent is still running"),
+            "必须禁止未核实就声称「还在跑」；prompt = {with_async}"
         );
         let without = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
         assert!(

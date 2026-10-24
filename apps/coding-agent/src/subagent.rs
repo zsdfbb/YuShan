@@ -40,6 +40,13 @@ pub const OUTER_GRACE: Duration = Duration::from_secs(60);
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 const DIAGNOSTIC_PREFIX: &str = "[diagnostic: ";
 
+/// 跨回合最多滞留多少条**未投出**的后台结果。
+///
+/// 与 [`DEFAULT_MAX_DISPATCHES_PER_TURN`] 同量级：一个回合最多派发 16 次，
+/// 若全都在回合末之后完成，下一回合要能全部投出去。超出时**淘汰最旧**并
+/// 留一行日志（结果本身仍能从产物转录里找回 —— 那才是权威副本）。
+pub const MAX_PENDING_RESULTS: usize = 32;
+
 /// 子 agent 被取消时的可归因来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancelCause {
@@ -160,6 +167,133 @@ impl UsageTotals {
     }
 }
 
+/// 一条**已跑完、尚未送达**的后台派发结果。
+///
+/// 只在「完成时本回合已结束」或「完成时落点未绑定」两条路径上入表 ——
+/// 正常情况下结果直接进本回合的边界源，不经过这里。
+struct PendingResult {
+    handle: String,
+    message: Message,
+}
+
+/// 后台派发结果的**进程级**投递表。
+///
+/// # 为何需要（生产证据，会话 `1792840206_799154000`）
+///
+/// `tokio::spawn` 是**分离任务**（`JoinHandle` 已丢弃，无 abort 路径）：子 agent
+/// 在父回合结束后仍会继续跑（日志实测：turn 11 于 20:14:28 结束，子转录
+/// 20:16:59 / 20:20:47 才落盘）。若完成时只 `push` 进**回合局部**的边界源，
+/// 那条结果会随回合一起销毁 —— 子 agent 白跑，模型永远等不到。
+///
+/// 故结果先落到本表（跨回合存活），再由每回合开头补投进**当前**边界源。
+/// 与后台命令（`bash_bg` 的 `BackgroundTasks::deferred`）**同一套形态**：
+/// 注册表是进程级的、落点是每回合绑定的。
+#[derive(Default)]
+pub struct PendingResults {
+    inner: Mutex<PendingInner>,
+}
+
+#[derive(Default)]
+struct PendingInner {
+    /// 本回合的投递落点（`None` = 未绑定 ⇒ 结果留表等下回合补投）。
+    sink: Option<Arc<QueueBoundarySource>>,
+    /// 绑定时那格的代数 —— 解绑只在代数仍相同时生效，
+    /// 避免晚 drop 的旧守卫把新回合刚绑的落点抹掉。
+    generation: u64,
+    /// 未送达的结果，**入表顺序**（最旧在前）。
+    queue: Vec<PendingResult>,
+}
+
+impl PendingResults {
+    /// 绑定本回合的落点 —— 守卫 drop 时解绑。
+    ///
+    /// 后一次绑定替换前一次（同一回合重复绑定会换到新队列，最后一个生效）。
+    pub fn bind(self: &Arc<Self>, sink: Arc<QueueBoundarySource>) -> PendingResultsBinding {
+        let generation = {
+            let mut inner = self.lock();
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.sink = Some(sink);
+            inner.generation
+        };
+        PendingResultsBinding {
+            results: Arc::clone(self),
+            generation,
+        }
+    }
+
+    fn unbind(&self, generation: u64) {
+        let mut inner = self.lock();
+        if inner.generation == generation {
+            inner.sink = None;
+        }
+    }
+
+    /// 交付一条结果：**已绑定** ⇒ 直接进本回合边界源；**未绑定** ⇒ 留表。
+    ///
+    /// 返回 `true` = 已投出（结果不再留表）。
+    fn deliver(self: &Arc<Self>, handle: String, message: Message) -> bool {
+        // **先取落点、释放锁，再 push**：`push` 会唤醒等待者，持锁调外部代码是坏习惯。
+        let sink = {
+            let mut inner = self.lock();
+            if let Some(sink) = inner.sink.clone() {
+                sink
+            } else {
+                // 未绑定（回合已结束 / 尚未开始）⇒ 留表，下一回合补投。
+                if inner.queue.len() >= MAX_PENDING_RESULTS {
+                    let dropped = inner.queue.remove(0);
+                    crate::logging::log(&format!(
+                        "subagent: 未投出的结果超过 {MAX_PENDING_RESULTS} 条，淘汰最旧的一条（{}）—— \
+                         完整转录仍在该次派发的产物文件里",
+                        dropped.handle
+                    ));
+                }
+                inner.queue.push(PendingResult { handle, message });
+                return false;
+            }
+        };
+        sink.push(Boundary::Deferred { handle, message });
+        true
+    }
+
+    /// 取走全部未投出的结果（**当前回合**的补投入口）—— 按入表顺序。
+    ///
+    /// 本表是进程级的、会话无关：子 agent 的结果不像后台命令那样带会话归属
+    /// （子 agent 在哪个会话里跑完，结果就属于哪里；跨会话串台的风险由
+    /// 「一条结果只入表一次」保证）。
+    pub fn take_pending(&self) -> Vec<(String, Message)> {
+        let mut inner = self.lock();
+        inner
+            .queue
+            .drain(..)
+            .map(|p| (p.handle, p.message))
+            .collect()
+    }
+
+    /// 未投出条数（**仅供测试** —— 生产路径不需要它，故不进非测试构建）。
+    #[cfg(test)]
+    pub fn pending_len(&self) -> usize {
+        self.lock().queue.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// [`PendingResults::bind`] 的 RAII 守卫 —— drop 时解绑本回合的落点。
+pub struct PendingResultsBinding {
+    results: Arc<PendingResults>,
+    generation: u64,
+}
+
+impl Drop for PendingResultsBinding {
+    fn drop(&mut self) {
+        self.results.unbind(self.generation);
+    }
+}
+
 /// 产物目录。`YUSHAN_SUBAGENTS_DIR` 显式指定时是 **Override 档（只写不删）**；
 /// 否则是 `~/.yushan/subagents/`（Primary 档，启动期可 sweep）。
 pub struct SubagentsDir {
@@ -260,11 +394,12 @@ pub struct AppSubagentRunner<'a> {
     /// **必须是 `Arc` 而非借用**：`ChildBoundary` 要能进 `Arc<dyn BoundarySource>`
     /// （隐含 `'static`），借用父会把它拽出 `'static`。
     parent_boundary: Option<Arc<dyn BoundarySource>>,
-    /// 后台结果回投的落点（**具体类型**，因为要用 `push` 而 trait 只有 `take`/`is_aborted`）。
+    /// 后台结果的**跨回合**投递表。
     ///
-    /// 与 `parent_boundary` 指向**同一个对象**（生产路径上由 `app_loop` 同时传入），
-    /// 只是多留一份具体类型以便 `Boundary::Deferred` 入队。
-    result_sink: Option<Arc<QueueBoundarySource>>,
+    /// 子 agent 完成时本回合可能已经结束（`tokio::spawn` 是分离任务）⇒ 不能只
+    /// 往回合本地的边界源里 `push`（那份队列随回合销毁）。故统一交给本表：
+    /// 已绑定落点就直接投，否则留表等下回合补投。详见 [`PendingResults`]。
+    results: Arc<PendingResults>,
 }
 
 impl<'a> AppSubagentRunner<'a> {
@@ -281,7 +416,7 @@ impl<'a> AppSubagentRunner<'a> {
         dir: Arc<SubagentsDir>,
         totals: Arc<UsageTotals>,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
-        result_sink: Option<Arc<QueueBoundarySource>>,
+        results: Arc<PendingResults>,
     ) -> Self {
         Self {
             parent_model,
@@ -297,7 +432,7 @@ impl<'a> AppSubagentRunner<'a> {
             dispatched: AtomicU32::new(0),
             totals,
             parent_boundary,
-            result_sink,
+            results,
         }
     }
 }
@@ -316,6 +451,12 @@ pub struct SubagentSetup {
     /// 按「模型名 + 构建时档位」缓存实例（跨派发复用；缓存持 `Arc<dyn Model>`，
     /// 见 runner 的注释）。
     model_cache: SubagentModelCache,
+    /// 后台结果的**跨回合**投递表（`Arc` 跨重建共享）。
+    ///
+    /// 与 `dir` 同理以 `Arc` 传入：工作区切换（`/resume`）会重建本结构，但
+    /// **已在后台跑着的子 agent 并不随之重建** —— 它们完成时写的那份表必须与
+    /// 重建后的新表是**同一个**，否则结果又落进无人读的旧表。
+    results: Arc<PendingResults>,
 }
 
 impl SubagentSetup {
@@ -333,6 +474,7 @@ impl SubagentSetup {
         workspace: PathBuf,
         web: WebConfig,
         dir: Arc<SubagentsDir>,
+        results: Arc<PendingResults>,
     ) -> Self {
         Self {
             child_prompt,
@@ -342,12 +484,29 @@ impl SubagentSetup {
             web,
             dir,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
+            results,
         }
     }
 
     /// 派发工具的外闸（子预算 + 宽限，构造期注入）。
     pub fn outer_timeout(&self) -> Duration {
         self.child_budget + OUTER_GRACE
+    }
+
+    /// 绑定**本回合**的结果落点 —— 守卫 drop 时解绑。
+    ///
+    /// 调用方必须让守卫活到回合结束（绑定给具名变量，不写 `_`）：中途解绑会让
+    /// 本回合后半程完成的结果只能留表，平白晚一个回合送达。
+    pub fn bind_results(&self, sink: Arc<QueueBoundarySource>) -> PendingResultsBinding {
+        self.results.bind(sink)
+    }
+
+    /// 取走**上一回合遗留**的完成结果（本回合开头的补投入口）。
+    ///
+    /// 子 agent 在回合结束后完成 ⇒ 结果留表；这里把它们交给调用方泵进本回合的
+    /// 边界源。**不在这里 push** —— 落点由调用方持有（与 `bash_bg` 的补投同形）。
+    pub fn take_pending_results(&self) -> Vec<(String, Message)> {
+        self.results.take_pending()
     }
 
     /// 造一份 runner（每回合一次 ⇒ 派发计数器天然 per-turn）。
@@ -357,7 +516,6 @@ impl SubagentSetup {
         parent_model: Option<Arc<dyn Model>>,
         totals: Arc<UsageTotals>,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
-        result_sink: Option<Arc<QueueBoundarySource>>,
     ) -> AppSubagentRunner<'a> {
         AppSubagentRunner::new(
             parent_model,
@@ -371,7 +529,7 @@ impl SubagentSetup {
             self.dir.clone(),
             totals,
             parent_boundary,
-            result_sink,
+            self.results.clone(),
         )
     }
 }
@@ -408,14 +566,19 @@ impl SubagentRunner for AppSubagentRunner<'_> {
     /// 任务完成时把结果作为 `Boundary::Deferred` **推进父边界源** ⇒ `BasicLoop` 在
     /// 下一个轮边界 append 进会话并 emit `DeferredResult`。**模型不需要 poll。**
     ///
-    /// # 生命周期（与同步 `run` 的**有意差异**）
+    /// # 生命周期：结果**跨回合送达**
     ///
-    /// **回合末不等异步子 agent**。父回合结束 ⇒ `BasicLoop` 不再拉边界源 ⇒
-    /// 推进去的 `Deferred` 无人消费；任务本身仍受 `child_budget` watchdog 约束，
-    /// 最迟在预算到点以 `Cancelled` 收尾（转录照写）。⇒ 不存在孤儿。
+    /// 父回合**不等**异步子 agent（它的价值是「父回合能继续」）。但「不等」不等于
+    /// 「不送达」：`tokio::spawn` 是分离任务，子 agent 在回合结束后仍会继续跑
+    /// （实测：转录在回合结束后 2~6 分钟才落盘）。它的结果交给 [`PendingResults`]——
+    /// 完成时本回合仍活着就直接进边界源，否则留表、由**下一回合开头**补投。
     ///
-    /// 这条差异是**设计选择**：异步派发的价值是「父回合能继续」，不是「结果必然送达」。
-    /// 要保证拿到结果就用同步的 `subagent`。
+    /// 故模型即使在本回合没等到，下一回合开头也一定会看到它；不会再出现
+    /// 「子 agent 跑完了、结果却随回合销毁」这种白烧一次派发的情形。
+    ///
+    /// # 孤儿约束
+    ///
+    /// 任务本身仍受 `child_budget` watchdog 约束（最迟到预算时以 `Cancelled` 收尾、转录照写）。
     fn spawn(
         &self,
         prompt: &str,
@@ -425,10 +588,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let resolved = self.resolve_model(model)?;
         self.take_dispatch_slot()?;
         let child_limits = self.child_limits_for(model);
-        let sink = self
-            .result_sink
-            .clone()
-            .ok_or_else(|| "本回合未挂载结果回投通道（异步派发不可用）".to_string())?;
+        let results = self.results.clone();
 
         // 句柄 = 本回合第 N 次派发（`take_dispatch_slot` 已自增 ⇒ 直接取当前值）。
         // 只用于让模型 / UI 区分是哪个后台任务，**不需要全局唯一**。
@@ -439,18 +599,19 @@ impl SubagentRunner for AppSubagentRunner<'_> {
 
         tokio::spawn(async move {
             let outcome = task.execute(prompt).await;
-            // 渲染成一条消息推进边界源。角色用 `User` 沿压缩摘要的先例
+            // 渲染成一条消息交给投递表：本回合还活着 ⇒ 直接进边界源；
+            // 已结束 ⇒ 留表，下一回合开头补投。角色用 `User` 沿压缩摘要的先例
             // （ADR-0017 决策 12：系统注入走 `User`）—— **区分来源靠事件类型**
             // （`DeferredResult`），不是靠角色。
-            sink.push(Boundary::Deferred {
-                handle: handle_for_task,
-                message: Message {
+            results.deliver(
+                handle_for_task,
+                Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: render_outcome_text(&outcome),
                     }],
                 },
-            });
+            );
         });
         Ok(handle)
     }
@@ -1163,6 +1324,68 @@ mod tests {
         assert_eq!(parent.take(), Some(Boundary::Abort));
     }
 
+    /// 构造一条纯文本 `User` 消息（投递表的操作对象）。
+    fn user_msg(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// 投递表的三种状态：已绑定 ⇒ 直接进队列；未绑定 ⇒ 留表；绑定后补投。
+    ///
+    /// 变异：① `deliver` 在未绑定时直接丢弃 ⇒ 第 2 段变红；
+    ///       ② `deliver` 忽略落点恒留表 ⇒ 第 1 段变红。
+    #[test]
+    fn pending_results_delivers_when_bound_and_queues_when_not() {
+        let results = Arc::new(PendingResults::default());
+        let sink = Arc::new(QueueBoundarySource::new());
+
+        // ① 未绑定 ⇒ 留表，边界源看不到。
+        assert!(!results.deliver("sa1".into(), user_msg("早到")));
+        assert_eq!(results.pending_len(), 1);
+        assert!(sink.take().is_none(), "未绑定时不得进任何队列");
+
+        // ② 绑定后 ⇒ 直接进队列，不再留表。
+        let _binding = results.bind(sink.clone());
+        assert!(results.deliver("sa2".into(), user_msg("在位")));
+        assert_eq!(results.pending_len(), 1, "留表的仍只有那条早到的");
+        match sink.take() {
+            Some(Boundary::Deferred { handle, .. }) => assert_eq!(handle, "sa2"),
+            other => panic!("应取到 sa2 的 Deferred，得到 {other:?}"),
+        }
+
+        // ③ 补投：把留表的取走，之后再取为空（不会重复投递）。
+        let pending = results.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "sa1");
+        assert!(results.take_pending().is_empty(), "取走后不得重复投递");
+    }
+
+    /// 解绑只在**代数仍相同**时生效：晚 drop 的旧守卫不得抹掉新回合的落点。
+    ///
+    /// 变异：`unbind` 不看代数（恒清空）⇒ 第二个守卫 drop 后新落点丢失 ⇒ 变红。
+    #[test]
+    fn pending_results_stale_binding_does_not_clobber_newer_one() {
+        let results = Arc::new(PendingResults::default());
+        let first = Arc::new(QueueBoundarySource::new());
+        let second = Arc::new(QueueBoundarySource::new());
+
+        let old = results.bind(first.clone());
+        let _new = results.bind(second.clone());
+        // 旧守卫**晚于**新绑定才 drop（顺序被调度打乱时的真实情形）。
+        drop(old);
+
+        assert!(
+            results.deliver("sa1".into(), user_msg("x")),
+            "旧守卫 drop 不得清掉新落点"
+        );
+        assert!(second.take().is_some(), "结果应进最新的落点");
+        assert!(first.take().is_none(), "旧落点不该拿到结果");
+    }
+
     #[test]
     fn usage_totals_accumulate_and_drain() {
         let t = UsageTotals::default();
@@ -1501,7 +1724,7 @@ mod tests {
             dir.clone(),
             totals.clone(),
             None,
-            None,
+            Arc::new(PendingResults::default()),
         );
 
         let out = runner.run("查 X", None, None).await.unwrap();
@@ -1569,7 +1792,7 @@ mod tests {
             Arc::new(SubagentsDir::at(base.join("subagents"), false)),
             Arc::new(UsageTotals::default()),
             None,
-            None,
+            Arc::new(PendingResults::default()),
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {
             runner.run("t", None, None).await.unwrap();
@@ -1663,7 +1886,7 @@ mod tests {
                 dir(),
                 Arc::new(UsageTotals::default()),
                 None,
-                None,
+                Arc::new(PendingResults::default()),
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -1688,7 +1911,7 @@ mod tests {
                 dir(),
                 Arc::new(UsageTotals::default()),
                 None,
-                None,
+                Arc::new(PendingResults::default()),
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -1980,7 +2203,7 @@ mod tests {
             dir,
             Arc::new(UsageTotals::default()),
             None,
-            None,
+            Arc::new(PendingResults::default()),
         )
     }
 
@@ -2005,6 +2228,18 @@ mod tests {
         child_budget: Duration,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
     ) -> AppSubagentRunner<'static> {
+        test_runner_with_parent_and_results(model, base, dir, limits, child_budget, parent_boundary)
+    }
+
+    /// 同 [`test_runner_with_parent`]，但显式给出投递表（异步派发用例需要拿到同一份）。
+    fn test_runner_with_parent_and_results(
+        model: impl Model + 'static,
+        base: &std::path::Path,
+        dir: Arc<SubagentsDir>,
+        limits: RunLimits,
+        child_budget: Duration,
+        parent_boundary: Option<Arc<dyn BoundarySource>>,
+    ) -> AppSubagentRunner<'static> {
         use ys_tools_web::FetchedDir;
 
         AppSubagentRunner::new(
@@ -2019,7 +2254,7 @@ mod tests {
             dir,
             Arc::new(UsageTotals::default()),
             parent_boundary,
-            None,
+            Arc::new(PendingResults::default()),
         )
     }
 
@@ -2046,6 +2281,9 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("ASYNC-SUMMARY-MARKER");
         let sink = StdArc::new(QueueBoundarySource::new());
+        // 结果落点每回合绑定（生产路径同形）；守卫活到用例末。
+        let results = StdArc::new(PendingResults::default());
+        let _binding = results.bind(sink.clone());
 
         let runner = AppSubagentRunner::new(
             Some(Arc::new(model)),
@@ -2059,7 +2297,7 @@ mod tests {
             Arc::new(SubagentsDir::at(base.join("artifacts"), false)),
             Arc::new(UsageTotals::default()),
             Some(sink.clone()),
-            Some(sink.clone()),
+            results,
         );
 
         // ① `spawn` 立刻返回（不等子 agent 跑完）。

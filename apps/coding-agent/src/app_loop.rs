@@ -1174,16 +1174,37 @@ async fn run_turn_once(
                 tasks.finish_delivery(candidate.handle, true);
             }
         }
+        // **上一回合遗留的子 agent 结果：一次性补投**。
+        //
+        // 子 agent 是分离任务（`tokio::spawn`），回合结束后仍会继续跑（实测转录
+        // 在回合结束后 2~6 分钟才落盘）⇒ 完成时本回合的边界源已销毁，结果留表。
+        // 不在这里补投，模型就永远等不到它 —— 那正是「派发白烧一次、模型反复说
+        // 还在跑」的故障（会话 `1792840206_799154000`）。
+        //
+        // 与后台命令的补投同形，但**不限流**：子 agent 每个都是一次真模型调用，
+        // 数量由 `DEFAULT_MAX_DISPATCHES_PER_TURN` 天然封顶（≤16），且每个结果都在
+        // 等一个明确答复 —— 限流只会让模型继续误以为「还没回来」。
+        if let Some(s) = ctx.subagent {
+            for (handle, message) in s.take_pending_results() {
+                boundary.push(Boundary::Deferred { handle, message });
+            }
+        }
         // subagent：每回合造一份 runner（派发计数器天然 per-turn；每次派发建新子 Agent）。
         // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`
         // 透传得到父的中止状态。
+        //
+        // 后台结果的落点**每回合绑定**：投递表是进程级的（子 agent 可能在本回合
+        // 结束后才完成，`tokio::spawn` 是分离任务），而边界源每回合新建 ⇒ 不绑就会
+        // 把结果推进一个无人读的队列（看起来成功，实则永久沉底）。
+        //
+        // **守卫必须活到块末**（绑在 `_subagent_binding` 而非 `_`）：写 `_` 会立即
+        // drop ⇒ 解绑 ⇒ 本回合后半程的完成项又只能留表、白等一个回合。
+        let _subagent_binding = ctx.subagent.map(|s| s.bind_results(boundary.clone()));
         let runner = ctx.subagent.map(|s| {
             s.make_runner(
                 Some(ctx.config),
                 model_arc.clone(),
                 ctx.subagent_totals.clone(),
-                Some(boundary.clone()),
-                // 后台结果回投到**同一份**边界源（`Deferred` 在轮边界被取走）。
                 Some(boundary.clone()),
             )
         });
@@ -1418,7 +1439,7 @@ mod tests {
     use super::*;
 
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -3367,6 +3388,7 @@ mod tests {
                         tmp.join("subagents"),
                         false,
                     )),
+                    Arc::new(crate::subagent::PendingResults::default()),
                 ))
             },
             None,
@@ -3394,6 +3416,265 @@ mod tests {
         assert!(
             contents.iter().any(|c| c.contains("## Files")),
             "runner 必须保证产物节存在：{contents:?}"
+        );
+    }
+
+    /// 子 agent 在**回合内**完成时，结果必须在**本回合**就送达（不能白等一个回合）。
+    ///
+    /// 这条钉的是「落点绑定」这一半：投递表是进程级的，若本回合没绑定落点，
+    /// 结果就只能留表、等下一回合补投 —— 功能上「不丢」，但模型多等了一整回合。
+    ///
+    /// 变异：`let _subagent_binding = ...` 改成 `let _ = ...`（守卫立即 drop）
+    /// ⇒ 本用例变红；另一个用例（跨回合）仍绿 —— 两条各钉一半。
+    #[tokio::test]
+    async fn async_subagent_result_delivered_within_the_same_turn() {
+        const CHILD_PROMPT: &str = "你是子 agent";
+        const CHILD_OUTPUT: &str = "CHILD-SAME-TURN";
+
+        struct Inner {
+            parent_calls: AtomicU32,
+            requests: Mutex<Vec<ModelRequest>>,
+        }
+        struct SameTurnModel(Arc<Inner>);
+
+        #[async_trait::async_trait]
+        impl Model for SameTurnModel {
+            fn model_id(&self) -> &str {
+                "same-turn"
+            }
+
+            async fn complete(
+                &self,
+                request: ModelRequest,
+                _sink: &mut dyn ModelEventSink,
+            ) -> Result<ModelResponse, ModelError> {
+                // 子 agent **立刻**返回 ⇒ 结果在父回合还活着时就已就绪。
+                if request.system.as_deref() == Some(CHILD_PROMPT) {
+                    return Ok(text_response(CHILD_OUTPUT));
+                }
+                self.0.requests.lock().unwrap().push(request);
+                let n = self.0.parent_calls.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    Ok(ModelResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::ToolUse {
+                                id: ToolCallId("call-1".into()),
+                                name: "subagent_async".into(),
+                                arguments: serde_json::json!({
+                                    "description": "快活",
+                                    "prompt": "干快活",
+                                }),
+                            }],
+                        },
+                        usage: Usage::default(),
+                        finish_reason: FinishReason::ToolCalls,
+                    })
+                } else if n < 6 {
+                    // 父继续做自己的事：给子 agent 足够时间在同一回合内完成。
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(ModelResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::ToolUse {
+                                id: ToolCallId(format!("call-{n}")),
+                                name: "no_such_tool".into(),
+                                arguments: serde_json::Value::Null,
+                            }],
+                        },
+                        usage: Usage::default(),
+                        finish_reason: FinishReason::ToolCalls,
+                    })
+                } else {
+                    Ok(text_response("parent done"))
+                }
+            }
+        }
+
+        let inner = Arc::new(Inner {
+            parent_calls: AtomicU32::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut h = spawn_app_loop_full(
+            Box::new(SameTurnModel(Arc::clone(&inner))),
+            false,
+            Vec::new(),
+            |_, _| {},
+            |b| b.tools(vec![Box::new(crate::subagent::SubagentAsyncTool::new())]),
+            |tmp| {
+                Some(crate::subagent::SubagentSetup::shared(
+                    CHILD_PROMPT.to_string(),
+                    ys_component::RunLimits::new(3),
+                    Duration::from_secs(30),
+                    tmp.to_path_buf(),
+                    WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
+                    Arc::new(crate::subagent::SubagentsDir::at(
+                        tmp.join("subagents"),
+                        false,
+                    )),
+                    Arc::new(crate::subagent::PendingResults::default()),
+                ))
+            },
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        // **只跑一个回合** —— 结果必须在这一个回合内进会话。
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let requests = inner.requests.lock().unwrap().clone();
+        assert!(
+            requests.iter().any(|r| has_text(r, CHILD_OUTPUT)),
+            "子 agent 在回合内完成时，结果必须在**本回合**的后续轮次送达 \
+             （否则白等一整个回合）；请求数 = {}",
+            requests.len()
+        );
+        // 并且确实经 `DeferredResult` 事件（而非伪装成用户消息）。
+        let deferred = events_of(&msgs)
+            .iter()
+            .filter(|e| matches!(e.event, AgentEvent::DeferredResult { .. }))
+            .count();
+        assert_eq!(deferred, 1, "应恰好一条 DeferredResult 事件");
+    }
+
+    /// `subagent_async` 的子 agent **在回合结束后**完成时，结果必须在**下一回合**
+    /// 的 `ModelRequest` 里可见 —— 否则「自动送达」是假的。
+    ///
+    /// 生产证据（会话 `1792840206_799154000`）：turn 11 于 20:13:36 派发 3 个
+    /// `subagent_async`，回合 20:14:28 结束；子 agent 分别于 20:16:59 / 20:20:47
+    /// 完成并把转录落盘（`stop_reason=completed`），但结果**从未**进入任何后续
+    /// `ModelRequest` —— 模型只能反复回答「还在跑」。
+    ///
+    /// 变异：把 `spawn` 的落点从「回合局部边界源」改成「跨回合可补投的注册表」
+    /// ⇒ 本用例变红（这是修复后的期望）。
+    #[tokio::test]
+    async fn async_subagent_result_survives_turn_boundary() {
+        /// 子 agent 的 system prompt —— 本用例用它区分父 / 子调用。
+        const CHILD_PROMPT: &str = "你是子 agent";
+        /// 子 agent 的产出正文 —— 断言只认这个标记。
+        const CHILD_OUTPUT: &str = "CHILD-LATE-OUTPUT";
+
+        struct Inner {
+            parent_calls: AtomicU32,
+            child_calls: AtomicU32,
+            requests: Mutex<Vec<ModelRequest>>,
+        }
+        struct AsyncLateModel(Arc<Inner>);
+
+        #[async_trait::async_trait]
+        impl Model for AsyncLateModel {
+            fn model_id(&self) -> &str {
+                "async-late"
+            }
+
+            async fn complete(
+                &self,
+                request: ModelRequest,
+                _sink: &mut dyn ModelEventSink,
+            ) -> Result<ModelResponse, ModelError> {
+                // 子 agent：慢于整个父回合 ⇒ 它必定在回合结束之后才完成。
+                if request.system.as_deref() == Some(CHILD_PROMPT) {
+                    self.0.child_calls.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return Ok(text_response(CHILD_OUTPUT));
+                }
+                self.0.requests.lock().unwrap().push(request);
+                let n = self.0.parent_calls.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    // 父第 1 轮：派发后台子 agent。
+                    Ok(ModelResponse {
+                        message: Message {
+                            role: Role::Assistant,
+                            content: vec![ContentBlock::ToolUse {
+                                id: ToolCallId("call-1".into()),
+                                name: "subagent_async".into(),
+                                arguments: serde_json::json!({
+                                    "description": "慢活",
+                                    "prompt": "干慢活",
+                                }),
+                            }],
+                        },
+                        usage: Usage::default(),
+                        finish_reason: FinishReason::ToolCalls,
+                    })
+                } else {
+                    // 父第 2 轮起：立刻收尾（此刻子 agent 还在睡）。
+                    Ok(text_response("parent done"))
+                }
+            }
+        }
+
+        let inner = Arc::new(Inner {
+            parent_calls: AtomicU32::new(0),
+            child_calls: AtomicU32::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut h = spawn_app_loop_full(
+            Box::new(AsyncLateModel(Arc::clone(&inner))),
+            false,
+            Vec::new(),
+            |_, _| {},
+            |b| b.tools(vec![Box::new(crate::subagent::SubagentAsyncTool::new())]),
+            |tmp| {
+                Some(crate::subagent::SubagentSetup::shared(
+                    CHILD_PROMPT.to_string(),
+                    ys_component::RunLimits::new(3),
+                    Duration::from_secs(30),
+                    tmp.to_path_buf(),
+                    WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
+                    Arc::new(crate::subagent::SubagentsDir::at(
+                        tmp.join("subagents"),
+                        false,
+                    )),
+                    Arc::new(crate::subagent::PendingResults::default()),
+                ))
+            },
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        // 回合 1：派发后立刻收尾（子 agent 仍在后台跑）。
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        // 等子 agent 真正跑完（300ms 睡眠 + 余量）—— 此后它的结果必须已在
+        // 某个**跨回合**的落点上，而不是随回合 1 的边界源一起销毁。
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // 回合 2：模型必须能在请求里看到子 agent 的产出。
+        h.requests.send(prompt("结果呢")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        let requests = inner.requests.lock().unwrap().clone();
+        // 区分性事实：子 agent **确实跑了**（不是被取消）—— 它的产出只在 write
+        // transcript 之外无处可去，故「取消」这一承诺与实现不符。
+        assert!(
+            inner.child_calls.load(Ordering::Relaxed) >= 1,
+            "子 agent 必须在回合结束后仍继续运行（tokio::spawn 分离任务）—— \
+             若此处为 0，说明它被取消了，与生产日志（转录在回合结束后 2~6 分钟落盘）矛盾"
+        );
+        assert!(
+            requests.len() >= 3,
+            "父回合应至少发生 3 次 model 调用（派发 / 收尾 / 第二回合），实际 {}",
+            requests.len()
+        );
+        let turn2 = requests.last().unwrap();
+        assert!(
+            has_text(turn2, CHILD_OUTPUT),
+            "子 agent 在回合结束后完成时，结果必须进入下一回合的 ModelRequest \
+             （否则「自动送达」失效，模型只会反复说「还在跑」）。\
+             第二回合请求里没有 {CHILD_OUTPUT}；消息数 = {}",
+            turn2.messages.len()
         );
     }
 

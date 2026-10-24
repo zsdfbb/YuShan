@@ -1759,14 +1759,17 @@ async fn run_single_turn(
     // subagent 能力：每回合造一份 runner（派发计数器天然 per-turn）。
     // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`
     // 透传得到父的中止状态。
+    //
+    // 结果落点同样要绑（守卫活到函数末）：完成时本回合若仍活着就直接进边界源。
+    // 一次性模式只有一个回合 ⇒ 回合结束后才完成的结果没有下一回合可补投
+    // （`-p` / `--json` 是「跑完即退出」，不存在后续回合）。
+    let _subagent_binding = subagent.map(|s| s.bind_results(boundary.clone()));
     let totals = std::sync::Arc::new(subagent::UsageTotals::default());
     let runner = subagent.map(|s| {
         s.make_runner(
             config,
             model_arc.clone(),
             totals.clone(),
-            Some(boundary.clone()),
-            // 后台结果回投到**同一份**边界源（`Deferred` 在轮边界被取走）。
             Some(boundary.clone()),
         )
     });

@@ -59,6 +59,11 @@ pub struct AgentFactory {
     child_budget: Duration,
     /// 子 agent 产物目录（`Arc` 跨重建共享；清理只在 `main` 启动期做）。
     subagents_dir: Arc<SubagentsDir>,
+    /// 后台派发结果的**跨回合**投递表（`Arc` 跨重建共享）。
+    ///
+    /// 与 `backgrounds` 同理是**进程级**的：工作区切换会重建 agent，但后台跑着的
+    /// 子 agent 不会跟着重建 —— 它们完成时写的那份表必须与重建后是同一份。
+    subagent_results: Arc<crate::subagent::PendingResults>,
     /// 后台命令上下文（**进程级**）—— `None` = 本工厂不带后台能力。
     ///
     /// 注册表对象随工厂冻结 ⇒ `/resume` 重建 agent 时仍是**同一份**；
@@ -108,6 +113,7 @@ impl AgentFactory {
             limits,
             child_budget,
             subagents_dir,
+            subagent_results: Arc::new(crate::subagent::PendingResults::default()),
             backgrounds: None,
         }
     }
@@ -144,6 +150,7 @@ impl AgentFactory {
             workspace.to_path_buf(),
             self.web.clone(),
             self.subagents_dir.clone(),
+            self.subagent_results.clone(),
         );
 
         // 父表 = 基础 9 元 + `bash_bg` + 派发工具**追加末位**

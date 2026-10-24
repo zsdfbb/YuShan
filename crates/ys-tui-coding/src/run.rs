@@ -207,6 +207,10 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                     requests,
                 );
             }
+            // `/copy`：同样需要终端才能完成 —— 写剪贴板要发转义序列到 stdout。
+            if let Some(text) = app.pending_clipboard.take() {
+                write_clipboard(&text);
+            }
         }
 
         // 3) Working 动画节拍（只在 turn 中有意义）
@@ -561,8 +565,65 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(
     let _ = terminal.show_cursor();
 }
 
-/// 终端状态恢复的字节序列：开换行 / 退 alt-screen / 关括号粘贴 / 关鼠标捕获 / 弹键盘增强。
+/// `/copy` 的载荷：OSC 52 剪贴板转义序列（终端无关，无新依赖）。
 ///
+/// 形如 `ESC ] 52 ; c ; <base64> BEL`。
+///
+/// # 为什么是 OSC 52 而不是平台命令
+///
+/// `pbcopy` / `wl-copy` / `clip.exe` 是三个平台三份实现，且经管道传给它们会把
+/// 内容留在进程参数 / 临时文件里；OSC 52 是终端自己实现的剪贴板协议，一条转义
+/// 序列搞定，且能穿透 `tmux` / `screen`（它们默认透传，可配 `set-clipboard on`）。
+///
+/// # 已知边界
+///
+/// 个别终端默认**禁用** OSC 52（防恶意程序写剪贴板），此时本序列会被静默忽略。
+/// 本函数不探测、不重试 —— 写入是单向的，无应答可等；失败时用户仍可用 `⇧`+拖选
+/// （若终端支持）作为退路。
+///
+/// # 为什么内联 base64 而不引 crate
+///
+/// `ys-tui-coding` 的依赖面已经收得很紧（见 `Cargo.toml` 里的逐条理由），
+/// 而 base64 的编码规则三行就能写清：每 3 字节 → 4 字符，余 1/2 字节补 `=`。
+fn clipboard_sequence(text: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4 + 8);
+    out.push_str("\x1b]52;c;");
+
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        // 每组的第几字节存在 ⇒ 输出几个字符（余 1 字节出 2 字符，余 2 出 3，整 3 出 4）。
+        let keep = chunk.len() + 1;
+        for i in 0..4 {
+            if i < keep {
+                let idx = ((n >> (18 - 6 * i)) & 0x3f) as usize;
+                out.push(ALPHABET[idx] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+
+    out.push('\x07');
+    out
+}
+
+/// 把文本写进终端剪贴板。best-effort：写失败不改任何状态（`/copy` 已在 transcript
+/// 里给过确认行，静默失败只会让用户重试一次，不会让界面停在半态）。
+fn write_clipboard(text: &str) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(clipboard_sequence(text).as_bytes());
+    let _ = out.flush();
+}
+
+/// 终端状态恢复的字节序列：开换行 / 退 alt-screen / 关括号粘贴 / 关鼠标捕获 / 弹键盘增强。///
 /// 抽成自由函数，让**正常退出**（[`exit_payload`]）与**异常退出**（panic hook）共用同一份
 /// 序列 —— 两处若各写一遍，改一处必漏另一处。
 ///
@@ -717,6 +778,72 @@ fn clamp_selection(selected: usize, filtered_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // `/copy` 的载荷：OSC 52 剪贴板序列（含内联 base64）
+    // -----------------------------------------------------------------------
+
+    /// OSC 52 的形状：`ESC ] 52 ; c ; <base64> BEL`。
+    ///
+    /// 变异：把 `c` 改成 `p`（主选择 vs 剪贴板）、或把 BER 终止符 `\x07` 换掉 ⇒ 红。
+    #[test]
+    fn test_clipboard_sequence_shape() {
+        let seq = clipboard_sequence("hi");
+        assert!(seq.starts_with("\x1b]52;c;"), "前缀不对：{seq:?}");
+        assert!(seq.ends_with('\x07'), "须以 BEL 终止：{seq:?}");
+        assert_eq!(&seq[7..seq.len() - 1], "aGk=", "payload 应为 base64");
+    }
+
+    /// base64 三种余数（0/1/2 字节）都要对 —— 这是手写编码最容易错的地方。
+    ///
+    /// 参照：`""` → `""`、`"a"` → `"YQ=="`、`"ab"` → `"YWI="`、`"abc"` → `"YWJj"`。
+    #[test]
+    fn test_clipboard_base64_covers_all_remainders() {
+        let payload = |s: &str| {
+            let seq = clipboard_sequence(s);
+            seq[7..seq.len() - 1].to_string()
+        };
+        assert_eq!(payload(""), "");
+        assert_eq!(payload("a"), "YQ==");
+        assert_eq!(payload("ab"), "YWI=");
+        assert_eq!(payload("abc"), "YWJj");
+        assert_eq!(payload("abcd"), "YWJjZA==");
+    }
+
+    /// UTF-8 多字节必须按**字节**编码，不能按字符 —— 中文是这档的高发区。
+    #[test]
+    fn test_clipboard_base64_encodes_utf8_bytes() {
+        let payload = |s: &str| {
+            let seq = clipboard_sequence(s);
+            seq[7..seq.len() - 1].to_string()
+        };
+        // "中" = E4 B8 AD
+        assert_eq!(payload("中"), "5Lit");
+        // "中文" = E4 B8 AD E6 96 87
+        assert_eq!(payload("中文"), "5Lit5paH");
+    }
+
+    /// 正文里的控制字符（含 ESC）不得截断序列 —— 它们是 payload 的一部分，
+    /// 编码后只出现 base64 字母表内的字符。
+    ///
+    /// 安全含义：文本直接拼进转义序列时，正文里的 `\x07` 会提前终止 OSC，
+    /// 之后的内容会被终端当普通输出执行。
+    #[test]
+    fn test_clipboard_payload_never_leaks_control_chars() {
+        let seq = clipboard_sequence("evil\x07\x1b]52;c;AAAA\x07");
+        assert_eq!(
+            seq.matches('\x07').count(),
+            1,
+            "正文里的 BEL 不得进入序列：{seq:?}"
+        );
+        let payload = &seq[7..seq.len() - 1];
+        assert!(
+            payload
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='),
+            "payload 只含 base64 字母表：{payload}"
+        );
+    }
 
     #[test]
     fn test_modal_move_wraps_both_ways() {

@@ -67,7 +67,7 @@ static COMMANDS: [CommandSpec; 14] = [
     },
     CommandSpec {
         name: "copy",
-        description: "复制最后一条回复（v1：写进对话区，手动选中）",
+        description: "复制最后一条回复到终端剪贴板",
         arg_hint: None,
     },
     CommandSpec {
@@ -366,6 +366,7 @@ const KEY_HELP: &str = "键位：
   ↑ ↓                输入框为空时 ↑ 取回历史（↓ 还原草稿）；否则滚动对话
   PageUp / PageDown  翻页（一页 = 视窗高度）
   滚轮 / 触控板上下   逐行滚动对话（不影响输入历史）
+  /copy              最后一条回复写入终端剪贴板（需终端支持 OSC 52）
   End                跳到最新消息
   Ctrl+↓ / Ctrl+End  跳到最新消息
   Ctrl+↑ / Ctrl+Home 跳到最早消息
@@ -499,17 +500,16 @@ pub fn status_text(view: &CodingView) -> String {
 
 /// `/copy` 的正文：最后一条非空 assistant 文本。
 ///
-/// **v1 无剪贴板依赖**（不为一个命令引一个跨平台剪贴板 crate）：内容写进
-/// transcript，用终端自身的选中复制即可。
-pub fn copy_text(app: &App) -> String {
-    let last = app.transcript.iter().rev().find_map(|line| match line {
+/// 返回 `None` = 没有可复制的回复。
+///
+/// **文本去往终端剪贴板**（OSC 52，由 `run.rs` 发序列）—— 不走「写进对话区让用户
+/// 手动选中」：`run.rs` 常开 `EnableMouseCapture`（ADR-0050 滚轮接管鼠标），
+/// 终端原生拖选因此失效，「可手动选中」是一个走不通的指路。
+pub fn copy_text(app: &App) -> Option<&str> {
+    app.transcript.iter().rev().find_map(|line| match line {
         TranscriptLine::Assistant(s) if !s.trim().is_empty() => Some(s.as_str()),
         _ => None,
-    });
-    match last {
-        Some(s) => format!("（/copy v1 占位：无剪贴板集成，内容如下，可手动选中）\n{s}"),
-        None => "（/copy：还没有可复制的回复）".to_string(),
-    }
+    })
 }
 
 /// 执行一个本地动作：写一条 `System` 行进 transcript 并重新贴底。
@@ -524,7 +524,20 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
             Some(name) => command_help_text(&name),
         },
         LocalAction::Status => status_text(&app.view),
-        LocalAction::Copy => copy_text(app),
+        LocalAction::Copy => {
+            // 借用在 `pending_clipboard` 写入前结束：先拿 owned 副本。
+            let body = copy_text(app).map(str::to_owned);
+            let Some(body) = body else {
+                app.transcript.push(TranscriptLine::System(
+                    "（/copy：还没有可复制的回复）".into(),
+                ));
+                app.follow = true;
+                return;
+            };
+            let chars = body.chars().count();
+            app.pending_clipboard = Some(body);
+            format!("（/copy：已写入终端剪贴板，{chars} 字）")
+        }
         LocalAction::Thinking(explicit) => {
             app.thinking_visible = explicit.unwrap_or(!app.thinking_visible);
             format!(
@@ -1125,23 +1138,20 @@ mod tests {
         a.transcript.push(TranscriptLine::Assistant("first".into()));
         a.transcript
             .push(TranscriptLine::Assistant("second".into()));
+        assert_eq!(copy_text(&a), Some("second"), "取最后一条非空 assistant");
+
         apply_local(&mut a, LocalAction::Copy);
-        let text = copy_text(&a);
-        // push 之后 last 是刚才那条 System
         let Some(TranscriptLine::System(s)) = a.transcript.last() else {
             panic!("应 push System");
         };
-        assert!(s.contains("second"), "取最后一条：{s}");
-        assert!(!s.contains("first"), "不取更早的：{s}");
-        assert!(text.contains("second"));
+        assert!(s.contains("剪贴板"), "确认行说明去向：{s}");
     }
 
-    /// `/copy` 的**占位**语义必须写在正文里（v1 无剪贴板，不是静默 no-op）。
+    /// 没有回复时不得写剪贴板（`copy_text` 返回 `None` 是唯一真值）。
     #[test]
     fn test_copy_without_assistant_reply_says_so() {
         let a = app();
-        let text = copy_text(&a);
-        assert!(text.contains("还没有可复制的回复"), "{text}");
+        assert_eq!(copy_text(&a), None);
     }
 
     #[test]
@@ -1156,7 +1166,59 @@ mod tests {
             success: true,
         });
         a.transcript.push(TranscriptLine::Error("boom".into()));
-        assert!(copy_text(&a).contains("还没有可复制的回复"));
+        assert_eq!(copy_text(&a), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // `/copy` 走终端剪贴板（OSC 52）—— 不再依赖用户手动选中
+    // -----------------------------------------------------------------------
+
+    /// **回归测试（Bug：`/copy` 无法获取内容）**。
+    ///
+    /// 原实现把正文写进 `System` 行并提示"可手动选中"，但 `run.rs` 常开
+    /// `EnableMouseCapture`（ADR-0050 为滚轮接管鼠标）⇒ 终端原生拖选失效
+    /// ⇒ 提示所指的那条路**物理上走不通**，`/copy` 在任何终端上都不可能成功。
+    ///
+    /// 修复后：正文交给 `pending_clipboard`，由 `run.rs` 用 OSC 52 写进终端剪贴板。
+    #[test]
+    fn test_copy_hands_text_to_clipboard_instead_of_manual_selection() {
+        let mut a = app();
+        a.transcript
+            .push(TranscriptLine::Assistant("正文一".into()));
+        a.transcript
+            .push(TranscriptLine::Assistant("正文二".into()));
+
+        apply_local(&mut a, LocalAction::Copy);
+
+        assert_eq!(
+            a.pending_clipboard.as_deref(),
+            Some("正文二"),
+            "必须把最后一条回复交给剪贴板通道"
+        );
+        let Some(TranscriptLine::System(s)) = a.transcript.last() else {
+            panic!("应 push System 确认行");
+        };
+        assert!(s.contains("剪贴板"), "确认行须说明已进剪贴板：{s}");
+        assert!(
+            !s.contains("手动选中"),
+            "不得再让用户手动选中（鼠标捕获下走不通）：{s}"
+        );
+        assert!(
+            !s.contains("正文二"),
+            "正文不进 transcript（已在剪贴板）：{s}"
+        );
+    }
+
+    /// 无回复可复制时**不得**改剪贴板。
+    #[test]
+    fn test_copy_without_reply_leaves_clipboard_untouched() {
+        let mut a = app();
+        apply_local(&mut a, LocalAction::Copy);
+        assert!(a.pending_clipboard.is_none(), "无回复时不得写剪贴板");
+        let Some(TranscriptLine::System(s)) = a.transcript.last() else {
+            panic!("应 push System");
+        };
+        assert!(s.contains("还没有可复制的回复"), "{s}");
     }
 
     #[test]

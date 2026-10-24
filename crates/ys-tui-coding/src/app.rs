@@ -52,6 +52,15 @@ pub struct App {
     /// `events.rs` 只认识键与缓冲，画不了屏；需要终端的部分一律经这个字段
     /// 交还给持有 `Terminal` 的事件循环（设计 §3「模态循环在 run.rs 里跑」）。
     pub pending_prompt: Option<PromptKind>,
+    /// 待写入**终端剪贴板**的文本（OSC 52）—— **由 `run.rs` 消费**。
+    ///
+    /// 与 [`Self::pending_prompt`] 同型：`commands.rs` 是纯逻辑、零终端（模块头纪律），
+    /// 写剪贴板必须发转义序列，而那要 `run.rs` 手里的 stdout —— 所以在这里交接。
+    ///
+    /// **为什么不能只把文本写进对话区**：`run.rs` 常开 `EnableMouseCapture`
+    /// （ADR-0050 滚轮接管鼠标）⇒ 终端原生拖选失效 ⇒ 「写进对话区让用户手动选中」
+    /// 这条路物理上走不通。
+    pub pending_clipboard: Option<String>,
     /// `/resume` 的候选会话（`Outbound::SessionList` 送来）。
     ///
     /// 与 `pending_prompt` **同 take 同清**：`run.rs` 在开 `/resume` 浮层时把它
@@ -139,6 +148,7 @@ impl App {
             history: InputHistory::new(),
             completion: None,
             pending_prompt: None,
+            pending_clipboard: None,
             pending_sessions: None,
             command_in_flight: false,
             is_turning: false,

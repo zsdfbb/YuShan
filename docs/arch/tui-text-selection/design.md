@@ -78,8 +78,7 @@ C：`DRAG_TICK = 16ms` + `step = clamp(1 + held_ms/40, 1, 8)` ⇒ 200 行约 **0
 
 | 文件 | 改动 | 行数 |
 |---|---|---|
-| `layout.rs` | **纯追加**：`EntryMemo.rev` / `TranscriptLayout.rev` / `revision_range()` / `window_rows()` | ~40 |
-| `events.rs` | `handle_mouse` 收整个 `MouseEvent`；三态分派；`scroll()` 改 `pub(crate)` 并清选区；`Resize` 清选区 | ~60 |
+| `layout.rs` | **纯追加**：`EntryMemo.rev` / `TranscriptLayout.rev` / `revision_range()` / `window_rows()` | ~40 || `events.rs` | `handle_mouse` 收整个 `MouseEvent`；三态分派；`scroll()` 改 `pub(crate)` 并清选区；`Resize` 清选区 | ~60 |
 | `draw.rs` | 抽 `window_lines()`；`ui()` 末尾挂 `draw_selection()` | ~35 |
 | `run.rs` | `DRAG_TICK` 可变 poll 周期；鼠标批次合并；`drag_tick()` 调用 | ~30 |
 | `app.rs` | `pub selection: selection::Selection` + 默认 + `jump_to_*` 里 `clear()` | ~15 |
@@ -110,6 +109,23 @@ pub(crate) struct GlyphGrid {
 
 struct GlyphKey { layout_rev: u64, win_rev: u64, inner: Rect, base_row: usize, skip: u16 }
 ```
+
+### 2.2b `window_rows()` —— 槽环的数据基础（**不可省**）
+
+现有的 `layout.window(top_row, height)` 只返回 `Window { lines, skip_rows }`（`layout.rs:209`），
+**不告诉你「屏幕第 y 行来自哪个 `Line` 的第几个视觉行」**。而槽环要只重建换进来的那 k 行，
+就必须知道这个映射。故 `layout.rs` 追加：
+
+```rust
+/// 屏幕第 y 行（0 基，相对内区顶）的来源。
+pub(crate) struct RowRef { pub line: u32, pub off: u16 }
+
+/// 与 [`window`] **共用同一次遍历**，不得另写一份定位逻辑。
+pub(crate) fn window_rows(&self, top_row: usize, height: usize) -> Vec<RowRef>
+```
+
+**纪律**：`window_rows` 与 `window` 必须由**同一个内部函数**产出（让 `window` 包一层丢掉 `RowRef`），
+否则「画的位置」与「认的位置」会漂移 —— ADR-0045 已因这类错位返工过一次。
 
 ### 2.3 缓存失效集合（承重）
 
@@ -157,7 +173,19 @@ struct GlyphKey { layout_rev: u64, win_rev: u64, inner: Rect, base_row: usize, s
 10. 按 64 行分块：`layout.window(row, chunk)` → `Paragraph::{wrap(Wrap{trim:false}), scroll}` 渲进
     复用的 `grid_buf`
 11. 逐行按 `[xa..=xb]` 读 `cell.symbol()`，**续格按 `skip = max(skip, cell_width) - 1` 跳过**
-12. 行尾 `trim_end(' ')`，行间 `'\n'`
+12. **按每行的非空白范围裁剪**再与选区区间求交（见下）
+13. 行尾 `trim_end(' ')`，行间 `'\n'`
+
+#### 提取必须按内容裁剪（高亮可以不裁）
+
+`trim_end` 只救行尾，救不了「选区跨越了内容边界」：一行只有 3 个字而选区拖到 `x=99`，
+或者选区纵跨到视窗底部的**空白填充行**（`Buffer` 在 `total_rows < inner_h` 或 `skip` 吃掉尾部行时
+会出现），都会把空内容当成选中内容。
+
+故提取时**逐行**先求该行实际的 `[first_non_blank, last_non_blank]`，再与 `[xa..=xb]` 求交；
+交集为空则该行不产出内容（但**保留它作为换行**，否则段落会被拼在一行）。
+
+**高亮仍画满矩形** —— 两者有意不一致：「块选择」的视觉直觉要矩形完整，而复制不应带出空白。
 
 ### 2.5 自动滚动
 
@@ -176,6 +204,10 @@ app.selection.drag_tick(&mut app /* … */);   // 在 compute_max_scroll 之前
   续格位图重建（2.4 µs）⇒ **8–12 µs/步**，与 `inner_h`、会话长度、已滚行数均无关。
 - **用户主动滚动 ≠ 拖动自动滚动**：`ScrollUp/Down`、`PageUp`、`↑` 等入口调 `clear()`（决策 6）；
   只有 `drag_tick` 走 `shift()`（决策 3）。否则拖到边缘会自我取消。
+- **`follow` 的夹取顺序（易错）**：`events::scroll()` 内部先 `compute_max_scroll` 再夹取，
+  而 `sync_scroll_state` 在 `follow == true` 时**强制** `scroll_offset = 0`。
+  故 `drag_tick` 必须**先置 `follow = false` 再调 `scroll()`**，并 `debug_assert!(!app.follow)`，
+  否则 `anchor_row` 会与实际画面脱节。
 - **鼠标批次合并（必须做）**：`poll()` 之后 `while poll(Duration::ZERO)` 排空，只应用**最后一个**
   `Drag`。触控板一次爆发 8–30 个事件，否则就是 8–30 次整屏 `draw`（每次 ~150 µs）。
 
@@ -201,6 +233,9 @@ impl Widget for Highlight<'_> {
 - **成本**：选中格数 × ~1.5 ns。3000 格 = 4.5 µs；典型 500 格 = 0.75 µs。
 - 渲染位置：`chat_block().inner(chat_area(&app, area))`；在 `draw_transcript` 之后、`draw_input`
   之前；`completion` 浮层仍最后画，自然盖在上面。
+- **签名用 `&mut App`**：`draw_selection(frame: &mut Frame, inner: Rect, app: &mut App)`，
+  在 `ui()` 里**独立一行**调用（不要塞进 `draw_transcript`）。`draw_transcript` 拿 `&App`，
+  而写 `GlyphGrid` 需要可变访问；用 `&mut` 就不必给 `grid` 再包一层 `RefCell`。
 
 ### 2.7 复制上限
 
@@ -220,7 +255,7 @@ OSC 52 载荷多数终端上限约 100 KB。设 `COPY_MAX_BYTES = 256 * 1024`：
 
 ## 4. M1 → M2 的迁移面
 
-采用方案里 M2 只需要：
+采用方案里 M2 需要：
 
 1. `anchor_row` / `cursor_row` 从「全局视觉行」改成「`TranscriptLayout` 的字符偏移」；
 2. 「行 → 字符」的解析换一处；
@@ -228,6 +263,10 @@ OSC 52 载荷多数终端上限约 100 KB。设 `COPY_MAX_BYTES = 256 * 1024`：
 
 调用方（`events.rs` / `run.rs` / `draw.rs`）**一行不改** —— 因为它们只碰 `(row, x)` 与 `Option<String>`。
 这正是「不引 trait 也能保住迁移面」的依据。
+
+**但要看清边界（避免后人误信“全部可复用”）**：M2 会**替掉 `Extractor`**（不再读 Buffer，
+改从源字符串按字符区间取），**不会替掉 `Selection` 状态机与高亮层**。`x` 的语义会从
+「屏幕列」变成「行内字符偏移」—— 同一字段、不同含义，故 M2 时 `x` 的每个使用点都要重审。
 
 ## 5. 已知缺口与代价
 
@@ -239,6 +278,8 @@ OSC 52 载荷多数终端上限约 100 KB。设 `COPY_MAX_BYTES = 256 * 1024`：
 | 双击选词 / 三击选行 | 未做 | 待定（`context.md` 未澄清问题） |
 | 拖出 Chat 区 | 夹到边界（不取消选区） | 与 C 一致 |
 | OSC 52 被终端禁用 | 静默失败 | 沿用 `/copy` 同口径，不加 `pbcopy` 兜底 |
+| **字形存两份**（`layout.memo.lines` + `GlyphGrid.slots`） | 视窗期 +120 KB | `Phase::Idle` 时释放 `slots`（§2.3 第 9 条） |
+| **`⇧` 退路在 VS Code+macOS 仍不存在** | 不是本设计缺陷，但别当通用退路 | xterm.js 判 Option 而非 Shift；ADR 已明确 |
 | 触控板事件爆发 | 已用批次合并消除 | 见 §2.5 |
 | 真实终端手感 | 单测覆盖不到 | `MANUAL_ACK`（ADR-0050 先例） |
 
@@ -248,10 +289,16 @@ OSC 52 载荷多数终端上限约 100 KB。设 `COPY_MAX_BYTES = 256 * 1024`：
 
 - `GlyphGrid` 缓存失效九条（§2.3）逐条钉住
 - `read_back` 的续格规则：CJK / 全角标点 / emoji / 混合 —— 已在 `context.md` 实测无损
-- `shift(k)` 与全量重建**逐格等价**（这是槽环的正确性守卫，等价于 ADR-0045 的 N4）
+- **逐行渲染 == 整窗渲染**（槽环的前提，已实测：短行 / 折行 / CJK / 空行四类逐格一致）
+- **按内容裁剪**：选区跨到短行 / 跨到视窗底部空白填充行 ⇒ 复制结果不带空白
+- `shift(k)` 与全量重建**逐格等价**（槽环正确性守卫，等价于 ADR-0045 的 N4）
 - 三态迁移：`Down` 无 `Drag` ⇒ 不复制；`Down`→`Drag`→`Up` ⇒ 复制；`⇧` ⇒ 全程无副作用
-- 自动滚动步长：`clamp(1 + held_ms/40, 1, 8)` 的边界
+- 自动滚动步长：`clamp(1 + held_ms/40, 1, 8)` 的边界，且**全程 `follow == false`**
 - 复制上限：>256 KB 不复制并留提示
+
+**限流闸门（把推论变成机制）**：`sync()` 里加 `recomputed_entries` 计数。拖选期断言
+「该计数不因选区而增加」—— 否则「流式拖选最多 10 次/秒」只是推论，改
+`RENDER_THROTTLE` 或 `render_sig` 语义时会静默退化而无人发现。
 
 **既有用例必须原样全绿**：「视窗渲染 == 整段渲染」等价性、N4、`wheel` 三条。
 

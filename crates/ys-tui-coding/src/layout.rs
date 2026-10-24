@@ -33,6 +33,12 @@ struct EntryMemo {
     sig: u64,
     /// 已渲染内容的哈希 —— 节流窗口内内容没真变 ⇒ 复用旧的 `row_starts`。
     render_sig: u64,
+    /// 条目级版本号：折行真的重算（`render_sig` 变，或首次渲染）时从
+    /// [`TranscriptLayout::rev_alloc`] 分配。
+    ///
+    /// **产物没变就不换号** —— 「流式节流窗口内源变、产物没变」因此不会打红任何
+    /// 以它为键的缓存（见 [`TranscriptLayout::revision_range`]）。
+    rev: u64,
     /// 该条目的渲染行（**不含**前置留白）。
     lines: Vec<Line<'static>>,
     /// `row_starts[k]` = 第 `k` 行首行在**条目内**的视觉行号；末位 = 该条目总行数。
@@ -56,12 +62,35 @@ pub(crate) struct Window {
     pub skip_rows: usize,
 }
 
+/// 屏幕第 y 行（0 基，相对内区顶）的来源。
+///
+/// `line` 是**窗口内第几个 `Line`**（与 [`Window::lines`] 同序、同下标），不是全局行号；
+/// `off` 是该 `Line` 内部的第几个视觉行。两者合起来足以把那一行单独重渲染，不必再查
+/// 条目表。
+///
+/// 两个字段同为 `u32`：视觉行号由「该行的显示宽度 / wrap 宽度」决定，**没有窄上界** ——
+/// 单条 200 KB 的文本在 `width = 1` 下可折出 20 万视觉行。`off` 若窄化成 `u16` 会静默
+/// 截断，让字形缓存在长行上取到**另一行**的字形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowRef {
+    pub line: u32,
+    pub off: u32,
+}
+
 /// 一次同步的结果。
 pub(crate) struct SyncResult {
     /// 总视觉行数。
     pub total_rows: usize,
     /// 宽度是否变了（变了 ⇒ 行号空间整个换掉，补偿不适用）。
     pub width_changed: bool,
+    /// 本次同步**真正重算了折行**的条目数（= `render_sig` 变了的条目数，含首次渲染）。
+    ///
+    /// 唯一用途：「流式拖选最多 10 次/秒」由此从推论变成可断言的机制 —— 拖选期该
+    /// 计数**不得**因选区而增加。
+    ///
+    /// 消费方是 `selection.rs` 的拖选限流断言，故非测试构建里暂时无人读它。
+    #[allow(dead_code)]
+    pub recomputed_entries: usize,
 }
 
 /// transcript 的布局记忆。
@@ -78,6 +107,12 @@ pub(crate) struct TranscriptLayout {
     starts: Vec<usize>,
     /// 总视觉行数。
     total_rows: usize,
+    /// **结构版本**：`reset()` / 宽度变 / `thinking_visible` 翻转时 `+1`。
+    ///
+    /// **不随条目内容变** —— 否则窗口外条目一更新就会连带全量重建视窗字形缓存。
+    structural_rev: u64,
+    /// 条目版本号**分配器**（单调递增，只增不减）。
+    rev_alloc: u64,
 }
 
 impl Default for TranscriptLayout {
@@ -89,6 +124,8 @@ impl Default for TranscriptLayout {
             gaps: Vec::new(),
             starts: Vec::new(),
             total_rows: 0,
+            structural_rev: 0,
+            rev_alloc: 0,
         }
     }
 }
@@ -100,6 +137,8 @@ impl TranscriptLayout {
         self.gaps.clear();
         self.starts.clear();
         self.total_rows = 0;
+        // 行号空间整个作废 ⇒ 结构版本 +1（`rev_alloc` 不清：它只要求单调）。
+        self.structural_rev += 1;
     }
 
     /// 同步布局：把 transcript 折成视觉行，并记住每个条目的折行结果。
@@ -124,6 +163,8 @@ impl TranscriptLayout {
             self.starts.clear();
             self.width = width;
             self.thinking_visible = thinking_visible;
+            // 行号空间整个换掉 ⇒ 结构版本 +1（不随条目内容变，只随结构变）。
+            self.structural_rev += 1;
         }
         // 条目数变化（追加 / 回放替换）。
         self.entries.truncate(transcript.len());
@@ -134,6 +175,7 @@ impl TranscriptLayout {
         // 缓存槽位与 transcript 对齐（增长即「上一条结束」）。
         cache.sync_len(transcript.len());
 
+        let mut recomputed_entries = 0usize;
         for (idx, item) in transcript.iter().enumerate() {
             if !crate::draw::is_visible(item, thinking_visible) {
                 self.entries[idx] = None;
@@ -155,14 +197,29 @@ impl TranscriptLayout {
             );
             let render_sig = lines_hash(&lines);
             let previous = self.entries[idx].take();
+            // 折行真的换了才算一次「重算」—— 产物没变（流式节流窗口内）不计入。
+            let reused = previous
+                .as_ref()
+                .is_some_and(|previous| previous.render_sig == render_sig);
+            if !reused {
+                recomputed_entries += 1;
+            }
+            // 版本号：产物没变 ⇒ 沿用旧号；否则从分配器取新号（首次渲染同此路径）。
+            let rev = if reused {
+                previous.as_ref().map_or(0, |previous| previous.rev)
+            } else {
+                self.rev_alloc += 1;
+                self.rev_alloc
+            };
             let row_starts = match previous {
                 // 产物没真变（流式节流窗口内）⇒ 折行结果照旧。
-                Some(previous) if previous.render_sig == render_sig => previous.row_starts,
+                Some(previous) if reused => previous.row_starts,
                 _ => line_row_starts(&lines, width),
             };
             self.entries[idx] = Some(EntryMemo {
                 sig,
                 render_sig,
+                rev,
                 lines,
                 row_starts,
             });
@@ -199,6 +256,7 @@ impl TranscriptLayout {
         SyncResult {
             total_rows: total,
             width_changed,
+            recomputed_entries,
         }
     }
 
@@ -206,7 +264,37 @@ impl TranscriptLayout {
     ///
     /// `skip_rows` 是**窗口首行内部**要跳过的视觉行数（首行被视窗上沿切开时非零）——
     /// 交给 `Paragraph::scroll` 的纵向分量。
+    ///
+    /// 本函数是 [`Self::window_impl`] 的薄包装（不建 `RowRef`）—— 定位逻辑只有一份。
     pub fn window(&self, top_row: usize, height: usize) -> Window {
+        self.window_impl(top_row, height, None)
+    }
+
+    /// 与 [`Self::window`] **共用同一次遍历**，额外给出「屏幕第 y 行来自哪个 `Line` 的
+    /// 第几个视觉行」。
+    ///
+    /// `rows.len() == min(height, 从 `top_row` 起的剩余可见行数)`：宽字符与折行仍由
+    /// `Paragraph::line_count` 定（本模块不自己算折行）。
+    ///
+    /// 消费方是 `selection.rs` 的视窗字形缓存，故非测试构建里暂时无人调用。
+    #[allow(dead_code)]
+    pub(crate) fn window_with_rows(&self, top_row: usize, height: usize) -> (Window, Vec<RowRef>) {
+        let mut rows = Vec::new();
+        let window = self.window_impl(top_row, height, Some(&mut rows));
+        (window, rows)
+    }
+
+    /// 视窗遍历的**唯一实现**。`rows` 为 `None` ⇒ 不构造 `RowRef`（稳态帧零分配）。
+    fn window_impl(
+        &self,
+        top_row: usize,
+        height: usize,
+        mut rows: Option<&mut Vec<RowRef>>,
+    ) -> Window {
+        // `rows` 是**输出参数**：返回时恰为本次窗口的每行来源（与 `top_row` / `height` 对应）。
+        if let Some(rows) = rows.as_deref_mut() {
+            rows.clear();
+        }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut skip_rows = 0usize;
         if self.total_rows == 0 || height == 0 {
@@ -231,6 +319,15 @@ impl TranscriptLayout {
                 // 视窗上沿落在留白行里：先把剩下的留白行补上（每行 1 视觉行）。
                 for _ in 0..(gap - rel) {
                     lines.push(Line::from(""));
+                    // 留白行也是 1 个视觉行的来源（`off` 恒 0）；窗口装不下的不记。
+                    if remaining > 0
+                        && let Some(rows) = rows.as_deref_mut()
+                    {
+                        rows.push(RowRef {
+                            line: (lines.len() - 1) as u32,
+                            off: 0,
+                        });
+                    }
                     remaining = remaining.saturating_sub(1);
                 }
                 rel = 0;
@@ -252,14 +349,27 @@ impl TranscriptLayout {
                 first_line_off = line_off;
             }
             for k in line_idx..memo.lines.len() {
-                let rows = memo.row_starts[k + 1] - memo.row_starts[k];
+                let rows_n = memo.row_starts[k + 1] - memo.row_starts[k];
                 lines.push(memo.lines[k].clone());
                 // 首行可能只显示下半截 ⇒ 它贡献 `rows - line_off` 个可见行。
-                let visible = if k == line_idx && first_is_content && lines.len() == 1 {
-                    rows.saturating_sub(line_off)
+                let cut = k == line_idx && first_is_content && lines.len() == 1;
+                let visible = if cut {
+                    rows_n.saturating_sub(line_off)
                 } else {
-                    rows
+                    rows_n
                 };
+                // 本 `Line` 的可见行：`off` 从 `line_off` 起（被切开时），窗口装不下的不记。
+                let first_off = if cut { line_off } else { 0 };
+                let take = visible.min(remaining);
+                if take > 0
+                    && let Some(rows) = rows.as_deref_mut()
+                {
+                    let line = (lines.len() - 1) as u32;
+                    rows.extend((0..take).map(|j| RowRef {
+                        line,
+                        off: row_off(first_off + j),
+                    }));
+                }
                 remaining = remaining.saturating_sub(visible);
                 if remaining == 0 {
                     break;
@@ -272,6 +382,63 @@ impl TranscriptLayout {
             skip_rows = first_line_off;
         }
         Window { lines, skip_rows }
+    }
+
+    /// 窗口覆盖条目的版本号 + 窗口顶的**条目内偏移**折叠成一个 `u64`（无分配）——
+    /// 视窗字形缓存的**窗口版本键**。
+    ///
+    /// **只看窗口覆盖的条目**（不遍历整个 `entries`）：窗口外条目更新不得打红缓存，
+    /// 否则「尾部增长、视窗原地不动」会退化成全量重建。
+    ///
+    /// **必含首条目内偏移**：`top_row` 相同不代表窗口内容相同。非贴底时内容在尾部增长
+    /// Δ 行，`app` 侧把 `scroll_offset` 也加 Δ —— `top_row` 数值不变；但若增长发生在
+    /// 窗口**上方**的条目里，`starts[]` 整体下移，同一个 `top_row` 指向的行内位置就往前
+    /// 退了若干视觉行，窗口内容已经换了一批。只折叠 `rev` 会漏掉这次变化，缓存于是拿
+    /// 旧字形配新内容。
+    ///
+    /// 消费方是 `selection.rs` 的视窗字形缓存，故非测试构建里暂时无人调用。
+    #[allow(dead_code)]
+    pub(crate) fn revision_range(&self, top_row: usize, height: usize) -> u64 {
+        if self.total_rows == 0 || height == 0 || self.starts.is_empty() {
+            return 0;
+        }
+        let top = top_row.min(self.total_rows - 1);
+        // 窗口覆盖的全局行区间（半开）：`[top, end)`。
+        let end = top.saturating_add(height).min(self.total_rows);
+        let first = self.locate_entry(top);
+        // 最后一个块起始 < `end` 的条目 —— 与 `window_impl` 推进条目的依据同源
+        // （`starts[i]` 是第 i 个条目的块起始、`starts[i+1]` 是块结束）。
+        let last = self
+            .starts
+            .partition_point(|&start| start < end)
+            .saturating_sub(1);
+        // 首条目内偏移（含该条目的前置留白）—— 见函数文档。
+        let mut hash = mix(0, 13, (top - self.starts[first]) as u64);
+        for idx in first..=last.min(self.entries.len().saturating_sub(1)) {
+            // 不可见条目不产出行 ⇒ 无版本可言。
+            if let Some(memo) = self.entries[idx].as_ref() {
+                hash = mix(hash, 14, memo.rev);
+            }
+        }
+        hash
+    }
+
+    /// 结构版本号：`reset()` / 宽度变 / `thinking_visible` 翻转时 +1。**不随条目内容变**。
+    #[allow(dead_code)]
+    pub(crate) fn structural_rev(&self) -> u64 {
+        self.structural_rev
+    }
+
+    /// 总视觉行数。
+    #[allow(dead_code)]
+    pub(crate) fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    /// 当前 wrap 宽度（折行口径，`>= 1`）—— 造 `Buffer` 渲字形时需要它。
+    #[allow(dead_code)]
+    pub(crate) fn width(&self) -> u16 {
+        self.width
     }
 
     /// 定位某个全局行号落在哪个条目。
@@ -324,6 +491,19 @@ fn render_entry(
         now,
     );
     out
+}
+
+/// 条目内视觉行号 → [`RowRef::off`]。
+///
+/// **不得截断**：视觉行号没有窄上界（见 [`RowRef`]）。`usize` 超出 `u32` 需要单行折出
+/// 40 亿以上视觉行（宽 ≥ 1 ⇒ 单行 40 亿字节以上），`debug_assert` 钉住该前提；
+/// 发布构建取饱和值而非回绕 —— 回绕会让第 0 个视觉行与第 2³² 个撞车。
+fn row_off(off: usize) -> u32 {
+    debug_assert!(
+        u32::try_from(off).is_ok(),
+        "条目内视觉行号 {off} 超出 u32，RowRef::off 无法表示"
+    );
+    u32::try_from(off).unwrap_or(u32::MAX)
 }
 
 /// 逐行折行，返回每行的起始行号（`len = 行数 + 1`，末位 = 总行数）。
@@ -410,8 +590,12 @@ fn mix(hash: u64, tag: u64, value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::app::App;
     use crate::view::CodingView;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn app_with(lines: Vec<TranscriptLine>) -> App {
         let mut app = App::new(CodingView::for_test());
@@ -532,5 +716,455 @@ mod tests {
             first,
             "内容未变 ⇒ 不得重新解析（折行结果按条目记住）"
         );
+    }
+
+    /// 同步一次（把 `md_cache` 的 `RefCell` 守卫封在内部 —— 用例里不重入借用）。
+    fn sync_once(
+        app: &App,
+        layout: &mut TranscriptLayout,
+        width: u16,
+        thinking_visible: bool,
+        now: Instant,
+    ) -> SyncResult {
+        let mut cache = app.md_cache.borrow_mut();
+        layout.sync(&app.transcript, &mut cache, thinking_visible, width, now)
+    }
+
+    fn synced(app: &App, width: u16, thinking_visible: bool, now: Instant) -> TranscriptLayout {
+        let mut layout = TranscriptLayout::default();
+        sync_once(app, &mut layout, width, thinking_visible, now);
+        layout
+    }
+
+    /// 整段渲染的**逐视觉行**结果（每行拼成字符串）—— 语义对照的参考答案。
+    ///
+    /// 一次性把整份 transcript 渲进「高度 = 总视觉行数」的缓冲区。思考可见性由 `app`
+    /// 自身决定（`build_text` 从 `app` 读）—— 调用方必须先把它调成与 `layout.sync`
+    /// 传入的一致。
+    fn whole_render_rows(app: &App, width: u16, total: usize) -> Vec<String> {
+        let text = crate::draw::build_text(app, width as usize, Instant::now());
+        let backend = TestBackend::new(width.max(1), total.min(u16::MAX as usize) as u16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let para = Paragraph::new(text).wrap(Wrap { trim: false });
+                f.render_widget(para, f.area());
+            })
+            .unwrap();
+        buffer_rows(terminal.backend().buffer())
+    }
+
+    /// 单个 `Line` 的**第 `off` 个视觉行**（1 行高的缓冲区）—— 解码 [`RowRef`] 的参考路径。
+    fn rendered_row(line: &Line<'static>, width: u16, off: usize) -> String {
+        let backend = TestBackend::new(width.max(1), 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let para = Paragraph::new(Text::from(vec![line.clone()]))
+                    .wrap(Wrap { trim: false })
+                    .scroll((off.min(u16::MAX as usize) as u16, 0));
+                f.render_widget(para, f.area());
+            })
+            .unwrap();
+        buffer_rows(terminal.backend().buffer()).concat()
+    }
+
+    fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        let width = buffer.area().width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// **V1**：`RowRef` 与视窗遍历的一致性，且**与真实折行逐行对上**。
+    ///
+    /// 样本含 CJK / 折行 / 表格 / thinking，宽度取窄（12）—— 必然折行，`off` 才有非零的机会。
+    /// `top` 扫遍**每一个**行号（而非只采样几个）：折行只在特定行上把 `off` 推开，采样会
+    /// 恰好落在「行首」那些行上，变异才不会被抓到。
+    ///
+    /// 两类断言：
+    /// 1. **内部自洽**：`line` 单调、同 `Line` 内 `off` 逐行递增、首行 `off` == `skip_rows`；
+    /// 2. **语义对照**：`rows[y]` 解码出的那一视觉行，必须与「整段渲染的第 `top + y` 行」
+    ///    逐字节相同 —— 这条把 `rows` 钉在真实折行上（少记行 / `off` 起点错都会红）。
+    #[test]
+    fn test_window_rows_invariants() {
+        // `whole_render_rows` 从 `app` 读思考可见性 ⇒ 必须先调成与 `synced` 传入的一致。
+        let mut app = sample();
+        app.thinking_visible = true;
+        let width = 12u16;
+        let layout = synced(&app, width, true, Instant::now());
+        let total = layout.total_rows();
+        assert!(total > 6, "前置：样本需多于几行（实际 {total}）");
+        assert!(total < u16::MAX as usize, "前置：参考渲染要一次放进缓冲区");
+        let reference = whole_render_rows(&app, width, total);
+        assert_eq!(
+            reference.len(),
+            total,
+            "前置：整段渲染的行数 == 布局总行数（N4）"
+        );
+        for top in 0..total {
+            for h in [1usize, 3, 7, total] {
+                let (window, rows) = layout.window_with_rows(top, h);
+                let ctx = format!("top={top} h={h} total={total}");
+                // 窗口恰有 `min(h, 剩余可见行)` 行 —— **等号**：少记一行（每个 `Line`
+                // 只记 1 行）或漏掉首行的剩余部分都会红。
+                assert_eq!(
+                    rows.len(),
+                    h.min(total - top),
+                    "{ctx}：行映射必须恰为窗口覆盖的视觉行数"
+                );
+                assert!(!rows.is_empty(), "{ctx}：窗口非空 ⇒ 行映射非空");
+                assert_eq!(
+                    rows[0].off as usize, window.skip_rows,
+                    "{ctx}：首行偏移必须与 skip_rows 一致"
+                );
+                for (y, r) in rows.iter().enumerate() {
+                    assert!(
+                        (r.line as usize) < window.lines.len(),
+                        "{ctx}：rows[{y}].line 越界（窗口 {} 行）",
+                        window.lines.len()
+                    );
+                    if y > 0 {
+                        let prev = rows[y - 1];
+                        assert!(prev.line <= r.line, "{ctx}：rows[{y}].line 必须单调不减");
+                        if prev.line == r.line {
+                            assert_eq!(r.off, prev.off + 1, "{ctx}：同一 Line 内 off 必须逐行递增");
+                        }
+                    }
+                    // 语义对照：解码出的那一行 == 整段渲染的第 `top + y` 行。
+                    let decoded =
+                        rendered_row(&window.lines[r.line as usize], width, r.off as usize);
+                    assert_eq!(
+                        decoded,
+                        reference[top + y],
+                        "{ctx}：第 {y} 行（line={} off={}）与整段渲染的第 {} 行不一致",
+                        r.line,
+                        r.off,
+                        top + y
+                    );
+                }
+            }
+        }
+    }
+
+    /// **`RowRef.off` 不得截断**：条目内视觉行号可以远超 `u16`。
+    ///
+    /// 宽 1 + 7 万字符的单条 `User` 行 ⇒ 7 万余视觉行。窗口顶落在其中 ⇒ `rows[0].off`
+    /// 必须是那个行号本身。（`off` 写成 `u16` 时 70000 会静默变成 4464。）
+    #[test]
+    fn test_row_ref_off_keeps_visual_row_beyond_u16() {
+        let width = 1u16;
+        // 宽 1 时每个字符占一个视觉行；`> ` 前缀占 2 行，故第 `n` 个视觉行 == 正文第 `n-2` 格。
+        let target = 70_000usize;
+        let app = app_with(vec![TranscriptLine::User("x".repeat(target + 2))]);
+        let layout = synced(&app, width, true, Instant::now());
+        let total = layout.total_rows();
+        assert!(
+            total > target,
+            "前置：单条就能折出 {target} 行以上（实际 {total}）"
+        );
+        let (window, rows) = layout.window_with_rows(layout.starts[0] + target, 2);
+        assert_eq!(rows.len(), 2, "窗口高 2 ⇒ 两行映射");
+        assert_eq!(rows[0].line, 0, "整条只有 1 个 `Line`");
+        assert_eq!(
+            rows[0].off as usize, target,
+            "条目内视觉行号必须原样给出（不得截断到 u16）"
+        );
+        assert_eq!(rows[1].off as usize, target + 1, "后续行逐行递增");
+        assert_eq!(window.skip_rows, target, "首行偏移与 rows[0].off 同源");
+    }
+
+    /// **同一遍历**：`window()` 与 `window_with_rows().0` 逐字段相同。
+    ///
+    /// 两者共用 `window_impl` —— 若哪天有人复制了第二份定位逻辑，这条用例会红。
+    #[test]
+    fn test_window_with_rows_shares_traversal() {
+        let app = sample();
+        let width = 32u16;
+        let layout = synced(&app, width, true, Instant::now());
+        let total = layout.total_rows();
+        for top in [0usize, 3, total / 2, total - 1] {
+            for h in [1usize, 3, 12, total] {
+                let plain = layout.window(top, h);
+                let (with_rows, _rows) = layout.window_with_rows(top, h);
+                assert_eq!(
+                    plain.skip_rows, with_rows.skip_rows,
+                    "top={top} h={h}：skip_rows"
+                );
+                assert_eq!(plain.lines, with_rows.lines, "top={top} h={h}：lines");
+            }
+        }
+    }
+
+    /// 4 行版 `User` 条目 —— 宽 40 下每行恰 1 个视觉行，**改内容不改几何**。
+    fn user_block(tag: &str) -> TranscriptLine {
+        TranscriptLine::User(format!("{tag}1\n{tag}2\n{tag}3\n{tag}4"))
+    }
+
+    /// 六个等高的 `User` 块：每个块 = 2 行留白 + 4 行内容（首块无留白）。
+    fn revision_sample() -> App {
+        app_with((1..=6).map(|n| user_block(&"p".repeat(n))).collect())
+    }
+
+    /// `revision_range` 只折叠**窗口内**条目 —— 窗口上方 / 下方的条目更新不得打红缓存。
+    ///
+    /// 窗口取**中部**且恰好盖住一个条目（窗口上沿 = 该条目块起点、下沿 = 下一条目块起点）：
+    /// 这样「上一条目」与「下一条目」都真实存在，且下沿**恰好压在块边界上**。
+    #[test]
+    fn test_revision_range_only_covers_window() {
+        let mut app = revision_sample();
+        let width = 40u16;
+        let base = Instant::now();
+        let mut layout = TranscriptLayout::default();
+        let result = sync_once(&app, &mut layout, width, true, base);
+        assert_eq!(
+            layout.total_rows(),
+            result.total_rows,
+            "只读取值器与同步结果同源"
+        );
+        assert_eq!(layout.width(), width, "只读取值器回的是折行口径宽度");
+
+        // 窗口位于中部、恰好覆盖第 `k` 个条目的块（留白 + 内容）。
+        let k = 3usize;
+        let top = layout.starts[k] + 3;
+        let h = layout.starts[k + 1] - top;
+        let total = layout.total_rows();
+        assert!(k > 0 && k + 1 < layout.entries.len(), "前置：上下都有邻居");
+        assert!(
+            top > total / 4 && top + h < total * 3 / 4,
+            "前置：窗口在中部"
+        );
+
+        let before = layout.revision_range(top, h);
+        assert_ne!(before, 0, "前置：窗口内有条目 ⇒ 版本键非零");
+        let starts_k = layout.starts[k];
+        let starts_k1 = layout.starts[k + 1];
+
+        // 窗口**上方**的条目：换成等高的另一段（`starts` 不动 ⇒ 窗口内容不变）。
+        app.transcript[1] = user_block("zzzz");
+        sync_once(
+            &app,
+            &mut layout,
+            width,
+            true,
+            base + Duration::from_secs(1),
+        );
+        assert_eq!(
+            layout.starts[k], starts_k,
+            "前置：上方换成等高的 ⇒ 行号不变"
+        );
+        assert_eq!(
+            layout.revision_range(top, h),
+            before,
+            "窗口上方条目更新 ⇒ 窗口版本键不得变（否则退化成全量折叠）"
+        );
+
+        // 窗口**下方**的条目：窗口下沿恰好压在块边界上。
+        assert_eq!(starts_k1, top + h, "前置：下沿压在块边界上");
+        app.transcript[k + 1] = user_block("wwwwww");
+        sync_once(
+            &app,
+            &mut layout,
+            width,
+            true,
+            base + Duration::from_secs(2),
+        );
+        assert_eq!(
+            layout.revision_range(top, h),
+            before,
+            "窗口下方条目更新 ⇒ 窗口版本键不得变（不得多算一行）"
+        );
+
+        // 改窗口**内**条目。
+        app.transcript[k] = user_block("qq");
+        sync_once(
+            &app,
+            &mut layout,
+            width,
+            true,
+            base + Duration::from_secs(3),
+        );
+        assert_ne!(
+            layout.revision_range(top, h),
+            before,
+            "窗口内条目更新 ⇒ 窗口版本键必须变"
+        );
+    }
+
+    /// **窗口键必含窗口顶的条目内偏移**：`top_row` 不变不等于窗口内容不变。
+    ///
+    /// 场景（`app::sync_scroll_state` 的增量补偿）：非贴底时内容在**上方**增长 Δ 行，
+    /// `scroll_offset` 也跟着加 Δ ⇒ `top_row` 数值不变；但 `starts[]` 整体下移，
+    /// 同一个 `top_row` 在条目内的相对位置退了 Δ 行 ⇒ 窗口已换了一批行。
+    ///
+    /// 只折叠 `rev` 会漏掉这次变化（覆盖条目集合与各自的 `rev` 都没变）⇒ 字形缓存不刷新。
+    #[test]
+    fn test_revision_range_folds_window_top_inner_offset() {
+        let mut app = revision_sample();
+        let width = 40u16;
+        let base = Instant::now();
+        let mut layout = TranscriptLayout::default();
+        sync_once(&app, &mut layout, width, true, base);
+
+        let k = 3usize;
+        let top = layout.starts[k] + 3;
+        let h = layout.starts[k + 1] - top;
+        let before_key = layout.revision_range(top, h);
+        let starts_k = layout.starts[k];
+        let before_lines: Vec<String> = layout
+            .window(top, h)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        let rev_of = |layout: &TranscriptLayout, idx: usize| {
+            layout.entries[idx].as_ref().map(|memo| memo.rev)
+        };
+        let before_rev = rev_of(&layout, k);
+
+        // 只长**窗口上方**的条目：块高 +1 行 ⇒ 其下所有 `starts` 下移 1。
+        app.transcript[1] = TranscriptLine::User("zz1\nzz2\nzz3\nzz4\nzz5".into());
+        sync_once(
+            &app,
+            &mut layout,
+            width,
+            true,
+            base + Duration::from_secs(1),
+        );
+
+        // 前置：窗口顶**行号不变**，上方条目真的变高了，窗口内条目原封不动。
+        assert_eq!(
+            layout.starts[k],
+            starts_k + 1,
+            "前置：上方条目长高 1 行（`starts` 下移）"
+        );
+        assert_eq!(
+            rev_of(&layout, k),
+            before_rev,
+            "前置：窗口内条目未被重算 ⇒ 覆盖条目的版本号没变"
+        );
+        let after_lines: Vec<String> = layout
+            .window(top, h)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert_ne!(before_lines, after_lines, "前置：窗口内容确实换了");
+
+        // 行号与覆盖条目的 `rev` 都没变 —— 唯一的区别是条目内偏移。
+        assert_ne!(
+            layout.revision_range(top, h),
+            before_key,
+            "窗口顶在条目内的偏移变了 ⇒ 窗口版本键必须变"
+        );
+    }
+
+    /// `recomputed_entries` 数的是**真正重算**的条目。
+    #[test]
+    fn test_recomputed_entries_counts_real_rerenders() {
+        let mut app = sample();
+        let width = 40u16;
+        let base = Instant::now();
+        let mut layout = TranscriptLayout::default();
+        let first = sync_once(&app, &mut layout, width, true, base).recomputed_entries;
+        assert!(first > 0, "首轮每条都要算");
+        assert_eq!(
+            sync_once(&app, &mut layout, width, true, base).recomputed_entries,
+            0,
+            "内容未变 ⇒ 一次重算都不该有"
+        );
+        // 改**非 assistant** 条目：`RenderCache` 的前提是 assistant 源文本只增不减
+        // （改历史须升级为内容哈希），换成 User 才能自由改写内容。
+        app.transcript[0] = TranscriptLine::User("换一个问题：这次写得长一些。".into());
+        assert_eq!(
+            sync_once(
+                &app,
+                &mut layout,
+                width,
+                true,
+                base + Duration::from_secs(1)
+            )
+            .recomputed_entries,
+            1,
+            "改一条 ⇒ 只重算那一条"
+        );
+    }
+
+    /// `structural_rev` 只随**结构**（reset / 宽度 / thinking）变，不随条目内容变。
+    #[test]
+    fn test_structural_rev_only_tracks_structure() {
+        let mut app = sample();
+        let now = Instant::now();
+        let mut layout = TranscriptLayout::default();
+
+        sync_once(&app, &mut layout, 40, true, now);
+        let base = layout.structural_rev();
+        assert!(base > 0, "首次同步换掉了整个行号空间（宽度 0 → 40）");
+
+        sync_once(&app, &mut layout, 40, true, now);
+        assert_eq!(
+            layout.structural_rev(),
+            base,
+            "同宽同 thinking ⇒ 结构版本不动"
+        );
+
+        // 只改内容（且是**非 assistant** 条目 —— 缓存前提是 assistant 源只增不减）。
+        app.transcript[3] = TranscriptLine::User("继续（改写过的同一问）".into());
+        sync_once(&app, &mut layout, 40, true, now + Duration::from_secs(1));
+        assert_eq!(layout.structural_rev(), base, "只内容变 ⇒ 结构版本不动");
+
+        sync_once(&app, &mut layout, 30, true, now + Duration::from_secs(2));
+        assert_eq!(layout.structural_rev(), base + 1, "宽度变 ⇒ +1");
+
+        sync_once(&app, &mut layout, 30, false, now + Duration::from_secs(3));
+        assert_eq!(layout.structural_rev(), base + 2, "thinking 翻转 ⇒ +1");
+
+        layout.reset();
+        assert_eq!(layout.structural_rev(), base + 3, "reset ⇒ +1");
+    }
+
+    /// `rev_alloc` 单调递增；产物没变的那次**不**消耗新号。
+    #[test]
+    fn test_rev_alloc_monotonic_and_no_waste() {
+        let mut app = app_with(vec![TranscriptLine::Assistant("abc".into())]);
+        let width = 40u16;
+        let base = Instant::now();
+        let mut layout = TranscriptLayout::default();
+
+        sync_once(&app, &mut layout, width, true, base);
+        let rev0 = layout.entries[0].as_ref().expect("已渲染").rev;
+        assert_eq!(layout.rev_alloc, rev0, "首次渲染从分配器取新号");
+
+        // 节流窗口内增长：**源**变了、**产物**没变 ⇒ 不换号、不消耗新号。
+        app.transcript[0] = TranscriptLine::Assistant("abcd".into());
+        let result = sync_once(
+            &app,
+            &mut layout,
+            width,
+            true,
+            base + Duration::from_millis(10),
+        );
+        assert_eq!(result.recomputed_entries, 0, "产物没变 ⇒ 不算重算");
+        assert_eq!(
+            layout.entries[0].as_ref().expect("已渲染").rev,
+            rev0,
+            "不换号"
+        );
+        assert_eq!(layout.rev_alloc, rev0, "不消耗新号");
+
+        // 过了节流窗口、且源再变一次（只改长度 ⇒ 布局签名也会变）⇒ 真重算 ⇒ 换号。
+        app.transcript[0] = TranscriptLine::Assistant("abcde".into());
+        sync_once(
+            &app,
+            &mut layout,
+            width,
+            true,
+            base + Duration::from_secs(1),
+        );
+        let rev1 = layout.entries[0].as_ref().expect("已渲染").rev;
+        assert!(rev1 > rev0, "重算 ⇒ 必须换新号（{rev1} > {rev0}）");
+        assert_eq!(layout.rev_alloc, rev1, "分配器与最新分配号一致");
     }
 }

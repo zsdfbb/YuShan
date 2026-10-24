@@ -54,7 +54,10 @@ const SUMMARY_KEYS: [&str; 7] = [
 ];
 
 /// 摘要的最大字符数（**字符**，不是字节 —— 中文按 1 个算）。
-const SUMMARY_MAX_CHARS: usize = 40;
+///
+/// 这只是**上界护栏**（防一条巨型 `write` 正文被抄进 transcript），不是显示宽度：
+/// 实际显示多少列由渲染时的可用宽度决定，超出 `[`TOOL_MAX_ROWS`]` 行才截断。
+const SUMMARY_MAX_CHARS: usize = 240;
 
 /// 从工具参数里抽一行摘要。
 ///
@@ -63,17 +66,37 @@ const SUMMARY_MAX_CHARS: usize = 40;
 /// 2. 否则取参数里递归找到的第一个字符串值
 /// 3. 否则用紧凑 JSON（`serde_json::Value::to_string`）
 ///
-/// 末了按**字符边界**截断到 [`SUMMARY_MAX_CHARS`]，超长补 `…`。
+/// 空白（含 `\n` / `\t`）先压成单个空格 —— 工具行是**一条**记录，
+/// 内嵌换行会把行高与后续续行对齐都搞乱。末了按**字符边界**截断到
+/// [`SUMMARY_MAX_CHARS`]，超长补 `…`。
 pub fn summarize_tool_args(_name: &str, args: &Value) -> String {
     for key in SUMMARY_KEYS {
         if let Some(Value::String(s)) = args.get(key) {
-            return truncate_chars(s, SUMMARY_MAX_CHARS);
+            return truncate_chars(&normalize_ws(s), SUMMARY_MAX_CHARS);
         }
     }
     if let Some(s) = first_string(args) {
-        return truncate_chars(&s, SUMMARY_MAX_CHARS);
+        return truncate_chars(&normalize_ws(&s), SUMMARY_MAX_CHARS);
     }
     truncate_chars(&args.to_string(), SUMMARY_MAX_CHARS)
+}
+
+/// 把连续的空白字符（空格 / 换行 / 制表符…）压成单个空格。
+fn normalize_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            in_ws = true;
+            continue;
+        }
+        if in_ws && !out.is_empty() {
+            out.push(' ');
+        }
+        in_ws = false;
+        out.push(ch);
+    }
+    out
 }
 
 /// 把持久化的会话历史（[`Message`] 的**复合**块）转成 transcript 行 —— `/resume` 回放专用。
@@ -265,9 +288,10 @@ mod tests {
         assert_eq!(summarize_tool_args("noop", &json!({})), "{}");
     }
 
+    /// 摘要只是**上界护栏**：极长参数被截到 [`SUMMARY_MAX_CHARS`]，仍是 char 边界。
     #[test]
     fn test_summarize_truncates_long_ascii_at_char_boundary() {
-        let long = "a".repeat(200);
+        let long = "a".repeat(SUMMARY_MAX_CHARS * 3);
         let s = summarize_tool_args("read", &json!({ "path": long }));
         assert_eq!(s.chars().count(), SUMMARY_MAX_CHARS);
         assert!(s.ends_with('…'));
@@ -276,7 +300,7 @@ mod tests {
     /// 回归：超长 CJK 摘要**不得 panic**（按 char，不按字节）。
     #[test]
     fn test_summarize_truncates_long_cjk_without_panic() {
-        let long = "中文路径很长的目录/文件.rs".repeat(20);
+        let long = "中文路径很长的目录/文件.rs".repeat(60);
         let s = summarize_tool_args("read", &json!({ "path": long }));
         assert_eq!(s.chars().count(), SUMMARY_MAX_CHARS);
         assert!(s.ends_with('…'));
@@ -284,19 +308,49 @@ mod tests {
         assert!(s.starts_with("中文路径"));
     }
 
+    /// 护栏**不是**显示宽度：常见的多词 `bash` 命令必须原样保留（不截到 40）。
+    ///
+    /// **变异**：把 `SUMMARY_MAX_CHARS` 改回 40 ⇒ 本用例红。
+    #[test]
+    fn test_summarize_keeps_realistic_commands_intact() {
+        let cmd = "cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture";
+        assert!(cmd.chars().count() > 40, "前提：长于旧的硬上限");
+        assert_eq!(
+            summarize_tool_args("bash", &json!({ "command": cmd })),
+            cmd,
+            "常见命令不得被截断"
+        );
+    }
+
+    /// 参数里的换行 / 制表符压成单个空格 —— 工具行不得因参数而占多行。
+    #[test]
+    fn test_summarize_normalizes_whitespace() {
+        assert_eq!(
+            summarize_tool_args("bash", &json!({ "command": "a\n\nb\t\tc" })),
+            "a b c"
+        );
+        assert_eq!(
+            summarize_tool_args("bash", &json!({ "command": "  ls  -la  " })),
+            "ls -la"
+        );
+    }
+
     /// 45 个汉字（每字 3 字节 = 135 字节）：旧的按字节截断必然 panic。
     #[test]
     fn test_truncate_boundary_exactly_one_over() {
-        let s = "汉".repeat(41);
+        let s = "汉".repeat(SUMMARY_MAX_CHARS + 1);
         let out = truncate_chars(&s, SUMMARY_MAX_CHARS);
         assert_eq!(out.chars().count(), SUMMARY_MAX_CHARS);
-        assert_eq!(out.chars().filter(|c| *c == '汉').count(), 39);
+        assert_eq!(
+            out.chars().filter(|c| *c == '汉').count(),
+            SUMMARY_MAX_CHARS - 1
+        );
     }
 
     #[test]
     fn test_truncate_short_string_untouched() {
-        assert_eq!(truncate_chars("短", 40), "短");
-        assert_eq!(truncate_chars("", 40), "");
+        assert_eq!(truncate_chars("短", SUMMARY_MAX_CHARS), "短");
+        assert_eq!(truncate_chars("", SUMMARY_MAX_CHARS), "");
     }
 
     // ---- 回放（`/resume`）：N9 / N10 ----

@@ -235,9 +235,17 @@ impl QueueBoundarySource {
 （有意接受的例外）。详见 §14.4。
 
 **对话区**：`TranscriptLine` 是**结构化**的（`User` / `Assistant` / `Thinking` / `Tool{id,name,summary,result,success}` /
-`Summary{rounds,stop,elapsed_secs}` / `Error` / `System`）—— 工具调用压一行渲染，摘要由
-`summarize_tool_args`（`SUMMARY_KEYS = [path, file_path, command, pattern, query, url]`）从结构化参数抽取，
-**摘要规则属产品知识，故在 TUI crate 而非协议**。失败的工具显示结果首行，成功的只给 ✓。
+`Summary{rounds,stop,elapsed_secs}` / `Error` / `System`）—— 工具调用最多 **两行**（`TOOL_MAX_ROWS = 2`）渲染，
+摘要由 `summarize_tool_args`（`SUMMARY_KEYS = [path, file_path, command, pattern, query, url, description]`）
+从结构化参数抽取，**摘要规则属产品知识，故在 TUI crate 而非协议**。
+
+**工具行的宽度与行数**：正文按 Chat 内区**当前可用宽度**折行（`wrap_limited`：优先在空格处断，
+单个词超宽才按列硬断），行首 `⏺ ` 与续行对齐位按**实际显示宽度**计算（`⏺` 的宽度随 unicode-width
+版本可能是 1 或 2，硬编码列数会让续行错位）。`✓` / `✗` 落在**末行**行尾，两行时跟着走、不停在半截内容后。
+失败时正文只占 **1** 行（`└ 结果首行` 另起一行，合计仍 ≤ 2 行）。超出两行的部分**只截不续**、
+末行补 `…` —— 工具调用是「过程」的刻度而非正文，一条长 `bash` 命令不该把一串调用摊满半屏；全文在工具结果与日志里。
+`SUMMARY_MAX_CHARS = 240` 只是**上界护栏**（防一条巨型 `write` 正文被抄进 transcript），**不是显示宽度**；
+参数里的空白（含 `\n` / `\t`）先压成单个空格，故一条工具调用不会因参数内嵌换行而多占行。
 `Summary` 渲染为 `{symbol} {stop-label} · N rounds · X.Ys`：已知 `StopReason` 的标签为
 `completed` / `max rounds` / `cancelled` / `truncated` / `no output`，未知变体显示 `unknown`；
 TUI 绘制与退出 scrollback 使用同一格式。

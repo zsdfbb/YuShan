@@ -77,6 +77,13 @@ const ACTION_INDENT: usize = 2;
 ///
 /// 层次：思考（[`ACTION_INDENT`]）⊂ 工具（[`ACTION_INDENT`] + [`ACTION_TOOL_INDENT`]）。
 const ACTION_TOOL_INDENT: usize = 2;
+/// 一条工具调用（含参数摘要）最多占的**视觉行数**。
+///
+/// 工具行是「过程」的刻度，不是正文 —— 它再长也不该把一串调用摊成半屏。
+/// 失败时要另起一行显示结果首行，故那时正文只准占 1 行（两者合计仍 ≤ 2 行）。
+const TOOL_MAX_ROWS: usize = 2;
+/// 工具行正文与结尾 `✓` / `✗` 之间保留的空格数（含末行的整行右边距）。
+const TOOL_MARK_GAP: usize = 2;
 /// 窗口小于此尺寸直接不渲染（留给「终端太小」）。
 const MIN_WIDTH: u16 = 10;
 const MIN_HEIGHT: u16 = 5;
@@ -845,18 +852,50 @@ pub(crate) fn push_non_assistant(
             // 不属于「行动」的类别色。
             let action_style = Style::default().fg(Color::DarkGray);
             let indent = " ".repeat(LineClass::of(item).indent(item));
-            out.push(Line::from(vec![
-                Span::styled(format!("{indent}⏺ {name} "), action_style),
-                Span::styled(summary.clone(), action_style),
-                Span::raw("   "),
-                Span::styled(mark, mark_style),
-            ]));
+            // 失败时要另起一行给结果首行 ⇒ 正文只准占 1 行（合计仍 ≤ [`TOOL_MAX_ROWS`]）。
+            let show_result = !*success && result.is_some();
+            let max_rows = if show_result { 1 } else { TOOL_MAX_ROWS };
+            // 行首 `⏺ ` 与续行对齐位按**实际显示宽度**算 —— `⏺` 的宽度随 unicode-width
+            // 版本可能是 1 或 2，硬编码列数会在续行错位。
+            let head_cols = display_width("⏺ ");
+            let budget = width
+                .saturating_sub(
+                    display_width(&indent) + head_cols + TOOL_MARK_GAP + display_width(mark),
+                )
+                .max(1);
+            // 工具名恒在首行，摘要跟随 —— 二者之间一个空格即可（末尾不留）。
+            let text = if summary.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} {summary}")
+            };
+            let rows = wrap_limited(&text, budget, max_rows);
+            let last = rows.len().saturating_sub(1);
+            for (i, row) in rows.into_iter().enumerate() {
+                // 首行 `⏺ `，续行用等宽空白对齐 —— 缩进与续行对齐都不依赖制表符。
+                let prefix = if i == 0 {
+                    format!("{indent}⏺ ")
+                } else {
+                    format!("{indent}{}", " ".repeat(head_cols))
+                };
+                let mut spans = vec![
+                    Span::styled(prefix, action_style),
+                    Span::styled(row, action_style),
+                ];
+                // 标记落在**末行**行尾：两行时它也跟着走，不会停在半截内容后。
+                if i == last {
+                    spans.push(Span::raw(" ".repeat(TOOL_MARK_GAP)));
+                    spans.push(Span::styled(mark, mark_style));
+                }
+                out.push(Line::from(spans));
+            }
             // 成功只给 ✓（结果默认不展开）；**失败**才显示结果首行 —— 「看不到任何结果」是真损失
-            if !*success && let Some(body) = result {
+            if show_result && let Some(body) = result {
                 let first = body.lines().next().unwrap_or("");
-                let budget = width.saturating_sub(6).max(1);
+                let prefix = format!("{indent}  └ ");
+                let budget = width.saturating_sub(display_width(&prefix)).max(1);
                 out.push(Line::from(Span::styled(
-                    format!("{indent}  └ {}", truncate_to_width(first, budget)),
+                    format!("{prefix}{}", truncate_to_width(first, budget)),
                     Style::default().fg(Color::Red),
                 )));
             }
@@ -995,7 +1034,13 @@ fn truncate_to_width(s: &str, max: usize) -> String {
     if display_width(s) <= max {
         return s.to_string();
     }
-    let budget = max.saturating_sub(1);
+    let mut out = take_width(s, max.saturating_sub(1));
+    out.push('…');
+    out
+}
+
+/// 取前缀，直取到再加一个字符就超 `budget` 列为止（不补省略号）。
+fn take_width(s: &str, budget: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
     for ch in s.chars() {
@@ -1006,8 +1051,76 @@ fn truncate_to_width(s: &str, max: usize) -> String {
         out.push(ch);
         w += cw;
     }
-    out.push('…');
     out
+}
+
+/// 按显示宽度贪心折行，**最多** `max_rows` 行；溢出的内容在末行以 `…` 收尾。
+///
+/// 工具行用它（[`TOOL_MAX_ROWS`]）：工具调用是「过程」的刻度，不是正文 ——
+/// 一条长 `bash` 命令不该把一串调用摊满半屏。**多出的部分只截不续**是有意的：
+/// 那一行的信息量远低于它占的垂直空间，全文在工具结果与日志里。
+///
+/// 优先在**空格**处断行（`bash` 命令、多词参数读起来不断词），
+/// 单个词本身超宽（路径、URL、中文）才按列硬断 —— CJK 没有空格，只能硬断。
+fn wrap_limited(s: &str, width: usize, max_rows: usize) -> Vec<String> {
+    let width = width.max(1);
+    let max_rows = max_rows.max(1);
+    let mut rows = wrap_words(s, width);
+    if rows.len() <= max_rows {
+        return rows;
+    }
+    rows.truncate(max_rows);
+    if let Some(last) = rows.last_mut() {
+        let mut kept = take_width(last, width.saturating_sub(1));
+        kept.push('…');
+        *last = kept;
+    }
+    rows
+}
+
+/// 按显示宽度折行：贪心装词，词间在空格处断；词本身超宽则按列硬断。
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for token in s.split_inclusive(' ') {
+        let tw = display_width(token);
+        if cur_w + tw <= width {
+            cur.push_str(token);
+            cur_w += tw;
+            continue;
+        }
+        if !cur.is_empty() {
+            rows.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            // 断行处的空格不带到下一行行首（行首空白既无信息又占列）。
+            if token.trim_end().is_empty() {
+                continue;
+            }
+        }
+        if tw <= width {
+            cur.push_str(token);
+            cur_w = tw;
+            continue;
+        }
+        // 词本身放不下一行：先把它硬断到当前行，剩下的继续累积。
+        for ch in token.chars() {
+            let cw = display_width(&ch.to_string());
+            if cur_w + cw > width && !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            cur.push(ch);
+            cur_w += cw;
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 /// 按显示宽度贪心硬 wrap（退出打印用；不做断词）。
@@ -1506,6 +1619,7 @@ mod tests {
         );
     }
 
+    /// 短摘要：一行搞定，结果不展开（成功只给 ✓）。
     #[test]
     fn test_tool_call_renders_one_line_and_hides_success_result() {
         let mut app = app_with(CodingView::for_test());
@@ -1524,6 +1638,97 @@ mod tests {
             !joined.contains("SECRET_BODY"),
             "成功时结果默认不展开：{joined}"
         );
+    }
+
+    /// 工具行**占满可用宽度**：宽屏下看到远多于摘要护栏的内容，仍是一行。
+    ///
+    /// **变异**：把正文宽度改回写死的常量（如摘要先截到 40 字符）⇒ 本用例红。
+    #[test]
+    fn test_tool_call_uses_available_width() {
+        let mut app = app_with(CodingView::for_test());
+        let long = "src/very/long/path/to/some/deeply/nested/module/file.rs";
+        assert!(long.chars().count() > 40, "前提：长于旧的硬上限");
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "read".into(),
+            summary: long.into(),
+            result: None,
+            success: true,
+        });
+        let rows = rows_of(&mut app, 120, 40);
+        let tool: Vec<&String> = rows.iter().filter(|r| r.contains('⏺')).collect();
+        assert_eq!(tool.len(), 1, "短于宽度时只占一行：{rows:?}");
+        assert!(
+            tool[0].contains(long),
+            "宽屏下应完整显示摘要：{:?}",
+            tool[0]
+        );
+        assert!(display_width(tool[0]) <= 120, "不得超出行宽：{:?}", tool[0]);
+    }
+
+    /// 超长摘要：**最多两行**，第二行以 `…` 收尾，`✓` 跟着落在末行。
+    ///
+    /// **变异**：`TOOL_MAX_ROWS` 改回不限（或 `wrap_limited` 忽略 `max_rows`）⇒ 行数红；
+    /// 标记固定在首行 ⇒ 「末行带 ✓」红。
+    #[test]
+    fn test_tool_call_wraps_to_at_most_two_lines() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "bash".into(),
+            summary: "cargo test --workspace --all-features --no-fail-fast -- --nocapture "
+                .repeat(6),
+            result: None,
+            success: true,
+        });
+        let rows = rows_of(&mut app, 60, 40);
+        let tool: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains('⏺') || r.contains('✓'))
+            .collect();
+        assert_eq!(tool.len(), TOOL_MAX_ROWS, "最多两行：{rows:?}");
+        let last = tool.last().unwrap();
+        assert!(last.contains('✓'), "标记落在末行：{last:?}");
+        assert!(last.contains('…'), "被截断的末行补省略号：{last:?}");
+        for row in &tool {
+            assert!(display_width(row) <= 60, "折行后每行仍不超宽：{row:?}");
+        }
+    }
+
+    /// 失败时：正文只占 1 行（给结果首行留位），合计仍 ≤ [`TOOL_MAX_ROWS`]。
+    #[test]
+    fn test_failed_tool_wraps_to_one_line_plus_result() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "bash".into(),
+            summary: "cargo test --workspace --all-features --no-fail-fast ".repeat(4),
+            result: Some("error: could not compile".into()),
+            success: false,
+        });
+        let rows = rows_of(&mut app, 60, 40);
+        // 只数**内容行**：`└` 也出现在 Input 边框上，故按行首缩进分辨。
+        let tool: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains('⏺') || r.trim_start().starts_with("└ "))
+            .collect();
+        assert_eq!(tool.len(), TOOL_MAX_ROWS, "摘要 1 行 + 结果 1 行：{rows:?}");
+        assert!(tool[0].contains('✗'), "标记在摘要行：{:?}", tool[0]);
+        assert!(
+            tool[1].contains("└ error: could not compile"),
+            "结果首行：{:?}",
+            tool[1]
+        );
+    }
+
+    /// 摘要里的换行被抹平 —— 一条工具调用不能占掉多行。
+    #[test]
+    fn test_tool_summary_has_no_embedded_newlines() {
+        let s = crate::transcript::summarize_tool_args(
+            "bash",
+            &serde_json::json!({ "command": "line1\nline2\tline3" }),
+        );
+        assert_eq!(s, "line1 line2 line3");
     }
 
     #[test]

@@ -14,6 +14,8 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
   ys-coding-agent --resume [<id>]        恢复既有会话（默认新会话；裸 --resume 列出候选并选择，
                                         --resume <id> 指定会话 id 或文件路径）
   ys-coding-agent worktree <动词> …      create [name] | attach [name] | list | remove <name>
+                                        create / attach 可带 -p / --json / --resume；
+                                        create 建完树即以新树为工作区启动
   ys-coding-agent --help | -h | help     打印本帮助后退出（不读凭证、不建运行时）
 
 公共 flag：

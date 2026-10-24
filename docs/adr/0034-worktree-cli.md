@@ -75,11 +75,20 @@
    HOME 相对路径（逐分量作目录，而非拼成单个目录名）另使「不同路径、同名目录」的两个仓库**不再撞名**，
    且 `~/a/b` 与 `~/a-b` 落点不同。
 
-7. **`create` 免起名 + 两处打印**（用户追加需求）。`create` 无参 ⇒ `auto_name()`，复用既有的
+7. **`create` 免起名 + 建完即启动**（用户追加需求）。`create` 无参 ⇒ `auto_name()`，复用既有的
    `wiring::new_session_id()` 形态（`wiring.rs:235-240`，零新依赖、零碰撞）；`attach` 无参 ⇒ 从 `list`
    选取（照 `--resume` 无参 `Resume::Pick` 先例）。**不采纳可读名**（`bright-running-fox` 那类需要词表，
-   本仓无先例；名字在可选取的前提下几乎不可见）。打印：`create` 成功打 `worktree: <name>` 到 **stderr**
-   （与 **ADR-0032** 的 `session: <id>` 同侧同风格）；会话结束在既有退出行处追加同名行 + 「分支未合并」提示。
+   本仓无先例；名字在可选取的前提下几乎不可见）。
+
+   **（U6 修订）`create` = 建树 + 以新树为工作区启动** —— 不再要求用户再跑一次 `worktree attach`。
+   两者共用同一个注入点（`Config::from_env()` 之后、skill 扫描之前改写 `config.cwd`）与同一套尾部
+   flag（`-p` / `--json` / `--resume` / `--debug`），故 `parse_worktree_binding` 按动词名分派。
+   告知行（`worktree: <name>` / 路径 / 分支未合并）**并入启动期提示**而不是直写 stderr：
+   起屏前的 stderr 会在退出 alt-screen 后变成主屏残渣。非终端环境（stdin/stdout 不是终端）
+   **不启 TUI** —— `enable_raw_mode()` 在管道下必失败，CI / 脚本里的 `create` 不能因此不可用，
+   此时打印告知后 `exit(0)`。
+
+   会话结束在既有退出行处追加同名行 + 「分支未合并」提示。
    ⚠️ **（U4 修订）退出行需要新句柄** —— 原判「工作区在启动期定死、运行期不变 ⇒ 不需要
    `SessionPathHandle` 式快照」被 U4 推翻：会话内 `/resume` 可切到一条记录了**别的**工作树的会话
    （用户明确要求），工作区因此**运行期可变**。退出行与回合末 `SessionMeta.workspace` 改由

@@ -65,7 +65,7 @@ mod worktree;
 #[cfg(test)]
 mod test_env;
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -146,11 +146,12 @@ enum Resume {
 
 /// `worktree` 子命令（CLI 四动词）。
 ///
-/// `create` / `attach` 的名参可省（`None` ⇒ 自动命名 / 列表选取）；`list` 无参；
-/// `remove` 必须有名字。
+/// `create` / `attach` 的名参可省（`None` ⇒ 自动命名 / 列表选取）；两者都吃模式 flag
+/// （`-p` / `--json` / `--resume` / `--debug`）—— `create` 建完树即**以该树为工作区启动**，
+/// 等价于「建树 + attach」，故与 `attach` 共用同一套尾部解析。`list` 无参；`remove` 必须有名字。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorktreeCmd {
-    /// `worktree create [name]`：建树（`None` ⇒ `worktree::auto_name()`）。
+    /// `worktree create [name]`：建树并以新树为工作区启动（`None` ⇒ `worktree::auto_name()`）。
     Create(Option<String>),
     /// `worktree attach [name]`：启动即绑定工作区（`None` ⇒ 列表选取）。
     Attach(Option<String>),
@@ -380,10 +381,6 @@ fn parse_worktree(argv: &[String]) -> Result<Args, String> {
         );
     };
     match verb {
-        "create" => Ok(Args {
-            worktree: Some(WorktreeCmd::Create(optional_name(&argv[1..], "create")?)),
-            ..new_interactive()
-        }),
         "list" => {
             if argv.len() > 1 {
                 return Err("worktree list 不接受参数".into());
@@ -402,48 +399,44 @@ fn parse_worktree(argv: &[String]) -> Result<Args, String> {
                 ..new_interactive()
             })
         }
-        "attach" => parse_worktree_attach(&argv[1..]),
+        // `create` 与 `attach` 同形：名参可选 + 模式 flag 区（`create` 建完即在该树启动）。
+        "create" | "attach" => parse_worktree_binding(verb, &argv[1..]),
         other => Err(format!(
             "未知的 worktree 动词：{other}（可用：create / attach / list / remove）"
         )),
     }
 }
 
-/// `create [name]` 的可选名参：0 参 ⇒ `None`（自动命名），1 参 ⇒ `Some`，更多 ⇒ `Err`。
+/// `create` / `attach` 共用的形态：`[name] [模式 flag...]`。
 ///
-/// **以 `-` 开头的名参一律报错**：名参与模式 flag 在语法上无从区分，若不拦，单独一个
-/// token（如 `worktree create -p`）会被当成名字、建出一棵名为 `-p` 的树。要自动命名就省略名字。
-fn optional_name(rest: &[String], verb: &str) -> Result<Option<String>, String> {
-    match rest {
-        [] => Ok(None),
-        [name] if name.starts_with('-') => Err(format!(
-            "worktree {verb} 的名字不能以 `-` 开头；如需自动命名请省略名字"
-        )),
-        [name] => Ok(Some(name.clone())),
-        _ => Err(format!("worktree {verb} 至多接受一个名字参数")),
-    }
-}
-
-/// `attach [name] [模式 flag...]`：名参可选（首 token 是 flag 则无名），其后按顶层模式解析
-/// ——`attach` 可带 `-p` / `--json` / `--resume [<id>]`（设计 §5.1）。
-fn parse_worktree_attach(rest: &[String]) -> Result<Args, String> {
+/// 名参可选 —— **首 token 以 `-` 开头即视为无名**（此后整段进模式 flag 区），故
+/// `worktree create -p "任务"` 是「自动命名 + single-shot」，不会建出一棵名为 `-p` 的树。
+/// `attach` 可带 `-p` / `--json` / `--resume [<id>]`（设计 §5.1）；`create` 同权。
+fn parse_worktree_binding(verb: &str, rest: &[String]) -> Result<Args, String> {
     let (name, tail) = match rest.first().map(String::as_str) {
         None => (None, &rest[0..]),
         Some(s) if s.starts_with('-') && s != "-" => (None, rest),
         Some(_) => (Some(rest[0].clone()), &rest[1..]),
     };
-    let (mode, stats, debug, resume) = parse_mode_tail(tail)?;
+    let (mode, stats, debug, resume) = parse_mode_tail(tail, verb)?;
+    let worktree = if verb == "create" {
+        WorktreeCmd::Create(name)
+    } else {
+        WorktreeCmd::Attach(name)
+    };
     Ok(Args {
         mode,
         stats,
         debug,
         resume,
-        worktree: Some(WorktreeCmd::Attach(name)),
+        worktree: Some(worktree),
     })
 }
 
-/// 解析 `worktree attach` 名参之后的模式 flag 区（照顶层 `parse_args` 的形态）。
-fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, bool, Resume), String> {
+/// 解析 `worktree <动词>` 名参之后的模式 flag 区（照顶层 `parse_args` 的形态）。
+///
+/// `verb` 只用于报错文案（`create` / `attach` 同一套语法）。
+fn parse_mode_tail(tail: &[String], verb: &str) -> Result<(Mode, bool, bool, Resume), String> {
     let Some(first) = tail.first().map(String::as_str) else {
         return Ok((Mode::Interactive, false, false, Resume::New));
     };
@@ -472,14 +465,14 @@ fn parse_mode_tail(tail: &[String]) -> Result<(Mode, bool, bool, Resume), String
             let (stats, debug, resume, rest) = split_leading_flags(tail)?;
             if !rest.is_empty() {
                 return Err(format!(
-                    "worktree attach 的交互式 flag 之后不能再跟任务文本：{}",
+                    "worktree {verb} 的交互式 flag 之后不能再跟任务文本：{}",
                     rest.join(" ")
                 ));
             }
             Ok((Mode::Interactive, stats, debug, resume))
         }
         other => Err(format!(
-            "worktree attach 只接受 -p / --json / --resume [<id>] / --debug 与可选名字；\
+            "worktree {verb} 只接受 -p / --json / --resume [<id>] / --debug 与可选名字；\
              未知参数：{other}"
         )),
     }
@@ -1155,6 +1148,42 @@ fn with_resume_hint(hint: Option<String>, triggered: bool) -> Option<String> {
         Some(h) => format!("{h}\n{line}"),
         None => line,
     })
+}
+
+/// 把建树告知（`worktree create` 成功）并入启动期提示，**放在最前**（它是最相关的上下文）。
+///
+/// 与 [`with_resume_hint`] 同规：不覆盖既有提示，多行拼接。
+fn with_worktree_note(hint: Option<String>, note: Option<String>) -> Option<String> {
+    let Some(note) = note else {
+        return hint;
+    };
+    Some(match hint {
+        Some(h) => format!("{note}\n{h}"),
+        None => note,
+    })
+}
+
+/// `worktree create` 成功的告知行：名字 / 路径 / 分支（未合并）。
+///
+/// 与退出行 `worktree: <name>` 同一格式（[`worktree_exit_line`]），便于脚本与测试识别。
+fn worktree_created_note(entry: &worktree::Entry) -> String {
+    let mut note = format!(
+        "{}\n路径：{}",
+        worktree_exit_line(&entry.name),
+        entry.path.display()
+    );
+    if let Some(branch) = &entry.branch {
+        note.push_str(&format!("\n分支：{branch}（未合并）"));
+    }
+    note
+}
+
+/// 能否起 TUI：stdin 与 stdout 都是终端。
+///
+/// 交互式模式依赖 `enable_raw_mode()` + alt-screen，管道 stdio 下必然失败 ⇒ 非终端环境
+/// （CI / 脚本 / 管道）**不**启动 TUI，由调用方降级为纯建树语义。
+fn tui_available() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
 /// 把打开会话时产生的一次性修复摘要追加到启动期提示末尾。
@@ -2388,33 +2417,14 @@ fn resolve_attach_target(
     }
 }
 
-/// 执行 `worktree create` / `list` / `remove`：打印结果后**早退**（不建 runtime / 不建 agent）。
+/// 执行 `worktree list` / `remove`：打印结果后**早退**（不建 runtime / 不建 agent）。
 ///
-/// `create` / `remove` 是显式动作 ⇒ 失败即**硬失败**（stderr 写明原因 + 退路，退出码非零）。
+/// `remove` 是显式动作 ⇒ 失败即**硬失败**（stderr 写明原因 + 退路，退出码非零）。
 /// `list` 结果写 **stdout**（数据流），仓库头写到 **stderr**（诊断）。
+///
+/// `create` / `attach` **不在此处** —— 它们要改写工作区后继续启动（`main` 内联处理）。
 fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
     match cmd {
-        WorktreeCmd::Create(name) => match worktree::main_repo(cwd)
-            .and_then(|repo| worktree::create(&repo.root, name.as_deref()))
-        {
-            Ok(entry) => {
-                // `worktree: <name>` 落 stderr（与 `session: <id>` 同侧同风格）。
-                eprintln!("{}", worktree_exit_line(&entry.name));
-                eprintln!("路径：{}", entry.path.display());
-                if let Some(branch) = &entry.branch {
-                    eprintln!("分支：{branch}（未合并）");
-                }
-                eprintln!("下一步：ys-coding-agent worktree attach {}", entry.name);
-                exit_with_debug(&mut None, 0);
-            }
-            Err(e) => {
-                eprintln!("创建 worktree 失败：{e}");
-                eprintln!(
-                    "退路：确认当前目录在 git 仓库内、已安装 git；若提示路径已被登记，可 `git worktree prune` 后重试。"
-                );
-                exit_with_debug(&mut None, 1);
-            }
-        },
         WorktreeCmd::List => {
             let listed = worktree::main_repo(cwd).and_then(|repo| {
                 eprintln!("仓库：{}（{}）", repo.name, repo.root.display());
@@ -2450,9 +2460,9 @@ fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
                 }
             }
         }
-        // `attach` 不早退（由 `main` 在进入本函数前单独处理）；此处不可达。
-        WorktreeCmd::Attach(_) => {
-            unreachable!("Attach 已由 main 提前处理，不应到达 run_worktree_early")
+        // `create` / `attach` 不早退（由 `main` 在进入本函数前单独处理）；此处不可达。
+        WorktreeCmd::Create(_) | WorktreeCmd::Attach(_) => {
+            unreachable!("Create / Attach 已由 main 提前处理，不应到达 run_worktree_early")
         }
     }
 }
@@ -2489,21 +2499,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 的第三种情形）—— 这是「绝不静默采用调用方 cwd」的落点：目标只可能是记录或此值。
     let shared_workspace = config.cwd.clone();
 
-    // `worktree` 子命令分流（**必须早于 skill 扫描**：`attach` 改写 `config.cwd`，
+    // `worktree` 子命令分流（**必须早于 skill 扫描**：`create` / `attach` 改写 `config.cwd`，
     // 而 skill 根 / 提示词 / 工具三者都从它派生，设计 §1.1/§1.2）。
     //
-    // `create` / `list` / `remove` 是进程级动作 ⇒ 在此**执行并早退**，不建 runtime；
-    // `attach` 只把工作区换到树上（失败则响亮警告 + 保持共享工作区），随后走正常启动。
+    // `create` = **建树 + 以新树为工作区启动**（与 `attach` 同一注入点、同一时机）；
+    // `attach` 只把工作区换到既有树上（失败则响亮警告 + 保持共享工作区）；
+    // `list` / `remove` 是进程级动作 ⇒ 在此**执行并早退**，不建 runtime。
     // 捕获的树名 / 树路径**只用于播种**启动期的绑定快照 —— 工作区在运行期可变
     // （会话内 `/resume` 可切树），故后续读取一律走 `WorktreeHandle`（见 `app_loop`）。
     let mut worktree_name: Option<String> = None;
-    // 本会话**当前绑定**的工作树路径（显式 attach 或从 meta 恢复时给出；否则共享工作区 ⇒ None）。
+    // 本会话**当前绑定**的工作树路径（显式 create/attach 或从 meta 恢复时给出；否则共享工作区 ⇒ None）。
     // 回合末据此写 `SessionMeta.workspace`：共享工作区写进去是无用噪声。
     let mut worktree_path: Option<PathBuf> = None;
-    // 是否**显式**给了 `worktree attach`（含失败降级）。显式者优先于 meta 记录：
-    // 只要用户点名了 attach，就不再套用 meta 里的工作区（哪怕是回退到共享工作区）。
-    let explicit_attach = matches!(&args.worktree, Some(WorktreeCmd::Attach(_)));
+    // 建树成功的告知行。**不进 stderr**（TUI 起屏前写 stderr 会在退出 alt-screen 后变成
+    // 主屏残渣，设计 §5），改为并入启动期提示：TUI 进 transcript、`-p`/`--json` 进 stderr。
+    let mut worktree_note: Option<String> = None;
+    // 是否**显式**指定了工作树（`create` 或 `attach`，含 attach 的失败降级）。
+    // 显式者优先于 meta 记录：只要用户点名了工作树，就不再套用 meta 里的记录
+    // （哪怕是回退到共享工作区）。
+    let explicit_binding = matches!(
+        &args.worktree,
+        Some(WorktreeCmd::Create(_) | WorktreeCmd::Attach(_))
+    );
     match &args.worktree {
+        Some(WorktreeCmd::Create(name)) => {
+            let created = worktree::main_repo(&config.cwd)
+                .and_then(|repo| worktree::create(&repo.root, name.as_deref()));
+            match created {
+                Ok(entry) => {
+                    // 建树成功 ⇒ 与 `attach` 同点注入：工具 / 提示词 / skill 根都从新树派生。
+                    worktree_path = Some(entry.path.clone());
+                    worktree_name = Some(entry.name.clone());
+                    config.cwd = entry.path.clone();
+                    worktree_note = Some(worktree_created_note(&entry));
+
+                    // **起不了 TUI 就不起**：交互式模式要求 stdin/stdout 是终端（`enable_raw_mode`
+                    // 在管道 stdio 下必失败）。非终端环境（CI / 脚本 / 管道）保持纯建树语义
+                    // —— 打印结果后 exit 0，不报错、不阻塞。
+                    if matches!(args.mode, Mode::Interactive) && !tui_available() {
+                        eprintln!("{}", worktree_exit_line(&entry.name));
+                        eprintln!("路径：{}", entry.path.display());
+                        if let Some(branch) = &entry.branch {
+                            eprintln!("分支：{branch}（未合并）");
+                        }
+                        eprintln!(
+                            "非交互环境（stdin/stdout 不是终端），未启动 TUI；\
+                             要在该树里开会话：ys-coding-agent worktree attach {}",
+                            entry.name
+                        );
+                        exit_with_debug(&mut None, 0);
+                    }
+                }
+                Err(e) => {
+                    // `create` 是显式动作 ⇒ **硬失败**（非零退出 + 明确原因 + 退路）。
+                    eprintln!("创建 worktree 失败：{e}");
+                    eprintln!(
+                        "退路：确认当前目录在 git 仓库内、已安装 git；若提示路径已被登记，可 `git worktree prune` 后重试。"
+                    );
+                    exit_with_debug(&mut None, 1);
+                }
+            }
+        }
         Some(WorktreeCmd::Attach(name)) => {
             match resolve_attach_target(&config.cwd, name.as_deref()) {
                 Ok((path, resolved)) => {
@@ -2545,22 +2601,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sessions_dir = sessions_dir();
     let (resume_path, resume_meta) = resolve_resume(&args.resume, &sessions_dir);
 
-    // —— `--resume` 的工作区恢复（**代码在 `attach` 之后、skill 扫描之前**）——
+    // —— `--resume` 的工作区恢复（**代码在 `create` / `attach` 之后、skill 扫描之前**）——
     //
     // 铁律（Codex issue #4791 的教训）：`--resume` **必须**优先采用 meta 记录的工作区，
     // **绝不**静默采用调用方的当前 cwd —— 那会扩大可写根。四情形：
-    //   · 显式 `attach` 已给定 ⇒ 显式者优先，此处不动作（仅在与记录不同时说明）；
+    //   · 显式 `create` / `attach` 已给定 ⇒ 显式者优先，此处不动作（仅在与记录不同时说明）；
     //   · 有记录且树仍在 ⇒ 恢复到该树，并告知；
     //   · 有记录但树已不在 ⇒ 明确告知后按共享工作区启动（`config.cwd` 不变）；
     //   · 无记录 ⇒ 什么都不做、**不打任何东西**。
-    if explicit_attach {
+    if explicit_binding {
         if let (Some(explicit), Some(recorded)) = (
             worktree_path.as_deref(),
             resume_meta.as_ref().and_then(|m| m.workspace.as_deref()),
         ) && !same_dir(explicit, recorded)
         {
             eprintln!(
-                "注意：本会话记录的工作树为 {}，但已按显式 attach 使用 {}。",
+                "注意：本会话记录的工作树为 {}，但已按显式指定的工作树使用 {}。",
                 recorded.display(),
                 explicit.display()
             );
@@ -2863,6 +2919,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hint,
         matches!(args.resume, Resume::New) && sessions_dir_has_entries(&sessions_dir),
     );
+
+    // 建树告知（`create` 路径）并入同一条启动期提示：名字 / 路径 / 分支未合并。
+    // 不进 stderr 是因为 TUI 起屏前写 stderr 会在退出 alt-screen 后变成主屏残渣（设计 §5）。
+    let hint = with_worktree_note(hint, worktree_note);
 
     // **工作区绑定快照**：名字 + 路径同源于启动期捕获的树名 / 树路径（attach 或 meta 恢复）。
     // 工作区在运行期可变（会话内 `/resume` 切树），故退出行与回合末 meta 都经此句柄读，
@@ -3580,20 +3640,26 @@ mod tests {
         assert!(parse_args(&s(&["worktree", "list", "extra"])).is_err());
     }
 
-    /// `worktree create` 的名参**以 `-` 开头 ⇒ Err**（否则会把 `-p` 当名字建树）；
-    /// 省略名字仍表示自动命名。
+    /// `worktree create` 与 `attach` 同形：名参可选，且**首 token 是 flag 即视为无名**
+    /// ——`create -p "任务"` 是「自动命名 + 单次回合」，不会建一棵名为 `-p` 的树。
     ///
-    /// 变异：把 `optional_name` 的 `starts_with('-')` 守卫删掉 ⇒ `create -p` 变 `Ok`
-    /// （`Some("-p")`）⇒ 本测试红。
+    /// 变异：把 `parse_worktree_binding` 的 `starts_with('-')` 守卫删掉 ⇒ `create -p`
+    /// 变 `Create(Some("-p"))` ⇒ 本测试红。
     #[test]
-    fn parse_worktree_create_rejects_flag_like_name() {
-        let err = parse_args(&s(&["worktree", "create", "-p"])).unwrap_err();
-        assert!(
-            err.contains("不能以 `-` 开头"),
-            "以 `-` 开头的名字应被拒并给出提示：{err}"
-        );
-        assert!(parse_args(&s(&["worktree", "create", "--json"])).is_err());
-        // 省略名字 ⇒ 自动命名（不受守卫影响）。
+    fn parse_worktree_create_accepts_mode_flags() {
+        let p = parse_args(&s(&["worktree", "create", "-p", "do it"])).unwrap();
+        assert_eq!(p.mode, Mode::Print("do it".into()));
+        assert_eq!(p.worktree, Some(WorktreeCmd::Create(None)));
+
+        let j = parse_args(&s(&["worktree", "create", "feat", "--json", "do"])).unwrap();
+        assert_eq!(j.mode, Mode::Json("do".into()));
+        assert_eq!(j.worktree, Some(WorktreeCmd::Create(Some("feat".into()))));
+
+        // `-p` 缺任务文本 ⇒ Err（与顶层同规）。
+        assert!(parse_args(&s(&["worktree", "create", "-p"])).is_err());
+        // 未知 flag ⇒ Err。
+        assert!(parse_args(&s(&["worktree", "create", "--nope"])).is_err());
+        // 省略名字 ⇒ 自动命名。
         assert_eq!(
             parse_args(&s(&["worktree", "create"])).unwrap().worktree,
             Some(WorktreeCmd::Create(None))

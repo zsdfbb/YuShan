@@ -287,13 +287,15 @@ fn canonical(p: &Path) -> PathBuf {
 // N1 —— `create <name>` 建树 + 建分支
 // ---------------------------------------------------------------------------
 
-/// **N1**：临时 git 仓内 `worktree create feat`。
+/// **N1**：临时 git 仓内 `worktree create feat`（**非 TTY**，故不启 TUI）。
 ///
 /// 断言：退出码 0；stdout 为空（create 的输出全走 stderr）；stderr 含 `worktree: feat`；
-/// `git worktree list` 含新路径；`git branch --list worktree-feat` 非空。
+/// `git worktree list` 含新路径；`git branch --list worktree-feat` 非空；
+/// 且明说「未启动 TUI」（非终端环境降级为纯建树，不报错）。
 ///
 /// 变异靶子：把 `worktree_exit_line` 的 `eprintln!` 改成 `println!` ⇒ stdout 非空 ⇒ 红；
-/// 分支名少 `worktree-` 前缀 ⇒ 分支断言红。
+/// 分支名少 `worktree-` 前缀 ⇒ 分支断言红；
+/// 把 `tui_available()` 守卫删掉 ⇒ 非 TTY 下尝试起 TUI 而失败 ⇒ 退出码 / 输出断言红。
 #[test]
 fn n1_create_makes_worktree_and_branch() {
     let sb = Sandbox::new("n1");
@@ -314,6 +316,10 @@ fn n1_create_makes_worktree_and_branch() {
     assert!(
         stderr.contains("worktree: feat"),
         "stderr 应含 `worktree: feat`：\n{stderr}"
+    );
+    assert!(
+        stderr.contains("未启动 TUI"),
+        "非终端环境应明说未启 TUI（降级为纯建树）：\n{stderr}"
     );
 
     let tree = created_path(&stderr);
@@ -687,13 +693,14 @@ fn n8_attach_degrades_without_panicking() {
 // N9 —— 退出行（`session:` + `worktree:`）
 // ---------------------------------------------------------------------------
 
-/// 回环地址上的极简 **成功** mock：每个请求都回 [`success_sse`]。
+/// 回环地址上的极简 **成功** mock：每个请求都回 [`success_sse`]，并**记录请求体**。
 ///
-/// 与 `session_cli.rs` 的 `SseMockServer` 同形（不记录请求 —— N9 只关心退出行）。
-/// 之所以能**离线**跑通成功回合：只有「回合成功」才会走 `persist_single_turn`，
-/// 而 `worktree: <name>` 那一行只在那里打印。
+/// 记录请求体是为了能断言「回合真正跑在哪棵树里」：系统提示首段是
+/// `Current working directory: <path>`，它直接反映 agent 装配时的工作区，
+/// 比 meta 的 `workspace` 键更难被旁路。
 struct SseServer {
     port: u16,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -705,6 +712,8 @@ impl SseServer {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_thread = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let sse = success_sse();
@@ -712,7 +721,7 @@ impl SseServer {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = serve_sse_once(stream, &sse);
+                        let _ = serve_sse_once(stream, &sse, &requests_thread);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
@@ -724,6 +733,7 @@ impl SseServer {
 
         Self {
             port,
+            requests,
             stop,
             handle: Some(handle),
         }
@@ -732,6 +742,11 @@ impl SseServer {
     /// api_base（code 会在其后追加 `/chat/completions`）。
     fn api_base(&self) -> String {
         format!("http://127.0.0.1:{}/v1", self.port)
+    }
+
+    /// 已捕获的请求体（不含头）。
+    fn bodies(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -768,8 +783,12 @@ fn headers_content_length(header_bytes: &[u8]) -> usize {
     0
 }
 
-/// 读一个请求（行 + 头 + body），回 200 + SSE 后关闭。
-fn serve_sse_once(mut stream: std::net::TcpStream, sse: &str) -> std::io::Result<()> {
+/// 读一个请求（行 + 头 + body），记录 body，回 200 + SSE 后关闭。
+fn serve_sse_once(
+    mut stream: std::net::TcpStream,
+    sse: &str,
+    requests: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> std::io::Result<()> {
     // macOS/BSD 上 `accept()` 的连接会继承监听 socket 的 O_NONBLOCK，显式复位。
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -794,6 +813,10 @@ fn serve_sse_once(mut stream: std::net::TcpStream, sse: &str) -> std::io::Result
         }
         raw.extend_from_slice(&tmp[..n]);
     }
+
+    // 记录 body：U6 断言系统提示里的 cwd 就是新树。
+    let body = String::from_utf8_lossy(&raw[header_end..]).into_owned();
+    requests.lock().unwrap().push(body);
 
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1066,8 +1089,8 @@ fn u3_explicit_attach_wins_over_recorded_worktree() {
         "成功回合应 exit(0)；stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("已按显式 attach 使用"),
-        "显式 attach 与记录不同时应说明：\n{stderr}"
+        stderr.contains("已按显式指定的工作树使用"),
+        "显式指定与记录不同时应说明：\n{stderr}"
     );
     assert!(
         stderr.contains("worktree: bug"),
@@ -1244,5 +1267,110 @@ fn no_arg_attach_reports_zero_and_two_candidates() {
         two.status.code(),
         Some(1),
         "无凭证应早退 exit(1)：\n{two_err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// U6 —— `create` 即启动（建树后直接以新树为工作区跑，无需 attach）
+// ---------------------------------------------------------------------------
+
+/// **U6**：`worktree create feat -p hi` ⇒ 建树 **并**在新树里跑一个成功回合，
+/// 无需任何 `attach`。
+///
+/// 断言：退出码 0；stderr 含建树告知（`worktree: feat` / `路径：`）与回合结束行；
+/// **请求体里的 `Current working directory` 就是新树**（证明工具 / 提示词 / skill 根
+/// 都从新树派生，而不是只把路径记进 meta）。
+///
+/// 变异靶子：把 `main` 里 `Create` 分支的 `config.cwd = entry.path` 删掉 ⇒ 系统提示的
+/// cwd 仍是共享工作区 ⇒ 本测试红。
+#[test]
+fn create_launches_session_in_the_new_tree() {
+    let server = SseServer::start();
+    let sb = Sandbox::new("u6_create_run");
+    init_repo(&sb.repo);
+    let api_base = server.api_base();
+
+    let mut cmd = command(&sb, &sb.repo);
+    cmd.args(["worktree", "create", "feat", "-p", "hi"]);
+    with_mock(&mut cmd, &api_base);
+    let out = run_cmd(cmd, &["worktree", "create", "feat", "-p", "hi"]);
+    let (stdout, stderr) = streams(&out);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "create -p 成功回合应 exit(0)；stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hi"),
+        "stdout 应为模型文本；stdout:\n{stdout:?}"
+    );
+    // 建树告知走启动期提示（`-p` 下即 stderr），不再是「下一步：attach」。
+    assert!(
+        stderr.contains("worktree: feat"),
+        "应告知建出的树名：\n{stderr}"
+    );
+    assert!(stderr.contains("路径："), "应告知建出的树路径：\n{stderr}");
+    assert!(
+        !stderr.contains("下一步："),
+        "create 已直接启动，不该再提示 attach：\n{stderr}"
+    );
+
+    // 系统提示首段的 cwd 就是新树 ⇒ 回合确实跑在树里。
+    let tree = canonical(&sb.trees.join("Develop").join("YuShan").join("feat"));
+    let bodies = server.bodies();
+    assert!(!bodies.is_empty(), "mock 应至少收到一个请求");
+    let cwd_line = format!("Current working directory: {}", tree.display());
+    assert!(
+        bodies.iter().any(|b| b.contains(&cwd_line)),
+        "请求体的系统提示应声明工作区为 {}；实际请求体：\n{}",
+        tree.display(),
+        bodies.join("\n---\n")
+    );
+
+    // meta 同样记录了新树（退出后 `--resume` 回到同一棵树）。
+    let id = line_after(&stderr, "session: ")
+        .expect("成功回合应打 `session: <id>`")
+        .trim()
+        .to_string();
+    let meta_path = sb.sessions.join(format!("{id}.jsonl"));
+    let content = std::fs::read_to_string(&meta_path).expect("会话文件应存在");
+    let first = content.lines().next().expect("首行应存在");
+    assert!(
+        first.contains(tree.to_str().unwrap()),
+        "meta 应记录新树路径 {}：\n{first}",
+        tree.display()
+    );
+}
+
+/// **U6b**：`create` 在非终端环境（本测试即管道 stdio）**不**尝试起 TUI，
+/// 而是打印建树结果后 exit 0 —— CI / 脚本里 `create` 必须可用。
+///
+/// 变异靶子：把 `main` 里 `tui_available()` 守卫删掉 ⇒ 非 TTY 下 `enable_raw_mode`
+/// 失败 ⇒ 退出码非 0 或 stderr 出现终端错误 ⇒ 红。
+#[test]
+fn create_without_tty_stays_headless() {
+    let sb = Sandbox::new("u6_no_tty");
+    init_repo(&sb.repo);
+
+    let out = run(&sb, &sb.repo, &["worktree", "create", "feat"]);
+    let (stdout, stderr) = streams(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "非终端环境 create 应 exit(0)；stderr:\n{stderr}"
+    );
+    assert!(stdout.is_empty(), "非终端 create 不写 stdout：{stdout:?}");
+    assert!(
+        stderr.contains("未启动 TUI"),
+        "应说明非终端环境未启 TUI：\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "降级路径不得 panic：\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("No model configured"),
+        "非终端 create 不应走到模型装配（纯建树后早退）：\n{stderr}"
     );
 }

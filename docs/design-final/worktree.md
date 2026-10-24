@@ -8,9 +8,9 @@
 ## 一句话
 
 `ys-coding-agent worktree {create, attach, list, remove}` —— 一个需求 = 一棵 git 工作树，
-安置在 ys 自己的目录下（`~/.yushan/worktrees/`）。`create` / `list` / `remove` 是
-`git worktree` 的薄包装；**`attach` 是 ys 特有动作 = 启动（或 resume）一个会话，把工作区
-绑定到该树**。无工具、无斜杠命令、无中途切换、无 IPC。
+安置在 ys 自己的目录下（`~/.yushan/worktrees/`）。`list` / `remove` 是 `git worktree` 的薄包装；
+**`create` = 建树 + 以新树为工作区启动**，**`attach` = 启动（或 resume）时绑定到既有树**
+—— 两者共用同一注入点与同一套尾部 flag。无工具、无斜杠命令、无中途切换、无 IPC。
 
 ## 落点
 
@@ -45,8 +45,9 @@ linked worktree 内返回**树根**，派生落点会多一层错名，`worktree
 
 | 时机 | 触发 | 实际行为 |
 |---|---|---|
-| 启动期 `attach` | `main` 在 `Config::from_env()` 后、skill 扫描前（`main.rs:1523-1548`） | `resolve_attach_target` 解析树路径 ⇒ `config.cwd = tree`；其余启动路径逐字节不变（skill 根 / 提示词 / 工具三者都从 `config.cwd` 派生）。主仓有项目级 `.yushan/` 则向 stderr 打**缺失警告**（`worktree.rs:406-412`）。失败 ⇒ 响亮警告 + 保持共享工作区继续启动，不早退不 panic |
-| 启动期 `--resume` 按 `SessionMeta.workspace` 恢复 | `main` 在 attach 之后、skill 扫描之前（`main.rs:1560-1596`） | 显式 `attach` 优先（与记录不同则说明，`main.rs:1568-1579`）；无显式 attach 且有记录且树仍在 ⇒ `config.cwd = recorded` 并告知「已恢复到工作树」；有记录但树已不在 ⇒ 告知「已不存在」后**按共享工作区启动**；无记录 ⇒ 什么都不做、不打任何东西 |
+| 启动期 `create` | `main` 在 `Config::from_env()` 后、skill 扫描前（`main.rs:2523-2560`） | 先 `worktree::create` 建树；成功 ⇒ **与 `attach` 同点注入**（`config.cwd` / `worktree_name` / `worktree_path`），告知行并入启动期提示；失败 ⇒ 硬失败（非零退出 + 原因 + 退路）。非终端环境（`tui_available()` 假）⇒ 打印告知后 `exit(0)`，不启 TUI |
+| 启动期 `attach` | 同上（`main.rs:2561-2590`） | `resolve_attach_target` 解析树路径 ⇒ `config.cwd = tree`；其余启动路径逐字节不变（skill 根 / 提示词 / 工具三者都从 `config.cwd` 派生）。主仓有项目级 `.yushan/` 则向 stderr 打**缺失警告**（`worktree.rs:406-412`）。失败 ⇒ 响亮警告 + 保持共享工作区继续启动，不早退不 panic |
+| 启动期 `--resume` 按 `SessionMeta.workspace` 恢复 | `main` 在 `create` / `attach` 之后、skill 扫描之前（`main.rs:2590-2630`） | 显式 `create` / `attach` 优先（与记录不同则说明）；无显式绑定且有记录且树仍在 ⇒ `config.cwd = recorded` 并告知「已恢复到工作树」；有记录但树已不在 ⇒ 告知「已不存在」后**按共享工作区启动**；无记录 ⇒ 什么都不做、不打任何东西 |
 | 会话内 `/resume` 重建 Agent | `app_loop` 处理 `Request::ResumeSession`（`app_loop.rs:373-412`） | `apply_resumed_workspace`（`app_loop.rs:455-507`）按目标 meta 的 `workspace` 换工作区，**成功则 `factory.build` 一次性换掉工具表 + `working_dir` + system prompt + subagent**，并刷新 `config.cwd` 与工作区句柄 |
 
 **会话内 `/resume` 的四情形**（`app_loop.rs:446-454`）：①记录存在、树仍在且与当前不同 ⇒ 重建到该树并告知；
@@ -84,6 +85,16 @@ linked worktree 内返回**树根**，派生落点会多一层错名，`worktree
    （`resolve_attach_target`，`main.rs:1387-1416`）。`NoAttachTarget` 是 `WorktreeError` 的**第 6 个变体**
    （设计 §5.2 只列了 5 个），刻意不复用 `NotFound`（后者外壳会拼出无意义的 `create <提示>` 退路，
    `worktree.rs:50-54`）。
+7. **`create` 建完即启动（U6）**。设计稿让 `create` 成功后提示「下一步：`worktree attach <name>`」
+   再早退；实际改为**建树后直接以新树为工作区启动**。落点：`parse_worktree` 的 `create` / `attach`
+   合并为 `parse_worktree_binding`（按动词名分派，共用 `parse_mode_tail` 与 `-` 开头守卫）；
+   `main` 里 `Create` 臂与 `Attach` 臂同样注入 `config.cwd` / 名字 / 路径；`run_worktree_early`
+   只剩 `List` / `Remove`。两个必要的配套：
+   - **告知行并入启动期提示**（`worktree_created_note` → `with_worktree_note`）而不是直写 stderr
+     —— 起屏前的 stderr 会在退出 alt-screen 后变成主屏残渣（§5 输出三分）。
+   - **非终端环境不启 TUI**（`tui_available()`）：`enable_raw_mode()` 在管道 stdio 下必失败，
+     CI / 脚本里的 `create` 不能因此不可用 ⇒ 打印告知行 + 一句「未启动 TUI」后 `exit(0)`。
+     `-p` / `--json` 不看 TTY，照常真跑。
 
 ## 已知限制
 
@@ -99,9 +110,12 @@ linked worktree 内返回**树根**，派生落点会多一层错名，`worktree
   `git worktree prune` 从 git 清除，`worktree_cli.rs:922-962`），谓词本身由
   `is_stale_registration_tracks_registered_but_missing_dir` 覆盖（`worktree.rs:632-723`）。判据按**状态**
   （登记在、目录不在）而非匹配 git 的 stderr 文案（文案随版本 / locale 变，`worktree.rs:296-314`）。
-- **`worktree remove -p` 仍会把 `-p` 当名字**：`create` 对以 `-` 开头的名参明确报错
-  （`optional_name`，`main.rs:291-304`），但 `remove` 臂未收紧（`main.rs:275-283`）—— `-p` 会通过
-  `validate_name` 被当成名字，落点不存在则 `remove` 失败。属已知缺口。
+- **`worktree remove -p` 仍会把 `-p` 当名字**：`create` / `attach` 已改为「首 token 以 `-` 开头即视为无名」，
+  故 `-p` 在那两个动词下是模式 flag（`parse_worktree_binding`，`main.rs:390-412`）；但 `remove` 臂未收紧
+  （`main.rs:275-283`）—— `-p` 会通过 `validate_name` 被当成名字，落点不存在则 `remove` 失败。属已知缺口。
+- **`create` 在非终端环境不启会话**：降级为纯建树（打印告知后 `exit(0)`），要进树得再跑
+  `worktree attach <name>`。这是有意的 —— `enable_raw_mode()` 在管道 stdio 下必失败，不能因为
+  「想顺手起会话」而让 CI / 脚本里的 `create` 不可用。`-p` / `--json` 不受此限（本就不起 TUI）。
 - **首次 `attach` 首轮 prompt cache miss**：cwd 与 `<project_instructions path="…">` 都进提示词文本
   ⇒ 每棵树一份前缀（设计 §5.4，已知代价非缺陷）。
 - **`create` 会真调 git、真建目录**：测试必须走 `crate::test_env::env_lock()` + `EnvRestore` 或
@@ -110,10 +124,12 @@ linked worktree 内返回**树根**，派生落点会多一层错名，`worktree
 ## 测试现状
 
 - **全量**：`cargo test --workspace` ⇒ **1109 passed / 0 failed / 9 ignored**。
-- `tests/worktree_cli.rs`：**16 用例**（子进程 e2e，真起临时 git 仓）—— N1 建树+分支、N2 免起名唯一、
+- `tests/worktree_cli.rs`：**19 用例**（子进程 e2e，真起临时 git 仓）—— N1 建树+分支、N2 免起名唯一、
   N3 非 git 硬失败、N4 非法名、N5 list、N6 remove 留分支/脏则拒删、F1 干净树直接 remove、N8 attach 降级
-  不 panic、N9 退出行、A1 项目配置缺失警告、U3 四条（恢复到记录树 / 记录树失效 / 显式 attach 优先）、
-  U5-4a 陈旧登记 prune 副作用、U5-4b 树内取主仓根、U5-4c 无参 attach 的 0 棵 / 2 棵候选提示。
+  不 panic、N9 退出行、A1 项目配置缺失警告、U3 四条（恢复到记录树 / 记录树失效 / 显式绑定优先）、
+  U5-4a 陈旧登记 prune 副作用、U5-4b 树内取主仓根、U5-4c 无参 attach 的 0 棵 / 2 棵候选提示、
+  U6 两条（`create -p` 真在新树里跑回合 —— 断言**请求体的系统提示**里 `Current working directory`
+  就是新树；非终端 `create` 保持 headless 且不走到模型装配）。
   用例全部经 **per-child env 注入**（不碰父进程 env），并套 60s `CHILD_TIMEOUT`（挂起即失败）。
 - `app_loop.rs`：**5 条会话内 `/resume` 工作区用例**（`resume_switches_to_recorded_workspace_consistently`
   / `..._missing_recorded_workspace_keeps_current` / `..._without_recorded_workspace_returns_to_shared`

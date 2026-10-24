@@ -149,12 +149,14 @@ if let Some(WorktreeCmd::Attach(name)) = &args.worktree {
 
 ```text
 ys-coding-agent worktree create [<name>]   # 建树：落 ys 目录、分支 worktree-<name>、base HEAD；unspecified ⇒ 自动命名
+                                          # 建完**即以新树为工作区启动**（可带 -p / --json / --resume）
 ys-coding-agent worktree attach [<name>]   # 启动/resume 会话，工作区 = 该树（可带 -p / --json / --resume）；unspecified ⇒ 列表选取
 ys-coding-agent worktree list              # 列出 ys 目录下的工作树（含路径 / 分支 / 是否脏）
 ys-coding-agent worktree remove <name>     # 删树：直套 git worktree remove（留分支、脏则拒删）
 ```
 
-`attach` **要求树已存在**（否则见 §5.3-b 的降级）。`create` / `attach` 分离是有意的：创建与绑定是两个动作。
+`attach` **要求树已存在**（否则见 §5.3-b 的降级）。`create` = **建树 + 以新树为工作区启动**，
+与 `attach` 共用同一注入点、同一套尾部 flag；`list` / `remove` 仍是纯进程级动作、执行后早退。
 **两个动词的名参都可省**（§5.3-i/§5.3-j）。
 
 ### 5.2 模块与接口
@@ -259,10 +261,14 @@ git 仍持有登记 ⇒ 同名 `create` 会报 `already registered`。⇒ `creat
 > 仍可能碰撞），而本仓无此先例、亦无此需求。名字在 `attach` 可选取的前提下几乎不可见。
 > 若将来确实要可读名，那是**独立小改动**，可随时加。
 
-**j. 两处打印，各按既有去处。**
+**j. 建树告知与会话退出行，各按既有去处。**
 
-- **`create` 成功 ⇒ 打 `worktree: <name>` 到 stderr**（+ 路径 / 分支 / 「下一步：`attach <name>`」两行）。
-  与 `session: <id>`（**ADR-0032**，同落 stderr）**同侧同风格**：人读诊断归 stderr，stdout 留给 `list` 的表格。
+- **`create` 成功 ⇒ 告知行（`worktree: <name>` / 路径 / 分支未合并）并入启动期提示**，不单独打 stderr。
+  理由：`create` 建完即起 TUI，起屏前写 stderr 的行会在退出 alt-screen 后变成主屏残渣（§5 输出三分）。
+  并入启动期提示后，TUI 进 transcript、`-p` / `--json` 进 stderr —— 一处文案、两处正确去处。
+- **非终端环境（stdin/stdout 不是终端）⇒ 不启 TUI**：`enable_raw_mode()` 在管道 stdio 下必失败，
+  CI / 脚本里的 `create` 不能因此不可用。此时打印告知行 + 一句「未启动 TUI；要在该树里开会话：
+  `worktree attach <name>`」后 `exit(0)` —— 建树本身成功，降级只影响「是否顺手起会话」。
 - **会话结束 ⇒ 在既有退出行处追加 `worktree: <name>`**，并提示「分支 `worktree-<name>` **未合并**；
   `git merge worktree-<name>` 或 `worktree remove <name>`」。复用 ADR-0032 的三模式统一出口
   （TUI 在 `main.rs:1191` 退出回放之后；`-p`/`--json` 在 `persist_single_turn`），文案与 `session_exit_line`

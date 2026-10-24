@@ -49,7 +49,7 @@ TUI 斜杠命令：
   /help [command]      显示可用命令
   /status              显示当前配置与状态
   /skills              查看并选择一个 skill
-  /copy                复制最后一条回复（v1：写进对话区，手动选中）
+  /copy                复制最后一条回复的 Markdown 原文到系统剪贴板
   /quit                退出
   /thinking [on|off]   开关思考内容的显示
   /effort [off|minimal|low|medium|high|xhigh|max|default]   设置模型思考档位

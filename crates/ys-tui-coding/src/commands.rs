@@ -67,7 +67,7 @@ static COMMANDS: [CommandSpec; 14] = [
     },
     CommandSpec {
         name: "copy",
-        description: "复制最后一条回复到终端剪贴板",
+        description: "复制最后一条回复的 Markdown 原文到系统剪贴板",
         arg_hint: None,
     },
     CommandSpec {
@@ -155,7 +155,8 @@ pub enum LocalAction {
     Help(Option<String>),
     /// 打印当前状态（`provider` / `model` / tokens / 轮数 / 会话文件 / 工具 / cwd）。
     Status,
-    /// 把最后一条 assistant 回复写进对话区（v1 无剪贴板依赖）。
+    /// 把最后一条 assistant 回复的 **Markdown 原文**送入剪贴板通道（[`App::pending_clipboard`]，
+    /// 由 `run.rs` 发 OSC 52）。
     Copy,
     /// `Some(on)` 显式设置，`None` 为 toggle。
     Thinking(Option<bool>),
@@ -366,7 +367,7 @@ const KEY_HELP: &str = "键位：
   ↑ ↓                输入框为空时 ↑ 取回历史（↓ 还原草稿）；否则滚动对话
   PageUp / PageDown  翻页（一页 = 视窗高度）
   滚轮 / 触控板上下   逐行滚动对话（不影响输入历史）
-  /copy              最后一条回复写入终端剪贴板（需终端支持 OSC 52）
+  /copy              最后一条回复的 Markdown 原文写入系统剪贴板（需终端支持 OSC 52）
   End                跳到最新消息
   Ctrl+↓ / Ctrl+End  跳到最新消息
   Ctrl+↑ / Ctrl+Home 跳到最早消息

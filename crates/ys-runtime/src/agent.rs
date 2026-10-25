@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ys_component::{RunLimits, RuntimeContext};
-use ys_event::EventSink;
+use ys_event::{AgentEvent, EventSink};
 use ys_loop::{AgentInput, AgentLoop, LoopError, RunResult};
 use ys_model::Model;
 use ys_protocol::BoundarySource;
@@ -17,7 +17,7 @@ use ys_tool::{ApprovalHandler, SubagentRunner, ToolRegistry};
 /// 选择「端口结构」(a) 而非「多参数」(b)：与会话的端口概念一致，且后续
 /// 再加端口（如工具审批流、记忆）时**不破签名**。
 pub struct AgentPorts<'a> {
-    /// 当前模型。`None` = 未配置（`run_turn` 返回
+    /// 当前模型。`None` = 未配置（`run_turn` **先发 `RunFailed`**，再返回
     /// [`LoopError::ConfigError`]）。
     pub model: Option<&'a dyn Model>,
     /// 会话（消息历史）。归接线器所有；`/new` 换的就是它。
@@ -105,16 +105,28 @@ impl Agent {
     /// 轮边界控制（steering 注入 / abort 中止）经 [`AgentPorts::boundary`]
     /// 借用传入 —— Agent 不持有它（与 session / events 同构）。`None` 时
     /// 行为与历史实现逐字节一致（无插话、无取消）。
+    ///
+    /// **无模型 ≠ 静默空回合**：未配置模型时不启动循环，但会先发
+    /// `RunFailed` 再返回 `ConfigError` —— 每次运行都必须以终局事件收场，
+    /// 否则接线器只能把 `Err` 落进日志，UI 收到零事件。
     pub async fn run_turn(
         &mut self,
         input: AgentInput,
         ports: AgentPorts<'_>,
     ) -> Result<RunResult, LoopError> {
-        let model = ports.model.ok_or_else(|| {
-            LoopError::ConfigError(
-                "No model configured. Use /login to configure an API provider.".into(),
+        let Some(model) = ports.model else {
+            let message = "No model configured. Use /login to configure an API provider.";
+            // 投递失败**不覆盖**原始配置错误（与 `BasicLoop` 的 `let _ = emit(..)`
+            // 同规）：消费者消失时，「没配模型」仍是最能说明问题的原因。
+            let _ = ys_event::emit(
+                ports.events,
+                AgentEvent::RunFailed {
+                    error: message.to_string(),
+                },
             )
-        })?;
+            .await;
+            return Err(LoopError::ConfigError(message.to_string()));
+        };
         let mut ctx = RuntimeContext::new(
             model,
             &self.registry,

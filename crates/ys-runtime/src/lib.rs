@@ -81,6 +81,18 @@ mod tests {
             msg.contains("No model configured"),
             "error should mention no model: {msg}"
         );
+
+        // **终止事件不变量**：开跑前失败也要发 `RunFailed`。否则接线器只能把
+        // `Err` 落进日志，UI 收到零事件 —— 用户敲了消息却看不到失败原因。
+        // 变异：删掉 `Agent::run_turn` 无模型分支里的 `emit(RunFailed)` ⇒ 变红。
+        assert!(
+            events.events().iter().any(|e| matches!(
+                e,
+                AgentEvent::RunFailed { error } if error.contains("No model configured")
+            )),
+            "无模型时必须在返回 Err 前发 RunFailed，实际事件：{:?}",
+            events.events()
+        );
     }
 
     #[tokio::test]

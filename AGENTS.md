@@ -50,7 +50,7 @@ YuShan/
 └── tmp/                          # 临时目录（已被 .gitignore 忽略，勿放正式内容）
 ```
 
-根文件：`Cargo.toml`（workspace 成员表）、`AGENTS.md`（`CLAUDE.md` 是指向它的软链）、`LICENSE`、`README.md`。
+根文件：`Cargo.toml`（workspace 成员表）、`AGENTS.md`（项目约定，`ys-coding-agent` 会把它作为项目上下文加载）、`LICENSE`、`README.md`。
 
 两条补充指针 —— `docs/arch/` 里个别**跨需求**的常引文档值得单独点出：
 `prompt-delivery/notes.md`（把项目约定送到模型面前的通道与成本）、`commands/login-model-behavior/`（`/login` & `/model` 行为设计）。

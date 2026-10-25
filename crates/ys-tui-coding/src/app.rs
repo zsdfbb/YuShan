@@ -523,6 +523,11 @@ impl App {
             "已插话：将在当前工具调用结束后生效".to_string(),
         ));
         self.suppress_user_echo += 1;
+        // **提交即回到底部跟随**，与 [`Self::begin_local_turn`] 同口径：用户敲了字回车，
+        // 期望就是看到自己这条与模型的回应。不这样做的话，用户往上翻过历史再插话时
+        // 会被永久留在旧位置 —— 两条回显都落在视窗之下，连「发出去了吗」都无从确认。
+        self.follow = true;
+        self.scroll_offset = 0;
     }
 
     /// 推进 Working 动画相位。

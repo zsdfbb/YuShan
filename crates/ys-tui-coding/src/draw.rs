@@ -3793,4 +3793,69 @@ mod tests {
             "内区宽 = 总宽 − 边框"
         );
     }
+
+    /// **画面级回归**：回合中点一下聊天区，后续输出必须仍然跟得上。
+    ///
+    /// 字段级断言（`events.rs::v6b_bare_click_does_not_stop_following`）只能证明
+    /// `follow` 没被误改；这条直接看屏 —— 用户报的症状就是「新输出不展示」。
+    ///
+    /// 为什么必须“回合中”点：`begin_local_turn` 会把 `follow` 置回真，掩盖提交前的冻结。
+    /// 而在回合进行中点一下（换焦点、误触）过去会永久冻结视窗：
+    /// `sync_scroll_state` 的增量补偿把 `scroll_offset` 与内容同步加 Δ ⇒ `top_row` 不变。
+    ///
+    /// 每步之后的渲染不是多余的：流式渲染缓存有 100 ms 节流窗口，不推帧就不会重算折行，
+    /// 也就看不到「内容长了但行数没变」这个假象。
+    #[test]
+    fn bare_click_mid_turn_keeps_new_output_visible() {
+        let (w, h) = (80u16, 24u16);
+        let mut app = app_with(CodingView::for_test());
+        let feed = |app: &mut App, tag: &str, n: usize| {
+            for i in 0..n {
+                app.apply_event(ys_protocol::Envelope::new(
+                    ys_protocol::Source::agent(),
+                    1,
+                    ys_event::AgentEvent::ModelTextDelta {
+                        text: format!("{tag} {i}\n\n"),
+                    },
+                ));
+                // 推帧把内容推过渲染节流窗口（否则整段被合批、总行数不动）。
+                std::thread::sleep(Duration::from_millis(110));
+                let _ = rows_of(app, w, h);
+            }
+        };
+        app.begin_local_turn("q1".into());
+        feed(&mut app, "head", 5);
+
+        // 回合仍在进行中，用户在聊天区单击（不拖动）。
+        let inner = chat_inner_rect(&app, w, h).expect("应有内区");
+        let (col, row) = (inner.x + 3, inner.y + 1);
+        let click = |app: &mut App, kind| {
+            crate::events::handle_mouse(
+                crossterm::event::MouseEvent {
+                    kind,
+                    column: col,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                app,
+                w,
+                h,
+            )
+        };
+        click(
+            &mut app,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        );
+        click(
+            &mut app,
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        );
+        assert!(app.follow, "单击不得脱离跟随");
+
+        feed(&mut app, "tail", 40);
+
+        let rows = rows_of(&mut app, w, h);
+        let tail: Vec<&String> = rows.iter().filter(|r| r.contains("tail 39")).collect();
+        assert_eq!(tail.len(), 1, "回合中单击之后，最新输出必须仍在屏上");
+    }
 }

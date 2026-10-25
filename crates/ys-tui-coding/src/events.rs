@@ -196,8 +196,9 @@ fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     // `top_row` 从 `sync_scroll_state` 取：`compute_max_scroll` **不回**它。
     let top_row = app.sync_scroll_state(width, height, Instant::now()).top_row;
     app.selection.begin(top_row + rel_y, rel_x, Instant::now());
-    // 拖动期间必须脱离底部跟随，否则内容一来画面就自己滚走。
-    app.follow = false;
+    // **不在这里脱离跟随**：按下只是记下锚点，一次「点一下」（无拖动）不该冻结视窗。
+    // 真正冻结视窗的是 [`extend_selection`] 里「指针确实离开了按下点」那一刻 ——
+    // 见那里的注释（ADR-0051 决策 8 的契约只针对拖动）。
 }
 
 /// 拖动 / 松开时把屏幕坐标钳进内区，并据钳制方向定 `edge`（触发自动滚动）。
@@ -229,7 +230,15 @@ fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
         edge,
         Instant::now(),
     );
-    app.follow = false;
+    // **真的开始拖了才冻结视窗**（ADR-0051 决策 8）：拖动期间视窗若继续跟着流式
+    // 输出下移，已选中的屏幕坐标就会指向别的内容。
+    //
+    // 判据是「指针离开了按下点」而不是「收到一个 Drag 事件」—— 触控板 / 高精度
+    // 鼠标在单击时也会补发一个坐标相同的 `Drag`，按事件判会把单击重新变成冻结。
+    let (anchor, cursor) = app.selection.bounds();
+    if anchor != cursor {
+        app.follow = false;
+    }
 }
 
 /// 松开左键：两端点重合 ⇒ 不复制；否则提取文本写进 `pending_clipboard`。
@@ -1212,6 +1221,26 @@ mod tests {
         assert!(a.abort_requested, "已按下的 Ctrl-C 不得被插话清除");
     }
 
+    /// **回合中提交插话 ⇒ 回到底部跟随**（用户显式敲了回车，期望看到回应）。
+    ///
+    /// 回归：`note_steered` 曾不碰 `follow`，于是先上翻看过历史再插话的用户会被
+    /// 永久留在旧位置 —— 自己那条回显与模型后续输出全落在视窗之下。
+    ///
+    /// 变异：删掉 `note_steered` 里的 `follow = true` / `scroll_offset = 0` ⇒ 两条断言红。
+    #[test]
+    fn note_steered_returns_to_following() {
+        let mut a = app_scrollable();
+        a.is_turning = true;
+        a.follow = false;
+        a.scroll_offset = 12;
+        a.new_content_below = true;
+
+        a.note_steered("插一句".into());
+
+        assert!(a.follow, "插话提交后必须回到底部跟随");
+        assert_eq!(a.scroll_offset, 0, "跟随 ⇒ 偏移归零");
+    }
+
     /// **回合中 `/compact` ⇒ 走 `Boundary::Compact`，不走 `Request::Compact`**。
     ///
     /// 承重的三点：
@@ -2047,6 +2076,78 @@ mod tests {
         );
         assert!(a.pending_clipboard.is_none(), "未拖动不得复制");
         assert!(!a.selection.is_active(), "松手后选区应清");
+    }
+
+    /// **单击不得冻结视窗**（回归：一次点一下会让后续输出永久不可见）。
+    ///
+    /// 触发链：`begin_selection` 无条件 `follow = false` ⇒ 用户回合中点一下聊天区
+    /// （换焦点、误触）之后，`sync_scroll_state` 的增量补偿把 `scroll_offset` 与内容
+    /// 同步加 Δ ⇒ `top_row` 恒等于单击那一刻的值 ⇒ 此后所有输出都堆在视窗下方。
+    ///
+    /// 变异：把 `follow = false` 放回 `begin_selection` ⇒ 本用例变红；
+    /// 把 `extend_selection` 的「真的移动了才冻结」改回无条件冻结 ⇒ 也变红
+    /// （单击时指针没动，不该冻结）。
+    #[test]
+    fn v6b_bare_click_does_not_stop_following() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        assert!(a.follow, "前置：默认贴底跟随");
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.follow, "按下本身不得脱离跟随");
+
+        // 触控板 / 高精度鼠标在单击时也会补发一个**坐标相同**的 `Drag`。
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.follow, "指针未移动的 Drag 不得脱离跟随");
+
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.follow, "单击松手后仍须继续跟随");
+        assert_eq!(a.scroll_offset, 0, "贴底跟随 ⇒ 偏移归零");
+    }
+
+    /// **真的拖动必须冻结视窗**（守住 ADR-0051 决策 8 的契约）。
+    ///
+    /// 拖动期间若视窗继续跟着流式输出下移，已选中的屏幕坐标就会指向别的内容。
+    ///
+    /// 变异：删掉 `extend_selection` 里的 `app.follow = false` ⇒ 本用例变红。
+    #[test]
+    fn v6c_real_drag_freezes_view() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        assert!(a.follow, "前置：默认贴底跟随");
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row + 2),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(!a.follow, "拖动已开始 ⇒ 必须冻结视窗");
     }
 
     /// **`Down` → `Drag` → `Up` ⇒ 复制**。

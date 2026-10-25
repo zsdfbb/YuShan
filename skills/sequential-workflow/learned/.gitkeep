@@ -1,0 +1,5 @@
+反思记录目录（空）。
+
+每次运行 sequential-workflow 的最后阶段会往这里写一份
+`YYYY-MM-DD-HHMM.md`，记录本次踩到的坑；后续运行会主动读这个目录，
+避开同类问题。见 ../REFERENCE.md 的「Reflect」阶段。

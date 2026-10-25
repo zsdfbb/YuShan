@@ -48,8 +48,7 @@ use crate::layout::{RowRef, TranscriptLayout, Window};
 /// **两态**：没有 `Done`。松手复制后立即 [`Selection::clear`] 回 `Idle`（高亮随之消失，
 /// 文字已在剪贴板），故 `Done` 没有观测点。
 ///
-/// 消费方是 `events.rs` 的鼠标分支与 `draw.rs` 的高亮层，故非测试构建里暂时无人构造。
-#[allow(dead_code)]
+/// 消费方是 `events.rs` 的鼠标分支与 `draw.rs` 的高亮层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Phase {
     /// 无选区：初始 / 已清 / resize / 用户主动滚动。
@@ -62,13 +61,10 @@ pub(crate) enum Phase {
 /// 贴边方向：`1` = 上沿（要看**更早**的行，对应 `scroll` 的 `delta > 0`）；
 /// `-1` = 下沿（要看**更新**的行）；`0` = 未贴边。
 ///
-/// 消费方是 `events.rs` 的鼠标分支（写入）与 `Selection::edge`（读出），
-/// 故非测试构建里暂时无人使用。
-#[allow(dead_code)]
+/// 消费方是 `events.rs` 的鼠标分支（写入）与 [`Selection::edge`]（读出）。
 type Edge = i8;
 
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub(crate) struct Selection {
     /// 按下点：全局视觉行（`top_row` + 内区相对 y）。**永不因滚动而变**。
     anchor_row: usize,
@@ -84,18 +80,14 @@ pub(crate) struct Selection {
     /// 只在**贴边方向变更**时重置，故按住不动会持续加速。
     edge_since: Option<Instant>,
     /// 视窗字形缓存。消费方是 `draw.rs` 的高亮层与 `selection::extract`。
-    #[allow(dead_code)]
     pub(crate) grid: GlyphGrid,
     /// 高亮矩形复用缓冲：容量复用 ⇒ 稳态帧零分配。消费方是 `draw.rs` 的高亮层。
-    #[allow(dead_code)]
     rects: Vec<Rect>,
 }
 
-/// 选择状态机：按下 / 拖动 / 清理。
+/// 选择状态机：按下 / 拖动 / 清理 / 高亮矩形。
 ///
-// 全部方法的消费方是 `events.rs` 的鼠标分支与 `draw.rs` 的高亮层（`app.rs` 持有本类型
-// 字段），故非测试构建里暂时无人调用。
-#[allow(dead_code)]
+/// 消费方是 `events.rs` 的鼠标分支、`draw.rs` 的高亮层与 `run.rs` 的自动滚动触发。
 impl Selection {
     /// 左键是否仍按着。
     pub(crate) fn is_dragging(&self) -> bool {
@@ -298,8 +290,8 @@ pub(crate) struct GlyphKey {
 /// **只从 `Paragraph` 渲出来的 `Buffer` 读**（模块头契约 2）：折行位置与宽字符续格由
 /// ratatui 决定，自己复算会漂移。
 ///
-/// 本单元每次键变化都**整窗重渲**，`order` 恒为 `(0..height)`；槽环（`shift` / `release`）
-/// 换实现时 `ensure` / `symbol` / `is_cont` / `head_col` 的签名与语义不变。
+/// 滚动走**槽环**：[`Self::shift`] 旋转 `order` 并只重渲换进来的那几行；
+/// 其余失效（结构 / 窗口内容 / 几何）走 [`Self::rebuild`] 整窗重渲。
 ///
 /// 坐标口径：`y` / `x` 都是**内区相对**（`y` = 屏幕行、`x` = 屏幕列），与
 /// [`Selection::bounds`] 的 `x` 同源。
@@ -307,19 +299,18 @@ pub(crate) struct GlyphKey {
 /// 消费方是 `draw.rs` 的高亮层与 [`extract`]。
 #[derive(Debug, Default)]
 pub(crate) struct GlyphGrid {
-    /// 内区几何。只写不读：键里已有一份（`key.inner`），本字段留给高亮层定位。
-    #[allow(dead_code)]
-    inner: Rect,
     /// `Buffer` 的宽度 = 折行宽度（**必须**等于 `layout.width()`，否则折行不同 ⇒ 字形错位）。
     width: u16,
     /// `Buffer` 的高度 = 内区高度。
     height: u16,
-    /// 屏幕第 0 行对应的全局视觉行。只写不读：键里已有一份，本字段留给槽环 `shift` 算位移。
-    #[allow(dead_code)]
+    /// 屏幕第 0 行对应的全局视觉行 —— 槽环 `shift` 据它算位移 `k`。
+    ///
+    /// 与 `key.base_row` 恒等（同一个值写两处），但两者用途不同：`key` 整体参与
+    /// 「键是否全等」，而位移只需要一个数，不必构造一次 `GlyphKey`。
     base_row: usize,
     /// `width × height` 的字形槽，`Paragraph` 直接渲进来。
     slots: Buffer,
-    /// 屏幕行 → slot。本单元恒 `(0..height)`。
+    /// 屏幕行 → slot。`shift(k)` 旋转它，故滚动不搬 cell。
     order: Vec<u16>,
     /// 每 slot 一行的宽字符续格位图（`width` 位，按 64 位分字）。
     cont: Vec<u64>,
@@ -431,7 +422,6 @@ impl GlyphGrid {
         {
             self.rebuild_count += 1;
         }
-        self.inner = inner;
         self.base_row = top_row;
         self.key = key;
         self.layout_slots(layout.width(), inner.height);
@@ -468,11 +458,26 @@ impl GlyphGrid {
         }
         // 只重建换进来的那 `n` 行：`k > 0` 是底部 `h-n..h`，`k < 0` 是顶部 `0..n`。
         let start = if k > 0 { h - n } else { 0 };
-        for y in start..(start + n).min(rows.len()) {
+        for y in start..start + n {
             let slot = self.order[y];
-            self.blit_row(window, rows[y], slot);
+            match rows.get(y) {
+                Some(row) => self.blit_row(window, *row, slot),
+                // 窗口比内区短（滚到内容尾部）⇒ 这一行**不存在**内容，必须擦掉该槽位
+                // 里环转进来的旧字形，否则内容尾之后会露出别的行。
+                None => self.clear_row(slot),
+            }
         }
         self.rebuild_cont();
+    }
+
+    /// 把 `slots` 的第 `slot` 行全部重置成空白格。
+    fn clear_row(&mut self, slot: u16) {
+        if slot >= self.height {
+            return;
+        }
+        for x in 0..self.width {
+            self.slots[(x, slot)].reset();
+        }
     }
 
     /// 把 `row` 指的那一行的字形写到 `slots` 的第 `slot` 行。
@@ -484,9 +489,7 @@ impl GlyphGrid {
             return;
         };
         // 先擦干净该 slot 行：旋转后它是另一行内容的旧字形。
-        for x in 0..self.width {
-            self.slots[(x, slot)].reset();
-        }
+        self.clear_row(slot);
         Paragraph::new(Text::from(vec![line.clone()]))
             .wrap(Wrap { trim: false })
             .scroll((row.off.min(u16::MAX as u32) as u16, 0))
@@ -615,8 +618,7 @@ const EXTRACT_BUDGET: Duration = Duration::from_millis(12);
 /// 一次提取的结局。
 ///
 /// 消费方是 `events.rs` 的松手分支：`Copied` 写进 `app.pending_clipboard`，`Empty` 与
-/// `TooLarge` 都不动剪贴板（后者在 transcript 回一行提示），故非测试构建里暂时无人构造。
-#[allow(dead_code)]
+/// `TooLarge` 都不动剪贴板（后者在 transcript 回一行提示）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExtractOutcome {
     /// 要写进 `app.pending_clipboard` 的文本。
@@ -637,8 +639,7 @@ pub(crate) enum ExtractOutcome {
 /// 字形**重新渲一遍**再读，不复用 [`GlyphGrid`] 的视窗缓存 —— 选区可以超出一屏（拖到边缘
 /// 自动滚动选中的就是这种），而缓存只有一屏。
 ///
-/// 消费方是 `events.rs` 的松手分支，故非测试构建里暂时无人调用。
-#[allow(dead_code)]
+/// 消费方是 `events.rs` 的松手分支。
 pub(crate) fn extract(
     layout: &TranscriptLayout,
     anchor: (usize, u16),
@@ -1369,6 +1370,84 @@ mod tests {
         assert!(tested >= 5, "应实际测到多个方向与幅度（实际 {tested}）");
     }
 
+    /// **V3 的尾部边界**：从满屏窗口滚到尾段（窗口比内区短）与反向滚回来，都要逐格一致。
+    ///
+    /// `v3_shift_matches_full_rebuild` 只从**中段**出发（两头都满屏），测不到
+    /// 「`rows.len() < height`」这条分支 —— 那里换进来的行有一部分是空的。
+    #[test]
+    fn v3_shift_matches_rebuild_at_both_ends() {
+        let width = 20u16;
+        let lines: Vec<TranscriptLine> = (0..24)
+            .map(|i| TranscriptLine::User(format!("row {i}")))
+            .collect();
+        let layout = layout_of(lines, width);
+        let total = layout.total_rows();
+        let h = 8u16;
+        let hh = h as usize;
+        assert!(total > hh + 4, "样本需比一屏多几行（total={total}）");
+        let inner = Rect::new(0, 0, width, h);
+        let max_top = total - 1;
+
+        for step in 1..=hh {
+            for from in [0usize, total - hh, total.saturating_sub(hh / 2)] {
+                for target in [from as isize + step as isize, from as isize - step as isize] {
+                    let target = target.clamp(0, max_top as isize) as usize;
+                    if target == from {
+                        continue;
+                    }
+                    let mut shifted = GlyphGrid::default();
+                    shifted.ensure(&layout, inner, from);
+                    shifted.ensure(&layout, inner, target);
+                    let mut rebuilt = GlyphGrid::default();
+                    rebuilt.ensure(&layout, inner, target);
+                    assert_grids_equal(
+                        &shifted,
+                        &rebuilt,
+                        &format!("from={from} target={target} step={step} total={total}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// **滚到内容尾部时 `shift` 必须擦掉环转进来的旧字形**。
+    ///
+    /// 窗口比内区短（`rows.len() < height`）时，换进来的行里有一部分**不存在内容**
+    /// （`rows` 里没有对应项）：若只是「有就渲、没有就跳过」，那些槽位会保留环转进来的
+    /// 别的行 —— 表现是「内容尾之后露出上面几行的字」。
+    ///
+    /// 变异：把 `shift` 里 `None => self.clear_row(slot)` 改回跳过 ⇒ 本用例红。
+    #[test]
+    fn shift_clears_rows_past_the_end_of_content() {
+        let width = 24u16;
+        let lines: Vec<TranscriptLine> = (0..20)
+            .map(|i| TranscriptLine::User(format!("row{i}")))
+            .collect();
+        let layout = layout_of(lines, width);
+        let total = layout.total_rows();
+        let h = 8u16;
+        let inner = Rect::new(0, 0, width, h);
+        let hh = h as usize;
+        assert!(total > hh + 4, "样本需比一屏多几行（total={total} h={hh}）");
+        // `|k| < h` 且 from 窗口满、to 窗口不足（走到尾部）：必须先滚到 from。
+        let from = total - hh - 2; // 满屏
+        let to = total - 3; // 只剩 3 行 ⇒ rows.len() = 3 < h
+        assert!(
+            (to as isize - from as isize).unsigned_abs() < hh,
+            "k 必须小于 height"
+        );
+        let mut shifted = GlyphGrid::default();
+        shifted.ensure(&layout, inner, from);
+        shifted.ensure(&layout, inner, to);
+        let mut rebuilt = GlyphGrid::default();
+        rebuilt.ensure(&layout, inner, to);
+        assert_grids_equal(
+            &shifted,
+            &rebuilt,
+            &format!("tail from={from} to={to} total={total}"),
+        );
+    }
+
     /// **只变 `base_row` ⇒ 走 `shift`，不重建**（设计 §2.3 第 6 条）。
     #[test]
     fn only_base_row_change_avoids_rebuild() {
@@ -1524,22 +1603,86 @@ mod tests {
         }
     }
 
-    /// **宽字符边界**：选区右端落在 CJK 续格上 ⇒ 矩形右边界是首格 + 1（整字宽）。
+    /// **宽字符边界（右端）**：选区右端落在 CJK 续格上 ⇒ 矩形右边界是首格 + 1（整字宽）。
+    ///
+    /// User 行带 `"> "` 前缀 ⇒ 内容从列 2 起：「中」占 2-3、续格在 3。
+    ///
+    /// 变异：`wide_aware_right` 改成直接返回 `x` ⇒ 右端停在续格上，矩形宽变 1 ⇒ 本用例红。
     #[test]
     fn rects_widen_wide_char_right_edge() {
         let width = 20u16;
         let layout = layout_of(vec![TranscriptLine::User("中文测试".into())], width);
         let inner = Rect::new(0, 0, width, 4);
         let mut sel = Selection::default();
-        sel.begin(0, 0, at(0));
-        sel.extend(0, 1, 0, at(10)); // 列 1 是「中」的续格
+        sel.begin(0, 2, at(0)); // 「中」的首格
+        sel.extend(0, 3, 0, at(10)); // 列 3 是「中」的续格
         sel.ensure_grid(&layout, inner, 0);
         let rects = sel.rects(0, inner).to_vec();
         assert_eq!(rects.len(), 1, "单行选区 ⇒ 一个矩形");
-        assert_eq!(rects[0].x, 0, "左端收拢到首格");
+        assert_eq!(rects[0].x, 2, "左端就是首格");
         assert_eq!(
             rects[0].width, 2,
             "右端在续格上 ⇒ 矩形宽应为 2（整字），不得只盖半个字"
+        );
+    }
+
+    /// **跨行选区的三块形态**：首行 `[x_lo..行尾]`、中间行满宽、末行 `[0..=x_hi]`。
+    ///
+    /// 三个矩形都必须是**内区相对**坐标（`y` 相对 `top_row`），且中间行是连续一整块 ——
+    /// 逐行各推一个会退化成「每行一个矩形」，在高亮与差集上都更贵。
+    #[test]
+    fn rects_multi_line_shape() {
+        let width = 16u16;
+        let lines: Vec<TranscriptLine> = (0..10)
+            .map(|i| TranscriptLine::User(format!("row{i:02}-----------")))
+            .collect();
+        let layout = layout_of(lines, width);
+        let total = layout.total_rows();
+        assert!(total >= 10, "每行不折行（total={total}）");
+        let inner = Rect::new(0, 0, width, 6);
+        let top = 1usize;
+        let mut sel = Selection::default();
+        sel.begin(2, 4, at(0)); // top+1 行，列 4
+        sel.extend(4, 3, 0, at(10)); // top+3 行，列 3
+        sel.ensure_grid(&layout, inner, top);
+        let rects = sel.rects(top, inner).to_vec();
+        assert_eq!(rects.len(), 3, "三行 ⇒ 首/中/末三块");
+        assert_eq!((rects[0].x, rects[0].y), (4, 1), "首行：从 x_lo 到行尾");
+        assert_eq!(rects[0].width, width - 4, "首行宽度到行尾");
+        assert_eq!(
+            (rects[1].x, rects[1].y, rects[1].width, rects[1].height),
+            (0, 2, width, 1),
+            "中间行：满宽一整块"
+        );
+        assert_eq!((rects[2].x, rects[2].y), (0, 3), "末行：从 0 到 x_hi");
+        assert_eq!(rects[2].width, 4, "末行宽度 = x_hi + 1");
+    }
+
+    /// **宽字符边界（左端）**：选区左端落在 CJK 续格上 ⇒ 矩形左边界是**首格**。
+    ///
+    /// 只测右端会漏掉这一半：左端不收拢时高亮从续格开始，`中` 的左半格露在选区外
+    /// —— 视觉上是「选中的字少了一半」，而右端的断言依然全绿。
+    ///
+    /// 变异：`rects` 里左端的 `grid.head_col(y, x_lo)` 改成直接用 `x_lo` ⇒ 本用例红。
+    #[test]
+    fn rects_collapse_wide_char_left_edge_to_head() {
+        let width = 20u16;
+        let layout = layout_of(vec![TranscriptLine::User("中文测试".into())], width);
+        let inner = Rect::new(0, 0, width, 4);
+        // User 行带 `"> "` 前缀 ⇒ 内容从列 2 起；「中」占 2-3，「文」4-5，「测」6-7。
+        let mut sel = Selection::default();
+        sel.begin(0, 3, at(0)); // 列 3 是「中」的续格
+        sel.extend(0, 7, 0, at(10)); // 列 7 是「测」的续格
+        sel.ensure_grid(&layout, inner, 0);
+        let rects = sel.rects(0, inner).to_vec();
+        assert_eq!(rects.len(), 1, "单行选区 ⇒ 一个矩形");
+        assert_eq!(
+            rects[0].x, 2,
+            "左端在续格上 ⇒ 必须收拢到首格（否则「中」露半格）"
+        );
+        assert_eq!(
+            rects[0].width, 6,
+            "右端在续格上 ⇒ 收拢到首格再 +1：2..=7 共 6 格（三个整字）"
         );
     }
 
@@ -1695,6 +1838,68 @@ mod tests {
             "上沿贴边 ⇒ scroll_offset 应递增（{before} → {}）",
             app.scroll_offset
         );
+    }
+
+    /// 多拍**单调**：`edge = -1` ⇒ `scroll_offset` 逐拍不增（且真的在推进）；
+    /// `edge = 1` ⇒ 逐拍不减。`cursor_row` 每拍都跟到新的边缘行。
+    ///
+    /// 单拍用例只看了一次差值，抓不到「第一拍对、第二拍被夹回」这类回归。
+    #[test]
+    fn drag_tick_multi_tick_is_monotonic_and_moves_cursor() {
+        let (w, h) = (40u16, 12u16);
+        let mut app = app_with_many_rows();
+        let max = app.compute_max_scroll(w, h);
+        assert!(max > 30, "前置：内容应可滚（max={max}）");
+        app.scroll_offset = max / 2;
+        app.follow = false;
+        let top_row = app.sync_scroll_state(w, h, at(0)).top_row;
+        let inner_h = crate::draw::chat_viewport(&app, w, h).1;
+
+        app.selection.begin(top_row, 0, at(0));
+        app.selection
+            .extend(top_row + inner_h as usize, 1, -1, at(0));
+
+        let mut prev = app.scroll_offset;
+        for i in 1..=6u64 {
+            drag_tick(&mut app, w, h, at(i * 16));
+            assert!(
+                app.scroll_offset <= prev,
+                "第 {i} 拍：下沿贴边必须逐拍不增（{prev} → {}）",
+                app.scroll_offset
+            );
+            assert!(
+                app.scroll_offset < prev || app.scroll_offset == 0,
+                "第 {i} 拍：应真的在推进（{prev} → {}）",
+                app.scroll_offset
+            );
+            // `cursor_row` 跟到新的底行：`top_row + inner_h - 1`。
+            let expect_cursor = max.saturating_sub(app.scroll_offset) + inner_h as usize - 1;
+            assert_eq!(
+                app.selection.bounds().1.0,
+                expect_cursor,
+                "第 {i} 拍：cursor_row 必须跟到新的边缘行"
+            );
+            prev = app.scroll_offset;
+        }
+
+        // 反向：上沿逐拍不减。
+        let mut app = app_with_many_rows();
+        let max = app.compute_max_scroll(w, h);
+        app.scroll_offset = max / 2;
+        app.follow = false;
+        let top_row = app.sync_scroll_state(w, h, at(0)).top_row;
+        app.selection.begin(top_row + 1, 0, at(0));
+        app.selection.extend(top_row, 1, 1, at(0));
+        let mut prev = app.scroll_offset;
+        for i in 1..=6u64 {
+            drag_tick(&mut app, w, h, at(i * 16));
+            assert!(
+                app.scroll_offset >= prev && app.selection.bounds().1.0 == max - app.scroll_offset,
+                "第 {i} 拍：上沿贴边必须逐拍不减且 cursor 跟到顶行（{prev} → {}）",
+                app.scroll_offset
+            );
+            prev = app.scroll_offset;
+        }
     }
 
     /// **`max == 0`**（内容不足一屏）⇒ 不动滚动位，但 `follow` 仍被置 `false`。

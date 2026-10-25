@@ -1,9 +1,7 @@
 # YuShan · 嵛山
 
 <p align="center">
-  <em>嵛山是福建福鼎东南海域的一座岛。<br>
-  山顶有天湖，湖边是草场，人叫它「南国天山」。<br>
-  安静、不大、能待得住。</em>
+  <em>YuShan（嵛山）是一座中国海岛的名字。</em>
 </p>
 
 <p align="center">

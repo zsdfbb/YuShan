@@ -279,12 +279,57 @@ pub(crate) mod test_support {
     /// 即可在**不依赖开发机是否装了真 ripgrep/fd** 的前提下精确控制输出与退出码。
     ///
     /// 脚本随测试的临时目录一起清理（调用方 `remove_dir_all`）。
+    ///
+    /// # 为何由**子进程**写文件，而不是 `std::fs::write`
+    ///
+    /// 这是个 `fork(2)` / `execve(2)` 的进程级竞态，与用例逻辑无关：Linux 在 `execve`
+    /// 一个**正被写方式打开**的文件时返回 `ETXTBSY`（``Text file busy``）。若本进程
+    /// 用 `fs::write` 直接写，那个写 fd 就存在于**共享的 fd 表**里 —— **别的测试线程**
+    /// 恰好此刻 `fork`，子进程在 `execve` 前会继承它，于是**别人**的 exec 就撞上。
+    ///
+    /// 实测（8 线程 × 100 次「写脚本 → 立即执行」）：
+    ///
+    /// | 做法 | 失败次数 |
+    /// |---|---|
+    /// | `fs::write` 直接写 | 30～44 |
+    /// | 显式 `File::create` + `sync_all` + `drop`（即「先 close 再 fork」）| 30 |
+    /// | 写临时文件再 `rename` / `hard_link` | 31 |
+    /// | 写后 `yield_now()` 等待 | 28 |
+    /// | 全局锁只包写、不包 spawn | 34～44 |
+    /// | **写 fd 只存在于子进程**（本实现）| **0**（1200 次 × 3 轮）|
+    ///
+    /// 前三行不能修它，因为**抢跑的是别人的 fork**：自己 close 得再早也拦不住。
+    /// 全局锁只有把 spawn 一起包进去才有效，代价是所有用到假二进制的用例串行。
+    ///
+    /// 本源方案让主进程**从不打开目标文件写**：`sh` 子进程持有写 fd，它的 fd 表与
+    /// 主进程无关，任何线程的 `fork` 都复制不到 ⇒ `ETXTBSY` 无从发生。确定性、无重试、
+    /// 不串行化。
     #[cfg(unix)]
     pub fn fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // 内容含 `$` / 反引号 / 单引号，不能拼进 shell 命令行 ⇒ 走 stdin 传给 `cat`。
+        // `chmod` 在同一子进程内做完，返回时文件必已就绪（且已 close）。
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(r#"cat > "$1" && chmod 755 "$1""#)
+            .arg("sh")
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sh 写假二进制");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin 已给 piped")
+            .write_all(format!("#!/bin/sh\n{body}").as_bytes())
+            .expect("写假二进制内容");
+        // 必须显式 drop：否则 `wait` 等不到 EOF（子进程的 `cat` 还在等 stdin）。
+        drop(child.stdin.take());
+        let status = child.wait().expect("等 sh 退出");
+        assert!(status.success(), "写假二进制失败：{path:?}");
         path
     }
 

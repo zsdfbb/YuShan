@@ -285,7 +285,7 @@ pub fn create(repo: &Path, name: Option<&str>) -> Result<Entry, WorktreeError> {
             let msg = reason(&out);
             return Err(WorktreeError::Git(format!(
                 "{msg}；{}",
-                create_error_hint(&msg, &name)
+                create_error_hint(&root, &name, &branch, &path)
             )));
         }
     }
@@ -319,14 +319,29 @@ fn is_stale_registration(root: &Path, path: &Path) -> bool {
 }
 
 /// `create` 失败的**下一步**提示：区分「名字冲突（换名）」与「陈旧登记（prune）」。
-fn create_error_hint(msg: &str, name: &str) -> String {
-    if msg.contains("a branch named") {
-        format!("分支 `worktree-{name}` 已存在；请换一个名字")
-    } else if msg.contains("already exists") {
+///
+/// 冲突类型按**状态**判定（分支是否已存在、落点是否已占用），**不匹配 git 的 stderr
+/// 文案** —— 与 [`is_stale_registration`] 同一条原则。git 的报错会随版本与 locale 变：
+/// 同一个失败在 `LANG=zh_CN.UTF-8` 下是「一个名为 'worktree-feat' 的分支已经存在」，
+/// 按 `contains("a branch named")` 判就会落进兜底提示，而用户真正需要的「换名」建议
+/// 反而丢了。
+fn create_error_hint(root: &Path, name: &str, branch: &str, path: &Path) -> String {
+    // 先判分支：`worktree add -b` 先碰分支，分支冲突时落点根本没被创建。
+    if branch_exists(root, branch) {
+        format!("分支 `{branch}` 已存在；请换一个名字")
+    } else if path.exists() {
         format!("落点已存在同名条目；请换一个名字，或先清理 `{name}` 的既有目录")
     } else {
         "若提示该路径已被登记，可先执行 `git worktree prune` 后重试".to_string()
     }
+}
+
+/// 分支是否已存在（`git show-ref --verify` 的退出码，不解析输出）。
+fn branch_exists(root: &Path, branch: &str) -> bool {
+    let refname = format!("refs/heads/{branch}");
+    git(root, &["show-ref", "--verify", "--quiet", &refname])
+        .map(|out| out.ok)
+        .unwrap_or(false)
 }
 
 /// 列出落在**本仓落点子树**下的工作树（含路径 / 分支 / 是否脏）。
@@ -734,6 +749,84 @@ mod tests {
         assert!(
             !is_stale_registration(&repo, &path),
             "prune 后登记已清除 ⇒ false"
+        );
+    }
+
+    /// `create_error_hint` **不看 git 的报错文案**（那随版本 / locale 变）。
+    ///
+    /// 回归：它曾靠 `msg.contains("a branch named")` 分派，而本机 `LANG=zh_CN.UTF-8`
+    /// 下 git 说「一个名为 'worktree-feat' 的分支已经存在」⇒ 两个分支都不匹配 ⇒ 落进
+    /// 兵底提示，用户拿不到「换名」这个真正可行的下一步。`create_prunes_stale_…`
+    /// 集成用例因此在中文环境下恒定失败。
+    ///
+    /// 本用例只断言**判据来自状态**：分支已存在 ⇒ 无论 locale、无论 stderr 说了什么，
+    /// 都给「换名」。
+    ///
+    /// 变异：把判据改回匹配文案（`msg.contains(..)`）⇒ `branch_exists` 不再被调用 ⇒ 分支
+    /// 已存在时会落进落点分支 / 兵底 ⇒ 变红。
+    #[test]
+    fn create_error_hint_judges_by_state_not_git_message() {
+        let _guard = env_lock();
+        let _restore = EnvRestore::capture(&["HOME", "USERPROFILE", "YUSHAN_WORKTREES_DIR"]);
+
+        let home = canonical(&unique_tmp_dir("hint_home"));
+        let trees = canonical(&unique_tmp_dir("hint_trees"));
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("USERPROFILE");
+            std::env::set_var("YUSHAN_WORKTREES_DIR", &trees);
+        }
+
+        let repo = home.join("Develop").join("YuShan");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .output()
+            .expect("spawn git（测试环境应装有 git）");
+        assert!(init.status.success(), "git init 应成功");
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=ys-test",
+                "-c",
+                "user.email=ys-test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit 应成功");
+
+        let path = path_for(&repo, "feat").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // 分支**不存在**、落点也**不存在** ⇒ 两个状态判据都不命中 ⇒ 兵底（prune 建议）。
+        let fallback = create_error_hint(&repo, "feat", "worktree-feat", &path);
+        assert!(
+            fallback.contains("prune"),
+            "分支与落点都无冲突 ⇒ 应给 prune 兵底：{fallback}"
+        );
+
+        // 建出该分支（不建树）⇒ 只有「分支已存在」这一条命中。
+        let create_branch = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "worktree-feat", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(create_branch.status.success(), "git branch 应成功");
+
+        let by_branch = create_error_hint(&repo, "feat", "worktree-feat", &path);
+        assert!(
+            by_branch.contains("请换一个名字") && by_branch.contains("分支"),
+            "分支已存在 ⇒ 必须建议换名（不得依赖 git 的本地化文案）：{by_branch}"
         );
     }
 

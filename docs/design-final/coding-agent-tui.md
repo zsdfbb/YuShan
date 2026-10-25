@@ -406,8 +406,16 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 > 到后台，目录到手经信道送进 `app_loop` 写回 registry 再刷一次视图（见 §8.2 M4）。故启动期
 > 不再有 `Fetching models…` 这类 stderr 提示：没有停顿要解释。
 >
-> **唯一例外**：`YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连且**没给** `YUSHAN_MODEL` 时，
-> 模型名无从可写死（见 M4），启动期**同步**拉一次该端点的目录取第一条才建得出 model。
+> **启动期同步拉目录的条件**：凭证齐全但模型名为空。两种来源：
+> · `YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连且**没给** `YUSHAN_MODEL`；
+> · auth.json 里有凭证但 `model` 为空（上次 `/login` 时没能读到目录）。
+> 成功 ⇒ 取目录第一条当起始模型并并入缓存。
+> **失败按模式分流**（ADR-[0056](../adr/0056-startup-catalog-failure-tui-degrades.md)）：
+> TUI ⇒ 以「无模型」状态照常起屏，失败原因作为**启动期提示**（`Outbound::Output`）进
+> transcript，用户可用 `/login` / `/model` 修复；`-p` / `--json` ⇒ 早失败（stderr）并提示
+> 显式给 `YUSHAN_MODEL` —— 没有交互窗口，缺模型跑不了。
+> **空模型名绝不构造模型实例**：接线器进入真正的「未配置模型」状态（状态行 `(no model)`，
+> 发消息由运行时的 `No model configured` 拦下），不会拿空名去撞端点。
 > 给了 `YUSHAN_MODEL`、或凭证来自 auth.json 且带着模型名，就完全不走这条路。
 
 **日志文件**（`apps/coding-agent/src/logging.rs`）：手写极简 logger —— 追加写、行首 `[unix秒]` 前缀、
@@ -449,10 +457,10 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M1 | **`resolve_prompt` 纯函数**：模态命令的决策逻辑（问什么、按什么顺序、取消怎么办）与渲染分离 | `ys-tui-coding/src/prompter.rs` |
 | M2 | **`TuiPrompter` 用嵌套事件循环**把问答画成模态浮层（不切屏、不 suspend/resume） | `ys-tui-coding/src/run.rs` |
 | M3 | **`/login` 的 api_base 解析**：TUI 在所选 provider **没有内置 base** 时（`custom` 这类）**追加一问 URL**，随 `Request::Login { api_base: Option<String> }` 交给 app；app 侧按 ① 用户显式 URL → ② provider 内置 base → ③ 回退 `config.api_base`（`YUSHAN_API_BASE`）→ ④ 都没有则**明确提示**要设环境变量（不静默失败、不写空 base 的 auth）。**协议因此比 design §6 多一个 `api_base` 字段**（初版实现漏了它，导致 `custom` 的交互式 URL 失效——已修） | `ys-tui-coding::prompter::resolve_prompt` + `capabilities::login` |
-| M4 | **`/model` 无参的模型列表来自 `CodingView.available_models`** —— 由**后台拉取**的目录填充：`main` 在起屏**前**只从 registry 摘出要拉的 `(api_base, api_key)`（`fetch_targets`：每个已登录 provider + env 直连端点），起屏**后** `rt.spawn` 一个后台任务 `ProviderRegistry::fetch_all`（`JoinSet` 并发，5s 超时），结果经 `mpsc` 送回 `app_loop`，由它 `apply_model_cache` 写回 registry 并**自发刷一次视图**（无 `Request`）。**模型名只有「该端点 `/v1/models` 的目录」这一个来源**（`/login` 也拉一次该 provider 的目录取第一条当起始模型）—— 代码里没有任何写死的模型名，拉不到就没有那一家，**不做静态回退**。候选 = **所有已登录 provider 已拉到的目录** + env 直连端点按 base 取的目录，**按 `(provider, model)` 去重**（同名 id 跨 provider **各占一行** —— 按 id 去重会把其中一条吃掉，用户既看不到也选不到）+ 当前正在跑的模型。每条是 `ModelEntry { provider, model, current }`：浮层显示 `provider/model`，归属未知（无 `cfg.provider`，如 env 直连）时退化为裸模型名，当前那条缀 `[current]`。**正在跑那条的归属取 `cfg.provider`（权威）**，不靠反查 —— 接线器的 model 就是用它那套凭证建出来的。**起屏不再等网络**（开屏即用；唯一例外是 env 直连且未给 `YUSHAN_MODEL`，见上）；**渲染路径一次 HTTP 都不发**（重绘不得触发 HTTP）—— registry 的写与 `build_view` 的读同在 app 循环那一线程，是唯一写者 | `apps/coding-agent/src/{provider,view,main,app_loop}.rs` |
+| M4 | **`/model` 无参的模型列表来自 `CodingView.available_models`** —— 由**后台拉取**的目录填充：`main` 在起屏**前**只从 registry 摘出要拉的 `(api_base, api_key)`（`fetch_targets`：每个已登录 provider + env 直连端点），起屏**后** `rt.spawn` 一个后台任务 `ProviderRegistry::fetch_all`（`JoinSet` 并发，5s 超时），结果经 `mpsc` 送回 `app_loop`，由它 `apply_model_cache` 写回 registry 并**自发刷一次视图**（无 `Request`）。**模型名只有「该端点 `/v1/models` 的目录」这一个来源**（`/login` 也拉一次该 provider 的目录取第一条当起始模型）—— 代码里没有任何写死的模型名，拉不到就没有那一家，**不做静态回退**。候选 = **所有已登录 provider 已拉到的目录** + env 直连端点按 base 取的目录，**按 `(provider, model)` 去重**（同名 id 跨 provider **各占一行** —— 按 id 去重会把其中一条吃掉，用户既看不到也选不到）+ 当前正在跑的模型。每条是 `ModelEntry { provider, model, current }`：浮层显示 `provider/model`，归属未知（无 `cfg.provider`，如 env 直连）时退化为裸模型名，当前那条缀 `[current]`。**正在跑那条的归属取 `cfg.provider`（权威）**，不靠反查 —— 接线器的 model 就是用它那套凭证建出来的。**起屏不再等网络**（开屏即用；例外是「有凭证、无模型名」的启动期同步拉取，其失败在 TUI 下降级为无模型启动，见上）；**渲染路径一次 HTTP 都不发**（重绘不得触发 HTTP）—— registry 的写与 `build_view` 的读同在 app 循环那一线程，是唯一写者 | `apps/coding-agent/src/{provider,view,main,app_loop}.rs` |
 | M9 | **跨 provider 选模型**：候选是多个 provider 的并集，故归属**显式带过来** —— `Request::SetModel` 带 `provider: Option<String>`（浮层选中时由 UI 带上；`/model provider/model` 限定名由 `capabilities::set_model` 拆出，**仅当 `/` 前逐字命中已知 provider 名**才拆，否则网关那种 `vendor/model` 形态的 id 会被误切）。**只有裸模型名**才回退 `ProviderRegistry::provider_for_model` 反查 —— 它遍历 `model_cache`（`HashMap`，迭代顺序不确定）返回第一个含该 id 的 provider，**同名 id 的归属是任意的**，会静默把端点切到错的一家。归属与当前 provider 不同则**连端点一起切**（api_base / api_key / provider，取自该 provider 的 auth 条目）。目录里都没有的手敲名字**保持当前 provider 不变** —— 只改 `config.model` 会把 A 家的模型名发到 B 家的 base | `apps/coding-agent/src/capabilities.rs`；`crates/ys-protocol/src/request.rs` |
 | M5 | **`Action::Abort` 目前是保留变体**：`parse()` 不产出它；Ctrl+C / Esc 在 `handle_key` 里直接投 `Boundary::Abort`。留作将来 `/abort`。turn 中 Ctrl+C 是**两段式**（第一次取消、第二次退出），见 M17 | `ys-tui-coding/src/commands.rs` |
-| M6 | **`app_loop` 的回合失败只落日志、不刷 transcript**：`BasicLoop` 返回错误前已发 `RunFailed`（UI 已看到 Error 行） | `app_loop::run` |
+| M6 | **`app_loop` 的回合失败只落日志、不刷 transcript**：`BasicLoop` 返回错误前已发 `RunFailed`（UI 已看到 Error 行）；**开跑前**的无模型错误由 `Agent::run_turn` 自己发同一条 `RunFailed`（不启动循环，但终局事件不变量照旧） | `app_loop::run`、`ys-runtime::agent` |
 | M7 | **`/new` 后 `session_started` 重置**（状态行时长据此归零） | `app_loop::run` |
 | M8 | **`export` 为同步 `std::fs::copy`**：会话是本地小文件；把一个非 `Sync` 的 `&Wiring` 借进 app 循环的 future 跨 `await` 会让整个循环不再 `Send`、无法 `spawn` | `capabilities::export` |
 | M10 | **`/skills` 命令（skills 特性落地后补）**：TUI 浮层列全部 skill（`/command  — description`，按 `command` 升序、**排除被内置命令遮蔽的**——与 `/` 浮层同一条规则），选中后**回填输入框** `/<command> `（尾随空格）而**不发 `Request`**：skill 常带参数（`/git-status --short`），用户补完再回车；`-p` / `--json` 无 TUI，不涉及此路。为此 `resolve_prompt` 的返回类型由 `Result<Request, _>` 改为 **`Result<PromptOutcome, _>`**（`PromptOutcome::Request` \| `PromptOutcome::Prefill(String)`），`run_prompt` 据此分支「发送」或「回填输入框」。选项文本与 `/` 补全**共用** `completion::skill_label` —— `Prompter::select` 只回传**显示串**，反解回 `command` 靠的就是这条格式（**故它是承重的**） | `ys-tui-coding/src/{commands,prompter,run,completion}.rs` |

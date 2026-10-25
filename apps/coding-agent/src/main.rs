@@ -1151,10 +1151,8 @@ fn with_resume_hint(hint: Option<String>, triggered: bool) -> Option<String> {
     })
 }
 
-/// 把建树告知（`worktree create` 成功）并入启动期提示，**放在最前**（它是最相关的上下文）。
-///
-/// 与 [`with_resume_hint`] 同规：不覆盖既有提示，多行拼接。
-fn with_worktree_note(hint: Option<String>, note: Option<String>) -> Option<String> {
+/// 把一条提示**前置**到既有启动期提示，**不覆盖**（`None` 原样返回）。
+fn prepend_hint(hint: Option<String>, note: Option<String>) -> Option<String> {
     let Some(note) = note else {
         return hint;
     };
@@ -1162,6 +1160,21 @@ fn with_worktree_note(hint: Option<String>, note: Option<String>) -> Option<Stri
         Some(h) => format!("{note}\n{h}"),
         None => note,
     })
+}
+
+/// 把建树告知（`worktree create` 成功）并入启动期提示，**放在最前**（它是最相关的上下文）。
+///
+/// 与 [`with_resume_hint`] 同规：不覆盖既有提示，多行拼接。
+fn with_worktree_note(hint: Option<String>, note: Option<String>) -> Option<String> {
+    prepend_hint(hint, note)
+}
+
+/// 把「模型目录拉不到、已以无模型状态启动」并入启动期提示，**放在最前**。
+///
+/// 没有模型时它是用户最需要看到的一条 —— 后续的降级提示 / 会话回放都不该把它压到
+/// 视野之外。
+fn with_catalog_hint(hint: Option<String>, note: Option<String>) -> Option<String> {
+    prepend_hint(hint, note)
 }
 
 /// `worktree create` 成功的告知行：名字 / 路径 / 分支（未合并）。
@@ -1632,6 +1645,22 @@ fn catalog_unavailable(base: &str, reason: &str) -> String {
     )
 }
 
+/// 目录拉取失败的分流：**交互式**降级为启动期提示，**一次性**硬失败。
+///
+/// TUI 能带着「无模型」启动（状态行 `(no model)`；发请求前由运行时拦下并提示
+/// `/login`）—— 只有让它起来，用户才有机会用 `/login` / `/model` 修复凭证或点名
+/// 模型。`-p` / `--json` 没有后续输入窗口，缺模型必然跑不了 ⇒ 直接失败并给出原因。
+fn catalog_failure(base: &str, reason: &str, interactive: bool) -> Result<Option<String>, String> {
+    if interactive {
+        Ok(Some(format!(
+            "无法从 {base} 读取模型目录（{reason}）；已以无模型状态启动 —— \
+             用 `/login` 重新登录，或用 `/model <provider>/<name>` 指定模型"
+        )))
+    } else {
+        Err(catalog_unavailable(base, reason))
+    }
+}
+
 /// 把目录里的**第一条**当起始模型：写进 `config.model`，并把整份目录并入 registry
 /// 的目录缓存 —— `/model` 候选（`models_for_provider`）与 `context_window_for` 的
 /// ② 级（目录里厂商自己报的窗口）立刻可用。
@@ -1650,6 +1679,30 @@ fn adopt_first_catalog_model(
     cache.insert(base.trim_end_matches('/').to_string(), models);
     config.registry.apply_model_cache(cache);
     Ok(())
+}
+
+/// 启动期「模型名缺失」时采用一次目录请求的结果。
+///
+/// 成功 ⇒ 目录第一条写进 `config.model` 并并入缓存，返回 `None`（无诊断）；
+/// 失败 / 空目录 ⇒ 交 [`catalog_failure`] 按模式分流。
+fn apply_startup_catalog(
+    config: &mut config::Config,
+    base: &str,
+    result: provider::FetchModelsResult,
+    interactive: bool,
+) -> Result<Option<String>, String> {
+    match result {
+        provider::FetchModelsResult::Success(models) => {
+            match adopt_first_catalog_model(config, base, models) {
+                Ok(()) => Ok(None),
+                Err(reason) => catalog_failure(base, reason, interactive),
+            }
+        }
+        provider::FetchModelsResult::AuthError(_) => catalog_failure(base, "鉴权失败", interactive),
+        provider::FetchModelsResult::NetworkError(_) => {
+            catalog_failure(base, "网络不可达", interactive)
+        }
+    }
 }
 
 /// 把一份目录并入 registry 的目录缓存（**不改 `config.model`**）。
@@ -2509,6 +2562,63 @@ fn run_worktree_early(cmd: &WorktreeCmd, cwd: &Path) -> ! {
     }
 }
 
+/// 按 `config.model` 构造主模型（生产 model factory 的唯一实现）。
+///
+/// **空模型名 ⇒ `None`**：模型名是请求的必填字段，拿空名建实例只会换来 400。
+/// 空名出现在「目录没拉到、`/login` 只存了凭证」的启动路径 —— 返回 `None` 让接线器
+/// 进入「未配置模型」状态（状态行 `(no model)`；发请求前由运行时提示 `/login`），
+/// 而不是假装已配置。
+fn build_configured_model(
+    cfg: &config::Config,
+    trace: Option<&debug_log::ModelTraceRouter>,
+) -> Option<Box<dyn ys_model::Model>> {
+    if cfg.model.is_empty() {
+        return None;
+    }
+    let base = cfg.api_base.as_ref()?;
+    let key = cfg.api_key.as_ref()?;
+    let compat = cfg.current_compat();
+    let effective_effort = cfg.effective_reasoning_effort();
+    let reasoning_effort = reasoning_effort_for(&compat, effective_effort.as_deref());
+    // `new` 自建 client（`owns_client == true`），故 `with_timeouts` 会按配置重建
+    // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
+    let retry = cfg.model_retry();
+    let timeout = cfg.model_timeout();
+    let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
+        api_base: base.clone(),
+        api_key: key.clone(),
+        model: cfg.model.clone(),
+        // 不设输出上限：交由 **provider 自身的模型上限**（DeepSeek 单次可达 ~200k）。
+        // 主循环的 `ModelRequest.max_tokens` 也是 `None` ⇒ 适配器**整个字段不序列化**，
+        // 绝不人为把模型掐断。辅助调用（摘要）在各自的请求里自带上限。
+        max_tokens: None,
+        temperature: Some(0.7),
+        reasoning_effort,
+        compat,
+    })
+    .with_retry(RetryConfig {
+        max_attempts: retry.max_attempts,
+        base_delay_ms: retry.base_delay_ms,
+        max_delay_ms: retry.max_delay_ms,
+    })
+    .with_timeouts(TimeoutConfig {
+        connect_secs: timeout.connect_secs,
+        idle_secs: timeout.idle_secs,
+    })
+    // 重试痕迹走 app 的 logging（ADR-0028 决策 7）：对 TUI 不可见、对排障可见。
+    // 适配器绝不直接 print —— 这条回调是它唯一的诊断出口。
+    .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg)));
+    if let Some(trace) = trace {
+        model = model.with_trace(trace.callback());
+    }
+    // 网关接入要求（OpenCode Go 的 `x-opencode-session` 等）：属**传输层**，
+    // 由 provider 知识给出，不经 `OpenAICompatibleConfig`（那是方言）。
+    for (header, value) in cfg.request_headers() {
+        model = model.with_extra_header(&header, &value);
+    }
+    Some(Box::new(model))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 模式与 `--resume` 必须在一切之前确定（决定事件消费者 / sink / 会话形态）。
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -2731,24 +2841,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   · `YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连、但没给 `YUSHAN_MODEL`；
     //   · auth 里有凭证、但 `model` 是空的（上次 `/login` 时没能读到目录）。
     // 这是启动期**唯一**可能等网络的路径，且只在「用户没点名模型」时发生。
-    // 拉不到 ⇒ **明确失败**（提示显式给名字）：名字写死在代码里只会过时，猜一个
-    // 不存在/不兼容的模型名更糟。
+    // 拉不到 ⇒ **交互式降级、一次性硬失败**（见 [`catalog_failure`]）：TUI 若也
+    // 起不来，用户就没有 `/login` / `/model` 这两条修复路径；而 `-p` / `--json`
+    // 缺模型必然跑不了，早失败并说明原因才可操作。
+    let mut catalog_hint: Option<String> = None;
     if config.model.is_empty() && config.is_configured() {
         let base = config.api_base.clone().unwrap_or_default();
         let key = config.api_key.clone().unwrap_or_default();
-        match rt.block_on(provider::ProviderRegistry::fetch_models(&base, &key)) {
-            provider::FetchModelsResult::Success(models) => {
-                if let Err(reason) = adopt_first_catalog_model(&mut config, &base, models) {
-                    return Err(catalog_unavailable(base.as_str(), reason).into());
-                }
-            }
-            provider::FetchModelsResult::AuthError(_) => {
-                return Err(catalog_unavailable(base.as_str(), "鉴权失败").into());
-            }
-            provider::FetchModelsResult::NetworkError(_) => {
-                return Err(catalog_unavailable(base.as_str(), "网络不可达").into());
-            }
-        }
+        let result = rt.block_on(provider::ProviderRegistry::fetch_models(&base, &key));
+        catalog_hint = apply_startup_catalog(
+            &mut config,
+            &base,
+            result,
+            matches!(args.mode, Mode::Interactive),
+        )?;
     }
 
     // `-p` / `--json`：**同步**拉一次当前端点的目录，让窗口解析能命中 ② 级
@@ -2797,50 +2903,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 注册 model factory（适配器特有的构建逻辑）
     let trace_for_main = model_trace.clone();
-    config.set_model_factory(move |cfg| {
-        let base = cfg.api_base.as_ref()?;
-        let key = cfg.api_key.as_ref()?;
-        let compat = cfg.current_compat();
-        let effective_effort = cfg.effective_reasoning_effort();
-        let reasoning_effort = reasoning_effort_for(&compat, effective_effort.as_deref());
-        // `new` 自建 client（`owns_client == true`），故 `with_timeouts` 会按配置重建
-        // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
-        let retry = cfg.model_retry();
-        let timeout = cfg.model_timeout();
-        let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
-            api_base: base.clone(),
-            api_key: key.clone(),
-            model: cfg.model.clone(),
-            // 不设输出上限：交由 **provider 自身的模型上限**（DeepSeek 单次可达 ~200k）。
-            // 主循环的 `ModelRequest.max_tokens` 也是 `None` ⇒ 适配器**整个字段不序列化**，
-            // 绝不人为把模型掐断。辅助调用（摘要）在各自的请求里自带上限。
-            max_tokens: None,
-            temperature: Some(0.7),
-            reasoning_effort,
-            compat,
-        })
-        .with_retry(RetryConfig {
-            max_attempts: retry.max_attempts,
-            base_delay_ms: retry.base_delay_ms,
-            max_delay_ms: retry.max_delay_ms,
-        })
-        .with_timeouts(TimeoutConfig {
-            connect_secs: timeout.connect_secs,
-            idle_secs: timeout.idle_secs,
-        })
-        // 重试痕迹走 app 的 logging（ADR-0028 决策 7）：对 TUI 不可见、对排障可见。
-        // 适配器绝不直接 print —— 这条回调是它唯一的诊断出口。
-        .with_logger(std::sync::Arc::new(|msg: &str| crate::logging::log(msg)));
-        if let Some(trace) = &trace_for_main {
-            model = model.with_trace(trace.callback());
-        }
-        // 网关接入要求（OpenCode Go 的 `x-opencode-session` 等）：属**传输层**，
-        // 由 provider 知识给出，不经 `OpenAICompatibleConfig`（那是方言）。
-        for (header, value) in cfg.request_headers() {
-            model = model.with_extra_header(&header, &value);
-        }
-        Some(Box::new(model))
-    });
+    config.set_model_factory(move |cfg| build_configured_model(cfg, trace_for_main.as_ref()));
 
     // 按**模型名**构造（subagent 的 `model` 参数）：同一 provider 上的另一个模型。
     // 未配置凭证 / 名字为空 ⇒ `None` ⇒ 调用方 **fail-closed**（绝不静默回退到父模型）。
@@ -2972,6 +3035,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 建树告知（`create` 路径）并入同一条启动期提示：名字 / 路径 / 分支未合并。
     // 不进 stderr 是因为 TUI 起屏前写 stderr 会在退出 alt-screen 后变成主屏残渣（设计 §5）。
     let hint = with_worktree_note(hint, worktree_note);
+
+    // 目录拉不到的降级告知（仅 TUI；一次性模式已在模型解析处硬失败）放在最前。
+    let hint = with_catalog_hint(hint, catalog_hint);
 
     // **工作区绑定快照**：名字 + 路径同源于启动期捕获的树名 / 树路径（attach 或 meta 恢复）。
     // 工作区在运行期可变（会话内 `/resume` 切树），故退出行与回合末 meta 都经此句柄读，
@@ -4653,6 +4719,27 @@ mod tests {
         );
     }
 
+    /// 目录失败提示**前置且不覆盖**既有启动期提示。
+    ///
+    /// 变异：把 [`prepend_hint`] 的拼接顺序反过来 ⇒ 第二条断言变红。
+    #[test]
+    fn with_catalog_hint_prepends_and_preserves_existing() {
+        assert_eq!(
+            with_catalog_hint(None, Some("catalog-note".into())).as_deref(),
+            Some("catalog-note")
+        );
+        assert_eq!(
+            with_catalog_hint(Some("原有提示".into()), Some("catalog-note".into())).as_deref(),
+            Some("catalog-note\n原有提示"),
+            "目录失败最要紧，必须排在最前"
+        );
+        assert_eq!(
+            with_catalog_hint(Some("原有提示".into()), None).as_deref(),
+            Some("原有提示"),
+            "无提示必须原样返回"
+        );
+    }
+
     #[test]
     fn with_session_recovery_hint_preserves_existing_hint_and_skips_empty() {
         let recovery = ys_session::SessionRecovery {
@@ -5394,6 +5481,112 @@ mod tests {
         assert!(adopt_first_catalog_model(&mut cfg, "https://x/v1", Vec::new()).is_err());
         assert!(cfg.model.is_empty(), "不得写入任何模型名");
         assert!(cfg.registry.models_for_base("https://x/v1").is_empty());
+    }
+
+    /// 启动期目录拉取失败：**交互式降级**（返回启动期提示、不写模型名），
+    /// **一次性硬失败**（返回 `Err`）。
+    ///
+    /// 交互式降级是 `/login` / `/model` 唯一可达的前提 —— 若这里也 `Err`，提示里
+    /// 建议的修复路径就被启动失败本身堵死了。
+    ///
+    /// 变异：把 `catalog_failure` 的 interactive 分支也改成 `Err` ⇒ 第一条
+    /// `expect` 变红；把 else 分支改成 `Ok` ⇒ 第二条 `expect_err` 变红。
+    #[test]
+    fn startup_catalog_failure_degrades_only_in_interactive_mode() {
+        let _guard = crate::test_env::env_lock();
+        let mut cfg = config::Config::from_env().unwrap();
+        cfg.model.clear();
+
+        let note = apply_startup_catalog(
+            &mut cfg,
+            "https://api.deepseek.com",
+            provider::FetchModelsResult::AuthError("401".into()),
+            true,
+        )
+        .expect("交互式模式不得把目录失败变成启动失败")
+        .expect("交互式降级必须给一条启动期提示");
+        assert!(note.contains("api.deepseek.com"), "提示要点名端点：{note}");
+        assert!(note.contains("鉴权失败"), "提示要带上失败原因：{note}");
+        assert!(note.contains("/login"), "提示要给出修复路径：{note}");
+        assert!(cfg.model.is_empty(), "拿不到目录就不得写模型名");
+
+        let err = apply_startup_catalog(
+            &mut cfg,
+            "https://api.deepseek.com",
+            provider::FetchModelsResult::AuthError("401".into()),
+            false,
+        )
+        .expect_err("一次性模式缺模型必须早失败");
+        assert!(
+            err.contains("YUSHAN_MODEL"),
+            "一次性模式的提示要可操作：{err}"
+        );
+        assert!(cfg.model.is_empty(), "失败路径同样不得写模型名");
+    }
+
+    /// 目录成功 ⇒ 采用第一条并返回 `None`（无诊断）；空目录 ⇒ 与拉不到同规，
+    /// 交 [`catalog_failure`] 分流。
+    #[test]
+    fn startup_catalog_success_adopts_first_and_empty_catalog_degrades() {
+        let _guard = crate::test_env::env_lock();
+        let mut cfg = config::Config::from_env().unwrap();
+        cfg.model.clear();
+
+        let models = vec![provider::ApiModel {
+            id: "first-model".into(),
+            owned_by: None,
+            name: None,
+            context_window: None,
+        }];
+        let note = apply_startup_catalog(
+            &mut cfg,
+            "https://x/v1",
+            provider::FetchModelsResult::Success(models),
+            false,
+        )
+        .expect("拿到目录必须成功");
+        assert!(note.is_none(), "成功路径不该产生诊断");
+        assert_eq!(cfg.model, "first-model");
+
+        cfg.model.clear();
+        let note = apply_startup_catalog(
+            &mut cfg,
+            "https://x/v1",
+            provider::FetchModelsResult::Success(Vec::new()),
+            true,
+        )
+        .expect("交互式模式下空目录也不得启动失败")
+        .expect("空目录要给出启动期提示");
+        assert!(note.contains("空目录"), "提示要说明原因：{note}");
+        assert!(cfg.model.is_empty());
+    }
+
+    /// 生产 model factory：**空模型名 ⇒ `None`**。
+    ///
+    /// 「只存了凭证、没有模型名」是 `/login` 拉不到目录后的合法持久化状态；它必须
+    /// 表现为「未配置模型」（状态行 `(no model)`、发请求前被运行时拦下），而不是
+    /// 一个模型名为空串的实例 —— 那只会把 400 留到第一次对话。
+    ///
+    /// 变异：删掉 `build_configured_model` 开头的 `cfg.model.is_empty()` 守卫
+    /// ⇒ 第一条断言变红。
+    #[test]
+    fn configured_model_requires_non_empty_model_name() {
+        let _guard = crate::test_env::env_lock();
+        let mut cfg = config::Config::from_env().unwrap();
+        cfg.api_base = Some("https://api.example.com".into());
+        cfg.api_key = Some("sk-test".into());
+        cfg.model.clear();
+
+        assert!(
+            build_configured_model(&cfg, None).is_none(),
+            "空模型名不得构造实例"
+        );
+
+        cfg.model = "some-model".into();
+        assert!(
+            build_configured_model(&cfg, None).is_some(),
+            "端点 / 凭证 / 模型名齐全时应能构造"
+        );
     }
 
     // ───────────────────────── debug 接线（Task 14）─────────────────────────

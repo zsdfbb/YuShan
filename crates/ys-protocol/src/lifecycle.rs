@@ -2,18 +2,13 @@
 ///
 /// 第三种策略若出现，加变体即可（`#[non_exhaustive]` 已备）。
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LifecyclePolicy {
     /// 消费者消失 → 干完当前轮收摊（交互式默认）
+    #[default]
     StopWhenConsumerGone,
     /// 消费者消失 → 继续跑（事件落盘兜底；后台长任务）
     ContinueWithoutConsumer,
-}
-
-impl Default for LifecyclePolicy {
-    fn default() -> Self {
-        Self::StopWhenConsumerGone
-    }
 }
 
 #[cfg(test)]

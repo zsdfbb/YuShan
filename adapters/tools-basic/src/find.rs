@@ -166,14 +166,13 @@ fn build_result(bounded: &Bounded, search_root: &Path, limit: usize, label: &str
         .map(|line| relativize(line, search_root))
         .collect();
 
-    if !killed_by_us {
-        if let Some(code) = bounded.code {
-            if code != 0 {
-                // 有结果就照给（并说明可能不全）；一条都没有才算失败。
-                if lines.is_empty() {
-                    return exit_error(label, bounded);
-                }
-            }
+    if !killed_by_us
+        && let Some(code) = bounded.code
+        && code != 0
+    {
+        // 有结果就照给（并说明可能不全）；一条都没有才算失败。
+        if lines.is_empty() {
+            return exit_error(label, bounded);
         }
     }
 

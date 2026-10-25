@@ -908,7 +908,7 @@ mod tests {
     fn scan_text(command: &str, content: &str) -> (Vec<SkillEntry>, Vec<String>) {
         let root = temp_dir("one");
         write_skill(&root, command, content);
-        let result = scan(&[root.clone()]);
+        let result = scan(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
         result
     }
@@ -1157,7 +1157,7 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0xFFu8, 1024 * 1024));
         std::fs::write(dir.join("SKILL.md"), &bytes).unwrap();
 
-        let (entries, diags) = scan(&[root.clone()]);
+        let (entries, diags) = scan(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(diags.is_empty(), "{diags:?}");
@@ -1196,7 +1196,7 @@ mod tests {
         // 合法邻居：证明「有界读」不会把整个 root 一起废掉
         write_skill(&root, "honest", "---\ndescription: 正常描述\n---\n正文\n");
 
-        let (entries, diags) = scan(&[root.clone()]);
+        let (entries, diags) = scan(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(diags.is_empty(), "{diags:?}");
@@ -1436,7 +1436,7 @@ mod tests {
             "git-status",
             "---\nname: git-status\ndescription: 状态\n---\n\n正文第一行\n正文第二行\n",
         );
-        let (skills, _) = scan(&[root.clone()]);
+        let (skills, _) = scan(std::slice::from_ref(&root));
 
         // 命中 + 参数
         let out = expand_invocation("/git-status --short 现在改了什么", &skills).unwrap();
@@ -1465,7 +1465,7 @@ mod tests {
     fn test_expand_invocation_does_not_swallow_plain_text() {
         let root = temp_dir("expand_miss");
         write_skill(&root, "git-status", "---\ndescription: 状态\n---\n正文\n");
-        let (skills, _) = scan(&[root.clone()]);
+        let (skills, _) = scan(std::slice::from_ref(&root));
 
         assert!(expand_invocation("看看 /git-status 怎么用", &skills).is_none()); // `/` 不在首位
         assert!(expand_invocation("git-status", &skills).is_none()); // 无前导 `/`
@@ -1526,7 +1526,7 @@ mod tests {
         // root 下的普通文件也不是 skill
         std::fs::write(root.join("notes.md"), "x").unwrap();
 
-        let (entries, diags) = scan(&[root.clone()]);
+        let (entries, diags) = scan(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(diags.is_empty(), "{diags:?}");
@@ -1592,7 +1592,7 @@ mod tests {
             command,
             "---\ndescription: 命令名含引号与和号\n---\n正文含 <b>标签</b> & 裸和号\n",
         );
-        let (skills, diags) = scan(&[root.clone()]);
+        let (skills, diags) = scan(std::slice::from_ref(&root));
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(skills.len(), 1, "含 `\"` / `&` 的目录名应当合法：{diags:?}");
 
@@ -1637,7 +1637,7 @@ mod tests {
         // 合法邻居：证明检查只吃坏名字
         write_skill(&root, "good", "---\ndescription: 好描述\n---\n正文\n");
 
-        let (entries, diags) = scan(&[root.clone()]);
+        let (entries, diags) = scan(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(entries.len(), 1, "三个坏目录都该被丢掉：{entries:?}");
@@ -1661,14 +1661,17 @@ mod tests {
         assert_eq!(scan(&[]), (Vec::new(), Vec::new()));
 
         let missing = PathBuf::from("/nonexistent/yushan-skills-root-xyz");
-        assert_eq!(scan(&[missing.clone()]), (Vec::new(), Vec::new()));
+        assert_eq!(
+            scan(std::slice::from_ref(&missing)),
+            (Vec::new(), Vec::new())
+        );
 
         let empty = temp_dir("empty");
-        assert_eq!(scan(&[empty.clone()]), (Vec::new(), Vec::new()));
+        assert_eq!(scan(std::slice::from_ref(&empty)), (Vec::new(), Vec::new()));
         // 目录里有东西但没有一份 `SKILL.md` ⇒ 仍然零 skill、零诊断
         std::fs::write(empty.join("README.md"), "x").unwrap();
         std::fs::create_dir_all(empty.join("no-skill-md")).unwrap();
-        assert_eq!(scan(&[empty.clone()]), (Vec::new(), Vec::new()));
+        assert_eq!(scan(std::slice::from_ref(&empty)), (Vec::new(), Vec::new()));
 
         let _ = std::fs::remove_dir_all(&empty);
     }
@@ -1777,7 +1780,7 @@ mod tests {
         write_skill(&root, "no-newline", "---");
         write_skill(&root, "binary", "\u{0}\u{1}\u{2}");
 
-        let (entries, diags) = scan(&[root.clone()]);
+        let (entries, diags) = scan(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
         assert!(entries.is_empty(), "{entries:?}");
         assert!(diags.is_empty(), "{diags:?}");

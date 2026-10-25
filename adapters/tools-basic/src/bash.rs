@@ -229,13 +229,13 @@ fn render_result(
     }
 
     // 检查退出码（被信号杀死时 code 为 None，不视作「非零退码」）
-    if let Some(code) = exit_code {
-        if code != 0 {
-            return ToolResult {
-                content: format!("{content}\n\nCommand exited with code {code}"),
-                is_error: true,
-            };
-        }
+    if let Some(code) = exit_code
+        && code != 0
+    {
+        return ToolResult {
+            content: format!("{content}\n\nCommand exited with code {code}"),
+            is_error: true,
+        };
     }
 
     ToolResult {

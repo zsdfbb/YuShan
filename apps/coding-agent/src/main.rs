@@ -1263,10 +1263,10 @@ pub(crate) async fn finalize_turn_meta(
         .filter(|t| !t.is_empty());
     wiring
         .update_meta(|meta| {
-            if meta.title.is_none() {
-                if let Some(t) = title {
-                    meta.title = Some(t);
-                }
+            if meta.title.is_none()
+                && let Some(t) = title
+            {
+                meta.title = Some(t);
             }
             if let Some(p) = provider {
                 meta.provider = Some(p.to_owned());
@@ -1449,10 +1449,10 @@ fn sweep_bg_root(root: &Path, max_age: Duration) {
 /// 责任在配置方；本函数只保证**自己的降级**不产生相对路径。第 2/3 档同样带
 /// 绝对性闸门（`HOME=""` / 相对取值会拼出相对路径）。
 fn sessions_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("YUSHAN_SESSIONS_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Ok(dir) = std::env::var("YUSHAN_SESSIONS_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
@@ -1725,6 +1725,22 @@ fn ensure_configured(
     exit_with_debug(&mut None, 1);
 }
 
+/// [`run_single_turn`] 的输入集合。
+///
+/// 收成结构体而不是 8 个平铺参数：其中数项在调用点恒为 `None`（测试）或恒为同一组值
+/// （生产），逐个平铺只是重复。**与 `run_turn_once` 的 `TurnCtx` 同一个理由** ——
+/// 同一族函数的输入集合不该一半用结构体、一半用长参数表。
+struct SingleTurnInputs<'a> {
+    input: AgentInput,
+    /// 本回合的 wall-clock 预算（`config.max_turn_duration()`）。
+    budget: Duration,
+    /// `None` = 无配置（测试）。影响按名构造模型与等待上限的收紧。
+    config: Option<&'a config::Config>,
+    subagent: Option<&'a subagent::SubagentSetup>,
+    debug: Option<&'a crate::debug_log::DebugHandle>,
+    session_id: &'a str,
+}
+
 /// `-p` / `--json` 的驱动：跑**一个** turn。
 ///
 /// `Inbox` / `Agent::run` 已删（T1）：单次运行就是一次 `run_turn`，`begin_turn(1)`
@@ -1738,13 +1754,16 @@ fn ensure_configured(
 async fn run_single_turn(
     agent: &mut Agent,
     wiring: &mut Wiring,
-    input: AgentInput,
-    budget: Duration,
-    config: Option<&config::Config>,
-    subagent: Option<&subagent::SubagentSetup>,
-    debug: Option<&crate::debug_log::DebugHandle>,
-    session_id: &str,
+    params: SingleTurnInputs<'_>,
 ) -> Result<RunResult, LoopError> {
+    let SingleTurnInputs {
+        input,
+        budget,
+        config,
+        subagent,
+        debug,
+        session_id,
+    } = params;
     // 预算计时原点与本回合耗时原点**同一个** —— 两个 `Instant::now()` 会让
     // `elapsed` 与 `budget_remaining` 对不上账。
     let started = Instant::now();
@@ -1941,12 +1960,14 @@ async fn run_print_mode(
         run_single_turn(
             agent,
             wiring,
-            AgentInput::text(task.as_str()),
-            budget,
-            Some(config),
-            subagent,
-            debug_handle.as_ref(),
-            session_id,
+            SingleTurnInputs {
+                input: AgentInput::text(task.as_str()),
+                budget,
+                config: Some(config),
+                subagent,
+                debug: debug_handle.as_ref(),
+                session_id,
+            },
         ),
         consume_print_events(rx, io::stdout(), debug.as_deref_mut(), session_id),
     );
@@ -2019,12 +2040,14 @@ async fn run_json_mode(
         run_single_turn(
             agent,
             wiring,
-            AgentInput::text(task.as_str()),
-            budget,
-            Some(config),
-            subagent,
-            debug_handle.as_ref(),
-            session_id,
+            SingleTurnInputs {
+                input: AgentInput::text(task.as_str()),
+                budget,
+                config: Some(config),
+                subagent,
+                debug: debug_handle.as_ref(),
+                session_id,
+            },
         ),
         consume_events(
             rx,
@@ -3821,12 +3844,14 @@ mod tests {
                 run_single_turn(
                     &mut agent,
                     &mut wiring,
-                    AgentInput::text("hi"),
-                    Duration::from_secs(60),
-                    None,
-                    None,
-                    None,
-                    "test-session"
+                    SingleTurnInputs {
+                        input: AgentInput::text("hi"),
+                        budget: Duration::from_secs(60),
+                        config: None,
+                        subagent: None,
+                        debug: None,
+                        session_id: "test-session",
+                    }
                 ),
                 consume_events(rx, &mut out, write_json_envelope, None),
             )
@@ -3954,12 +3979,14 @@ mod tests {
             run_single_turn(
                 &mut agent,
                 &mut wiring,
-                AgentInput::text("hi"),
-                Duration::from_secs(60),
-                None,
-                None,
-                None,
-                "test-session"
+                SingleTurnInputs {
+                    input: AgentInput::text("hi"),
+                    budget: Duration::from_secs(60),
+                    config: None,
+                    subagent: None,
+                    debug: None,
+                    session_id: "test-session",
+                }
             ),
             consume_events(rx, &mut out, write_json_envelope, None),
         );
@@ -4080,12 +4107,14 @@ mod tests {
                 run_single_turn(
                     &mut agent,
                     &mut wiring,
-                    AgentInput::text("hi"),
-                    config.max_turn_duration(),
-                    None,
-                    None,
-                    None,
-                    "test-session",
+                    SingleTurnInputs {
+                        input: AgentInput::text("hi"),
+                        budget: config.max_turn_duration(),
+                        config: None,
+                        subagent: None,
+                        debug: None,
+                        session_id: "test-session",
+                    }
                 ),
                 consume_events(rx, &mut out, write_json_envelope, None),
             )
@@ -4720,7 +4749,7 @@ mod tests {
             "---\nname: git-status\ndescription: 状态\n---\n正文第一行\n",
         )
         .unwrap();
-        let (entries, diags) = crate::skills::scan(&[dir.clone()]);
+        let (entries, diags) = crate::skills::scan(std::slice::from_ref(&dir));
         assert_eq!(entries.len(), 1, "测试前提：{diags:?}");
 
         let expanded = expand_task("/git-status 现在改了什么".to_string(), &entries);
@@ -4997,7 +5026,7 @@ mod tests {
             "---\nname: git-status\ndescription: 状态\n---\n正文第一行\n",
         )
         .unwrap();
-        let (entries, diags) = crate::skills::scan(&[dir.clone()]);
+        let (entries, diags) = crate::skills::scan(std::slice::from_ref(&dir));
         assert_eq!(entries.len(), 1, "测试前提：{diags:?}");
 
         let original = "/git-status 现在改了什么".to_string();

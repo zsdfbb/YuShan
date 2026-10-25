@@ -328,10 +328,10 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn headers_content_length(header_bytes: &[u8]) -> usize {
     let text = String::from_utf8_lossy(header_bytes);
     for line in text.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.eq_ignore_ascii_case("content-length") {
-                return value.trim().parse::<usize>().unwrap_or(0);
-            }
+        if let Some((key, value)) = line.split_once(':')
+            && key.eq_ignore_ascii_case("content-length")
+        {
+            return value.trim().parse::<usize>().unwrap_or(0);
         }
     }
     0

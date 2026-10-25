@@ -196,7 +196,7 @@ fn slug_of(url: &str) -> String {
             // 路径为空/只有 `/`（此时唯一片段也是空）→ 退回 host。
             let last = parsed
                 .path_segments()
-                .and_then(|segs| segs.filter(|s| !s.is_empty()).next_back())
+                .and_then(|segs| segs.rev().find(|s| !s.is_empty()))
                 .map(str::to_owned);
             last.unwrap_or_else(|| parsed.host_str().unwrap_or_default().to_owned())
         }

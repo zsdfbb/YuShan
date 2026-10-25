@@ -69,10 +69,10 @@ fn require_env(name: &str) -> String {
 /// Tavily 的项目命名空间名与生态通用名都认。
 fn require_env_any(names: &[&str]) -> String {
     for name in names {
-        if let Ok(v) = std::env::var(name) {
-            if !v.trim().is_empty() {
-                return v.trim().to_string();
-            }
+        if let Ok(v) = std::env::var(name)
+            && !v.trim().is_empty()
+        {
+            return v.trim().to_string();
         }
     }
     panic!(

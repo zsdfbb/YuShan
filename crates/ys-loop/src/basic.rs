@@ -2285,7 +2285,8 @@ mod tests {
     fn result_ids_in(order: &[(&'static str, String)]) -> Vec<String> {
         order
             .iter()
-            .filter_map(|(kind, id)| (*kind == "R").then(|| id.clone()))
+            .filter(|&(kind, _)| *kind == "R")
+            .map(|(_, id)| id.clone())
             .collect()
     }
 

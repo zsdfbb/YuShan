@@ -85,7 +85,8 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
             title,
         });
     }
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    // 新的在前（`Reverse` 而不是 `b.cmp(a)`：clippy 的 `unnecessary_sort_by`）。
+    out.sort_by_key(|a| std::cmp::Reverse(a.mtime));
     out
 }
 

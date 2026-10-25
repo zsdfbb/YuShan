@@ -3403,7 +3403,7 @@ mod tests {
         let dir = root.join("git-status");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), "---\ndescription: 状态\n---\n正文\n").unwrap();
-        let (skills, _) = crate::skills::scan(&[root.clone()]);
+        let (skills, _) = crate::skills::scan(std::slice::from_ref(&root));
         assert_eq!(skills.len(), 1);
 
         for text in [

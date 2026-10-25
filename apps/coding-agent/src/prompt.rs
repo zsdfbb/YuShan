@@ -447,14 +447,15 @@ fn try_load(
     files: &mut Vec<ContextFile>,
     seen: &mut std::collections::HashSet<std::path::PathBuf>,
 ) {
-    if path.exists() && !seen.contains(path) {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            files.push(ContextFile {
-                path: path.to_path_buf(),
-                content,
-            });
-            seen.insert(path.to_path_buf());
-        }
+    if path.exists()
+        && !seen.contains(path)
+        && let Ok(content) = std::fs::read_to_string(path)
+    {
+        files.push(ContextFile {
+            path: path.to_path_buf(),
+            content,
+        });
+        seen.insert(path.to_path_buf());
     }
 }
 

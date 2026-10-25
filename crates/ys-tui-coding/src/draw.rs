@@ -160,7 +160,11 @@ fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
 
     draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
     // 选区高亮**独立一行**：它需要 `&mut app`（写字形缓存），不能塞进 `draw_transcript`。
-    draw_selection(frame, chunks[0], scroll.top_row, app);
+    // 内区几何在**整屏** `area` 上算好再传下去 —— 高亮层不得再从 `chunks[0]` 推一遍：
+    // 那是二次切分，会把内区多扣掉「Input 高度 + 状态行」。
+    if let Some(inner) = chat_inner(app, area) {
+        draw_selection(frame, inner, scroll.top_row, app);
+    }
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app, palette);
 
@@ -298,12 +302,16 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, pal
 
 /// 选区高亮层：在 `draw_transcript` **之后**、`draw_input` **之前**独立调用。
 ///
+/// `inner` 是 Chat 内区的**屏幕绝对几何**，由调用方经 [`chat_inner`]（唯一来源）在整屏
+/// `area` 上算好传入。本函数**不得**再对传入区做一次布局切分 —— 重新切分会把内区多扣掉
+/// Input 高度与状态行，高亮与字形网格随之短掉那几行（贴着 Input 的下沿选不中、也读不到字形）。
+///
 /// 取 `&mut App`：写 `app.selection.grid` 需要可变访问，而 `draw_transcript` 拿的是
 /// `&App`。分开写就不必给 `GlyphGrid` 再包一层 `RefCell`。
-fn draw_selection(frame: &mut Frame, area: Rect, top_row: usize, app: &mut App) {
-    let Some(inner) = chat_inner(app, area) else {
+fn draw_selection(frame: &mut Frame, inner: Rect, top_row: usize, app: &mut App) {
+    if inner.width == 0 || inner.height == 0 {
         return;
-    };
+    }
     if app.selection.is_active() {
         let layout = app.layout.borrow();
         app.selection.ensure_grid(&layout, inner, top_row);
@@ -3556,5 +3564,51 @@ mod tests {
             before,
             "稳态帧不得重建字形缓存"
         );
+    }
+
+    /// **内区每一行都能被选中**（回归：高亮层曾比真实渲染少 4 行）。
+    ///
+    /// `draw_selection` 曾收到 `Layout::vertical(..).split(area)[0]` 这个**已切好的
+    /// Chat 分块**，而 `chat_inner` 期望的是**整屏** `area` —— 它会再切一次，于是内区被
+    /// 多扣掉「Input 高度 + 状态行」（单行输入框下 = 4 行）。后果是高亮矩形底边与字形网格
+    /// 高度都比真实 Chat 内区短 4 行：贴 Input 的那四行拖过也不变色（字也读不到）。
+    ///
+    /// 提取本身不受影响（`extract` 自己重渲一份字形），所以这是**看得见与看不见**的差异：
+    /// 用户以为没选中，实际剪贴板里有。
+    ///
+    /// 变异：把 `ui_with` 里的 `chat_inner(app, area)` 换回 `chat_inner(app, chunks[0])`
+    /// ⇒ 本用例变红。
+    #[test]
+    fn selection_covers_every_row_of_chat_inner() {
+        let (w, h) = (80u16, 24u16);
+        let mut app = app_with(CodingView::for_test());
+        // 内容刚好铺满内区：`top_row == 0`，屏幕行号与全局行号一一对应。
+        let inner = chat_inner_rect(&app, w, h).expect("应有内区");
+        for i in 0..inner.height {
+            app.transcript
+                .push(TranscriptLine::System(format!("L{i:02}")));
+        }
+        let scroll = app.sync_scroll_state(w, h, Instant::now());
+        assert_eq!(scroll.top_row, 0, "前置：内容恰好一屏 ⇒ 视窗顶即第 0 行");
+
+        // 从内区首行拖到内区**最后一行**。
+        app.selection.begin(0, 0, Instant::now());
+        app.selection
+            .extend((inner.height - 1) as usize, w - 1, 0, Instant::now());
+
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // 全域选中 ⇒ 内区**每一行**的每一格都必须反显（任何一行漏掉都意味着高度算短了）。
+        for y in inner.y..inner.bottom() {
+            for x in [0u16, w / 2, w - 1] {
+                assert!(
+                    buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                    "内区 ({x},{y}) 应被高亮（内区 {inner:?}）"
+                );
+            }
+        }
     }
 }

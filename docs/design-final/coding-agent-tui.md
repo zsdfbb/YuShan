@@ -1341,6 +1341,15 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
 （按下时 = `top_row` + 内区相对 y），`x` 是内区相对屏幕列。因此选区能**超过一屏**，
 且 `anchor_row` 是逻辑坐标、不随滚动改变。**自动滚动只改 `cursor_row`。**
 
+**内区几何只有一个来源**：`chat_inner(app, area)` 期望的是**整屏** `area`，它内部自己切
+Chat / Input / Status 三块。`ui_with` 已切出 `chunks[]`，故高亮层**必须**接收
+`chat_inner(app, area)` 的结果而非 `chunks[0]` —— 把已切好的 Chat 分块再喂给 `chat_inner`
+会二次切分，内区被多扣掉「Input 高度 + 状态行」，高亮与 `GlyphGrid` 随之短掉那几行
+（贴 Input 的几行拖过不变色）。守卫：`draw::tests::selection_covers_every_row_of_chat_inner`。
+
+**提取不受上面那条影响**：`extract` 另建一份 `GlyphGrid` 按 `layout` 重渲，读的是布局而非
+视窗缓存 —— 故几何算短时「剪贴板里有、屏幕上看不见」，而不是复制缺内容。
+
 **九条缓存失效**（设计 §2.3 的落地）：键 = `layout_rev`（`structural_rev`）+ `win_rev`
 （`rev_alloc`，内容代次）+ `inner` Rect + `base_row`。仅 `base_row` 变 ⇒ `shift(k)`
 槽环旋转；其余 ⇒ 全量 `rebuild`；`Idle` ⇒ `release()`（保容量、还内存）。

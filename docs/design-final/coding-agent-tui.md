@@ -309,9 +309,12 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 聊天滚动让给 `PageUp/PageDown`（逐页）、`Ctrl+Up/Ctrl+Down`（跳到最早 / 最新）与
 **滚轮 / 触控板上下**（逐行，[ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)）；
 水平方向归输入（`Left/Right/Delete/Home`）；
-`Ctrl`·`⌥` + 左右（或 `⌥b` / `⌥f`）让输入光标**按词**移动，`Ctrl-A` / `Ctrl-E` 到**输入行首 / 行尾**。
-`End` 回聊天底部（早于 `Home` 绑定，故不做对称）—— 输入行尾**不占 `End`**，走 `Ctrl-E`。
+`Ctrl`·`⌥` + 左右（或 `⌥b` / `⌥f`）让输入光标**按词**移动，`Home` / `End` 到**输入当前行的行首 / 行尾**
+（`Ctrl-E` 与 `End` 同义；`Ctrl-A` 已让给**全选**，[ADR-0059](../../adr/0059-ctrl-a-select-all-and-ctrl-v-paste.md)）。
 补全浮层打开时上下归浮层。
+
+> 本段是 §18.4 之前的**历史叙述**（`↑↓` 归历史、`End` 归聊天底部的时期），已被 ADR-0045 /
+> ADR-0057 / ADR-0059 依次改写；**当前键位以 §18.4 的表为准**。
 
 **macOS 的 `⌘` 补记**：终端自己消费 `⌘` 组合，**从不把它交给应用** —— 所以 `⌘←`/`⌘→` 能否生效
 只取决于终端把它们映射成了什么字节。Terminal.app 与 iTerm2 的**出厂映射**恰好是 `Ctrl-A` /
@@ -1296,12 +1299,13 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 | `↓` | 输入框**按视觉行下移** → 到底才回落：浏览态内取历史下一条（越过最新即还原草稿并退出浏览态），否则逐视觉行滚动 |
 | `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1**（聊天滚动的主入口） |
 | 滚轮 / 触控板上下 | 逐 **1 视觉行**滚动聊天（与输入历史**无关**）；脱离底部即停止跟随 |
-| `Home` / `End` | 输入**当前行**的行首 / 行尾（与 `Ctrl-A` / `Ctrl-E` 同义；对称） |
+| `Home` / `End` | 输入**当前行**的行首 / 行尾（`Ctrl-E` 与 `End` 同义；`Ctrl-A` **不是**行首，见下） |
 | `Ctrl-End` / `Ctrl-Down` | 跳到最新消息 |
 | `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息 |
 | `←` / `→` | 输入光标（`Ctrl` 或 `⌥` 按词；`⌥b` / `⌥f` 同义） |
 | `Shift` + `←→↑↓ Home End` | **扩选**（锚点钉在移动前的位置；端点重合即收起） |
-| `Ctrl+Shift+A` | **全选输入框** |
+| `Ctrl+A` | **全选输入框**（`Ctrl+Shift+A` 等价；随后 `Backspace` / 打字替换整段） |
+| `Ctrl+V` | **粘贴系统剪贴板**到输入框（有选区则替换整段；读不到时无反应） |
 | `Ctrl+C` | **有选区 ⇒ 复制到系统剪贴板**；无选区 ⇒ 取消回合（回合中，再按一次退出）/ 退出 |
 | `Backspace` / `Delete` / 打字 · 粘贴 | 有选区 ⇒ 替换整段；否则删/插一个 char |
 | `Enter` / `Shift`·`Alt+Enter` / `Ctrl+J` | 提交 / 换行 / 换行（终端无关的换行键） |
@@ -1317,9 +1321,17 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 `draw::wrap_input` 同一个折行口径）。折行宽度由 `ui_with` 每帧写进 `InputBuffer::wrap_width`
 —— 缓冲层**不猜**宽度：未写过时 `up()` / `down()` 返回 `false`，直接回落历史/滚动。
 
-**`Ctrl+Shift+A` 的可用性取决于终端**：多数终端把 `Ctrl+Shift+字母` 发成同一个控制字符，
-此时它退化成 `Ctrl+A`（行首）。本仓开了 `DISAMBIGUATE_ESCAPE_CODES`，支持的终端会发
-`CSI 97;6u`，能区分。
+**全选走裸 `Ctrl+A`**（ADR-0059）：它在 raw 模式下是 `0x01`，**所有终端都送得到**；
+`Ctrl+Shift+A` 依赖 `DISAMBIGUATE_ESCAPE_CODES`（支持的终端发 `CSI 97;6u`），压不成修饰键
+的终端把它退化成 `Ctrl+A` —— 两档都是全选，所以压不压得成都按得出来。**代价**：
+readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留为行尾，与 `End` 同义）。
+
+**`Ctrl+V` 是应用内粘贴**（ADR-0059）：终端自己的粘贴键（`Ctrl+Shift+V` / `⌘V`）由终端读
+剪贴板并塞成 bracketed paste（`Event::Paste`）；裸 `Ctrl+V` 是控制字符 `0x16`，终端不解释
+它 ⇒ 字节到得了应用，于是这里接住它：置 `App::pending_paste`，由 `run.rs` 在本轮末尾用本机
+工具（`wl-paste` / `xsel --clipboard --output` / `xclip -o` / `pbpaste`）同步读出来插入缓冲。
+**不发 OSC 52 读请求** —— 那要求终端回写到 stdin，与 crossterm 的事件读取抢同一字节流。
+读不到（无工具 / SSH 远端 / 空内容）⇒ 什么都不发生，改用终端的粘贴键。
 
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
@@ -1373,8 +1385,10 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
 - **鼠标捕获期间终端原生拖选失效** ⇒ 已由应用内选区补上（ADR-0051：裸左键拖选 =
   应用内选区 + 松手即复制）。选区自身的代价见 §18.7。
 - **模态浮层不吃滚轮**：浮层自读事件、`_ => {}` 掉鼠标 —— 浮层内容尚不滚动（见 `docs/TODO.md` §C）。
-- **`Ctrl+Shift+A` 在部分终端按不出来**（`Ctrl+Shift+字母` 被压成同一个控制字符 ⇒ 退化成 `Ctrl+A`）。
-  有 `DISAMBIGUATE_ESCAPE_CODES` 的终端（kitty / WezTerm / foot / Windows Terminal 等）能区分。
+- **`Ctrl+V` 在 SSH / 容器里无反应**：远端没有本机剪贴板工具（读取只走工具，不发 OSC 52 读）。
+  那时用终端自己的粘贴键（`Ctrl+Shift+V` / `⌘V`）。工具缺失时`Ctrl+V`会走完整条候选链（逐个
+  `ENOENT`），延迟以毫秒计但确实在按键路径上 —— 不做能力缓存，否则用户装了工具也没反应。
+- **`Ctrl+A` 不再是 readline 的行首**（ADR-0059）：行首走 `Home`。
 - **`↑` 取历史的路径变长**：输入框多行 / 软折行时须先回到首行（ADR-0057 决策 4 的代价）。
 - **`xsel` 复制后不退出**：X11 selection 的拥有者必须是个活进程 ⇒ 下一个 `xsel` 接管时它才退。
   这不是泄漏，但 `ps` 里会看到它。
@@ -1388,8 +1402,8 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
 「复制出口」）。原实现只发 OSC 52，而 VS Code 的 xterm.js 不实现它 —— 那正是主要使用场景，
 于是「复制成功」在这类终端上一直是幻觉。
 
-**输入框也有选区了**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+Shift+A` 全选、
-`Shift+方向` 扩选、有选区时 `Ctrl+C` 复制、编辑键替换整段。高亮走同一口径
+**输入框也有选区了**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+A` 全选、
+`Shift+方向` 扩选、有选区时 `Ctrl+C` 复制、`Ctrl+V` 粘贴替换、编辑键替换整段。高亮走同一口径
 （`Modifier::REVERSED`）且与 `draw::wrap_input` **共用折行结果** —— 另算一份就会错位。
 
 **模块划分**（唯一新文件 `crates/ys-tui-coding/src/selection.rs`）：

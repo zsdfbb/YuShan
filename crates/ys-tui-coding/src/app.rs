@@ -62,6 +62,13 @@ pub struct App {
     /// （ADR-0050 滚轮接管鼠标）⇒ 终端原生拖选失效 ⇒ 「写进对话区让用户手动选中」
     /// 这条路物理上走不通。
     pub pending_clipboard: Option<String>,
+    /// 请求**读**系统剪贴板并插入输入框（`Ctrl+V`）—— **由 `run.rs` 消费**。
+    ///
+    /// 与 [`Self::pending_clipboard`] 同一条纪律，方向相反：读剪贴板要起子进程，
+    /// 而 `events.rs` 只认键与缓冲、不做 IO。置位只是一次**意图**，`run.rs` 在本轮
+    /// 末尾读出来插进缓冲；读不到（无工具 / SSH）就什么都不发生
+    /// —— 那时用终端自己的粘贴键（`Ctrl+Shift+V` / `⌘V`，走 bracketed paste）。
+    pub pending_paste: bool,
     /// `/resume` 的候选会话（`Outbound::SessionList` 送来）。
     ///
     /// 与 `pending_prompt` **同 take 同清**：`run.rs` 在开 `/resume` 浮层时把它
@@ -174,6 +181,7 @@ impl App {
             completion: None,
             pending_prompt: None,
             pending_clipboard: None,
+            pending_paste: false,
             pending_sessions: None,
             command_in_flight: false,
             is_turning: false,

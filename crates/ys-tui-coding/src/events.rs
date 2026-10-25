@@ -3,8 +3,25 @@
 //! 键位集：**Enter 提交或填入补全（`Shift`/`Alt` + Enter 换行，`Ctrl-J` 亦可，见下）/
 //! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / Esc 取消或清空输入 /
 //! `↑` 取会话内历史（`↓` 往新还原草稿）/ `PageUp`·`PageDown` 与 `Ctrl+↑`·`Ctrl+↓` 滚聊天 /
-//! 左右与 Home·Delete 归输入光标（`Ctrl`·`⌥` + 左右 = 按词移动）/ Ctrl-A·Ctrl-E
-//! 输入行首·行尾 / Tab 开补全浮层**。
+//! 左右与 Home·Delete 归输入光标（`Ctrl`·`⌥` + 左右 = 按词移动）/ `Home`·`End`·Ctrl-E
+//! 输入行首·行尾 / **Ctrl-A 全选、Ctrl-V 粘贴** / Tab 开补全浮层**。
+//!
+//! # 为什么把行首让给全选（`Ctrl-A` 的改义）
+//!
+//! `Ctrl-A` 在 readline 里是 `beginning-of-line`，但**本仓的行首另有两个入口**：
+//! `Home`（输入当前行行首）与 `Ctrl-A` 曾经同义。而「全选输入框」此前只有一个
+//! `Ctrl+Shift+A` —— 多数终端把 `Ctrl+Shift+字母` 压成同一个控制字符，那个键**按不出来**
+//! （ADR-0057 记的正是这个代价）。于是把全选放到裸 `Ctrl+A`：压不压得成都按得出，
+//! 且行首仍有 `Home`，没有净损失。`Ctrl+E` 保留（与 `End` 同义），行尾因此仍是两个键。
+//!
+//! # `Ctrl+V`：为什么它在这里，而终端自己的粘贴键不是
+//!
+//! 终端的粘贴键（`Ctrl+Shift+V` / `⌘V`）由**终端**完成：它把剪贴板内容包进 bracketed
+//! paste 交给应用（`Event::Paste`），应用只管插入。而裸 `Ctrl+V` 在 raw 模式下是控制字符
+//! `0x16`，终端不解释它 —— 字节到得了应用，于是这里能给它一个应用内语义：**读系统剪贴板
+//! 并插入**。读要起子进程，本模块不做 IO，故只置位 [`App::pending_paste`]，由 `run.rs`
+//! 在本轮末尾读出来插进缓冲。读不到的场合（无本机剪贴板工具、SSH / 容器）什么都不发生
+//! —— 那时用终端自己的粘贴键。
 //!
 //! # 换行键：为什么除了 `Shift`/`Alt` + Enter 还要 `Ctrl-J`
 //!
@@ -47,7 +64,9 @@
 //! | `PageUp` / `PageDown` | **聊天滚动（翻页）**：步长 = 视窗高度 − 1 |
 //! | `Left` / `Right` / `Delete` / `Home` | **输入光标**（`InputBuffer`） |
 //! | `Ctrl`·`⌥` + `Left` / `Right`（或 `⌥b` / `⌥f`） | **输入按词移动** |
-//! | `Ctrl-A` / `Ctrl-E` | **输入行首 / 行尾** |
+//! | `Ctrl-A` | **全选输入框**（行首改走 `Home`） |
+//! | `Ctrl-E` | **输入行尾**（与 `End` 同义） |
+//! | `Ctrl-V` | **粘贴系统剪贴板**进输入框 |
 //! | `End` / `Ctrl-End` / `Ctrl-Down` | **跳到最新消息**（`scroll_offset = 0`、`follow = true`） |
 //! | `Ctrl-Home` / `Ctrl-Up` | **跳到最早消息** |
 //! | 滚轮 / 触控板上下滑 | **逐视觉行滚动聊天**（与 `↑` 的「历史为空」回落同一语义） |
@@ -331,24 +350,27 @@ pub fn handle_key(
                 app.should_quit = true;
                 return;
             }
-            // 行首 / 行尾（readline 约定）。macOS 上 ⌘←/⌘→ **默认就发这两个控制
-            // 字符**（Terminal.app / iTerm2 的出厂键映射），而 ⌘ 本身从不交给应用
-            // —— 绑这里等价于让「⌘ + 左右」可用。`End` 不动（它归「回到最新消息」，
-            // 见模块文档的取舍表）。
+            // `Ctrl+A` = **全选输入框**。行首 / 行尾完全交给 `Home` / `End`
+            // （多行时是**当前行**的首尾，语义更窄也更好猜），因此这里让出 `Ctrl+A`
+            // 不丢任何位置动作 —— `Ctrl+E` 仍然保留为行尾的第二个键。
             //
-            // `Ctrl+Shift+A` 是**全选**（多一个键，不动 readline 的 Ctrl-A 语义）：
-            // 大多数终端把 `Ctrl`+`Shift`+字母发成同一个控制字符，而 crossterm 开了
-            // `DISAMBIGUATE_ESCAPE_CODES` 后能拿到 `CSI 97;6u` 这类带修饰键的形态；
-            // 拿不到时它就与 `Ctrl+A` 同义（行首），不丢任何现有行为。
-            KeyCode::Char('a') if shift => app.input.select_all(),
-            KeyCode::Char('a') => {
-                app.input.begin_move(false);
-                app.input.cursor_home();
-                return;
-            }
+            // 全选此前只有 `Ctrl+Shift+A`，而多数终端把 `Ctrl+Shift+字母` 压成同一个
+            // 控制字符（`Ctrl+A`）⇒ 那个键根本按不出来（ADR-0057 记的正是这个代价）。
+            // 挪到裸 `Ctrl+A` 之后，**压不压得成都按得出全选**：能区分修饰键的终端
+            // （`DISAMBIGUATE_ESCAPE_CODES` ⇒ `CSI 97;6u`）里两个键都是全选；
+            // 区分不了的终端里 `Ctrl+Shift+A` 退化成 `Ctrl+A`，还是全选。
+            KeyCode::Char('a') => app.input.select_all(),
             KeyCode::Char('e') => {
                 app.input.begin_move(false);
                 app.input.cursor_end();
+                return;
+            }
+            // `Ctrl+V` = **粘贴系统剪贴板**。终端自己有粘贴键（`Ctrl+Shift+V` / `⌘V`），
+            // 但那是终端把内容塞成 bracketed paste（`Event::Paste`）—— 用户实测
+            // `Ctrl+V` 按了没反应，因为它在 raw 模式下就是控制字符 `0x16`，没人接。
+            // 这里只置位：读剪贴板要起子进程，而本模块不做 IO（见 `App::pending_paste`）。
+            KeyCode::Char('v') => {
+                app.pending_paste = true;
                 return;
             }
             _ => {}
@@ -1637,7 +1659,7 @@ mod tests {
             assert_eq!(a.input.cursor, 7, "按词右移：越过 bar 到行尾");
         }
 
-        // Ctrl-E / Ctrl-A：行尾 / 行首 —— macOS 的 ⌘→ / ⌘← 出厂就发这两个控制字符
+        // Ctrl-E：行尾。**行首不再是 Ctrl-A**（它已让给全选），走 `Home`。
         a.input.cursor = 2;
         handle_key(
             with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
@@ -1648,15 +1670,8 @@ mod tests {
             40,
         );
         assert_eq!(a.input.cursor, 7, "Ctrl-E 到行尾");
-        handle_key(
-            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &mut a,
-            &ch.req_tx,
-            &ch.bnd_tx,
-            120,
-            40,
-        );
-        assert_eq!(a.input.cursor, 0, "Ctrl-A 到行首");
+        key(&mut a, &ch, KeyCode::Home);
+        assert_eq!(a.input.cursor, 0, "Home 到行首");
         assert_eq!(a.input.text, "foo bar", "移动不修改文本");
 
         // `End` 的语义**变了**：裸 `End` 归输入行尾（与 `Home` 对称），
@@ -1678,24 +1693,17 @@ mod tests {
         assert!(a.follow);
     }
 
-    /// 多行输入下 Ctrl-A / Ctrl-E 只到**本行**首尾（与 `cursor_home`/`cursor_end` 同语义，
-    /// 不是缓冲首尾）。
+    /// 多行输入下 `Home` / `End` / `Ctrl-E` 只到**本行**首尾（与
+    /// `cursor_home`/`cursor_end` 同语义，不是缓冲首尾）。
     #[test]
-    fn test_ctrl_a_e_are_line_scoped_in_multiline_input() {
+    fn test_home_end_are_line_scoped_in_multiline_input() {
         let ch = channels();
         let mut a = app();
         a.input.insert_str("aa\nbbbb\ncc");
         a.input.cursor = 9; // 第三行「cc」的第二个字符之后
 
-        handle_key(
-            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            &mut a,
-            &ch.req_tx,
-            &ch.bnd_tx,
-            120,
-            40,
-        );
-        assert_eq!(a.input.cursor, 8, "Ctrl-A 到本行行首，不是缓冲开头");
+        key(&mut a, &ch, KeyCode::Home);
+        assert_eq!(a.input.cursor, 8, "Home 到本行行首，不是缓冲开头");
 
         handle_key(
             with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
@@ -3065,17 +3073,43 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 输入框选区与按视觉行移动（Ctrl+Shift+A 全选 → 退格清空；Shift+方向 扩选）
+    // 输入框选区与按视觉行移动（Ctrl+A 全选 → 退格清空；Shift+方向 扩选）
     // -----------------------------------------------------------------------
 
     /// **用户报的需求**：一个键选中全部输入，然后一下删掉。
     ///
-    /// 变异：去掉 `Char('a') if shift` 那一支 ⇒ 全选不会发生 ⇒ 退格只删一个字 ⇒ 红。
+    /// 变异：把 `Char('a')` 那一支改回 `cursor_home()` ⇒ 全选不会发生 ⇒ 退格只删一个字 ⇒ 红。
     #[test]
-    fn test_ctrl_shift_a_then_backspace_clears_input() {
+    fn test_ctrl_a_then_backspace_clears_input() {
         let ch = channels();
         let mut a = app();
         a.input.insert_str("一段很长的草稿\n还有第二行");
+
+        handle_key(
+            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.input.selection().is_some(), "Ctrl+A 应建立选区");
+        assert_eq!(a.input.cursor, a.input.text.chars().count());
+
+        key(&mut a, &ch, KeyCode::Backspace);
+        assert!(a.input.text.is_empty(), "一下退格清空全部输入");
+        assert_eq!(a.input.cursor, 0);
+        assert_eq!(a.input.anchor, None, "选区被消费掉");
+        assert!(ch.next_request().is_none(), "编辑不发请求");
+    }
+
+    /// 能区分修饰键的终端会发 `Ctrl+Shift+A` —— 它**也是**全选（压不成裸键时
+    /// 退化成的就是 `Ctrl+A`，两者同义，不丢行为）。
+    #[test]
+    fn test_ctrl_shift_a_is_also_select_all() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("aa\nbb");
 
         handle_key(
             with_mod(
@@ -3088,33 +3122,53 @@ mod tests {
             120,
             40,
         );
-        assert!(a.input.selection().is_some(), "Ctrl+Shift+A 应建立选区");
-        assert_eq!(a.input.cursor, a.input.text.chars().count());
-
-        key(&mut a, &ch, KeyCode::Backspace);
-        assert!(a.input.text.is_empty(), "一下退格清空全部输入");
-        assert_eq!(a.input.cursor, 0);
-        assert_eq!(a.input.anchor, None, "选区被消费掉");
-        assert!(ch.next_request().is_none(), "编辑不发请求");
+        assert_eq!(a.input.selection(), Some((0, 5)), "整段选中");
     }
 
-    /// 裸 `Ctrl+A` 仍是**行首**（readline）—— 全选用带 `Shift` 的那个键。
+    /// 行首 / 行尾由 `Home` / `End` 与 `Ctrl+E` 承担（`Ctrl+A` 已让给全选）。
     #[test]
-    fn test_ctrl_a_still_goes_to_line_home() {
+    fn test_home_end_and_ctrl_e_move_within_line() {
         let ch = channels();
         let mut a = app();
         a.input.insert_str("aa\nbb");
 
+        key(&mut a, &ch, KeyCode::End);
+        assert_eq!(a.input.cursor, 5, "End = 末行行尾");
+        key(&mut a, &ch, KeyCode::Home);
+        assert_eq!(a.input.cursor, 3, "Home = 本行行首");
         handle_key(
-            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            with_mod(KeyCode::Char('e'), KeyModifiers::CONTROL),
             &mut a,
             &ch.req_tx,
             &ch.bnd_tx,
             120,
             40,
         );
-        assert_eq!(a.input.cursor, 3, "本行行首");
-        assert_eq!(a.input.anchor, None, "不建选区");
+        assert_eq!(a.input.cursor, 5, "Ctrl+E 与 End 同义");
+        assert_eq!(a.input.anchor, None, "移动不建选区");
+    }
+
+    /// `Ctrl+V` 只**置位读请求**，不碰输入框也不碰终端 —— 读剪贴板在 `run.rs` 那一侧。
+    ///
+    /// 变异：把那一支写成 `insert_str` / 直接返回而不置位 ⇒ 红（`pending_paste` 为假）。
+    #[test]
+    fn test_ctrl_v_requests_paste_without_touching_input() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("草稿");
+
+        handle_key(
+            with_mod(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.pending_paste, "必须置位读请求");
+        assert_eq!(a.input.text, "草稿", "事件层不自己插内容");
+        assert!(a.pending_clipboard.is_none(), "读不是写");
+        assert!(!a.should_quit && !a.abort_requested, "粘贴与退出/取消无关");
     }
 
     /// `Shift+←` 扩选，`Shift+→` 缩回去，端点重合即无选区。

@@ -464,7 +464,7 @@ impl KeyGroup {
 ///
 /// **不列 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（见 `events.rs`
 /// 模块头）。**不列 `⌥+↓`**：Terminal.app 发 `ESC[B`，与普通 `↓` 同形。
-static KEYBINDINGS: [KeyBinding; 20] = [
+static KEYBINDINGS: [KeyBinding; 21] = [
     KeyBinding {
         keys: "← / →",
         action: "移动输入光标（Ctrl 或 ⌥ + ←/→ 按词移动；⌥b / ⌥f 同义）",
@@ -479,21 +479,27 @@ static KEYBINDINGS: [KeyBinding; 20] = [
     },
     KeyBinding {
         keys: "Home / End",
-        action: "输入当前行的行首 / 行尾（与 Ctrl+A / Ctrl+E 同义）",
+        action: "输入当前行的行首 / 行尾（多行时只到本行）",
         group: KeyGroup::Editing,
         note: None,
     },
     KeyBinding {
-        keys: "Ctrl+A / Ctrl+E",
-        action: "输入行首 / 行尾（readline 习惯）",
-        group: KeyGroup::Editing,
-        note: None,
-    },
-    KeyBinding {
-        keys: "Ctrl+Shift+A",
+        keys: "Ctrl+A",
         action: "全选输入框（随后 Backspace 一下清空）",
         group: KeyGroup::Editing,
-        note: Some("部分终端把它压成 Ctrl+A，全选按不出来"),
+        note: Some("行首改走 Home / Ctrl+E 给行尾；部分终端把 Ctrl+Shift+A 压成它，两者同义"),
+    },
+    KeyBinding {
+        keys: "Ctrl+E",
+        action: "输入当前行行尾（与 End 同义）",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+V",
+        action: "粘贴系统剪贴板到输入框（有选区则替换整段）",
+        group: KeyGroup::Editing,
+        note: Some("读不到剪贴板（无本机工具 / SSH 远端）时无反应，改用终端的 Ctrl+Shift+V"),
     },
     KeyBinding {
         keys: "Shift + ← → ↑ ↓",
@@ -654,9 +660,10 @@ const KEY_HELP_BRIEF: &str = "键位（完整表：/keybind）：
   ↑ ↓                输入框内先按视觉行移光标；到首/末行才取历史 / 滚动对话
   PageUp / PageDown  翻页；Ctrl+↑ / Ctrl+Home 最早，Ctrl+↓ / Ctrl+End 最新
   滚轮 / 触控板上下   逐行滚动对话（不影响输入历史）
-  Home / End         输入行首 / 行尾（Ctrl+A / Ctrl+E 同义）
-  Ctrl+A / Ctrl+E    同 Home / End（readline 习惯）
-  Shift + ←→↑↓       扩选；Ctrl+Shift+A 全选输入框
+  Home / End         输入行首 / 行尾（Ctrl+E 也是行尾）
+  Ctrl+A             全选输入框（随后 Backspace 清空）
+  Ctrl+V             粘贴系统剪贴板（读不到时用终端的 Ctrl+Shift+V）
+  Shift + ←→↑↓       扩选（端点重合即收起）
   Enter              提交（Shift/Alt+Enter 或 Ctrl+J 换行）
   Ctrl+C             有选区时复制；否则取消回合，再按一次退出
   Ctrl+D             退出；Esc 取消回合 / 清空输入
@@ -1477,7 +1484,8 @@ mod tests {
             "Ctrl+End",
             "滚轮",
             "Home",
-            "Ctrl+Shift+A",
+            "Ctrl+A",
+            "Ctrl+V",
         ] {
             assert!(text.contains(key), "键位段必须列出 {key}");
         }
@@ -1566,7 +1574,7 @@ mod tests {
             panic!("应写 System 行");
         };
         assert!(line.contains("键位："), "正文就是键位表：{line}");
-        assert!(line.contains("Ctrl+Shift+A"), "完整表必须含新增的全选键");
+        assert!(line.contains("Ctrl+A"), "完整表必须含全选键");
         assert!(a.pending_clipboard.is_none(), "不得碰剪贴板");
     }
 

@@ -186,19 +186,29 @@ fn setup_terminal() -> Result<Term, TuiError> {
     Ok(terminal)
 }
 
-/// 消费**一轮**里排好的事件，并在同一个轮次里把剪贴板写出去。
+/// 消费**一轮**里排好的事件，并在同一个轮次里收口剪贴板的两条路（写 / 读）。
 ///
-/// 三件事的顺序是承重的：
+/// 四件事的顺序是承重的：
 ///
 /// 1. 合并后的**鼠标**事件（拖选松手 → `pending_clipboard`）；
-/// 2. 被推迟的**非鼠标**事件（`Ctrl+C` 复制、`/copy`、粘贴）；
-/// 3. 排空 `pending_clipboard` 写剪贴板。
+/// 2. 被推迟的**非鼠标**事件（`Ctrl+C` 复制、`Ctrl+V` 置 `pending_paste`、`/copy`、粘贴）；
+/// 3. 排空 `pending_paste` **读**剪贴板并插进输入框；
+/// 4. 排空 `pending_clipboard` **写**剪贴板。
 ///
-/// **2 必须在 3 之前**：键盘那条路也写 `pending_clipboard`，反过来排会让
-/// 「按 Ctrl+C 复制」晚一个事件才生效（用户看到的是「没反应」）。
-/// 抽成自由函数是为了让这个顺序可测（`test_round_writes_clipboard_from_deferred_key`）——
-/// 塞在 `event_loop` 里就只能靠人读。参数多恰是它的形态：它要转交两个信道、尺寸与
-/// 剪贴板出口，收成一个结构体只会让「顺序」这件事更难看出来。
+/// **2 必须在 3 / 4 之前**：键盘那条路既可能置位读请求也直接写 `pending_clipboard`，
+/// 反过来排会让「按 Ctrl+C 复制」「按 Ctrl+V 粘贴」都晚一个事件才生效（用户看到的是
+/// 「没反应」）。
+///
+/// **3 必须在 4 之前**（ADR-0059 决策 4）：两者在同一轮同时非空，说明上一轮刚复制过
+/// （X11 下 `xsel` 接管 selection 需要一点时间），这一轮又按了粘贴。先写后读会把**刚
+/// 复制的文本**读回来并插进输入框（「我明明粘的是别处的内容」）；先读后写则可能读到旧
+/// 剪贴板 —— 两种都不完美，但「粘到旧内容」是可删的、可预期的，而「静默地把输入框
+/// 改成刚复制的草稿」是破坏性的。读失败（`None`）只清标志、不动输入框。
+///
+/// 抽成自由函数是为了让这个顺序可测（`test_round_writes_clipboard_from_deferred_key`、
+/// `test_round_pastes_into_input`、`test_round_reads_before_writing`）—— 塞在
+/// `event_loop` 里就只能靠人读。参数多恰是它的形态：它要转交两个信道、尺寸与剪贴板
+/// 的读写出口，收成一个结构体只会让「顺序」这件事更难看出来。
 #[allow(clippy::too_many_arguments)]
 fn handle_round(
     app: &mut App,
@@ -209,12 +219,19 @@ fn handle_round(
     width: u16,
     height: u16,
     clip: &mut impl FnMut(&str),
+    read: &mut impl FnMut() -> Option<String>,
 ) {
     if let Some(m) = mouse {
         events::handle_event(m, app, requests, boundaries, width, height);
     }
     if let Some(other) = deferred {
         events::handle_event(other, app, requests, boundaries, width, height);
+    }
+    if std::mem::take(&mut app.pending_paste)
+        && let Some(text) = read()
+    {
+        // `insert_str` 先消费选区（有选区时粘贴即替换，与 GUI 输入框同语义）。
+        app.input.insert_str(&text);
     }
     if let Some(text) = app.pending_clipboard.take() {
         clip(&text);
@@ -283,6 +300,7 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                 size.width,
                 size.height,
                 &mut write_clipboard,
+                &mut read_system_clipboard,
             );
             // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
             // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
@@ -821,6 +839,60 @@ fn clipboard_sequence(text: &str) -> String {
     out
 }
 
+/// 读系统剪贴板；取不到（没有任何本机工具 / 工具退出非 0 / 空内容）⇒ `None`。
+///
+/// **只走本机工具，不发 OSC 52 读请求**：`OSC 52` 的**读**形态要求终端把内容回写到 stdin，
+/// 而 stdin 正被 crossterm 的事件读取占着 —— 两路读同一字节流会互相吞事件（终端回的应答
+/// 一旦被事件解析器吃掉，用户按的键也一并丢）。写是单向的，读不是，故读取只走工具。
+/// 后果：SSH / 容器里没有工具时 `Ctrl+V` 无内容可粘 —— 那时用终端的粘贴键
+/// （`Ctrl+Shift+V` / `⌘V`，它由终端自己把内容塞进 bracketed paste）。
+///
+/// **同步**：读必须在把内容插进缓冲**之前**完成（用户按 `Ctrl+V` 期待的是当场出现文本），
+/// 而这是 UI 线程上的一次短命子进程（本地文件/进程通信，毫秒级）。写入路径可以异步
+/// （不等结果），读取不能。
+fn read_system_clipboard() -> Option<String> {
+    for (program, args) in clipboard_readers() {
+        if let Some(text) = run_reader(program, &args) {
+            // 空白剪贴板等同「没内容」：粘一段纯空格比什么都不做更意外。
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// 各平台的剪贴板**读取**命令（顺序与 [`clipboard_writers`] 一致：Wayland 优先）。
+fn clipboard_readers() -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut v: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|s| !s.is_empty()) {
+        v.push(("wl-paste", vec!["--no-newline"]));
+    }
+    v.push(("xsel", vec!["--clipboard", "--output"]));
+    v.push(("xclip", vec!["-selection", "clipboard", "-o"]));
+    v.push(("pbpaste", vec![]));
+    v.push(("wl-paste", vec!["--no-newline"]));
+    v
+}
+
+/// 跑一个读取工具并取它的 stdout；命令缺失 / 非 0 退出 / 输出不是 UTF-8 ⇒ `None`。
+///
+/// `--no-newline`（`wl-paste` 默认补一个换行）与 `xsel` 的输出会带尾随换行 —— 那是
+/// 工具的行格式而不是用户复制的内容，**按终端的口径保留原样**：粘贴时多出的换行
+/// 落在输入框里是可见的，用户能删；反过来猜「哪个换行是工具加的」必然猜错一半。
+fn run_reader(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
 /// 把文本写进**系统**剪贴板。
 ///
 /// 两条路**都走**，不去探测终端支不支持 OSC 52：
@@ -1232,6 +1304,7 @@ mod tests {
             120,
             40,
             &mut |t: &str| written.push(t.to_string()),
+            &mut || None,
         );
         assert_eq!(
             written,
@@ -1257,8 +1330,104 @@ mod tests {
             120,
             40,
             &mut |_: &str| calls += 1,
+            &mut || None,
         );
         assert_eq!(calls, 0);
+    }
+
+    /// `Ctrl+V` → 读剪贴板 → 插进输入框；读不到（`None`）⇒ **不动输入框**
+    /// （不清空、不插空串 —— 「按了没反应」比「草稿被清空」好）。
+    ///
+    /// 变异：把 `insert_str` 换成 `clear` / 在读失败时仍清输入框 ⇒ 红。
+    #[test]
+    fn test_round_pastes_into_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (req_tx, _req_rx) = mpsc::channel(8);
+        let (bnd_tx, _bnd_rx) = mpsc::channel(8);
+        let mut app = App::new(CodingView::for_test());
+        app.input.insert_str("草稿");
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        let mut written: Vec<String> = Vec::new();
+        handle_round(
+            &mut app,
+            None,
+            Some(key),
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |t: &str| written.push(t.to_string()),
+            &mut || Some("粘进来的".to_string()),
+        );
+        assert_eq!(app.input.text, "草稿粘进来的", "插在光标处");
+        assert!(!app.pending_paste, "读完即清标志");
+        assert!(written.is_empty(), "读不是写：不得碰写剪贴板的出口");
+
+        // 读失败：输入框保持原样（连标志一起清掉，否则下一轮会莫名其妙读一次）。
+        app.pending_paste = true;
+        handle_round(
+            &mut app,
+            None,
+            None,
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |_: &str| {},
+            &mut || None,
+        );
+        assert_eq!(app.input.text, "草稿粘进来的", "读不到时不动输入框");
+        assert!(!app.pending_paste, "失败也要清标志");
+    }
+
+    /// 同一轮里**先读后写**（ADR-0059 决策 4）：反过来会把自己刚复制的文本粘回输入框。
+    ///
+    /// 变异：把 `read` 那一段挪到 `clip` 之后 ⇒ `read` 观察到的是「已经写过」⇒ 红。
+    #[test]
+    fn test_round_reads_before_writing() {
+        use std::cell::Cell;
+        let (req_tx, _req_rx) = mpsc::channel(8);
+        let (bnd_tx, _bnd_rx) = mpsc::channel(8);
+        let mut app = App::new(CodingView::for_test());
+
+        let wrote = Cell::new(false);
+        let read_saw_write = Cell::new(false);
+        handle_round(
+            &mut app,
+            None,
+            None,
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |_: &str| wrote.set(true),
+            &mut || {
+                read_saw_write.set(wrote.get());
+                None
+            },
+        );
+        // 这一轮两条都没内容（都空），单独构造：读在前、写在后。
+        app.pending_paste = true;
+        app.pending_clipboard = Some("刚复制的".to_string());
+        handle_round(
+            &mut app,
+            None,
+            None,
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |_: &str| wrote.set(true),
+            &mut || {
+                read_saw_write.set(wrote.get());
+                None
+            },
+        );
+        assert!(
+            !read_saw_write.get(),
+            "读必须在写之前：否则会把自己刚复制的文本粘回输入框"
+        );
     }
 
     /// 本机剪贴板工具链的**形态**：每个候选都带完整参数，且 `xsel` 明确指定

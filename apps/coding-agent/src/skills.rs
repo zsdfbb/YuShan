@@ -924,6 +924,169 @@ mod tests {
         (entries.remove(0), diags)
     }
 
+    // ─────────────────── 仓库自带 skills/ 的契约（scripts/install-skills.sh 的对侧） ───────────────────
+
+    /// **仓库 `skills/` 目录下每一份 skill 都必须能被真实的 [`scan`] 加载**。
+    ///
+    /// 这是 `scripts/install-skills.sh` 的**对侧契约**：那个脚本把 `skills/<name>/` 软链进
+    /// `~/.yushan/skills/`，而「链过去之后能不能用」取决于本模块的解析规则。两边任何一侧
+    /// 漂移都会**静默**失效 —— 脚本报「安装成功」、启动期却零 skill 且零诊断（目录存在、
+    /// `SKILL.md` 存在、但 `description` 解析为空 ⇒ 被 `non_empty` 守卫整条丢弃）。
+    ///
+    /// 刻意**不用 `env!("CARGO_MANIFEST_DIR")`**：那是 crate 目录，不是仓库根。
+    /// 用 `current_dir` 向上找含 `skills/` 的目录 —— `cargo test` 的 CWD 是**包根**
+    /// （crate 目录），上溯 3 层即仓库根。找不到就**跳过**（例如 vendored 构建），
+    /// 不 panic：本用例守的是仓库布局，不是被测函数。
+    ///
+    /// 变异：删掉 `skills/pdf-analysis/SKILL.md` 的 `description:` 行 ⇒ 本用例红，且
+    /// **诊断为 `[]`** —— 这正是它必须存在的理由：skill 被静默丢弃时**没有任何提示**。
+    /// （已实测：`left: [] / right: ["pdf-analysis"]`）
+    #[test]
+    fn test_repo_skills_directory_is_loadable() {
+        let Some(skills_dir) = repo_skills_dir() else {
+            eprintln!("跳过：找不到仓库根的 skills/（非仓库布局）");
+            return;
+        };
+
+        let (entries, diags) = scan(std::slice::from_ref(&skills_dir));
+
+        // 仓库里至少有一份（当前是 pdf-analysis）。加一个下限，防止「目录被误删
+        // ⇒ scan 静默返回零条 ⇒ 本用例空转通过」。
+        let expected: Vec<String> = std::fs::read_dir(&skills_dir)
+            .expect("读 skills/")
+            .flatten()
+            .filter(|e| e.path().join("SKILL.md").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "{} 下没有任何含 SKILL.md 的目录",
+            skills_dir.display()
+        );
+
+        let mut loaded: Vec<String> = entries.iter().map(|e| e.command.clone()).collect();
+        loaded.sort();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        assert_eq!(
+            loaded, expected_sorted,
+            "仓库里每个含 SKILL.md 的目录都必须被加载；诊断 = {diags:?}"
+        );
+
+        for entry in &entries {
+            // `description` 是模型**唯一**能看到的选型依据：空就等于这个 skill 不存在。
+            assert!(
+                !entry.description.trim().is_empty(),
+                "{} 的 description 为空",
+                entry.command
+            );
+            // 目录行里 `>` `<` 不转义就会破坏 `<available_skills>` 结构，
+            // 而那在本用例的视野里表现为「加载了但看不清」。这里只要求 description
+            // 不含未转义尖括号 —— 有就说明作者写了，需要改写或接受被转义。
+            // 只做**报告**，不失败：转义是 render_line 的职责，不是作者的。
+            assert!(
+                !entry.description.contains('\n'),
+                "{} 的 description 含换行（应被单行化）: {:?}",
+                entry.command,
+                entry.description
+            );
+        }
+    }
+
+    /// 从 `current_dir` 上溯找含 `skills/` 子目录的仓库根。
+    fn repo_skills_dir() -> Option<PathBuf> {
+        let mut dir: &Path = &std::env::current_dir().ok()?;
+        loop {
+            let candidate = dir.join("skills");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+            dir = dir.parent()?;
+        }
+    }
+
+    /// **skill 自带的安装脚本必须可跑**：`setup.sh --check` 是模型的第一个动作，
+    /// 它挂了就等于这个 skill 完全不可用。
+    ///
+    /// 只跑**只读**模式（`--check` / `--hint` / `--dry-run`）：`--check` 绝不装包，
+    /// 故本用例离线、无副作用，可以进常规测试集。
+    ///
+    /// 钉住三件事（每件都对应一条真实威胁）：
+    /// 1. **能跑通** —— 不是语法错 / 不是 bash 3.2 的多字节变量名炸（实测踩过：
+    ///    `"...$suggest："` 在 3.2 上把中文冒号当成变量名）。
+    /// 2. **`--check` 的头两行是机器可读格式** —— SKILL.md 让模型去 grep 它，
+    ///    格式一变，模型拿到的就是空值而不会报错。
+    /// 3. **`--check` 真的只读** —— 退出码只能是 0（就绪）或 3（未就绪），
+    ///    其他值说明它去装东西了。
+    ///
+    /// 变异：把 `--check` 分支里那两个 `printf` 的 `PDF_BACKEND=` 改成 `backend=` ⇒
+    /// 第 2 条断言红。
+    #[test]
+    fn test_repo_skill_setup_scripts_are_invocable_and_readonly() {
+        let Some(skills_dir) = repo_skills_dir() else {
+            eprintln!("跳过：找不到仓库根的 skills/");
+            return;
+        };
+
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&skills_dir)
+            .expect("读 skills/")
+            .flatten()
+        {
+            let script = entry.path().join("scripts").join("setup.sh");
+            if !script.is_file() {
+                continue;
+            }
+            checked += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+
+            let out = std::process::Command::new("bash")
+                .arg(&script)
+                .arg("--check")
+                .output()
+                .unwrap_or_else(|e| panic!("{name}: 无法执行 setup.sh --check: {e}"));
+
+            let code = out.status.code();
+            assert!(
+                matches!(code, Some(0) | Some(3)),
+                "{name}: --check 必须只读（退出码 0 或 3），实得 {code:?}\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut lines = stdout.lines();
+            assert!(
+                lines.next().is_some_and(|l| l.starts_with("PDF_BACKEND=")),
+                "{name}: --check 第一行必须是 `PDF_BACKEND=`，实得 {stdout:?}"
+            );
+            let second = lines.next().unwrap_or_default();
+            assert!(
+                second == "PDF_READY=1" || second == "PDF_READY=0",
+                "{name}: --check 第二行必须是 `PDF_READY=0|1`，实得 {second:?}"
+            );
+            // 两行必须**自洽**：有后端 ⇔ READY=1；退出码也要跟着走。
+            let has_backend = stdout
+                .lines()
+                .next()
+                .is_some_and(|l| l.len() > "PDF_BACKEND=".len());
+            assert_eq!(
+                has_backend,
+                second == "PDF_READY=1",
+                "{name}: PDF_BACKEND 与 PDF_READY 不自洽：{stdout:?}"
+            );
+            assert_eq!(
+                code == Some(0),
+                second == "PDF_READY=1",
+                "{name}: 退出码与 PDF_READY 不自洽：{stdout:?}"
+            );
+        }
+
+        assert!(
+            checked > 0,
+            "仓库里应当至少有一个 skill 带 scripts/setup.sh"
+        );
+    }
+
     /// 合成条目（不落盘）：`path` 由 `scope` + `command` 拼出，断言好写。
     fn synthetic(command: &str, description: &str, scope: Scope) -> SkillEntry {
         let tag = match scope {

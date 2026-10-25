@@ -23,3 +23,6 @@ target
 tmp/
 
 .DS_Store
+
+# skill 自带的 Python venv（由 skills/*/scripts/setup.sh 创建，机器相关）
+skills/*/scripts/.venv/

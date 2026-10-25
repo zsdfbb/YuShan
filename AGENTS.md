@@ -32,6 +32,8 @@ YuShan/
 │   └── tools-web                 # 联网工具（websearch / webfetch）
 ├── apps/
 │   └── coding-agent              # 可执行入口：TUI / -p / --json 三模式
+├── skills/                       # 仓库自带的 skill（**不编译进二进制**，由安装脚本铺到 ~/.yushan/skills）
+│   └── pdf-analysis              # PDF 提取与分析：setup.sh 自举后端 → 分页落盘 → read 续读
 ├── docs/                         # 设计与过程产物；**「去哪找什么」就在这一层**
 │   ├── architecture.md           # 架构全貌（15 节：分层 / 信道 / 时序 / 数据流 / 输出三分 / TUI 形态 / 测试分层）
 │   ├── design.md                 # 架构规范、核心 trait、Hook/Event 边界、测试矩阵
@@ -78,6 +80,7 @@ YuShan/
 - `./scripts/build-baseline.sh <label>` — 构建耗时基线（冷 / 改底层 crate / 改叶文件 / 无改动），对比构建配置收益用
 - `python3 scripts/cancellation-mutation.py` — **取消链路的变异测试**（ADR-0046）：注入 12 处 bug ⇒ 期望用例变红；一次跑完全部并给汇总表（`--list` 只列清单，数字参数只跑指定编号）
 - `python3 scripts/wheel-mutation.py` — **滚轮接管的变异测试**（ADR-0050）：注入 6 处 bug ⇒ 期望用例变红
+- `./scripts/install-skills.sh` — 把仓库 `skills/` 下的 skill 铺进 `~/.yushan/skills`（默认**软链**，`git pull` 即生效；`--copy` 改复制、`--dest` 换目标、`--list` 列清单、`--dry-run` 预演）。**不覆盖**目标已有的非本仓库条目。重启 agent 后生效（skill 目录只在启动期扫一次）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）
 - `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）

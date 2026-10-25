@@ -86,7 +86,7 @@ $ python3 scripts/ram-compare.py --rounds 3 -v
   渲染层（`ys-tui-coding`）**根本不认识 `Agent`**——这条靠 `Cargo.toml` 卡住，写错了编译不过，不靠自觉。
 - **能换。** 模型后端、工具集、界面都是可插拔的 crate。接自己的模型？写个 `Model` 实现。
   不想要 TUI？用 `--json` 直接吃事件流，自己画。
-- **不做安全。** 不是疏忽，是分工。沙箱那层交给 [seabox](https://github.com/zsdfbb/seabox)——
+- **不做安全。** 不是疏忽，是分工。沙箱那层交给我的另一个项目 [seabox](https://github.com/zsdfbb/seabox)——
   Landlock + seccomp + namespace 的 OS 级限制，同样不需要 Docker。
   YuShan 负责「能干活」，seabox 负责「越界就拦住」。
 
@@ -197,6 +197,10 @@ $ cargo clippy --all-targets && cargo fmt
 | 现在实际是什么样（含与设计的分歧） | [`docs/design-final/`](docs/design-final/) |
 | 每个决策为什么这么定 | [`docs/adr/`](docs/adr/) |
 | 还没做什么 | [`docs/TODO.md`](docs/TODO.md) |
+| 怎么贡献 | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+
+仓库自带 5 个开发用 skill（架构探索 / 设计 / 校验、诊断、顺序工作流），
+clone 后跑 `./scripts/install-skills.sh` 即可在 agent 里通过 `/` 调用。
 
 ## 状态
 

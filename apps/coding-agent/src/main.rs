@@ -1765,6 +1765,17 @@ async fn run_single_turn(
     // 一次性模式只有一个回合 ⇒ 回合结束后才完成的结果没有下一回合可补投
     // （`-p` / `--json` 是「跑完即退出」，不存在后续回合）。
     let _subagent_binding = subagent.map(|s| s.bind_results(boundary.clone()));
+    // **收紧子 agent 等待上限**（ADR-0055）。
+    //
+    // 与 TUI 路径（`app_loop`，每回合按剩余预算收紧）同一条纪律，但这里更简单：
+    // 本路径只有一个回合，`budget` 就是全部预算 ⇒ 直接取 `min`。
+    //
+    // **必须设**：`resolve_limits` 不填该字段（走 `Default` 的 30 min）；
+    // 若用户的 `max_turn_duration` 比 30 min 小，budget 会先到点推 `Abort`，
+    // 而回合其实只是在正常等子 agent。
+    if let Some(cfg) = config {
+        agent.set_subagent_wait(cfg.subagent_wait().min(budget));
+    }
     let totals = std::sync::Arc::new(subagent::UsageTotals::default());
     let runner = subagent.map(|s| {
         s.make_runner(

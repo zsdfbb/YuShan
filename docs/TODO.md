@@ -69,8 +69,7 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 | 项 | ADR（accepted） | 全仓源码证据 | 计划 |
 |---|---|---|---|
-| **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15）；**协议格已由 ADR-0047 备好**（`Delivery{origin: System}`） | grep `follow_up` / `FollowUp` = **0** | `docs/design-plans/2026-09-15-follow-up.md`；协议见 `docs/adr/0047` |
-| **长程 todo + `ToolPlugin` 装配缝** | ADR-0024（`:7`）supersede 0021 决策 5；ADR-0021（`:7`）决策 ③ | grep `ToolPlugin` = **0**、`todo.json` = **0**、`should_inject` = **0**；`adapters/tools-basic/src/` 只有 7 个文件工具，无 `todo.rs` | `docs/arch/long-horizon-todo/design.md`、`docs/arch/hooks-and-plugins/design.md` |
+| **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15）；**协议格已由 ADR-0047 备好**（`Delivery{origin: System}`） | grep `follow_up` / `FollowUp` = **0** | `docs/design-plans/2026-09-15-follow-up.md`；协议见 `docs/adr/0047` || **长程 todo + `ToolPlugin` 装配缝** | ADR-0024（`:7`）supersede 0021 决策 5；ADR-0021（`:7`）决策 ③ | grep `ToolPlugin` = **0**、`todo.json` = **0**、`should_inject` = **0**；`adapters/tools-basic/src/` 只有 7 个文件工具，无 `todo.rs` | `docs/arch/long-horizon-todo/design.md`、`docs/arch/hooks-and-plugins/design.md` |
 
 **这两项相互咬合**（0024 的推动判据「有未完成项」依赖 0014 的 follow-up 机制），
 宜按 **follow-up → todo** 的顺序推进。
@@ -89,6 +88,15 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 **仍然成立的那一半**：**「下一回合」语义仍缺协议格与队列** ——
 `Boundary` 仍无 `NextTurn` 一格，app 侧无跨回合队列 ⇒ 系统发起的 follow-up 无处可去。
 `grep follow_up / FollowUp` 仍为 **0**。
+
+> ⚠️ **ADR-0055（2026-10-25）改变了这里的结论边界**：子 agent 的结果现在**不再需要**
+> 「再起一个回合」—— 父回合会在收场前等子 agent，把结果作为**同一回合的下一轮**的输入
+> （`crates/ys-loop/src/basic.rs` 的 `wait_for_subagents`）。
+>
+> ⇒ 本条缺的「协议格 + 队列」仍是真的，但它的**第一个假想消费者已不存在**：
+> ADR-0055 明确否决了「系统再起回合」这条路（四条硬代价，见该 ADR 的 Considered Options）。
+> 将来若真要做 follow-up（如 `todo` 的推动），需重新论证「为什么不能在回合内等」，
+> 而不能直接引用本段的「协议已备」。as-built 见 `docs/design-final/subagent-continuation.md`。
 
 **根因的解法已定（2026-10-22，ADR-0047）**：
 投递去向做成协议一等公民（`DeliveryTarget` / `Delivery`，`ys-protocol` 新文件），

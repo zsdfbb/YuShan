@@ -1,4 +1,5 @@
 use super::CompactPolicy;
+use std::time::Duration;
 
 /// 同一批并发工具调用的默认上限（ADR-0022 决策 14 的**单一真值**）。
 ///
@@ -51,6 +52,22 @@ pub struct RunLimits {
     /// 默认 `true`（直接提升「有答复」的概率）；置 `false` ⇒ 与既有行为逐字节一致
     /// （首轮空响应当即收场）。重试消耗一个 round，受 `max_rounds` 与轮边界 abort 约束。
     pub retry_empty_response: bool,
+    /// 收场前**等待在跑子 agent** 的上限（ADR-0055）。
+    ///
+    /// 模型给出最终答复时若仍有子 agent 在跑，父回合**不许收场** —— 结果回来要作为
+    /// 同一回合的下一轮输入，模型才能汇报并继续。本值是该等待的硬上限。
+    ///
+    /// 默认 **30 min**：实测最长一次派发 965 s（`subagent.rs` 的注释记录），留约 2 倍余量。
+    /// 装配点会再按 `min(本值, max_turn_duration)` 收紧一次 —— 否则父 budget 到点会
+    /// 推 `Abort` 并打印「budget exhausted」，而回合其实只是在正常等待。
+    pub subagent_wait: Duration,
+    /// 等待期间的唤醒兜底间隔（ADR-0055）。
+    ///
+    /// **不是状态轮询**：主路径是 `SubagentRunner::settled()` 的即时唤醒。本值只为两件事
+    /// 兜底 —— ① `Boundary::Abort` 的生效延迟（等待返回后必经 Step 3 探针）；
+    /// ② 「结果已 push 进边界源但无唤醒源」这条缝隙（`QueueBoundarySource::push` 是同步的，
+    /// 不通知任何人）。
+    pub subagent_poll: Duration,
 }
 
 impl RunLimits {
@@ -76,6 +93,10 @@ impl Default for RunLimits {
             max_turn_tool_result_tokens: 0,
             // true = 启用一次空响应重试；置 false 时行为与旧版一致。
             retry_empty_response: true,
+            // 30 min：实测最长派发 965 s，留约 2 倍余量。
+            subagent_wait: Duration::from_secs(30 * 60),
+            // 200ms：只兜 abort 延迟与边界源缝隙，不是状态轮询。
+            subagent_poll: Duration::from_millis(200),
         }
     }
 }
@@ -144,5 +165,34 @@ mod tests {
         assigned.retry_empty_response = false;
         assert_eq!(assigned.max_turn_tool_result_tokens, 1);
         assert!(!assigned.retry_empty_response);
+    }
+
+    /// ADR-0055：`subagent_wait` / `subagent_poll` 的默认值。
+    ///
+    /// 两者必须**非零** —— `subagent_wait == 0` 会让「等子 agent」变成「立刻收场」
+    /// （功能静默失效），`subagent_poll == 0` 会让等待循环忙转。
+    ///
+    /// 变异自检：把 `subagent_wait` 默认改 `Duration::ZERO` ⇒ 本用例变红；
+    /// 把 30 min 改成 15 min ⇒ 第二段断言变红（实测最长派发 965 s，15 min 余量不足）。
+    #[test]
+    fn subagent_wait_fields_default_and_are_settable() {
+        let d = RunLimits::default();
+        assert_eq!(d.subagent_wait, Duration::from_secs(30 * 60));
+        assert_eq!(d.subagent_poll, Duration::from_millis(200));
+        assert!(!d.subagent_wait.is_zero(), "0 会让等待静默失效");
+        assert!(!d.subagent_poll.is_zero(), "0 会让等待循环忙转");
+        // 15 min 不够：实测最长派发 965 s ≈ 16 min。
+        assert!(
+            d.subagent_wait >= Duration::from_secs(30 * 60),
+            "默认上限必须给 965 s 的实测最长派发留余量"
+        );
+
+        let limits = RunLimits {
+            subagent_wait: Duration::from_millis(80),
+            subagent_poll: Duration::from_millis(10),
+            ..Default::default()
+        };
+        assert_eq!(limits.subagent_wait, Duration::from_millis(80));
+        assert_eq!(limits.subagent_poll, Duration::from_millis(10));
     }
 }

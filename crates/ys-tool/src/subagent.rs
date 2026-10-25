@@ -6,6 +6,8 @@
 //! 已依赖 `ys-core`），也允许 `ys-protocol` 的 `BoundarySource`（`ToolContext` 已在用）。
 
 use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 use ys_core::{StopReason, Usage};
 use ys_protocol::BoundarySource;
 
@@ -60,11 +62,13 @@ pub trait SubagentRunner: Send + Sync {
     /// `BasicLoop` 在下一个**轮边界**把它 append 进会话并 emit `DeferredResult`。
     /// 模型不必轮询、也不可能「忘记取」。
     ///
-    /// # 生命周期契约（**结构保证，不靠自觉**）
+    /// # 生命周期契约（**分离任务，不与 runner 同寿**）
     ///
-    /// 后台任务的存活期**不超过创建它的 runner**。runner 随回合结束被 drop ⇒
-    /// 未完成的任务一律取消。⇒ **回合末不等异步子 agent** —— 这与同步 `run` 的语义
-    /// 差异是**有意**的：异步派发的价值是「父回合能继续」，不是「结果一定送达」。
+    /// 后台任务是 `tokio::spawn` 的**分离任务**：回合结束后仍会继续跑，结果经实现方的
+    /// 跨回合投递表（coding agent 的 `PendingResults`）在后续回合送达。
+    ///
+    /// ⇒ **回合末不再等于任务死亡**。取消靠两层：`ChildBoundary` 透传父的 `is_aborted`、
+    /// 以及子自己的预算 watchdog。
     ///
     /// 默认实现 = 不支持（返回 `Err`）⇒ 只挂同步派发的实现方不必改。
     fn spawn(
@@ -74,6 +78,33 @@ pub trait SubagentRunner: Send + Sync {
         _boundary: Option<&dyn BoundarySource>,
     ) -> Result<String, String> {
         Err("本实现不支持后台派发".to_string())
+    }
+
+    /// 本**进程**范围内仍在跑的子 agent 数（ADR-0055）。
+    ///
+    /// # 实现约束（承重）
+    ///
+    /// 必须读**进程级**状态，**不得**读 runner 自己的计数器 —— runner 每回合新建，
+    /// 上一回合派发、本回合仍在跑的子 agent 不在它的视野里。读自己的计数器会恒为 `0`，
+    /// 让「父回合等子 agent」静默失效。
+    ///
+    /// # 消费者
+    ///
+    /// `BasicLoop` 在收场前的轮边界用它决定「能不能收场」。默认 `0` ⇒ 不挂派发的实现方
+    /// 与既有测试 fake **零改动**，行为逐字节不变。
+    fn running(&self) -> usize {
+        0
+    }
+
+    /// 等到「[`running`](Self::running) 发生变化」—— **不分方向**，调用方必须复核。
+    ///
+    /// 返回 `Pin<Box<dyn Future>>` 而非 `async fn`：`ys-tool` **不带 tokio 运行时依赖**
+    /// （tokio 只在 dev-dependencies），故不用 `#[async_trait]`。形状与
+    /// `EventSink::emit` 同构。
+    ///
+    /// 默认实现永不就绪 —— 配合 `running() == 0`，调用方根本不会进入等待。
+    fn settled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
     }
 }
 

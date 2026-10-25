@@ -453,7 +453,7 @@ impl App {
                     .unwrap_or("(empty)")
                     .trim();
                 self.transcript.push(TranscriptLine::System(format!(
-                    "↓ {handle} finished: {head}"
+                    "↓ {handle} 结果已注入会话: {head}"
                 )));
                 self.note_appended_below();
             }

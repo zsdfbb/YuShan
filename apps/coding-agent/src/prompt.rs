@@ -323,10 +323,15 @@ fn tool_guidelines(tools: &[&str]) -> String {
             "Use subagent_async instead of subagent when you want to dispatch several sub-tasks \
              or keep answering the user while a sub-agent works: it returns a handle immediately \
              and the result is delivered to you automatically when it finishes — do NOT poll for \
-             it. Keep doing your own part after dispatching. If you end the turn before it \
-             finishes, the sub-agent keeps running and its result is delivered at the start of \
-             your next turn — so never claim a dispatched sub-agent is still running without \
-             checking, and never re-dispatch the same work"
+             it. Keep doing your own part after dispatching. If you finish your own part first, \
+             the turn keeps running until the sub-agent reports back, so never claim it is still \
+             running and never re-dispatch the same work"
+                .to_string(),
+        );
+        // 用户要求的「回复后立即汇报并继续」：**报告是义务**，不是可选风格。
+        guidelines.push(
+            "When a sub-agent's result arrives, say in one line what it found and what you are \
+             doing next, then continue"
                 .to_string(),
         );
     }
@@ -1113,13 +1118,12 @@ mod tests {
         );
         // **异步派发**的指引只在 `subagent_async` 在场时出现（子表没有它）。
         //
-        // 承重的三句：① 结果**自动送达、不要 poll**；② 结束回合**不会**丢结果 ——
-        // 子 agent 继续跑，结果在**下一回合开头**送达（投递表跨回合，见
-        // `subagent::PendingResults`）；③ **不得谎报状态**：没核实就别声称还在跑
-        // （真实事故：模型连答两次「还在跑」，而子 agent 早已完成）。
+        // 承重的三句：① 结果**自动送达、不要 poll**；② 模型先做完自己那部分时，
+        //    回合**不会**结束 —— 它会继续跑到子 agent 回报（ADR-0055：父回合等得起）；
+        //    ③ 不得谎报状态：既不必声称还在跑，也不要重派。
         //
-        // 变异：删掉「do NOT poll for it」/「delivered at the start of your next turn」
-        // ⇒ 变红。
+        // 变异：删掉「do NOT poll for it」/「the turn keeps running until the sub-agent
+        // reports back」/「say in one line what it found」⇒ 变红。
         let with_async = build_system_prompt(
             &dir,
             &[spec("read"), spec("subagent"), spec("subagent_async")],
@@ -1130,13 +1134,24 @@ mod tests {
             "必须说明「结果自动送达、不要 poll」；prompt = {with_async}"
         );
         assert!(
-            with_async.contains("If you end the turn before it finishes")
-                && with_async.contains("delivered at the start of your next turn"),
-            "必须说明「结束回合不丢结果，下一回合开头送达」；prompt = {with_async}"
+            with_async.contains("the turn keeps running until the sub-agent reports back"),
+            "必须说明「父回合会等到子 agent 回报」—— 这是 ADR-0055 的行为契约；\
+             prompt = {with_async}"
         );
         assert!(
-            with_async.contains("never claim a dispatched sub-agent is still running"),
+            with_async.contains("never claim it is still running"),
             "必须禁止未核实就声称「还在跑」；prompt = {with_async}"
+        );
+        // 用户明确要求的「回复后立即汇报并继续」—— 汇报是义务，不是风格。
+        assert!(
+            with_async.contains("say in one line what it found and what you are doing next"),
+            "必须要求结果到达后先报一句发现与下一步；prompt = {with_async}"
+        );
+        // **旧承诺必须消失**：旧文案说「结果在你下一个回合开头送达」，而那个
+        // “next turn” 需要用户开口 —— 假契约已被 ADR-0055 取代。
+        assert!(
+            !with_async.contains("delivered at the start of your next turn"),
+            "不得再承诺需要用户开口的「下一回合送达」；prompt = {with_async}"
         );
         let without = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
         assert!(

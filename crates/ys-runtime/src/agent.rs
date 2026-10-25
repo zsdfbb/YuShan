@@ -182,6 +182,23 @@ impl Agent {
     pub fn set_context_window(&mut self, window: usize) {
         self.limits.context_window = window;
     }
+
+    /// 收紧「收场前等待子 agent」的上限（ADR-0055）。
+    ///
+    /// 与 [`set_context_window`](Self::set_context_window) 同一条纪律：由应用层在
+    /// **回合开头**按当前配置派生一次，库不自行读配置。调用方须传入
+    /// `min(配置值, 剩余预算)` —— 否则父 budget 到点会推 `Abort` 并报
+    /// 「budget exhausted」，而回合其实只是在正常等待。
+    pub fn set_subagent_wait(&mut self, wait: std::time::Duration) {
+        // 0 会让等待静默失效（等价于「立刻收场」）⇒ 钳到最小 1ms，
+        // 让「配错了」表现为「等极短」而不是「功能不存在」。
+        self.limits.subagent_wait = wait.max(std::time::Duration::from_millis(1));
+    }
+
+    /// 当前生效的等待上限 —— 供调用方与自己的配置取 `min`（见 `app_loop` 的每回合刷新）。
+    pub fn subagent_wait(&self) -> std::time::Duration {
+        self.limits.subagent_wait
+    }
 }
 
 #[cfg(test)]

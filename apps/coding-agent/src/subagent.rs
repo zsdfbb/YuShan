@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,7 +66,6 @@ impl CancelCause {
 }
 
 /// 子 agent 的边界源：`is_aborted` 透传父的；`take()` **只取自己那份**，绝不消费父队列。
-///
 /// 与 ADR-0022 决策 5 的差异（`take()` 从「恒 None」改为取自己的）记在 ADR-0029 §6 修正 4。
 /// **插话探针不透传**（恒 `false`）—— 理由见该 trait 方法实现。
 pub struct ChildBoundary {
@@ -191,6 +190,22 @@ struct PendingResult {
 #[derive(Default)]
 pub struct PendingResults {
     inner: Mutex<PendingInner>,
+    /// 有结果落地时的一次性唤醒 —— **让回合外的结果也能被看见**。
+    ///
+    /// 未绑定时结果只是静默入表（下面 `deliver` 的分支），而表在回合外**没有读者**
+    /// （`take_pending` 唯一的入口是 `Request::Prompt`）⇒ 不加唤醒，用户会以为
+    /// 「子 agent 还在跑」而它其实早就回来了。
+    ///
+    /// # 为什么是 `notify_one`（存 permit），而不是 `notify_waiters`
+    ///
+    /// 消费端（app 循环的空闲分支）是**事件驱动**的：大部分时间并不挂在 `notified()` 上。
+    /// `notify_waiters` **不存 permit** ⇒ 若结果正好在那段间隙里落地，唤醒就落空了，
+    /// 「已返回」那行提示要等到下一次（可能永远不来的）结果或用户输入。
+    /// `notify_one` 存一个 permit，下一次 `notified()` 立即完成。
+    ///
+    /// 代价（已接受）：permit 可跨回合残留 ⇒ 空闲等待可能「假醒」一次；
+    /// 消费端用 [`has_pending`](PendingResults::has_pending) 复核，空则无动作。
+    wake: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -248,11 +263,30 @@ impl PendingResults {
                     ));
                 }
                 inner.queue.push(PendingResult { handle, message });
+                drop(inner);
+                // 唤醒在**锁外**：持锁调外部代码是坏习惯（`push` 也会唤醒等待者）。
+                self.wake.notify_one();
                 return false;
             }
         };
         sink.push(Boundary::Deferred { handle, message });
         true
+    }
+
+    /// 是否还有未投出的结果 —— [`notified`](Self::notified) 唤醒后的**必要复核**。
+    ///
+    /// 唤醒只是「可能有新东西」（`notify_waiters` 不区分事件类型，也可能来自别的
+    /// 写入方）⇒ 醒来后必须复核，不能假定一定非空。
+    pub fn has_pending(&self) -> bool {
+        !self.lock().queue.is_empty()
+    }
+
+    /// 等到「有新结果入表」。
+    ///
+    /// 只报「**可能有**」，不报具体是什么 —— 消费端一律 `take_pending()` 全量取走，
+    /// 并先用 [`has_pending`](Self::has_pending) 复核（permit 可能跨回合残留）。
+    pub async fn notified(&self) {
+        self.wake.notified().await;
     }
 
     /// 取走全部未投出的结果（**当前回合**的补投入口）—— 按入表顺序。
@@ -292,6 +326,144 @@ impl Drop for PendingResultsBinding {
     fn drop(&mut self) {
         self.results.unbind(self.generation);
     }
+}
+
+/// 进程级的「仍在跑的子 agent 数」（ADR-0055）。
+///
+/// # 为何必须是进程级
+///
+/// `AppSubagentRunner` **每回合新建**（`app_loop` 的 `make_runner`）⇒ 上一回合派发、
+/// 本回合仍在跑的子 agent 不在它的视野里。若判据读 runner 自己的计数器，它会恒为 `0`
+/// ⇒ 父回合立刻收场，「等子 agent 回来」静默失效。
+///
+/// 故本结构与 [`PendingResults`] 并列：以 `Arc` 经 `SubagentSetup` 跨 `/resume` 重建共享。
+///
+/// # 为何用 RAII 守卫而不是手工加减
+///
+/// `ChildTask::execute` 有四条退出路径（组装失败 / `Ok` / `Err` / future 被 drop）。
+/// 手工 `fetch_sub` 必漏一条，而漏减会让父回合钉死在等待里 —— 这是正确性问题，
+/// 不是防御性编程。守卫进 `ChildTask`，`Drop` 结构上保证回归。
+#[derive(Default)]
+pub struct LiveSubagents {
+    running: AtomicUsize,
+    /// 计数变化时唤醒等待方。
+    ///
+    /// 用 `notify_waiters`（**不存 permit**）而非 `notify_one`：等待循环是
+    /// 「唤醒 + `subagent_poll` tick」双源 ⇒ 漏一次唤醒的代价只是一个 tick；
+    /// 而 permit 会跨回合残留，让下一回合凭空立即醒来。
+    settled: tokio::sync::Notify,
+}
+
+impl LiveSubagents {
+    /// 登记一个在跑的子 agent；返回的守卫 drop 时自减并唤醒等待方。
+    ///
+    /// **必须在 `tokio::spawn` 之前调用**（但要在模型 / 额度解析成功之后）——
+    /// 否则「已 spawn 但未计数」的窗口里父回合可能收场。
+    pub fn enter(self: &Arc<Self>) -> LiveGuard {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        LiveGuard {
+            live: Arc::clone(self),
+        }
+    }
+
+    /// 仍在跑的数量。父回合的**唯一收场判据**（`BasicLoop` Step 9c）。
+    pub fn count(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// 等到「计数发生变化」—— **不分方向**，调用方必须复核 [`count`](Self::count)。
+    pub async fn settled_notified(&self) {
+        self.settled.notified().await
+    }
+}
+
+/// [`LiveSubagents::enter`] 的 RAII 守卫 —— drop 时自减并唤醒。
+pub struct LiveGuard {
+    live: Arc<LiveSubagents>,
+}
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        // `fetch_sub` 的结果不作判断：`SeqCst` 下计数不会穿透 0（enter/drop 严格配对）。
+        self.live.running.fetch_sub(1, Ordering::SeqCst);
+        // 必须唤醒：判据从「>0」变成「==0」的那一刻，父回合才允许收场。
+        self.live.settled.notify_waiters();
+    }
+}
+
+/// **ADR-0055 承重不变量**：`LiveGuard` 必须把计数减回去。
+///
+/// 父回合的收场判据是 `running() == 0` ⇒ 任何让计数停在 >0 的路径都会把父回合
+/// 钉死在等待里直到 `subagent_wait` 上限。`ChildTask::execute` 有四条退出路径
+/// （组装失败 / `Ok` / `Err` / future 被 drop），靠 `Drop` 才能全部覆盖。
+///
+/// 变异：删掉 `LiveGuard::drop` 里的 `fetch_sub` ⇒ 归零断言变红。
+#[test]
+fn live_guard_returns_the_slot_on_drop() {
+    let live = Arc::new(LiveSubagents::default());
+    assert_eq!(live.count(), 0, "初始无在跑");
+
+    {
+        let _a = live.enter();
+        let _b = live.enter();
+        assert_eq!(live.count(), 2, "两次 enter ⇒ 计数 2");
+    }
+    assert_eq!(live.count(), 0, "守卫 drop 后必须归零");
+}
+
+/// `has_pending` 与 `take_pending` 口径一致 —— app 侧空闲唤唤醒靠前者判断
+/// 「要不要提示」，后者负责真正取走。
+///
+/// 变异：把 `has_pending` 写成恒 `false` ⇒ 入表后的断言变红。
+#[test]
+fn pending_results_has_pending_matches_the_queue() {
+    let results = Arc::new(PendingResults::default());
+    assert!(!results.has_pending(), "初始为空");
+
+    let delivered = results.deliver(
+        "sa1".to_string(),
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "r".into() }],
+        },
+    );
+    assert!(!delivered, "未绑定落点时不算已投出");
+    assert!(results.has_pending(), "入表后 has_pending 必须为真");
+
+    let taken = results.take_pending();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].0, "sa1");
+    assert!(!results.has_pending(), "取走后必须为空");
+}
+
+/// **唤醒必须存 permit**：结果在「消费端还没开始等」时落地，也不能丢通知。
+///
+/// 这是 `notify_waiters` → `notify_one` 那次修复的钉子。消费端（app 循环空闲分支）
+/// 是事件驱动的，大部分时间不挂在 `notified()` 上；`notify_waiters` 在那个间隙里
+/// 唤醒落空 ⇒「已返回」提示要等下一条结果（可能永远不来）。
+///
+/// 变异：把 `deliver` 里的 `notify_one` 换回 `notify_waiters` ⇒ 本用例超时失败。
+#[tokio::test]
+async fn pending_results_wakeup_survives_no_waiter() {
+    let results = Arc::new(PendingResults::default());
+
+    // **先**入表（此刻没有任何 waiter），**再**开始等 —— 这是真实时序：
+    // 子 agent 收尾时 app 循环多半正阻塞在 `request_rx.recv()` 上。
+    results.deliver(
+        "sa1".to_string(),
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "late".into(),
+            }],
+        },
+    );
+    assert!(results.has_pending(), "应已入表");
+
+    // 若唤醒没存 permit，这里会永远挂住。
+    tokio::time::timeout(Duration::from_secs(2), results.notified())
+        .await
+        .expect("唤醒必须在无 waiter 时存下 permit，否则迟到的结果永远不会被看见");
 }
 
 /// 产物目录。`YUSHAN_SUBAGENTS_DIR` 显式指定时是 **Override 档（只写不删）**；
@@ -400,6 +572,8 @@ pub struct AppSubagentRunner<'a> {
     /// 往回合本地的边界源里 `push`（那份队列随回合销毁）。故统一交给本表：
     /// 已绑定落点就直接投，否则留表等下回合补投。详见 [`PendingResults`]。
     results: Arc<PendingResults>,
+    /// 进程级的「仍在跑」计数（ADR-0055）—— 父回合的收场判据经它读出。
+    live: Arc<LiveSubagents>,
 }
 
 impl<'a> AppSubagentRunner<'a> {
@@ -417,6 +591,7 @@ impl<'a> AppSubagentRunner<'a> {
         totals: Arc<UsageTotals>,
         parent_boundary: Option<Arc<dyn BoundarySource>>,
         results: Arc<PendingResults>,
+        live: Arc<LiveSubagents>,
     ) -> Self {
         Self {
             parent_model,
@@ -433,6 +608,7 @@ impl<'a> AppSubagentRunner<'a> {
             totals,
             parent_boundary,
             results,
+            live,
         }
     }
 }
@@ -457,6 +633,11 @@ pub struct SubagentSetup {
     /// **已在后台跑着的子 agent 并不随之重建** —— 它们完成时写的那份表必须与
     /// 重建后的新表是**同一个**，否则结果又落进无人读的旧表。
     results: Arc<PendingResults>,
+    /// 进程级的「仍在跑」计数（ADR-0055）。
+    ///
+    /// 与 `results` 同一条理由共享所有权：已在后台跑着的子 agent 不随 `/resume` 重建，
+    /// 它们的计数必须汇入**同一份**计数器，否则新回合读到的 `0` 会让父回合提前收场。
+    live: Arc<LiveSubagents>,
 }
 
 impl SubagentSetup {
@@ -467,6 +648,17 @@ impl SubagentSetup {
     /// `dir` 以 `Arc` 传入、**跨重建共享**（供 [`crate::assembly::AgentFactory`] 用）：
     /// 工作区切换时同一进程内会多次重建本结构，共享同一份产物目录描述（`Arc` 只复制
     /// 指针），落点与 sweep 档位因此跨重建一致。
+    /// 后台结果的**跨回合**投递表（`Arc` 跨重建共享）。
+    ///
+    /// 与 `dir` 同理以 `Arc` 传入：工作区切换（`/resume`）会重建本结构，但
+    /// **已在后台跑着的子 agent 并不随之重建** —— 它们完成时写的那份表必须与
+    /// 重建后的新表是**同一个**，否则结果又落进无人读的旧表。
+    ///
+    /// `live` 同理（见 [`LiveSubagents`] 的文档）。
+    ///
+    /// 参数多是必然的：它冻结的是「一次派发需要的全部不变输入」，每个都得能在
+    /// `/resume` 重建后重新给到。拆参数包只会把六个 `Arc::clone` 推给调用方。
+    #[allow(clippy::too_many_arguments)]
     pub fn shared(
         child_prompt: String,
         child_limits: RunLimits,
@@ -475,6 +667,7 @@ impl SubagentSetup {
         web: WebConfig,
         dir: Arc<SubagentsDir>,
         results: Arc<PendingResults>,
+        live: Arc<LiveSubagents>,
     ) -> Self {
         Self {
             child_prompt,
@@ -485,6 +678,7 @@ impl SubagentSetup {
             dir,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
             results,
+            live,
         }
     }
 
@@ -530,7 +724,13 @@ impl SubagentSetup {
             totals,
             parent_boundary,
             self.results.clone(),
+            self.live.clone(),
         )
+    }
+
+    /// 结果投递表（供 app 循环在**回合之间**等它落地）。
+    pub fn pending_results(&self) -> &Arc<PendingResults> {
+        &self.results
     }
 }
 
@@ -554,10 +754,25 @@ impl SubagentRunner for AppSubagentRunner<'_> {
 
         // 执行交给 owned 的 `ChildTask` —— 同步 `run` 与异步 `spawn` **共用同一份**
         // 执行逻辑（否则两条路径的行为会漂移：结果打包、诊断、usage 上卷全在手写两份）。
+        //
+        // 同步路径也占额：模型自己就在等这一发，但父回合的收场判据必须看到它
+        // （否则「在等的子 agent」不计入 `running()` ⇒ 判据偏乐观）。
         Ok(self
-            .child_task(resolved, child_limits)
+            .child_task(resolved, child_limits, self.live.enter())
             .execute(prompt.to_string())
             .await)
+    }
+
+    /// 进程级：仍在跑的子 agent 数。
+    ///
+    /// **读 `self.live` 而非自己的计数器** —— 后者只记「本回合派了几次」
+    /// （`dispatched`，每回合从 0 重来），拿它当判据会漏掉上一回合遗留的子 agent。
+    fn running(&self) -> usize {
+        self.live.count()
+    }
+
+    fn settled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.live.settled_notified())
     }
 
     /// **后台派发**：回合内解析模型 + 查额度（两者都要读 `config`，不能带进后台），
@@ -593,7 +808,9 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         // 句柄 = 本回合第 N 次派发（`take_dispatch_slot` 已自增 ⇒ 直接取当前值）。
         // 只用于让模型 / UI 区分是哪个后台任务，**不需要全局唯一**。
         let handle = format!("sa{}", self.dispatched.load(Ordering::Relaxed));
-        let task = self.child_task(resolved, child_limits);
+        // **先占额、再 spawn**：`ChildTask` 持有守卫 ⇒ `execute` 的每条退出路径
+        // （组装失败 / Ok / Err / future 被 drop）都由 `Drop` 回归。
+        let task = self.child_task(resolved, child_limits, self.live.enter());
         let prompt = prompt.to_string();
         let handle_for_task = handle.clone();
 
@@ -708,7 +925,12 @@ impl AppSubagentRunner<'_> {
         limits
     }
 
-    fn child_task(&self, model: Arc<dyn Model>, child_limits: RunLimits) -> ChildTask {
+    fn child_task(
+        &self,
+        model: Arc<dyn Model>,
+        child_limits: RunLimits,
+        guard: LiveGuard,
+    ) -> ChildTask {
         ChildTask {
             model,
             child_prompt: self.child_prompt.clone(),
@@ -719,6 +941,7 @@ impl AppSubagentRunner<'_> {
             dir: self.dir.clone(),
             totals: self.totals.clone(),
             parent_boundary: self.parent_boundary.clone(),
+            _live: guard,
         }
     }
 }
@@ -738,6 +961,11 @@ struct ChildTask {
     dir: Arc<SubagentsDir>,
     totals: Arc<UsageTotals>,
     parent_boundary: Option<Arc<dyn BoundarySource>>,
+    /// 本子 agent 的「在跑」额度（ADR-0055）。
+    ///
+    /// 字段名带下划线：**不读取，只为了持有** —— `execute` 返回与 future 被 drop
+    /// 两条路径都靠它的 `Drop` 把计数减回去。少了它，父回合会钉死在等待里。
+    _live: LiveGuard,
 }
 
 impl ChildTask {
@@ -1725,6 +1953,7 @@ mod tests {
             totals.clone(),
             None,
             Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
         );
 
         let out = runner.run("查 X", None, None).await.unwrap();
@@ -1793,6 +2022,7 @@ mod tests {
             Arc::new(UsageTotals::default()),
             None,
             Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {
             runner.run("t", None, None).await.unwrap();
@@ -1887,6 +2117,7 @@ mod tests {
                 Arc::new(UsageTotals::default()),
                 None,
                 Arc::new(PendingResults::default()),
+                Arc::new(LiveSubagents::default()),
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -1912,6 +2143,7 @@ mod tests {
                 Arc::new(UsageTotals::default()),
                 None,
                 Arc::new(PendingResults::default()),
+                Arc::new(LiveSubagents::default()),
             );
             runner.run("x", Some("shared-name"), None).await.unwrap()
         };
@@ -2204,6 +2436,7 @@ mod tests {
             Arc::new(UsageTotals::default()),
             None,
             Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
         )
     }
 
@@ -2255,6 +2488,7 @@ mod tests {
             Arc::new(UsageTotals::default()),
             parent_boundary,
             Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
         )
     }
 
@@ -2298,6 +2532,7 @@ mod tests {
             Arc::new(UsageTotals::default()),
             Some(sink.clone()),
             results,
+            Arc::new(LiveSubagents::default()),
         );
 
         // ① `spawn` 立刻返回（不等子 agent 跑完）。

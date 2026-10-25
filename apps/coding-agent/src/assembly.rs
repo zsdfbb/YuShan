@@ -64,6 +64,10 @@ pub struct AgentFactory {
     /// 与 `backgrounds` 同理是**进程级**的：工作区切换会重建 agent，但后台跑着的
     /// 子 agent 不会跟着重建 —— 它们完成时写的那份表必须与重建后是同一份。
     subagent_results: Arc<crate::subagent::PendingResults>,
+    /// 进程级的「仍在跑」计数（ADR-0055）。与 `subagent_results` 同一理由跨重建共享：
+    /// 已在后台跑着的子 agent 的计数必须汇入同一份，否则新回合读到的 `0`
+    /// 会让父回合提前收场。
+    subagent_live: Arc<crate::subagent::LiveSubagents>,
     /// 后台命令上下文（**进程级**）—— `None` = 本工厂不带后台能力。
     ///
     /// 注册表对象随工厂冻结 ⇒ `/resume` 重建 agent 时仍是**同一份**；
@@ -114,6 +118,7 @@ impl AgentFactory {
             child_budget,
             subagents_dir,
             subagent_results: Arc::new(crate::subagent::PendingResults::default()),
+            subagent_live: Arc::new(crate::subagent::LiveSubagents::default()),
             backgrounds: None,
         }
     }
@@ -151,6 +156,7 @@ impl AgentFactory {
             self.web.clone(),
             self.subagents_dir.clone(),
             self.subagent_results.clone(),
+            self.subagent_live.clone(),
         );
 
         // 父表 = 基础 9 元 + `bash_bg` + 派发工具**追加末位**

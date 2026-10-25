@@ -50,11 +50,16 @@ const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|
 /// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
 const EFFORT_DEFAULT_TOKEN: &str = "default";
 
-static COMMANDS: [CommandSpec; 15] = [
+static COMMANDS: [CommandSpec; 16] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
         arg_hint: Some("[command]"),
+    },
+    CommandSpec {
+        name: "keybind",
+        description: "列出全部快捷键",
+        arg_hint: None,
     },
     CommandSpec {
         name: "status",
@@ -161,6 +166,11 @@ pub enum LocalAction {
     Help(Option<String>),
     /// 打印当前状态（`provider` / `model` / tokens / 轮数 / 会话文件 / 工具 / cwd）。
     Status,
+    /// 打印**完整**键位表（分段；真源是 [`all_keybindings`]）。
+    ///
+    /// 与 `/help` 的分工：`/help` 是命令索引 + 一段高频键位摘要（完整表塞进去会把
+    /// 要查的命令挤出屏幕），`/keybind` 是那份表的正本。
+    Keybind,
     /// 把最后一条 assistant 回复的 **Markdown 原文**送入剪贴板通道（[`App::pending_clipboard`]，
     /// 由 `run.rs` 发 OSC 52）。
     Copy,
@@ -253,6 +263,7 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
         } else {
             Some(arg())
         })),
+        "keybind" => Action::Local(LocalAction::Keybind),
         "status" => Action::Local(LocalAction::Status),
         // 开选择器列全部 skill（带 description）。**选中不直发** —— 回填输入框，
         // 用户补参数后自行回车（见 `PromptKind::PickSkill`）。
@@ -385,34 +396,271 @@ pub fn help_text() -> String {
         out.push('\n');
     }
     out.push('\n');
-    out.push_str(KEY_HELP);
+    out.push_str(KEY_HELP_BRIEF);
     out.trim_end().to_string()
 }
 
-/// `/help` 里的**键位**段 —— 导航与输入编辑。
+/// 一个键位条目 —— `/keybind` 与 `/help` 的键位段**共用这一份**。
 ///
-/// **为什么要有这一段**：滚动键（`↑↓` / `PageUp` / `End` …）此前没有任何界面出口，
-/// 用户只能试 —— 而「跳到最新消息」是高频操作，试不出来就等于没有。
+/// 结构化而不是一段字符串：两个出口（`/keybind` 详表、`/help` 摘要）需要的是同一批
+/// 事实的**不同排布**，写两遍必然漂移（上一轮就出现过 `/help` 列 `End` 为「跳到最新
+/// 消息」而实现已改成输入行尾的偏差）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyBinding {
+    /// 键的组合，如 `"Ctrl+Shift+A"`；多个写法用 `" / "` 分隔。
+    pub keys: &'static str,
+    /// 一句话行为说明。
+    pub action: &'static str,
+    /// 分组（决定 `/keybind` 里的分段与小标题）。
+    pub group: KeyGroup,
+    /// `true` = 已经**不在**当前实现里，列出只为解释历史习惯（`/keybind` 里标 `（未绑定）`）。
+    ///
+    /// 目前无条目使用：它存在的理由是**别把「终端做不到」写成「不支持」**——
+    /// 列在这里的键是「本仓刻意不绑」的（如 `⌘` 组合），需要一句原因。
+    pub note: Option<&'static str>,
+}
+
+/// 键位分组（`/keybind` 的段序即枚举序）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyGroup {
+    /// 输入编辑：光标、选区、删除。
+    Editing,
+    /// 提交、换行、补全、取消、退出。
+    Submit,
+    /// 聊天滚动与跳转。
+    Scroll,
+    /// 剪贴板。
+    Clipboard,
+    /// 鼠标。
+    Mouse,
+}
+
+impl KeyGroup {
+    /// 全部组（段序）。
+    pub const ALL: [KeyGroup; 5] = [
+        Self::Editing,
+        Self::Submit,
+        Self::Scroll,
+        Self::Clipboard,
+        Self::Mouse,
+    ];
+
+    /// 小标题（`/keybind` 的段头）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Editing => "输入编辑",
+            Self::Submit => "提交与退出",
+            Self::Scroll => "滚动与跳转",
+            Self::Clipboard => "剪贴板",
+            Self::Mouse => "鼠标",
+        }
+    }
+}
+
+/// 键位表 —— **`/keybind` 与 `/help` 的唯一真源**。
 ///
-/// 键位取 **Mac / Linux 通用**的那一套：`Ctrl+↑/↓` 与 `Ctrl+Home/End` 都是
-/// 终端无关的（`CSI 1;5A` 一类）。**不列 `⌘` 组合** —— macOS 终端自己消费 `⌘`，
-/// 字节到不了应用（见 `events.rs` 模块头）。
-const KEY_HELP: &str = "键位：
-  ↑ ↓                输入框为空时 ↑ 取回历史（↓ 还原草稿）；否则滚动对话
-  PageUp / PageDown  翻页（一页 = 视窗高度）
+/// 条目顺序即 `/keybind` 的显示顺序（组内）。`/help` 只取其中高频的一段（见
+/// [`KEY_HELP_BRIEF`]），避免把 `/help` 撑成第二份完整手册。
+///
+/// **不列 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（见 `events.rs`
+/// 模块头）。**不列 `⌥+↓`**：Terminal.app 发 `ESC[B`，与普通 `↓` 同形。
+static KEYBINDINGS: [KeyBinding; 20] = [
+    KeyBinding {
+        keys: "← / →",
+        action: "移动输入光标（Ctrl 或 ⌥ + ←/→ 按词移动；⌥b / ⌥f 同义）",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "↑ / ↓",
+        action: "输入框内按视觉行上下移动；到首/末行才回落历史 / 聊天滚动",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Home / End",
+        action: "输入当前行的行首 / 行尾（与 Ctrl+A / Ctrl+E 同义）",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+A / Ctrl+E",
+        action: "输入行首 / 行尾（readline 习惯）",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+Shift+A",
+        action: "全选输入框（随后 Backspace 一下清空）",
+        group: KeyGroup::Editing,
+        note: Some("部分终端把它压成 Ctrl+A，全选按不出来"),
+    },
+    KeyBinding {
+        keys: "Shift + ← → ↑ ↓",
+        action: "扩选（Home / End 同理；端点重合即收起）",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Backspace / Delete",
+        action: "删除；有选区时删除整段选中",
+        group: KeyGroup::Editing,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Enter",
+        action: "提交输入",
+        group: KeyGroup::Submit,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Shift+Enter / Alt+Enter / Ctrl+J",
+        action: "输入框内换行（Ctrl+J 用于不支持键盘增强协议的终端）",
+        group: KeyGroup::Submit,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Tab",
+        action: "补全浮层（输入以 `/` 开头时）；浮层内 Tab/Enter 填入、↑↓ 选择",
+        group: KeyGroup::Submit,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Esc",
+        action: "回合中取消回合；idle 时清空输入",
+        group: KeyGroup::Submit,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+C",
+        action: "有选区时复制；否则取消回合（再按一次退出）",
+        group: KeyGroup::Submit,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+D",
+        action: "退出",
+        group: KeyGroup::Submit,
+        note: None,
+    },
+    KeyBinding {
+        keys: "PageUp / PageDown",
+        action: "翻页（一页 = 视窗高度 − 1 行）",
+        group: KeyGroup::Scroll,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+↑ / Ctrl+Home",
+        action: "跳到最早消息",
+        group: KeyGroup::Scroll,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+↓ / Ctrl+End",
+        action: "跳到最新消息",
+        group: KeyGroup::Scroll,
+        note: None,
+    },
+    KeyBinding {
+        keys: "滚轮 / 触控板",
+        action: "逐 1 视觉行滚动对话（不影响输入历史）",
+        group: KeyGroup::Scroll,
+        note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+C",
+        action: "复制输入框选区",
+        group: KeyGroup::Clipboard,
+        note: None,
+    },
+    KeyBinding {
+        keys: "左键拖选（Chat 区）",
+        action: "选中对话内容，松手即复制；⇧+拖选 = 用终端原生选择",
+        group: KeyGroup::Mouse,
+        note: None,
+    },
+    KeyBinding {
+        keys: "/copy",
+        action: "把最后一条回复的 Markdown 原文写入系统剪贴板",
+        group: KeyGroup::Clipboard,
+        note: None,
+    },
+];
+
+/// 全部键位（顺序即 `/keybind` 的显示顺序）。
+pub fn all_keybindings() -> &'static [KeyBinding] {
+    &KEYBINDINGS
+}
+
+/// `/keybind` 的正文：按 [`KeyGroup::ALL`] 分段，逐条列键与行为（含注意事项）。
+///
+/// **为什么不只是 `/help` 的那一段**：`/help` 是命令索引，塞二十条键位会把真正要
+/// 找的命令挤到屏幕外；而键位是「试不出来就等于没有」的那类信息，需要一个能整屏
+/// 读完、且**与实现同源**的出口。
+pub fn keybind_text() -> String {
+    let mut out = String::from("键位：\n");
+    for group in KeyGroup::ALL {
+        let items: Vec<&KeyBinding> = all_keybindings()
+            .iter()
+            .filter(|b| b.group == group)
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(group.label());
+        out.push('\n');
+        // 键列按**本组最长键**对齐：不对齐时中英混排的 `—` 会跳来跳去，扫读成本高。
+        // 宽度用**显示列**（CJK 占 2 列）而不是 char 数 —— 否则 `滚轮 / 触控板` 这类
+        // 条目会多缩两格（`draw::display_width` 是同一口径，纯计算、不碰终端）。
+        let pad = items
+            .iter()
+            .map(|b| crate::draw::display_width(b.keys))
+            .max()
+            .unwrap_or(0);
+        for b in items {
+            out.push_str("  ");
+            out.push_str(b.keys);
+            for _ in crate::draw::display_width(b.keys)..pad {
+                out.push(' ');
+            }
+            out.push_str("  — ");
+            out.push_str(b.action);
+            out.push('\n');
+            // 注意事项**单独续行**：塞在行为说明后面会变成两层括号
+            // （「…清空）（部分终端…）」），读起来像两个都不重要。
+            if let Some(note) = b.note {
+                out.push_str("  ");
+                for _ in 2..pad + 4 {
+                    out.push(' ');
+                }
+                out.push_str("· ");
+                out.push_str(note);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str(
+        "\n终端限制：不绑 ⌘ 组合（终端自己消费）；不绑 ⌥+↓（Terminal.app 发 ESC[B，与 ↓ 同形）。",
+    );
+    out.trim_end().to_string()
+}
+
+/// `/help` 里那段**高频摘要**（完整表走 `/keybind`）。
+///
+/// 取的是「不知道就卡住」的那几条：滚动的三个入口、输入的行首行尾、提交/换行、
+/// 全选与复制、取消与退出。完整键位与终端限制见 [`keybind_text`]。
+const KEY_HELP_BRIEF: &str = "键位（完整表：/keybind）：
+  ↑ ↓                输入框内先按视觉行移光标；到首/末行才取历史 / 滚动对话
+  PageUp / PageDown  翻页；Ctrl+↑ / Ctrl+Home 最早，Ctrl+↓ / Ctrl+End 最新
   滚轮 / 触控板上下   逐行滚动对话（不影响输入历史）
-  /copy              最后一条回复的 Markdown 原文写入系统剪贴板（需终端支持 OSC 52）
-  End                跳到最新消息
-  Ctrl+↓ / Ctrl+End  跳到最新消息
-  Ctrl+↑ / Ctrl+Home 跳到最早消息
-  Home               输入行首（Ctrl+A 同义）
-  Ctrl+A / Ctrl+E    输入行首 / 行尾
-  ← →                输入光标（Ctrl 或 ⌥ + ← → 按词移动）
+  Home / End         输入行首 / 行尾（Ctrl+A / Ctrl+E 同义）
+  Ctrl+A / Ctrl+E    同 Home / End（readline 习惯）
+  Shift + ←→↑↓       扩选；Ctrl+Shift+A 全选输入框
   Enter              提交（Shift/Alt+Enter 或 Ctrl+J 换行）
-  Tab                补全浮层
-  Esc                取消回合 / 清空输入
-  Ctrl+C             取消回合；再按一次退出
-  Ctrl+D             退出";
+  Ctrl+C             有选区时复制；否则取消回合，再按一次退出
+  Ctrl+D             退出；Esc 取消回合 / 清空输入
+  Tab                补全浮层";
 
 /// `/help` 的正文（**含 skill 段**）—— 内置命令表之后追加一段 skill 名清单。
 ///
@@ -559,6 +807,7 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
             Some(name) => command_help_text(&name),
         },
         LocalAction::Status => status_text(&app.view),
+        LocalAction::Keybind => keybind_text(),
         LocalAction::Copy => {
             // 借用在 `pending_clipboard` 写入前结束：先拿 owned 副本。
             let body = copy_text(app).map(str::to_owned);
@@ -571,7 +820,7 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
             };
             let chars = body.chars().count();
             app.pending_clipboard = Some(body);
-            format!("（/copy：已写入终端剪贴板，{chars} 字）")
+            format!("（/copy：已写入系统剪贴板，{chars} 字）")
         }
         LocalAction::Thinking(explicit) => {
             app.thinking_visible = explicit.unwrap_or(!app.thinking_visible);
@@ -1029,8 +1278,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "skills", "copy", "quit", "thinking", "effort", "theme", "model",
-                "login", "logout", "new", "resume", "compact", "export",
+                "help", "keybind", "status", "skills", "copy", "quit", "thinking", "effort",
+                "theme", "model", "login", "logout", "new", "resume", "compact", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );
@@ -1214,26 +1463,130 @@ mod tests {
         assert!(!a.thinking_visible, "显式 off");
     }
 
-    /// `/help` 必须列出**键位** —— 滚动键此前没有任何界面出口（用户只能试）。
+    /// `/help` 必须列出**键位摘要**，并指向 `/keybind` —— 滚动键此前没有任何界面
+    /// 出口（用户只能试）。
     #[test]
     fn test_help_text_contains_key_bindings() {
         let text = help_text();
-        assert!(text.contains("键位："), "help 必须有键位段");
+        assert!(text.contains("键位"), "help 必须有键位段");
         for key in [
-            "End",
-            "Ctrl+↓",
+            "PageUp",
+            "PageDown",
             "Ctrl+↑",
             "Ctrl+Home",
             "Ctrl+End",
-            "PageUp",
-            "PageDown",
             "滚轮",
             "Home",
+            "Ctrl+Shift+A",
         ] {
             assert!(text.contains(key), "键位段必须列出 {key}");
         }
+        assert!(
+            text.contains("/keybind"),
+            "摘要必须指向完整表，否则用户不知道还有正本：{text}"
+        );
         // `⌘` 组合到不了应用（终端自己消费）⇒ 不得出现在键位表里。
         assert!(!text.contains('⌘'), "键位表不得列 ⌘ 组合（终端消费不到）");
+    }
+
+    // -----------------------------------------------------------------------
+    // `/keybind`：完整键位表
+    // -----------------------------------------------------------------------
+
+    /// `/keybind` 必须把**每一条**键位都渲染出来，且按组分段。
+    ///
+    /// 变异：把 `keybind_text` 的循环写成只取第一组 ⇒ 本用例红（缺组标题）。
+    #[test]
+    fn test_keybind_text_covers_every_binding_and_group() {
+        let text = keybind_text();
+        assert!(text.starts_with("键位："), "应有标题：{text}");
+        for group in KeyGroup::ALL {
+            let in_group: Vec<&KeyBinding> = all_keybindings()
+                .iter()
+                .filter(|b| b.group == group)
+                .collect();
+            if in_group.is_empty() {
+                continue;
+            }
+            assert!(
+                text.contains(group.label()),
+                "缺分组小标题「{}」：{text}",
+                group.label()
+            );
+            for b in in_group {
+                assert!(
+                    text.contains(b.keys),
+                    "漏了键「{}」（组 {}）",
+                    b.keys,
+                    group.label()
+                );
+                assert!(text.contains(b.action), "漏了行为说明「{}」", b.action);
+            }
+        }
+        // 终端限制必须显式写出来 —— 否则用户会以为「本仓不支持 ⌘」是缺陷。
+        assert!(text.contains("终端限制"), "必须说明终端侧限制");
+    }
+
+    /// 键位表本身的基本约束：键非空、行为非空、组内**无重名同义项**。
+    #[test]
+    fn test_keybindings_are_well_formed() {
+        assert!(!all_keybindings().is_empty());
+        for b in all_keybindings() {
+            assert!(!b.keys.trim().is_empty(), "键不能为空");
+            assert!(!b.action.trim().is_empty(), "{} 缺行为说明", b.keys);
+        }
+        // 组内同一个键组合不得出现两次（否则究竟哪条生效说不清）。
+        for group in KeyGroup::ALL {
+            let mut keys: Vec<&str> = all_keybindings()
+                .iter()
+                .filter(|b| b.group == group)
+                .map(|b| b.keys)
+                .collect();
+            let n = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), n, "{} 组内有重复键位", group.label());
+        }
+    }
+
+    /// `/keybind` 是本地动作：解析落在本地，`apply_local` 把表写进 transcript，
+    /// **不发请求**、不碰剪贴板。
+    #[test]
+    fn test_keybind_is_local_and_writes_into_transcript() {
+        let mut a = app();
+        assert_eq!(
+            parse("/keybind"),
+            Action::Local(LocalAction::Keybind),
+            "解析必须落到本地动作"
+        );
+        let before = a.transcript.len();
+        apply_local(&mut a, LocalAction::Keybind);
+        assert_eq!(a.transcript.len(), before + 1, "应 push 一条 System 行");
+        let Some(TranscriptLine::System(line)) = a.transcript.last() else {
+            panic!("应写 System 行");
+        };
+        assert!(line.contains("键位："), "正文就是键位表：{line}");
+        assert!(line.contains("Ctrl+Shift+A"), "完整表必须含新增的全选键");
+        assert!(a.pending_clipboard.is_none(), "不得碰剪贴板");
+    }
+
+    /// `Ctrl+C` 同时出现在「提交与退出」与「剪贴板」两组 —— 这是**有意的**：
+    /// 同一个键两种语义，用户必须能在两处都查到。用注释钉住，避免以后被当成重复删掉。
+    #[test]
+    fn test_ctrl_c_is_listed_in_both_groups_on_purpose() {
+        let groups: Vec<KeyGroup> = all_keybindings()
+            .iter()
+            .filter(|b| b.keys == "Ctrl+C")
+            .map(|b| b.group)
+            .collect();
+        assert!(
+            groups.contains(&KeyGroup::Submit),
+            "Ctrl+C 必须列在提交与退出组"
+        );
+        assert!(
+            groups.contains(&KeyGroup::Clipboard),
+            "Ctrl+C 必须列在剪贴板组"
+        );
     }
 
     #[test]

@@ -285,6 +285,15 @@ pub fn handle_key(
     if ctrl {
         match key.code {
             KeyCode::Char('c') => {
+                if app.input.selection().is_some() {
+                    // 有选区时 Ctrl-C 是**复制**（GUI 输入框口径）：搜一下就把选区当命令撤了
+                    // 太容易误伤 —— 而退出/取消两个动作另外都还有键（Ctrl-D / Esc / 再按一次
+                    // Ctrl-C 仅限回合中）。
+                    app.pending_clipboard = app.input.selection_text().map(str::to_owned);
+                    app.input.begin_move(false);
+                    app.input.settle();
+                    return;
+                }
                 if app.is_turning {
                     // 两段式：第一次请求取消，第二次退出。
                     //
@@ -317,11 +326,19 @@ pub fn handle_key(
             // 字符**（Terminal.app / iTerm2 的出厂键映射），而 ⌘ 本身从不交给应用
             // —— 绑这里等价于让「⌘ + 左右」可用。`End` 不动（它归「回到最新消息」，
             // 见模块文档的取舍表）。
+            //
+            // `Ctrl+Shift+A` 是**全选**（多一个键，不动 readline 的 Ctrl-A 语义）：
+            // 大多数终端把 `Ctrl`+`Shift`+字母发成同一个控制字符，而 crossterm 开了
+            // `DISAMBIGUATE_ESCAPE_CODES` 后能拿到 `CSI 97;6u` 这类带修饰键的形态；
+            // 拿不到时它就与 `Ctrl+A` 同义（行首），不丢任何现有行为。
+            KeyCode::Char('a') if shift => app.input.select_all(),
             KeyCode::Char('a') => {
+                app.input.begin_move(false);
                 app.input.cursor_home();
                 return;
             }
             KeyCode::Char('e') => {
+                app.input.begin_move(false);
                 app.input.cursor_end();
                 return;
             }
@@ -365,48 +382,76 @@ pub fn handle_key(
         KeyCode::Char('j') if ctrl => app.input.insert_char('\n'),
         KeyCode::Backspace => app.input.backspace(),
         KeyCode::Delete => app.input.delete_forward(),
-        // 左右归**输入光标**（上下归历史、翻页归聊天 —— 见模块文档的取舍表）。
-        // 带 Ctrl / Alt 时**按词**移动：macOS 的 ⌥←/⌥→ 与多数终端的 Ctrl+←/Ctrl+→
-        // 都落到这一支（终端各自发 `ESC[1;5D` 或 `ESC b` 这类序列，crossterm 解出
-        // 的就是 Left/Right + 修饰键）。终端的键映射若把 ⌘← 发成别的，见 Ctrl-A/E。
-        KeyCode::Left if ctrl || alt => app.input.cursor_word_left(),
-        KeyCode::Right if ctrl || alt => app.input.cursor_word_right(),
-        KeyCode::Left => app.input.cursor_left(),
-        KeyCode::Right => app.input.cursor_right(),
-        // Home 之前未绑定：给输入**行首**（End 保留给「回到最新消息」）
-        KeyCode::Home if !ctrl => app.input.cursor_home(),
-        // `Ctrl` + Home/End：**聊天**的首/末尾（与输入光标的一对 `Ctrl+A/E` 呼应）。
-        // `Ctrl+↑/↓` 是同一组动作的另一种写法（部分用户更习惯方向键）。
-        KeyCode::Home => jump_to_start(app, width, height),
-        KeyCode::End => app.jump_to_end(),
+        // `Ctrl` + Home/End/↑/↓：**聊天**的首/末尾（与输入光标的一对 `Ctrl+A/E` 呼应）。
+        // 不进入下面的输入层分支：这是对话导航，不应碰输入框的光标与选区。
+        KeyCode::Home if ctrl => jump_to_start(app, width, height),
+        KeyCode::End if ctrl => app.jump_to_end(),
         KeyCode::Up if ctrl => jump_to_start(app, width, height),
         KeyCode::Down if ctrl => app.jump_to_end(),
-        // `↑` / `↓`：**先问历史，再退聊天滚动**。
-        //
-        // readline 语义：历史非空就取历史，**与输入框是否已有内容无关** —— 首次按下
-        // 由 `InputHistory::prev` 把输入框现有内容存成草稿，`↓` 越过最新一条时还回来。
-        // 一个例外：历史为空时 `↑` 仍回落成逐行滚动（新会话里不能没有滚动入口）。
-        // 聊天滚动的常备入口因此归 `PageUp` / `PageDown` 与 `Ctrl+↑/↓`（见模块文档）。
-        KeyCode::Up => {
-            if let Some(text) = app.history.prev(&app.input.text) {
-                set_input(app, &text);
-            } else {
-                scroll_clearing_selection(app, width, height, 1);
+        // 方向键在**输入光标与选区**这一层的分工（readline / GUI 输入框同口径）：
+        // - 裸键：移动光标、丢弃选区；`↑↓` **先给输入框**（多行时按视觉行上下），
+        //   已到首/末行才回落历史与聊天滚动 —— 这跟「多行输入框里 ↑ 直接跳历史」
+        //   互斥：有软换行的输入框里 ↑ 是编辑操作，不是导航操作。
+        // - `Shift`：扩选（锚点钉在移动前的位置）；`Ctrl` / `Alt`：按词移动。
+        // - `Ctrl+Shift+←/→`：按词扩选（终端发的是 `CSI 1;6D` 这类，修饰键两个都有）。
+        KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Up
+        | KeyCode::Down => {
+            let extend = shift;
+            app.input.begin_move(extend);
+            match key.code {
+                KeyCode::Left if ctrl || alt => app.input.cursor_word_left(),
+                KeyCode::Right if ctrl || alt => app.input.cursor_word_right(),
+                KeyCode::Left => app.input.cursor_left(),
+                KeyCode::Right => app.input.cursor_right(),
+                KeyCode::Home => app.input.cursor_home(),
+                KeyCode::End => app.input.cursor_end(),
+                KeyCode::Up if shift => {
+                    // Shift+↑：没得扩就**不建空选区**（已到首行，什么都不该发生）。
+                    if !app.input.up() {
+                        app.input.anchor = None;
+                    }
+                }
+                KeyCode::Down if shift => {
+                    if !app.input.down() {
+                        app.input.anchor = None;
+                    }
+                }
+                // 裸 `↑`：先给输入框（多行 / 软换行时按视觉行上移），到顶才回落历史。
+                KeyCode::Up => {
+                    app.input.anchor = None;
+                    if !app.input.up() {
+                        if let Some(text) = app.history.prev(&app.input.text) {
+                            set_input(app, &text);
+                        } else {
+                            scroll_clearing_selection(app, width, height, 1);
+                        }
+                    }
+                }
+                // 裸 `↓`：只在**浏览态**里归历史；否则先给输入框，到底才聊天滚动。
+                KeyCode::Down => {
+                    app.input.anchor = None;
+                    let browsing = app.history.is_browsing();
+                    if !browsing {
+                        if !app.input.down() {
+                            scroll_clearing_selection(app, width, height, -1);
+                        }
+                        app.input.settle();
+                        return;
+                    }
+                    if let Some(text) = app.history.next_entry() {
+                        set_input(app, &text);
+                    }
+                }
+                _ => {}
             }
+            app.input.settle();
         }
         KeyCode::PageUp => {
             scroll_clearing_selection(app, width, height, page_rows(app, width, height))
-        }
-        KeyCode::Down => {
-            // `↓` 只在**浏览态**里归历史；否则一律聊天滚动（向下是高频操作）。
-            // 退出浏览态那一下已经交出了草稿，**不再多滚一次**（`return`）。
-            if app.history.is_browsing()
-                && let Some(text) = app.history.next_entry()
-            {
-                set_input(app, &text);
-                return;
-            }
-            scroll_clearing_selection(app, width, height, -1);
         }
         KeyCode::PageDown => {
             scroll_clearing_selection(app, width, height, -page_rows(app, width, height))
@@ -1304,6 +1349,7 @@ mod tests {
         }
         assert!(a.follow);
 
+        // 空输入框：`↑` 无处可去 ⇔ 回落成逐行滚动（多行 / 软折行时它先给输入光标）。
         handle_key(press(KeyCode::Up), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
         assert_eq!(a.scroll_offset, 1);
         assert!(!a.follow, "向上滚即脱离跟随");
@@ -1332,6 +1378,14 @@ mod tests {
         assert_eq!(a.scroll_offset, 1);
 
         handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        handle_key(
+            with_mod(KeyCode::End, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
         assert_eq!(a.scroll_offset, 0);
         assert!(a.follow);
     }
@@ -1576,13 +1630,23 @@ mod tests {
         assert_eq!(a.input.cursor, 0, "Ctrl-A 到行首");
         assert_eq!(a.input.text, "foo bar", "移动不修改文本");
 
-        // `End` 的语义**不变**（回到最新消息）—— 行尾走 Ctrl-E，不抢 `End`
+        // `End` 的语义**变了**：裸 `End` 归输入行尾（与 `Home` 对称），
+        // 「回到最新消息」走 `Ctrl+End` / `Ctrl+↓`。
         a.follow = false;
         a.scroll_offset = 5;
         handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
-        assert_eq!(a.scroll_offset, 0, "End 仍回聊天底部");
+        assert_eq!(a.input.cursor, 7, "裸 End = 输入行尾");
+        assert_eq!(a.scroll_offset, 5, "裸 End 不再回聊天底部");
+        handle_key(
+            with_mod(KeyCode::End, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "Ctrl+End 回聊天底部");
         assert!(a.follow);
-        assert_eq!(a.input.cursor, 0, "End 不动输入光标");
     }
 
     /// 多行输入下 Ctrl-A / Ctrl-E 只到**本行**首尾（与 `cursor_home`/`cursor_end` 同语义，
@@ -1654,9 +1718,9 @@ mod tests {
         assert_eq!(a.input.text, "", "末尾 Delete 是 no-op");
     }
 
-    /// `Home` 移到**输入行首**；`End` 的聊天滚动语义**不受影响**。
+    /// `Home` 移到**输入行首**，`End` 到**输入行尾**；聊天导航走带 `Ctrl` 的那一组。
     #[test]
-    fn test_home_moves_input_cursor_while_end_still_scrolls() {
+    fn test_home_and_end_are_input_line_scoped() {
         let ch = channels();
         let mut a = app();
         for i in 0..80 {
@@ -1678,13 +1742,43 @@ mod tests {
         assert_eq!(a.scroll_offset, 0);
         assert!(a.follow);
 
-        // End：聊天跳回最新（既有语义），输入光标不动
+        // End：输入行尾（与 Home 对称）—— 这是本轮的反转点。聊天导航改用 Ctrl+End。
         a.follow = false;
         a.scroll_offset = 7;
         handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
-        assert_eq!(a.scroll_offset, 0);
-        assert!(a.follow);
-        assert_eq!(a.input.cursor, 3, "End 不动输入光标");
+        assert_eq!(a.input.cursor, 5, "End = 输入当前行行尾");
+        assert_eq!(a.scroll_offset, 7, "End 不滚聊天");
+    }
+
+    /// `Ctrl+End` / `Ctrl+↓` 才是「跳回最新」；裸 `End` 现在归**输入行尾**。
+    #[test]
+    fn test_ctrl_end_scrolls_while_bare_end_is_input_line_end() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.input.insert_str("ab\ncd");
+        a.input.cursor = 3;
+
+        a.follow = false;
+        a.scroll_offset = 7;
+        handle_key(
+            with_mod(KeyCode::End, KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, 0, "Ctrl+End = 跳回最新");
+        assert_eq!(a.input.cursor, 3, "Ctrl+End 不动输入光标");
+
+        a.follow = false;
+        a.scroll_offset = 7;
+        handle_key(press(KeyCode::End), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.cursor, 5, "裸 End = 输入当前行行尾");
+        assert_eq!(a.scroll_offset, 7, "裸 End 不滚聊天");
     }
 
     /// 多行输入：光标上下移动**不属于**输入（那是聊天滚动/历史），
@@ -2415,14 +2509,26 @@ mod tests {
         }
     }
 
-    /// 选中第二项后填入的必须是第二项（不是第 0 项）。
+    /// 移动高亮后填入的必须是**高亮那一项**（不是第 0 项）。
+    ///
+    /// 按名字断言而不是「按两下到 status」：命令表会增删条目，写死下标会让
+    /// 「表里插一条」变成一个无关测试变红的理由。
     #[test]
     fn test_completion_fills_the_highlighted_item() {
         let ch = channels();
         let mut a = app();
         a.input.insert_str("/");
         key(&mut a, &ch, KeyCode::Tab);
-        key(&mut a, &ch, KeyCode::Down); // → /status
+        let items = a.completion.as_ref().expect("应开浮层").items.clone();
+        let target = items
+            .iter()
+            .position(|i| i.replacement == "/status ")
+            .expect("命令表里应有 /status");
+        assert!(target > 0, "前置：/status 不是第 0 项");
+        for _ in 0..target {
+            key(&mut a, &ch, KeyCode::Down);
+        }
+        assert_eq!(a.completion.as_ref().unwrap().selected, target);
         key(&mut a, &ch, KeyCode::Enter);
         assert_eq!(a.input.text, "/status ");
     }
@@ -2855,5 +2961,181 @@ mod tests {
         assert_eq!(state.items.len(), 1, "{:?}", state.items);
         assert_eq!(state.items[0].replacement, "/commit ");
         assert!(ch.next_request().is_none(), "开浮层不发请求");
+    }
+
+    // -----------------------------------------------------------------------
+    // 输入框选区与按视觉行移动（Ctrl+Shift+A 全选 → 退格清空；Shift+方向 扩选）
+    // -----------------------------------------------------------------------
+
+    /// **用户报的需求**：一个键选中全部输入，然后一下删掉。
+    ///
+    /// 变异：去掉 `Char('a') if shift` 那一支 ⇒ 全选不会发生 ⇒ 退格只删一个字 ⇒ 红。
+    #[test]
+    fn test_ctrl_shift_a_then_backspace_clears_input() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("一段很长的草稿\n还有第二行");
+
+        handle_key(
+            with_mod(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.input.selection().is_some(), "Ctrl+Shift+A 应建立选区");
+        assert_eq!(a.input.cursor, a.input.text.chars().count());
+
+        key(&mut a, &ch, KeyCode::Backspace);
+        assert!(a.input.text.is_empty(), "一下退格清空全部输入");
+        assert_eq!(a.input.cursor, 0);
+        assert_eq!(a.input.anchor, None, "选区被消费掉");
+        assert!(ch.next_request().is_none(), "编辑不发请求");
+    }
+
+    /// 裸 `Ctrl+A` 仍是**行首**（readline）—— 全选用带 `Shift` 的那个键。
+    #[test]
+    fn test_ctrl_a_still_goes_to_line_home() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("aa\nbb");
+
+        handle_key(
+            with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.cursor, 3, "本行行首");
+        assert_eq!(a.input.anchor, None, "不建选区");
+    }
+
+    /// `Shift+←` 扩选，`Shift+→` 缩回去，端点重合即无选区。
+    #[test]
+    fn test_shift_arrows_extend_then_collapse() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("abcdef");
+
+        let shift_left = || KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        handle_key(shift_left(), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        handle_key(shift_left(), &mut a, &ch.req_tx, &ch.bnd_tx, 120, 40);
+        assert_eq!(a.input.selection(), Some((4, 6)), "左移两次选中最后两个字");
+
+        handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.selection(), Some((5, 6)));
+        handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.input.selection(), None, "端点重合 ⇒ 折叠成无选区");
+        // `settle()` 不只是「让 `selection()` 返回 None」：它把 `anchor` 本身清掉。
+        // 留着 `Some(cursor)` 也能被 `selection()` 归一化，但状态会变成「有锚点却没
+        // 选区」—— 下一次 `begin_move(true)` 就不再重钉锚点，选区会从旧位置长出来。
+        assert_eq!(
+            a.input.anchor, None,
+            "折叠时锚点必须清掉，不只是查询时归一化"
+        );
+    }
+
+    /// 有选区时 `Ctrl+C` 是**复制**（不退出、不取消回合），并把文本交给剪贴板通道。
+    ///
+    /// 变异：把那一段换成无条件取消/退出 ⇒ 本用例红（`should_quit` 或 `abort_requested`）。
+    #[test]
+    fn test_ctrl_c_copies_when_input_has_selection() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("待复制的草稿");
+        a.input.select_all();
+
+        handle_key(
+            with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.pending_clipboard.as_deref(), Some("待复制的草稿"));
+        assert!(!a.should_quit, "有选区时 Ctrl-C 不退出");
+        assert!(!a.abort_requested, "也不当作取消");
+        assert_eq!(a.input.selection(), None, "复制后选区收起");
+        assert_eq!(a.input.text, "待复制的草稿", "复制不修改文本");
+    }
+
+    /// 回合中、**无选区**时 `Ctrl+C` 仍是两段式取消/退出（不被复制分支抢走）。
+    #[test]
+    fn test_ctrl_c_without_selection_still_cancels_or_quits() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("abc");
+
+        handle_key(
+            with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.should_quit, "idle 下 Ctrl-C 退出");
+        assert!(a.pending_clipboard.is_none());
+    }
+
+    /// 多行输入里裸 `↑` **动输入光标**，不跳历史、不滚聊天。
+    ///
+    /// 变异：把 `↑` 改回无条件先问历史 ⇒ 光标不动、历史被填入 ⇒ 红。
+    #[test]
+    fn test_bare_up_moves_input_cursor_in_multiline_input() {
+        let ch = channels();
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a.history.record("上一条命令");
+        a.input.insert_str("第一行\n第二行");
+        // 渲染层每帧写入的折行宽度：这里直接给（不经 draw 也能测到编辑语义）。
+        a.input.wrap_width = Some(100);
+        assert_eq!(a.input.cursor, 7);
+
+        key(&mut a, &ch, KeyCode::Up);
+        assert_eq!(a.input.cursor, 3, "移到第一行同列");
+        assert_eq!(a.input.text, "第一行\n第二行", "不拿历史覆盖草稿");
+        assert_eq!(a.scroll_offset, 0, "不滚聊天");
+
+        // 已在首行 ⇒ 才回落历史（readline 语义不变）。
+        key(&mut a, &ch, KeyCode::Up);
+        assert_eq!(a.input.text, "上一条命令");
+    }
+
+    /// 软折行（无 `\n` 但超宽）同样先归输入光标。
+    #[test]
+    fn test_bare_up_follows_soft_wrap_before_history() {
+        let ch = channels();
+        let mut a = app();
+        a.history.record("上一条命令");
+        a.input.insert_str("abcdefgh");
+        a.input.wrap_width = Some(4);
+
+        key(&mut a, &ch, KeyCode::Up);
+        assert_eq!(a.input.cursor, 4, "按视觉行上移，不跳历史");
+        assert_eq!(a.input.text, "abcdefgh");
     }
 }

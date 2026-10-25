@@ -495,7 +495,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | 落点 | 条数 | 覆盖 |
 |---|---|---|
 | `crates/ys-protocol` | 46（其中 `boundary` 18） | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `has_pending_steer`（只看 Steer、不消费、不泄露正文、默认 false）/ `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
-| `crates/ys-tui-coding` | 242（**当前值**） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消）；**本轮 md 渲染 +30**（逐项见 §9.4） |
+| `crates/ys-tui-coding` | 501（**当前值**） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消）；**本轮 md 渲染 +30**（逐项见 §9.4） |
 | `crates/ys-runtime/tests/run_turn_boundary.rs` | 5 | `run_turn` + `AgentPorts` 带 `BoundarySource` 的轮边界语义（跨 crate，不反向依赖 app） |
 | `apps/coding-agent/src/app_loop.rs` | 2 | Prompt → 事件（turn 从 1）→ View；`NewSession` → Output + 刷新快照；**残留 `Abort` 被空闲期丢弃**（变异测试钉住） |
 | `apps/coding-agent/src/capabilities.rs` | 13 | `/login`（成功 / 未知 provider / custom 无 base / 回退）、`/logout`、`/model`（成功 / 缺凭证置空）、`/new`、`/compact`、`/export`（含**自拷贝护栏**变异测试） |
@@ -1277,19 +1277,39 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 
 ### 18.4 键位
 
+> **§18.4 已被 ADR-0057 改写**：`↑↓` 先归输入光标、裸 `End` 归输入行尾、新增输入框选区。
+> 下表是当前形态。
+
 | 键 | 行为 |
 |---|---|
-| `End` / `Ctrl-End` / `Ctrl-Down` | 跳到最新消息 |
-| `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息 |
-| `↑` | **取回会话内历史**（历史非空即取，输入框是否已有字不影响；首次按下把现有内容存成草稿）；历史为空时回落逐视觉行滚动 |
-| `↓` | 浏览态内：往新一条，越过最新即还原草稿并退出浏览态；否则逐视觉行滚动（脱离底部即停止跟随） |
+| `↑` | 输入框**按视觉行上移**（软换行也算一行）→ 到首行才取会话内历史 → 历史空则逐视觉行滚动 | 
+| `↓` | 输入框**按视觉行下移** → 到底才回落：浏览态内取历史下一条（越过最新即还原草稿并退出浏览态），否则逐视觉行滚动 |
 | `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1**（聊天滚动的主入口） |
 | 滚轮 / 触控板上下 | 逐 **1 视觉行**滚动聊天（与输入历史**无关**）；脱离底部即停止跟随 |
-| `Home` | 输入行首（**裸** `Home` 归输入光标，与 `End` 刻意不对称） |
+| `Home` / `End` | 输入**当前行**的行首 / 行尾（与 `Ctrl-A` / `Ctrl-E` 同义；对称） |
+| `Ctrl-End` / `Ctrl-Down` | 跳到最新消息 |
+| `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息 |
+| `←` / `→` | 输入光标（`Ctrl` 或 `⌥` 按词；`⌥b` / `⌥f` 同义） |
+| `Shift` + `←→↑↓ Home End` | **扩选**（锚点钉在移动前的位置；端点重合即收起） |
+| `Ctrl+Shift+A` | **全选输入框** |
+| `Ctrl+C` | **有选区 ⇒ 复制到系统剪贴板**；无选区 ⇒ 取消回合（回合中，再按一次退出）/ 退出 |
+| `Backspace` / `Delete` / 打字 · 粘贴 | 有选区 ⇒ 替换整段；否则删/插一个 char |
+| `Enter` / `Shift`·`Alt+Enter` / `Ctrl+J` | 提交 / 换行 / 换行（终端无关的换行键） |
+| `Tab` | 补全浮层（`/` 开头时） |
+| `Esc` | 取消回合（或命令在飞）→ 否则清空输入 |
+| 左键拖选（Chat） | 应用内选区 + 松手即复制；`⇧`+拖选把原生选择让回终端 |
 
-多行输入框里**上下不移动输入光标**（`InputBuffer` 只有一个 char 索引，无列位置概念）——
-要回到行首 / 行尾、跨行移动或按词移动，用 `Home`、`Ctrl-A` / `Ctrl-E`、`Left` / `Right`、
-`Ctrl`·`⌥` + 左右。
+**`↑↓` 与历史的走廊规则变了**（ADR-0057 决策 4）：软换行让 `↑` 在长草稿里成了编辑操作，
+「无条件先问历史」会把草稿整段换掉。现在输入框有得动就先动它，到边界才回落。
+**代价**：`↑` 取历史要多按几下；`PageUp` / `Ctrl+↑` 不受影响。
+
+**多行输入框现在上下移动输入光标**（`InputBuffer::visual_row_col` / `index_at`，与
+`draw::wrap_input` 同一个折行口径）。折行宽度由 `ui_with` 每帧写进 `InputBuffer::wrap_width`
+—— 缓冲层**不猜**宽度：未写过时 `up()` / `down()` 返回 `false`，直接回落历史/滚动。
+
+**`Ctrl+Shift+A` 的可用性取决于终端**：多数终端把 `Ctrl+Shift+字母` 发成同一个控制字符，
+此时它退化成 `Ctrl+A`（行首）。本仓开了 `DISAMBIGUATE_ESCAPE_CODES`，支持的终端会发
+`CSI 97;6u`，能区分。
 
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
@@ -1305,7 +1325,21 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp / PageDown**
 （须 `fn+↑` / `fn+↓`）。这也是滚轮进应用的直接理由。
 
-TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
+**键位表是结构化数据，不是一段字符串**（ADR-0057 决策 6）：真源是
+`commands::all_keybindings()`（`KeyBinding { keys, action, group, note }`），两个出口
+从它派生：
+
+| 出口 | 内容 |
+|---|---|
+| `/keybind` | **完整表**，按 `KeyGroup`（输入编辑 / 提交与退出 / 滚动与跳转 / 剪贴板 / 鼠标）分段，键列按显示宽度对齐，注意事项单独续行 |
+| `/help` | 命令索引 + 一段**高频摘要**（`KEY_HELP_BRIEF`），结尾指向 `/keybind` |
+
+分两个出口的理由：`/help` 是命令索引，二十条键位会把它要查的命令挤出屏幕；而键位是
+「试不出来就等于没有」的那类信息，需要一个能整屏读完、且与实现同源的出口。
+
+**上一轮的偏差正是这个结构缺口的产物**：`/help` 里那段写死为字符串，实现改了（`End`
+归输入行尾、`↑` 先归输入光标）而文案没跟上。结构化之后两个出口共用同一批事实，
+`/keybind` 用例逐条断言「每一条 `all_keybindings()` 都出现在输出里」，漂移即红。
 
 ### 18.5 会话内输入历史 — as-built
 
@@ -1313,7 +1347,7 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
 
 - **只记进程内的提交原文**（`events::submit` 在非空白时才调 `record`）—— 含 `/` 命令与多行原文，不改写。**不落盘、不跨会话、不跨 `--resume`**。
 - **`/new` / `/resume` 都不清空它**：它记的是「本进程里敲过什么」，与当前打开哪个会话无关。
-- **走廊规则**：`↑` 只要**历史非空**就取历史（与输入框是否已有内容无关）；历史为空时回落成逐视觉行滚动。`↓` **只在浏览态**归历史，其余一律滚动 —— 聊天滚动的主入口是 `PageUp` / `PageDown` 与 `Ctrl+↑/↓`。
+- **走廊规则（ADR-0057 改写）**：`↑` 先给**输入框**（按视觉行上移，到首行才继续）→ 再问历史（非空即取，与输入框是否已有内容无关）→ 历史空则回落逐视觉行滚动。`↓` 对称：输入框下移 → 到底才回落（浏览态内取历史下一条，否则滚动）—— 聊天滚动的主入口仍是 `PageUp` / `PageDown` 与 `Ctrl+↑/↓`。
 - **草稿**：首次进入浏览时存下输入框原文（含多行 / CJK，原样），`↓` 越过最新一条就还原它并退出浏览态（readline 语义）。
 - **去重与上限**：与上一条逐字相同的**不重复入栈**；`MAX_ENTRIES = 200`，超出丢最旧。
 
@@ -1329,11 +1363,24 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
 - **鼠标捕获期间终端原生拖选失效** ⇒ 已由应用内选区补上（ADR-0051：裸左键拖选 =
   应用内选区 + 松手即复制）。选区自身的代价见 §18.7。
 - **模态浮层不吃滚轮**：浮层自读事件、`_ => {}` 掉鼠标 —— 浮层内容尚不滚动（见 `docs/TODO.md` §C）。
+- **`Ctrl+Shift+A` 在部分终端按不出来**（`Ctrl+Shift+字母` 被压成同一个控制字符 ⇒ 退化成 `Ctrl+A`）。
+  有 `DISAMBIGUATE_ESCAPE_CODES` 的终端（kitty / WezTerm / foot / Windows Terminal 等）能区分。
+- **`↑` 取历史的路径变长**：输入框多行 / 软折行时须先回到首行（ADR-0057 决策 4 的代价）。
+- **`xsel` 复制后不退出**：X11 selection 的拥有者必须是个活进程 ⇒ 下一个 `xsel` 接管时它才退。
+  这不是泄漏，但 `ps` 里会看到它。
 
 ### 18.7 文本选区与松手复制 — as-built
 
-鼠标左键拖选 Chat 区 ⇒ 应用内反显高亮；松手把**屏幕字形**写进系统剪贴板（OSC 52）。
+鼠标左键拖选 Chat 区 ⇒ 应用内反显高亮；松手把**屏幕字形**写进系统剪贴板。
 消掉了「复制内容要靠终端给不给修饰键」这一跳终端差异（ADR-0051）。
+
+**出口（ADR-0057 已改）**：不再只发 OSC 52，而是**本机工具 + OSC 52 双发**（见上节
+「复制出口」）。原实现只发 OSC 52，而 VS Code 的 xterm.js 不实现它 —— 那正是主要使用场景，
+于是「复制成功」在这类终端上一直是幻觉。
+
+**输入框也有选区了**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+Shift+A` 全选、
+`Shift+方向` 扩选、有选区时 `Ctrl+C` 复制、编辑键替换整段。高亮走同一口径
+（`Modifier::REVERSED`）且与 `draw::wrap_input` **共用折行结果** —— 另算一份就会错位。
 
 **模块划分**（唯一新文件 `crates/ys-tui-coding/src/selection.rs`）：
 
@@ -1365,6 +1412,13 @@ Chat / Input / Status 三块。`ui_with` 已切出 `chunks[]`，故高亮层**�
 > ⚠️ **`win_rev` 用的是 `rev_alloc` 而不是 `revision_range`**：后者把「窗口首条目内偏移」
 > 折进了哈希，而滚动本身就会改这个偏移 —— 拿它做键的话「纯滚动」永远被判成内容变化，
 > 槽环永远不会生效。代价是窗口**外**条目重渲也会打一次全量重建（正确性优先）。
+
+**复制出口**（ADR-0057 决策 1）：`write_clipboard` = **本机工具 + OSC 52 双发**。
+本机工具按序试 `wl-copy`（仅 Wayland）→ `xsel --clipboard --input` → `xclip -selection clipboard` →
+`pbcopy` → `wl-copy` → `clip.exe`，命中即返回，文本写进子进程 stdin 后**立即关 stdin**
+（`xsel` 靠 EOF 判断粘完，但它写完不自己退 —— X11 selection 的拥有者必须是个活进程，
+故不 wait、不 kill）。OSC 52 仍然发：那是 SSH / 容器 / tmux 里**唯一**可用的通路。
+两条都失败时静默（写入无应答可等，探测做不到），用户退路是 `⇧`+拖选。
 
 **复制上限** `COPY_MAX_BYTES = 256 KiB`：超限**不复制**、不静默截断，transcript 回一行提示。
 **自动滚动**：`DRAG_TICK = 16ms` 可变 poll 周期 + `step = clamp(1 + held_ms/40, 1, 8)`，

@@ -158,6 +158,10 @@ fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
     ])
     .split(area);
 
+    // 输入框宽度的**唯一写入处**：方向键的「按视觉行上下」需要与屏幕相同的折行宽度，
+    // 而缓冲层拿不到终端尺寸。写在这里（每帧、每个渲染入口都经过）⇒ 只要画过一帧就已知。
+    app.input.wrap_width = Some(input_inner_width(area.width));
+
     draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
     // 选区高亮**独立一行**：它需要 `&mut app`（写字形缓存），不能塞进 `draw_transcript`。
     // 内区几何在**整屏** `area` 上算好再传下去 —— 高亮层不得再从 `chunks[0]` 推一遍：
@@ -338,12 +342,25 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     // turn 进行中也照常渲染输入缓冲与光标：`Working` 心跳只由状态行承担。
     // 视觉行超过 pane 时滚动，让光标所在行可见（贴住窗口底部）。
     let offset = cursor_row.saturating_sub(inner_h.saturating_sub(1));
+
+    // 选区高亮与光标**共用这一份折行结果**：`rows` 已折好，逐行取选区相交的列区间即可。
+    // 重算一份就会「高亮框与文字错一位」。
+    let sel_cells = input_selection_cells(app, &rows, inner_w, inner_h, offset);
+
     frame.render_widget(
         Paragraph::new(rows.join("\n"))
             .block(block)
             .scroll((offset.min(u16::MAX as usize) as u16, 0)),
         area,
     );
+
+    // 选区反显：与 Chat 选区同口径（`Modifier::REVERSED`，见 `selection.rs::Highlight`）。
+    // 颜色刻意不猜 —— 主题里没有「选区色」这一个槽，反显对任何前景色都可见。
+    let x0 = inner.x;
+    for (x, y) in sel_cells {
+        let cell = &mut frame.buffer_mut()[(x0 + x, inner.y + y)];
+        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+    }
 
     let row = cursor_row - offset;
     if row < inner_h && cursor_col < inner_w {
@@ -352,6 +369,80 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             inner.y + row as u16,
         ));
     }
+}
+
+/// 输入框选区的**屏幕内相对**单元格 `(x, y)`（相对内区左上角）。
+///
+/// 入参是已折好的 `rows`（[`wrap_input`] 的产物）—— 本函数不重算折行，只把
+/// `(lo, hi)` 两个 char 索引映射到「第几个视觉行 + 该行内的显示列区间」。
+/// 只给当前可见窗口（`offset..offset + inner_h`）内的行产出格子。
+fn input_selection_cells(
+    app: &App,
+    rows: &[String],
+    inner_w: usize,
+    inner_h: usize,
+    offset: usize,
+) -> Vec<(u16, u16)> {
+    let Some((lo, hi)) = app.input.selection() else {
+        return Vec::new();
+    };
+    // char 索引 → (视觉行, 行内显示列)：与 `wrap_input` **同一个**贪心折行口径
+    // （宽字符算 2 列、`\n` 断行），但不需要光标，只需两个端点。
+    let pos_of = |target: usize| -> (usize, usize) {
+        let mut row = 0usize;
+        let mut col = 0usize;
+        for (i, ch) in app.input.text.chars().enumerate() {
+            if i == target {
+                return (row, col);
+            }
+            if ch == '\n' {
+                row += 1;
+                col = 0;
+                continue;
+            }
+            let cw = display_width(&ch.to_string()).max(1);
+            if col + cw > inner_w.max(1) && col > 0 {
+                row += 1;
+                col = 0;
+            }
+            col += cw;
+        }
+        (row, col)
+    };
+    let (start_row, start_col) = pos_of(lo);
+    let (end_row, end_col) = pos_of(hi);
+
+    let mut cells = Vec::new();
+    for (row, line) in rows
+        .iter()
+        .enumerate()
+        .skip(start_row)
+        .take(end_row + 1 - start_row)
+    {
+        let y = row as isize - offset as isize;
+        if y < 0 || y as usize >= inner_h {
+            continue;
+        }
+        // 本行的选区列区间：首行从 `start_col` 起、末行到 `end_col` 止，中间行满宽。
+        let w = display_width(line);
+        let from = if row == start_row {
+            start_col.min(w)
+        } else {
+            0
+        };
+        let to = if row == end_row {
+            end_col.min(w)
+        } else {
+            // 折行时末尾可能**正好**填满：`from..w` 已包含全部格子，不额外加 `inner_w`。
+            w
+        };
+        for x in from..to {
+            if x < inner_w {
+                cells.push((x as u16, y as u16));
+            }
+        }
+    }
+    cells
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
@@ -1155,7 +1246,10 @@ pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
 
 /// 一个字符串的**显示宽度**（CJK = 2 列）——直接借 ratatui 的 unicode-width 口径，
 /// 保证与渲染一致。
-fn display_width(s: &str) -> usize {
+///
+/// `pub(crate)`：`input.rs` 的视觉行移动（`Up` / `Down`）必须用**同一个**宽度口径，
+/// 否则「按 ↑ 换行」与屏幕上的折行对不上。
+pub(crate) fn display_width(s: &str) -> usize {
     Span::raw(s).width()
 }
 
@@ -2903,11 +2997,20 @@ mod tests {
         let (row0, _) = first.iter().find(|(_, rev)| *rev).expect("应有一行高亮");
         assert!(row0.contains("/help"), "初始高亮第 0 项：{row0}");
 
-        state.move_down();
+        // 下移到 /status（按**名字**定位：命令表增删不该让本用例变红）。
+        let items = state.items.clone();
+        let target = items
+            .iter()
+            .position(|i| i.replacement == "/status ")
+            .expect("命令表里应有 /status");
+        assert!(target > 0, "前置：/status 不是第 0 项");
+        for _ in 0..target {
+            state.move_down();
+        }
         app.completion = Some(state.clone());
         let second = rows_with_reverse(&mut app, 120, 40);
         let (row1, _) = second.iter().find(|(_, rev)| *rev).expect("应有一行高亮");
-        assert!(row1.contains("/status"), "下移后高亮第 1 项：{row1}");
+        assert!(row1.contains("/status"), "下移后高亮 /status：{row1}");
         assert_ne!(row0, row1, "高亮行必须换了一行");
 
         // 只应有一行高亮
@@ -3610,5 +3713,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 输入框选区高亮必须落在**它自己的字上**（与 Chat 选区同一口径：`REVERSED`）。
+    ///
+    /// 变异：把 `input_selection_cells` 的 `pos_of` 换成「按 char 数当列」⇒ CJK 下
+    /// 高亮只覆盖 5 格而不是 7 格（`中文` 每字 2 列）⇒ 红。
+    ///
+    /// 断言用**列区间**而不是「找子串」：宽字符的续格在 `Buffer` 里是空格，
+    /// 屏幕上是 `中 文 abc`，按字符画去找原文必然找不到。
+    #[test]
+    fn input_selection_highlights_exactly_the_selected_glyphs() {
+        const W: u16 = 40;
+        const H: u16 = 20;
+        let mut app = app_with(CodingView::for_test());
+        app.input.insert_str("中文abc");
+        app.input.select_all();
+        let buf = {
+            let backend = TestBackend::new(W, H);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| ui(f, &mut app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        // 输入框内区首行：找画了文字的那一行（反显前先确认有内容）。
+        let mut hits: Vec<(u16, u16)> = Vec::new();
+        for y in 0..H {
+            for x in 0..W {
+                if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                    hits.push((x, y));
+                }
+            }
+        }
+        assert!(!hits.is_empty(), "全选后必须有高亮格");
+        let y = hits[0].1;
+        assert!(hits.iter().all(|h| h.1 == y), "单行输入应只高亮一行");
+
+        // 「中文」= 4 列 + 「abc」= 3 列 ⇒ 内区 0..7（内区左边框占 1 列）。
+        //
+        // 少掉的 2 / 4 是**宽字符的续格**：终端用首格的 SGR 把两列一起涂，续格
+        // （`Cell::skip`）根本不会被 diff-writer 写出去，故它不承载样式。
+        // 反过来说，只要首格在，屏幕上就是整字反显 —— 断言只列首格与半角格。
+        let cols: Vec<u16> = hits.iter().map(|h| h.0).collect();
+        assert_eq!(cols, vec![1, 3, 5, 6, 7], "高亮列区间不对：{cols:?}");
+    }
+
+    /// 无选区时 **一格**都不反显（否则“全选框”会永久挂在输入框上）。
+    #[test]
+    fn input_without_selection_has_no_highlight() {
+        const W: u16 = 40;
+        const H: u16 = 20;
+        let mut app = app_with(CodingView::for_test());
+        app.input.insert_str("abc");
+        let backend = TestBackend::new(W, H);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let count = buf
+            .content()
+            .iter()
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .count();
+        assert_eq!(count, 0, "无选区时全屏不得有 REVERSED 格");
+    }
+
+    /// 渲染一帧就会把折行宽度写回缓冲 —— 方向键的视觉行移动靠它。
+    ///
+    /// 变异：删掉 `ui_with` 里那行 `wrap_width = ...` ⇒ 本用例红（`None`）。
+    #[test]
+    fn render_records_input_wrap_width() {
+        const W: u16 = 40;
+        const H: u16 = 20;
+        let mut app = app_with(CodingView::for_test());
+        assert_eq!(app.input.wrap_width, None, "初始未知");
+        let _ = rows_of(&mut app, W, H);
+        assert_eq!(
+            app.input.wrap_width,
+            Some(W as usize - 2),
+            "内区宽 = 总宽 − 边框"
+        );
     }
 }

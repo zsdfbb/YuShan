@@ -423,14 +423,37 @@ mod tests {
         }
     }
 
-    /// `/theme` 在**三个面**上同源：命令表（15 条）、补全浮层（`/them` → `theme`、
+    /// `/keybind` 必须出现在**补全浮层**与 `/help` 里 —— 否则用户不知道有这个命令
+    /// （它是「试不出来就等于没有」的那类信息的出口）。
+    #[test]
+    fn test_keybind_is_discoverable_via_completion_and_help() {
+        let items = matches("/keyb");
+        assert!(
+            items.iter().any(|i| i.replacement == "/keybind "),
+            "补全必须给出 /keybind：{items:?}"
+        );
+        let help = crate::commands::help_text();
+        assert!(help.contains("/keybind"), "命令索引必须列 keybind");
+    }
+
+    /// `/theme` 在**三个面**上同源：命令表、补全浮层（`/them` → `theme`、
     /// `/th` → thinking + theme）、`/help` 正文。
     ///
     /// 变异：从 `COMMANDS` 里删掉 `theme` 条目 ⇒ 下面三条断言全部变红。
+    ///
+    /// **不写死条数**：命令表会增删条目，写死会让「插一条命令」变成无关测试变红的
+    /// 理由。真正要守的是**无重名**（重名会让补全出现两行一样的、而解析只走一条）。
     #[test]
     fn test_theme_in_commands_and_completion() {
         let specs = all_commands();
-        assert_eq!(specs.len(), 15, "命令表应有 15 条（新增 theme）");
+        let mut names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        names.sort_unstable();
+        let deduped = {
+            let mut n = names.clone();
+            n.dedup();
+            n
+        };
+        assert_eq!(names, deduped, "命令表不得有重名");
         let theme = specs
             .iter()
             .find(|s| s.name == "theme")

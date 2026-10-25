@@ -28,6 +28,7 @@
 
 use std::fmt;
 use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -185,6 +186,41 @@ fn setup_terminal() -> Result<Term, TuiError> {
     Ok(terminal)
 }
 
+/// 消费**一轮**里排好的事件，并在同一个轮次里把剪贴板写出去。
+///
+/// 三件事的顺序是承重的：
+///
+/// 1. 合并后的**鼠标**事件（拖选松手 → `pending_clipboard`）；
+/// 2. 被推迟的**非鼠标**事件（`Ctrl+C` 复制、`/copy`、粘贴）；
+/// 3. 排空 `pending_clipboard` 写剪贴板。
+///
+/// **2 必须在 3 之前**：键盘那条路也写 `pending_clipboard`，反过来排会让
+/// 「按 Ctrl+C 复制」晚一个事件才生效（用户看到的是「没反应」）。
+/// 抽成自由函数是为了让这个顺序可测（`test_round_writes_clipboard_from_deferred_key`）——
+/// 塞在 `event_loop` 里就只能靠人读。参数多恰是它的形态：它要转交两个信道、尺寸与
+/// 剪贴板出口，收成一个结构体只会让「顺序」这件事更难看出来。
+#[allow(clippy::too_many_arguments)]
+fn handle_round(
+    app: &mut App,
+    mouse: Option<Event>,
+    deferred: Option<Event>,
+    requests: &Sender<Request>,
+    boundaries: &Sender<Boundary>,
+    width: u16,
+    height: u16,
+    clip: &mut impl FnMut(&str),
+) {
+    if let Some(m) = mouse {
+        events::handle_event(m, app, requests, boundaries, width, height);
+    }
+    if let Some(other) = deferred {
+        events::handle_event(other, app, requests, boundaries, width, height);
+    }
+    if let Some(text) = app.pending_clipboard.take() {
+        clip(&text);
+    }
+}
+
 fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -238,9 +274,16 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                 }
                 crossterm::event::read().ok()
             });
-            if let Some(m) = mouse {
-                events::handle_event(m, app, requests, boundaries, size.width, size.height);
-            }
+            handle_round(
+                app,
+                mouse,
+                deferred,
+                requests,
+                boundaries,
+                size.width,
+                size.height,
+                &mut write_clipboard,
+            );
             // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
             // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
             if let Some(kind) = app.pending_prompt.take() {
@@ -252,14 +295,6 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                     &mut outbound_open,
                     requests,
                 );
-            }
-            // 松手复制要**当场**写剪贴板，不等下一个非鼠标事件。
-            if let Some(text) = app.pending_clipboard.take() {
-                write_clipboard(&text);
-            }
-            // 被推迟的非鼠标事件：本轮消费，不丢。
-            if let Some(other) = deferred {
-                events::handle_event(other, app, requests, boundaries, size.width, size.height);
             }
         }
 
@@ -741,17 +776,16 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(
 ///
 /// 形如 `ESC ] 52 ; c ; <base64> BEL`。
 ///
-/// # 为什么是 OSC 52 而不是平台命令
+/// # 为什么保留 OSC 52（已有本机工具了）
 ///
-/// `pbcopy` / `wl-copy` / `clip.exe` 是三个平台三份实现，且经管道传给它们会把
-/// 内容留在进程参数 / 临时文件里；OSC 52 是终端自己实现的剪贴板协议，一条转义
-/// 序列搞定，且能穿透 `tmux` / `screen`（它们默认透传，可配 `set-clipboard on`）。
+/// 它是**唯一**能穿过 SSH / 容器 / tmux（配 `set-clipboard on`）的通道：那些环境里没有
+/// 本机工具可用，剪贴板在终端那一侧。与 [`write_system_clipboard`] 是两条互补的路。
 ///
 /// # 已知边界
 ///
-/// 个别终端默认**禁用** OSC 52（防恶意程序写剪贴板），此时本序列会被静默忽略。
-/// 本函数不探测、不重试 —— 写入是单向的，无应答可等；失败时用户仍可用 `⇧`+拖选
-/// （若终端支持）作为退路。
+/// 不少终端默认**禁用** OSC 52（防恶意程序写剪贴板）：VS Code 的 xterm.js 至今未实现
+/// 它，有些只支持读不支持写。此时本序列会被静默忽略 —— 这正是本仓库不再只靠它的理由
+/// （本机工具是那条路的兜底）。
 ///
 /// # 为什么内联 base64 而不引 crate
 ///
@@ -787,12 +821,91 @@ fn clipboard_sequence(text: &str) -> String {
     out
 }
 
-/// 把文本写进终端剪贴板。best-effort：写失败不改任何状态（`/copy` 已在 transcript
-/// 里给过确认行，静默失败只会让用户重试一次，不会让界面停在半态）。
+/// 把文本写进**系统**剪贴板。
+///
+/// 两条路**都走**，不去探测终端支不支持 OSC 52：
+///
+/// 1. **终端原生工具**（`xsel` / `xclip` / `pbcopy` / `wl-copy` / `clip.exe`）—— 命中即
+///    真的进了系统剪贴板，`⇧`+拖选之外的任何粘贴入口都能用（包括在别的 app 里粘贴）。
+/// 2. **OSC 52** —— 兜住 SSH / 无 X 的环境，且终端若把它落到自己的剪贴板就同样可用。
+///
+/// 为什么不二选一：两者**互不排斥**，而失败都是静默的（终端可以忽略 OSC 52；没有工具的
+/// 机器上命令直接 `ENOENT`）。分头探测得先知道「终端到底支不支持」，那个信息拿不到
+/// （写入是单向的，无应答可等），所以只能两边都发。
+///
+/// **写第一条**的是工具：它成功时 OSC 52 只作冗余；工具不存在时序列已经发出去了。
 fn write_clipboard(text: &str) {
+    write_system_clipboard(text);
     let mut out = std::io::stdout();
     let _ = out.write_all(clipboard_sequence(text).as_bytes());
     let _ = out.flush();
+}
+
+/// 各平台的剪贴板写入命令（**只选本机存在的一个**，按序优先）。
+///
+/// `WAYLAND_DISPLAY` 有值时 Wayland 工具优先：Wayland 会话里 `xsel` 可能连得上（XWayland），
+/// 但写进去的剪贴板只有 X 客户端看得见，浏览器 / 原生 Wayland 应用粘不到 ——
+/// 那比「写不进去」更难排查。
+fn clipboard_writers() -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut v: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|s| !s.is_empty()) {
+        v.push(("wl-copy", vec![]));
+    }
+    v.push(("xsel", vec!["--clipboard", "--input"]));
+    v.push(("xclip", vec!["-selection", "clipboard"]));
+    v.push(("pbcopy", vec![]));
+    v.push(("wl-copy", vec![]));
+    v.push(("clip.exe", vec![]));
+    v
+}
+
+/// 本机命令行剪贴板工具（不依赖任何 crate）。
+///
+/// **全异步**：写入要 fork/exec 一个进程，而 UI 线程是个 `block_on` 驱动的大循环
+/// （见 `lib.rs` 的线程模型）；同步等子进程退出会在每次复制上搭一笔进程启动成本。
+/// 于是 `spawn` 之后立即返回，由子进程自己等 stdin 关、自己退。
+///
+/// **stdin 写完就 drop**：`xsel` / `xclip` 靠 stdin 的 EOF 判断「粘完了」，不关它们
+/// 会永远挂着（不单是泄漏 —— `xsel` 会一直占着 clipboard selection）。
+///
+/// 进程组：子进程是 UI 线程的直系子进程，不额外 `setsid` —— 它是一个短命进程，
+/// 且 stdin 已关，不会读到终端的输入。
+fn write_system_clipboard(text: &str) {
+    for (program, args) in clipboard_writers() {
+        if spawn_writer(program, &args, text) {
+            return;
+        }
+    }
+}
+
+/// 启动一个写入工具并把 `text` 输到它的 stdin；`true` = 成功发出。
+///
+/// 抽成函数是为了可测：「子进程真的收到了字节」与「stdin 已关」两件事都能用
+/// `sh -c 'cat > 文件'` 当假工具验到（见单测 `test_spawn_writer_feeds_child_stdin`）。
+///
+/// 返回后**不等子进程**（见 [`write_system_clipboard`]）。
+fn spawn_writer(program: &str, args: &[&str], text: &str) -> bool {
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        // 工具不存在 / 无权限：试下一个。**不打印** —— 复制失败时界面多一行
+        // 与操作无关的报错，比静默失败更吵。
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+        // drop 即关闭 ⇒ 子进程读到 EOF，开始退出。
+    }
+    // `xsel` **写完后不会自己退**：它要一直持有 selection，直到别的程序接管它
+    // （这是 X11 clipboard 的语义：selection 的拥有者必须是个活进程）。
+    // 于是这里**不** wait、不 kill —— 让它后台挂着；下次复制时新的 `xsel` 会
+    // 接管 selection，旧的自动退出。
+    true
 }
 
 /// 终端状态恢复的字节序列：开换行 / 退 alt-screen / 关括号粘贴 / 关鼠标捕获 / 弹键盘增强。///
@@ -1076,6 +1189,7 @@ fn theme_index(kind: ThemeKind) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     // -----------------------------------------------------------------------
     // `/copy` 的载荷：OSC 52 剪贴板序列（含内联 base64）
@@ -1090,6 +1204,150 @@ mod tests {
         assert!(seq.starts_with("\x1b]52;c;"), "前缀不对：{seq:?}");
         assert!(seq.ends_with('\x07'), "须以 BEL 终止：{seq:?}");
         assert_eq!(&seq[7..seq.len() - 1], "aGk=", "payload 应为 base64");
+    }
+
+    /// **一轮里排空剪贴板的顺序**：被推迟的键盘事件必须先被处理，否则
+    /// 「按 `Ctrl+C` 复制」要等下一个事件才生效（用户看到的是「没反应」）。
+    ///
+    /// 这是 `handle_round` 的存在理由 —— 变异：把 `deferred` 那段挪到 `clip` 之后
+    /// ⇒ 本用例红（`clip` 收到零次调用）。
+    #[test]
+    fn test_round_writes_clipboard_from_deferred_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (req_tx, _req_rx) = mpsc::channel(8);
+        let (bnd_tx, _bnd_rx) = mpsc::channel(8);
+        let mut app = App::new(CodingView::for_test());
+        app.input.insert_str("要复制的草稿");
+        app.input.select_all();
+
+        // 键盘事件走的是 `deferred`（鼠标合并时被推迟的那条路）。
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let mut written: Vec<String> = Vec::new();
+        handle_round(
+            &mut app,
+            None,
+            Some(key),
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |t: &str| written.push(t.to_string()),
+        );
+        assert_eq!(
+            written,
+            vec!["要复制的草稿".to_string()],
+            "同一轮里就要写出"
+        );
+        assert!(app.pending_clipboard.is_none(), "写完即清");
+    }
+
+    /// 没有可写内容时**一届都不调**（不得凭空写空串 —— 那会清空用户的剪贴板）。
+    #[test]
+    fn test_round_without_clipboard_never_calls_writer() {
+        let (req_tx, _req_rx) = mpsc::channel(8);
+        let (bnd_tx, _bnd_rx) = mpsc::channel(8);
+        let mut app = App::new(CodingView::for_test());
+        let mut calls = 0;
+        handle_round(
+            &mut app,
+            None,
+            None,
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |_: &str| calls += 1,
+        );
+        assert_eq!(calls, 0);
+    }
+
+    /// 本机剪贴板工具链的**形态**：每个候选都带完整参数，且 `xsel` 明确指定
+    /// `--clipboard`（不带它写的是 PRIMARY selection，而粘贴读的是 CLIPBOARD）。
+    ///
+    /// 变异：把 `xsel` 的参数删成空 ⇒ 本用例红（那是「复制了但粘不出来」的真实形态）。
+    #[test]
+    fn test_clipboard_writers_are_well_formed() {
+        let writers = clipboard_writers();
+        let xsel = writers
+            .iter()
+            .find(|(p, _)| *p == "xsel")
+            .expect("xsel 必须在候选链里");
+        assert_eq!(
+            xsel.1,
+            vec!["--clipboard", "--input"],
+            "xsel 必须写 CLIPBOARD"
+        );
+        let xclip = writers
+            .iter()
+            .find(|(p, _)| *p == "xclip")
+            .expect("xclip 必须在候选链里");
+        assert_eq!(xclip.1, vec!["-selection", "clipboard"]);
+        // macOS / Windows 兜底：两个都不带参数（它们本来就只写剪贴板）。
+        assert!(writers.iter().any(|(p, a)| *p == "pbcopy" && a.is_empty()));
+        assert!(writers.iter().any(|(p, _)| *p == "clip.exe"));
+    }
+
+    /// 子进程**真的收到了字节**，且 stdin 被关（否则工具永远等 EOF）。
+    ///
+    /// 用 `sh -c 'cat > 文件'` 当假工具：它读到 EOF 就退，文件内容即 stdin 的全部字节。
+    ///
+    /// 变异：把 `drop(stdin)` 删掉（守着 `stdin` 不放）⇒ `cat` 永不退 ⇒ 文件为空 ⇒ 红。
+    #[test]
+    fn test_spawn_writer_feeds_child_stdin_and_closes_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "yushan-clip-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("got.txt");
+        let script = format!("cat > {}", out.display());
+        let ok = spawn_writer("sh", &["-c", &script], "剪贴板内容 abc");
+        assert!(ok, "spawn 应成功");
+
+        // 子进程是异步的：等文件写出内容（最多 2s），不 sleep 一个固定值。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = String::new();
+        while Instant::now() < deadline {
+            got = std::fs::read_to_string(&out).unwrap_or_default();
+            if got == "剪贴板内容 abc" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(got, "剪贴板内容 abc", "子进程 stdin 内容应当是待复制文本");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 命令不存在时返回 `false`（让调用方试下一个），不 panic。
+    #[test]
+    fn test_spawn_writer_reports_missing_program() {
+        assert!(!spawn_writer("yushan-no-such-clipboard-tool-xyz", &[], "x"));
+    }
+
+    /// Wayland 会话里 `wl-copy` 必须**排第一**：挂在 XWayland 上的 `xsel` / `xclip`
+    /// 写得进去，但原生 Wayland 应用（含浏览器）粘不到。
+    ///
+    /// 变异：把 wl-copy 的优先级顺序调换 ⇒ 本用例红。
+    #[test]
+    fn test_clipboard_writer_prefers_wayland_when_present() {
+        // 进程级 env 改写：本仓的 tui crate 里只有这一处需要，故就地锁一把，
+        // 不去引 apps 侧的 `test_env`（方向不允许：tui 不依赖 apps）。
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("WAYLAND_DISPLAY");
+        // SAFETY: 已持锁，同一时刻只有一个测试改这个变量。
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", "wayland-9") };
+        let first = clipboard_writers()[0].0;
+        match prev {
+            // SAFETY: 同上。
+            Some(v) => unsafe { std::env::set_var("WAYLAND_DISPLAY", v) },
+            None => unsafe { std::env::remove_var("WAYLAND_DISPLAY") },
+        }
+        assert_eq!(first, "wl-copy", "Wayland 会话里 wl-copy 必须优先");
     }
 
     /// base64 三种余数（0/1/2 字节）都要对 —— 这是手写编码最容易错的地方。

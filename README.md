@@ -46,7 +46,7 @@ $ ys-coding-agent --json "跑一遍测试"    # 事件流，给别的程序吃
 | 项目 | 常驻 | 是 YuShan 的 | 进程数 | 技术栈 |
 |---|---|---|---|---|
 | **YuShan** | **23 MiB** | **1×** | 1 | Rust |
-| codewhale | 132–169 MiB | 6–7× | 3 | TypeScript |
+| codewhale | 132–169 MiB | 6–7× | 3 | Rust |
 | Pi | 142–145 MiB | 6× | 1 | TypeScript |
 | Claude Code | 262–263 MiB | 11× | 1 | TypeScript |
 | Codex CLI | 349–357 MiB | 15× | 4–5 | Rust + Node |

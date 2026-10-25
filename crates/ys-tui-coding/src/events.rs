@@ -108,7 +108,11 @@
 //! - **模态浮层不吃滚轮**：浮层自己读事件（`run.rs` 的 `Prompter` 实现），它 `_ => {}`
 //!   掉鼠标 —— 浮层内容不滚动，捕获仍开着只为不丢状态。
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use std::time::Instant;
+
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use tokio::sync::mpsc::Sender;
 use ys_core::Message;
 use ys_protocol::{Boundary, Request};
@@ -116,6 +120,7 @@ use ys_protocol::{Boundary, Request};
 use crate::app::{App, message_text};
 use crate::commands::{self, Action};
 use crate::completion;
+use crate::transcript::TranscriptLine;
 
 /// 处理一个 crossterm 事件。
 pub fn handle_event(
@@ -131,27 +136,127 @@ pub fn handle_event(
         // bracketed paste：多行粘贴**不得**被当多次提交
         Event::Paste(text) => app.input.insert_str(&text),
         // 滚轮 / 触控板：**滚聊天**，与 `↑↓` 的历史语义无关（见模块文档）。
-        // 其余鼠标事件（按下 / 松开 / 拖动 / 悬停）一律忽略 —— 不绑点击，避免与
-        // 用户在终端里的原生拖选抢事件。
-        Event::Mouse(m) => handle_mouse(m.kind, app, width, height),
-        // 尺寸变化由 ratatui 在下次 draw 时自动响应（wrap 行数随之重算）
-        Event::Resize(_, _) => {}
+        // 左键三态归应用内选区（ADR-0051）；其余鼠标事件（水平滚动 / 悬停）忽略。
+        Event::Mouse(m) => handle_mouse(m, app, width, height),
+        // 宽度变 ⇒ 折行重排 ⇒ 行号空间整个换掉（设计 §2.3 第 1 条）：选区必清。
+        Event::Resize(_, _) => app.selection.clear(),
         _ => {}
     }
 }
 
-/// 鼠标事件：只认**滚轮上下**，其余忽略（见模块文档「滚轮」段）。
+/// 鼠标事件。
 ///
-/// 步长取 **1 视觉行** —— 与 `↑` 在「历史为空」时的回落一致，方向也一致
-/// （`ScrollUp` 往旧内容、`ScrollDown` 往新）。触摸板的连续滑动会被终端合批成多个
-/// 事件，每个走一行即可；不乘倍率，否则 macOS 那种一次滑动几十个事件的终端会飞过头。
-pub fn handle_mouse(kind: MouseEventKind, app: &mut App, width: u16, height: u16) {
-    match kind {
-        MouseEventKind::ScrollUp => scroll(app, width, height, 1),
-        MouseEventKind::ScrollDown => scroll(app, width, height, -1),
-        // 水平滚动没有语义（对话是单列竖排）；按键 / 拖拽 / 悬停不绑任何动作。
+/// - **滚轮上下**：滚聊天，步长 1 视觉行（见模块文档「滚轮」段）；属**用户主动**滚动，
+///   走 [`scroll_clearing_selection`]（ADR-0051 决策 6：滚一下就清选区）。
+/// - **左键三态**（按下 / 拖动 / 松开）：应用内选区的生命周期（ADR-0051）。
+/// - **`⇧` 按住**：直接返回，把原生选择让回终端（决策 1）。
+/// - 其余（水平滚动 / 悬停 / 其它键）：不绑任何动作。
+pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
+    // **最先**判修饰键：`⇧` 是「让回终端原生选择」的开关，必须在任何状态变更之前。
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        return;
+    }
+    match m.kind {
+        MouseEventKind::ScrollUp => scroll_clearing_selection(app, width, height, 1),
+        MouseEventKind::ScrollDown => scroll_clearing_selection(app, width, height, -1),
+        MouseEventKind::Down(MouseButton::Left) => begin_selection(app, m, width, height),
+        MouseEventKind::Drag(MouseButton::Left) => extend_selection(app, m, width, height),
+        MouseEventKind::Up(MouseButton::Left) => finish_selection(app, m, width, height),
+        // 水平滚动没有语义（对话是单列竖排）；悬停不绑（不做 hover）。
         _ => {}
     }
+}
+
+/// 用户**主动**滚动的入口：先清选区，再滚。
+///
+/// 与 [`scroll`] 的分工是承重的：`selection::drag_tick`（拖到边缘的自动滚动）也调
+/// [`scroll`]，若在 `scroll` 内部清选区，拖到边缘会**自我取消**（设计 §5.3）。
+fn scroll_clearing_selection(app: &mut App, width: u16, height: u16, delta: isize) {
+    app.selection.clear();
+    scroll(app, width, height, delta);
+}
+
+/// 左键按下：在内区内那么建选区，在内区外则不开始。
+///
+/// 按下点在内区外时钳制语义没有意义（用户意图不是选 Chat），故直接忽略 ——
+/// 与 `Drag` / `Up` 的「窗外钳制」有意不同。
+fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
+    let Some(inner) = crate::draw::chat_inner_rect(app, width, height) else {
+        return;
+    };
+    if m.column < inner.x
+        || m.column >= inner.x + inner.width
+        || m.row < inner.y
+        || m.row >= inner.y + inner.height
+    {
+        return;
+    }
+    let rel_x = m.column - inner.x;
+    let rel_y = (m.row - inner.y) as usize;
+    // `top_row` 从 `sync_scroll_state` 取：`compute_max_scroll` **不回**它。
+    let top_row = app.sync_scroll_state(width, height, Instant::now()).top_row;
+    app.selection.begin(top_row + rel_y, rel_x, Instant::now());
+    // 拖动期间必须脱离底部跟随，否则内容一来画面就自己滚走。
+    app.follow = false;
+}
+
+/// 拖动 / 松开时把屏幕坐标钳进内区，并据钳制方向定 `edge`（触发自动滚动）。
+fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
+    if !app.selection.is_dragging() {
+        return;
+    }
+    let Some(inner) = crate::draw::chat_inner_rect(app, width, height) else {
+        return;
+    };
+    let row = m
+        .row
+        .clamp(inner.y, inner.y + inner.height.saturating_sub(1));
+    let col = m
+        .column
+        .clamp(inner.x, inner.x + inner.width.saturating_sub(1));
+    // `1` = 上沿（看更早的行），`-1` = 下沿。与 `scroll` 的 `delta > 0` 同向。
+    let edge: i8 = if m.row < inner.y {
+        1
+    } else if m.row >= inner.y + inner.height {
+        -1
+    } else {
+        0
+    };
+    let top_row = app.sync_scroll_state(width, height, Instant::now()).top_row;
+    app.selection.extend(
+        top_row + (row - inner.y) as usize,
+        col - inner.x,
+        edge,
+        Instant::now(),
+    );
+    app.follow = false;
+}
+
+/// 松开左键：两端点重合 ⇒ 不复制；否则提取文本写进 `pending_clipboard`。
+///
+/// 无论结局如何都要清选区（高亮消失，文字已在剪贴板）。
+fn finish_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
+    if !app.selection.is_dragging() {
+        return;
+    }
+    extend_selection(app, m, width, height);
+    let (anchor, cursor) = app.selection.bounds();
+    if anchor == cursor {
+        app.selection.clear();
+        return;
+    }
+    let outcome = crate::selection::extract(&app.layout.borrow(), anchor, cursor);
+    match outcome {
+        crate::selection::ExtractOutcome::Copied(text) => app.pending_clipboard = Some(text),
+        crate::selection::ExtractOutcome::TooLarge(bytes) => {
+            app.transcript.push(TranscriptLine::System(format!(
+                "选区 {} KB，超过复制上限 256 KB；请分段选择或用 /copy",
+                bytes.div_ceil(1024)
+            )))
+        }
+        crate::selection::ExtractOutcome::Empty => {}
+    }
+    app.selection.clear();
 }
 
 /// 处理一次按键（`KeyEventKind::Release` / `Repeat` 之外的都忽略）。
@@ -286,10 +391,12 @@ pub fn handle_key(
             if let Some(text) = app.history.prev(&app.input.text) {
                 set_input(app, &text);
             } else {
-                scroll(app, width, height, 1);
+                scroll_clearing_selection(app, width, height, 1);
             }
         }
-        KeyCode::PageUp => scroll(app, width, height, page_rows(app, width, height)),
+        KeyCode::PageUp => {
+            scroll_clearing_selection(app, width, height, page_rows(app, width, height))
+        }
         KeyCode::Down => {
             // `↓` 只在**浏览态**里归历史；否则一律聊天滚动（向下是高频操作）。
             // 退出浏览态那一下已经交出了草稿，**不再多滚一次**（`return`）。
@@ -299,9 +406,11 @@ pub fn handle_key(
                 set_input(app, &text);
                 return;
             }
-            scroll(app, width, height, -1);
+            scroll_clearing_selection(app, width, height, -1);
         }
-        KeyCode::PageDown => scroll(app, width, height, -page_rows(app, width, height)),
+        KeyCode::PageDown => {
+            scroll_clearing_selection(app, width, height, -page_rows(app, width, height))
+        }
         // Tab：输入 `/` 开头时按前缀开补全浮层（无命中 / 不以 `/` 开头 = no-op）。
         // 候选含 skill（与 `submit` 的解析同源，见模块文档）。
         KeyCode::Tab => {
@@ -376,7 +485,7 @@ fn jump_to_start(app: &mut App, width: u16, height: u16) {
 }
 
 /// 滚动：`delta > 0` 向上（远离底部），`delta < 0` 向下（回到贴底）。
-fn scroll(app: &mut App, width: u16, height: u16, delta: isize) {
+pub(crate) fn scroll(app: &mut App, width: u16, height: u16, delta: isize) {
     let max = app.compute_max_scroll(width, height);
     let next = if delta >= 0 {
         app.scroll_offset.saturating_add(delta as usize).min(max)
@@ -588,6 +697,15 @@ mod tests {
 
     fn app() -> App {
         App::new(CodingView::for_test())
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1719,19 +1837,19 @@ mod tests {
         assert_eq!(a.scroll_offset, 0);
 
         // 向上滑：一事件 = 一视觉行，输入框与历史浏览态都不动。
-        handle_mouse(MouseEventKind::ScrollUp, &mut a, 120, 40);
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 5), &mut a, 120, 40);
         assert_eq!(a.scroll_offset, 1, "滚轮步长 = 1 视觉行");
         assert!(!a.follow, "向上滑即脱离跟随");
         assert!(a.input.text.is_empty(), "滚轮不得把历史填进输入框");
         assert!(!a.history.is_browsing(), "滚轮不进入历史浏览态");
 
         // 再向上：逐行累加，不是整页。
-        handle_mouse(MouseEventKind::ScrollUp, &mut a, 120, 40);
+        handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 5), &mut a, 120, 40);
         assert_eq!(a.scroll_offset, 2);
 
         // 向下滑：回到贴底并恢复跟随。
         for _ in 0..2 {
-            handle_mouse(MouseEventKind::ScrollDown, &mut a, 120, 40);
+            handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 5), &mut a, 120, 40);
         }
         assert_eq!(a.scroll_offset, 0, "向下滑回到最新");
         assert!(a.follow, "回到底部即恢复跟随");
@@ -1743,8 +1861,6 @@ mod tests {
     /// 变异：把 `_` 臂改成任意滚动（如统一 `scroll(app, .., 1)`）⇒ 本用例红。
     #[test]
     fn test_other_mouse_events_are_ignored() {
-        use crossterm::event::MouseButton;
-
         let mut a = app();
         for i in 0..80 {
             a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
@@ -1752,15 +1868,14 @@ mod tests {
         a.follow = false;
         a.scroll_offset = 5;
 
+        // 左键三态**已改由应用内选区处理**（ADR-0051），故不在本用例里断言「不动」——
+        // 它们的行为归 `selection_drag_*` 几条用例。本用例只守「剩下这些仍一律不动」。
         for kind in [
             MouseEventKind::ScrollLeft,
             MouseEventKind::ScrollRight,
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-            MouseEventKind::Drag(MouseButton::Left),
             MouseEventKind::Moved,
         ] {
-            handle_mouse(kind, &mut a, 120, 40);
+            handle_mouse(mouse(kind, 10, 5), &mut a, 120, 40);
             assert_eq!(a.scroll_offset, 5, "{kind:?} 不得改变滚动位置");
             assert!(!a.follow, "{kind:?} 不得恢复跟随");
         }
@@ -1791,6 +1906,271 @@ mod tests {
             40,
         );
         assert_eq!(a.scroll_offset, 1, "鼠标事件必须进入滚动处理");
+    }
+
+    // -----------------------------------------------------------------------
+    // T18：左键三态迁移（ADR-0051）
+    // -----------------------------------------------------------------------
+
+    /// 造一个内容超过一屏的 App（选中/滚动都有余地）。
+    fn app_scrollable() -> App {
+        let mut a = app();
+        for i in 0..80 {
+            a.transcript.push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        a
+    }
+
+    /// **V6：按下未拖动即松开 ⇒ 不复制**（防误触覆盖剪贴板）。
+    #[test]
+    fn v6_click_without_drag_does_not_copy() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.selection.is_active(), "按下应建立选区");
+
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.pending_clipboard.is_none(), "未拖动不得复制");
+        assert!(!a.selection.is_active(), "松手后选区应清");
+    }
+
+    /// **`Down` → `Drag` → `Up` ⇒ 复制**。
+    #[test]
+    fn drag_then_release_copies_text() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), col + 3, row + 2),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.selection.is_active(), "拖动期选区应存在");
+
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), col + 3, row + 2),
+            &mut a,
+            w,
+            h,
+        );
+        let copied = a.pending_clipboard.take().expect("松手应复制");
+        assert!(!copied.is_empty(), "复制的文本不得为空");
+        assert!(!a.selection.is_active(), "松手后选区应清");
+    }
+
+    /// **V7：`⇧` 按住 ⇒ 全程无副作用**（让回终端原生选择）。
+    #[test]
+    fn v7_shift_has_no_side_effects() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        a.follow = false;
+        a.scroll_offset = 5;
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let mut ev = mouse(kind, col, row);
+            ev.modifiers = KeyModifiers::SHIFT;
+            handle_mouse(ev, &mut a, w, h);
+            assert_eq!(a.scroll_offset, 5, "⇧ 不得改滚动位置");
+            assert!(!a.follow, "⇧ 不得恢复跟随");
+            assert!(a.pending_clipboard.is_none(), "⇧ 不得复制");
+            assert!(!a.selection.is_active(), "⇧ 不得建选区");
+        }
+    }
+
+    /// 窗外拖动 ⇒ 钳进内区并置 `edge`（触发自动滚动）。
+    #[test]
+    fn drag_outside_clamps_and_sets_edge() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+
+        handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 2,
+                inner.y + 1,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        // 拖到内区上方。
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), inner.x + 2, 0),
+            &mut a,
+            w,
+            h,
+        );
+        assert_eq!(a.selection.edge(), 1, "拖过上沿 ⇒ edge = 1");
+        assert_eq!(
+            a.selection.bounds().1.0,
+            a.sync_scroll_state(w, h, std::time::Instant::now()).top_row,
+            "光标应钳到视窗顶行"
+        );
+
+        // 拖到内区下方。
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), inner.x + 2, h - 1),
+            &mut a,
+            w,
+            h,
+        );
+        assert_eq!(a.selection.edge(), -1, "拖过下沿 ⇒ edge = -1");
+    }
+
+    /// 按在内区外（如 Chat 顶边框）⇒ **不开始选区**。
+    #[test]
+    fn press_outside_chat_does_not_start_selection() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 0),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(!a.selection.is_active(), "边框上按下不得建选区");
+    }
+
+    /// **V9：resize 清选区**（变异注入 #6 的锚点）。
+    #[test]
+    fn v9_resize_clears_selection() {
+        let ch = channels();
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 2,
+                inner.y + 1,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.selection.is_active(), "前置：选区存在");
+
+        handle_event(Event::Resize(80, 24), &mut a, &ch.req_tx, &ch.bnd_tx, w, h);
+        assert!(
+            !a.selection.is_active(),
+            "resize 必须清选区（行号空间作废）"
+        );
+    }
+
+    /// 用户主动滚动清选区：`ScrollUp` / `PageUp` 都要清。
+    ///
+    /// 与 `drag_tick` 的自动滚动形成对照（后者**不得**清，否则拖到边缘自我取消）。
+    #[test]
+    fn user_scroll_clears_selection() {
+        let ch = channels();
+        let (w, h) = (120u16, 40u16);
+        for kind in ["scroll", "pageup"] {
+            let mut a = app_scrollable();
+            let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+            handle_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    inner.x + 2,
+                    inner.y + 1,
+                ),
+                &mut a,
+                w,
+                h,
+            );
+            handle_mouse(
+                mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    inner.x + 6,
+                    inner.y + 3,
+                ),
+                &mut a,
+                w,
+                h,
+            );
+            assert!(a.selection.is_active(), "前置：选区存在");
+
+            if kind == "scroll" {
+                handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 5), &mut a, w, h);
+            } else {
+                handle_key(press(KeyCode::PageUp), &mut a, &ch.req_tx, &ch.bnd_tx, w, h);
+            }
+            assert!(!a.selection.is_active(), "{kind} 应清选区（用户主动滚动）");
+        }
+    }
+
+    /// **V10：超限 ⇒ 不复制，transcript 回一行提示**。
+    #[test]
+    fn v10_oversized_selection_reports_instead_of_copying() {
+        // 一屏最多装 `inner_h × w` 格，故要越过 256 KB 需要**很高的终端**：
+        // 1200 行 × 200 列 = 240000 格，仍不满，故取 1500 行。
+        let (w, h) = (200u16, 1500u16);
+        let mut a = app();
+        a.transcript
+            .push(TranscriptLine::User("x".repeat(400 * 1024)));
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), inner.x, inner.y),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                inner.x + inner.width - 1,
+                inner.y + inner.height - 1,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                inner.x + inner.width - 1,
+                inner.y + inner.height - 1,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.pending_clipboard.is_none(), "超限不得写剪贴板");
+        let last = a.transcript.last().expect("应有提示行");
+        let text = match last {
+            TranscriptLine::System(t) => t.clone(),
+            other => panic!("期望 System 提示，实际 {other:?}"),
+        };
+        assert!(text.contains("256"), "提示应说明上限：{text}");
     }
 
     /// `↑↓` 归历史之后，聊天滚动仍有 `PageUp` / `PageDown` 这个入口。

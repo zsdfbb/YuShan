@@ -463,6 +463,19 @@ impl TranscriptLayout {
         self.width
     }
 
+    /// 条目版本号分配器的当前值 —— 「内容代次」。
+    ///
+    /// **只在某条目的折行产物真的重算时 `+1`**（`sync` 里 `render_sig` 不等才分配新号）。
+    /// 因此它不动 ⇔ 没有任何条目重渲 ⇔ 字形缓存可以整份复用。
+    ///
+    /// 与 [`Self::revision_range`] 的分工：那个是**窗口局部**的键（用于判断「窗口内是否需要
+    /// 重建」），本函数是**全布局**的内容代次（用于判断「能否整份复用 + 只做位移」）。
+    /// 两者不可互替——`revision_range` 把首条目内偏移折进了哈希（滚动本身就会改它），
+    /// 故拿它判「纯滚动」永远不成立。
+    pub(crate) fn rev_alloc(&self) -> u64 {
+        self.rev_alloc
+    }
+
     /// 定位某个全局行号落在哪个条目。
     fn locate_entry(&self, row: usize) -> usize {
         if self.starts.is_empty() {

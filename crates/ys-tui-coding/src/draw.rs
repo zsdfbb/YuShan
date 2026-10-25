@@ -35,6 +35,7 @@ use ys_core::StopReason;
 use crate::app::App;
 use crate::completion::CompletionState;
 use crate::input::InputBuffer;
+use crate::selection::Highlight;
 use crate::theme::Palette;
 use crate::transcript::TranscriptLine;
 
@@ -158,6 +159,8 @@ fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
     .split(area);
 
     draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
+    // 选区高亮**独立一行**：它需要 `&mut app`（写字形缓存），不能塞进 `draw_transcript`。
+    draw_selection(frame, chunks[0], scroll.top_row, app);
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app, palette);
 
@@ -208,17 +211,33 @@ fn chat_block() -> Block<'static> {
         .title(" Chat ")
 }
 
+/// Chat 内区几何的**唯一来源**。
+///
+/// 尺寸低于 [`MIN_WIDTH`] / [`MIN_HEIGHT`] ⇒ `None`（[`ui`] 整屏不渲染）。
+/// [`chat_viewport`] 与 [`chat_inner_rect`] 两个包装**都经它** —— 内区宽高的逐项扣减
+/// 只发生在这一个调用里，故绝不逐处手写减法（不变量 7）。
+fn chat_inner(app: &App, area: Rect) -> Option<Rect> {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return None;
+    }
+    Some(chat_block().inner(chat_area(app, area)))
+}
+
 /// Chat 内区几何（**宽、高**）—— 滚动数学与渲染共用同一份。
 ///
 /// 需要终端尺寸：wrap 行数依赖宽度、可见行数依赖高度。尺寸太小（[`ui`] 不渲染）时返回 `(0, 0)`。
 pub(crate) fn chat_viewport(app: &App, width: u16, height: u16) -> (u16, u16) {
-    let area = Rect::new(0, 0, width, height);
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        return (0, 0);
+    match chat_inner(app, Rect::new(0, 0, width, height)) {
+        Some(inner) => (inner.width.max(1), inner.height),
+        None => (0, 0),
     }
-    let chat = chat_area(app, area);
-    let inner = chat_block().inner(chat);
-    (inner.width.max(1), inner.height)
+}
+
+/// Chat 内区的**屏幕绝对坐标**（含 `x` / `y`）—— 鼠标坐标转内区相对坐标用。
+///
+/// 与 [`chat_viewport`] 同源（同一个 `chat_inner`），故不可能漂移。
+pub(crate) fn chat_inner_rect(app: &App, width: u16, height: u16) -> Option<Rect> {
+    chat_inner(app, Rect::new(0, 0, width, height))
 }
 
 /// 允许的最大 `scroll_offset`（**视觉行**，0 = 贴底）。
@@ -244,13 +263,17 @@ pub fn max_scroll_offset_at(app: &mut App, width: u16, height: u16, now: Instant
 /// 与滚动数学读的是同一份布局 ⇒ 画面与滚动位置必然一致。
 ///
 /// 视窗切片依赖「整段折行 == 逐行折行之和」（N4）—— 故切片后拼起来与整段折行等价。
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, palette: Palette) {
-    let block = chat_block();
-    let inner = block.inner(area);
-    let inner_h = inner.height as usize;
-
+/// 当前视窗要画的行（含「空 transcript ⇒ 占位行」）—— [`draw_transcript`] 与
+/// 判断占位行时的依据必须同源。
+///
+/// 返回 `(lines, skip_rows)`：`skip_rows` 是窗口首行内部要跳过的视觉行数。
+fn window_lines(
+    app: &App,
+    top_row: usize,
+    inner_h: usize,
+    palette: Palette,
+) -> (Vec<Line<'static>>, usize) {
     let window = app.layout.borrow().window(top_row, inner_h);
-    // 空 transcript ⇒ 占位一行（与旧实现同形）。
     let lines = if window.lines.is_empty() && app.transcript.is_empty() {
         vec![Line::from(Span::styled(
             "(no messages yet)",
@@ -259,11 +282,39 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, pal
     } else {
         window.lines
     };
+    (lines, window.skip_rows)
+}
+
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, palette: Palette) {
+    let block = chat_block();
+    let inner = block.inner(area);
+    let (lines, skip_rows) = window_lines(app, top_row, inner.height as usize, palette);
     let para = Paragraph::new(Text::from(lines))
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((window.skip_rows.min(u16::MAX as usize) as u16, 0));
+        .scroll((skip_rows.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(para, area);
+}
+
+/// 选区高亮层：在 `draw_transcript` **之后**、`draw_input` **之前**独立调用。
+///
+/// 取 `&mut App`：写 `app.selection.grid` 需要可变访问，而 `draw_transcript` 拿的是
+/// `&App`。分开写就不必给 `GlyphGrid` 再包一层 `RefCell`。
+fn draw_selection(frame: &mut Frame, area: Rect, top_row: usize, app: &mut App) {
+    let Some(inner) = chat_inner(app, area) else {
+        return;
+    };
+    if app.selection.is_active() {
+        let layout = app.layout.borrow();
+        app.selection.ensure_grid(&layout, inner, top_row);
+        drop(layout);
+        let rects = app.selection.rects(top_row, inner);
+        frame.render_widget(Highlight { rects }, inner);
+    } else {
+        // 无选区也要走一次：让 `ensure_grid` 把一屏字形释放掉（设计 §2.3 第 9 条）。
+        let layout = app.layout.borrow();
+        app.selection.ensure_grid(&layout, inner, top_row);
+    }
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
@@ -3408,5 +3459,102 @@ mod tests {
         // System 行 → `muted`
         let sys = lines(&TranscriptLine::System("提示".into()));
         assert_eq!(first_fg(&sys), Some(palette.muted), "System 行应取 `muted`");
+    }
+
+    // -----------------------------------------------------------------------
+    // T14：选区接线
+    // -----------------------------------------------------------------------
+
+    /// **`chat_inner_rect` 的原点与尺寸**：`Borders::TOP` ⇒ 无左右竖线 ⇒ `x == 0`；
+    /// 顶板标题线占第 0 行 ⇒ `y == 1`；宽 == 终端宽。
+    #[test]
+    fn chat_inner_rect_origin_is_title_line_plus_one() {
+        let app = app_with(CodingView::for_test());
+        let (w, h) = (80u16, 24u16);
+        let rect = chat_inner_rect(&app, w, h).expect("正常尺寸应有内区");
+        assert_eq!(rect.x, 0, "无左右竖线 ⇒ 内区 x 从 0 起");
+        assert_eq!(rect.y, 1, "标题线占第 0 行 ⇒ 内区 y == 1");
+        assert_eq!(rect.width, w, "内区宽 == 终端宽");
+    }
+
+    /// **与 `chat_viewport` 同源**（两者都经 `chat_inner`，不得各写一条链）。
+    #[test]
+    fn chat_inner_rect_agrees_with_viewport() {
+        let app = app_with(CodingView::for_test());
+        for (w, h) in [(MIN_WIDTH, MIN_HEIGHT), (80, 24), (120, 40), (200, 60)] {
+            let (vw, vh) = chat_viewport(&app, w, h);
+            let rect = chat_inner_rect(&app, w, h).expect("该尺寸应有内区");
+            assert_eq!(rect.width.max(1), vw, "({w},{h}) 宽不同源");
+            assert_eq!(rect.height, vh, "({w},{h}) 高不同源");
+        }
+        // 低于 MIN ⇒ 两侧都对 None / (0,0)。
+        assert!(chat_inner_rect(&app, MIN_WIDTH - 1, 20).is_none());
+        assert_eq!(chat_viewport(&app, MIN_WIDTH - 1, 20), (0, 0));
+        assert!(chat_inner_rect(&app, 80, MIN_HEIGHT - 1).is_none());
+        assert_eq!(chat_viewport(&app, 80, MIN_HEIGHT - 1), (0, 0));
+    }
+
+    /// **空 transcript ⇒ 占位行**（`window_lines` 与 `draw_transcript` 同源）。
+    #[test]
+    fn window_lines_yields_placeholder_when_empty() {
+        let mut app = app_with(CodingView::for_test());
+        app.sync_scroll_state(80, 24, Instant::now());
+        let (lines, _) = window_lines(&app, 0, 10, ThemeKind::default().palette());
+        assert_eq!(lines.len(), 1, "空 transcript 只给一行占位");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "(no messages yet)");
+
+        // 实际渲染也应出现同一句。
+        let rows = rows_of(&mut app, 80, 24);
+        assert!(
+            rows.iter().any(|r| r.contains("(no messages yet)")),
+            "渲染应包含占位行"
+        );
+    }
+
+    /// **高亮落在正确格**：开启选区后渲一帧，`REVERSED` 的格应恰好落在 `chat_inner_rect`
+    /// 内的选区矩形上；且连续两帧后 `rebuild_count` 不再增长（稳态零重建）。
+    #[test]
+    fn selection_highlights_correct_cells_and_goes_steady() {
+        let (w, h) = (80u16, 24u16);
+        let mut app = app_with(CodingView::for_test());
+        for line in ["alpha", "bravo"] {
+            app.transcript
+                .push(TranscriptLine::Assistant(line.to_string()));
+        }
+        let inner = chat_inner_rect(&app, w, h).expect("应有内区");
+        // 先同步一帧，拿到真实 `top_row`。
+        let scroll = app.sync_scroll_state(w, h, Instant::now());
+
+        // 内容不足一屏 ⇒ `top_row == 0`，故全局行 0 就是内区第 0 行（`alpha`）。
+        // 造一个落在该行、列 0..=4 的选区。
+        assert_eq!(scroll.top_row, 0, "前置：内容不足一屏 ⇒ 视窗顶即第 0 行");
+        app.selection.begin(0, 0, Instant::now());
+        app.selection.extend(0, 4, 0, Instant::now());
+
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let y = inner.y;
+        for x in 0..w {
+            let reversed = buf[(x, y)].modifier.contains(Modifier::REVERSED);
+            let should = (0..=4).contains(&x);
+            assert_eq!(
+                reversed, should,
+                "({x},{y}) 高亮与选区不符（内区 x 从 {} 起）",
+                inner.x
+            );
+        }
+
+        // 稳态：同一选区再渲一帧，不得重建字形缓存。
+        let before = app.selection.grid.rebuild_count_snapshot();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        assert_eq!(
+            app.selection.grid.rebuild_count_snapshot(),
+            before,
+            "稳态帧不得重建字形缓存"
+        );
     }
 }

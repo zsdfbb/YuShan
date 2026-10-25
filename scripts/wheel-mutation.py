@@ -32,7 +32,7 @@ MUTATIONS = [
     (
         "M1 滚轮 ScrollUp 接到输入历史",
         EV,
-        "        MouseEventKind::ScrollUp => scroll(app, width, height, 1),",
+        "        MouseEventKind::ScrollUp => scroll_clearing_selection(app, width, height, 1),",
         "        MouseEventKind::ScrollUp => {\n"
         "            if let Some(t) = app.history.prev(&app.input.text) {\n"
         "                app.input.clear();\n"
@@ -44,21 +44,21 @@ MUTATIONS = [
     (
         "M2 滚轮步长改成一页",
         EV,
-        "        MouseEventKind::ScrollUp => scroll(app, width, height, 1),",
-        "        MouseEventKind::ScrollUp => scroll(app, width, height, page_rows(app, width, height)),",
+        "        MouseEventKind::ScrollUp => scroll_clearing_selection(app, width, height, 1),",
+        "        MouseEventKind::ScrollUp => {\n            scroll_clearing_selection(app, width, height, page_rows(app, width, height))\n        }",
         "test_wheel_scrolls_chat_and_never_input_history",
     ),
     (
         "M3 其余鼠标事件也滚动（抢终端拖选）",
         EV,
-        "        // 水平滚动没有语义（对话是单列竖排）；按键 / 拖拽 / 悬停不绑任何动作。\n        _ => {}",
-        "        _ => scroll(app, width, height, 1),",
+        "        // 水平滚动没有语义（对话是单列竖排）；悬停不绑（不做 hover）。\n        _ => {}",
+        "        _ => scroll_clearing_selection(app, width, height, 1),",
         "test_other_mouse_events_are_ignored",
     ),
     (
         "M4 删掉 handle_event 的 Mouse 分支",
         EV,
-        "        Event::Mouse(m) => handle_mouse(m.kind, app, width, height),\n",
+        "        Event::Mouse(m) => handle_mouse(m, app, width, height),\n",
         "",
         "test_handle_event_routes_mouse_to_scroll",
     ),
@@ -72,8 +72,8 @@ MUTATIONS = [
     (
         "M6 ScrollDown 方向反了",
         EV,
-        "        MouseEventKind::ScrollDown => scroll(app, width, height, -1),",
-        "        MouseEventKind::ScrollDown => scroll(app, width, height, 1),",
+        "        MouseEventKind::ScrollDown => scroll_clearing_selection(app, width, height, -1),",
+        "        MouseEventKind::ScrollDown => scroll_clearing_selection(app, width, height, 1),",
         "test_wheel_scrolls_chat_and_never_input_history",
     ),
 ]

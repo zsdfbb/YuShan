@@ -124,6 +124,16 @@ pub struct App {
     ///
     /// `RefCell`：`layout` 走 `&App`（帧路径与事件路径共用），内部需要可变访问。
     pub(crate) layout: std::cell::RefCell<crate::layout::TranscriptLayout>,
+    /// 当前拖选状态（ADR-0051）。
+    ///
+    /// **帧路径不得清它** —— 拖动期间每帧都会走 [`App::sync_scroll_state`]，在那里清会让
+    /// 拖动自我取消。清理点只有三个：用户主动跳转（[`App::jump_to_end`] /
+    /// [`App::jump_to_start`]）、回放替换 transcript（[`App::reset_for_replay`]）、
+    /// 以及由 `events.rs` 自己负责的 resize 与松手后收尾。
+    ///
+    /// 类型是 `pub(crate)`（`draw.rs` 的高亮层与 `events.rs` 的鼠标分支都要直接访问），
+    /// 故字段同用 `pub(crate)` —— 与 [`Self::layout`] / [`Self::md_cache`] 一贯。
+    pub(crate) selection: crate::selection::Selection,
     /// `ToolCallId` → transcript 下标 —— 工具结果据此回填到对应的 Tool 行。
     pub(crate) tool_index: HashMap<ToolCallId, usize>,
     /// 本地回显抑制计数：提交时已本地 push 的那条 `UserMessage`，
@@ -176,6 +186,7 @@ impl App {
             current_round: None,
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             layout: std::cell::RefCell::new(crate::layout::TranscriptLayout::default()),
+            selection: crate::selection::Selection::default(),
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
             pending_echo_texts: VecDeque::new(),
@@ -276,6 +287,9 @@ impl App {
         self.tool_index.clear();
         self.suppress_user_echo = 0;
         self.pending_echo_texts.clear();
+        // 回放整体替换 transcript ⇒ 全局视觉行号空间作废，旧选区的行号已无意义
+        // （设计 §2.3 第 4 条）。
+        self.selection.clear();
         self.follow = true;
         self.scroll_offset = 0;
     }
@@ -598,16 +612,23 @@ impl App {
     }
 
     /// 跳到**最新内容**（末尾）—— 恢复贴底跟随，并清掉「有新内容」提示。
+    ///
+    /// 顺带清选区：用户主动跳转 ⇒ 行号空间整体挪动，拖到一半的选区已无意义
+    /// （ADR-0051 决策 6）。
     pub fn jump_to_end(&mut self) {
         self.scroll_offset = 0;
         self.follow = true;
         self.new_content_below = false;
+        self.selection.clear();
     }
 
     /// 跳到**最早内容**（顶部）—— 脱离跟随。
+    ///
+    /// 同样清选区（ADR-0051 决策 6），理由与 [`Self::jump_to_end`] 一致。
     pub fn jump_to_start(&mut self, max_scroll: usize) {
         self.scroll_offset = max_scroll;
         self.follow = false;
+        self.selection.clear();
     }
 
     /// 本回合已用秒数（回合未开始时为 0）。`draw.rs` 的状态行要用 ⇒ `pub(crate)`。
@@ -2018,6 +2039,82 @@ mod tests {
         assert!(a.follow, "跳到底部 ⇒ 恢复贴底");
         assert_eq!(a.scroll_offset, 0, "跳到底部 ⇒ 偏移归零");
         assert!(!a.new_content_below, "跳到底部 ⇒ 提示清零");
+    }
+
+    // -----------------------------------------------------------------------
+    // 选区清理点（ADR-0051 决策 6 / 设计 §2.3 第 4 条）
+    // -----------------------------------------------------------------------
+
+    /// 造一个**正在进行**的选区（`is_active() == true`）。
+    ///
+    /// 只走 `begin`（按下即 `Dragging`）—— 这正是拖动期间的形态，也是唯一需要
+    /// 被帧路径保护的形态。
+    fn with_active_selection() -> App {
+        let mut a = app();
+        a.selection.begin(5, 3, Instant::now());
+        assert!(a.selection.is_active(), "前置：选区处于 active 态");
+        a
+    }
+
+    /// `jump_to_end` 清选区（ADR-0051 决策 6：用户主动跳转）。
+    ///
+    /// 变异：删掉 `jump_to_end` 里的 `self.selection.clear()` ⇒ 本用例变红。
+    #[test]
+    fn test_jump_to_end_clears_selection() {
+        let mut a = with_active_selection();
+        a.jump_to_end();
+        assert!(
+            !a.selection.is_active(),
+            "跳到底部必须清选区：行号空间挪了，旧选区已无意义"
+        );
+    }
+
+    /// `jump_to_start` 清选区（与 `jump_to_end` 同一条决策）。
+    ///
+    /// 变异：删掉 `jump_to_start` 里的 `self.selection.clear()` ⇒ 本用例变红。
+    #[test]
+    fn test_jump_to_start_clears_selection() {
+        let mut a = with_active_selection();
+        a.jump_to_start(42);
+        assert_eq!(a.scroll_offset, 42, "前置：确实跳到了顶部");
+        assert!(
+            !a.selection.is_active(),
+            "跳到顶部必须清选区（ADR-0051 决策 6）"
+        );
+    }
+
+    /// `reset_for_replay` 清选区（设计 §2.3 第 4 条：回放替换 transcript）。
+    ///
+    /// 变异：删掉 `reset_for_replay` 里的 `self.selection.clear()` ⇒ 本用例变红。
+    #[test]
+    fn test_reset_for_replay_clears_selection() {
+        let mut a = with_active_selection();
+        a.reset_for_replay();
+        assert!(
+            !a.selection.is_active(),
+            "回放替换 transcript ⇒ 行号空间作废，选区必须清"
+        );
+    }
+
+    /// **反例守卫（承重）**：帧路径 `sync_scroll_state` **不得**清选区。
+    ///
+    /// 拖动期间每帧都会走到它（`draw` 与事件层共用同一份布局同步）。在那里清选区
+    /// 会让拖动在第一帧就自我取消 —— 而三条正向用例**全部依然绿**（它们不经过帧路径），
+    /// 只有本用例能抓到这种「清理点放错了位置」的错。
+    ///
+    /// 变异：把 `self.selection.clear()` 加进 `sync_scroll_state` ⇒ 本用例变红。
+    #[test]
+    fn test_sync_scroll_state_keeps_selection() {
+        let mut a = with_active_selection();
+        let before = a.selection.bounds();
+
+        let _ = a.sync_scroll_state(120, 40, Instant::now());
+
+        assert!(
+            a.selection.is_active(),
+            "帧路径不得清选区 —— 否则拖动期间每帧自我取消"
+        );
+        assert_eq!(a.selection.bounds(), before, "帧路径也不得改动两端点");
     }
 
     #[test]

@@ -78,7 +78,8 @@ C：`DRAG_TICK = 16ms` + `step = clamp(1 + held_ms/40, 1, 8)` ⇒ 200 行约 **0
 
 | 文件 | 改动 | 行数 |
 |---|---|---|
-| `layout.rs` | **纯追加**：`EntryMemo.rev` / `TranscriptLayout.rev` / `revision_range()` / `window_rows()` | ~40 || `events.rs` | `handle_mouse` 收整个 `MouseEvent`；三态分派；`scroll()` 改 `pub(crate)` 并清选区；`Resize` 清选区 | ~60 |
+| `layout.rs` | **纯追加**：`EntryMemo.rev` / `TranscriptLayout.rev` / `revision_range()` / `window_rows()` | ~40 |
+| `events.rs` | `handle_mouse` 收整个 `MouseEvent`；三态分派；`scroll()` 改 `pub(crate)`（**本体保持纯净、不清选区**）；新增 `scroll_clearing_selection()` 供**用户主动**滚动入口；`Resize` 清选区 | ~60 |
 | `draw.rs` | 抽 `chat_inner()` 唯一几何来源；新增 `chat_inner_rect()`；`ui()` 末尾挂 `draw_selection()` | ~35 |
 | `run.rs` | `DRAG_TICK` 可变 poll 周期；鼠标批次合并；`drag_tick()` 调用 | ~30 |
 | `app.rs` | `pub selection: selection::Selection` + 默认 + `jump_to_*` 里 `clear()` | ~15 |

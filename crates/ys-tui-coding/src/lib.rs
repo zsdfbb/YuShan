@@ -44,6 +44,7 @@ mod layout;
 mod md;
 mod prompter;
 mod run;
+mod selection;
 mod styles;
 mod theme;
 mod transcript;

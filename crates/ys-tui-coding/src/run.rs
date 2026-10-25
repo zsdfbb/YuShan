@@ -54,12 +54,47 @@ use crate::prompter::{PromptError, PromptOutcome, Prompter, resolve_prompt, reso
 use crate::theme::ThemeKind;
 use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
-use crate::{draw, events};
+use crate::{draw, events, selection};
 
 /// 等输入的时长上限（空闲重绘节拍）。
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// 拖选贴边时的轮询周期 —— 自动滚动要跟手，故比空闲节拍短。
+const DRAG_TICK: Duration = Duration::from_millis(16);
 /// Working 动画节拍。
 const TICK_INTERVAL: Duration = Duration::from_millis(300);
+
+/// 本轮的等输入时长：拖到边缘时用 [`DRAG_TICK`]（16 ms），否则用 [`POLL_INTERVAL`]。
+fn poll_interval(dragging_with_edge: bool) -> Duration {
+    if dragging_with_edge {
+        DRAG_TICK
+    } else {
+        POLL_INTERVAL
+    }
+}
+
+/// 把一批连续到达的鼠标事件合并成**最后一个**，并把碰到的首个非鼠标事件**推迟**返回。
+///
+/// 触控板一次滑动会爆发 8–30 个事件，逐个走一遍 `draw`（每次约 150 µs）就是可见的卡顿
+/// （设计 §2.5）。合并不丢事件：非鼠标事件一律原样返回，由调用方在本轮消费。
+///
+/// 返回 `(最后一个鼠标事件, 被推迟的非鼠标事件)`。
+fn coalesce(
+    first: Event,
+    mut next: impl FnMut() -> Option<Event>,
+) -> (Option<Event>, Option<Event>) {
+    let mut mouse = match first {
+        Event::Mouse(_) => Some(first),
+        other => return (None, Some(other)),
+    };
+    while let Some(event) = next() {
+        match event {
+            Event::Mouse(_) => mouse = Some(event),
+            // 遇到非鼠标事件就停：**不 read 丢掉**，原样交给调用方。
+            other => return (mouse, Some(other)),
+        }
+    }
+    (mouse, None)
+}
 
 /// TUI 初始化 / 渲染过程中的 IO 失败。
 #[derive(Debug)]
@@ -192,10 +227,20 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             );
         }
 
-        // 2) 等输入，最多 POLL_INTERVAL
-        if crossterm::event::poll(POLL_INTERVAL)? {
-            let event = crossterm::event::read()?;
-            events::handle_event(event, app, requests, boundaries, size.width, size.height);
+        // 2) 等输入，最多 poll 周期（拖到边缘时缩短到 `DRAG_TICK`）
+        let poll = poll_interval(app.selection.is_dragging() && app.selection.edge() != 0);
+        if crossterm::event::poll(poll)? {
+            let first = crossterm::event::read()?;
+            // 触控板会爆发一串事件：只应用最后一个鼠标事件，非鼠标事件推到后面。
+            let (mouse, deferred) = coalesce(first, || {
+                if !crossterm::event::poll(Duration::ZERO).ok()? {
+                    return None;
+                }
+                crossterm::event::read().ok()
+            });
+            if let Some(m) = mouse {
+                events::handle_event(m, app, requests, boundaries, size.width, size.height);
+            }
             // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
             // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
             if let Some(kind) = app.pending_prompt.take() {
@@ -208,9 +253,13 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                     requests,
                 );
             }
-            // `/copy`：同样需要终端才能完成 —— 写剪贴板要发转义序列到 stdout。
+            // 松手复制要**当场**写剪贴板，不等下一个非鼠标事件。
             if let Some(text) = app.pending_clipboard.take() {
                 write_clipboard(&text);
+            }
+            // 被推迟的非鼠标事件：本轮消费，不丢。
+            if let Some(other) = deferred {
+                events::handle_event(other, app, requests, boundaries, size.width, size.height);
             }
         }
 
@@ -221,7 +270,9 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
         }
 
         // 滚动位置按当前尺寸重新夹紧（窗口缩放后 wrap 行数会变）——
-        // `compute_max_scroll` 内部同步布局并把 `scroll_offset` 夹到有效范围。
+        // 必须在 `compute_max_scroll` **之前**跑自动滚动：它会重算 `top_row`，
+        // 而 `drag_tick` 的 `cursor_row` 依赖新的 `top_row`（设计 §5.5）。
+        selection::drag_tick(app, size.width, size.height, Instant::now());
         app.compute_max_scroll(size.width, size.height);
 
         if app.should_quit {

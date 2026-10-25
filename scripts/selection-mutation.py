@@ -50,14 +50,10 @@ MUTATIONS = [
     ),
     (
         2,
-        "shift 方向取反（上移写成下移）",
+        "shift 方向取反（rotate_left → rotate_right）",
         SEL,
-        "            for y in 0..(self.height as usize - shift) {\n"
-        "                self.copy_row((y + shift) as u16, y as u16);\n"
-        "            }",
-        "            for y in 0..(self.height as usize - shift) {\n"
-        "                self.copy_row(y as u16, (y + shift) as u16);\n"
-        "            }",
+        "            self.order.rotate_left(n);",
+        "            self.order.rotate_right(n);",
         "v3_shift_matches_full_rebuild",
         SEL_TESTS,
     ),

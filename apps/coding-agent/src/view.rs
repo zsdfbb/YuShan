@@ -12,7 +12,8 @@
 use std::time::Instant;
 
 use ys_runtime::Agent;
-use ys_tui_coding::{CodingView, ModelEntry, ProviderEntry};
+
+use ys_tui_coding::{CodingView, ModelEntry, ProviderEntry, ThemeKind};
 
 use crate::config::Config;
 use crate::provider::ProviderRegistry;
@@ -23,6 +24,20 @@ use crate::wiring::Wiring;
 /// 从实时数据源构造显示快照。
 ///
 /// 调用时机：view₀（启动）+ 每个 `Request` 处理完之后（`app_loop`）。
+///
+/// `theme` 由调用方传入、**本函数不读盘**：`app_loop` 是在「每个请求处理完刷快照」
+/// 时调它，若在这里 `state.load()` 就变成每轮对话读一次 `state.json`。取值来自
+/// app 侧的**进程级镜像**（`app_loop::run` 里的 `let mut theme: ThemeKind`，
+/// `Request::SetTheme` 单向更新）。
+///
+/// 与 `thinking_visible` 的区别正在这里：后者在 app 侧只作持久化镜像、不需要进
+/// 视图（回合路径直接用局部量）；主题**必须**进视图（UI 要它上色），故只能走参数
+/// 或读盘 —— 参数是正确选择。
+///
+/// 形参已达 8 个。**不再加参数**：若将来还有「每请求都要刷新的单个偏好」，
+/// 应连同 `stats` / `session_started` / `theme` 一起收进一个 `ViewInputs` 结构体，
+/// 而不是继续拉长签名。
+#[allow(clippy::too_many_arguments)]
 pub fn build_view(
     cfg: &Config,
     agent: &Agent,
@@ -31,6 +46,7 @@ pub fn build_view(
     state: &StateStore,
     stats: &TurnStats,
     session_started: Instant,
+    theme: ThemeKind,
 ) -> CodingView {
     let logged_in = registry.logged_in_providers();
 
@@ -134,6 +150,8 @@ pub fn build_view(
         is_first_run: registry.logged_in_providers().is_empty() && !state.exists(),
         // `/thinking` 显示开关的**启动初值**（resume 时取自 meta；`App::new` 消费一次）。
         thinking_visible: wiring.meta().map(|m| m.thinking_visible).unwrap_or(false),
+        // 主题的**启动初值**（来自 `state.json`；`App::new` 消费一次）。
+        theme,
         // `/effort` 的当前有效档位：会话覆盖优先，否则配置默认（默认 `high`）。
         effort: cfg.effective_effort_level(),
     }
@@ -218,6 +236,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         assert_eq!(view.cwd, PathBuf::from("/tmp/proj"));
@@ -258,6 +277,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **C8 端到端**：`state.json` 的 `theme` → `CodingView.theme` → `App.theme`。
+    ///
+    /// 这条钉住持久化闭环的两端：app 侧把 kebab-case 名解析成 `ThemeKind` 塞进视图，
+    /// UI 侧 `App::new` 消费一次作为运行期初值。任一端断开（例如忘了传参、或
+    /// `App::new` 仍用 `ThemeKind::default()` 占位）都会红。
+    ///
+    /// 变异：`build_view` 里把 `theme` 参数改成 `ThemeKind::default()` ⇒ 红；
+    /// `App::new` 里把 `let theme = view.theme;` 改回 `ThemeKind::default()` ⇒ 红。
+    #[test]
+    fn test_state_theme_reaches_view_and_app() {
+        let dir = temp_dir("theme_e2e");
+        let path = dir.join("state.json");
+        let mut state = StateStore::new();
+        state.set_override(path.clone());
+        let mut st = state.load();
+        st.theme = Some("nord".into());
+        state.save(&st).unwrap();
+
+        // 与启动期同一条解析路径（main.rs 的 `saved_state.theme`）。
+        let theme: ThemeKind = state
+            .load()
+            .theme
+            .as_deref()
+            .and_then(|s| s.parse::<ThemeKind>().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            theme,
+            ThemeKind::Nord,
+            "前置：state.json 的名字应解析成 Nord"
+        );
+
+        let cfg = Config::from_env().unwrap();
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+        let view = build_view(
+            &cfg,
+            &agent,
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+            theme,
+        );
+        assert_eq!(view.theme, ThemeKind::Nord, "视图必须带上持久化的主题");
+
+        // UI 侧消费一次作为运行期初值 —— 该断言在 `ys-tui-coding` 的 `app.rs` 里
+        // （`App.theme` 是 crate 内可见，跨 crate 读不到）：
+        // `test_app_new_consumes_view_theme_initial`。
+
+        // 未知名回落默认（不 panic、不污染）。
+        let mut st2 = state.load();
+        st2.theme = Some("no-such-theme".into());
+        state.save(&st2).unwrap();
+        let fallback: ThemeKind = state
+            .load()
+            .theme
+            .as_deref()
+            .and_then(|s| s.parse::<ThemeKind>().ok())
+            .unwrap_or_default();
+        assert_eq!(fallback, ThemeKind::default(), "未知名应回落默认主题");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `CodingView.effort` 透传有效档位（会话覆盖优先于配置默认）。
     ///
     /// 变异：把 `CodingView { effort: cfg.effective_effort_level() }` 改回常量
@@ -280,6 +364,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         assert_eq!(view.effort, Some(ys_core::EffortLevel::High));
@@ -323,6 +408,7 @@ mod tests {
             &state,
             &stats,
             started,
+            ThemeKind::default(),
         );
 
         assert_eq!(view.total_input_tokens, 121);
@@ -379,6 +465,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         assert!(
@@ -445,6 +532,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         assert!(
@@ -511,6 +599,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         for expected in ["deepseek-v4", "MiniMax-M3", "MiniMax-M2.7"] {
@@ -587,6 +676,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         let rows: Vec<_> = view
@@ -652,6 +742,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         let row = view
@@ -721,6 +812,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         let carried: Vec<(String, String, String)> = view
@@ -810,6 +902,7 @@ mod tests {
             &state,
             &TurnStats::default(),
             Instant::now(),
+            ThemeKind::default(),
         );
 
         let commands: Vec<&str> = view.skills.iter().map(|s| s.command.as_str()).collect();

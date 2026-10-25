@@ -67,6 +67,7 @@ mod test_env;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,7 +86,7 @@ use ys_session::SessionError;
 use ys_tool::Tool;
 use ys_tools_basic::{BackgroundTasks, BgLimits, SessionSlot};
 use ys_tools_web::WebConfig;
-use ys_tui_coding::CodingView;
+use ys_tui_coding::{CodingView, ThemeKind};
 
 use channel::{ChannelSink, ChannelStatsHandle};
 use debug_log::{ArgsMode, DebugIds, DebugRecord, DebugSink};
@@ -2200,6 +2201,9 @@ fn run_interactive(
     rt: tokio::runtime::Runtime,
     config: config::Config,
     state_store: state::StateStore,
+    // 启动期从 `state.json` 解析出的主题（`main` 已 `load()` 过一次，不在这里重读）。
+    // 它只是 view₀ 的初值：运行期真值在 UI 侧，app 侧镜像由 `Request::SetTheme` 更新。
+    theme: ThemeKind,
     agent: Agent,
     subagent: subagent::SubagentSetup,
     factory: assembly::AgentFactory,
@@ -2300,6 +2304,7 @@ fn run_interactive(
         &state_store,
         &stats,
         session_started,
+        theme,
     );
 
     // 4. 三条信道：① Request（回合边界）/ ② Boundary（轮边界）/ ③ Outbound（app → UI）。
@@ -2656,6 +2661,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 从 state.json 加载已保存的会话状态
     let state_store = state::StateStore::new();
     let saved_state = state_store.load();
+    // 主题是**全局偏好**（`/new` 不重置、`/resume` 不跟会话变）⇒ 只从 `state.json` 取，
+    // 不看 resume meta。未知 / 缺失的名字一律回落默认主题。
+    let theme: ThemeKind = saved_state
+        .theme
+        .as_deref()
+        .and_then(|s| ThemeKind::from_str(s).ok())
+        .unwrap_or_default();
 
     // 模型解析（优先级，设计 §5.6）：env 完整凭证 > resume meta（provider 须有凭证）
     // > state.json（last-active provider+model）> 第一个存有凭证的 provider。
@@ -3125,6 +3137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rt,
                 config,
                 state_store,
+                theme,
                 agent,
                 subagent,
                 factory,
@@ -5145,6 +5158,7 @@ mod tests {
         let state = crate::state::AppState {
             last_active_provider: Some("minimax".into()),
             last_active_model: Some("state-model".into()),
+            ..Default::default()
         };
         let choice = resolve_model_from_meta(&cfg, None, Some(&state)).expect("state 档");
         assert_eq!(choice.provider.as_deref(), Some("minimax"));
@@ -5154,6 +5168,7 @@ mod tests {
         let unknown = crate::state::AppState {
             last_active_provider: Some("nope".into()),
             last_active_model: Some("nope-model".into()),
+            ..Default::default()
         };
         let choice = resolve_model_from_meta(&cfg, None, Some(&unknown)).expect("降级到档 4");
         assert_eq!(

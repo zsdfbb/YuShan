@@ -15,6 +15,7 @@ use crate::commands::PromptKind;
 use crate::completion::CompletionState;
 use crate::history::InputHistory;
 use crate::input::InputBuffer;
+use crate::theme::ThemeKind;
 use crate::transcript::{TranscriptLine, replay_lines, summarize_tool_args};
 use crate::view::CodingView;
 
@@ -89,6 +90,18 @@ pub struct App {
     pub(crate) abort_requested: bool,
     /// `/thinking` 开关（默认隐藏思考内容）。
     pub thinking_visible: bool,
+    /// 当前配色主题（运行期真值）。
+    ///
+    /// 与 [`Self::thinking_visible`] **同一纪律**：启动时从视图快照消费一次，此后
+    /// **不被 `Outbound::View` 覆盖** —— 切主题是 UI 本地动作（`/theme`、浮层预览），
+    /// app 推送的快照只是持久化镜像的载体（设计 §5.6）。
+    ///
+    /// **也不随 `/resume` 重置**：主题是全局偏好，换会话不改它（见
+    /// [`Self::reset_for_replay`]）。
+    ///
+    /// 改动**只能**经 [`Self::set_theme`] —— 它一并作废 markdown 缓存与布局记忆；
+    /// 直接赋值会让屏上留着旧配色的已渲染产物。
+    pub(crate) theme: ThemeKind,
     pub should_quit: bool,
     pub turn_started_at: Option<Instant>,
     /// Working 动画相位（0..WORKING_DOTS）。
@@ -137,6 +150,8 @@ impl App {
         // 启动时消费一次视图初值；运行期真值是 `App.thinking_visible` 自身，
         // 不会随 `Outbound::View` 快照覆盖（设计 §5.6）。
         let thinking_visible = view.thinking_visible;
+        // 同一条纪律：主题也只在启动时消费一次，运行期真值是 `App.theme` 自身。
+        let theme = view.theme;
         Self {
             view,
             transcript: Vec::new(),
@@ -154,6 +169,7 @@ impl App {
             is_turning: false,
             abort_requested: false,
             thinking_visible,
+            theme,
             should_quit: false,
             turn_started_at: None,
             working_dot: 0,
@@ -217,11 +233,32 @@ impl App {
         }
     }
 
+    /// 切主题 —— **唯一的失效入口**。
+    ///
+    /// 三件事必须**绑在一起**做，缺一就是「屏上还是旧配色」：
+    /// 1. 更新运行期真值；
+    /// 2. 作废 markdown 渲染缓存（槽位里存的是**已上色**的行，而键 `(len, width)` 不含主题）；
+    /// 3. 作废布局记忆（`EntryMemo.lines` 同样是已上色的 `Line`，`sig` 只哈希条目文本）。
+    ///
+    /// **不要**在调用点各写一遍这三行 —— `/theme <name>`、浮层逐键预览、Esc 还原
+    /// 全走本函数。
+    // 消费方是 `commands.rs` 的 `apply_local`（`/theme <name>`）与 `run.rs` 的浮层预览；
+    // 在那两处接线之前，只有本模块的用例调它。与 `RenderCache::set_theme` 同一处置。
+    #[allow(dead_code)]
+    pub(crate) fn set_theme(&mut self, kind: ThemeKind) {
+        self.theme = kind;
+        self.md_cache.borrow_mut().set_theme(kind.palette());
+        self.layout.borrow_mut().reset();
+    }
+
     /// 回放（`/resume`）前的**清屏**：一次性重置全部与 transcript 同源的状态。
     ///
     /// 缺一项都会留下跨会话的脏状态。**不在此重置 `thinking_visible`** —— 它由
     /// [`App::apply_outbound`] 的 `SessionResumed` 臂单独按目标会话的 meta 设定
     /// （语义不同：这里是清屏，那里是「跟随目标会话」）。
+    ///
+    /// **也不重置 `theme`**：主题是全局偏好，`/resume` 换会话时不变。无需在这里补任何一行
+    /// —— 上一行的 `layout.reset()` 已清空 `EntryMemo`，下一帧 `sync` 自会按当前主题重建。
     ///
     /// **也不清回合态**（`is_turning` / `turn_started_at` / `working_dot`）：清屏发生在
     /// [`App::apply_outbound`] 收到 `SessionResumed` 时，**依赖该事件恒在回合边界抵达**
@@ -518,6 +555,7 @@ impl App {
                 &self.transcript,
                 &mut cache,
                 self.thinking_visible,
+                self.theme.palette(),
                 inner_w,
                 now,
             );
@@ -665,6 +703,9 @@ pub(crate) fn user_message(text: &str) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    use ratatui::style::Color;
     use ys_core::{Role, StopReason, ToolCall, ToolResult, Usage};
     use ys_protocol::Source;
 
@@ -682,6 +723,30 @@ mod tests {
         view.thinking_visible = true;
         let a = App::new(view);
         assert!(a.thinking_visible, "启动初值应进 App");
+    }
+
+    /// `App::new` 消费一次 `CodingView.theme` 作为运行期初值（与 `thinking_visible` 同形）。
+    ///
+    /// 变异：`App::new` 里把 `let theme = view.theme;` 改回 `ThemeKind::default()`
+    /// ⇒ 本用例变红。这正是持久化闭环在 UI 侧的最后一米。
+    #[test]
+    fn test_app_new_consumes_view_theme_initial() {
+        let mut view = CodingView::for_test();
+        assert_eq!(view.theme, ThemeKind::default(), "for_test 默认主题");
+        view.theme = ThemeKind::Nord;
+        let a = App::new(view);
+        assert_eq!(a.theme, ThemeKind::Nord, "启动初值应进 App");
+    }
+
+    /// 运行期 `Outbound::View` 快照**不覆盖** `theme` —— 与 `thinking_visible` 同一纪律。
+    #[test]
+    fn test_view_snapshot_does_not_override_theme() {
+        let mut a = app();
+        a.set_theme(ThemeKind::Nord);
+        let mut snapshot = CodingView::for_test();
+        snapshot.theme = ThemeKind::EverforestDark;
+        a.apply_outbound(ys_protocol::Outbound::View(snapshot));
+        assert_eq!(a.theme, ThemeKind::Nord, "快照不得覆盖运行期真值");
     }
 
     /// 运行期 `Outbound::View` 快照**不覆盖** `thinking_visible` —— UI 自身才是真值。
@@ -1741,6 +1806,7 @@ mod tests {
     #[test]
     fn test_reset_for_replay_clears_every_same_source_state() {
         use crate::styles::AssistantStyles;
+        use crate::theme::ThemeKind;
         use std::time::Instant;
 
         let mut a = app();
@@ -1757,7 +1823,13 @@ mod tests {
         {
             let mut c = a.md_cache.borrow_mut();
             c.sync_len(a.transcript.len());
-            c.lines_for(1, "AAAA", 60, AssistantStyles, Instant::now());
+            c.lines_for(
+                1,
+                "AAAA",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                Instant::now(),
+            );
         }
         assert_eq!(crate::md::render_calls(), 1, "前置：AAAA 已入缓存");
 
@@ -1774,7 +1846,13 @@ mod tests {
         // 若把 `reset()` 删掉，`lines_for` 会命中 "AAAA" 的产物（键 = 槽下标+len+width 全同）。
         {
             let mut c = a.md_cache.borrow_mut();
-            let lines = c.lines_for(1, "BBBB", 60, AssistantStyles, Instant::now());
+            let lines = c.lines_for(
+                1,
+                "BBBB",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                Instant::now(),
+            );
             let flattened: String = lines
                 .iter()
                 .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -1982,5 +2060,153 @@ mod tests {
             ],
         };
         assert_eq!(message_text(&msg), "a\nb", "只取 Text 块，非 Text 块跳过");
+    }
+
+    // -----------------------------------------------------------------------
+    // 主题：切换必须真的重渲染（C7）
+    // -----------------------------------------------------------------------
+
+    /// 当前首帧渲染能看到的全部 `fg`（含行级与 span 级）。
+    ///
+    /// 走**生产路径**：`sync_scroll_state` 先同步布局（它与画面读同一份记忆），
+    /// 再从 `layout.window` 取行 —— 不另走 `build_text` 那条参考路径，否则就测不到
+    /// `EntryMemo` 里已上火色的旧行。
+    fn rendered_fgs(app: &mut App) -> HashSet<Color> {
+        let (w, h) = (80u16, 40u16);
+        app.sync_scroll_state(w, h, Instant::now());
+        let layout = app.layout.borrow();
+        let total = layout.total_rows();
+        let window = layout.window(0, total.max(1));
+        let mut out = HashSet::new();
+        for line in &window.lines {
+            if let Some(fg) = line.style.fg {
+                out.insert(fg);
+            }
+            for span in &line.spans {
+                if let Some(fg) = span.style.fg {
+                    out.insert(fg);
+                }
+            }
+        }
+        out
+    }
+
+    /// 该色板 10 个槽位的值集合（“产出色只准来自主题”这条的判据）。
+    fn palette_colors(kind: ThemeKind) -> HashSet<Color> {
+        let p = kind.palette();
+        [
+            p.bg, p.fg, p.accent, p.code, p.muted, p.user, p.ok, p.warn, p.fail, p.info,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// **C7：切主题必须真的重渲染**。
+    ///
+    /// 两条断言各钉一个失效面：
+    /// 1. 换主题后 `fg` 集合**变了** —— 钉「切换真的重渲染」（而不是屏上留着旧配色）；
+    /// 2. 新集合 ⊆ 新主题的调色板 —— 钉「没有一条路径漏了新色」：markdown 走
+    ///    `RenderCache`、其余走 `push_non_assistant`，两条都可能单独漏。
+    ///
+    /// transcript 同时含 **markdown**（标题 / 强调 / 行内码 ⇒ `accent` / `fg` / `code`）
+    /// 与**工具失败行**（⇒ `fail` / `muted`）/ 用户行（⇒ `user`）：只含纯文本的话，
+    /// 库可能不上色（`fg = None`），缓存留着旧产物也看不出来。
+    ///
+    /// **变异自检**（实测见任务报告）：
+    /// - 注释掉 `App::set_theme` 里的 `md_cache.set_theme(...)` ⇒ **本用例红**（第 2 条：
+    ///   缓存命中旧槽位，markdown 留着旧主题的 `accent` / `fg` / `code`）；
+    /// - 注释掉 `layout.reset()` ⇒ **本用例仍绿**（等价变异体）：`TranscriptLayout::sync`
+    ///   自身已按色板比值判「换主题 ⇒ 全量作废」，那一行是冗余保险。捕获它的是
+    ///   [`test_set_theme_invalidates_both_caches`] 的「布局记忆必须被清空」断言 ——
+    ///   而不是本条的颜色比对。
+    #[test]
+    fn test_set_theme_recolors_rendered_transcript() {
+        let mut a = app();
+        a.transcript.push(TranscriptLine::User("问一句".into()));
+        a.transcript.push(TranscriptLine::Assistant(
+            "# 标题\n\n正文 **强调** 与 `inline_code`\n\n- 列表项".into(),
+        ));
+        a.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "bash".into(),
+            summary: "false".into(),
+            result: Some("boom".into()),
+            success: false,
+        });
+
+        let kind_a = ThemeKind::AyuMirage;
+        let kind_b = ThemeKind::Nord;
+        assert_ne!(
+            kind_a.palette().bg,
+            kind_b.palette().bg,
+            "前置：两套主题必须不同"
+        );
+
+        a.set_theme(kind_a);
+        let fgs_a = rendered_fgs(&mut a);
+        assert!(!fgs_a.is_empty(), "前置：渲染行里应取到颜色");
+        assert!(
+            fgs_a.is_subset(&palette_colors(kind_a)),
+            "前置：主题 A 下产出色应来自 A 的调色板，实际 {fgs_a:?}"
+        );
+
+        a.set_theme(kind_b);
+        let fgs_b = rendered_fgs(&mut a);
+
+        assert_ne!(fgs_a, fgs_b, "换主题必须真的重渲染（fg 集合应不同）");
+        assert!(
+            fgs_b.is_subset(&palette_colors(kind_b)),
+            "切到主题 B 后产出色必须全来自 B 的调色板（否则有路径用了旧色板）：{fgs_b:?}"
+        );
+    }
+
+    /// `App::set_theme` 同时作废**两个**记忆：markdown 缓存与布局。
+    ///
+    /// 直接断言两个容器为空 —— C7 只证明「最终画面对了」，本条钉的是「怎么做到的」：
+    /// 若哪天 `set_theme` 改为在渲染时惰性判色，这里会先红，提醒改设计而不只是改用例。
+    #[test]
+    fn test_set_theme_invalidates_both_caches() {
+        let mut a = app();
+        a.transcript
+            .push(TranscriptLine::Assistant("# 标题\n\n正文".into()));
+        // 先渲染一次，把产物写进两个缓存。
+        let _ = rendered_fgs(&mut a);
+        assert!(
+            !a.layout.borrow().window(0, 1).lines.is_empty(),
+            "前置：布局里已有渲染行"
+        );
+
+        a.set_theme(ThemeKind::Nord);
+
+        assert_eq!(
+            a.layout.borrow().total_rows(),
+            0,
+            "换主题必须清空布局记忆（EntryMemo 里是已上色的行）"
+        );
+        // 缓存槽位没有公开读取口（故意如此）—— 用「重渲染必然发生」间接钉：
+        // 清空后首帧的渲染次数必须 > 0。
+        crate::md::reset_render_calls();
+        let _ = rendered_fgs(&mut a);
+        assert!(
+            crate::md::render_calls() > 0,
+            "换主题后必须重新解析 markdown（缓存不得命中旧槽位）"
+        );
+    }
+
+    /// 主题**不随** `/resume` 回放重置（D5：主题是全局偏好）。
+    #[test]
+    fn test_resume_keeps_current_theme() {
+        let mut a = app();
+        a.set_theme(ThemeKind::Nord);
+        a.apply_outbound(Outbound::SessionResumed {
+            summary: summary("target", "目标会话"),
+            thinking_visible: false,
+            history: vec![user_message("旧的 Q")],
+        });
+        assert_eq!(
+            a.theme,
+            ThemeKind::Nord,
+            "换会话不得重置主题（`reset_for_replay` 只清 transcript 同源状态）"
+        );
     }
 }

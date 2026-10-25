@@ -53,7 +53,17 @@ pub(crate) fn render(src: &str, width: usize, styles: AssistantStyles) -> Vec<Li
             let spans: Vec<Span<'static>> = line
                 .spans
                 .into_iter()
-                .map(|span| Span::styled(span.content.into_owned(), span.style))
+                .map(|span| {
+                    // 库对**正文** span 不给前景色（继承终端前景）。主题要能决定正文
+                    // 颜色，就必须在这里补上 `fg` 槽位 —— 否则白底终端上正文与主题
+                    // `bg` 可能撞成一片。**只补无前景的**：库明确上了色的 span
+                    // （标题 / 代码 / 引用 / alert…）保持原样，故语法层的语义不受影响。
+                    let mut style = span.style;
+                    if style.fg.is_none() {
+                        style = style.fg(styles.palette().fg);
+                    }
+                    Span::styled(span.content.into_owned(), style)
+                })
                 .collect();
             // `alignment` 字段是 `Option<Alignment>`，而 `Line::alignment()` setter 只收
             // `Alignment`（会丢掉"未设置"态）—— 直接写字段以原样保留。
@@ -118,6 +128,8 @@ mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier, Style};
 
+    use crate::theme::{Palette, ThemeKind};
+
     /// N3 覆盖用的固定文档（标题 / 粗体 / 斜体 / 行内码 / 链接 / 引用 / 列表 / 围栏码 / 表格）。
     const DOC: &str = "\
 # Heading
@@ -141,209 +153,11 @@ fn main() {}
 | a | b |
 ";
 
-    fn r(src: &str, width: usize) -> Vec<Line<'static>> {
-        render(src, width, AssistantStyles)
-    }
-
-    /// 一行里所有 span 内容的拼接（用于内容级断言）。
-    fn flat(line: &Line<'static>) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    /// 整个产物的纯文本（行间以 `\n` 连接）。
-    fn flat_all(lines: &[Line<'static>]) -> String {
-        lines.iter().map(flat).collect::<Vec<_>>().join("\n")
-    }
-
-    /// 收集所有产出样式（行级 + span 级）—— 泄漏检测要看两处都算。
-    fn all_styles(lines: &[Line<'static>]) -> Vec<ratatui::style::Style> {
-        let mut out = Vec::new();
-        for l in lines {
-            out.push(l.style);
-            for s in &l.spans {
-                out.push(s.style);
-            }
-        }
-        out
-    }
-
-    fn has_span(lines: &[Line<'static>], content: &str, pred: impl Fn(&Span) -> bool) -> bool {
-        lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content.as_ref() == content && pred(s))
-        })
-    }
-
-    #[test]
-    fn n3_heading_levels_have_explicit_style_and_no_marker() {
-        let lines = r(DOC, 120);
-        // h1：品红 + 粗体 + 下划线，**且不带 `#` 标记**（heading_marker 置空）
-        let h1 = lines
-            .iter()
-            .find(|l| flat(l).contains("Heading"))
-            .expect("应有一行含 Heading");
-        assert_eq!(h1.style.fg, Some(Color::Magenta), "h1 前景应为品红");
-        assert!(h1.style.add_modifier.contains(Modifier::BOLD));
-        assert!(h1.style.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(!flat(h1).contains('#'), "标题标记 `#` 应被去掉");
-    }
-
-    #[test]
-    fn n3_bold_italic_inline_code_link() {
-        let lines = r(DOC, 120);
-        assert!(
-            has_span(&lines, "bold", |s| s
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD)),
-            "粗体应为 BOLD"
-        );
-        assert!(
-            has_span(&lines, "italic", |s| s
-                .style
-                .add_modifier
-                .contains(Modifier::ITALIC)),
-            "斜体应为 ITALIC"
-        );
-        // 行内码：单一代码色（cyan 前景、无底色），与正文区分
-        assert!(
-            has_span(&lines, "code", |s| s.style.fg == Some(Color::Cyan)
-                && s.style.bg.is_none()),
-            "行内码应为 cyan 前景、无底色"
-        );
-        // 链接：下划线、不上色（非默认蓝）
-        assert!(
-            has_span(&lines, "link", |s| s
-                .style
-                .add_modifier
-                .contains(Modifier::UNDERLINED)
-                && s.style.fg.is_none()),
-            "链接应为下划线且无前景色"
-        );
-    }
-
-    #[test]
-    fn n3_blockquote_list_fenced_code_table() {
-        let lines = r(DOC, 120);
-        // 引用：行级暗灰
-        let quote = lines
-            .iter()
-            .find(|l| flat(l).contains("quote line"))
-            .expect("引用行");
-        assert_eq!(quote.style.fg, Some(Color::DarkGray));
-        // 有序列表标记暗灰
-        assert!(has_span(&lines, "1. ", |s| s.style.fg == Some(Color::DarkGray)));
-        // 无序列表标记（库默认 `- `，字形写死）
-        assert!(has_span(&lines, "- ", |_| true));
-        // 围栏代码：围栏行被去掉；内容**逐字保留**；行级 + span 级都是同一个代码色
-        let code = lines
-            .iter()
-            .find(|l| flat(l).contains("fn main() {}"))
-            .expect("代码行");
-        assert_eq!(flat(code), "fn main() {}", "代码样式不得改动字符");
-        assert_eq!(code.style.fg, Some(Color::Cyan), "围栏代码用行级代码色");
-        assert!(code.style.bg.is_none(), "围栏代码不得带底色");
-        assert!(!flat_all(&lines).contains("```"), "围栏行应被去掉");
-        // 表格头加粗、框线暗灰
-        assert!(has_span(&lines, "H1", |s| s
-            .style
-            .add_modifier
-            .contains(Modifier::BOLD)));
-        let joined = flat_all(&lines);
-        assert!(
-            joined.contains('─') && joined.contains('│'),
-            "应画出表格框线"
-        );
-        assert!(
-            lines.iter().any(|l| l
-                .spans
-                .iter()
-                .any(|s| s.content.starts_with('┌') && s.style.fg == Some(Color::DarkGray))),
-            "框线应为暗灰"
-        );
-    }
-
-    /// 回归：代码（行内 + 围栏块）**不产出任何背景色**。
-    ///
-    /// `code()` 同时作用于行内码与围栏代码块，而围栏块是整行级样式 —— 底色会让长代码块
-    /// 糊成一大片、并给缩进 / 行尾空白染色。故此处按产物扫描：任一行级或 span 级样式
-    /// 都不许带 `bg`。
-    #[test]
-    fn code_never_paints_a_background() {
-        let lines = r(
-            "前置 `inline` 后置\n\n```rust\nfn main() {}\n    let x = 1;\n```\n",
-            120,
-        );
-        for style in all_styles(&lines) {
-            assert_eq!(style.bg, None, "代码不得产出背景色：{style:?}");
-        }
-        // 非空性：行内与围栏两处代码都确实渲染到了（否则扫描是 vacuous）。
-        assert!(has_span(&lines, "inline", |_| true), "行内 code 未渲染");
-        assert!(
-            lines.iter().any(|l| flat(l) == "fn main() {}"),
-            "围栏 code 未渲染"
-        );
-    }
-
-    /// 代码**不分语言**：rust / python / json 围栏块与行内码共用同一个代码色；
-    /// 围栏行不进产物，字符逐字不变。
-    #[test]
-    fn every_code_block_shares_one_style() {
-        let src = "\
-```rust
-fn main() { let s = \"hi\"; }
-```
-
-```python
-def f(x):
-    return x  # 注释
-```
-
-```json
-{ \"a\": 1 }
-```
-
-正文里的行内码 `inline` 也同色。
-";
-        let lines = r(src, 120);
-        assert!(!flat_all(&lines).contains("```"), "围栏行应被去掉");
-
-        // 三个不同语言的围栏块：样式必须完全一致（cyan 前景、无底色）。
-        let want = Style::new().fg(Color::Cyan);
-        for needle in [
-            "fn main() { let s = \"hi\"; }",
-            "def f(x):",
-            "    return x  # 注释",
-            "{ \"a\": 1 }",
-        ] {
-            let line = lines
-                .iter()
-                .find(|l| flat(l) == needle)
-                .unwrap_or_else(|| panic!("缺少代码行 {needle:?}"));
-            assert_eq!(line.style, want, "代码行样式应统一：{needle:?}");
-            assert_eq!(flat(line), needle, "代码样式不得改动字符");
-        }
-        assert!(
-            has_span(&lines, "inline", |s| s.style == want),
-            "行内码应与围栏块同色"
-        );
-    }
-
-    /// N3 附加（加强版，R3）：**默认色泄漏** —— 用一份**触发全部 23 个 `StyleSheet` 方法**
-    /// 的文档渲染，再断言产出中不存在任何 `DefaultStyleSheet` 的**专属信号**。
-    ///
-    /// 用「专属信号」而非「与某个默认 `Style` 完全相等」：有若干方法本仓的配色**刻意与默认相同**
-    /// （`definition_term`/`table_cell`/`definition_description`/`table_border`/`math_inline`/
-    /// `math_display`，以及 `alert` 的 Important/Warning/Caution 三支）—— 对它们「泄漏」无从谈起，
-    /// 用完全相等作判据只会误报。故判据取默认配色中**本仓永不产出**的部分：蓝 / 绿 / cyan /
-    /// light-cyan / light-yellow / light-blue、白字黑底、`DIM`（见 [`default_signal`]）。
-    #[test]
-    fn n3_no_default_palette_leak() {
-        // 一份尽量触发全部样式点的文档：front matter / h1–h6 / 标题属性 / 段落（粗斜删码链接图片 +
-        // 内联 HTML）/ 引用 / 无序 + 有序 + task 列表 / 围栏码 / 行内 + 独立数学 / 脚注引用 + 定义 /
-        // 定义列表 / 分隔线 / 表格（表头 + 数据 + 对齐）/ 五种 GFM alert。
-        let src = "\
+    /// 触发**全部 23 个 `StyleSheet` 方法**的固定文档：front matter / h1–h6 / 标题属性 /
+    /// 段落（粗斜删码链接图片 + 内联 HTML）/ 引用 / 无序 + 有序 + task 列表 / 围栏码 /
+    /// 行内 + 独立数学 / 脚注引用 + 定义 / 定义列表 / 分隔线 / 表格（表头 + 数据 + 对齐）/
+    /// 五种 GFM alert。
+    const ALL_ELEMENTS: &str = "\
 ---
 title: Meta
 ---
@@ -403,59 +217,294 @@ Term
 > [!CAUTION]
 > cau body
 ";
-        let lines = r(src, 120);
 
-        // ---- 非空性：逐条确认 23 个样式点确被本输入触发（否则泄漏断言是 vacuous）----
-        // 1 heading（各级，行级品红；标题标记已置空 ⇒ 行文本恰为标题文本）
-        for h in ["H1", "H2", "H3", "H4", "H5", "H6"] {
-            assert!(
-                lines
-                    .iter()
-                    .any(|l| flat(l) == h && l.style.fg == Some(Color::Magenta)),
-                "heading {h} 未触发或未着色"
-            );
+    /// 用默认主题渲染（多数用例只需一个基准色板）。
+    fn r(src: &str, width: usize) -> Vec<Line<'static>> {
+        r_with(src, width, ThemeKind::default())
+    }
+
+    fn r_with(src: &str, width: usize, kind: ThemeKind) -> Vec<Line<'static>> {
+        render(src, width, AssistantStyles::new(kind.palette()))
+    }
+
+    /// 基准色板（默认主题的 10 个槽位）。
+    fn base_palette() -> Palette {
+        ThemeKind::default().palette()
+    }
+
+    /// 样式的前景色。
+    fn fg(style: Style) -> Option<Color> {
+        style.fg
+    }
+
+    /// 断言该样式的**前景恰为该主题的某槽位**。`what` 进失败信息，便于定位到漏覆写的方法。
+    fn assert_slot(style: Style, p: &Palette, slot: Color, what: &str) {
+        assert_eq!(
+            fg(style),
+            Some(slot),
+            "{what} 的前景应取自主题槽位，实际色板：{p:?}"
+        );
+    }
+
+    /// 一行里所有 span 内容的拼接（用于内容级断言）。
+    fn flat(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// 整个产物的纯文本（行间以 `\n` 连接）。
+    fn flat_all(lines: &[Line<'static>]) -> String {
+        lines.iter().map(flat).collect::<Vec<_>>().join("\n")
+    }
+
+    /// 收集所有产出样式（行级 + span 级）—— 泄漏检测要看两处都算。
+    fn all_styles(lines: &[Line<'static>]) -> Vec<ratatui::style::Style> {
+        let mut out = Vec::new();
+        for l in lines {
+            out.push(l.style);
+            for s in &l.spans {
+                out.push(s.style);
+            }
         }
-        // 2 code（行内 + 围栏）
-        assert!(
-            has_span(&lines, "code", |s| s.style.fg == Some(Color::Cyan)),
-            "行内 code 未触发"
-        );
-        assert!(
-            lines
+        out
+    }
+
+    /// 产出的 (样式, 文本) 对：行级用整行文本，span 级用 span 文本。
+    fn styled_texts(lines: &[Line<'static>]) -> Vec<(Style, String)> {
+        let mut out = Vec::new();
+        for l in lines {
+            out.push((l.style, flat(l)));
+            for s in &l.spans {
+                out.push((s.style, s.content.to_string()));
+            }
+        }
+        out
+    }
+
+    fn has_span(lines: &[Line<'static>], content: &str, pred: impl Fn(&Span) -> bool) -> bool {
+        lines.iter().any(|l| {
+            l.spans
                 .iter()
-                .any(|l| flat(l) == "fn main() {}" && l.style.fg == Some(Color::Cyan)),
-            "围栏 code 未触发"
+                .any(|s| s.content.as_ref() == content && pred(s))
+        })
+    }
+
+    #[test]
+    fn n3_heading_levels_have_explicit_style_and_no_marker() {
+        let lines = r(DOC, 120);
+        // h1：accent 前景 + 粗体 + 下划线，**且不带 `#` 标记**（heading_marker 置空）
+        let h1 = lines
+            .iter()
+            .find(|l| flat(l).contains("Heading"))
+            .expect("应有一行含 Heading");
+        assert_slot(h1.style, &base_palette(), base_palette().accent, "h1");
+        assert!(h1.style.add_modifier.contains(Modifier::BOLD));
+        assert!(h1.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!flat(h1).contains('#'), "标题标记 `#` 应被去掉");
+    }
+
+    #[test]
+    fn n3_bold_italic_inline_code_link() {
+        let lines = r(DOC, 120);
+        assert!(
+            has_span(&lines, "bold", |s| s
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)),
+            "粗体应为 BOLD"
         );
-        // 3 link
+        assert!(
+            has_span(&lines, "italic", |s| s
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)),
+            "斜体应为 ITALIC"
+        );
+        // 行内码：单一代码色（`code` 槽位前景、无底色），与正文区分
+        let p = base_palette();
+        assert!(
+            has_span(&lines, "code", |s| fg(s.style) == Some(p.code)
+                && s.style.bg.is_none()),
+            "行内码应为 `code` 槽位前景、无底色"
+        );
+        // 链接：下划线 + `info` 槽位（显式上色，避免被正文 fg 吞掉）
         assert!(
             has_span(&lines, "link", |s| s
                 .style
                 .add_modifier
                 .contains(Modifier::UNDERLINED)
-                && s.style.fg.is_none()),
+                && fg(s.style) == Some(p.info)),
+            "链接应为下划线且无前景色"
+        );
+    }
+
+    #[test]
+    fn n3_blockquote_list_fenced_code_table() {
+        let lines = r(DOC, 120);
+        let p = base_palette();
+        // 引用：行级 `muted`
+        let quote = lines
+            .iter()
+            .find(|l| flat(l).contains("quote line"))
+            .expect("引用行");
+        assert_slot(quote.style, &p, p.muted, "blockquote");
+        // 有序列表标记 `muted`
+        assert!(has_span(&lines, "1. ", |s| fg(s.style) == Some(p.muted)));
+        // 无序列表标记（库默认 `- `，字形写死）
+        assert!(has_span(&lines, "- ", |_| true));
+        // 围栏代码：围栏行被去掉；内容**逐字保留**；行级 + span 级都是同一个代码色
+        let code = lines
+            .iter()
+            .find(|l| flat(l).contains("fn main() {}"))
+            .expect("代码行");
+        assert_eq!(flat(code), "fn main() {}", "代码样式不得改动字符");
+        assert_eq!(code.style.fg, Some(p.code), "围栏代码用行级 `code` 槽位色");
+        assert!(code.style.bg.is_none(), "围栏代码不得带底色");
+        assert!(!flat_all(&lines).contains("```"), "围栏行应被去掉");
+        // 表格头加粗、框线 `muted`
+        assert!(has_span(&lines, "H1", |s| s
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)));
+        let joined = flat_all(&lines);
+        assert!(
+            joined.contains('─') && joined.contains('│'),
+            "应画出表格框线"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                .spans
+                .iter()
+                .any(|s| s.content.starts_with('┌') && fg(s.style) == Some(p.muted))),
+            "框线应取 `muted` 槽位"
+        );
+    }
+
+    /// 回归：代码（行内 + 围栏块）**不产出任何背景色**。
+    ///
+    /// `code()` 同时作用于行内码与围栏代码块，而围栏块是整行级样式 —— 底色会让长代码块
+    /// 糊成一大片、并给缩进 / 行尾空白染色。故此处按产物扫描：任一行级或 span 级样式
+    /// 都不许带 `bg`。
+    #[test]
+    fn code_never_paints_a_background() {
+        let lines = r(
+            "前置 `inline` 后置\n\n```rust\nfn main() {}\n    let x = 1;\n```\n",
+            120,
+        );
+        for style in all_styles(&lines) {
+            assert_eq!(style.bg, None, "代码不得产出背景色：{style:?}");
+        }
+        // 非空性：行内与围栏两处代码都确实渲染到了（否则扫描是 vacuous）。
+        assert!(has_span(&lines, "inline", |_| true), "行内 code 未渲染");
+        assert!(
+            lines.iter().any(|l| flat(l) == "fn main() {}"),
+            "围栏 code 未渲染"
+        );
+    }
+
+    /// 代码**不分语言**：rust / python / json 围栏块与行内码共用同一个代码色；
+    /// 围栏行不进产物，字符逐字不变。
+    #[test]
+    fn every_code_block_shares_one_style() {
+        let src = "\
+```rust
+fn main() { let s = \"hi\"; }
+```
+
+```python
+def f(x):
+    return x  # 注释
+```
+
+```json
+{ \"a\": 1 }
+```
+
+正文里的行内码 `inline` 也同色。
+";
+        let lines = r(src, 120);
+        assert!(!flat_all(&lines).contains("```"), "围栏行应被去掉");
+
+        // 三个不同语言的围栏块：样式必须完全一致（`code` 槽位前景、无底色）。
+        let want = Style::new().fg(base_palette().code);
+        for needle in [
+            "fn main() { let s = \"hi\"; }",
+            "def f(x):",
+            "    return x  # 注释",
+            "{ \"a\": 1 }",
+        ] {
+            let line = lines
+                .iter()
+                .find(|l| flat(l) == needle)
+                .unwrap_or_else(|| panic!("缺少代码行 {needle:?}"));
+            assert_eq!(line.style, want, "代码行样式应统一：{needle:?}");
+            assert_eq!(flat(line), needle, "代码样式不得改动字符");
+        }
+        assert!(
+            has_span(&lines, "inline", |s| s.style == want),
+            "行内码应与围栏块同色"
+        );
+    }
+
+    /// N3 附加（R3）：**逐元素非空性** —— 用一份**触发全部 23 个 `StyleSheet` 方法**的文档渲染，
+    /// 逐条断言每种元素都被本模块的样式表着色（而非 vacuous 地漏过）。
+    ///
+    /// 判据一律是「等于某主题的某槽位」：漏覆写某个方法 ⇒ 该元素取到库默认色 ⇒ 不等于任何槽位 ⇒ 红。
+    /// 全产物范围的「产出色 ∈ 主题调色板」扫描由 [`test_no_default_color_leak_per_theme`] 承担。
+    #[test]
+    fn n3_every_element_is_colored() {
+        let lines = r(ALL_ELEMENTS, 120);
+        let p = base_palette();
+
+        // ---- 非空性：逐条确认 23 个样式点确被本输入触发（否则泄漏断言是 vacuous）----
+        // 1 heading（各级，行级 `accent`；标题标记已置空 ⇒ 行文本恰为标题文本）
+        for h in ["H1", "H2", "H3", "H4", "H5", "H6"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| flat(l) == h && fg(l.style) == Some(p.accent)),
+                "heading {h} 未触发或未着色"
+            );
+        }
+        // 2 code（行内 + 围栏）
+        assert!(
+            has_span(&lines, "code", |s| fg(s.style) == Some(p.code)),
+            "行内 code 未触发"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| flat(l) == "fn main() {}" && fg(l.style) == Some(p.code)),
+            "围栏 code 未触发"
+        );
+        // 3 link：下划线 + `info` 槽位（必须显式上色，否则会被正文 fg 吞掉）
+        assert!(
+            has_span(&lines, "link", |s| s
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+                && fg(s.style) == Some(p.info)),
             "link 未触发"
         );
         // 4 blockquote
         assert!(
             lines
                 .iter()
-                .any(|l| flat(l).contains("quote") && l.style.fg == Some(Color::DarkGray)),
+                .any(|l| flat(l).contains("quote") && fg(l.style) == Some(p.muted)),
             "blockquote 未触发"
         );
         // 5 heading_meta
         assert!(
-            lines
+            lines.iter().any(|l| l
+                .spans
                 .iter()
-                .any(|l| l.spans.iter().any(
-                    |s| s.content.contains("{#anchor}") && s.style.fg == Some(Color::DarkGray)
-                )),
+                .any(|s| s.content.contains("{#anchor}") && fg(s.style) == Some(p.muted))),
             "heading_meta 未触发"
         );
         // 6 metadata_block
         assert!(
             lines
                 .iter()
-                .any(|l| flat(l) == "title: Meta" && l.style.fg == Some(Color::DarkGray)),
+                .any(|l| flat(l) == "title: Meta" && fg(l.style) == Some(p.muted)),
             "metadata_block 未触发"
         );
         // 7 heading_marker 置空已由上面「heading 行恰为 H1..H6、无 `#` 前缀」钉住
@@ -463,28 +512,28 @@ Term
         assert!(!flat_all(&lines).contains("```"), "code_block_fence 未置空");
         // 9 html
         assert!(
-            has_span(&lines, "<br>", |s| s.style.fg == Some(Color::DarkGray)),
+            has_span(&lines, "<br>", |s| fg(s.style) == Some(p.muted)),
             "html 未触发"
         );
         // 10 math_inline
         assert!(
-            has_span(&lines, "$y$", |s| s.style.fg == Some(Color::Magenta)
+            has_span(&lines, "$y$", |s| fg(s.style) == Some(p.accent)
                 && s.style.add_modifier.contains(Modifier::ITALIC)),
             "math_inline 未触发"
         );
         // 11 math_display
         assert!(
-            has_span(&lines, "$$x$$", |s| s.style.fg == Some(Color::Magenta)),
+            has_span(&lines, "$$x$$", |s| fg(s.style) == Some(p.accent)),
             "math_display 未触发"
         );
         // 12 footnote_ref
         assert!(
-            has_span(&lines, "[fn]", |s| s.style.fg == Some(Color::DarkGray)),
+            has_span(&lines, "[fn]", |s| fg(s.style) == Some(p.muted)),
             "footnote_ref 未触发"
         );
         // 13 footnote_def
         assert!(
-            has_span(&lines, "[fn]: ", |s| s.style.fg == Some(Color::DarkGray)),
+            has_span(&lines, "[fn]: ", |s| fg(s.style) == Some(p.muted)),
             "footnote_def 未触发"
         );
         // 14 definition_term
@@ -502,31 +551,32 @@ Term
         );
         // 16/17/18 alert（五种 kind）+ alert_icon（置空 ⇒ 行文本恰为 `> {label}`）+ alert_label
         for (color, label) in [
-            (Color::Magenta, "Note"),
-            (Color::Magenta, "Tip"),
-            (Color::Yellow, "Important"),
-            (Color::Yellow, "Warning"),
-            (Color::Red, "Caution"),
+            (p.info, "Note"),
+            (p.info, "Tip"),
+            (p.warn, "Important"),
+            (p.warn, "Warning"),
+            (p.fail, "Caution"),
         ] {
             assert!(
                 lines
                     .iter()
-                    .any(|l| flat(l) == format!("> {label}") && l.style.fg == Some(color)),
+                    .any(|l| flat(l) == format!("> {label}") && fg(l.style) == Some(color)),
                 "alert {label} 未触发/未着色，或 alert_icon 未置空"
             );
         }
-        // 19 table_header
+        // 19 table_header：与单元格同 `fg`，层次只靠 BOLD。
         assert!(
             has_span(&lines, "Left", |s| s
                 .style
                 .add_modifier
                 .contains(Modifier::BOLD)
-                && s.style.fg.is_none()),
+                && fg(s.style) == Some(p.fg)),
             "table_header 未触发"
         );
-        // 20 table_cell
+        // 20 table_cell：`fg`、无 BOLD。
         assert!(
-            has_span(&lines, "a", |s| s.style == ratatui::style::Style::default()),
+            has_span(&lines, "a", |s| fg(s.style) == Some(p.fg)
+                && !s.style.add_modifier.contains(Modifier::BOLD)),
             "table_cell 未触发"
         );
         // 21 table_border
@@ -534,56 +584,90 @@ Term
             lines.iter().any(|l| l
                 .spans
                 .iter()
-                .any(|s| s.content.starts_with('┌') && s.style.fg == Some(Color::DarkGray))),
+                .any(|s| s.content.starts_with('┌') && fg(s.style) == Some(p.muted))),
             "table_border 未触发"
         );
         // 22 list_marker
         assert!(
-            has_span(&lines, "1. ", |s| s.style.fg == Some(Color::DarkGray)),
+            has_span(&lines, "1. ", |s| fg(s.style) == Some(p.muted)),
             "list_marker 未触发"
         );
         // 23 image_alt
         assert!(
-            has_span(&lines, "[img] ", |s| s.style.fg == Some(Color::DarkGray)
+            has_span(&lines, "[img] ", |s| fg(s.style) == Some(p.muted)
                 && s.style.add_modifier.contains(Modifier::ITALIC)),
             "image_alt 未触发"
         );
 
-        // ---- 泄漏扫描：任何产出样式都不得携带默认专属信号 ----
-        for style in all_styles(&lines) {
-            if let Some(what) = default_signal(style) {
-                panic!("漏进 DefaultStyleSheet 默认配色（{what}）：{style:?}");
-            }
+        // 全产物范围的「产出色 ∈ 主题调色板」扫描见 `test_no_default_color_leak_per_theme`。
+    }
+
+    /// C5（R3）：**逐主题扫全部产物**，断言没有任何 `Span` / 行携带主题色板之外的颜色。
+    ///
+    /// 漏覆写砦任一 `StyleSheet` 方法 ⇒ 该元素取到 `DefaultStyleSheet` 的具名色（蓝 / 绿 /
+    /// cyan / 白字黑底 / dim…）⇒ 落不进 10 个槽位 ⇒ 红。逐主题跑：写死成默认主题色的
+    /// 实现同样会红。
+    ///
+    /// **前景与背景都查**：只看 `fg` 会漏掉「白字黑底」这类只改背景的默认配色（`code()` 的默认
+    /// 形态正是其一）。产出色在 `md.rs` 里只会是 `None` 或色板值（`bg` 恒为 `None`）：
+    /// 库给字体形态叠加的除外，那不影响颜色。
+    /// 正文（库不给前景的 span）必须取当前主题的 `fg` —— 否则白底终端上正文与主题
+    /// `bg` 可能撞成一片，「换主题」对最该换的那部分文本失效。
+    ///
+    /// 变异：删掉 `render` 里「`style.fg.is_none()` ⇒ 补 `fg`」那段 ⇒ 本用例红。
+    #[test]
+    fn body_text_takes_fg_slot_per_theme() {
+        for kind in ThemeKind::ALL {
+            let p = kind.palette();
+            let lines = r_with("plain body text\n", 120, kind);
+            let span = lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .find(|s| s.content.contains("plain body text"))
+                .expect("应有正文 span");
+            assert_eq!(
+                fg(span.style),
+                Some(p.fg),
+                "{}：正文应取 fg 槽位",
+                kind.name()
+            );
         }
     }
 
-    /// `DefaultStyleSheet` 的**专属信号** —— 本仓 `AssistantStyles` 永远不产出它们；
-    /// 命中任一即说明某方法漏写、回落到了库默认配色（R3）。
-    ///
-    /// 本仓刻意**不用**蓝 / 绿 / light-cyan / light-yellow / light-blue，也不用白字黑底、
-    /// 不用 `DIM`。其余默认色（magenta / yellow / red / dark_gray）本仓有意复用，故不作信号。
-    ///
-    /// **`cyan` 在 2026-10-10 从信号集移除**：`code()` 有意用 cyan 作单一代码色（不分语言）。
-    /// 代价是「heading / table_header 回落默认 cyan」不再能被颜色扫描发现 —— 由同用例里
-    /// 逐元素的非空性断言补上（heading 断言 fg 恰为 magenta；table_header 断言 BOLD 且**无前景**）。
-    fn default_signal(style: ratatui::style::Style) -> Option<&'static str> {
-        for color in [style.fg, style.bg].into_iter().flatten() {
-            match color {
-                Color::Blue => return Some("默认蓝（link / alert Note）"),
-                Color::Green => return Some("默认绿（blockquote / alert Tip）"),
-                Color::LightCyan => return Some("默认 light cyan（heading 4-6）"),
-                Color::LightYellow => return Some("默认 light yellow（metadata_block）"),
-                Color::LightBlue => return Some("默认 light blue（list_marker）"),
-                _ => {}
+    #[test]
+    fn test_no_default_color_leak_per_theme() {
+        for kind in ThemeKind::ALL {
+            let p = kind.palette();
+            let slots = [
+                p.bg, p.fg, p.accent, p.code, p.muted, p.user, p.ok, p.warn, p.fail, p.info,
+            ];
+            let lines = r_with(ALL_ELEMENTS, 120, kind);
+
+            // 非空性：扫描前先确认这份文档确实产出了内容（否则整个扫描是 vacuous）。
+            assert!(
+                styled_texts(&lines).len() > 40,
+                "{}：样例文档产出过少，泄漏扫描可能空闲",
+                kind.name()
+            );
+
+            for (style, text) in styled_texts(&lines) {
+                if let Some(color) = style.fg {
+                    assert!(
+                        slots.contains(&color),
+                        "{}：前景色 {color:?} 不在该主题色板内（文本 {text:?}）",
+                        kind.name()
+                    );
+                }
+                if let Some(color) = style.bg {
+                    assert_eq!(
+                        color,
+                        p.bg,
+                        "{}：背景色 {color:?} 应为主题 bg（文本 {text:?}）",
+                        kind.name()
+                    );
+                }
             }
         }
-        if style.fg == Some(Color::White) && style.bg == Some(Color::Black) {
-            return Some("默认白字黑底（code）");
-        }
-        if style.add_modifier.contains(Modifier::DIM) {
-            return Some("默认 dim（heading_meta / html / footnote / image_alt）");
-        }
-        None
     }
 
     /// N5：表格窄屏守卫 —— 任意宽度下，凡**含框线字符**的行显示宽度都不得超过 `width`。
@@ -666,7 +750,7 @@ Term
         let src = "# 标题\n\n这是一段非常长的正文，明显超过窗口宽度，并且含有**粗体**内容，\
                    用来验证守卫不会把整条回答静默退回纯文本。";
         let lines = r(src, 8);
-        // 标题行：行级样式（品红 + 粗体 + 下划线），且不带 `#` 标记
+        // 标题行：行级样式（`accent` + 粗体 + 下划线），且不带 `#` 标记
         let h = lines
             .iter()
             .find(|l| flat(l).contains("标题"))

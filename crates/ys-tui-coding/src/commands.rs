@@ -21,6 +21,7 @@ use ys_core::{ContentBlock, EffortLevel, Message, Role};
 use ys_protocol::Request;
 
 use crate::app::App;
+use crate::theme::ThemeKind;
 use crate::transcript::TranscriptLine;
 use crate::view::{CodingView, SkillEntry};
 
@@ -49,7 +50,7 @@ const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|
 /// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
 const EFFORT_DEFAULT_TOKEN: &str = "default";
 
-static COMMANDS: [CommandSpec; 14] = [
+static COMMANDS: [CommandSpec; 15] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -84,6 +85,11 @@ static COMMANDS: [CommandSpec; 14] = [
         name: "effort",
         description: "设置模型思考档位",
         arg_hint: Some("[off|minimal|low|medium|high|xhigh|max|default]"),
+    },
+    CommandSpec {
+        name: "theme",
+        description: "切换配色主题",
+        arg_hint: Some("[name]"),
     },
     CommandSpec {
         name: "model",
@@ -162,6 +168,13 @@ pub enum LocalAction {
     Thinking(Option<bool>),
     /// 无参 `/effort`：显示当前档位与用法（**不发请求**；真值在 `CodingView.effort`）。
     Effort,
+    /// `/theme <name>`：**已解析**的主题。
+    ///
+    /// 携带 [`ThemeKind`] 而不是原始 `String`：非法输入必须在进入本地应用**之前**
+    /// 就被拦下（解析在 `parse_with_skills` 里做，落成 [`Self::Hint`]），故本变体
+    /// 的载荷天然是合法值，`apply_local` 不必再承担「解析失败怎么办」这一态。
+    /// 无参 `/theme` 不走这里 —— 它开浮层（[`PromptKind::PickTheme`]）。
+    Theme(ThemeKind),
     /// 本地提示（未知命令 / 参数错误）—— 文本原样进 transcript。
     Hint(String),
 }
@@ -189,6 +202,13 @@ pub enum PromptKind {
     /// [`crate::prompter::resolve_session_pick`]（候选与 `&CodingView` **不同源**，
     /// 故不走 `resolve_prompt`）。
     PickSession,
+    /// 选主题 → `Request::SetTheme { theme }`。
+    ///
+    /// **不走 [`crate::prompter::resolve_prompt`]**：主题浮层要**实时预览**
+    /// （每移动一格就把候选色板铺到整屏），而 `Prompter::select` 是 `&self` 且无
+    /// 回调，结构上拿不到「逐键」这件事。故由 `run.rs` 的专用模态
+    /// （`apply_theme_modal`）处理，`resolve_prompt` 对本值一律返回 `Err`。
+    PickTheme,
 }
 
 /// 解析一次提交的输入。
@@ -267,6 +287,20 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
                         }),
                         Err(_) => Action::Local(LocalAction::Hint(EFFORT_USAGE.to_string())),
                     }
+                }
+            }
+        }
+        // 无参 → 浮层（要实时预览，见 [`PromptKind::PickTheme`]）；有参 → 本地立即
+        // 生效（`apply_local` 调 `app.set_theme`），再由 `events.rs` 单向同步给 app
+        // 持久化。非法值只本地提示**不改任何状态**（`ThemeParseError` 的回显已含
+        // 全部合法名，故不再另造一份用法串）。
+        "theme" => {
+            if args.is_empty() {
+                Action::Prompt(PromptKind::PickTheme)
+            } else {
+                match arg().parse::<ThemeKind>() {
+                    Ok(kind) => Action::Local(LocalAction::Theme(kind)),
+                    Err(e) => Action::Local(LocalAction::Hint(e.to_string())),
                 }
             }
         }
@@ -556,6 +590,13 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
                 .map(|level| level.to_string())
                 .unwrap_or_else(|| EFFORT_DEFAULT_TOKEN.to_string())
         ),
+        // 主题**只有一份真值**（`App.theme`）—— 与 `/effort` 的「只读视图」不同：
+        // 主题是纯 UI 状态，本地改完就是最终值，app 侧只是持久化镜像。落盘由
+        // `events.rs` 单向同步（本函数只拿 `&mut App`，不做 IO）。
+        LocalAction::Theme(kind) => {
+            app.set_theme(kind);
+            format!("theme: {}", kind.name())
+        }
         LocalAction::Hint(text) => text,
     };
     app.transcript.push(TranscriptLine::System(text));
@@ -606,6 +647,8 @@ mod tests {
                 "/effort maybe",
                 Action::Local(L::Hint(EFFORT_USAGE.to_string())),
             ),
+            ("/theme", Action::Prompt(PromptKind::PickTheme)),
+            ("/theme nord", Action::Local(L::Theme(ThemeKind::Nord))),
             ("/model", Action::Prompt(PromptKind::PickModel)),
             (
                 "/model gpt-4o",
@@ -823,6 +866,67 @@ mod tests {
         }
     }
 
+    /// `/theme` 的三种形态：无参开浮层、合法名（大小写不敏感 / `_` 归一化）落成
+    /// 已解析的 [`ThemeKind`]、非法名只本地提示。
+    ///
+    /// 变异：把无参分支改成 `LocalAction::Hint`（不开浮层）⇒ 第一条断言变红；
+    /// 把 `arg().parse::<ThemeKind>()` 换成 `Ok(ThemeKind::default())` ⇒ 后两条变红。
+    #[test]
+    fn test_theme_parse_three_forms() {
+        // 无参 = 浮层（要实时预览，故不进通用 `Prompt` 路径也不直发）。
+        assert_eq!(parse("/theme"), Action::Prompt(PromptKind::PickTheme));
+        assert_eq!(parse("/theme   "), Action::Prompt(PromptKind::PickTheme));
+
+        // 有参合法 ⇒ 已解析的主题值（名称归一化由 `ThemeKind::from_str` 决定）。
+        assert_eq!(
+            parse("/theme nord"),
+            Action::Local(LocalAction::Theme(ThemeKind::Nord))
+        );
+        assert_eq!(
+            parse("/theme NORD"),
+            Action::Local(LocalAction::Theme(ThemeKind::Nord)),
+            "大小写不敏感"
+        );
+        assert_eq!(
+            parse("/theme gruvbox_dark"),
+            Action::Local(LocalAction::Theme(ThemeKind::GruvboxDark)),
+            "`_` 归一化为 `-`"
+        );
+
+        // 有参非法 ⇒ 本地提示且**列出全部合法名**（不改任何状态）。
+        match parse("/theme nope") {
+            Action::Local(LocalAction::Hint(text)) => {
+                assert!(text.contains("nope"), "要回显原文：{text}");
+                for kind in ThemeKind::ALL {
+                    assert!(
+                        text.contains(kind.name()),
+                        "提示缺 `{}`：{text}",
+                        kind.name()
+                    );
+                }
+            }
+            other => panic!("非法主题应本地提示，得到 {other:?}"),
+        }
+    }
+
+    /// `/theme <name>` 的本地应用：**调 `App::set_theme`**（不是只写一行文本），
+    /// 并把生效后的规范名写进 transcript。
+    ///
+    /// 变异：把臂里的 `app.set_theme(kind)` 删掉（只留文本）⇒ 第一条断言变红。
+    #[test]
+    fn test_apply_local_theme_sets_app_theme() {
+        let mut a = app();
+        assert_eq!(a.theme, ThemeKind::default(), "初始为主题默认值");
+
+        apply_local(&mut a, LocalAction::Theme(ThemeKind::Nord));
+        assert_eq!(a.theme, ThemeKind::Nord, "`/theme nord` 必须本地立即生效");
+        let Some(TranscriptLine::System(text)) = a.transcript.last() else {
+            panic!("应 push 一条 System：{:?}", a.transcript);
+        };
+        assert_eq!(text, "theme: nord", "回显用 kebab-case 规范名");
+        assert!(a.follow, "本地动作要贴底");
+    }
+
     /// 无参 `/effort` 只读视图：恰好一条 System 行，档位 + 用法同处一行。
     ///
     /// 变异：把 `None` 的显示改回 `-` 或空串 ⇒ 本测试**不受影响**（它在 apply 前
@@ -925,8 +1029,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "status", "skills", "copy", "quit", "thinking", "effort", "model", "login",
-                "logout", "new", "resume", "compact", "export",
+                "help", "status", "skills", "copy", "quit", "thinking", "effort", "theme", "model",
+                "login", "logout", "new", "resume", "compact", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );

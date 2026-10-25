@@ -273,8 +273,9 @@ provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoni
 
 `Thinking` 与 `Tool` **同属** `Action` —— 它们是同一件事的两面（想 → 做）；拆成两类会在两者之间
 插空白，把一串工具调用切碎。块**内部**的层次由缩进表达：思考缩进 **2 格**、工具缩进 **4 格**
-（层次：想 ⊂ 做），整体前景色为**暗灰** `DarkGray`，与顶格的正文块拉开视觉重量。
-工具行的 `✓` / `✗` 保留绿 / 红 —— 那是**语义**信号（成功与否），不属于「行动」的类别色。
+（层次：想 ⊂ 做），整体前景色取 **`muted`** 槽位，与顶格的正文块拉开视觉重量。
+工具行的 `✓` / `✗` 分别取 **`ok`** / **`fail`** 槽位 —— 那是**语义**信号（成功与否），不属于「行动」的类别色；
+具体明暗由当前主题决定（见 §14.9），不假设「绿 / 红」。
 缩进用**空格**而非制表符（制表宽度随终端设置变化，同一份内容会错位），且**不依赖任何特殊字形** ——
 字体缺 `⌁` (U+2301) 时缩进照样成立。`LineClass::indent` 是缩进的**唯一真相源**
 （思考行与工具行都经它取值），不在两处各写一遍魔法数。
@@ -332,7 +333,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 ## 6. 命令划分：TUI 侧表 vs app 侧能力
 
-**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，14 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，15 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app。二者唯一契约是 `Request` —— 漏实现是**编译错误**
 （app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -354,6 +355,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | `/quit` | 本地 | — |
 | `/thinking [on\|off]` | 本地开关 **（不在 design §6 表里，实现新增，见 §8）** | — |
 | `/effort [level]` | 无参本地显示当前档位与用法（**不发请求**）；有参直发；`default` 清除设置（发 `None`） | `SetEffort` |
+| `/theme [name]` | 无参时**浮层选择 + 逐键实时预览**（Esc 还原不落盘、Enter 确认落盘）；有参本地立即生效、再单向同步；非法值只提示（见 §14.9） | `SetTheme` |
 | `/model [name]` | 无参时**浮层选择**（`available_models`，每条显示 `provider/model`、可输入筛选）；有参直发，支持 `provider/model` 限定名 | `SetModel` |
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
@@ -431,7 +433,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D3 | app 循环伪代码把 `boundary_rx` 直接交给 `BasicLoop`（§7） | app 侧在 `select!` 里把 `boundary_rx` 收到的 `Boundary` **push 进每回合新建的 `QueueBoundarySource`** | ① app 循环在回合中已经 `select!` 着 `boundary_rx`，顺手泵进源即可；② 一次性源避免 `Abort` 标记跨回合污染（§4）。另加空闲期排空残留 |
 | D4 | app 循环伪代码在回合末**不排空**事件信道（§7） | 回合结束后 `while let Ok(env) = sink_rx.try_recv()` 排空 | `select!` 分支选择是随机的，可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件还躺在信道里；不排空会晚一整回合转发（`is_turning` 不复位、turn 摘要不显示） |
 | D5 | `CodingView` 字段清单「含 `ToolCallId → ToolCall` 映射，供工具结果回填」（§9 未决） | **视图不含映射**；结果回填靠 **UI 侧** `App` 自己的 `tool_index`（transcript 下标） | 视图只承载「状态行 / `/status`」要显示的东西；回填是渲染关注点，归 UI |
-| D6 | 命令表只有 §6 的 9 条 | 表里有 **14 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）、**`/resume`**（运行期切换会话落地后补，见 §8.2 M19）与 **`/effort`**（思考档位落地后补，见 §8.2 M21） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md`；`/effort` 见 `docs/design-final/effort.md` |
+| D6 | 命令表只有 §6 的 9 条 | 表里有 **15 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）、**`/resume`**（运行期切换会话落地后补，见 §8.2 M19）、**`/effort`**（思考档位落地后补，见 §8.2 M21）与 **`/theme`**（配色主题落地后补，见 §14.9） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md`；`/effort` 见 `docs/design-final/effort.md`；`/theme` 见 §14.9 与 ADR-0053 |
 | D7 | 初始化顺序编号为 1.信道 2.sink 3.阻塞 Wiring 4.Agent 5.view₀ 6.spawn（§7） | 实际 1+2.channel/sink → **4.Agent** → **3.阻塞 Wiring** → 5.view₀ → 6.spawn | Agent 构建不阻塞、不依赖 Wiring；先建 Agent 后建 Wiring 不破坏 R7 的承重结论（**阻塞早退发生在 spawn 之前**，`begin_turn` 只在 agent 真跑时发生） |
 | D8 | `ys-protocol` 里的 `Envelope` / `LifecyclePolicy`「迁往 ys-protocol」（review R1 建议） | 已迁；`ys-channel` 整 crate 删除 | 见 `core-channel.md` §8 |
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
@@ -543,7 +545,7 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
 | `apps/coding-agent/src/capabilities.rs` | `set_effort` 保存 + 重建（factory 收到有效档位）+ 输出 `effort: high`；`None` 清除覆盖并输出配置默认 `high`；无凭证 ⇒ `wiring.model == None`；不支持的 provider 仍保存并给 warning；`/resume` 从目标 meta 还原并重建 | 只写 `config.effort` 不重建 ⇒ factory 断言；无凭证仍保留旧 model ⇒ 置空断言；漏 `cfg.effort = effort` ⇒ resume 用例 |
 | `apps/coding-agent/src/app_loop.rs` | `SetEffort` 臂产出 `Output` + 刷新 `View.effort`；`None` 清除覆盖后视图回到默认 `high`；`every_request_variant_is_handled` 覆盖该变体；回合末写入 / `/new` 保留 | 漏 `SetEffort` 臂 ⇒ `match` 不穷尽编译失败；只改 config 不刷视图 ⇒ `set_effort_updates_view`；回合末不写 ⇒ meta 用例 |
 | `apps/coding-agent/src/{main,view}.rs` | `finalize_turn_meta` 三态（写入 / 清除 / 不写）；启动期 `restore_effort_from_meta`；`CodingView.effort` 透传**有效**档位（覆盖或配置默认） | 无条件写 ⇒ 三态用例；视图写死 `None` ⇒ `test_build_view_passes_effort` |
-| `crates/ys-tui-coding/src/{commands,events}.rs` | 命令表 14 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例 |
+| `crates/ys-tui-coding/src/{commands,events}.rs` | 命令表 15 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例 |
 | `crates/ys-protocol/src/boundary.rs` | `Compact` 不置 `aborted`、参与 FIFO、`Debug` 不泄露正文、`has_pending_steer` **包含** `Compact` | 把 `push` 的 `Abort` 判定放宽到 `Compact` ⇒ abort 用例；扫描改回只匹配 `Steer(_)` ⇒ 探针用例 |
 | `crates/ys-loop/src/basic.rs` | 轮边界收到 `Compact` ⇒ 就地压（**不判阈值**）+ `purpose=Compaction` 上报 + 本轮只跑一轮；**收场前**收到 `Compact` ⇒ 压了但 `rounds` 不增 | 删 `Boundary::Compact` 臂 ⇒ 不压缩；把它设成 `consumed = true` ⇒ `rounds` 1→2 |
 | `crates/ys-tui-coding/src/events.rs` | 回合中 `/compact` ⇒ 投 `Boundary::Compact`、**不**投 `Request`、当场出一行反馈；空闲 `/compact` ⇒ 仍投 `Request::Compact` | 删 `is_turning` 分流分支 ⇒ 回合中用例；去掉守卫 ⇒ 空闲用例 |
@@ -780,7 +782,9 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
   保留 `Line::style` 与 `Line::alignment`（库会写这两者）。
 - `styles.rs`：`impl tui_markdown::StyleSheet`，**23 个方法逐一覆写** —— `DefaultStyleSheet` 自带主观配色，
   漏写会把默认色漏进来。粗体 / 斜体由库硬编码为纯修饰符、**不可配色**，本仓本就要 Strong=BOLD / Emphasis=ITALIC（无颜色）。
-  `code()`（行内码 + 围栏代码块）**只用单一 `cyan` 前景色，不分语言**（2026-10-10 修订）——
+  **颜色全部来自 `ThemeKind::palette()` 的 10 个槽位**；`AssistantStyles` 持有 `Palette` **值**（`AssistantStyles::new(palette)`），
+  方法体内只出现 `self.palette.<槽位>`，不出现任何具名色（见 §14.9）。
+  `code()`（行内码 + 围栏代码块）**只用单一 `code` 槽位前景色，不分语言**（2026-10-10 修订）——
   整块底色会在长代码块上糊成一大片、并给缩进染色，故不用底色；也不引 `highlight-code`（`syntect` + `onig_sys` C 库）。
 - `tui_markdown::` 路径**只出现在** `md.rs` 与 `styles.rs`（可 grep 断言；库成熟度风险的缓解）。
 
@@ -857,6 +861,245 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
   （仓库 `Cargo.toml` 无 `[profile]` 段，两侧同工具链、同 cargo 默认 release profile。）
 - 依赖：`Cargo.lock` 中 `ratatui-core` **只有 1 条**（v0.1.2 单版本）；`syntect` / `ansi-to-tui` / `onig` 均不出现；
   独立包数 194 → 201（+7）。
+
+### 14.9 配色主题 — as-built
+
+形态决策见 [ADR-0053](../adr/0053-tui-color-themes.md)。本节的范围**大于** §14 的 markdown 样式表：
+整屏画布、状态行、工具标记、模态浮层与 markdown 各元素同属一套配色。
+
+#### 模块落点与类型
+
+| 符号 | 形态 | 位置 |
+|---|---|---|
+| `ThemeKind` | 5 变体枚举，`Copy + Default`（默认 `AyuMirage`）；`ALL` 的**顺序即浮层展示顺序**，且与变体声明顺序一致（`next` / `prev` 以判别值取下标） | `crates/ys-tui-coding/src/theme.rs` |
+| `ThemeKind::name()` / `label()` | kebab-case 机器名（`/theme` 的取值、`state.json` 的存储值）/ 人读名（浮层逐行显示） | 同上 |
+| `Palette` | 10 个 `Color::Rgb`，`Copy + PartialEq`，40 字节。**不实现 `Default`**：构造必须显式给出 `ThemeKind`，否则「漏传主题」会被一份静默色板掩盖 | 同上 |
+| `ThemeKind::palette() -> Palette` | **按值**返回，不是 `&'static Palette` —— 调用方可自由持有 / 比较一份色板值 | 同上 |
+| `is_purple(Color)` | 紫色守卫，仅 `pub(crate)`，只在单测调用 | 同上 |
+| `AssistantStyles::new(palette: Palette)` | 收**色板值**而非 `ThemeKind`：渲染层只需要 10 个颜色槽位，中间不出现「色板 → 主题 → 色板」的反查 | `styles.rs` |
+| `draw::chrome(app) -> Palette` | 渲染层**唯一**取色入口（`app.theme.palette()`） | `draw.rs` |
+| `App::set_theme(kind)` | **唯一**失效入口（见下） | `app.rs` |
+| `AppState.theme: Option<String>` | 全局偏好的持久化载体 | `apps/coding-agent/src/state.rs` |
+
+**`ThemeKind` 的解析**（`FromStr`）：大小写不敏感，`'_'` 归一化为 `'-'`；未知名返回 `ThemeParseError`，
+其 `Display` **回显输入原文**并列出全部合法名。
+
+#### 10 槽位语义表（语义 → 颜色的唯一映射来源）
+
+| 槽位 | 落到哪些 UI 元素 |
+|---|---|
+| `bg` | 整屏画布；每个 `Clear` 之后的补铺 |
+| `fg` | 正文：`md::render` 给库未上色的 span 补前景；用户消息正文、`Error:` 正文、定义列表、表格表头与单元格 |
+| `accent` | markdown 标题（h1–h6）与数学（行内 / 块） |
+| `code` | 行内码、围栏代码块；模态选择器的筛选框在**已输入**时的查询文本 |
+| `muted` | 引用、系统行、状态行、行动块（思考 + 工具正文）、表格框线、列表标记、脚注、HTML、标题属性、前沿元数据、图片占位、选择器占位 / 计数、空态占位 |
+| `user` | 用户消息前缀 `> ` |
+| `ok` | 工具成功标记 `✓` |
+| `warn` | GFM alert 的 `Important` / `Warning` |
+| `fail` | 工具失败标记 `✗`、工具失败结果首行、`Error: ` 前缀、alert `Caution` |
+| `info` | GFM alert 的 `Note` / `Tip` |
+
+**链接与表格表头有意不着色**（前者只加下划线、后者只加粗），故它们不落在任何槽位上。
+
+#### 5 套内置主题
+
+`/theme` 的合法取值即 kebab-case 名（大小写不敏感，`_` 视同 `-`）：
+
+| 名（= `/theme` 取值） | `label` | bg | fg | accent | code | muted | user | ok | warn | fail | info |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ayu-mirage` | Ayu Mirage | #1f2430 | #cccac2 | #ffcc66 | #5ccfe6 | #6c7986 | #73b8ff | #bae67e | #ffd173 | #f28779 | #95e6cb |
+| `gruvbox-dark` | Gruvbox Dark | #1d2021 | #ebdbb2 | #fabd2f | #8ec07c | #928374 | #83a598 | #b8bb26 | #fe8019 | #fb4934 | #83a598 |
+| `nord` | Nord | #2e3440 | #d8dee9 | #88c0d0 | #8fbcbb | #4c566a | #81a1c1 | #a3be8c | #ebcb8b | #bf616a | #5e81ac |
+| `everforest-dark` | Everforest Dark | #2d353b | #d3c6aa | #a7c080 | #83c092 | #859289 | #7fbbb3 | #dbbc7f | #e69875 | #e67e80 | #83c092 |
+| `solarized-dark` | Solarized Dark | #002b36 | #93a1a1 | #b58900 | #2aa198 | #586e75 | #268bd2 | #859900 | #cb4b16 | #dc322f | #2aa198 |
+
+色板是 `static` 常量、由 `const fn rgb(0xRRGGBB)` 在编译期展开 ⇒ 零运行时分配、零文件 IO。
+
+**已知合法撞色**（属有意接受）：`gruvbox-dark` 的 `user` 与 `info` 同色；`everforest-dark` 与
+`solarized-dark` 的 `code` 与 `info` 同色 —— 这几套调色板的非紫色相不足以再拉开一档。
+
+#### 唯一失效入口与两条失效链
+
+缓存里存的是**已上色**的产物，而两条缓存的键都**不含主题**（`RenderCache` 的键是
+`(槽下标, src.len(), width)`；`TranscriptLayout` 的 `EntryMemo` 签名只哈希条目文本）。故切主题
+**必须显式作废**，且两条链要一起：
+
+```
+App::set_theme(kind)                       // 唯一入口
+├── self.theme = kind                      // 运行期真值
+├── md_cache.set_theme(kind.palette())     // 链 ①：色板同值早退；不同则清 slots
+└── layout.reset()                         // 链 ②：清 entries / gaps / starts
+       └─ 下一帧 layout.sync(.., theme=..) 按色板值再判一次（自愈）
+```
+
+- **`RenderCache::set_theme(palette)`**：`palette == self.theme` 时**直接返回**（浮层逐键预览会反复调用它，
+  同值重入不该白清一屏产物）；不同则记住新色板并清空全部槽位。它与 `RenderCache::reset()` 的区别只有
+  一条：`reset()` 不改色板（`/resume` 的回放清屏与主题无关，两者语义不得混）。
+- **`TranscriptLayout::sync(.., theme: Palette, ..)`**：`theme != self.theme` 并入既有的「宽度变 /
+  `thinking_visible` 翻转」全量作废分支；`self.theme` **在分支之外**更新 —— 否则同一主题连续调用会永远
+  判「变了」，每帧全量重算。`theme` 是**必填**参数（不给默认值）：漏传就是「屏上还是旧配色」这种只在
+  缓存命中时才现形的偶发 bug。
+- **`layout.reset()` 对「重渲染」是冗余的**（`sync` 的判据已能自愈），保留它是为了立即释放已上色的行、
+  并让不变量在 `set_theme` 处自明。见「分歧与已知限制」第 1 条。
+
+**失效判据按色板值比较（`Palette: PartialEq`），不引 `theme_rev` 版本计数器**：40 字节一次比值即得
+「是否换了主题」，而计数器要求每个改主题的点都记得 `+1`、且「加对了吗」与渲染结果无因果关系
+⇒ 漏加 / 重加都表现为「偶发旧色」。
+
+**不许在调用点各写一遍这三行**：`/theme <name>`（`apply_local`）、浮层逐键预览与 `Esc` 还原
+（`run.rs`）全部走 `App::set_theme`。漏一处即「某条路径切换后部分内容还是旧色」。
+
+**`/resume` 不重置主题**：`reset_for_replay()` 不动 `theme`，且上一行的 `layout.reset()` 已清空
+`EntryMemo`，下一帧 `sync` 会按当前主题重建 —— 无需为此补任何一行。
+
+#### 背景铺色与 `Clear` 补铺
+
+- `draw::chrome(app)` **一帧取一次**（`ui` / `ui_with_modal` 在 `&mut app` 借用**之前**取色），沿参数链
+  下传 ⇒ 同一帧内所有 pane 与浮层必然读到同一份色板。
+- `ui_with` 在 `area.width < MIN_WIDTH || area.height < MIN_HEIGHT` 的 **early-return 之后**用 `bg` 铺满
+  `frame.area()`，再由各 pane 在上面画；终端过小时一个格子都不画。
+- **每个 `Clear` 之后必须补铺 `bg`**（三处：`draw_completion` / `prompt_select` / `prompt_text`）：
+  `Clear` 把区域重置为**终端默认底色**，不补铺就是屏上一个与主题背景不一致的黑洞 / 亮洞。
+- 取色**按值**（`Palette` 是 `Copy`）：`push_transcript_line` / `push_non_assistant` 拿不到 `App`，
+  而颜色是已烘进 `Line` 的产物 ⇒ 主题只能由持有真值的一方显式传入，不得在渲染层重新取默认色板。
+
+**测试里有一处有意放宽**：背景断言逐格比对**除「宽字符尾随列」以外的每个格子**。ratatui 写宽字符时
+会把紧随其后的列 `reset()` 回 `Color::Reset`（`Buffer::set_stringn`）—— 那一列在终端上被前一个字形
+覆盖、底色本就不可见，无法补铺。判定条件极窄（`Span::raw(buf.content()[i-1].symbol()).width() > 1`），
+其余格子一律必须等于主题 `bg`。（逐格而非抽查：`bg` 泄漏可能出现在任意没被 widget 覆盖的边角。）
+
+#### `/theme` 三态与浮层实时预览
+
+| 输入 | `parse()` 产出 | 行为 |
+|---|---|---|
+| `/theme`（含纯空白） | `Action::Prompt(PromptKind::PickTheme)` | 开浮层，`↑` / `↓` 立即应用 ⇒ 实时预览 |
+| `/theme <合法名>` | `Action::Local(LocalAction::Theme(ThemeKind))` | `apply_local` 调 `App::set_theme` 本地立即生效，再由 `events.rs` 单向同步 `Request::SetTheme { theme }` |
+| `/theme <非法名>` | `Action::Local(LocalAction::Hint(..))` | 一行提示（含原文回显 + 全部合法名），**不改任何状态** |
+
+`LocalAction::Theme` 携带的是**已解析的 `ThemeKind`** 而不是原始 `String`：非法输入必须在进入本地应用
+**之前**被拦下。归一化（大小写 / `_`）由 `ThemeKind::from_str` 决定，同步给 app 的载荷因此恒为 kebab-case。
+
+**浮层实现**（`run.rs::apply_theme_modal`）：
+
+- 复用 `draw::Modal::Select` 渲染，**不新造 `Modal` 变体** —— 浮层框架（居中尺寸、`Clear` + 背景补铺、
+  页脚键位、滚动与计数）只该有一份。候选是 `ThemeKind::ALL` 的 `label()`；选中项按同一数组的
+  `position` 反查回 `ThemeKind`（`theme_index`）。
+- 逐键转移抽成纯函数 `theme_modal_step(ThemeModalState, ThemeKey) -> ThemeModalStep`
+  （`Preview` / `Restore` / `Confirm` / `Ignore`）。**纯函数不改状态**：宿主收到 `Preview(k)` 时
+  自己写 `state.selected = k` 并 `app.set_theme(k)` —— 否则预览与高亮会各走一条道。
+- 出口由 `ThemeModalClose` 在**类型上**区分「要不要落盘」：
+
+| 键 | 转移 | 效果 |
+|---|---|---|
+| `↑` / `↓` | `Preview(prev/next)` | 立即 `set_theme`（环形，`ALL` 顺序即展示顺序） |
+| `Esc` | `Restore(opened_with)` | 还原到打开前的主题，**不落盘**（`Cancelled` ⇒ 不发请求） |
+| `Ctrl-C` | 先还原，再 `Err(PromptError::Quit)` | 与浮层其余模态一致（`Ctrl-C` = 关程序）；先还原是为了让退出回放的 scrollback 用回原配色 |
+| `Enter` | `Confirm(selected)` | `Confirmed` ⇒ 调用方发 `Request::SetTheme`（落盘）并补一行 `theme: <name>` |
+| 其余 | `Ignore` | 本浮层无查询框，不做过滤 |
+
+`resolve_prompt` 对 `PickTheme` **一律返回 `Err`**（与 `PickSession` 同形态）：`Prompter::select` 是
+`&self`、无回调、只回传最终选中项的显示串，结构上做不了逐键预览。
+
+**复用的代价**：浮层顶部因此有一行常驻筛选输入框 `> `，敲字被 `ThemeKey::Other` 吞掉（不生效、不报错）。
+见「分歧与已知限制」第 4 条。
+
+#### 持久化与进程级镜像
+
+- **载体 `~/.yushan/state.json`**（`AppState.theme: Option<String>`，kebab-case 名），**不进 session meta**：
+  主题是**全局偏好** —— 跨会话保留，`/new` 不重置，`/resume` 换会话时主题不变。
+- **app 侧进程级镜像**：`app_loop::run` 持 `let mut theme: ThemeKind`，启动期由 `state_store.load()`
+  初始化（未知 / 缺失 ⇒ `ThemeKind::default()`），`Request::SetTheme` 单向更新并落盘。
+  与 `thinking_visible` 同类，但**载体不同**（后者在 `SessionMeta`）。
+- **`build_view` 收 `theme: ThemeKind` 参数、不读盘**：它在 app 循环里「每个请求处理完刷新快照」时被调，
+  在里面 `state.load()` 会变成每轮对话一次 IO。主题**必须**进视图（UI 要它上色），故只能走参数。
+- **`login` / `logout` 保留主题**：`capabilities.rs` 的三处 `AppState` 序列化一律**先 `load()` 再改自己那几个字段**，
+  不得整份构造字面量 —— 整份构造会把用户选的 `theme` 一起抹掉（症状是「重启后主题丢了」，且几乎无法归因到 `login`）。
+- **app 侧的 `SetTheme` 臂不回显**：UI 侧（`/theme <name>` 经 `apply_local`、浮层确认经 `run.rs`）已经写了
+  一条 `theme: <name>`，本臂只更新镜像 + 落盘。与 `SetThinking` 同一纪律 —— 否则每条命令打两遍。
+  非法名（协议层不校验）在此只给一行 `Warning`，**不落盘、不改镜像**。
+- **运行期真值在 UI 侧**：`App.theme` 由 `App::new` 从视图快照消费**一次**，此后**不被** `Outbound::View`
+  覆盖 —— 切主题是 UI 本地动作（`/theme`、浮层预览），app 推送的快照只是持久化镜像的载体。
+  与 `thinking_visible` 同一纪律，由 `test_view_snapshot_does_not_override_theme` 钉住。
+- **协议只承载名**：`Request::SetTheme { theme: String }` —— **协议层**不解析、不校验（`ThemeKind` 定义在
+  `ys-tui-coding`，`ys-protocol` 不认识 UI crate）。名字的解释权归 owner crate：app 侧自己调同一个
+  `ThemeKind::from_str` 校验 + 归一，两个校验点不各自写一套判据。推论：新增主题不需要改协议。
+
+#### 命令表
+
+`COMMANDS` 为 **15 条**（新增 `theme`，`arg_hint = Some("[name]")`）。`/theme` 在**三个面**上同源：
+命令表、补全浮层（`/them` → 唯一命中）、`/help` 正文。
+
+#### 紫色守卫
+
+产品需求：任何主题的 **9 个非 `bg` 槽位**（5 套 × 9 = 45 色）都不得落在紫色色相区。判据
+`is_purple`：`Color::Rgb` → sRGB → HSL，色相 `∈ [255°, 330°]` **闭区间**、饱和度 `>= 0.20`、亮度
+`∈ [0.15, 0.90]` **闭区间**，三者同时满足才判紫。非 `Rgb` 变体返回 `false`（本设计不产生具名色 /
+索引色，「是否漏用 RGB」由色板断言负责）。HSL 是最小纯浮点实现，不引色彩库。
+
+改色板时若触发守卫，**改色板而不是放宽判据**。
+
+#### 测试与变异
+
+| 落点 | 覆盖 | 变异点（注入 ⇒ 变红） |
+|---|---|---|
+| `theme.rs` | 名称往返 / 大小写 / `_` 归一化 / 未知名回显；`next`-`prev` 互逆（同时钉住 `ALL` 顺序 == 变体声明顺序）；45 色不落紫色区（三道具门限**各有**「只有它决定结果」的样本）；10 槽位全为 `Color::Rgb` | 删某道门限 ⇒ 边界样本用例；放宽判据 ⇒ 45 色用例 |
+| `styles.rs` | 5 主题 × 关键方法 → 槽位（逐主题跑，防「槽位写死成默认主题的色」）；关键方法不等于 `DefaultStyleSheet` 的主观配色 | 删任一方法的取色 ⇒ 槽位用例 |
+| `md.rs` | 无库默认色泄漏：5 主题各渲染一份全元素样例，`fg` ∈ 色板、`bg` 仅 `palette.bg` 或 `None`（**只看 `fg` 会漏掉「白字黑底」**） | 漏覆写 `code()` ⇒ 泄漏用例 |
+| `cache.rs` | 换主题后同键也必须重算、新产物只用新色板槽位；同值 `set_theme` 不白清缓存 | `set_theme` 改空操作 / 删同值早退 |
+| `layout.rs` | 换主题 ⇒ `recomputed_entries` = 可见条目数；同主题连续 `sync` 不重算（`self.theme` 必须在分支外更新） | 删 `\|\| theme_changed` / 把 `self.theme = theme` 包进分支 |
+| `draw.rs` | 整屏每格 `bg`（含输入框内区、状态行、边角，多尺寸）；浮层区域内仍是 `bg`；切主题整屏换 `bg` 走生产路径；chrome 六类条目各取对应槽位 | 删整屏铺色 / 删某处 `Clear` 后补铺 / 漏接 `chrome(app)` |
+| `app.rs` | 两处记忆都被作废（**直接断言** `layout.total_rows() == 0`）；切主题真的重渲染；`/resume` 不改主题；`App::new` 消费视图初值；快照不覆盖 | 删 `md_cache.set_theme` ⇒ 重渲染用例 |
+| `commands.rs` / `events.rs` | `/theme` 三态；本地立即生效 + **恰好一条** `SetTheme`、无参不发请求；归一化名同步 | 无参改直发 / 删同步块 / 载荷传原始串 |
+| `run.rs` | `theme_modal_step` 穷举 `(ThemeModalState, ThemeKey)`；`Esc` 还原 `opened_with`；环形；每帧预览都调 `set_theme`；确认发请求；其余键 `Ignore` | `Esc` 改成 `Confirm` |
+| `prompter.rs` | `PickTheme` **结构上**拒绝走通用 `Prompter` 路径（返回 `Err`，且不向 `Prompter` 发问） | 放行 `PickTheme` ⇒ 用例 |
+| `state.rs` / `view.rs` / `app_loop.rs` / `capabilities.rs` | 旧 `state.json`（无 `theme` 键）仍解析且不丢老字段；`state.json` → 视图 → `App`；未知主题名回落默认；`SetTheme` 真落盘 + 真更新镜像 + 非法名不改镜像；`login` / `logout` 不清 `theme` | `login` 整份重建 `AppState` |
+| `ys-protocol/src/request.rs` | 往返逐字节保真，且钉住线格式（变体名 `SetTheme` + 字段名 `theme`） | 改变体名 / 字段名 |
+
+**变异脚本 `scripts/theme-mutation.py`** 三条注入，全部实测「红（抓到）」：
+
+1. **M1** 删 `App::set_theme` 里的 `md_cache.set_theme(...)` → `app::tests::test_set_theme_invalidates_both_caches`
+2. **M2** `login` 整份重建 `AppState` 清掉 `theme` → `capabilities::tests::test_login_and_logout_preserve_theme`
+3. **M3** `theme_modal_step` 的 `Esc` 改成 `Confirm` → `run::tests::test_theme_modal_escape_restores_opened_with`
+
+三条脚本级纪律：
+
+- **只认「预期用例名出现在 FAILED 列表」**，不看退出码 —— 否则「过滤后 0 个用例」的 `cargo test`
+  会以退出码 0 静默通过，被当成「测试抓不到」的反面（假红）。
+- **`ys-coding-agent` 没有 lib target**（单测长在 bin crate 里）⇒ 对该 crate 必须用 `--bins`；
+  `cargo test --lib` 会显示「running 0 tests」并**静默通过**。
+- 与 `wheel-mutation.py` 不同，本脚本**不用 `git checkout --` 还原**（注入落在尚未提交的工作区，整份还原则
+  会抹掉整批改动）：它在内存里保存原文、`finally` 写回，粒度是「只还原自己动过的那一处」。
+
+#### 分歧与已知限制（逐条，缺一即文档滞后）
+
+1. **`layout.reset()` 对「重渲染」是冗余的 —— 一处已知的等价变异。** `TranscriptLayout::sync` 的
+   `theme != self.theme` 判据已能自愈，故删掉 `set_theme` 里的 `layout.reset()` 后**颜色断言仍绿**。
+   保留它的理由：立即释放已上色的行，并让「两条链一起作废」这条不变量在 `set_theme` 处自明。
+   正因如此它**不得**伪装成被颜色用例捕获 —— 兜底的是直接断言 `layout.total_rows() == 0` 的
+   `test_set_theme_invalidates_both_caches`。
+2. **`Palette` 按值而非 `&'static`，`AssistantStyles::new` 收 `Palette` 而非 `ThemeKind`。** 前者让
+   调用方可自由持有 / 比较色板（缓存失效直接比值）；后者消除了「色板 → 主题 → 色板」的反查 ——
+   渲染层只需要 10 个颜色槽位，不需要知道它来自哪套内置主题。
+3. **`build_view` 形参达 8 个**（已 `#[allow(clippy::too_many_arguments)]`）。这是「不读盘」的对价：
+   函数签名旁的文档明写**不再加参数** —— 再有「每请求都要刷新的单个偏好」应连同
+   `stats` / `session_started` / `theme` 一起收进一个 `ViewInputs` 结构体。
+4. **浮层顶部多一行无效筛选框。** 主题浮层复用 `Modal::Select`，故带上了它常驻的 `> ` 输入框；敲字被
+   `ThemeKey::Other` 吞掉（不生效、不报错）。换来的是浮层框架（`Clear` + 背景补铺、页脚键位、滚动）
+   只有一份实现。
+5. **`AppState.theme` 的 `#[serde(default)]` 对 `Option<T>` 是冗余的**：缺键本就解成 `None`。它是
+   风格一致性 + 意图声明，**不是正确性开关**。真正会让旧 `state.json` 读不出来的是把字段写成
+   **非 `Option` 且无默认值**（那时缺键 ⇒ `from_str` 失败 ⇒ `load()` 回落 `AppState::default()`
+   ⇒ `last_active_model` 一起丢）。故这一条的变异点**不是**「删 `#[serde(default)]`」（删了用例仍绿）。
+6. **紫色守卫的端点口径**：色相 `[255, 330]`、亮度 `[0.15, 0.90]` 均**含端点**，饱和度 `>= 0.20`。
+   实现与测试须同一口径；`is_purple` 另有「只有某一道具门限决定结果」的边界样本，否则删掉某道门限仍可能全绿。
+7. **正文补色在 `md::render` 里做，不在 `StyleSheet` 里。** `tui_markdown::StyleSheet` 没有
+   「正文」方法 —— 库对正文 span 产出空样式（继承终端前景）。故 `render` 对「库未上色（`fg.is_none()`）」
+   的 span 统一补 `palette.fg`，`styles.rs` 侧则给需要**非**正文色的元素显式上色（标题 / 代码 / 引用 /
+   链接 / 表格 / 定义列表）。**推论**：任何新增的 `StyleSheet` 方法若有意「不上色」，必须显式写成
+   `fg(palette.fg)`，否则会被补成正文色。
+8. **链接与表格显式取色。** `link()` 取 `info` + 下划线（若不上色，会被正文 `fg` 吞掉、只剩下划线可辨）；
+   `table_header` / `table_cell` / `definition_term` / `definition_description` 取 `fg`，表头与术语的
+   层次只靠 `BOLD`，不引第二套前景色。
 
 ---
 

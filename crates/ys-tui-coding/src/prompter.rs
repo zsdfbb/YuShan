@@ -179,6 +179,15 @@ pub fn resolve_prompt(
         PromptKind::PickSession => Err(PromptError::Other(
             "PickSession 须经 resolve_session_pick 处理".into(),
         )),
+        // 主题浮层要**实时预览**（每移动一格就把候选色板铺到整屏）。
+        //
+        // `Prompter::select` 是 `&self` 且无回调 —— 它只回传「最后选中哪一项」，
+        // 中间过程（逐键）不对外发出任何信号 ⇒ 本 trait **结构上**无法承载
+        // 预览。故 `PickTheme` 不能走通用 `Prompter` 路径，由 `run.rs` 的专用模态
+        // （`apply_theme_modal`）处理，它在自己的循环里直接拿 `&mut App`。
+        PromptKind::PickTheme => Err(PromptError::Other(
+            "PickTheme 须经 run.rs 的实时预览模态处理".into(),
+        )),
     }
 }
 
@@ -880,6 +889,43 @@ mod tests {
         assert_eq!(
             relative_time(UNIX_EPOCH + Duration::from_secs(100), UNIX_EPOCH),
             "刚刚"
+        );
+    }
+
+    /// `PickTheme` **结构上拒绝**走通用 `Prompter` 路径：返回 `Err(Other)`，且
+    /// **不向 `Prompter` 发问**（`calls()` 为空、答案队列一根未消费）。
+    ///
+    /// 根据：`Prompter::select` 是 `&self` 且无回调，无法做实时预览（D3）。本测试
+    /// 同时是那条理由的可执行证据 —— 假如哪天把它接回 `resolve_prompt`（改成
+    /// `prompter.select(..)`），下面的「零调用」与 `Ok` 断言会同时变红。
+    ///
+    /// 变异：把该臂改成 `Ok(PromptOutcome::NoOp(..))` ⇒ 第一条 `Err` 断言变红；
+    /// 改成真去 `prompter.select(..)` ⇒ `calls()` 不再为空、变红。
+    #[test]
+    fn test_pick_theme_is_rejected_by_generic_prompter() {
+        // 先往队列里放一根答案：如果哪天真去问了，它会回 `nord` 而非 `Cancelled`，
+        // 于是「别人替它答了一个主题」也会被下面的断言拦住。
+        let p = FakePrompter::ok(["nord"]);
+        let view = CodingView::for_test();
+
+        match resolve_prompt(PromptKind::PickTheme, &p, &view) {
+            Err(PromptError::Other(msg)) => assert!(
+                msg.contains("PickTheme"),
+                "错误信息要指认变体（否则用户只能看到一句无信息量的话）：{msg}"
+            ),
+            other => panic!("PickTheme 必须被拒绝，得到 {other:?}"),
+        }
+
+        assert!(
+            p.calls().is_empty(),
+            "PickTheme 不得向 Prompter 发问：{:?}",
+            p.calls()
+        );
+        // 答案队列没被消费 ⇒ 确实没走 `select` / `text`。
+        assert_eq!(
+            p.text("sentinel", None),
+            Ok("nord".to_string()),
+            "队列应完整未动"
         );
     }
 }

@@ -28,7 +28,7 @@ use ys_session::SessionMeta;
 
 use crate::config::Config;
 use crate::provider::{ApiModel, AuthEntry, ProviderRegistry};
-use crate::state::{AppState, StateStore};
+use crate::state::StateStore;
 use crate::wiring::Wiring;
 
 /// `/login` 的 api_base 解析（三级回退）：
@@ -154,10 +154,12 @@ pub fn login(
         None => out.push("Warning: Could not build model. Check API credentials.".to_string()),
     }
 
-    if let Err(e) = state.save(&AppState {
-        last_active_provider: Some(provider_name.to_string()),
-        last_active_model: Some(model_name.clone()),
-    }) {
+    // 读现有 state 再改自己的字段 —— 直接构字面量会**清掉 `theme`**
+    // （主题是全局偏好，与登录/模型选择无关）。
+    let mut st = state.load();
+    st.last_active_provider = Some(provider_name.to_string());
+    st.last_active_model = Some(model_name.clone());
+    if let Err(e) = state.save(&st) {
         out.push(format!("Warning: Could not persist state: {e}"));
     }
 
@@ -183,7 +185,12 @@ pub fn logout(config: &mut Config, wiring: &mut Wiring, state: &StateStore) -> V
     // 配置归接线器，不伸手进 agent（ADR-0010）。
     wiring.set_model(None);
 
-    if let Err(e) = state.save(&AppState::default()) {
+    // 只清 provider/model：`theme` 是全局偏好，**不随登出重置**（同 `load()` 后改字段，
+    // 而不是 `AppState::default()` —— 后者会把主题一起抹掉）。
+    let mut st = state.load();
+    st.last_active_provider = None;
+    st.last_active_model = None;
+    if let Err(e) = state.save(&st) {
         out.push(format!("Warning: Could not persist state: {e}"));
     }
 
@@ -250,10 +257,11 @@ pub fn set_model(
 
     config.model = model.clone();
 
-    if let Err(e) = state.save(&AppState {
-        last_active_provider: config.provider.clone(),
-        last_active_model: Some(model.clone()),
-    }) {
+    // 读现有 state 再改自己的字段 —— 直接构字面量会**清掉 `theme`**。
+    let mut st = state.load();
+    st.last_active_provider = config.provider.clone();
+    st.last_active_model = Some(model.clone());
+    if let Err(e) = state.save(&st) {
         out.push(format!("Warning: Could not persist state: {e}"));
     }
 
@@ -671,6 +679,7 @@ pub(crate) fn session_summary(path: &Path, meta: Option<&SessionMeta>) -> Sessio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AppState;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ys_core::{ContentBlock, Message, Role};
@@ -1167,6 +1176,50 @@ mod tests {
     }
 
     /// `/logout`：auth 落盘被移除、config 清空、接线器 model 置空、state 复位。
+    /// **T15**：登录 / 登出不得清掉主题偏好。
+    ///
+    /// `login` 与 `logout` 都会写 `state.json`（记录 last_active_provider/model）。
+    /// 若它们像 `AppState { .. }` 那样整份构造，就会把用户选的 `theme` 一起抹掉 ——
+    /// 症状是「重启后主题丢了」，极难归因到 login/logout。
+    #[test]
+    fn test_login_and_logout_preserve_theme() {
+        let (mut config, _dir) = test_config();
+        let (state, state_dir) = test_state();
+        // 前置：state.json 里已有主题偏好。
+        let mut st = state.load();
+        st.theme = Some("nord".into());
+        state.save(&st).unwrap();
+
+        let mut wiring = test_wiring();
+        let _ = login(
+            &mut config,
+            &mut wiring,
+            &state,
+            "deepseek",
+            "sk-test",
+            None,
+            Some(&catalog(&["deepseek-flash"])),
+        );
+        assert_eq!(
+            state.load().theme.as_deref(),
+            Some("nord"),
+            "login 不得清掉 theme"
+        );
+
+        // `/logout` 同理：只清凭证与 provider/model，主题留下。
+        let _ = logout(&mut config, &mut wiring, &state);
+        let after = state.load();
+        assert_eq!(
+            after.theme.as_deref(),
+            Some("nord"),
+            "logout 不得清掉 theme"
+        );
+        assert!(after.last_active_provider.is_none());
+        assert!(after.last_active_model.is_none());
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     #[test]
     fn test_logout_clears_everything() {
         let (mut config, dir) = test_config();
@@ -1189,6 +1242,7 @@ mod tests {
             .save(&AppState {
                 last_active_provider: Some("deepseek".into()),
                 last_active_model: Some("deepseek-chat".into()),
+                ..Default::default()
             })
             .unwrap();
         let mut wiring =

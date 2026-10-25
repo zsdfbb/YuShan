@@ -29,9 +29,10 @@
 //! 本地动作当场执行（写 transcript），`Request` 投给 app 线程。**唯一需要模态浮层的
 //! 是 [`Action::Prompt`]** —— 它要画屏，而画屏得握 `Terminal`，故这里只把意图记进
 //! [`App::pending_prompt`]，由 `run.rs` 的事件循环取走并跑模态循环（设计 §3
-//!「TUI 自己的浮层选择器」）。本地动作默认**不发请求**；`/thinking` 是唯一例外 ——
-//! 它本地立即生效后，再把 UI 运行期真值经 [`Request::SetThinking`] **单向**同步给
-//! app 作持久化镜像（设计 §5.1 / §5.6）。
+//!「TUI 自己的浮层选择器」）。本地动作默认**不发请求**；两个例外，形态相同
+//! （UI 先本地生效，再把运行期真值经请求**单向**同步给 app 作持久化镜像 —— 设计
+//! §5.1 / §5.6）：`/thinking` → [`Request::SetThinking`]、`/theme <name>` →
+//! [`Request::SetTheme`]。
 //!
 //! # 方向键的取舍：上下归历史、左右归输入、翻页归聊天
 //!
@@ -469,17 +470,34 @@ fn dispatch(
         Action::Quit => app.should_quit = true,
         Action::Abort => request_abort(boundaries),
         Action::Local(local) => {
+            // 需要发请求的本地动作要先**析出载荷**（`apply_local` 会消费掉 `local`）。
+            // 两者的共同点：UI 先本地生效，再把真值单向同步给 app 持久化。
             let is_thinking = matches!(local, commands::LocalAction::Thinking(_));
+            let theme = match &local {
+                commands::LocalAction::Theme(kind) => Some(*kind),
+                _ => None,
+            };
             commands::apply_local(app, local);
-            // `/thinking` 是本地动作的唯一例外：先本地立即生效（`apply_local` 已改写
-            // `app.thinking_visible`），再把改写后的 UI 真值单向同步给 app 持久化。
-            // 其余本地动作不发任何请求。
+            // `/thinking`：`apply_local` 已改写 `app.thinking_visible`，这里把改写后
+            // 的真值回传。
             if is_thinking {
                 send_request(
                     app,
                     requests,
                     Request::SetThinking {
                         visible: app.thinking_visible,
+                    },
+                );
+            }
+            // `/theme <name>`：`apply_local` 已调 `app.set_theme`，这里只把**已解析
+            // 出的规范名**（kebab-case）交给 app 落盘。协议只承载名字而不承载
+            // `ThemeKind` —— 解析归 owner crate（见 `Request::SetTheme`）。
+            if let Some(kind) = theme {
+                send_request(
+                    app,
+                    requests,
+                    Request::SetTheme {
+                        theme: kind.name().to_string(),
                     },
                 );
             }
@@ -2216,6 +2234,76 @@ mod tests {
         assert!(ch.next_request().is_none(), "Abort 不发 Request");
         assert!(!a.should_quit, "Abort 是取消，不是退出");
         assert!(a.transcript.is_empty(), "Abort 不动 transcript");
+    }
+
+    /// `/theme nord`：本地立即生效（`App.theme` 改掉）+ 恰好一条 `Request::SetTheme`
+    /// （单向同步给 app 落盘）。无参 `/theme` 则**不发请求**，只留浮层意图。
+    ///
+    /// 变异：删 `if let Some(kind) = theme` 整块 ⇒ 第一条断言变红；把载荷改成
+    /// `kind.label()`（如 `"Nord"`）⇒ 名字断言变红（协议只收 kebab-case）。
+    #[test]
+    fn test_theme_command_applies_locally_and_syncs_once() {
+        use crate::theme::ThemeKind;
+
+        let ch = channels();
+        let mut a = app();
+        assert_eq!(a.theme, ThemeKind::default(), "初始为主题默认值");
+        a.input.insert_str("/theme nord");
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(a.theme, ThemeKind::Nord, "本地立即生效");
+        assert_eq!(
+            ch.next_request().unwrap(),
+            Request::SetTheme {
+                theme: "nord".into()
+            },
+            "本地生效后回传一份给 app 落盘"
+        );
+        assert!(ch.next_request().is_none(), "只回传一条 SetTheme");
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s == "theme: nord"),
+            "{:?}",
+            a.transcript
+        );
+
+        // 无参：走实时预览浮层（run.rs 处理），这里只留意图，**不发请求**。
+        a.input.insert_str("/theme");
+        key(&mut a, &ch, KeyCode::Enter);
+        assert_eq!(
+            a.pending_prompt,
+            Some(crate::commands::PromptKind::PickTheme)
+        );
+        assert!(ch.next_request().is_none(), "开浮层不发请求");
+        assert_eq!(
+            a.theme,
+            ThemeKind::Nord,
+            "开浮层不改主题（预览由 run.rs 做）"
+        );
+    }
+
+    /// `/theme NORD`（大小写）与 `/theme gruvbox_dark`（下划线）同步的都是
+    /// **规范 kebab-case 名** —— 协议层不做归一，归一只能发生在这一层。
+    ///
+    /// 变异：直接把用户输入原文当载荷发出去 ⇒ 本用例变红（`state.json` 会存下
+    /// `NORD` / `gruvbox_dark`，下次启动解析反而依赖 `from_str` 的宽容度）。
+    #[test]
+    fn test_theme_command_syncs_normalized_name() {
+        for (input, expected) in [
+            ("/theme NORD", "nord"),
+            ("/theme gruvbox_dark", "gruvbox-dark"),
+        ] {
+            let ch = channels();
+            let mut a = app();
+            a.input.insert_str(input);
+            key(&mut a, &ch, KeyCode::Enter);
+            assert_eq!(
+                ch.next_request().unwrap(),
+                Request::SetTheme {
+                    theme: expected.into()
+                },
+                "输入 `{input}` 应归一为 {expected}"
+            );
+        }
     }
 
     /// `/thinking on` 当场改状态（本地动作），并把改写后的真值经

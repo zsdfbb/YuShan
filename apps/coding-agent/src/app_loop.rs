@@ -27,6 +27,7 @@
 //!         finalize_turn_meta(..).await;   // 回合末写穿 meta
 //!       }
 //!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
+//!     SetTheme{theme} => { theme = parse(theme); 落盘 state.json }  // 进程级镜像 + Output
 //!     SetEffort/SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
 //!     ListSessions/ResumeSession => { 会话列表 / 原子恢复 → SessionList/SessionResumed }
 //!   }
@@ -52,6 +53,7 @@
 //! `run_turn_once` 开头 —— 它挡的是**上一个请求**残留的 `Abort`，与回合数无关。
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
@@ -62,7 +64,7 @@ use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
 use ys_tools_basic::{BackgroundTasks, render_completion};
-use ys_tui_coding::CodingView;
+use ys_tui_coding::{CodingView, ThemeKind};
 
 use crate::capabilities;
 use crate::config::Config;
@@ -332,6 +334,20 @@ pub async fn run(
     // 作持久化镜像；**`/new` 不重置它**（展示偏好随进程，设计 §5.6）。
     let mut thinking_visible = wiring.meta().map(|m| m.thinking_visible).unwrap_or(false);
 
+    // 主题的**进程级镜像**：启动时由 state.json 初始化，`Request::SetTheme` 单向更新
+    // 并落盘；`build_view` 从它取值（不在 `build_view` 里读盘 —— 那是每请求一次的 IO）。
+    //
+    // 与 `thinking_visible` 同类（会话级偏好、UI 本地即时生效、本处只作持久化镜像），
+    // 但**载体不同**：主题是**全局偏好**，**不进 session meta**（`thinking_visible`
+    // 的载体是 `SessionMeta`）。`/new` 不重置它、`/resume` 换会话也不改它 ——
+    // 别为了「对齐」把它塞进 meta。
+    let mut theme: ThemeKind = state_store
+        .load()
+        .theme
+        .as_deref()
+        .and_then(|s| ThemeKind::from_str(s).ok())
+        .unwrap_or_default();
+
     loop {
         // 等一条 UI 请求；后台模型目录若尚未返回，则与之赛跑。目录**一次性**到达，
         // 收到后把 `models_rx` 置 `None`，此后主循环只等 `Request`。
@@ -364,6 +380,7 @@ pub async fn run(
                         &state_store,
                         &stats,
                         session_started,
+                        theme,
                     );
                     send_or_flush(
                         &out_tx,
@@ -485,6 +502,29 @@ pub async fn run(
             Request::SetThinking { visible } => {
                 // 单向更新进程级镜像；UI 侧已本地即时生效。无输出。
                 thinking_visible = visible;
+            }
+
+            Request::SetTheme { theme: name } => {
+                // 协议层只承载 kebab-case 名、不解析（`ThemeKind` 归 `ys-tui-coding`），
+                // 校验与归一就在这一层：非法名只警告、**不落盘**。
+                //
+                // UI 侧已经本地即时生效（`/theme <name>` / 浮层确认），本臂只负责
+                // 更新镜像 + 持久化 —— 主题是全局偏好，不进 session meta。
+                match ThemeKind::from_str(&name) {
+                    Ok(kind) => {
+                        theme = kind;
+                        // 读现有 state 再改自己的字段：直接构造字面量会清掉 provider/model。
+                        let mut st = state_store.load();
+                        st.theme = Some(kind.name().to_string());
+                        if let Err(e) = state_store.save(&st) {
+                            lines.push(format!("Warning: Could not persist theme: {e}"));
+                        }
+                        // **不回显**：UI 侧（`/theme <name>` 经 `apply_local`、浮层确认经
+                        // `run.rs`）已经写了一条 `theme: <name>`。与 `SetThinking` 同一纪律 ——
+                        // 单向持久化同步不产生用户可见输出，否则每条命令打两遍。
+                    }
+                    Err(e) => lines.push(format!("Warning: {e}")),
+                }
             }
 
             Request::SetEffort { effort } => {
@@ -754,6 +794,7 @@ pub async fn run(
             &state_store,
             &stats,
             session_started,
+            theme,
         );
         send_or_flush(
             &out_tx,
@@ -2613,6 +2654,66 @@ mod tests {
         let first = content.lines().next().expect("应有首行 meta");
         let meta: ys_session::SessionMeta = serde_json::from_str(first).expect("首行应为 meta");
         meta.effort
+    }
+
+    /// **C8（写方向）**：`Request::SetTheme` 真的落盘、真的更新进程级镜像。
+    ///
+    /// 这条走**生产路径**（app 循环的 `SetTheme` 臂），不像 view 侧那条由测试自己
+    /// 写 state.json。缺了它，把整个臂删成空操作、或只落盘不更新镜像，都无人发现。
+    ///
+    /// 变异：把该臂改成 `let _ = (name, kind);` ⇒ 本用例红。
+    #[tokio::test]
+    async fn theme_request_persists_and_updates_mirror() {
+        let model = MockModel::new("mock");
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        // ① 合法名：落盘 + 镜像更新（镜像经下一份 View 快照可见）。
+        h.requests
+            .send(Request::SetTheme {
+                theme: "nord".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert_eq!(view.theme, ThemeKind::Nord, "镜像应更新，并经快照传出");
+
+        let state_path = h.temp_path("state.json");
+        let raw = std::fs::read_to_string(&state_path).expect("应已写出 state.json");
+        assert!(raw.contains("\"theme\""), "state.json 应含 theme 键：{raw}");
+        let saved: crate::state::AppState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(saved.theme.as_deref(), Some("nord"));
+
+        // ② 大小写 / 下划线归一化：落盘的是规范名。
+        h.requests
+            .send(Request::SetTheme {
+                theme: "GRUVBOX_DARK".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert_eq!(view.theme, ThemeKind::GruvboxDark);
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        assert!(raw.contains("\"gruvbox-dark\""), "落盘应为规范名：{raw}");
+
+        // ③ 非法名：只警告、**不落盘**（文件保持上一次的合法值）。
+        h.requests
+            .send(Request::SetTheme {
+                theme: "no-such-theme".into(),
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        assert_eq!(view.theme, ThemeKind::GruvboxDark, "非法名不得改镜像");
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        assert!(
+            raw.contains("\"gruvbox-dark\""),
+            "非法名不得覆写 state.json：{raw}"
+        );
+
+        shutdown(h).await;
     }
 
     /// 读会话文件首行 meta 的 `title`（测试专用）。

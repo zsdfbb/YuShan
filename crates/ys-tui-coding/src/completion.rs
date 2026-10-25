@@ -422,4 +422,39 @@ mod tests {
             assert_eq!(open(input), open_with_skills(input, &[]), "输入 `{input}`");
         }
     }
+
+    /// `/theme` 在**三个面**上同源：命令表（15 条）、补全浮层（`/them` → `theme`、
+    /// `/th` → thinking + theme）、`/help` 正文。
+    ///
+    /// 变异：从 `COMMANDS` 里删掉 `theme` 条目 ⇒ 下面三条断言全部变红。
+    #[test]
+    fn test_theme_in_commands_and_completion() {
+        let specs = all_commands();
+        assert_eq!(specs.len(), 15, "命令表应有 15 条（新增 theme）");
+        let theme = specs
+            .iter()
+            .find(|s| s.name == "theme")
+            .expect("命令表里必须有 theme");
+        assert_eq!(theme.arg_hint, Some("[name]"));
+        assert!(!theme.description.is_empty());
+
+        // 输入 `/them`：唯一命中就是 theme（`/th` 也会命中 `/thinking`），且 Tab 接受后
+        // 的回填串带尾随空格。
+        let hits = open("/them").expect("`/them` 应开浮层");
+        assert_eq!(hits.items.len(), 1, "只有 theme：{hits:?}");
+        assert_eq!(hits.items[0].replacement, "/theme ");
+        assert_eq!(hits.items[0].display, "/theme [name]  — 切换配色主题");
+        // 短前缀 `/th` 则不应漏掉 theme（与 thinking 并列命中，两者都在）。
+        let both: Vec<String> = matches_with_skills("/th", &[])
+            .into_iter()
+            .map(|i| i.replacement)
+            .collect();
+        assert_eq!(both, vec!["/thinking ", "/theme "], "表序：thinking 在前");
+
+        // `/help` 正文同样看得到（与浮层同源）。
+        assert!(
+            crate::commands::help_text().contains("/theme [name]"),
+            "`/help` 必须列出 /theme"
+        );
+    }
 }

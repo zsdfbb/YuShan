@@ -64,7 +64,7 @@
 
 ## 基线
 
-- **基线 ref**：Phase 3 由 `baseline.sh` 填写（`./scripts/build-baseline.sh tui-theme-switch`）。
+- **基线 ref**：`adcda18cd1d0be1fd0e4bc0ab24491df8974e254`（Phase 3 起点，`baseline.sh tui-theme-switch` 建立；备份分支 `sw-backup/tui-theme-switch`）。
 - 用途：review 执行 `git diff <基线 ref> -- <files>` 取字节级证据。
 - **前置闸门**：`./scripts/par-test.sh` 必须全绿（否则基线不可信）。
 
@@ -104,7 +104,7 @@
     - `impl FromStr for ThemeKind`：大小写不敏感（`eq_ignore_ascii_case`），`'_'` 先归一化为 `'-'`；未知名返回 `ThemeParseError`，其 `Display` 含输入原文。
     - `pub struct Palette { bg, fg, accent, code, muted, user, ok, warn, fail, info: Color }`，`#[derive(Clone, Copy, Debug, PartialEq, Eq)]`。**不给 `Palette` 实现 `Default`**（设计计划风险 12）。
     - `const fn rgb(hex: u32) -> Color`。
-    - `impl ThemeKind { fn palette(&self) -> &'static Palette }`，内部为 5 个 `static` 常量（编译期表，零运行时分配）。
+    - `impl ThemeKind { fn palette(&self) -> Palette }`，内部为 5 个 `static` 常量（编译期表，零运行时分配；**按值返回**，`Palette` 是 `Copy`）。
     - `pub(crate) fn is_purple(c: Color) -> bool`：`Color::Rgb` → sRGB → HSL，判色相 ∈ `[255.0, 330.0]`（左闭右闭）、`sat >= 0.20`、`0.15 <= light <= 0.90`；非 `Rgb` 变体返回 `false`。**端点是含还是不含必须在实现与测试里定死同一口径**（采用上面这组）。
   - 5 套取色严格照抄设计计划 D4 的表格（10 槽位 × 5 套），一字不改。
   - `lib.rs`：`mod theme;` 按字母序插在 `mod styles;` 与 `mod transcript;` 之间；`pub use theme::ThemeKind;` 加在 `pub use styles::...` 附近（当前无 `styles` 的 re-export，故放在 `pub use run::{TuiError, run};` 之后或按既有顺序）。
@@ -146,7 +146,7 @@
 - 涉及文件: `crates/ys-tui-coding/src/styles.rs`
 - 关联测试任务: T4（C4/C5 单测）
 - 说明:
-  - `pub(crate) struct AssistantStyles { palette: &'static Palette }`，`#[derive(Clone, Copy)]`（去掉 `Default` —— 无字段时 `Default` 才合理，现在需显式主题）。
+  - `pub(crate) struct AssistantStyles { palette: Palette }`，`#[derive(Clone, Copy)]`（去掉 `Default` —— 无字段时 `Default` 才合理，现在需显式主题）。
   - 新增 `pub(crate) fn new(kind: ThemeKind) -> Self { Self { palette: kind.palette() } }`。
   - 23 个 `StyleSheet` 方法全部改为读 `self.palette`，映射按设计计划「`styles.rs`：`AssistantStyles` 携带调色板」节的表：
     - `heading` → `accent` + `BOLD`（h1 另加 `UNDERLINED`）
@@ -192,7 +192,7 @@
 - 依赖: T1
 - 涉及文件: `crates/ys-tui-coding/src/draw.rs`
 - 说明:
-  - 新增 `fn chrome(app: &App) -> &'static Palette { app.theme.palette() }`（`app.theme` 由 T7 提供；**本任务先用 `ThemeKind::default()` 占位**，T7 合入后切到 `app.theme`）。
+  - 新增 `fn chrome(app: &App) -> Palette { app.theme.palette() }`（按值；`app.theme` 由 T7 提供；**本任务先用 `ThemeKind::default()` 占位**，T7 合入后切到 `app.theme`）。
   - 13 处 `Color::*` 按设计计划「`draw.rs`：13 处 chrome 色」节的表映射到槽位（223/267/396/428/450/401/597/798/821/846/848/853/899/918/927）。
   - **背景铺色（D2）**：在 `draw.rs:106-110` 的 `MIN_WIDTH`/`MIN_HEIGHT` early-return **之后**、pane 绘制**之前**：
     ```rust
@@ -231,12 +231,12 @@
 - 涉及文件: `crates/ys-tui-coding/src/cache.rs`, `crates/ys-tui-coding/src/layout.rs`
 - 说明:
   - `cache.rs`：
-    - `RenderCache` 加私有字段 `theme_rev: u64`（`Default` 里给 `0`）。
-    - 新增 `pub fn set_theme(&mut self, kind: ThemeKind)`：内部 `self.theme_rev += 1;` 并**清空 slots**（复用 `reset()` 的清空逻辑，或直接 `self.reset()`）。语义：「主题变了 ⇒ 所有渲染产物作废」。
-    - 若选择「把 `theme` 纳入 `Slot` 比较」的替代方案：`Slot` 加 `theme_rev: u64`，`lines_for` 命中条件加 `slot.theme_rev == self.theme_rev`。二选一，**不得两套并存**（否则清空与键比较会互相掩盖 bug）。
+    - `RenderCache` 加私有字段 `theme: Palette`（`Default` 里给 `ThemeKind::default().palette()`）。
+    - 新增 `pub fn set_theme(&mut self, palette: Palette)`：**先比值**（`palette == self.theme` 则直接返回，不白清缓存），不等才更新字段并**清空 slots**（复用 `reset()` 的清空逻辑）。语义：「主题变了 ⇒ 所有渲染产物作废」。
+    - **不引版本计数器**（`theme_rev`）：`Palette` 是 `Copy + PartialEq` 的值，比值即得结论；计数器会引入「漏加/重复加」这类与渲染无关的失效 bug。
   - `layout.rs`：
-    - `TranscriptLayout` 加私有字段 `theme: ThemeKind`；`reset()` 里同步重置（或更新为传入值）。
-    - `pub fn sync(...)` 入参**追加** `theme: ThemeKind`（放在 `thinking_visible` 之后、`width` 之前或末尾，以最小化调用点改动为准）。
+    - `TranscriptLayout` 加私有字段 `theme: Palette`；`reset()` 里同步重置（或更新为传入值）。
+    - `pub fn sync(...)` 入参**追加** `theme: Palette`（放在 `thinking_visible` 之后、`width` 之前或末尾，以最小化调用点改动为准）。用 `PartialEq` 比值判「换了主题」。
     - 既有全量作废分支（`:158-166`）加 `|| theme != self.theme`，并在分支体内 `self.theme = theme;`。**注意**：即使不休分支也要更新 `self.theme`（否则同一主题连续调用会永远判「变了」）。
     - 加参数后 `layout.rs` 内的所有直接 `sync(..)` 调用（测试里多处）都要补参数。**定为必填参数**（不给默认值），让编译器找全所有调用点。
 - 验收:
@@ -294,7 +294,11 @@
   - 构造含 markdown + 工具结果的固定 transcript。
   - A 主题下取一次渲染行的 `fg` 集合（走 `sync_scroll_state` + `window` / `cache`）。
   - `app.set_theme(B)` 后再取一次，断言集合不同、且 ⊆ B 的调色板。
-  - **变异点（两处分别验）**：注释掉 `App::set_theme` 里的 `md_cache.set_theme` ⇒ 必须红；注释掉 `layout.reset()` ⇒ 必须红。
+  - **变异点（两处分别验）**：
+    - 注释掉 `App::set_theme` 里的 `md_cache.set_theme(...)` ⇒ **必须红**（缓存键不含色板，必须显式作废）。
+    - 注释掉 `layout.reset()` ⇒ **等价变异体，原颜色断言仍绿**。原因：`TranscriptLayout::sync` 的失效判据已含 `theme != self.theme`（T6），下一帧 sync 会自行全量作废，故 `reset()` 对「重渲染」这件事是冗余的（保留它是为了立即释放已上色的行，并让不变量在 `set_theme` 处自明）。
+      因此**「布局必须作废」这条不能靠颜色断言钉住**，改由一条直接断言 `layout.total_rows() == 0` 的用例钉住；而 `layout` 失效判据本身的守卫是 T6b 的变异（删 `|| theme_changed` ⇒ 红）。
+      该等价性必须写进用例注释与 design-final 的分歧清单，不得伪装成「红」。
 - 验收:
   - `cargo test -p ys-tui-coding --lib app::` 全绿。
   - 两个变异点各跑一次，两次都必须红。
@@ -437,7 +441,8 @@
     - **宿主层**用可记录的 applier（或 `FakePrompter`-风格替身）断言：「每次 `Preview` 都调了 `app.set_theme`」「`Esc` 后 `app.theme == opened_with`」「`Esc` 后**没有**发出 `Request::SetTheme`」。
   - **变异脚本**：新建 `scripts/theme-mutation.py`（仿 `scripts/wheel-mutation.py` 的形态），注入三条 bug 并期望对应用例变红：
     - M1：删掉 `App::set_theme` 里的 `md_cache.set_theme`（或 `layout.reset`）⇒ C7 红。
-    - M2：去掉 `AppState.theme` 的 `#[serde(default)]` ⇒ C9 红（该用例在 T15）。
+    - M2：把 `AppState.theme` 改成**非 `Option` 且无默认值**（如 `String`）⇒ C9 红（该用例在 T15）。
+      **不要**用「删 `#[serde(default)]`」当变异点：`Option<T>` 缺键本就解成 `None`，删了用例仍绿（实测）。
     - M3：`theme_modal_step` 的 `Esc` 改成 `Confirm` ⇒ C11 红。
   - 变异脚本的用例锚点（用例名）在此任务里定死，供脚本引用。
 - 验收:
@@ -481,19 +486,27 @@
 - 关联测试任务: T15（C8/C9 用例）
 - 说明:
   - `apps/coding-agent/src/state.rs`：
-    - `AppState` 加 `#[serde(default)] pub theme: Option<String>`。**`#[serde(default)]` 是正确性要求**：`load()` 在解析失败时静默回落 `AppState::default()`，会丢掉 `last_active_model`；旧 state.json 无 `theme` 键时若不加该属性就走到这条失败路径（C9 钉这条）。
+    - `AppState` 加 `#[serde(default)] pub theme: Option<String>`。**注意**：`Option<T>` 缺键本就解成 `None`，该属性此处是**风格一致性 + 意图声明**（与 `SessionMeta` 的可选字段一致），不是正确性开关。真正的风险是有人把它改成非 `Option` 必填字段 —— 那时旧文件解析失败、`load()` 回落 default、`last_active_model` 一起丢（C9 钉这条行为）。
     - 顺序：`last_active_provider` / `last_active_model` 之后加 `theme`。
   - `crates/ys-tui-coding/src/view.rs`：
     - `CodingView` 加 `pub theme: ThemeKind`，**紧跟** `thinking_visible`（同一类「启动期消费一次」的字段），注释同款：「只在启动时被 `App::new` 消费一次；运行期真值是 `App.theme`」。
     - `CodingView::for_test()`（`:188` 起，`:239` 附近）补 `theme: ThemeKind::default()`。
   - `apps/coding-agent/src/view.rs`：
-    - `build_view`（`:26`）里取值：`let theme = state.load().theme.as_deref().and_then(|s| ThemeKind::from_str(s).ok()).unwrap_or_default();`
+    - **`build_view` 加一个 `theme: ThemeKind` 参数**（在 `session_started` 之后，或按可读性放在 `stats` 之前 —— 实现时选一处并把 10+ 调用点一并补上）。
+    - **不读盘**：`build_view` 在 `app_loop.rs:749` 是「每个请求处理完刷快照」时调用，读盘会变成每轮一次 `state.json` IO。取值来自 app 侧进程级镜像（见下）。
     - `CodingView { theme, .. }` 构造。
-    - **签名不动**（不改 7 个参数）。理由：`build_view` 不是热路径（启动一次），多一次读盘可接受；改签名会波及所有调用点与测试替身。**须在代码旁注释这条取舍**。
-    - 若实施时发现 `build_view` 被高频调用（如每回合重建视图），改为从 `main.rs:2657` 的 `saved_state` 传参，并在 PR 描述里记明。
+    - 代码旁注释写明这条取舍（为什么不像 `thinking_visible` 那样只做本地变量：主题必须进视图，UI 需要它）。
     - **`apps/coding-agent` 依赖 `ys-tui-coding` 已核实**（`apps/coding-agent/Cargo.toml:21`），故 `CodingView.theme` 直接用 `ThemeKind`，不用 `String` 往返。
   - `apps/coding-agent/src/app_loop.rs`：
-    - 新增 `Request::SetTheme { theme }` 臂：读现有 `AppState` → 只改 `theme` 字段 → `save`；产出 `Outbound::Output`（如 `theme: nord`）与 `Outbound::View(..)`。
+    - 新增**进程级镜像**，与既有 `thinking_visible`（`:333`）并列：
+      ```rust
+      // 启动时由 state.json 初始化；`SetTheme` 单向更新，落盘后随进程存活。
+      let mut theme: ThemeKind = state_store.load().theme.as_deref()
+          .and_then(|s| ThemeKind::from_str(s).ok())
+          .unwrap_or_default();
+      ```
+    - 新增 `Request::SetTheme { theme }` 臂：解析成 `ThemeKind`（非法名只产出 `Output` 警告、**不落盘**）→ 更新上面那个 `theme` 镜像 → 读现有 `AppState`、只改 `theme` 字段、`save`；产出 `Outbound::Output`（如 `theme: nord`）与 `Outbound::View(..)`。
+    - `build_view` 的两处调用（`:359`、`:749`）把 `theme` 传进去。
     - `:29` 模块文档伪码加 `SetTheme{theme} => { ... }`（与既有 `SetThinking{visible}` 行同款）。
     - **`theme` 是全局偏好，不进 session meta**（与 `thinking_visible` 的载体不同，`crates/ys-session/src/meta.rs:45`）—— 须在代码注释里写明，防止后人「对齐」时顺手塞进 meta。
   - `apps/coding-agent/src/capabilities.rs`：
@@ -528,11 +541,11 @@
   - **C9**（`test_old_state_without_theme_keeps_last_model`）：
     - 手写 `{"last_active_provider":"p","last_active_model":"m"}`（**无** `theme` 键）→ `load()`。
     - 断言 `last_active_model == Some("m")` 且 `theme == None`。
-    - **变异点**：去掉 `#[serde(default)]` ⇒ 必须红。
+    - **变异点**：把字段改成非 `Option` 且无默认值 ⇒ 必须红。（删 `#[serde(default)]` 对 `Option` 是等价变异，实测仍绿 —— 不要用它。）
   - **C8/C9 的 app 侧处理**：若 `Request::SetTheme` 的处理逻辑在 `capabilities.rs` 而非 `app_loop.rs`，用例放进 `capabilities.rs` 的 `#[cfg(test)]`（文件集不变，仍属单元 E）。
 - 验收:
   - `cargo test -p ys-coding-agent --lib state::` 与 `--lib app_loop::` 全绿。
-  - **变异自查**：去掉 `#[serde(default)]` 后 C9 必须红；还原。
+  - **变异自查**：把字段改成非 `Option` 必填后 C9 必须红；还原。
   - `python3 scripts/theme-mutation.py` 的 M2 报「红（抓到）」（此时三条变异全部可验）。
 - 关联测试合同: C8, C9
 
@@ -570,7 +583,7 @@
     - `:277` 的 ✓/✗ 绿/红语义改为 `ok` / `fail` 槽位（不再说「绿」「红」）。
     - `:781-782` 的 `styles.rs`「23 方法覆写」补一句「颜色全部来自 `ThemeKind::palette()` 的 10 个槽位」。
     - 新增一节「配色主题 — as-built」：模块落点（`theme.rs`）、10 槽位语义、5 套名、`App::set_theme` 的唯一失效入口（`md_cache` 与 `layout` 两条链）、背景铺色与 `Clear` 补铺、`/theme` 三态与浮层预览、持久化到 `state.json`、紫色守卫。
-    - **分歧清单**：若实现与设计计划有分歧（如 `build_view` 是否改签名、`cache` 选 `theme_rev` 还是 `Slot` 键、`is_purple` 端点口径），逐条记入该节 —— 缺一即为文档滞后。
+    - **分歧清单**：若实现与设计计划有分歧（如 `build_view` 是否改签名、`cache` 是否按色板值比较、`is_purple` 端点口径），逐条记入该节 —— 缺一即为文档滞后。
   - `crates/ys-tui-coding/src/styles.rs` 模块头：**已在 T3 改写**，本任务只做**校验**（`grep` 确认不再出现「无 `Palette` 结构」「不引 Theme」）。
   - `crates/ys-tui-coding/src/lib.rs` 模块头：若提到「颜色只在渲染层决定」，补一句「由 `ThemeKind` 的编译期色板唯一给出」；`mod theme;` 行已在 T1 加。
   - **一致性校验**（可执行检查，代替人工目检）：
@@ -604,7 +617,7 @@
 
 ## 波次计划
 
-> **Phase 3 由调度器按「依赖」+「涉及文件交集」两栏重算后回填本表。**
+> **Phase 3 已按「依赖」+「涉及文件交集」重算，权威排程见下表。**
 > 下面的预览是**按当前声明的依赖手算的一致性快照**，不是权威排程。
 
 | 波 | 任务（可并行） | 本波关键产出 | 说明 |
@@ -631,7 +644,7 @@
 - [ ] `cargo fmt --check` 通过。
 - [ ] **`./scripts/par-test.sh` 全绿**（全量测试**唯一**入口；`cargo test --workspace` 串行 ≈34s，脚本 ≈7.4s，不算跑过测试）。
 - [ ] 测试合同 C1–C11 各有至少一条对应用例且全绿（C12 人工，不作门禁）。
-- [ ] `python3 scripts/theme-mutation.py` 三条注入全部报「红（抓到）」：M1（删缓存失效 / C7）、M2（删 `#[serde(default)]` / C9）、M3（`Esc` 改成 `Confirm` / C11）。
+- [ ] `python3 scripts/theme-mutation.py` 三条注入全部报「红（抓到）」：M1（删缓存失效 / C7）、M2（`theme` 改成非 `Option` 必填 / C9）、M3（`Esc` 改成 `Confirm` / C11）。
 - [ ] 既有变异脚本不退化：`python3 scripts/cancellation-mutation.py`、`python3 scripts/wheel-mutation.py`。
 - [ ] `grep` 确认 `crates/ys-tui-coding/src/` 下**仍无** `std::fs` / `File::` 使用（主题不得引入文件 IO）。
 - [ ] `grep` 确认 `crates/ys-tui-coding/src/styles.rs` 不再含「无 `Palette` 结构」「不引 Theme」。

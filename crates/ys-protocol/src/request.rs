@@ -41,6 +41,18 @@ pub enum Request {
     /// provider 的**思考深度**。值为 `None` 时由 app 侧删除已持久化的设置，
     /// 而不是把 `"default"` 之类的伪档位写进枚举。
     SetEffort { effort: Option<EffortLevel> },
+    /// 切换配色主题。
+    ///
+    /// 载荷是**主题的 kebab-case 名**（如 `"nord"`），不是枚举：`ThemeKind` 定义在
+    /// `ys-tui-coding`，而 `ys-protocol` 不认识 UI crate，也不该认识 —— 协议只承载
+    /// 「UI 说用户选了哪个主题」这一层的最小足够表示。合法名表归 owner crate
+    /// （`ThemeKind::from_str`），协议层**不解析、不校验**：
+    /// 接线器只把它原样写进 `state.json`，解析回枚举发生在 `build_view` 时。
+    /// 附带收益：新增主题不需要改协议。
+    ///
+    /// 与 `SetThinking` 并列：后者是「是否显示思考」的显示开关，本变体是配色选择。
+    /// 两者都**不改变 UI 的本地即时生效语义** —— UI 先本地生效，再单向同步给 app 持久化。
+    SetTheme { theme: String },
     /// 登录一个 provider 并持久化凭证。
     ///
     /// `api_base` 是**用户显式提供的** API base（`/login custom` 这类没有内置 base
@@ -186,6 +198,25 @@ mod tests {
             effort: Some(EffortLevel::High),
         });
         assert_roundtrip(&Request::SetEffort { effort: None });
+    }
+
+    /// `SetTheme` 只承载 kebab-case 名（协议不解析、不校验），往返必须逐字节保真。
+    ///
+    /// 同时钉住**线格式**：变体名 `SetTheme` + 字段名 `theme` —— 跨进程 / 跨日志的
+    /// 兼容全靠这两个名字，refactor 时被改名则旧 UI 与旧日志静默解析失败。
+    ///
+    /// 变异：把载荷类型改成 `String` 以外的包装 / 给字段加 `#[serde(rename)]` ⇒
+    /// 下面那两处 `assert!(json.contains(..))` 变红。
+    #[test]
+    fn test_request_set_theme_roundtrip() {
+        let req = Request::SetTheme {
+            theme: "nord".into(),
+        };
+        assert_roundtrip(&req);
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"SetTheme\""), "变体名变化：{json}");
+        assert!(json.contains("\"theme\":\"nord\""), "字段名变化：{json}");
     }
 
     /// `Login` 的两种 `api_base` 都要能过 serde：`Some` = 用户显式填的 URL

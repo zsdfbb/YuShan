@@ -45,6 +45,7 @@ mod md;
 mod prompter;
 mod run;
 mod styles;
+mod theme;
 mod transcript;
 mod view;
 
@@ -55,5 +56,6 @@ pub use history::InputHistory;
 pub use input::InputBuffer;
 pub use prompter::{FakePrompter, PromptError, Prompter};
 pub use run::{TuiError, run};
+pub use theme::{Palette, ThemeKind};
 pub use transcript::{TranscriptLine, replay_lines, summarize_tool_args};
 pub use view::{CodingView, ModelEntry, ProviderEntry, SkillEntry};

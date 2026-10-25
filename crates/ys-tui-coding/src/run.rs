@@ -48,9 +48,10 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use ys_protocol::{Boundary, Outbound, Request};
 
 use crate::app::App;
-use crate::commands::PromptKind;
+use crate::commands::{PROMPT_PAGE_SIZE, PromptKind};
 use crate::input::InputBuffer;
 use crate::prompter::{PromptError, PromptOutcome, Prompter, resolve_prompt, resolve_session_pick};
+use crate::theme::ThemeKind;
 use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
 use crate::{draw, events};
@@ -250,9 +251,39 @@ fn run_prompt<B: Backend<Error = std::io::Error> + Write + Send>(
     outbound_open: &mut bool,
     requests: &Sender<Request>,
 ) {
+    // `/theme` 无参：**实时预览**浮层（每移动一格立即铺色）。它在
+    // [`resolve_prompt`] **之前**分流 —— 后者的 `Prompter::select` 只回传最终
+    // 选中项、不给中间过程留回调，结构上做不了逐键预览（见 `PromptKind::PickTheme`）。
+    if matches!(kind, PromptKind::PickTheme) {
+        let outcome = {
+            let prompter = TuiPrompter::new(
+                &mut *terminal,
+                &mut *app,
+                &mut *outbound,
+                &mut *outbound_open,
+            );
+            prompter.lock().apply_theme_modal()
+        };
+        match outcome {
+            Ok(close) => {
+                // 确认：预览已把主题设成 `kind` 了 ⇒ 这里只补本地回显 + 单向同步。
+                // 取消（Esc）：主题已还原、`request()` 为 `None` ⇒ 不发请求、不落盘。
+                if let Some(kind) = close.confirmed() {
+                    app.transcript
+                        .push(TranscriptLine::System(format!("theme: {}", kind.name())));
+                    app.follow = true;
+                }
+                if let Some(req) = close.request() {
+                    apply_prompt_outcome(app, requests, Ok(PromptOutcome::Request(req)));
+                }
+            }
+            Err(e) => apply_prompt_outcome(app, requests, Err(e)),
+        }
+        return;
+    }
+
     // 视图快照必须在把 `app` 借给 prompter **之前**取走（CodingView 是 Clone）
     let view = app.view.clone();
-    // `/resume` 的候选与当前会话路径来自 `App`（与 `view` 不同源）—— 一并先取走。
     // `take()` 同时把 `pending_sessions` 清空：浮层结束时不再残留旧列表（与
     // `pending_prompt` 同 take 同清）。
     let sessions = app.pending_sessions.take().unwrap_or_default();
@@ -481,6 +512,96 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                 // 粘贴进来的多行也只是一段筛选串（与 `text_modal` 同规，不与 Enter 混淆）
                 Event::Paste(text) => query.insert_str(&text),
                 _ => {}
+            }
+        }
+    }
+
+    /// 主题浮层：**每移一格立即预览**（`app.set_theme`），Enter 确认、Esc 还原。
+    ///
+    /// # 为何复用 [`draw::Modal::Select`]
+    ///
+    /// 浮层框架（居中尺寸、`Clear` + 背景补铺、页脚键位、滚动与计数）只该有一份。
+    /// 主题浮层的差异只有两处：**不筛**（无查询框，`query` 恒空）与**选中态可立即
+    /// 生效**。前者用空 `InputBuffer` 即可表达（`filter_indices` 对空查询返回全体），
+    /// 后者在逐键处理里做 —— 都不需要新的 `Modal` 变体。故候选用
+    /// [`ThemeKind::label`]，选中项按同一数组的 `position` 反查回 `ThemeKind`。
+    ///
+    /// # 出口
+    ///
+    /// - `Enter` ⇒ [`ThemeModalClose::Confirmed`]，由调用方发 `Request::SetTheme`（落盘）。
+    /// - `Esc` ⇒ [`ThemeModalClose::Cancelled`]，主题**已还原到 `opened_with`**，不落盘。
+    /// - `Ctrl-C` ⇒ 与 Esc **同还原语义**，但返回 [`PromptError::Quit`]（与
+    ///   [`Self::select_modal`] 一致：浮层里 Ctrl-C = 关程序）。先还原再退，是为了
+    ///   让退出回放的 scrollback 用回用户原来那套配色。
+    /// - 其余键 ⇒ `Ignore`（本浮层无查询框，不做过滤）。
+    fn apply_theme_modal(&mut self) -> Result<ThemeModalClose, PromptError> {
+        let labels: Vec<String> = ThemeKind::ALL
+            .iter()
+            .map(|k| k.label().to_string())
+            .collect();
+        let mut state = ThemeModalState {
+            opened_with: self.app.theme,
+            selected: self.app.theme,
+        };
+        // 无查询框：候选恒为全体（`theme_index` 给的高亮就是 `options` 的下标）。
+        let filtered: Vec<usize> = (0..labels.len()).collect();
+        let query = InputBuffer::new();
+        loop {
+            self.drain_outbound();
+            if !*self.outbound_open {
+                // app 线程没了 —— 问谁都没意义。**仍先还原主题**：预览已改过色板，
+                // 不还原会让「退出前最后一眼」与「落盘值」撕裂。
+                self.app.set_theme(state.opened_with);
+                return Err(PromptError::Cancelled);
+            }
+
+            let selected = theme_index(state.selected);
+            let app = &mut *self.app;
+            let terminal = &mut *self.terminal;
+            terminal.draw(|f| {
+                draw::ui_with_modal(
+                    f,
+                    app,
+                    draw::Modal::Select {
+                        prompt: "主题（↑↓ 预览，Enter 确认，Esc 取消）",
+                        options: &labels,
+                        filtered: &filtered,
+                        selected,
+                        query: &query,
+                        page_size: PROMPT_PAGE_SIZE,
+                    },
+                )
+            })?;
+
+            if !crossterm::event::poll(POLL_INTERVAL)? {
+                continue;
+            }
+            let key = match crossterm::event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Ctrl-C 在浮层里也是「关程序」，不能被吞掉（同 `select_modal`）。
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        self.app.set_theme(state.opened_with);
+                        return Err(PromptError::Quit);
+                    }
+                    match key.code {
+                        KeyCode::Up => ThemeKey::Up,
+                        KeyCode::Down => ThemeKey::Down,
+                        KeyCode::Enter => ThemeKey::Enter,
+                        KeyCode::Esc => ThemeKey::Esc,
+                        _ => ThemeKey::Other,
+                    }
+                }
+                // 粘贴 / 鼠标 / 松开事件：无查询框，一律忽略。
+                _ => ThemeKey::Other,
+            };
+
+            // 借位拆开：`apply` 要 `&mut self.app`，而 `state` 是本地量。
+            let app = &mut *self.app;
+            let mut apply = |kind: ThemeKind| app.set_theme(kind);
+            if let Some(close) = apply_theme_step(&mut state, key, &mut apply) {
+                return Ok(close);
             }
         }
     }
@@ -775,6 +896,132 @@ fn clamp_selection(selected: usize, filtered_len: usize) -> usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 主题浮层（实时预览）
+// ---------------------------------------------------------------------------
+
+/// 主题浮层的**状态**。
+///
+/// `opened_with` 是打开那一刻的 `App.theme` —— Esc / Ctrl-C 拿它还原（预览把主题
+/// 改过很多次了，「关掉浮层」必须回到用户进来时的样子）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThemeModalState {
+    pub opened_with: ThemeKind,
+    pub selected: ThemeKind,
+}
+
+/// 主题浮层关心的键。其余键（`Backspace` / `Left` / `Paste` …）一律 [`ThemeKey::Other`]
+/// —— 本浮层**无查询框**，不做过滤。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeKey {
+    Up,
+    Down,
+    Enter,
+    Esc,
+    Other,
+}
+
+/// 一次按键的**纯决策结果**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeModalStep {
+    /// 高亮移到了新主题：调用方应**立即** `app.set_theme(kind)`（预览）。
+    Preview(ThemeKind),
+    /// 取消：调用方应 `app.set_theme(kind)` 还原并关掉浮层（**不落盘**）。
+    Restore(ThemeKind),
+    /// 确认：关掉浮层，`kind` 由调用方单向同步给 app 落盘。
+    Confirm(ThemeKind),
+    /// 无动作（本浮层不用的键）。
+    Ignore,
+}
+
+/// 「按键 → 下一步」的**纯函数**，不碰 `App`、不画屏（C11 的落点）。
+///
+/// # 谁推进 `selected`
+///
+/// **本函数不改 `ThemeModalState`** —— 它只读 `state` 给出决策。推进责任在调用方：
+/// 收到 [`ThemeModalStep::Preview`]`(k)` 时，把 `state.selected = k`（同时
+/// `app.set_theme(k)`）。**不要**在函数里也推一次，否则预览与高亮会各走一条
+/// 推进逻辑而分叉（`↓` 一帧跳两格、或高亮停在旧项而屏上已是新色）。
+///
+/// `Esc` / `Enter` 返回的 `kind` 不变 `selected`：前者的目标是 `opened_with`（回溯
+/// 到桌子起点，不是移到另一项），后者的目标是当前 `selected`（已经对）。
+pub(crate) fn theme_modal_step(state: ThemeModalState, key: ThemeKey) -> ThemeModalStep {
+    match key {
+        ThemeKey::Down => ThemeModalStep::Preview(state.selected.next()),
+        ThemeKey::Up => ThemeModalStep::Preview(state.selected.prev()),
+        // 恒用 `opened_with`（而不是 `selected`）—— 用户可能已移动了十几格，
+        // 「取消」的语义是回到进来时的样子，不是后退一步。
+        ThemeKey::Esc => ThemeModalStep::Restore(state.opened_with),
+        ThemeKey::Enter => ThemeModalStep::Confirm(state.selected),
+        ThemeKey::Other => ThemeModalStep::Ignore,
+    }
+}
+
+/// 主题浮层的**结局** —— 决定要不要发 `Request::SetTheme`（= 要不要落盘）。
+///
+/// 两个出口的区别就是 D3 的核心：**预览既然已本地生效，取消就不能留下痕迹**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThemeModalClose {
+    /// Enter：`kind` 是用户确认的主题。
+    Confirmed(ThemeKind),
+    /// Esc（以及 Ctrl-C 的**还原语义**）：主题已回到打开时的值，**不发请求、不落盘**。
+    Cancelled,
+}
+
+impl ThemeModalClose {
+    /// 本结局要发出的请求 —— [`Self::Cancelled`] 恒为 `None`（不落盘）。
+    fn request(&self) -> Option<Request> {
+        match self {
+            ThemeModalClose::Confirmed(kind) => Some(Request::SetTheme {
+                theme: kind.name().to_string(),
+            }),
+            ThemeModalClose::Cancelled => None,
+        }
+    }
+
+    /// 确认时返回选中的主题（用于本地回显）；取消时为 `None`。
+    fn confirmed(&self) -> Option<ThemeKind> {
+        match self {
+            ThemeModalClose::Confirmed(kind) => Some(*kind),
+            ThemeModalClose::Cancelled => None,
+        }
+    }
+}
+
+/// 把一次按键**施加**到浮层状态与 app 上 —— 宿主层的纯逻辑，`apply` 是可测的
+/// 「设主题」回调（生产路径上是 `App::set_theme`）。
+///
+/// 返回 `Some(close)` 表示浮层该关，`None` 表示继续。**`selected` 的推进在这里**
+/// （见 [`theme_modal_step`] 的说明）：`Preview(k)` ⇒ 先写 `state.selected = k`
+/// 再调 `apply(k)`，两件事同处一步，不会分叉。
+fn apply_theme_step(
+    state: &mut ThemeModalState,
+    key: ThemeKey,
+    apply: &mut dyn FnMut(ThemeKind),
+) -> Option<ThemeModalClose> {
+    match theme_modal_step(*state, key) {
+        ThemeModalStep::Preview(kind) => {
+            state.selected = kind;
+            apply(kind);
+            None
+        }
+        ThemeModalStep::Restore(kind) => {
+            apply(kind);
+            Some(ThemeModalClose::Cancelled)
+        }
+        ThemeModalStep::Confirm(kind) => Some(ThemeModalClose::Confirmed(kind)),
+        ThemeModalStep::Ignore => None,
+    }
+}
+
+/// 主题在 [`ThemeKind::ALL`] 里的下标 —— 浮层高亮用（`ALL` 顺序即展示顺序）。
+fn theme_index(kind: ThemeKind) -> usize {
+    ThemeKind::ALL
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1251,183 @@ mod tests {
             seq.contains("\x1b[<1u"),
             "须弹出键盘增强标志（否则泄漏进 shell）：{seq:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // C11：主题浮层的预览 / 还原 / 确认三态
+    // -----------------------------------------------------------------------
+
+    /// 纯函数的四个转移，对 `(state, key)` 穷举：5 个起始主题 × 5 个 `selected`。
+    ///
+    /// 变异：把 `Esc` 臂改成 `Confirm(state.selected)` ⇒ 本用例与
+    /// `test_theme_modal_escape_restores_opened_with` 同时变红。
+    #[test]
+    fn test_theme_modal_step_transitions() {
+        for opened in ThemeKind::ALL {
+            for selected in ThemeKind::ALL {
+                let state = ThemeModalState {
+                    opened_with: opened,
+                    selected,
+                };
+                assert_eq!(
+                    theme_modal_step(state, ThemeKey::Down),
+                    ThemeModalStep::Preview(selected.next()),
+                    "Down ⇒ next"
+                );
+                assert_eq!(
+                    theme_modal_step(state, ThemeKey::Up),
+                    ThemeModalStep::Preview(selected.prev()),
+                    "Up ⇒ prev"
+                );
+                assert_eq!(
+                    theme_modal_step(state, ThemeKey::Enter),
+                    ThemeModalStep::Confirm(selected),
+                    "Enter ⇒ 当前选中项"
+                );
+                assert_eq!(
+                    theme_modal_step(state, ThemeKey::Other),
+                    ThemeModalStep::Ignore,
+                    "Other ⇒ Ignore"
+                );
+            }
+        }
+    }
+
+    /// `Esc` 还原的是 **`opened_with`**，不是 `selected`，也不是「后退一步」——
+    /// 用户可能已经移动了十几格，取消的语义是「回到进来时的样子」。
+    ///
+    /// 变异：把 `Esc` 臂改成 `Restore(state.selected)` ⇒ 本用例变红。
+    #[test]
+    fn test_theme_modal_escape_restores_opened_with() {
+        let opened = ThemeKind::AyuMirage;
+        // 逐个试「已移开很多格」的选择：每一个都必须还原到 opened。
+        for selected in ThemeKind::ALL {
+            let state = ThemeModalState {
+                opened_with: opened,
+                selected,
+            };
+            assert_eq!(
+                theme_modal_step(state, ThemeKey::Esc),
+                ThemeModalStep::Restore(opened),
+                "selected={} 时仍须还原到 opened",
+                selected.name()
+            );
+        }
+    }
+
+    /// 环形闭合的两个具体端点（与 `theme.rs` 的互逆用例互补：这里钉的是
+    /// 浮层首尾相接的两个方向，用户连按到底不会停住）。
+    #[test]
+    fn test_theme_modal_wraps_around() {
+        assert_eq!(
+            ThemeKind::SolarizedDark.next(),
+            ThemeKind::AyuMirage,
+            "最后一个的下一个是第一个"
+        );
+        assert_eq!(
+            ThemeKind::AyuMirage.prev(),
+            ThemeKind::SolarizedDark,
+            "第一个的上一个是最后一个"
+        );
+    }
+
+    /// 宿主层：「按键序列 → set_theme 调用序列」—— `Preview` 必须**每次都调**
+    /// applier，`Esc` 后最终值是 `opened_with`，且 Esc 那条路**不发请求**（不落盘）。
+    ///
+    /// 变异：把 `apply_theme_step` 的 `Preview` 臂里的 `apply(kind)` 删掉（只推
+    /// `selected`）⇒ 调用序列变短、变红；把 `Restore` 臂的 `apply(kind)` 删掉 ⇒
+    /// 最终值断言变红。
+    #[test]
+    fn test_theme_modal_applies_every_preview_then_restores() {
+        let opened = ThemeKind::Nord;
+        let mut state = ThemeModalState {
+            opened_with: opened,
+            selected: opened,
+        };
+        let mut applied: Vec<ThemeKind> = Vec::new();
+
+        // ↓↓↑：每格都预览一次（含回退到同值）。
+        for key in [ThemeKey::Down, ThemeKey::Down, ThemeKey::Up] {
+            assert!(
+                apply_theme_step(&mut state, key, &mut |k| applied.push(k)).is_none(),
+                "移动键不关浮层"
+            );
+        }
+        assert_eq!(
+            applied,
+            vec![opened.next(), opened.next().next(), opened.next()],
+            "每次 Preview 都要调 applier"
+        );
+        assert_eq!(state.selected, opened.next(), "selected 由调用方推进");
+
+        // Esc：还原到 opened，且**不发请求**。
+        let close = apply_theme_step(&mut state, ThemeKey::Esc, &mut |k| applied.push(k))
+            .expect("Esc 必须关浮层");
+        assert_eq!(close, ThemeModalClose::Cancelled);
+        assert_eq!(
+            applied.last().copied(),
+            Some(opened),
+            "Esc 后最终 applier 收到的是 opened_with"
+        );
+        assert!(
+            close.request().is_none(),
+            "Esc 不得发 Request::SetTheme（不落盘）"
+        );
+        assert!(close.confirmed().is_none(), "Esc 不写本地回显");
+    }
+
+    /// `Enter` ⇒ `Confirmed(selected)`，且它**是**唯一会产生 `Request::SetTheme`
+    /// 的出口（名字用 kebab-case，协议只收这一种）。
+    ///
+    /// 变异：把 `request()` 改成返回 `None` ⇒ 本用例变红（确认后不落盘）。
+    #[test]
+    fn test_theme_modal_confirm_requests_set_theme() {
+        let mut state = ThemeModalState {
+            opened_with: ThemeKind::AyuMirage,
+            selected: ThemeKind::AyuMirage,
+        };
+        let mut applied: Vec<ThemeKind> = Vec::new();
+
+        // ↓ 到 Gruvbox，再 Enter —— 确认的是**预览到的那一个**。
+        assert!(apply_theme_step(&mut state, ThemeKey::Down, &mut |k| applied.push(k)).is_none());
+        let close = apply_theme_step(&mut state, ThemeKey::Enter, &mut |k| applied.push(k))
+            .expect("Enter 必须关浮层");
+        assert_eq!(close, ThemeModalClose::Confirmed(ThemeKind::GruvboxDark));
+        assert_eq!(close.confirmed(), Some(ThemeKind::GruvboxDark));
+        assert_eq!(
+            close.request(),
+            Some(Request::SetTheme {
+                theme: "gruvbox-dark".into()
+            }),
+            "确认才落盘，且载荷是 kebab-case 名"
+        );
+        assert_eq!(
+            applied,
+            vec![ThemeKind::GruvboxDark],
+            "Enter 本身不再调 applier（预览已设过）"
+        );
+    }
+
+    /// 本浮层**不认的键**既不改状态也不关浮层（无查询框，不做过滤）。
+    #[test]
+    fn test_theme_modal_ignores_other_keys() {
+        let mut state = ThemeModalState {
+            opened_with: ThemeKind::Nord,
+            selected: ThemeKind::EverforestDark,
+        };
+        let mut applied: Vec<ThemeKind> = Vec::new();
+        assert!(apply_theme_step(&mut state, ThemeKey::Other, &mut |k| applied.push(k)).is_none());
+        assert!(applied.is_empty(), "Ignore 不得碰 app");
+        assert_eq!(state.selected, ThemeKind::EverforestDark, "state 原封不动");
+    }
+
+    /// 选题浮层高亮的下标与 `ThemeKind::ALL` 顺序一致（`Modal::Select` 的
+    /// `selected` 是 `options` 下标，而 `options` 直接从 `ALL` 派生）。
+    #[test]
+    fn test_theme_index_mirrors_all_order() {
+        for (i, kind) in ThemeKind::ALL.iter().enumerate() {
+            assert_eq!(theme_index(*kind), i, "{}", kind.name());
+        }
     }
 
     /// `apply_prompt_outcome(Err(Cancelled))` ⇒ **无副作用**：transcript / 输入框 /

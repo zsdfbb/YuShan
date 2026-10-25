@@ -12,6 +12,7 @@ use std::time::Instant;
 use ys_core::EffortLevel;
 
 use crate::format::format_duration;
+use crate::theme::ThemeKind;
 
 /// 一个已知 provider（`/login` 浮层的选项）。
 ///
@@ -121,6 +122,12 @@ pub struct CodingView {
     /// 只在启动时被 `App::new` 消费一次；运行期真值是 `App.thinking_visible`，
     /// 此后本字段仅是 app 侧持久化镜像的载体（设计 §5.6）。
     pub thinking_visible: bool,
+    /// 配色主题的**启动初值**（来自 `~/.yushan/state.json`，全局偏好）。
+    ///
+    /// 只在启动时被 `App::new` 消费一次；运行期真值是 `App.theme`，不被
+    /// `Outbound::View` 快照覆盖 —— 切主题是 UI 本地动作（`/theme`、浮层预览），
+    /// 本字段此后仅是 app 侧持久化镜像的载体。
+    pub theme: ThemeKind,
 }
 
 impl Default for CodingView {
@@ -146,6 +153,7 @@ impl Default for CodingView {
             is_first_run: true,
             effort: None,
             thinking_visible: false,
+            theme: ThemeKind::default(),
         }
     }
 }
@@ -237,6 +245,7 @@ impl CodingView {
             is_first_run: false,
             effort: None,
             thinking_visible: false,
+            theme: ThemeKind::default(),
         }
     }
 }

@@ -25,6 +25,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::cache::RenderCache;
+use crate::theme::{Palette, ThemeKind};
 use crate::transcript::TranscriptLine;
 
 /// 一个 transcript 条目的布局记忆。
@@ -99,6 +100,11 @@ pub(crate) struct TranscriptLayout {
     width: u16,
     /// thinking 是否可见。变了 ⇒ 可见条目集合变了 ⇒ 全部记忆作废。
     thinking_visible: bool,
+    /// 上次同步用的色板。变了 ⇒ `EntryMemo.lines` 里的颜色已过期 ⇒ 全部记忆作废。
+    ///
+    /// 不参与 `EntryMemo.sig`（`entry_sig` 只哈希条目文本）：色板是**全局**状态，
+    /// 比一次值就够，不必让每个条目各自记一份。
+    theme: Palette,
     /// 逐条目记忆（与 transcript 等长；不可见条目为 `None`）。
     entries: Vec<Option<EntryMemo>>,
     /// 每个条目前置的留白行数（不可见条目为 0）。
@@ -107,7 +113,7 @@ pub(crate) struct TranscriptLayout {
     starts: Vec<usize>,
     /// 总视觉行数。
     total_rows: usize,
-    /// **结构版本**：`reset()` / 宽度变 / `thinking_visible` 翻转时 `+1`。
+    /// **结构版本**：`reset()` / 宽度变 / `thinking_visible` 翻转 / 换主题时 `+1`。
     ///
     /// **不随条目内容变** —— 否则窗口外条目一更新就会连带全量重建视窗字形缓存。
     structural_rev: u64,
@@ -120,6 +126,7 @@ impl Default for TranscriptLayout {
         Self {
             width: 0,
             thinking_visible: true,
+            theme: ThemeKind::default().palette(),
             entries: Vec::new(),
             gaps: Vec::new(),
             starts: Vec::new(),
@@ -132,6 +139,10 @@ impl Default for TranscriptLayout {
 
 impl TranscriptLayout {
     /// 清空全部记忆 —— 会话回放（transcript 整体替换）专用。
+    ///
+    /// **不动 `theme`**：主题是全局偏好（`/resume` 换会话时主题不变），而本函数只清
+    /// 「按条目记下的折行 / 渲染产物」。清空后 `entries` 为空 ⇒ 下一帧无论如何都会重建，
+    /// 届时 [`Self::sync`] 会按传入的色板自行更新这个字段。
     pub fn reset(&mut self) {
         self.entries.clear();
         self.gaps.clear();
@@ -146,18 +157,27 @@ impl TranscriptLayout {
     /// **只重算变化了的条目** —— 条目签名（廉价）没变就直接复用记忆；签名变了才
     /// 重新渲染并重算折行；若重渲染后的内容哈希与上次相同（流式节流窗口内
     /// 「源变、产物没变」），连折行结果一起复用。
+    ///
+    /// `theme` 是**必填**参数（不给默认值）：记忆里存的是已上色的行，漏传就是
+    /// 「屏上还是旧配色」这种只在缓存命中时才现形的偶发 bug。
     pub fn sync(
         &mut self,
         transcript: &[TranscriptLine],
         cache: &mut RenderCache,
         thinking_visible: bool,
+        theme: Palette,
         width: u16,
         now: Instant,
     ) -> SyncResult {
         let width = width.max(1);
         let width_changed = width != self.width;
-        if width_changed || thinking_visible != self.thinking_visible {
-            // 宽度变了 ⇒ 折行结果全变；thinking 可见性变了 ⇒ 可见条目集合变了。
+        let theme_changed = theme != self.theme;
+        // **无论是否进下面的分支都要更新**：否则同一主题连续调用会永远判「变了」，
+        // 每帧全量重算（性能灾难）。放在判据算出之后、其它 `self` 字段可变借用之前。
+        self.theme = theme;
+        if width_changed || thinking_visible != self.thinking_visible || theme_changed {
+            // 宽度变了 ⇒ 折行结果全变；thinking 可见性变了 ⇒ 可见条目集合变了；
+            // 换主题 ⇒ 已渲染行里的颜色过期。
             self.entries.clear();
             self.gaps.clear();
             self.starts.clear();
@@ -193,6 +213,7 @@ impl TranscriptLayout {
                 idx,
                 width as usize,
                 thinking_visible,
+                theme,
                 now,
             );
             let render_sig = lines_hash(&lines);
@@ -423,7 +444,8 @@ impl TranscriptLayout {
         hash
     }
 
-    /// 结构版本号：`reset()` / 宽度变 / `thinking_visible` 翻转时 +1。**不随条目内容变**。
+    /// 结构版本号：`reset()` / 宽度变 / `thinking_visible` 翻转 / 换主题时 +1。
+    /// **不随条目内容变**。
     #[allow(dead_code)]
     pub(crate) fn structural_rev(&self) -> u64 {
         self.structural_rev
@@ -478,6 +500,7 @@ fn render_entry(
     idx: usize,
     width: usize,
     thinking_visible: bool,
+    theme: Palette,
     now: Instant,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
@@ -486,6 +509,7 @@ fn render_entry(
         &transcript[idx],
         width,
         thinking_visible,
+        theme,
         cache,
         idx,
         now,
@@ -593,6 +617,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::app::App;
+    use crate::theme::ThemeKind;
     use crate::view::CodingView;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -632,6 +657,7 @@ mod tests {
                             &app.transcript,
                             &mut cache,
                             thinking_visible,
+                            ThemeKind::default().palette(),
                             w,
                             Instant::now(),
                         )
@@ -661,14 +687,28 @@ mod tests {
             let mut cache = app.md_cache.borrow_mut();
             let mut layout = TranscriptLayout::default();
             layout
-                .sync(&app.transcript, &mut cache, true, w, Instant::now())
+                .sync(
+                    &app.transcript,
+                    &mut cache,
+                    true,
+                    ThemeKind::default().palette(),
+                    w,
+                    Instant::now(),
+                )
                 .total_rows
         };
         assert!(total > 3, "前置：内容不止几行");
         let mut layout = TranscriptLayout::default();
         {
             let mut cache = app.md_cache.borrow_mut();
-            layout.sync(&app.transcript, &mut cache, true, w, Instant::now());
+            layout.sync(
+                &app.transcript,
+                &mut cache,
+                true,
+                ThemeKind::default().palette(),
+                w,
+                Instant::now(),
+            );
         }
 
         let head = layout.window(0, 1);
@@ -699,17 +739,18 @@ mod tests {
         let app = sample();
         let w = 40u16;
         crate::md::reset_render_calls();
+        let theme = ThemeKind::default().palette();
         {
             let mut cache = app.md_cache.borrow_mut();
             let mut layout = TranscriptLayout::default();
-            layout.sync(&app.transcript, &mut cache, true, w, Instant::now());
+            layout.sync(&app.transcript, &mut cache, true, theme, w, Instant::now());
         }
         let first = crate::md::render_calls();
         assert!(first > 0, "前置：首轮确实渲染了");
         {
             let mut cache = app.md_cache.borrow_mut();
             let mut layout = TranscriptLayout::default();
-            layout.sync(&app.transcript, &mut cache, true, w, Instant::now());
+            layout.sync(&app.transcript, &mut cache, true, theme, w, Instant::now());
         }
         assert_eq!(
             crate::md::render_calls(),
@@ -719,6 +760,9 @@ mod tests {
     }
 
     /// 同步一次（把 `md_cache` 的 `RefCell` 守卫封在内部 —— 用例里不重入借用）。
+    ///
+    /// 主题取 [`ThemeKind::default`] 的色板：既有用例都与主题无关，用默认色板让它们
+    /// 保持「只测几何」的原意；测主题的用例走 [`sync_once_with_theme`]。
     fn sync_once(
         app: &App,
         layout: &mut TranscriptLayout,
@@ -726,8 +770,33 @@ mod tests {
         thinking_visible: bool,
         now: Instant,
     ) -> SyncResult {
+        sync_once_with_theme(
+            app,
+            layout,
+            width,
+            thinking_visible,
+            ThemeKind::default().palette(),
+            now,
+        )
+    }
+
+    fn sync_once_with_theme(
+        app: &App,
+        layout: &mut TranscriptLayout,
+        width: u16,
+        thinking_visible: bool,
+        theme: Palette,
+        now: Instant,
+    ) -> SyncResult {
         let mut cache = app.md_cache.borrow_mut();
-        layout.sync(&app.transcript, &mut cache, thinking_visible, width, now)
+        layout.sync(
+            &app.transcript,
+            &mut cache,
+            thinking_visible,
+            theme,
+            width,
+            now,
+        )
     }
 
     fn synced(app: &App, width: u16, thinking_visible: bool, now: Instant) -> TranscriptLayout {
@@ -1123,6 +1192,87 @@ mod tests {
 
         layout.reset();
         assert_eq!(layout.structural_rev(), base + 3, "reset ⇒ +1");
+    }
+
+    /// 可见条目数（`recomputed_entries` 的期望值就是它）。
+    fn visible_count(app: &App, thinking_visible: bool) -> usize {
+        app.transcript
+            .iter()
+            .filter(|item| crate::draw::is_visible(item, thinking_visible))
+            .count()
+    }
+
+    /// **主题进失效判据（布局层）**：换主题 ⇒ 全部条目重算（`EntryMemo.lines` 里的颜色
+    /// 已经烘进去了）。宽度与内容都不变，只换色板。
+    ///
+    /// **变异自检**：从全量作废分支里删掉 `|| theme_changed` ⇒ 本用例必须**红**
+    /// （`recomputed_entries` 会停在 0）。
+    #[test]
+    fn theme_change_invalidates_all_entries() {
+        let app = sample();
+        let w = 40u16;
+        let now = Instant::now();
+        // 起点取**非**默认主题：同时钉住「初始状态就是 `ThemeKind::default().palette()`」
+        // 这条约定（默认构造 + 非默认色板 = 真换主题，必须作废）。
+        let a = ThemeKind::Nord.palette();
+        let b = ThemeKind::GruvboxDark.palette();
+        assert_ne!(a, b, "前置：两套色板必须不同");
+        let visible = visible_count(&app, true);
+        assert!(visible > 0, "前置：样本有可见条目");
+
+        let mut layout = TranscriptLayout::default();
+        // 先用 A 同步两次，确保 `self.theme` 已稳定在 A（否则第二行只是「首帧」）。
+        sync_once_with_theme(&app, &mut layout, w, true, a, now);
+        assert_eq!(
+            sync_once_with_theme(&app, &mut layout, w, true, a, now).recomputed_entries,
+            0,
+            "前置：同主题同宽度 ⇒ 不重算"
+        );
+
+        // 只换主题：宽度、内容、时刻都不变。
+        let result = sync_once_with_theme(&app, &mut layout, w, true, b, now);
+        assert_eq!(
+            result.recomputed_entries, visible,
+            "换主题 ⇒ 全部可见条目都要重算（不得沿用已上色的旧行）"
+        );
+        assert!(!result.width_changed, "前置：宽度没变");
+        assert_eq!(layout.theme, b, "同步后必须记住新色板");
+    }
+
+    /// **同一主题连续 `sync` 不得每次判「变了」**：`self.theme` 必须**在分支之外**
+    /// 也更新，否则每帧全量重算（性能灾难）。
+    ///
+    /// 取**非**默认主题是必需的：默认主题与 `Default::default()` 的初始值相同，拿它
+    /// 测不出「忘了更新 `self.theme`」——两个色板恰好相等，仍会全算一遍却不报错。
+    ///
+    /// **变异自检（实测结论）**：
+    /// 1. 把判据改成「与常量默认色板比」（等价于字段白记）⇒ 本用例与
+    ///    [`theme_change_invalidates_all_entries`] 均**红**（`recomputed_entries` = 可见条目数）。
+    /// 2. 把 `self.theme = theme;` **包进 `if theme_changed`** 或挤进全量作废分支（条件保留
+    ///    `|| theme_changed`）是**等价变异体**：字段只在变时赋值本就不需要更新，作废分支照样
+    ///    被进 —— 任何用例都不可能捕获它。它的危害只能靠「分支外赋值」这种写法本身避开，
+    ///    故这里额外**直接断言** `layout.theme`：字段真的跟上了传入值，「不重算」才有意义。
+    #[test]
+    fn same_theme_repeated_sync_recomputes_nothing() {
+        let app = sample();
+        let w = 40u16;
+        let now = Instant::now();
+        let a = ThemeKind::Nord.palette();
+        let mut layout = TranscriptLayout::default();
+
+        let first = sync_once_with_theme(&app, &mut layout, w, true, a, now);
+        assert!(first.recomputed_entries > 0, "首轮必然全算");
+        assert_eq!(layout.theme, a, "同步后必须记住传入的色板");
+
+        // 宽度、内容、主题全部不变：一次重算都不该有。
+        for round in 1..=2 {
+            assert_eq!(
+                sync_once_with_theme(&app, &mut layout, w, true, a, now).recomputed_entries,
+                0,
+                "第 {round} 次同主题同步不得重算（`self.theme` 必须在分支外更新）"
+            );
+            assert_eq!(layout.theme, a, "第 {round} 次同主题同步后色板不变得被记住");
+        }
     }
 
     /// `rev_alloc` 单调递增；产物没变的那次**不**消耗新号。

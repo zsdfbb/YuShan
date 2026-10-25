@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
@@ -35,6 +35,7 @@ use ys_core::StopReason;
 use crate::app::App;
 use crate::completion::CompletionState;
 use crate::input::InputBuffer;
+use crate::theme::Palette;
 use crate::transcript::TranscriptLine;
 
 /// 输入区最多显示的内容行数（不含边框）。
@@ -102,12 +103,45 @@ const COMPLETION_MAX_WIDTH: u16 = 64;
 const MODAL_MIN_WIDTH: u16 = 24;
 const MODAL_MAX_WIDTH: u16 = 72;
 
+/// 当前主题的色板 —— 本模块**唯一**取色入口。
+///
+/// 主题真值只有一处：`App.theme`（运行期真值，不随 `Outbound::View` 快照覆盖）。
+/// chrome（状态行 / 选择器 / 用户前缀 / ✓✗ / 错误前缀 / 系统行）与 markdown 样式
+/// （`push_transcript_line`）都从这里或从这里派生的色板取色，故换主题不会漏掉一条路径。
+///
+/// **按值**：`Palette` 是 `Copy`，且一帧只取一次、一路传下去 —— 同一帧内所有 pane
+/// 必然读到同一份色板（否则「先铺底、后画浮层」可能用两套色板）。
+fn chrome(app: &App) -> Palette {
+    app.theme.palette()
+}
+
+/// 色板 → 主题（[`ThemeKind::palette`] 的逆）。
+///
 /// 渲染整屏。
+///
+/// 取色在 `&mut app` 借用**之前**完成：`ui_with` 内部要可变借用 `app`
+/// （`sync_scroll_state`），那一刻再取色就借不到了。
 pub fn ui(frame: &mut Frame, app: &mut App) {
+    let palette = chrome(app);
+    ui_with(frame, app, palette);
+}
+
+/// [`ui`] 的完整形态：显式传入色板。
+///
+/// 允许单测渲染**任意**主题而不依赖全局状态；生产路径由 [`ui`] / [`ui_with_modal`]
+/// 从 `App.theme` 取色传入。
+fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return;
     }
+
+    // 整屏背景铺色（D2）：先铺满，再由各 pane 在上面画。
+    // 必须在 early-return 之后 —— 终端过小时不画任何东西。
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg)),
+        frame.area(),
+    );
 
     // 帧时钟：帧内**只有一处**取时刻（`layout` 同步），一路传下去。
     let now = Instant::now();
@@ -123,14 +157,14 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    draw_transcript(frame, chunks[0], app, scroll.top_row);
+    draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
     draw_input(frame, chunks[1], app);
-    draw_status(frame, chunks[2], app);
+    draw_status(frame, chunks[2], app, palette);
 
     // 补全浮层**最后画**：Clear 后盖在 Chat 区域上（设计 §1「独立于三个 pane」）。
     // 它不参与上面的布局计算 —— 开合时三个 pane 的位置一个像素都不动。
     if let Some(state) = &app.completion {
-        draw_completion(frame, chunks[0], state);
+        draw_completion(frame, chunks[0], state, palette);
     }
 }
 
@@ -210,7 +244,7 @@ pub fn max_scroll_offset_at(app: &mut App, width: u16, height: u16, now: Instant
 /// 与滚动数学读的是同一份布局 ⇒ 画面与滚动位置必然一致。
 ///
 /// 视窗切片依赖「整段折行 == 逐行折行之和」（N4）—— 故切片后拼起来与整段折行等价。
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize) {
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, palette: Palette) {
     let block = chat_block();
     let inner = block.inner(area);
     let inner_h = inner.height as usize;
@@ -220,7 +254,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize) {
     let lines = if window.lines.is_empty() && app.transcript.is_empty() {
         vec![Line::from(Span::styled(
             "(no messages yet)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.muted),
         ))]
     } else {
         window.lines
@@ -261,10 +295,10 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_status(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
     let text = status_text(app, area.width as usize);
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(text).style(Style::default().fg(palette.muted)),
         area,
     );
 }
@@ -276,7 +310,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 /// 补全浮层：贴 Chat 区底部、盖在对话内容上（设计 §1 mockup）。
 ///
 /// 只画 `visible` 条（超出的一半被窗口裁掉），保证 `selected` 一定可见。
-fn draw_completion(frame: &mut Frame, chat: Rect, state: &CompletionState) {
+fn draw_completion(frame: &mut Frame, chat: Rect, state: &CompletionState, palette: Palette) {
     if state.items.is_empty() || chat.height < 3 || chat.width < 8 {
         return;
     }
@@ -287,6 +321,11 @@ fn draw_completion(frame: &mut Frame, chat: Rect, state: &CompletionState) {
     let rect = Rect::new(chat.x, chat.bottom() - h, w, h);
 
     frame.render_widget(Clear, rect);
+    // `Clear` 把区域重置为终端默认底色 ⇒ 立即用主题 `bg` 补铺，否则这块是视觉黑洞。
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg)),
+        rect,
+    );
     let inner_w = (w - 2) as usize;
     let lines: Vec<Line<'static>> = state.items[start..start + visible]
         .iter()
@@ -342,7 +381,8 @@ pub(crate) enum Modal<'a> {
 /// 空白中间一个小方框 —— 那不是「盖在 Chat 上」，是把界面擦掉了。
 /// 浮层自己的 `Clear` 负责把**它占的那块**擦干净，其余交给 [`ui`]。
 pub(crate) fn ui_with_modal(frame: &mut Frame, app: &mut App, modal: Modal<'_>) {
-    ui(frame, app);
+    let palette = chrome(app);
+    ui_with(frame, app, palette);
     match modal {
         Modal::Select {
             prompt,
@@ -351,12 +391,14 @@ pub(crate) fn ui_with_modal(frame: &mut Frame, app: &mut App, modal: Modal<'_>) 
             selected,
             query,
             page_size,
-        } => prompt_select(frame, prompt, options, filtered, selected, query, page_size),
+        } => prompt_select(
+            frame, prompt, options, filtered, selected, query, page_size, palette,
+        ),
         Modal::Text {
             prompt,
             help,
             input,
-        } => prompt_text(frame, prompt, help, input),
+        } => prompt_text(frame, prompt, help, input, palette),
     }
 }
 
@@ -377,6 +419,7 @@ fn prompt_select(
     selected: usize,
     query: &InputBuffer,
     page_size: usize,
+    palette: Palette,
 ) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT || options.is_empty() {
@@ -393,12 +436,12 @@ fn prompt_select(
     let (query_row, query_style) = if query.text.is_empty() {
         (
             format!("> {FILTER_PLACEHOLDER}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.muted),
         )
     } else {
         (
             format!("> {}", query.text),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(palette.code),
         )
     };
     // 宽度按「标题 / 筛选行 / 最长候选」里更宽的那个算 —— 否则标题会被边框裁掉，
@@ -416,6 +459,11 @@ fn prompt_select(
     let rect = centered_rect(area, w, h);
 
     frame.render_widget(Clear, rect);
+    // `Clear` 后补铺主题 `bg`（同 [`draw_completion`]）。
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg)),
+        rect,
+    );
     let inner_w = (w.saturating_sub(2)) as usize;
 
     let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
@@ -425,7 +473,7 @@ fn prompt_select(
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             truncate_to_width(NO_MATCH, inner_w),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.muted),
         )));
     } else {
         lines.extend(
@@ -447,7 +495,7 @@ fn prompt_select(
         if filtered.len() > visible {
             lines.push(Line::from(Span::styled(
                 format!("… {}/{}", selected + 1, filtered.len()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted),
             )));
         }
     }
@@ -471,7 +519,13 @@ fn prompt_select(
 ///
 /// 光标**由本函数直接落好**（按显示宽度，CJK 占 2 列），调用方不必再管。
 /// 只画浮层本身；底下的界面由 [`ui_with_modal`] 先画好。
-fn prompt_text(frame: &mut Frame, prompt: &str, help: Option<&str>, input: &InputBuffer) {
+fn prompt_text(
+    frame: &mut Frame,
+    prompt: &str,
+    help: Option<&str>,
+    input: &InputBuffer,
+    palette: Palette,
+) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return;
@@ -484,6 +538,11 @@ fn prompt_text(frame: &mut Frame, prompt: &str, help: Option<&str>, input: &Inpu
     let rect = centered_rect(area, w, 3);
 
     frame.render_widget(Clear, rect);
+    // `Clear` 后补铺主题 `bg`（同 [`draw_completion`]）。
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg)),
+        rect,
+    );
     let block = Block::bordered().title(title);
     let inner = block.inner(rect);
     frame.render_widget(Paragraph::new(input.text.clone()).block(block), rect);
@@ -591,10 +650,11 @@ pub(crate) fn build_text(app: &App, width: usize, now: Instant) -> Text<'static>
 /// （TUI 与退出回放共用同一个开关值）。
 #[cfg(test)]
 fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant) -> Text<'static> {
+    let palette = chrome(app);
     if app.transcript.is_empty() {
         return Text::from(vec![Line::from(Span::styled(
             "(no messages yet)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette.muted),
         ))]);
     }
 
@@ -614,6 +674,7 @@ fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant
             item,
             width,
             thinking_visible,
+            palette,
             &mut cache,
             idx,
             now,
@@ -762,41 +823,51 @@ fn block_gap_rows(
 
 /// 一个 transcript 条目 → 它的渲染行（**不含**前置留白）。
 ///
+/// `palette` 由调用方给出（**按值**，`Copy`）：本函数拿不到 `App`，而颜色又是已烘进
+/// `Line` 的产物 ⇒ 主题必须由持有真值的一方显式传入，不得在这里重新取默认色板。
+///
 /// `cache` 由调用方持有（`RenderCache` 的 `RefCell` 守卫不得跨调用带出切片 ——
 /// **借用纪律**：`lines_for` 返回的切片生命周期绑在守卫上，必须在守卫作用域内 clone
 /// 进目标，不得带出；不重入 `borrow_mut`）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn push_transcript_line(
     out: &mut Vec<Line<'static>>,
     item: &TranscriptLine,
     width: usize,
     thinking_visible: bool,
+    palette: Palette,
     cache: &mut crate::cache::RenderCache,
     idx: usize,
     now: Instant,
 ) {
     if let TranscriptLine::Assistant(s) = item {
-        // assistant markdown 走缓存 + `md::render`
-        let styles = crate::styles::AssistantStyles;
+        // assistant markdown 走缓存 + `md::render`。
+        // 样式表从**入参色板**构造：换成默认主题会让「切了主题 markdown 还是旧配色」。
+        let styles = crate::styles::AssistantStyles::new(palette);
         out.extend(cache.lines_for(idx, s, width, styles, now).iter().cloned());
         return;
     }
-    push_non_assistant(out, item, width, thinking_visible);
+    push_non_assistant(out, item, width, thinking_visible, palette);
 }
 
 /// 非 `Assistant` 变体 → 行（TUI 与退出回放共用，行为一致）。
+///
+/// `palette` 按值传入：颜色已烘进 `Line`，故取色必须由持有主题真值的一方给出 ——
+/// 本函数拿不到 `App`，若在这里重新取默认色板，切主题后这些行会保持旧配色。
 pub(crate) fn push_non_assistant(
     out: &mut Vec<Line<'static>>,
     item: &TranscriptLine,
     width: usize,
     thinking_visible: bool,
+    palette: Palette,
 ) {
     match item {
         TranscriptLine::User(s) => {
             for (i, part) in s.split('\n').enumerate() {
                 let prefix = if i == 0 { "> " } else { "  " };
                 out.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Green)),
-                    Span::raw(part.to_string()),
+                    Span::styled(prefix, Style::default().fg(palette.user)),
+                    Span::styled(part.to_string(), Style::default().fg(palette.fg)),
                 ]));
             }
         }
@@ -818,7 +889,7 @@ pub(crate) fn push_non_assistant(
                 return;
             }
             let style = Style::default()
-                .fg(Color::DarkGray)
+                .fg(palette.muted)
                 .add_modifier(Modifier::ITALIC);
             // 缩进由 `LineClass` 决定（唯一真相源）—— 思考与工具同属行动块，
             // 但工具在块内**多缩进**一级（层次：想 ⊂ 做）。
@@ -843,14 +914,14 @@ pub(crate) fn push_non_assistant(
             ..
         } => {
             let (mark, mark_style) = if *success {
-                ("✓", Style::default().fg(Color::Green))
+                ("✓", Style::default().fg(palette.ok))
             } else {
-                ("✗", Style::default().fg(Color::Red))
+                ("✗", Style::default().fg(palette.fail))
             };
-            // 行动块整体降色（暗灰）：与顶格的 assistant 正文拉开视觉重量。
-            // 标记 `✓` / `✗` 保留自己的绿 / 红 —— 那是**语义**信号（成功与否），
+            // 行动块整体降色（`muted`）：与顶格的 assistant 正文拉开视觉重量。
+            // 标记 `✓` / `✗` 保留自己的 `ok` / `fail` —— 那是**语义**信号（成功与否），
             // 不属于「行动」的类别色。
-            let action_style = Style::default().fg(Color::DarkGray);
+            let action_style = Style::default().fg(palette.muted);
             let indent = " ".repeat(LineClass::of(item).indent(item));
             // 失败时要另起一行给结果首行 ⇒ 正文只准占 1 行（合计仍 ≤ [`TOOL_MAX_ROWS`]）。
             let show_result = !*success && result.is_some();
@@ -896,7 +967,7 @@ pub(crate) fn push_non_assistant(
                 let budget = width.saturating_sub(display_width(&prefix)).max(1);
                 out.push(Line::from(Span::styled(
                     format!("{prefix}{}", truncate_to_width(first, budget)),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(palette.fail),
                 )));
             }
         }
@@ -915,8 +986,8 @@ pub(crate) fn push_non_assistant(
             for (i, part) in s.split('\n').enumerate() {
                 let prefix = if i == 0 { "Error: " } else { "  " };
                 out.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::Red)),
-                    Span::raw(part.to_string()),
+                    Span::styled(prefix, Style::default().fg(palette.fail)),
+                    Span::styled(part.to_string(), Style::default().fg(palette.fg)),
                 ]));
             }
         }
@@ -924,7 +995,7 @@ pub(crate) fn push_non_assistant(
             for part in s.split('\n') {
                 out.push(Line::from(Span::styled(
                     part.to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted),
                 )));
             }
         }
@@ -1002,7 +1073,7 @@ pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
             // （空行经 wrap 仍是 1 行空串，但顺序必须是「先空行、后内容」）。
             out.extend(std::iter::repeat_n(String::new(), gap));
             let mut lines: Vec<Line<'static>> = Vec::new();
-            push_non_assistant(&mut lines, item, width, app.thinking_visible);
+            push_non_assistant(&mut lines, item, width, app.thinking_visible, chrome(app));
             for line in &lines {
                 out.extend(wrap_plain(&line.to_string(), width));
             }
@@ -1200,10 +1271,12 @@ fn wrap_input(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeKind;
     use crate::view::CodingView;
     use ratatui::Terminal;
     use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use std::time::Duration;
     use ys_core::ToolCallId;
 
@@ -2858,7 +2931,16 @@ mod tests {
         let filtered = vec![0usize, 1];
         let query = InputBuffer::new();
         let (rows, reversed) = render(60, 20, |f| {
-            prompt_select(f, "Select provider", &options, &filtered, 1, &query, 8)
+            prompt_select(
+                f,
+                "Select provider",
+                &options,
+                &filtered,
+                1,
+                &query,
+                8,
+                ThemeKind::default().palette(),
+            )
         });
         let joined = rows.join("\n");
         assert!(joined.contains("Select provider"), "{joined}");
@@ -2900,7 +2982,16 @@ mod tests {
         let filtered = vec![2usize]; // 只筛中 minimax 那条
         let query = InputBuffer::new();
         let (rows, reversed) = render(60, 20, |f| {
-            prompt_select(f, "Select model", &options, &filtered, 0, &query, 8)
+            prompt_select(
+                f,
+                "Select model",
+                &options,
+                &filtered,
+                0,
+                &query,
+                8,
+                ThemeKind::default().palette(),
+            )
         });
         let joined = rows.join("\n");
         assert!(joined.contains("minimax/MiniMax-M3"), "{joined}");
@@ -2931,7 +3022,16 @@ mod tests {
         let mut query = InputBuffer::new();
         query.insert_str("mini");
         let (rows, _) = render(60, 20, |f| {
-            prompt_select(f, "Select model", &options, &[], 0, &query, 8)
+            prompt_select(
+                f,
+                "Select model",
+                &options,
+                &[],
+                0,
+                &query,
+                8,
+                ThemeKind::default().palette(),
+            )
         });
         let joined = rows.join("\n");
         // CJK 宽字符的空格问题同上一个用例。
@@ -2952,7 +3052,15 @@ mod tests {
             let backend = TestBackend::new(60, 20);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|f| prompt_text(f, "API key", Some("deepseek"), &buf))
+                .draw(|f| {
+                    prompt_text(
+                        f,
+                        "API key",
+                        Some("deepseek"),
+                        &buf,
+                        ThemeKind::default().palette(),
+                    )
+                })
                 .unwrap();
             let rows: Vec<String> = {
                 let buffer = terminal.backend().buffer().clone();
@@ -3079,5 +3187,226 @@ mod tests {
         assert_eq!(window_start(4, 10, 4), 1, "选中项贴窗口底");
         assert_eq!(window_start(9, 10, 4), 6, "到头夹住，不越尾");
         assert_eq!(window_start(0, 0, 0), 0, "空列表不 panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // 主题：整屏背景铺色与 `Clear` 之后的补铺（T5b）
+    // -----------------------------------------------------------------------
+
+    /// 渲染一帧 `draw::ui`，返回**整块**缓冲（含每个格子的样式）。
+    fn buffer_of(app: &mut App, w: u16, h: u16) -> Buffer {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// 该格子是否是**宽字符的尾随列**。
+    ///
+    /// ratatui 写宽字符时会把紧随其后的列 `reset()` 回 `Color::Reset`（`Buffer::set_stringn`），
+    /// 因为那一列在终端上被前一个字符覆盖、底色看不见。这不是背景铺色的漏点，也无法补铺
+    /// —— 故逐格断言时跳过它，其余格子一律必须等于主题 `bg`。
+    fn is_wide_trailing(buf: &Buffer, i: usize) -> bool {
+        let width = buf.area().width as usize;
+        if width == 0 || i.is_multiple_of(width) {
+            return false;
+        }
+        Span::raw(buf.content()[i - 1].symbol()).width() > 1
+    }
+
+    /// 缓冲的每个格子都必须铺上主题 `bg`（宽字符尾随列除外，见 [`is_wide_trailing`]）。
+    ///
+    /// 逐格比对（而不是只抽查几处）：`bg` 泄漏可以出现在任意一个没被 widget 覆盖的格子上，
+    /// 抽查漏掉恰好就是那些边角。
+    fn assert_screen_bg(buf: &Buffer, palette: Palette, ctx: &str) {
+        for (i, cell) in buf.content().iter().enumerate() {
+            if is_wide_trailing(buf, i) {
+                continue;
+            }
+            let (x, y) = buf.pos_of(i);
+            assert_eq!(
+                cell.bg, palette.bg,
+                "{ctx}：格子 ({x},{y}) 的 bg 不是主题 bg（{:?}）",
+                palette.bg
+            );
+        }
+    }
+
+    /// **整屏背景铺色**（D2）：含顶边框行、输入框内区、状态行在内的**每个**格子都是 `bg`。
+    ///
+    /// 变异：删掉 `ui()` 里的整屏铺色 ⇒ 未被 pane 着色的格子回落 `Color::Reset` ⇒ 红。
+    #[test]
+    fn test_ui_paints_theme_bg_everywhere() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("hello".into()));
+        app.transcript
+            .push(TranscriptLine::Assistant("hi there **bold**".into()));
+        let palette = ThemeKind::default().palette();
+
+        // 多尺寸：小（刚过 MIN_*）、常规、宽 —— 边角与输入框内区都覆盖到。
+        for (w, h) in [(MIN_WIDTH, MIN_HEIGHT), (80, 24), (120, 40)] {
+            let buf = buffer_of(&mut app, w, h);
+            assert_screen_bg(&buf, palette, &format!("ui {w}x{h}"));
+        }
+    }
+
+    /// **`Clear` 之后必须补铺背景**：模态浮层区域内仍是主题 `bg`（不是 ``Color::Reset``）。
+    ///
+    /// `Clear` 把区域重置为终端默认底色，不补铺就会出现与主题背景不一致的矩形
+    /// —— 屏上一个视觉黑洞。变异：删掉 `prompt_select` 里 `Clear` 之后的补铺 ⇒ 红。
+    #[test]
+    fn test_modal_overlay_uses_theme_bg_not_default() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("hello".into()));
+        let palette = ThemeKind::default().palette();
+        let options: Vec<String> = (0..6).map(|i| format!("option-{i}")).collect();
+        let filtered: Vec<usize> = (0..options.len()).collect();
+        let query = crate::input::InputBuffer::new();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                ui_with_modal(
+                    f,
+                    &mut app,
+                    Modal::Select {
+                        prompt: "模型",
+                        options: &options,
+                        filtered: &filtered,
+                        selected: 0,
+                        query: &query,
+                        page_size: 5,
+                    },
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // 整屏仍是主题 bg（浮层区域也包括在内 —— 这就是「不黑洞」的判据）。
+        assert_screen_bg(&buf, palette, "ui_with_modal Select");
+        // 前置：浮层真的画出来了（否则上面的断言对“没有浮层”也成立）。
+        let joined: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(joined.contains("option-0"), "浮层应列出候选：{joined}");
+    }
+
+    /// **切主题整屏换色**：同一个 `App` 走 `set_theme` 后整屏 `bg` 跟着换。
+    ///
+    /// 走生产路径（`set_theme` + [`ui`]，而非直接传色给 [`ui_with`]）—— 钉的正是
+    /// 「`ui` 从 `App.theme` 取色」：漏接 `chrome(app)` 就恒为默认主题，本用例必红。
+    #[test]
+    fn test_theme_switch_repaints_whole_screen_bg() {
+        let palette_a = ThemeKind::default().palette();
+        let palette_b = ThemeKind::Nord.palette();
+        assert_ne!(palette_a.bg, palette_b.bg, "前置：两套主题的 bg 必须不同");
+
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("hello".into()));
+
+        let buf_a = buffer_of(&mut app, 80, 24);
+        assert_screen_bg(&buf_a, palette_a, "主题 A");
+
+        app.set_theme(ThemeKind::Nord);
+        let buf_b = buffer_of(&mut app, 80, 24);
+        assert_screen_bg(&buf_b, palette_b, "主题 B");
+
+        assert_ne!(
+            buf_a.content()[0].bg,
+            buf_b.content()[0].bg,
+            "换主题必须整屏换色"
+        );
+    }
+
+    /// **chrome 槽位正确**：各类 transcript 条目的 fg 取自对应槽位。
+    ///
+    /// 用 `push_non_assistant` 直接产出行再逐 span 取样式 —— 比在字符画里找格子
+    /// 更稳（不受 wrap / 横滚影响）。覆盖 user / thinking / 工具成功 / 工具失败 /
+    /// Error / System 六类。
+    #[test]
+    fn test_push_non_assistant_uses_chrome_slots() {
+        let palette = ThemeKind::default().palette();
+        let width = 80;
+        let lines = |item: &TranscriptLine| {
+            let mut out: Vec<Line<'static>> = Vec::new();
+            push_non_assistant(&mut out, item, width, true, palette);
+            out
+        };
+        // 首行首 span 的 fg。
+        let first_fg = |lines: &[Line<'static>]| lines[0].spans[0].style.fg;
+
+        // 用户消息前缀 `> ` → `user`
+        let user = lines(&TranscriptLine::User("hello".into()));
+        assert_eq!(user[0].spans[0].content, "> ");
+        assert_eq!(first_fg(&user), Some(palette.user), "用户前缀应取 `user`");
+
+        // 思考 → `muted` + ITALIC
+        let thinking = lines(&TranscriptLine::Thinking("想一下".into()));
+        assert_eq!(
+            first_fg(&thinking),
+            Some(palette.muted),
+            "思考行应取 `muted`"
+        );
+        assert!(
+            thinking[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC),
+            "思考行必须保持斜体"
+        );
+
+        // 工具成功 `✓` → `ok`；行动块本身仍是 `muted`
+        let ok_line = lines(&TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "read".into(),
+            summary: "a.rs".into(),
+            result: None,
+            success: true,
+        });
+        let ok_marks: Vec<_> = ok_line[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == "✓")
+            .collect();
+        assert_eq!(ok_marks.len(), 1, "成功工具行应有一个 ✓");
+        assert_eq!(ok_marks[0].style.fg, Some(palette.ok), "✓ 应取 `ok`");
+        assert_eq!(
+            ok_line[0].spans[0].style.fg,
+            Some(palette.muted),
+            "行动块前缀应取 `muted`"
+        );
+
+        // 工具失败 `✗` → `fail`；失败结果首行也是 `fail`
+        let fail_line = lines(&TranscriptLine::Tool {
+            id: ToolCallId("c2".into()),
+            name: "bash".into(),
+            summary: "false".into(),
+            result: Some("boom".into()),
+            success: false,
+        });
+        let fail_marks: Vec<_> = fail_line[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == "✗")
+            .collect();
+        assert_eq!(fail_marks.len(), 1, "失败工具行应有一个 ✗");
+        assert_eq!(fail_marks[0].style.fg, Some(palette.fail), "✗ 应取 `fail`");
+        assert_eq!(
+            fail_line[1].spans[0].style.fg,
+            Some(palette.fail),
+            "失败结果首行应取 `fail`"
+        );
+
+        // `Error: ` 前缀 → `fail`
+        let err = lines(&TranscriptLine::Error("坏了".into()));
+        assert_eq!(err[0].spans[0].content, "Error: ");
+        assert_eq!(
+            first_fg(&err),
+            Some(palette.fail),
+            "`Error: ` 前缀应取 `fail`"
+        );
+
+        // System 行 → `muted`
+        let sys = lines(&TranscriptLine::System("提示".into()));
+        assert_eq!(first_fg(&sys), Some(palette.muted), "System 行应取 `muted`");
     }
 }

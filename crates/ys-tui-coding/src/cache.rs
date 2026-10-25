@@ -17,6 +17,13 @@
 //! **变小**时走到。若调用方先 clear、再立刻 extend 到**相同长度**，长度看起来没变，会走
 //! 「增长」分支而**绕过**缩短 ⇒ 等长内容假命中（旧槽位的 `len`/`width` 与新内容恰好相同即
 //! 直接复用旧产物）。故必须显式 `reset()`。
+//!
+//! # 主题不在键里
+//!
+//! 槽位存的是**已上色**的 `Line`，而键只有 `(len, width)` —— 换主题若不作废，屏上就是旧配色。
+//! 故换主题必须走显式的 [`RenderCache::set_theme`]（比值 ⇒ 色板变了才全量作废），
+//! **不把主题塞进键**：逐槽记一份色板等于给每个槽位多一份状态，而切主题是低频操作，
+//! 全量作废的代价可接受。
 
 use std::time::{Duration, Instant};
 
@@ -24,6 +31,7 @@ use ratatui::text::Line;
 
 use crate::md;
 use crate::styles::AssistantStyles;
+use crate::theme::{Palette, ThemeKind};
 
 /// 流式节流窗口：距上次渲染不足此时长时**沿用上次产物**（设计 §2.5）。
 pub(crate) const RENDER_THROTTLE: Duration = Duration::from_millis(100);
@@ -50,7 +58,6 @@ struct Slot {
 /// 节流状态**存在本结构内**（它记住每条上次算出什么、何时算的），令布局同步
 /// （[`crate::layout`]）与画面读到**同一份**上次产物 —— 否则滚动按新内容、画面按旧内容，
 /// 二者错位（设计 §2.5 边界 ①，风险 R11）。
-#[derive(Default)]
 pub(crate) struct RenderCache {
     slots: Vec<Option<Slot>>,
     /// 最近一次被 `lines_for` 请求的槽位 —— `sync_len` 增长时据此把「上一条」标记为结束。
@@ -58,6 +65,25 @@ pub(crate) struct RenderCache {
     /// 超长单条（`> MAX_CACHED_SRC`）的**暂存产物**：只服务退化路径，**不写 slot**（内存意图：
     /// 超长单条真的不入缓存，设计 §2.5）。每次退化渲染覆写它。
     scratch: Vec<Line<'static>>,
+    /// 当前色板。**只由 [`RenderCache::set_theme`] 改**，且不参与命中判定（键仍是
+    /// `(len, width)`）—— 它唯一的用途是「换主题 ⇒ 全量作废」的比值判据。
+    // 消费方是 `App::set_theme`（`app.rs`）→ `RenderCache::set_theme`，两者同步落地；
+    // 在接线前这里只有本模块的用例读它。与 `SyncResult::recomputed_entries` 同一处置。
+    #[allow(dead_code)]
+    theme: Palette,
+}
+
+/// 手写而非 `derive`：[`Palette`] 刻意不实现 `Default`（无主题的色板没有合理默认值），
+/// 故这里显式取 [`ThemeKind::default`] 的色板作为初始状态。
+impl Default for RenderCache {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            streaming: None,
+            scratch: Vec::new(),
+            theme: ThemeKind::default().palette(),
+        }
+    }
 }
 
 impl RenderCache {
@@ -93,6 +119,22 @@ impl RenderCache {
     pub fn reset(&mut self) {
         self.slots.clear();
         self.streaming = None;
+    }
+
+    /// 换主题 ⇒ 所有渲染产物作废（槽位里存的是**已上色**的行，而键不含主题）。
+    ///
+    /// **色板未变时直接返回**：主题浮层逐键预览会反复调用它，同值重入不该白清一屏产物。
+    ///
+    /// 与 [`Self::reset`] 的区别只有一条：本函数记住新色板，`reset()` 不改它（`/resume`
+    /// 的回放清屏与主题无关，两者语义不得混）。
+    // 消费方是 `App::set_theme`（`app.rs`，唯一失效入口）。
+    #[allow(dead_code)]
+    pub fn set_theme(&mut self, palette: Palette) {
+        if palette == self.theme {
+            return;
+        }
+        self.theme = palette;
+        self.reset();
     }
 
     /// 显式标记某槽位「该条结束」：下次取用忽略节流、必算。
@@ -186,6 +228,7 @@ impl RenderCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeKind;
 
     fn flat_all(lines: &[Line<'static>]) -> String {
         lines
@@ -213,11 +256,23 @@ mod tests {
         let mut cache = RenderCache::default();
         let base = Instant::now();
         let first: Vec<Line<'static>> = cache
-            .lines_for(0, "# T\n\nbody **x**", 60, AssistantStyles, base)
+            .lines_for(
+                0,
+                "# T\n\nbody **x**",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base,
+            )
             .to_vec();
         cache.finish(0);
         let second: Vec<Line<'static>> = cache
-            .lines_for(0, "# T\n\nbody **x**", 60, AssistantStyles, base)
+            .lines_for(
+                0,
+                "# T\n\nbody **x**",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base,
+            )
             .to_vec();
         assert_eq!(first, second, "重算产物应与首次逐字节一致");
         assert_eq!(flat_all(&first), flat_all(&second));
@@ -229,12 +284,18 @@ mod tests {
         md::reset_render_calls();
         let mut cache = RenderCache::default();
         let base = Instant::now();
-        cache.lines_for(0, "hello world", 60, AssistantStyles, base);
         cache.lines_for(
             0,
             "hello world",
             60,
-            AssistantStyles,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
+        cache.lines_for(
+            0,
+            "hello world",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
             base + Duration::from_millis(50),
         );
         assert_eq!(md::render_calls(), 1, "窗口内应复用、不重算");
@@ -248,13 +309,31 @@ mod tests {
         let mut cache = RenderCache::default();
         let base = Instant::now();
         let later = base + Duration::from_millis(200); // 已过 RENDER_THROTTLE 窗口
-        cache.lines_for(0, "aaaa", 60, AssistantStyles, base);
+        cache.lines_for(
+            0,
+            "aaaa",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
         // 同一时刻、同一长度：永久命中，不重算
-        cache.lines_for(0, "aaaa", 60, AssistantStyles, later);
+        cache.lines_for(
+            0,
+            "aaaa",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            later,
+        );
         assert_eq!(md::render_calls(), 1, "长度相同应永久命中");
         // 长度 +1：键变 ⇒ 重算
         let out = cache
-            .lines_for(0, "aaaaa", 60, AssistantStyles, later)
+            .lines_for(
+                0,
+                "aaaaa",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                later,
+            )
             .to_vec();
         assert_eq!(md::render_calls(), 2, "长度变化应重算");
         assert_eq!(flat_all(&out), "aaaaa");
@@ -266,8 +345,20 @@ mod tests {
         md::reset_render_calls();
         let mut cache = RenderCache::default();
         let base = Instant::now();
-        cache.lines_for(0, "abcd", 40, AssistantStyles, base);
-        cache.lines_for(0, "abcd", 80, AssistantStyles, base); // 同一时刻、同长度，仅宽度不同
+        cache.lines_for(
+            0,
+            "abcd",
+            40,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
+        cache.lines_for(
+            0,
+            "abcd",
+            80,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        ); // 同一时刻、同长度，仅宽度不同
         assert_eq!(md::render_calls(), 2, "宽度变化应重算（键必须含 width）");
     }
 
@@ -278,16 +369,40 @@ mod tests {
         let mut cache = RenderCache::default();
         cache.sync_len(2);
         let base = Instant::now();
-        cache.lines_for(0, "one", 60, AssistantStyles, base);
-        cache.lines_for(1, "two", 60, AssistantStyles, base);
+        cache.lines_for(
+            0,
+            "one",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
+        cache.lines_for(
+            1,
+            "two",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
         assert_eq!(md::render_calls(), 2);
         // 再取回 idx 0/1，窗口内均命中
         assert_eq!(
-            flat_all(cache.lines_for(0, "one", 60, AssistantStyles, base)),
+            flat_all(cache.lines_for(
+                0,
+                "one",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base
+            )),
             "one"
         );
         assert_eq!(
-            flat_all(cache.lines_for(1, "two", 60, AssistantStyles, base)),
+            flat_all(cache.lines_for(
+                1,
+                "two",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base
+            )),
             "two"
         );
         assert_eq!(md::render_calls(), 2);
@@ -300,7 +415,13 @@ mod tests {
         let mut cache = RenderCache::default();
         cache.sync_len(1);
         let base = Instant::now();
-        cache.lines_for(0, "grow", 60, AssistantStyles, base); // streaming = 0
+        cache.lines_for(
+            0,
+            "grow",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        ); // streaming = 0
         assert_eq!(md::render_calls(), 1);
         // 下一条出现（transcript 增长）→ 上一条结束
         cache.sync_len(2);
@@ -308,7 +429,7 @@ mod tests {
             0,
             "grow",
             60,
-            AssistantStyles,
+            AssistantStyles::new(ThemeKind::default().palette()),
             base + Duration::from_millis(1),
         );
         assert_eq!(md::render_calls(), 2, "上一条结束后必须重算一次");
@@ -320,9 +441,21 @@ mod tests {
         md::reset_render_calls();
         let mut cache = RenderCache::default();
         let base = Instant::now();
-        cache.lines_for(0, "fin", 60, AssistantStyles, base);
+        cache.lines_for(
+            0,
+            "fin",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
         cache.finish(0);
-        cache.lines_for(0, "fin", 60, AssistantStyles, base); // 同刻同键，但已 forced
+        cache.lines_for(
+            0,
+            "fin",
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        ); // 同刻同键，但已 forced
         assert_eq!(md::render_calls(), 2);
     }
 
@@ -343,7 +476,13 @@ mod tests {
         let base = Instant::now();
 
         let a = cache
-            .lines_for(0, "AAAA", 60, AssistantStyles, base)
+            .lines_for(
+                0,
+                "AAAA",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base,
+            )
             .to_vec();
         assert_eq!(flat_all(&a), "AAAA", "先填充 A 的产物");
         assert_eq!(md::render_calls(), 1);
@@ -351,7 +490,13 @@ mod tests {
         // 回放：清屏后立刻 extend 到**相同长度** —— 长度没变，键看起来「没变」。
         cache.reset();
         let b = cache
-            .lines_for(0, "BBBB", 60, AssistantStyles, base)
+            .lines_for(
+                0,
+                "BBBB",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base,
+            )
             .to_vec();
 
         assert_eq!(flat_all(&b), "BBBB", "回放后必须重渲染，不得复用等长旧产物");
@@ -370,10 +515,24 @@ mod tests {
         let mut cache = RenderCache::default();
         let base = Instant::now();
         let big = "a".repeat(MAX_CACHED_SRC + 1);
-        let first = cache.lines_for(0, &big, 60, AssistantStyles, base).to_vec();
+        let first = cache
+            .lines_for(
+                0,
+                &big,
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                base,
+            )
+            .to_vec();
         assert!(!first.is_empty(), "退化路径仍应产出内容");
         assert!(cache.slot_is_none(0), "超长单条不得写入缓存槽");
-        cache.lines_for(0, &big, 60, AssistantStyles, base);
+        cache.lines_for(
+            0,
+            &big,
+            60,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            base,
+        );
         assert_eq!(md::render_calls(), 2, "超长单条应每帧现算");
         assert!(cache.slot_is_none(0), "第二次取用后槽位仍应为空");
     }
@@ -389,14 +548,26 @@ mod tests {
         for i in 0..1000usize {
             src.push('x');
             let now = base + Duration::from_millis(i as u64); // t = 0..=999 ms
-            cache.lines_for(0, &src, 40, AssistantStyles, now);
+            cache.lines_for(
+                0,
+                &src,
+                40,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                now,
+            );
         }
         let in_loop = md::render_calls();
         assert!(in_loop <= 10, "1 秒窗口内渲染次数应 ≤ 10（实际 {in_loop}）");
         // 该条结束（例如紧接着追加下一条 / turn 结算）→ 强制完整渲染
         cache.finish(0);
         let final_now = base + Duration::from_millis(1000);
-        let lines = cache.lines_for(0, &src, 40, AssistantStyles, final_now);
+        let lines = cache.lines_for(
+            0,
+            &src,
+            40,
+            AssistantStyles::new(ThemeKind::default().palette()),
+            final_now,
+        );
         let total = md::render_calls();
         assert!(total <= 11, "总渲染次数应 ≤ 11（实际 {total}）");
         assert_eq!(
@@ -443,13 +614,25 @@ mod tests {
         let mut cache = RenderCache::default();
         let warm = Instant::now();
         for (i, src) in docs.iter().enumerate() {
-            let _ = cache.lines_for(i, src, 80, AssistantStyles, warm);
+            let _ = cache.lines_for(
+                i,
+                src,
+                80,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                warm,
+            );
         }
         cache.reset();
 
         let start = Instant::now();
         for (i, src) in docs.iter().enumerate() {
-            let _ = cache.lines_for(i, src, 80, AssistantStyles, start);
+            let _ = cache.lines_for(
+                i,
+                src,
+                80,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                start,
+            );
         }
         let elapsed = start.elapsed();
 
@@ -457,5 +640,112 @@ mod tests {
             "N13 首帧基准：{N} 条 × ~2 KiB（共 {total_bytes} 字节），reset() 后首帧全量渲染耗时 = {elapsed:?}（参照阈值 100 ms）"
         );
         assert_eq!(docs.len(), N, "基准规模自检（不参与性能断言）");
+    }
+
+    /// 产物里出现的**前景色集合**（去重后按出现顺序排）—— 比「产物不同」更精确：
+    /// 换主题必须真的换成另一套颜色，而不是仅仅多算一次。
+    fn fg_colors(lines: &[Line<'static>]) -> Vec<ratatui::style::Color> {
+        let mut out = Vec::new();
+        for line in lines {
+            for color in line
+                .spans
+                .iter()
+                .filter_map(|s| s.style.fg)
+                .chain(line.style.fg)
+            {
+                if !out.contains(&color) {
+                    out.push(color);
+                }
+            }
+        }
+        out
+    }
+
+    /// **主题进失效判据（缓存层）**：换主题后即便 `(槽下标, src.len(), width)` 全同，
+    /// 也不得复用旧槽位的产物 —— 槽里存的是**已上色**的行，键里却没有主题。
+    ///
+    /// **变异自检**：把 `set_theme` 改成空操作（或删掉它的 `self.reset()`）⇒ 本用例必须**红**
+    /// （第二次取到的是 A 的旧产物：颜色集合不变、渲染调用数仍为 1）。
+    #[test]
+    fn set_theme_invalidates_rendered_slots() {
+        md::reset_render_calls();
+        let mut cache = RenderCache::default();
+        cache.sync_len(1);
+        let base = Instant::now();
+        let src = "# 标题\n\n正文 `code` **粗体**";
+        let width = 60usize;
+        let a = ThemeKind::default();
+        let b = ThemeKind::Nord;
+        assert_ne!(a.palette(), b.palette(), "前置：两套色板必须不同");
+
+        let first = cache
+            .lines_for(0, src, width, AssistantStyles::new(a.palette()), base)
+            .to_vec();
+        assert_eq!(md::render_calls(), 1, "前置：首次渲染");
+        let first_fg = fg_colors(&first);
+        assert!(!first_fg.is_empty(), "前置：产物必须带前景色");
+
+        // 换主题：同一条、同宽度、同长度 —— 键三者全同，只有主题变了。
+        cache.set_theme(b.palette());
+        let second = cache
+            .lines_for(0, src, width, AssistantStyles::new(b.palette()), base)
+            .to_vec();
+
+        assert_eq!(md::render_calls(), 2, "换主题后同键也必须重算");
+        assert_ne!(first, second, "换主题后产物不得是旧的");
+        let second_fg = fg_colors(&second);
+        assert_ne!(
+            first_fg, second_fg,
+            "换主题后前景色集合必须变（{first_fg:?} → {second_fg:?}）"
+        );
+        // 新产物只用 B 的槽位色 —— 钉住「真的换成了 B」而不只是「换了一份色」。
+        let palette_b = b.palette();
+        let slots_b = [
+            palette_b.fg,
+            palette_b.accent,
+            palette_b.code,
+            palette_b.muted,
+            palette_b.user,
+            palette_b.ok,
+            palette_b.warn,
+            palette_b.fail,
+            palette_b.info,
+        ];
+        for color in &second_fg {
+            assert!(
+                slots_b.contains(color),
+                "B 主题的产物只能使用 B 的槽位色，出现 {color:?}"
+            );
+        }
+    }
+
+    /// **同值 `set_theme` 不白清缓存**：主题浮层逐键预览会反复调用它，色板没变时
+    /// 不得把已渲染产物丢掉重算。
+    ///
+    /// **变异自检**：删掉 `set_theme` 开头那句 `if palette == self.theme { return; }`
+    /// ⇒ 本用例必须**红**（渲染调用数会涨到 2）。
+    #[test]
+    fn set_theme_with_same_palette_keeps_cache() {
+        md::reset_render_calls();
+        let mut cache = RenderCache::default();
+        cache.sync_len(1);
+        let base = Instant::now();
+        let src = "# 标题\n\n正文 `code`";
+        let width = 60usize;
+        let a = ThemeKind::default();
+
+        let first = cache
+            .lines_for(0, src, width, AssistantStyles::new(a.palette()), base)
+            .to_vec();
+        assert_eq!(md::render_calls(), 1, "前置：首次渲染");
+
+        // 同值重入：色板没变 ⇒ 不清缓存。
+        cache.set_theme(a.palette());
+        let second = cache
+            .lines_for(0, src, width, AssistantStyles::new(a.palette()), base)
+            .to_vec();
+
+        assert_eq!(md::render_calls(), 1, "同值 set_theme 不得作废缓存");
+        assert_eq!(first, second, "同值 set_theme 后产物应逐字节相同");
     }
 }

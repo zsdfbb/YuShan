@@ -128,24 +128,12 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
-- **TUI 鼠标：只做了滚轮**（[ADR-0050](../adr/0050-tui-mouse-wheel-scroll.md)）：
-  - ⬜ **文本选区与松手复制**（[ADR-0051](../adr/0051-tui-text-selection.md)）：设计、审核、
-    两份计划均已就绪（`docs/arch/tui-text-selection/`、`docs/design-plans/`、`docs/exec-plans/`
-    的 `2026-10-24-tui-text-selection.md`），W0（`layout.rs` 字形缓存地基，`36c4e1f`）已落地。
-    **剩余**：T3–T25。依据：`docs/reports/2026-10-24-tui-text-selection-w0-report.md` §5 遗留
-    明写「后续波次 W1 `selection.rs` 骨架 → … → W11 文档回写（共 11 波未做）」。
-  - ⚠️ **T22 变异脚本的注入 #3 是等价变异**：计划 / `design.md` §6 / 脚本表三处都写
-    「`skip = max(skip, w) - 1` → `skip = w - 1` ⇒ V4 红」，实测**打不红** —— `skip` 是循环内
-    状态变量，`w ≤ 1` 时 `max` 不改变值，两种写法逐轮产出相同序列。落地 `scripts/selection-mutation.py`
-    时必须改成 `skip = 0`（完全不跳续格，实测 V4 红）。依据：`selection.rs` 实现期的实测，
-    见 W1 单元回报。
+- **TUI 鼠标**（[ADR-0050](../adr/0050-tui-mouse-wheel-scroll.md) 滚轮 +
+  [ADR-0051](../adr/0051-tui-text-selection.md) 拖选）：
   - ⬜ **模态浮层里的滚轮**：浮层自己读事件（`crates/ys-tui-coding/src/run.rs` 的
     `Prompter` 实现），`_ => {}` 掉鼠标 ⇒ 会话列表 / 模型列表超过一屏时**无法滚动**，
     只能靠方向键逐项移动（跨屏时会自动跟高亮）。补法：在 `select_modal` 的匹配里加
     `Event::Mouse` 臂改 `top` / 高亮。依据：ADR 风险表的「模态浮层里的滚轮」一行标**未做**。
-  - ⬜ **`⇧`+拖选可用性的人工确认**：捕获期间裸拖选失效，`⇧`+拖选在 iTerm2 /
-    Terminal.app / WezTerm / VSCode 集成终端下的实际表现均**未验证**（ADR-0050 的
-    `MANUAL_ACK` 项）。不达标时的退路：只在滚轮事件发生时才临时关捕获（成本高，需实测）。
 
 - **bg-notify 的 R1 技术债：投递机制不外溢**（ADR `docs/arch/bg-notify/adr-bg-notify.md`）：
   「落点格 + `Delivery` 三态 + take/claim/Finish」现在长在 `adapters/tools-basic/src/background.rs`

@@ -1289,7 +1289,8 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 **滚轮归应用**（ADR-0050）：`run::setup_terminal` 开 `EnableMouseCapture`，
 `events::handle_mouse` 只认 `ScrollUp` / `ScrollDown`（其余鼠标事件忽略）。
 不开捕获时终端把滚轮译成 `↑` / `↓` ⇒ 滑触控板翻的是**输入历史**而不是对话。
-代价：终端原生拖选失效，需 `⇧`+拖选或 `/copy`。
+捕获期间终端原生拖选失效的代价，已由**应用内选区 + 松手即复制**（ADR-0051）消掉 ——
+裸左键拖选即可复制，`⇧`+拖选则把原生选择**让回**终端。
 
 **macOS 的两个坑**（键盘侧入口为何不够）：系统级快捷键占用了 `Ctrl+↑` / `Ctrl+↓`
 （Mission Control / App Exposé，字节到不了终端，需在「系统设置 → 键盘 → 键盘快捷键 →
@@ -1317,8 +1318,65 @@ TUI `/help` 增「键位」段（此前键位没有任何界面出口）。
   「可能没跟上」，不是「算错」。
 - 逐行 `line_count` 有分配开销（每条目只在内容变化时算一次）。
 - 真实终端的「翻页跟手」观感仍是 `MANUAL_ACK` 项（见 §10）。
-- **鼠标捕获期间终端原生拖选失效** ⇒ 拷贝须 `⇧`+拖选或 `/copy`（ADR-0050 的代价）。
+- **鼠标捕获期间终端原生拖选失效** ⇒ 已由应用内选区补上（ADR-0051：裸左键拖选 =
+  应用内选区 + 松手即复制）。选区自身的代价见 §18.7。
 - **模态浮层不吃滚轮**：浮层自读事件、`_ => {}` 掉鼠标 —— 浮层内容尚不滚动（见 `docs/TODO.md` §C）。
+
+### 18.7 文本选区与松手复制 — as-built
+
+鼠标左键拖选 Chat 区 ⇒ 应用内反显高亮；松手把**屏幕字形**写进系统剪贴板（OSC 52）。
+消掉了「复制内容要靠终端给不给修饰键」这一跳终端差异（ADR-0051）。
+
+**模块划分**（唯一新文件 `crates/ys-tui-coding/src/selection.rs`）：
+
+| 项 | 职责 |
+|---|---|
+| `Selection` | 状态机：`anchor_*` / `cursor_*` / `edge` / `edge_since` + `rects` 复用缓冲 |
+| `GlyphGrid` | 视窗字形缓存：`slots: Buffer` + `order: Vec<u16>` 槽环 + `cont` 续格位图 |
+| `extract` | 按 `EXTRACT_CHUNK_ROWS` 分块重渲 → 逐行**按内容裁剪** → 读回 |
+| `Highlight` | 只改 `Modifier::REVERSED` 样式，**不动 symbol**、**不用 `Clear`** |
+| `drag_tick` | 贴边自动滚动（自由函数，六步顺序不可换） |
+
+**坐标模型**：`anchor_row` / `cursor_row` 是 `TranscriptLayout` 的**全局视觉行号**
+（按下时 = `top_row` + 内区相对 y），`x` 是内区相对屏幕列。因此选区能**超过一屏**，
+且 `anchor_row` 是逻辑坐标、不随滚动改变。**自动滚动只改 `cursor_row`。**
+
+**九条缓存失效**（设计 §2.3 的落地）：键 = `layout_rev`（`structural_rev`）+ `win_rev`
+（`rev_alloc`，内容代次）+ `inner` Rect + `base_row`。仅 `base_row` 变 ⇒ `shift(k)`
+槽环旋转；其余 ⇒ 全量 `rebuild`；`Idle` ⇒ `release()`（保容量、还内存）。
+
+> ⚠️ **`win_rev` 用的是 `rev_alloc` 而不是 `revision_range`**：后者把「窗口首条目内偏移」
+> 折进了哈希，而滚动本身就会改这个偏移 —— 拿它做键的话「纯滚动」永远被判成内容变化，
+> 槽环永远不会生效。代价是窗口**外**条目重渲也会打一次全量重建（正确性优先）。
+
+**复制上限** `COPY_MAX_BYTES = 256 KiB`：超限**不复制**、不静默截断，transcript 回一行提示。
+**自动滚动**：`DRAG_TICK = 16ms` 可变 poll 周期 + `step = clamp(1 + held_ms/40, 1, 8)`，
+200 拍实测选区增量 ≈ **366 µs**（固定 UI 开销另计）。
+
+**`⇧` 语义**：拖选的 `⇧` = 把原生选择**让回终端**（不是退路）。
+
+**已知代价**：
+
+| 项 | 代价 |
+|---|---|
+| 选区不跨**用户滚动** / **resize** 存活 | 有意（决策 5/6）；松手后 resize 无害 |
+| 流式拖选时缓存重建 ≤ 10 次/秒 | 受 `RENDER_THROTTLE` 天然限流 |
+| 字形存两份（`layout` + `GlyphGrid`） | 视窗期 ≈ 120 KB；`Idle` 时释放 |
+| 双击选词 / 三击选行 | 未做（`SelectionMode` 不建） |
+| `⇧` 退路在 VS Code+macOS 仍不存在 | 不是本设计缺陷；`⇧` 只是「让回」开关 |
+| 真实终端手感 | `MANUAL_ACK`；客观替代闸门是 3 个 `#[ignore]` 基准 |
+
+**实现的四处明确化**（与 `docs/arch/tui-text-selection/design.md` 的差异）：
+
+1. `Phase` **两态**（`Idle` / `Dragging`）：`Done` 无观测点（松手即 `clear()`）。
+2. `TranscriptLayout.rev` 拆成 `structural_rev`（结构）+ `rev_alloc`（内容代次）。
+3. `window_rows()` 落地为 `window_with_rows() -> (Window, Vec<RowRef>)`：`window()` 传
+   `None` 保持零分配，二者共用 `window_impl` 一次遍历。
+4. `drag_tick` 是**自由函数**（避 `app.selection` 与 `&mut app` 的借用冲突），
+   且**只动 `cursor_*`**、不动 `anchor_*`。
+
+**变异测试**：`python3 scripts/selection-mutation.py`（8 处注入，全部可被抓到）。
+
 ## 19. 后台命令执行（execution-efficiency）— as-built
 
 > ⚠️ **本轮已被 §20 部分取代**：`bash_poll` 已删除，结果回收从「模型轮询」改为

@@ -487,6 +487,14 @@ fn jump_to_start(app: &mut App, width: u16, height: u16) {
 /// 滚动：`delta > 0` 向上（远离底部），`delta < 0` 向下（回到贴底）。
 pub(crate) fn scroll(app: &mut App, width: u16, height: u16, delta: isize) {
     let max = app.compute_max_scroll(width, height);
+    scroll_with_max(app, max, delta);
+}
+
+/// [`scroll`] 的夹取部分：调用方**已经持有** `max_scroll` 时用它，省一次全量布局同步。
+///
+/// `compute_max_scroll` 内部会走 `layout.sync`（O(条目数)），而拖动期间内容不变 ⇒
+/// `max` 每拍相同。`selection::drag_tick` 已经算过一次，不该再算一次。
+pub(crate) fn scroll_with_max(app: &mut App, max: usize, delta: isize) {
     let next = if delta >= 0 {
         app.scroll_offset.saturating_add(delta as usize).min(max)
     } else {

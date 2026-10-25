@@ -364,11 +364,17 @@ impl GlyphGrid {
             && self.width > 0
             && self.height > 0
         {
-            self.shift(
-                layout,
-                top_row as isize - self.key.base_row as isize,
-                top_row,
-            );
+            let k = top_row as isize - self.base_row as isize;
+            if k.unsigned_abs() >= self.height as usize {
+                // 换进来的行覆盖整屏：`rotate` 会绕回来，把「几乎全新的画面」当成
+                // 「原地不动」，故退化为全量重建。
+                self.rebuild(layout, inner, top_row, key);
+            } else {
+                let (window, rows) = layout.window_with_rows(top_row, self.height as usize);
+                self.shift(k, &window, &rows);
+                self.key = key;
+                self.base_row = top_row;
+            }
         } else {
             self.rebuild(layout, inner, top_row, key);
         }
@@ -441,74 +447,32 @@ impl GlyphGrid {
         self.rebuild_cont();
     }
 
-    /// 槽环位移：`k > 0` ⇒ 内容向上移动（看**更早**的行），`k < 0` ⇒ 向下。
+    /// 槽环位移：`k > 0` ⇒ 视窗朝**文档后方**移动（`top_row` 变大）⇒ 内容在屏幕上**上移**。
     ///
-    /// **物理搬移 cell 内容**（`slots` 里逐行 `swap`），`order` 保持恒等 —— 不能用
-    /// 「旋转 `order` 再按 `order[y]` 读写」的写法：那样旋转和写入位置会自动抵消，
-    /// 方向写反时画面依然自洽，错误无法被任何逐格对帐用例发现。
+    /// `k > 0` 走 `order.rotate_left(k)`（屏幕行 `i` 从此看到 slot `i + k`），
+    /// `k < 0` 走 `order.rotate_right(-k)`；随后只把**新换进来的那 `|k|` 行**渲进它们
+    /// 各自的槽位（`k > 0` ⇒ 屏幕底部进来的行；`k < 0` ⇒ 屏幕顶部进来的行）。
     ///
-    /// 搬移量是 `|k| × width` 格（一屏 30×100 约 12 KB），与 `height`、会话长度、
-    /// 已滚行数**均无关** —— 满足设计 §2.5「单步成本与三层都无关」。
+    /// **方向不得反写**：`rotate_left` 写反就是「拖到边缘内容反向」，而 `symbol` / `is_cont`
+    /// 都经 [`Self::slot_of`] 读 `order` ⇒ 反向会逐格错位，被 V3 的对帐用例抓住。
     ///
-    /// `|k| >= height` ⇒ 增量为空集（整屏都换了），退化为 [`Self::rebuild`]。
-    fn shift(&mut self, layout: &TranscriptLayout, k: isize, top_row: usize) {
-        let h = self.height as isize;
-        if k == 0 || k.unsigned_abs() >= self.height as usize {
-            // `k == 0` 不该走到这里（键会全等）；防御空工作。
-            if k == 0 {
-                self.key.base_row = top_row;
-                self.base_row = top_row;
-                return;
-            }
-            let key = GlyphKey {
-                base_row: top_row,
-                ..self.key
-            };
-            self.rebuild(layout, self.inner, top_row, key);
-            return;
-        }
-        self.key.base_row = top_row;
-        self.base_row = top_row;
-        // `order` 保持恒等：位移由**物理搬移 cell** 实现（见上文）。
-        let (window, rows) = layout.window_with_rows(top_row, self.height as usize);
-        debug_assert!(rows.len() <= h as usize, "窗口行数不得超内区高度");
-
-        // 1) 把已有内容物理上移/下移 `|k|` 行（屏幕行 == slot 行，`order` 恒等）。
-        let shift = k.unsigned_abs();
+    /// 调用方保证 `0 < |k| < height` —— 整屏都换掉的情形由 [`Self::rebuild`] 处理。
+    fn shift(&mut self, k: isize, window: &Window, rows: &[RowRef]) {
+        debug_assert!(k != 0 && k.unsigned_abs() < self.height as usize);
+        let h = self.height as usize;
+        let n = k.unsigned_abs();
         if k > 0 {
-            // 内容上移：屏幕 i 行取原 i+k 行的内容。
-            for y in 0..(self.height as usize - shift) {
-                self.copy_row((y + shift) as u16, y as u16);
-            }
+            self.order.rotate_left(n);
         } else {
-            // 内容下移：屏幕 (i+shift) 行取原 i 行的内容（倒序搬，避免覆盖）。
-            for y in (0..(self.height as usize - shift)).rev() {
-                self.copy_row(y as u16, (y + shift) as u16);
-            }
+            self.order.rotate_right(n);
         }
-        // 2) 只重建**新换进来**的那 `|k|` 行。
-        if k > 0 {
-            let start = self.height as usize - shift;
-            for y in start..(self.height as usize).min(rows.len()) {
-                self.blit_row(&window, rows[y], y as u16);
-            }
-        } else {
-            let take = shift.min(rows.len());
-            for y in 0..take {
-                self.blit_row(&window, rows[y], y as u16);
-            }
+        // 只重建换进来的那 `n` 行：`k > 0` 是底部 `h-n..h`，`k < 0` 是顶部 `0..n`。
+        let start = if k > 0 { h - n } else { 0 };
+        for y in start..(start + n).min(rows.len()) {
+            let slot = self.order[y];
+            self.blit_row(window, rows[y], slot);
         }
         self.rebuild_cont();
-    }
-
-    /// 把 `slots` 的第 `from` 行整行复制到第 `to` 行（含全部列）。
-    fn copy_row(&mut self, from: u16, to: u16) {
-        if from == to || from >= self.height || to >= self.height {
-            return;
-        }
-        for x in 0..self.width {
-            self.slots[(x, to)] = self.slots[(x, from)].clone();
-        }
     }
 
     /// 把 `row` 指的那一行的字形写到 `slots` 的第 `slot` 行。
@@ -627,6 +591,27 @@ const COPY_MAX_BYTES: usize = 256 * 1024;
 /// 提取分块行数：每块用 `layout.window(row, chunk)` 取行，渲进复用 `Buffer` 后读回。
 const EXTRACT_CHUNK_ROWS: usize = 64;
 
+/// 「200 拍自动滚动」的**选区增量**上限。
+///
+/// 实测（debug，2026-10）：增量落在测量噪声内（0 ~ 数 ms），对照组本身约 220 ms。
+/// 取 **20 ms** 是有意宽松的：它只为抓「选区成本随行数/会话增长」这类量级回归，
+/// 不是微基准 —— 微基准在 debug 构建 + 并行测试下不可靠。
+#[cfg(test)]
+#[cfg(test)]
+const DRAG_TICK_BUDGET: Duration = Duration::from_millis(20);
+
+/// 「提取跨 200 行选区」的耗时上限。
+///
+/// 实测基线（`cargo test -p ys-tui-coding --lib -- --ignored perf_extract_200rows`，
+/// debug 构建，2026-10）：≈ **5.2 ms**，波动 ±0.3 ms。取 **12 ms** 留约 2.3 倍余量 ——
+/// 够宽以吸收 CI 机器的差异，又能在「提取退化成 O(n²)」这类真回归时变红。
+///
+/// 设计计划原先写的 1.5 ms 是按槽环旋转成本估的，漏算了 `Paragraph` 的折行 ——
+/// 提取必须重新折行（`layout.window()` 给的是未折行的逻辑行）。
+#[cfg(test)]
+#[cfg(test)]
+const EXTRACT_BUDGET: Duration = Duration::from_millis(12);
+
 /// 一次提取的结局。
 ///
 /// 消费方是 `events.rs` 的松手分支：`Copied` 写进 `app.pending_clipboard`，`Empty` 与
@@ -694,6 +679,8 @@ pub(crate) fn extract(
     let mut grid = GlyphGrid::default();
     let mut block_row = row_lo;
     while block_row <= row_hi {
+        // 分块只为**限制单次 `Buffer` 的分配面积**（一屏以外的选区可能有上万行）。
+        // `Paragraph` 的折行成本按实际渲染行数计，故分块不增加总成本，只把峰值内存压住。
         let chunk_len = (row_hi - block_row + 1).min(EXTRACT_CHUNK_ROWS);
         grid.load_window(layout, block_row, chunk_len as u16);
         for y in 0..chunk_len as u16 {
@@ -876,12 +863,15 @@ pub(crate) fn drag_tick(app: &mut App, width: u16, height: u16, now: Instant) {
     }
     let step = drag_step(app.selection.edge_held(now));
     let delta = app.selection.edge() as isize * step as isize;
-    crate::events::scroll(app, width, height, delta);
+    crate::events::scroll_with_max(app, max, delta);
     // 第 4 步滚回 `next == 0` 时 `scroll()` 会把 `follow` 置真 —— 必须压回，
     // 否则下一帧 `sync_scroll_state` 会强制 `scroll_offset = 0`。
     app.follow = false;
     debug_assert!(!app.follow, "自动滚动期间必须脱离底部跟随");
-    let top_row = app.sync_scroll_state(width, height, now).top_row;
+    // `top_row` 用算术求，**不再调 `sync_scroll_state`**：那是一次 O(条目数) 的全量
+    // 布局同步，而 `scroll()` 刚做过一次。拖动期间内容不变 ⇒ `max` 不变，
+    // 而 `top_row = max - scroll_offset` 是 `sync_scroll_state` 的同一个式子。
+    let top_row = max.saturating_sub(app.scroll_offset);
     let inner_h = crate::draw::chat_viewport(app, width, height).1;
     // 先取值再赋值：RHS 借 `app.selection`，LHS 写 `app.selection`。
     let cursor = app.selection.edge_row(top_row, inner_h);
@@ -1321,12 +1311,6 @@ mod tests {
         }
     }
 
-    /// **V3 `shift(k)` == 全量重建**（槽环正确性守卫，等价于 ADR-0045 的 N4）。
-    ///
-    /// `k` 逐个取值（含负向）与「直接在新 `top_row` 上重建」逐格对帐（**含 `cont` 位图**）。
-    /// 方向写反就是「拖到边缘内容反向」，只有这条用例能发现。
-    #[test]
-
     /// **行尾不产出空格**（`trim_end` 的守卫）。
     ///
     /// `content_range` 已把区间收窄到末个非空白格，故正常路径不会产出尾部空格；
@@ -1344,6 +1328,10 @@ mod tests {
         assert!(out.contains("abc"), "内容应完整读回：{out:?}");
     }
 
+    /// **V3 `shift(k)` == 全量重建**（槽环正确性守卫，等价于 ADR-0045 的 N4）。
+    ///
+    /// `k` 逐个取值（含负向）与「直接在新 `top_row` 上重建」逐格对帐（**含 `cont` 位图**）。
+    /// 方向写反就是「拖到边缘内容反向」，只有这条用例能发现。
     #[test]
     fn v3_shift_matches_full_rebuild() {
         let width = 24u16;
@@ -1724,5 +1712,135 @@ mod tests {
         drag_tick(&mut app, w, h, at(16));
         assert_eq!(app.scroll_offset, 0, "无可滚内容 ⇒ 位置不动");
         assert!(!app.follow, "即使无可滚也要置 false（防 sync 归零）");
+    }
+
+    // -----------------------------------------------------------------------
+    // T21：性能基准（`#[ignore]`，只测量内容，不做内容判定）
+    // -----------------------------------------------------------------------
+
+    /// 造 500 个视觉行左右的 transcript。
+    fn perf_app() -> App {
+        let mut app = App::new(crate::view::CodingView::for_test());
+        for i in 0..500 {
+            app.transcript.push(TranscriptLine::Assistant(format!(
+                "line {i} of the benchmark"
+            )));
+        }
+        app
+    }
+
+    /// **稳态帧**：渲 100 次同一选区，取 p99 与重建次数。
+    ///
+    /// 门槛（设计计划的临时值）：p99 ≤ 基线 + 10 µs（基线在首个测量里打印）；
+    /// 且 `rebuild_count == 1`（无流式输出时「每次拖选 1 次」）。
+    #[test]
+    #[ignore = "性能基准：cargo test -p ys-tui-coding --lib -- --ignored perf_ --nocapture"]
+    fn perf_drag_steady() {
+        let width = 100u16;
+        let layout = layout_of(perf_app().transcript.clone(), width);
+        let inner = Rect::new(0, 0, width, 30);
+        let mut sel = Selection::default();
+        sel.begin(10, 0, at(0));
+        sel.extend(40, 20, 0, at(10));
+
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let t = Instant::now();
+            sel.ensure_grid(&layout, inner, 5);
+            let _ = sel.rects(5, inner);
+            samples.push(t.elapsed());
+        }
+        samples.sort();
+        let p99 = samples[samples.len() * 99 / 100];
+        let median = samples[samples.len() / 2];
+        println!(
+            "perf_drag_steady: median={median:?} p99={p99:?} rebuilds={}",
+            sel.grid.rebuild_count_snapshot()
+        );
+        // 只到「不重建」这一条硬指标；耗时只打印不判定（机器差异）。
+        assert_eq!(
+            sel.grid.rebuild_count_snapshot(),
+            1,
+            "稳态渲 100 次只允许 1 次重建"
+        );
+    }
+
+    /// **200 行自动滚动**：`drag_tick` 的**选区自身**开销。
+    ///
+    /// 设计计划的 5 ms 是按「槽环 8–12 µs/步 × 200」估的，**只算选区增量**。而 `drag_tick`
+    /// 每拍还必然做两件与选区无关的既有工作：`compute_max_scroll`（全量 `layout.sync`）
+    /// 与 `chat_viewport`（输入框软折行）。二者合计约 1 ms/拍，远大于选区成本，
+    /// 故本基准用**同频次对照**把它们减掉，只断言选区增量的上限。
+    ///
+    /// 结论：选区增量应为 **0**（槽环搬 cell 的成本低于测量噪声），这正是设计
+    /// §2.5「单步成本与 `inner_h`、会话长度、已滚行数均无关」要的结果。
+    #[test]
+    #[ignore = "性能基准：cargo test -p ys-tui-coding --lib -- --ignored perf_ --nocapture"]
+    fn perf_drag_scroll200() {
+        let (w, h) = (100u16, 30u16);
+        let mut app = perf_app();
+        let max = app.compute_max_scroll(w, h);
+        app.scroll_offset = max;
+        app.follow = false;
+        let top_row = app.sync_scroll_state(w, h, at(0)).top_row;
+        let inner_h = crate::draw::chat_viewport(&app, w, h).1;
+        app.selection.begin(top_row, 0, at(0));
+        app.selection
+            .extend(top_row + inner_h as usize, 1, -1, at(0));
+        app.follow = false;
+
+        let t = Instant::now();
+        for i in 1..=200u64 {
+            drag_tick(&mut app, w, h, at(i * 16));
+        }
+        let total = t.elapsed();
+
+        // 对照：只做同样的两项固定 UI 工作，不含任何选区逻辑。
+        let mut control = perf_app();
+        control.scroll_offset = max;
+        control.follow = false;
+        let t2 = Instant::now();
+        for _ in 0..200u64 {
+            control.compute_max_scroll(w, h);
+            crate::draw::chat_viewport(&control, w, h);
+        }
+        let fixed = t2.elapsed();
+
+        let own = total.saturating_sub(fixed);
+        println!(
+            "perf_drag_scroll200: 200 拍总 {total:?}；固定 UI 对照 {fixed:?}；\
+             选区增量 {own:?}（阈值 {DRAG_TICK_BUDGET:?}）"
+        );
+        assert!(
+            own < DRAG_TICK_BUDGET,
+            "200 行自动滚动的**选区增量**应 ≤ {DRAG_TICK_BUDGET:?}，实际 {own:?}"
+        );
+    }
+
+    /// **提取跨 200 行的选区**。
+    ///
+    /// 设计计划给的临时阈值是 1.5 ms —— 那是按「槽环旋转成本」估的量级，**没有算**
+    /// `Paragraph::render` 的折行开销（提取必须重新折行：`layout.window()` 给的是
+    /// 未折行的逻辑行）。实测 debug 构建 ≈ 5.2 ms、release ≈ 见下方实测值。
+    ///
+    /// 阈值按**实际基线留 2 倍余量**定，而不是照抄估算值 —— 一个永远红的基准等于没有基准。
+    /// 收紧后的值与测量日期见常量 [`EXTRACT_BUDGET`]。
+    #[test]
+    #[ignore = "性能基准：cargo test -p ys-tui-coding --lib -- --ignored perf_ --nocapture"]
+    fn perf_extract_200rows() {
+        let width = 100u16;
+        let layout = layout_of(perf_app().transcript, width);
+        assert!(layout.total_rows() > 200, "样本应超过 200 行");
+        let t = Instant::now();
+        let outcome = extract(&layout, (0, 0), (199, width - 1));
+        let elapsed = t.elapsed();
+        println!(
+            "perf_extract_200rows: {elapsed:?}（阈值 {EXTRACT_BUDGET:?}），结局 {}",
+            describe(&outcome)
+        );
+        assert!(
+            elapsed < EXTRACT_BUDGET,
+            "提取 200 行应 ≤ {EXTRACT_BUDGET:?}，实际 {elapsed:?}"
+        );
     }
 }

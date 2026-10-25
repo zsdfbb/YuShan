@@ -141,7 +141,8 @@ $ ./target/release/ys-coding-agent -p "这个项目是做什么的"
 - 拉不到模型列表时也能降级启动，不会卡住
 
 **干活**
-- 9 个工具：`read` `write` `edit` `bash` `grep` `find` `ls` `websearch` `webfetch`
+- 12 个工具：9 个基础（`read` `write` `edit` `bash` `grep` `find` `ls` `websearch` `webfetch`）
+  + `bash_bg` + `subagent` + `subagent_async`（后三者追加在末位，顺序即契约）
 - 搜索后端可配多个（SearXNG / DeepSeek / Tavily / Bocha / Firecrawl），配了哪个用哪个
 - **子 agent**：派一个出去干子任务，父回合会等它回来接着干，不会半路把活丢了
 - **Skill**：把 `SKILL.md` 丢进 `.yushan/skills`，模型需要时才读正文——不占上下文
@@ -190,6 +191,7 @@ $ cargo clippy --all-targets && cargo fmt
 
 | 想看什么 | 去哪 |
 |---|---|
+| **怎么用 `ys-coding-agent`**（CLI / 内置命令 / 键位） | [`apps/coding-agent/README.md`](apps/coding-agent/README.md) |
 | 约定和硬性约束 | [`AGENTS.md`](AGENTS.md) |
 | 架构图（分层 / 信道 / 时序 / 数据流） | [`docs/architecture.md`](docs/architecture.md) |
 | 现在实际是什么样（含与设计的分歧） | [`docs/design-final/`](docs/design-final/) |
@@ -197,8 +199,10 @@ $ cargo clippy --all-targets && cargo fmt
 | 还没做什么 | [`docs/TODO.md`](docs/TODO.md) |
 | 怎么贡献 | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 
-仓库自带 5 个开发用 skill（架构探索 / 设计 / 校验、诊断、顺序工作流），
-clone 后跑 `./scripts/install-skills.sh` 即可在 agent 里通过 `/` 调用。
+仓库自带 5 个开发用 skill（架构探索 / 设计 / 校验、诊断、顺序工作流），外加 `pdf-analysis` 示例。
+clone 后跑 `./scripts/install-skills.sh` 即可在 agent 里通过 `/` 调用 —— 这个项目本身就是用它们迭代的，
+哪种任务用哪个、在本 runtime 下怎么落地（无 plan mode）见
+[`CONTRIBUTING.md`](CONTRIBUTING.md#用本项目自己开发)。
 
 ## 状态
 

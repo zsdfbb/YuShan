@@ -31,9 +31,12 @@ YuShan/
 │   ├── tools-basic               # 文件与 shell 工具
 │   └── tools-web                 # 联网工具（websearch / webfetch）
 ├── apps/
-│   └── coding-agent              # 可执行入口：TUI / -p / --json 三模式
+│   └── coding-agent              # 可执行入口：TUI / -p / --json 三模式（用法见其 README.md）
 ├── skills/                       # 仓库自带的 skill（**不编译进二进制**，由安装脚本铺到 ~/.yushan/skills）
-│   └── pdf-analysis              # PDF 提取与分析：setup.sh 自举后端 → 分页落盘 → read 续读
+│   ├── arch-explore/ arch-design/ arch-validate/   # 探索 → 多方案设计 → 校验（产出 docs/arch/<需求>/）
+│   ├── diagnose/                 # 疑难 bug / 性能回退的规范诊断循环
+│   ├── sequential-workflow/      # 端到端功能开发：plan → exec → 归档，实现全经 subagent 派发
+│   └── pdf-analysis/             # PDF 提取与分析：setup.sh 自举后端 → 分页落盘 → read 续读
 ├── docs/                         # 设计与过程产物；**「去哪找什么」就在这一层**
 │   ├── architecture.md           # 架构全貌（15 节：分层 / 信道 / 时序 / 数据流 / 输出三分 / TUI 形态 / 测试分层）
 │   ├── design.md                 # 架构规范、核心 trait、Hook/Event 边界、测试矩阵
@@ -87,7 +90,7 @@ YuShan/
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr
 - `cargo test -p ys-coding-agent e2e -- --ignored --nocapture` — 端到端（需 `YUSHAN_API_BASE` + `YUSHAN_API_KEY`）
-- `cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture` — **R8 对账**（skill 目录段的真实 input token 成本；`#[ignore]`，**尚未校准**，需同上凭证）
+- `cargo test -p ys-coding-agent --test e2e_skills -- --ignored --nocapture` — **R8 对账**（skill 目录段的真实 input token 成本；`#[ignore]`，**已校准：真实/估算 = 0.704**（2026-09-21 实测，见 `docs/design-final/skills.md`）；provider 不回报 usage 时只打印「未校准」、不做断言。需同上凭证）
 - `cargo test -p ys-coding-agent --test e2e_bench -- --ignored --nocapture` — **基准**（同一任务的轮数 / 墙钟 / `ttft`·`gen`·`tools` 切分；`#[ignore]`，**只测量、不做任何内容判定**，需同上凭证；调参见 `YUSHAN_BENCH_REPEATS` / `YUSHAN_BENCH_ONLY` / `YUSHAN_BENCH_TIMEOUT_SECS` / `YUSHAN_BENCH_CLEAN` / `YUSHAN_BENCH_HEAVY`；**默认保留**逐轮日志等证据供回溯；长跑项默认跳过（机制保留，当前无条目用它）。默认集 7 条 ≈ **2 分钟**；其中 `fact/1` 是**可判定**任务 —— 时间与质量同时可测，是唯一能做外部对照的提示）
 
 环境变量：`YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL`；`YUSHAN_REASONING_EFFORT`（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`，默认 **`high`**；仅 provider 声明支持时随请求发送，当前为 `opencode-go`）；`YUSHAN_CHANNEL_CAPACITY`（信道容量，下限 16）；`YUSHAN_SESSIONS_DIR`（会话目录覆盖，测试用）；`YUSHAN_LOG_DIR`（日志目录覆盖，测试/基准用 —— 凭证仍在 `$HOME`，故隔离日志不能靠改 `HOME`；非空为 Override，只写不清理；未设置或空串为 Default，正常启动清理超过 7 天的 `debug-*.jsonl`）；`YUSHAN_DEBUG`（结构化执行日志：**未设置或空串默认开启**；`1/true/yes/on` 开启，其余非空值关闭；**优先于命令行 `--debug`**，`--debug` 仍兼容）；`YUSHAN_DEBUG_ARGS`（工具参数摘要档位 `none` / `head` / `full`，默认 `head`；脱敏在所有档位都生效）；`YUSHAN_SEARCH_SEARXNG_URL` / `YUSHAN_SEARCH_DEEPSEEK_KEY`（亦认生态通用名 `DEEPSEEK_API_KEY`，命名空间名优先）/ `YUSHAN_SEARCH_TAVILY_KEY`（亦认生态通用名 `TAVILY_API_KEY`，命名空间名优先）/ `YUSHAN_SEARCH_BOCHA_KEY` / `YUSHAN_SEARCH_FIRECRAWL_KEY`（搜索后端，**各自配置才进链**）；`YUSHAN_FETCHED_DIR`（webfetch 落盘目录覆盖，须为**绝对路径**，测试用）；`YUSHAN_BG_DIR`（后台命令落盘根目录，须为**绝对路径**，未设置时默认 `<temp_dir>/yushan-bg`；细节见 `docs/arch/execution-efficiency/design.md` §4.5）。
@@ -121,6 +124,12 @@ YuShan/
 
 ## 工作约定
 
+- **开发流程由仓库自带的 skill 承担**：`./scripts/install-skills.sh` 装一次，之后
+  `arch-explore` → `arch-design` → `arch-validate` 管设计，`sequential-workflow` 管端到端实现
+  （所有代码修改经 subagent 派发），`diagnose` 管疑难 bug。**产物落点与本仓库目录一致**
+  （`docs/arch/` / `design-plans/` / `exec-plans/` / `reports/` / `design-final/`），不另建结构。
+  skill 正文里的 `EnterPlanMode` / Explore agent 是上游术语，本 runtime 无 plan mode ——
+  等价做法与任务选型见 [`CONTRIBUTING.md`](CONTRIBUTING.md)「用本项目自己开发」。
 - **文档、注释、讨论、commit message、PR 描述用中文**；代码标识符用英文（技术术语/专名可夹英文）
 - **注释只写当前设计 —— 不写历史，也不写竞品**：
   - **要写**：这段代码**现在**的行为契约、不变量、约束；以及**属于本设计自身**的取舍理由（依赖方向、性能、安全、数据格式）。用现在时或条件句（「若 X 则 Y」）。

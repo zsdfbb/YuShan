@@ -382,6 +382,13 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 > 补一行「已请求压缩，将在下一轮边界执行…」。理由：`request_rx` 只在回合之间被消费，
 > 回合中投 `Request` 要等整个回合跑完（实测 7 分钟）。见 ADR-0052。
 >
+> **开始 / 结束两行提示**（两条路径都有）：`/compact` 会先给一行「Compacting context (~N tokens)…」，
+> 压完再给「Compacted: ~N → ~M tokens (… summarized, … kept)」。开始行必须在压缩那次 `await`
+> **之前**落地 —— 摘要是一次独立模型调用（实测数十秒），`capabilities::compact` 中途没有出站口，
+> 攒到最后一起发就等于压缩全程冻屏。压不了（无 model / 无事可压）时**只给一行**收场提示：
+> 判定与文案在 `capabilities::compact_opening`（`CompactOpening`），与 `compact` 共用同一个
+> `plan()` ⇒ 不会出现「先打了正在压缩、再说无事可压」。
+>
 > **降级语义**：`/compact` **已接真压缩**（`capabilities::compact` → `ys_loop::plan` + `execute`：
 > 摘要成一条 checkpoint、尾部原样保留）；四条路径里**三条失败（无 model / 无事可压 / 摘要失败）
 > 都不碰 session 一个字节**，各给一行明确提示 —— 靠「什么都不做」而非「清空」降级。`/copy` 无剪贴板；

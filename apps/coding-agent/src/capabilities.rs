@@ -353,6 +353,87 @@ pub async fn new_session(wiring: &mut Wiring) -> Vec<String> {
     }
 }
 
+/// 「没有 model」的唯一提示文案。
+///
+/// 单点定义：`compact_blockers` 与 [`compact`] 的防御分支都取这一行。两条路各写一遍
+/// 文案，改一处忘另一处就会让用户看到两种说法的同一件事。
+fn no_model_lines() -> Vec<String> {
+    vec!["Cannot compact: no model configured. Use /login.".to_string()]
+}
+
+/// 「现在不能 / 不必压」的**唯一判定处**：`Some(lines)` = 一行收场提示。
+///
+/// 两个调用方（[`compact_opening`] 与 [`compact`]）共用它 —— 分开写两份判定迟早会漂移，
+/// 而漂移的表现正是「先打了『正在压缩』，然后告诉你无事可压」。
+///
+/// `configured` 由调用方从**自己的借用形态**取（[`Wiring::is_configured`] 或
+/// `ports.model.is_some()`）：判定本身不该为了拿这个布尔值多借一次接线器。
+fn compact_blockers(
+    configured: bool,
+    messages: &[Message],
+    policy: &ys_component::CompactPolicy,
+    window: usize,
+) -> Option<Vec<String>> {
+    // 无 model ⇒ 明确提示并收手。**绝不**退回 `clear_session`：那会把「压不了」
+    // 变成「历史没了」。
+    if !configured {
+        return Some(no_model_lines());
+    }
+    // `plan()` 是纯同步函数、**不碰 model**：消息太少（`len < 2`）或结构上无法
+    // 同时保证「摘要段非空 + 保留段非空」时返回 `None`。
+    if ys_loop::plan(messages, policy, window).is_none() {
+        return Some(vec!["Nothing to compact.".to_string()]);
+    }
+    None
+}
+
+/// 每轮固定开销（system prompt + 工具表 spec）叠进会话估算。
+///
+/// `CompactOutcome::estimated_tokens_*` 就是这个口径（见 `ys_loop::compact::execute`）
+/// ⇒ 开始行与收场行报的是**同一个数**的前后两端，不会出现「开始 12k、结束却说 5k 起」。
+fn estimated_occupancy(messages: &[Message], fixed_prompt_tokens: usize) -> usize {
+    ys_loop::token::estimate_session_tokens(messages) + fixed_prompt_tokens
+}
+
+/// `/compact` 的**开场判定**：这一敲下去会不会真压。
+///
+/// 单独成函数的理由是时序：**开始提示必须早于真正开压**。摘要是一次独立模型调用
+/// （实测数十秒），而 [`compact`] 一进去就 `await`、中途没有任何出站口 —— 用户在那段
+/// 时间里只看得到一个不动的屏。
+///
+/// 判定与文案都在这里算好，[`compact`] 复用同一份判定（`compact_blockers`）⇒
+/// 不会出现「打了『正在压缩』，然后告诉你无事可压」。
+#[derive(Debug)]
+pub enum CompactOpening {
+    /// 现在不会压：`lines` 就是**唯一**输出（与收场行是同一行，不再有开始行）。
+    Blocked(Vec<String>),
+    /// 会压：先把 `line` 打给用户（开始提示），再等 [`compact`] 的收场行。
+    Start(String),
+}
+
+/// 见 [`CompactOpening`]。
+///
+/// 入参与 [`compact`] 逐项对应（`policy` / `window` / `fixed_prompt_tokens`），且都取自
+/// **同一个** `config` 与 `agent` —— 两处口径分叉会让开始行的数字与收场行对不上。
+///
+/// `plan()` 会被算两次（这里一次、[`compact`] 里一次）：它是**纯同步**的线性扫描，
+/// 代价可忽略；反倒是不共享计划能让两个函数各自独立成立（`compact` 仍是自足的）。
+pub fn compact_opening(
+    wiring: &Wiring,
+    policy: &ys_component::CompactPolicy,
+    window: usize,
+    fixed_prompt_tokens: usize,
+) -> CompactOpening {
+    let messages = wiring.session_messages();
+    if let Some(lines) = compact_blockers(wiring.is_configured(), messages, policy, window) {
+        return CompactOpening::Blocked(lines);
+    }
+    CompactOpening::Start(format!(
+        "Compacting context (~{} tokens)…",
+        estimated_occupancy(messages, fixed_prompt_tokens)
+    ))
+}
+
 /// `/compact`：真压缩 —— 把手里的旧消息摘要成一条 checkpoint，尾部原样保留。
 ///
 /// # 为什么不是「清空会话」
@@ -385,15 +466,18 @@ pub async fn compact(
     // （分开借会被借用检查器拦下 —— model 的不可变借用压着 session 的可变借用）。
     let ports = wiring.ports();
     let Some(model) = ports.model else {
-        // 无 model ⇒ 明确提示并收手。**绝不**退回 `clear_session`：
-        // 那会把「压不了」变成「历史没了」。
-        return vec!["Cannot compact: no model configured. Use /login.".to_string()];
+        return no_model_lines();
     };
 
-    // `plan()` 是纯同步函数、**不碰 model**：消息太少（`len < 2`）或结构上无法
-    // 同时保证「摘要段非空 + 保留段非空」时返回 `None`。
+    // 早退判定与 [`compact_opening`] **同一份实现**：开始行说的是「会压」，这里必须
+    // 给出同一个结论。
     let messages = ports.session.messages();
+    if let Some(lines) = compact_blockers(true, messages, policy, window) {
+        return lines;
+    }
     let Some(plan) = ys_loop::plan(messages, policy, window) else {
+        // 不可达：上面的 `compact_blockers` 已用同一个 `plan()` 判过 `None`。
+        // 保留一行而不是 `unwrap`（会话可能在两者之间被换掉）。
         return vec!["Nothing to compact.".to_string()];
     };
 
@@ -1312,6 +1396,84 @@ mod tests {
         let reopened = JsonlSession::open(&new).await.unwrap();
         assert_eq!(reopened.messages().len(), 1, "新文件只含新会话内容");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **开场判定 —— 会压时给一行带估算值的开始行**。
+    ///
+    /// 估算口径必须与 [`compact`] 的收场行**同源**（含 `fixed_prompt_tokens`），
+    /// 否则用户会看到「开始 ~1200、结束却说压前 1000」。
+    ///
+    /// 变异：把 `compact_opening` 的求和写成只数会话消息（不加 `fixed`）⇒ 数字断言变红。
+    #[tokio::test]
+    async fn test_compact_opening_reports_estimated_occupancy() {
+        let dir = temp_dir("compact_opening_start");
+        let model = MockModel::new("mock");
+        let mut wiring = Wiring::persistent_new(
+            Some(Box::new(model)),
+            Box::new(CollectingSink::new()),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+        seed(&mut wiring, 6, 100).await;
+
+        let policy = ys_component::CompactPolicy::default();
+        let fixed = 777;
+        let expected = ys_loop::token::estimate_session_tokens(wiring.session_messages()) + fixed;
+        match compact_opening(&wiring, &policy, 3000, fixed) {
+            CompactOpening::Start(line) => {
+                assert_eq!(line, format!("Compacting context (~{expected} tokens)…"));
+            }
+            other => panic!("应判定为会压：{other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **开场判定 —— 压不了的两种情形各给一行收场提示，且**不**说「正在压缩」**。
+    ///
+    /// 它们与 [`compact`] 的早退是**同一份判定**（`compact_blockers`）⇒ 开始行与收场行
+    /// 不可能对同一现场给出相反结论。
+    ///
+    /// 变异：删掉 `compact_opening` 里的 `compact_blockers` 调用（恒返回 `Start`）
+    /// ⇒ 两条断言均变红。
+    #[tokio::test]
+    async fn test_compact_opening_blocks_with_a_single_line() {
+        let policy = ys_component::CompactPolicy::default();
+
+        // ① 无 model。
+        let dir = temp_dir("compact_opening_no_model");
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        seed(&mut wiring, 6, 100).await;
+        match compact_opening(&wiring, &policy, 3000, 0) {
+            CompactOpening::Blocked(lines) => {
+                assert_eq!(lines.len(), 1, "只给一行：{lines:?}");
+                assert!(lines[0].contains("no model configured"), "{lines:?}");
+            }
+            other => panic!("无 model 时必须拦下：{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ② 消息太少（`plan()` 返回 `None`）。
+        let dir = temp_dir("compact_opening_too_few");
+        let model = MockModel::new("mock"); // 队列为空：被调用即 panic
+        let mut wiring = Wiring::persistent_new(
+            Some(Box::new(model)),
+            Box::new(CollectingSink::new()),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+        seed(&mut wiring, 1, 100).await;
+        match compact_opening(&wiring, &policy, 3000, 0) {
+            CompactOpening::Blocked(lines) => {
+                assert_eq!(lines, vec!["Nothing to compact.".to_string()]);
+            }
+            other => panic!("无事可压时必须拦下：{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

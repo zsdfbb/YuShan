@@ -29,8 +29,8 @@ crates/ys-session/src/jsonl.rs       JsonlSession 覆写 replace_all（赋值一
 apps/coding-agent/src/provider.rs    KNOWN_MODEL_WINDOWS 内置表 + builtin_context_window()
 apps/coding-agent/src/config.rs      三级窗口解析 context_window() + compact_policy() + load_user_config()
 apps/coding-agent/src/main.rs        读 config.json → 算启动初值 limits → build_agent(..).limits(limits)
-apps/coding-agent/src/app_loop.rs    Prompt 臂开头 set_context_window；Compact 臂 → capabilities::compact
-apps/coding-agent/src/capabilities.rs /compact 真压缩（无 model / 无事可压 / 成功 / 失败，四路径）
+apps/coding-agent/src/app_loop.rs    Prompt 臂开头 set_context_window；Compact 臂 → compact_opening 先发开始行，再 capabilities::compact
+apps/coding-agent/src/capabilities.rs /compact 真压缩（无 model / 无事可压 / 成功 / 失败，四路径）+ compact_opening（开场判定）
 apps/coding-agent/src/wiring.rs      clear_session 已删（见「偏离」）
 crates/ys-tui-coding/src/app.rs      ContextCompacted → System 行；Failed → Error 行（**不** finish_turn）
 crates/ys-runtime/src/agent.rs       Agent::context_window() / set_context_window()（limits 最小暴露面）
@@ -123,6 +123,25 @@ trigger_at(w)  = min( floor(w*trigger_ratio), w - effective_reserve ).max(keep +
 不影响 `-p` / `--json` 的消费循环退出条件。**手动 `/compact` 不发事件**（`Request::Compact` 臂不在 `select!` 里，
 emit 的事件会躺在 `sink_rx` 直到下个 `Prompt` 才转发 → 顺序错乱），改走 `Outbound::Output`，但**底层是同一份 `CompactOutcome`**。
 
+**手动路径给「开始 + 结束」两行提示，开始行先于压缩那次 `await` 落地**：
+
+```
+Compacting context (~N tokens)…              ← 压缩前发，绝不等摘要回来
+Compacted: ~N → ~M tokens (S summarized, K kept).
+```
+
+- **为什么开始行不能攒到最后**：摘要是一次独立模型调用（实测数十秒），`capabilities::compact`
+  一进去就 `await`、中途**没有任何出站口** ⇒ 两条一起发等于压缩全程冻屏，
+  与 ADR-0052 修掉的「敲了没反应」同一种观感。
+- **数字同口径**：开始行的 `N` 与 `execute` 的 `estimated_tokens_before` 用同一个式子
+  （`estimate_session_tokens(messages) + fixed_prompt_tokens`，见 `capabilities::estimated_occupancy`）
+  ⇒ 前后两端不会出现「开始 12k、结束说压前 5k」。
+- **压不了就不打开始行**：无 model / 无事可压的判定与文案集中在 `capabilities::compact_blockers`，
+  `compact_opening` 与 `compact` **共用**它（`plan()` 因此算两次；纯同步线性扫描，代价可忽）。
+  这在结构上排除「先说正在压缩、再说无事可压」——后者只有一行收场提示。
+- **自动路径仍只有收场事件**（不发 `Started`，理由见上）；两行提示是**手动命令**的行为，
+  与事件语义无关：`-p` / `--json` 逐字节不变。
+
 ## 与设计的偏离
 
 1. **`CompactError::NoModel` 未实现** —— `RuntimeContext.model` 本就非 `Optional`（`&dyn Model`），
@@ -207,6 +226,10 @@ emit 的事件会躺在 `sink_rx` 直到下个 `Prompt` 才转发 → 顺序错�
 - `crates/ys-session/src/{lib,jsonl}.rs`：`replace_all` 默认实现语义、`JsonlSession` 恰好一次落盘、空 vec 截断文件
 - `apps/coding-agent/src/{config,provider,main,capabilities,app_loop}.rs`：三级解析优先级与非法条目丢弃、
   内置表、`build_agent` 挂 limits 回归、`/compact` 四路径、`prompt_refreshes_context_window_each_turn`
+- `apps/coding-agent/src/{capabilities,app_loop}.rs`：**开始 / 结束两行提示** ——
+  开场判定的估算口径（含固定开销）、无 model / 无事可压时**只有一行**、
+  以及 `app_loop` 的出站序列「开始行 → 收场行」/「只有收场提示」。
+  变异（均已验证变红）：删开始行、无条件先发开始行、开始行漏算固定开销、开场判定不拦无 model。
 - ⚠️ **承重耦合**：`app_loop::every_request_variant_is_handled` 会走到 Step 4b，它安全**只因为**会话太小
   ⇒ 阈值不满足 / `plan()` 返回 `None` ⇒ `MockModel` 空队列不被消费（`remove(0)` 会 panic）。
   **护栏叠加三道**（阈值 / `len < 2` 的 `None` / `execute` 拒绝空区间），任意让压缩可能无条件调用 model 的改动都会打破它。

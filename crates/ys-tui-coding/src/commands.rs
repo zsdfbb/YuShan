@@ -123,7 +123,9 @@ static COMMANDS: [CommandSpec; 16] = [
     },
     CommandSpec {
         name: "compact",
-        description: "压缩上下文（回合中则在下一轮边界执行）",
+        // 文案不提「回合中则在下一轮边界执行」：那是投递路径的实现细节（ADR-0052），
+        // 用户在 `/help` 里要的是「这条命令干什么、会看到什么」。
+        description: "压缩上下文；先提示再报告前后估算",
         arg_hint: None,
     },
     CommandSpec {

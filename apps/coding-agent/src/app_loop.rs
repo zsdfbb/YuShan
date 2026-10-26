@@ -28,7 +28,9 @@
 //!       }
 //!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
 //!     SetTheme{theme} => { theme = parse(theme); 落盘 state.json }  // 进程级镜像 + Output
-//!     SetEffort/SetModel/Login/Logout/NewSession/Compact/Export => { 能力函数 → Output }
+//!     SetEffort/SetModel/Login/Logout/NewSession/Export => { 能力函数 → Output }
+//!     // Compact 是唯一先发一条的：开始行必须在压缩那次 `await` **之前**落地
+//!     Compact => { opening → Output(“Compacting…”); lines = compact(..) }
 //!     ListSessions/ResumeSession => { 会话列表 / 原子恢复 → SessionList/SessionResumed }
 //!   }
 //!   emit_view();                     // 每个请求处理完刷一次快照
@@ -66,7 +68,7 @@ use ys_runtime::{Agent, AgentPorts};
 use ys_tools_basic::{BackgroundTasks, render_completion};
 use ys_tui_coding::{CodingView, ThemeKind};
 
-use crate::capabilities;
+use crate::capabilities::{self, CompactOpening};
 use crate::config::Config;
 use crate::debug_log::{ArgsMode, DebugSink};
 use crate::logging;
@@ -742,14 +744,36 @@ pub async fn run(
                 let fixed = agent.fixed_prompt_tokens();
                 // 活对话的 system（同理取自 agent）⇒ 摘要请求复用前缀、命中 KV cache。
                 let live_system = agent.system_prompt().map(str::to_string);
-                lines = capabilities::compact(
-                    &mut wiring,
-                    &policy,
-                    config.context_window(),
-                    fixed,
-                    live_system.as_deref(),
-                )
-                .await;
+                let window = config.context_window();
+
+                // **开始提示必须先于这次 `await` 落地**：摘要是一次独立模型调用
+                // （实测数十秒），`capabilities::compact` 一进去就 await、中途没有任何
+                // 出站口。攒到 `lines` 里与收场行一起发，就等于在压缩全程把屏幕冻住。
+                //
+                // 压不了的两种情形（无 model / 无事可压）**不得**先打「正在压缩」：
+                // 判定与文案全在 `compact_opening` 里，与 `compact` 用同一份 `plan()`。
+                // （第三种「摘要失败」要到模型调用回来才知道，只能由收场行报。）
+                match capabilities::compact_opening(&wiring, &policy, window, fixed) {
+                    CompactOpening::Blocked(blocked) => lines = blocked,
+                    CompactOpening::Start(opening) => {
+                        send_or_flush(
+                            &out_tx,
+                            Outbound::Output(opening),
+                            &mut debug,
+                            &stats,
+                            run_rounds,
+                        )
+                        .await?;
+                        lines = capabilities::compact(
+                            &mut wiring,
+                            &policy,
+                            window,
+                            fixed,
+                            live_system.as_deref(),
+                        )
+                        .await;
+                    }
+                }
             }
 
             Request::Export { path } => {
@@ -3158,10 +3182,10 @@ mod tests {
         );
     }
 
-    /// 6. **`Request` 变体覆盖**：11 个变体中本用例发 9 个（`Prompt` + 7 个能力 +
-    ///    `SetThinking`；`ListSessions` / `ResumeSession` 需额外前置条件，另有用例），
-    ///    app 循环都必须处理并给出出站消息、不得 panic（`Prompt` → 事件；
-    ///    7 个能力 → `Output` + `View`；`SetThinking` → 仅 `View`）。
+    /// 6. **`Request` 变体覆盖**：11 个变体中本用例发 9 个（`Prompt` + 6 个能力 +
+    ///    `SetThinking`；`ListSessions` / `ResumeSession` 需额外前置条件，`Compact`
+    ///    产出两条输出 —— 二者各另有用例），app 循环都必须处理并给出出站消息、不得
+    ///    panic（`Prompt` → 事件；6 个能力 → `Output` + `View`；`SetThinking` → 仅 `View`）。
     #[tokio::test]
     async fn every_request_variant_is_handled() {
         let model = MockModel::new("mock");
@@ -3193,9 +3217,10 @@ mod tests {
                 path: Some(export_path.clone()),
             },
             Request::NewSession,
-            Request::Compact,
+            // ⚠️ `Compact` **不在**这个表里：它是唯一会产出**两条** `Output` 的变体
+            // （开始行在压缩那次 `await` 之前落地，见它的专门用例）。
         ];
-        assert_eq!(cases.len(), 7, "7 个有输出的能力变体");
+        assert_eq!(cases.len(), 6, "6 个恰好输出一条 Output 的能力变体");
 
         // `Prompt` 先跑：会话有内容，`/export` 才有东西可导。
         h.requests.send(prompt("hello")).await.unwrap();
@@ -3231,6 +3256,86 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let _ = take_view(&mut msgs);
         assert!(msgs.is_empty(), "SetThinking 不应产出 Output：{msgs:?}");
+    }
+
+    /// **空闲 `/compact` 产出两条 `Output`：先「正在压缩」，再收场行。**
+    ///
+    /// 时序是承重的：摘要是一次独立模型调用（可能数十秒），而 `capabilities::compact`
+    /// 一进去就 `await`、中途没有出站口。若两条一起攒到最后发，用户在压缩全程看到的
+    /// 是一个冻住的屏 —— 与 ADR-0052 修掉的「敲了没反应」同一种观感。
+    ///
+    /// 构造：一条**大**用户消息（≈50k 估算 token）让 `plan()` 切出非空摘要段。
+    ///
+    /// 变异：把开始行改成与 `lines` 一起发（或删掉它）⇒ 本用例的出站序列断言变红。
+    #[tokio::test]
+    async fn compact_emits_an_opening_line_before_the_result() {
+        let model = MockModel::new("mock");
+        model.push_text("hi");
+        // 摘要调用消费这一条（顺序固定：先回合，再压缩）。
+        model.push_text("HANDOFF SUMMARY");
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        // 200k 个 ASCII 字符 ⇒ ≈50k 估算 token ⇒ 必超出保留预算（窗口的 10%），
+        // 且远低于自动触发点（85%）⇒ 本回合不会被自动压缩干扰。
+        h.requests.send(prompt(&"a".repeat(200_000))).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        h.requests.send(Request::Compact).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        assert_eq!(msgs.len(), 2, "开始行 + 收场行，恰好两条：{msgs:?}");
+        match &msgs[0] {
+            Outbound::Output(line) => {
+                assert!(
+                    line.starts_with("Compacting context (~"),
+                    "第一条必须是开始行：{line}"
+                );
+                assert!(
+                    line.contains('~'),
+                    "估算值必须带 ~ 前缀，不得暗示精确：{line}"
+                );
+            }
+            other => panic!("第一条应为开始行：{other:?}"),
+        }
+        match &msgs[1] {
+            Outbound::Output(line) => {
+                assert!(
+                    line.starts_with("Compacted: ~"),
+                    "第二条必须是收场行：{line}"
+                );
+            }
+            other => panic!("第二条应为收场行：{other:?}"),
+        }
+    }
+
+    /// **压不了时不打开始行** —— 只有一行收场提示。
+    ///
+    /// 否则用户会看到「正在压缩…」紧跟「Nothing to compact.」这种自相矛盾的输出。
+    ///
+    /// 构造：新会话**一条消息都没有** ⇒ `plan()` 返回 `None`（`len < 2`）。
+    /// 注意不能用「先跑一个小回合」来造 —— 两三条消息的会话**能**切出合法的
+    /// 摘要/保留两段，`plan()` 会 `Some`，那时就真去调模型了。
+    ///
+    /// 变异：让 `app_loop` 无条件先发开始行（不认 `CompactOpening::Blocked`）
+    /// ⇒ 出站序列变成两条 ⇒ 变红。
+    #[tokio::test]
+    async fn compact_that_cannot_run_emits_no_opening_line() {
+        // 模型队列**空着**：若真去压，`MockModel` 的 `remove(0)` 会 panic。
+        let mut h = spawn_app_loop(Box::new(MockModel::new("mock")), true, Vec::new()).await;
+
+        h.requests.send(Request::Compact).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let _ = take_view(&mut msgs);
+
+        assert_eq!(msgs.len(), 1, "压不了时只应有收场提示：{msgs:?}");
+        match &msgs[0] {
+            Outbound::Output(line) => {
+                assert!(line.starts_with("Nothing to compact."), "{line}");
+                assert!(!line.contains("Compacting"), "不得先说「正在压缩」：{line}");
+            }
+            other => panic!("应为收场提示：{other:?}"),
+        }
     }
 
     /// **`/login` 的种子回落**：端点拿不到目录时，登录仍能定出模型与候选。

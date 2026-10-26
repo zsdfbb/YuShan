@@ -58,9 +58,14 @@ $ ys-coding-agent --json --stats "..." 2>stats.log  # 背压统计单独进 stde
 首次启动没有凭证也能进界面，状态行会显示未配置模型。在 TUI 里：
 
 ```
-/login     选 provider（deepseek / minimax 已内置端点；其它填自定义 base URL）→ 填 API key
+/login     选 provider（deepseek / minimax / opencode-go / glm / glm-coding 有内置端点；
+           custom 这类没内置 base 的会再问一句 URL）→ 填 API key
 /model     无参开浮层选模型；也可 /model <name> 直接点名
 ```
+
+`glm`（标准 API）与 `glm-coding`（Coding Plan 专属端点）是**两个独立 provider**：
+端点不同、API key **不通用**，各登各的。两者都没有模型列表接口，模型名来自内置种子
+（`glm-5.3` / `glm-5.3-flash`），登录过程不发网络请求。
 
 凭证写入 `~/.yushan/auth.json`（Unix 上权限收紧），**之后启动自动加载**。
 `/logout` 清除。
@@ -73,6 +78,19 @@ $ export YUSHAN_API_KEY=sk-...
 $ export YUSHAN_MODEL=deepseek-chat
 $ ./target/release/ys-coding-agent -p "你好"
 ```
+
+同样形态换成 GLM 标准 API（编码套餐把 base 换成
+`https://open.bigmodel.cn/api/coding/paas/v4`）：
+
+```console
+$ export YUSHAN_API_BASE=https://open.bigmodel.cn/api/paas/v4
+$ export YUSHAN_API_KEY=sk-...
+$ export YUSHAN_MODEL=glm-5.3
+$ ./target/release/ys-coding-agent -p "你好"
+```
+
+注意：env 直连没有 provider 名（`provider` 恒为 `None`）⇒ 不走该家的方言，思考档位
+`YUSHAN_REASONING_EFFORT` **不会**随请求发送、思考内容也不解析。需要这些时用 `/login`。
 
 拉不到模型列表（目录接口失败）不会卡住：agent 降级启动，用已保存的 provider / model，
 必要时提示你用 `/model <provider>/<name>` 点名。
@@ -199,7 +217,7 @@ $ ys-coding-agent worktree remove feat-a          # 删树（分支保留）
 | 变量 | 作用 |
 |---|---|
 | `YUSHAN_API_BASE` / `YUSHAN_API_KEY` / `YUSHAN_MODEL` | 模型端点 / 凭证 / 模型名 |
-| `YUSHAN_REASONING_EFFORT` | 思考档位 `minimal`…`max`，默认 `high`；仅 provider 声明支持时随请求发送 |
+| `YUSHAN_REASONING_EFFORT` | 思考档位 `minimal`…`max`，默认 `high`；经 provider 级 + 模型级两层门控后才随请求发送（GLM 还会折叠到该代际接受的档位） |
 | `YUSHAN_CHANNEL_CAPACITY` | 事件信道容量，默认 1024，下限 16（低于下限会 clamp 并在 stderr 警告） |
 | `YUSHAN_SESSIONS_DIR` | 会话目录覆盖（默认 `~/.yushan/sessions`） |
 | `YUSHAN_LOG_DIR` | 结构化日志目录覆盖（默认 `~/.yushan/logs`） |

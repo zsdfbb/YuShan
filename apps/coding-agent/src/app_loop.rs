@@ -70,7 +70,7 @@ use crate::capabilities;
 use crate::config::Config;
 use crate::debug_log::{ArgsMode, DebugSink};
 use crate::logging;
-use crate::provider::{FetchModelsResult, ModelCache, ProviderRegistry};
+use crate::provider::{ApiModel, FetchModelsResult, ModelCache, ProviderRegistry};
 use crate::state::StateStore;
 use crate::status::TurnStats;
 use crate::view::build_view;
@@ -611,11 +611,19 @@ pub async fn run(
                 api_key,
                 api_base,
             } => {
-                // 起始模型只能从端点来：先按 `/login` 的同一规则定出 base，再拉它的
-                // `/v1/models`，把目录交给 `capabilities::login` 定模型。
+                // 起始模型只能从目录来：先按 `/login` 的同一规则定出 base，再把该
+                // provider 的目录交给 `capabilities::login` 定模型。
                 //
-                // 这是用户显式动作 ⇒ 这次网络值得等（`fetch_models` 自带 5s 超时）；
-                // 拉到的目录同时进 registry 缓存，`/model` 候选与窗口查询立刻可用。
+                // 目录的**第一手来源是端点本身**（`fetch_models`，自带 5s 超时）：这是用户
+                // 显式动作 ⇒ 这次网络值得等；拉取期间 Esc 可取消（命令不过 `BasicLoop`，
+                // 没人读 `Boundary`，不在这里 `select!` 一个取消口就只剩 Ctrl-C 关进程）。
+                //
+                // 拉不到（超时 / 401 / 空目录 / 该端点无此接口，如编码套餐端点实测 404）时
+                // **回落到内置种子**（[`ProviderRegistry::seed_catalog`]）—— 种子是模型名的
+                // 兜底来源，不是主来源。
+                //
+                // 两条路径的收尾一致：目录进 registry 缓存，`/model` 候选与窗口查询立刻可用
+                // （种子在构造时已预热一份，但用户可能给了一个**别的** base，那条键要靠这里补上）。
                 match capabilities::resolve_login_base(&config, &provider, api_base.as_deref()) {
                     Err(msg) => lines = msg,
                     Ok(base) => {
@@ -633,7 +641,7 @@ pub async fn run(
                                 lines = vec!["Login cancelled. Nothing was changed.".to_string()];
                             }
                             Some(fetched) => {
-                                let catalog = match fetched {
+                                let mut catalog = match fetched {
                                     FetchModelsResult::Success(models) if !models.is_empty() => {
                                         Some(models)
                                     }
@@ -650,6 +658,21 @@ pub async fn run(
                                         None
                                     }
                                 };
+                                // 目录拉不到时**回落到内置种子**：编码套餐端点的
+                                // `/v1/models` 实测 404，而种子在那里是唯一可用的模型名来源。
+                                // 种子已经在 `model_cache` 里（构造时预热），故不需要再写一次。
+                                if catalog.is_none() {
+                                    catalog = config.registry.seed_catalog(&provider).map(|seed| {
+                                        seed.iter()
+                                            .map(|(id, window)| ApiModel {
+                                                id: (*id).to_string(),
+                                                owned_by: None,
+                                                name: None,
+                                                context_window: Some(*window),
+                                            })
+                                            .collect()
+                                    });
+                                }
                                 lines = capabilities::login(
                                     &mut config,
                                     &mut wiring,
@@ -1062,10 +1085,13 @@ struct ModelSnapshot {
     effort: Option<String>,
 }
 
-/// 读当前的 provider / model / **实际生效**的思考档位。
+/// 读当前的 provider / model / **生效**的思考档位，供「变没变」的比较。
 ///
-/// 用 [`Config::effective_reasoning_effort`]（而非 `reasoning_effort`）——
-/// 请求里发的是**生效值**（`/effort` 覆盖优先），记配置默认值会与实际请求不符。
+/// 取 [`Config::effective_reasoning_effort`]（会话覆盖优先）而不是配置默认值：
+/// `/effort` 改了档位也是一次变化，只记配置默认值会让它看不出来。
+///
+/// 这里存的是**原始档位**而非 wire 值：比较关心「用户想要的档位变了没有」，
+/// 与该 provider / 模型代际实际发不发得出去无关（wire 值见 [`record_model_change`]）。
 fn model_snapshot(config: &Config) -> ModelSnapshot {
     ModelSnapshot {
         provider: config.provider.clone(),
@@ -1083,7 +1109,8 @@ fn model_snapshot(config: &Config) -> ModelSnapshot {
 /// **不重发 `run_start`**：那是 **run 级**事件（`run` 序号 + `begin_run`），
 /// 重发会破坏 run 的划分与 `run_end` 的配对 ⇒ 另起一个事件类型。
 ///
-/// 载荷取**前后两份快照** + **实际下发的 effort**（`None` = provider 不支持该字段）。
+/// 载荷取**前后两份快照** + **实际下发的 effort**（`None` = provider 或该模型代际
+/// 不接受该字段 ⇒ 请求里不带）。
 fn record_model_change(
     debug: &mut Option<DebugSink>,
     session_id: &str,
@@ -1105,14 +1132,20 @@ fn record_model_change(
     fields.insert("from_model".into(), serde_json::json!(before.model));
     fields.insert("to_provider".into(), serde_json::json!(after.provider));
     fields.insert("to_model".into(), serde_json::json!(after.model));
-    // **实际下发的 effort**（`None` = 该 provider 不接受该字段 ⇒ 请求里不带）。
+    // **实际下发的 effort**（门控 + 折叠之后；`None` = 请求里不带该字段）。
+    //
+    // 记 wire 值而不是原始配置值：GLM 的 `xhigh` 实际发 `max`，id 解析不出代际的模型则完全不发 ——
+    // 原始值会让排障得出与真实请求相反的结论。
+    //
+    // 只有这一个字段：能力位（provider 级还是模型级、认不认该字段）已被它的
+    // `null` / 非 `null` 完全表达，另记一个能力位会与 wire 值互相矛盾
+    // （无法解析代际的模型上「provider 支持=true」+「effort=null」）。
     fields.insert(
         "reasoning_effort".into(),
-        serde_json::json!(config.effective_reasoning_effort()),
-    );
-    fields.insert(
-        "supports_reasoning_effort".into(),
-        serde_json::json!(config.supports_reasoning_effort()),
+        serde_json::json!(config.current_compat().effort_for(
+            &config.model,
+            config.effective_reasoning_effort().as_deref()
+        )),
     );
     crate::debug_record(sink, session_id, "model_changed", None, None, fields);
 }
@@ -1699,6 +1732,29 @@ mod tests {
             persistent,
             prefilled,
             |_, _| {},
+            |b| b,
+            |_| None,
+            None,
+            true,
+            true,
+            false,
+        )
+        .await
+    }
+
+    /// 同 [`spawn_app_loop_debug`]，但允许在起跑前改写 [`Config`]（第二个参数是
+    /// 临时目录）—— 供「启动态就已登录某个 provider / 某个模型代际」的用例把
+    /// 现场摆好，而不是绕道 `Request::Login`（那会触发真实网络与目录拉取）。
+    async fn spawn_app_loop_debug_with(
+        model: Box<dyn Model>,
+        persistent: bool,
+        tweak: impl FnOnce(&mut Config, &PathBuf),
+    ) -> Harness {
+        spawn_app_loop_full(
+            model,
+            persistent,
+            Vec::new(),
+            tweak,
             |b| b,
             |_| None,
             None,
@@ -2466,9 +2522,9 @@ mod tests {
         let mut found = false;
         for _ in 0..100 {
             for (_path, records) in debug_files(&logs.0) {
-                if records
+                if let Some(record) = records
                     .iter()
-                    .any(|r| r.get("ev").and_then(|e| e.as_str()) == Some("model_changed"))
+                    .find(|r| r.get("ev").and_then(|e| e.as_str()) == Some("model_changed"))
                 {
                     found = true;
                     // 载荷必须带**前后**两份快照 + 实际下发的 effort。
@@ -2479,6 +2535,12 @@ mod tests {
                         raw.contains("reasoning_effort"),
                         "缺 reasoning_effort（实际下发值）"
                     );
+                    // 能力位已由 `reasoning_effort` 的 `null` / 非 `null` 表达；
+                    // 另记一个 provider 级能力位会与 wire 值互相矛盾。
+                    assert!(
+                        record.get("supports_reasoning_effort").is_none(),
+                        "不应再记录 provider 级能力位：{record}"
+                    );
                     break;
                 }
             }
@@ -2488,6 +2550,126 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(found, "换模型后应有 model_changed 事件；目录：{:?}", logs.0);
+    }
+
+    /// 跑一次「换到 `provider` / `model`」，返回该次 `model_changed` 里的
+    /// `reasoning_effort` 字段（`null` = 请求里不带该字段）。
+    ///
+    /// 启动态由 `tweak` 把 **provider + 档位**摆好、模型名留成占位值，再靠
+    /// `SetModel` 只改模型 ⇒ 恰好触发一条 `model_changed`（`/effort` 与 `/model`
+    /// 走同一 `record_model_change`），且不依赖开发机的 `YUSHAN_REASONING_EFFORT`。
+    ///
+    /// 每个 case 用**独立日志目录**：无会话文件时 debug 名是
+    /// `debug-<pid>-<ms>.jsonl`，同进程内多 case 共目录会互相串。
+    async fn model_changed_wire_effort(
+        tag: &str,
+        provider: &str,
+        model: &str,
+        effort: ys_core::EffortLevel,
+    ) -> serde_json::Value {
+        let logs = TempDir::new(tag);
+        // `DebugEnv` 整段持有 `env_lock`：必须在本次调用内 drop，不能跨 case 持有。
+        let _env = DebugEnv::set(&logs.0);
+
+        let mock = MockModel::new("mock");
+        let mut h = spawn_app_loop_debug_with(Box::new(mock), false, |config, _tmp| {
+            config.provider = Some(provider.to_string());
+            config.effort = Some(effort);
+            config.model = "before-switch".to_string();
+        })
+        .await;
+
+        // `provider` 与启动态相同 ⇒ `set_model` 不走换 provider 的凭证分支，
+        // 不触发任何网络；只有模型名变化。
+        h.requests
+            .send(Request::SetModel {
+                model: model.to_string(),
+                provider: Some(provider.to_string()),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+        shutdown(h).await;
+
+        for _ in 0..100 {
+            for (_path, records) in debug_files(&logs.0) {
+                if let Some(record) = records
+                    .iter()
+                    .find(|r| r.get("ev").and_then(|e| e.as_str()) == Some("model_changed"))
+                {
+                    return record["reasoning_effort"].clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("换模型后应有 model_changed 事件；目录：{:?}", logs.0);
+    }
+
+    /// `model_changed.reasoning_effort` 记的是 **wire 值**（`None` = 请求里不带该字段）。
+    ///
+    /// 承重的是「日志与真实请求一致」：记原始配置值会让排障得出相反结论 ——
+    /// GLM 的 `xhigh` 在 5.3 上实际发 `max`，在 5.2 上同样是 `max`，更早代际原样发 `xhigh`，
+    /// 而 id 解析不出代际的模型则完全不发。
+    ///
+    /// 变异：把 `effort_for(&config.model, ...)` 换回
+    /// `config.effective_reasoning_effort()` ⇒ 第一条断言拿到 `"xhigh"` 而非
+    /// `"max"`、第三条拿到 `"xhigh"` 而非 `null` ⇒ 变红。
+    #[tokio::test]
+    async fn model_changed_records_wire_effort() {
+        // GLM 5.3（≥ 5.3 的代际）把 `xhigh` 折叠成 `max`。
+        let glm53 = model_changed_wire_effort(
+            "wire_effort_glm53",
+            "glm",
+            "glm-5.3",
+            ys_core::EffortLevel::XHigh,
+        )
+        .await;
+        assert_eq!(
+            glm53,
+            serde_json::json!("max"),
+            "glm-5.3 的 xhigh 在 wire 上是 max"
+        );
+
+        // 5.3 之前的代际（这里用 `glm-5`）原样透传 `xhigh`。
+        let glm_old = model_changed_wire_effort(
+            "wire_effort_glm_old",
+            "glm",
+            "glm-5",
+            ys_core::EffortLevel::XHigh,
+        )
+        .await;
+        assert_eq!(
+            glm_old,
+            serde_json::json!("xhigh"),
+            "5.2 之前的代际原样透传 xhigh，得到 {glm_old}"
+        );
+
+        // id 解析不出 GLM 代际（provider 仍为 `glm`）⇒ 不发该字段 ⇒ 日志必须是 `null`。
+        let unknown = model_changed_wire_effort(
+            "wire_effort_glm_unknown",
+            "glm",
+            "some-unknown-id",
+            ys_core::EffortLevel::XHigh,
+        )
+        .await;
+        assert!(
+            unknown.is_null(),
+            "模型级门控 fail-closed 时不发该字段，日志应为 null，得到 {unknown}"
+        );
+
+        // 逐字方言不折叠：GLM 的折叠规则不得外溢到其它 provider。
+        let opencode = model_changed_wire_effort(
+            "wire_effort_opencode",
+            "opencode-go",
+            "deepseek-v4-pro",
+            ys_core::EffortLevel::XHigh,
+        )
+        .await;
+        assert_eq!(
+            opencode,
+            serde_json::json!("xhigh"),
+            "opencode-go 原样透传 xhigh"
+        );
     }
 
     /// A1 的端到端不变量：跑完一个回合后，**执行时长**必须大于零。
@@ -3049,6 +3231,54 @@ mod tests {
         let mut msgs = collect_until_view(&mut h).await;
         let _ = take_view(&mut msgs);
         assert!(msgs.is_empty(), "SetThinking 不应产出 Output：{msgs:?}");
+    }
+
+    /// **`/login` 的种子回落**：端点拿不到目录时，登录仍能定出模型与候选。
+    ///
+    /// harness 未接真端点，`fetch_models` 必然失败（网络/超时）⇒ 正好走到回落分支。
+    /// 断言：不用凭证/目录也能登录成功；起始模型取种子第一条；目录进缓存 ⇒ 同一次
+    /// 刷新的 `View` 里立刻有候选。
+    ///
+    /// 变异：去掉 `catalog.is_none()` 的种子回落 ⇒ `capabilities::login` 拿到 `None`，
+    /// 只存凭证不切模型，两条断言均变红。
+    #[tokio::test]
+    async fn login_with_seed_catalog_skips_network_and_fills_candidates() {
+        let mut h = spawn_app_loop(Box::new(MockModel::new("mock")), false, Vec::new()).await;
+
+        let started = Instant::now();
+        h.requests
+            .send(Request::Login {
+                provider: "glm".into(),
+                api_key: "sk-glm".into(),
+                // 不传 base：用该 provider 的内置 base（种子就按这个 base 预热）。
+                api_base: None,
+            })
+            .await
+            .unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let view = take_view(&mut msgs);
+        let _ = started.elapsed();
+
+        // 目录拉不到 ⇒ 回落种子；本次登录仍要能定出模型，而不是停在「只存凭证」。
+        let [Outbound::Output(text)] = msgs.as_slice() else {
+            panic!("登录应恰为 [Output] + View：{msgs:?}");
+        };
+        assert!(
+            text.contains("Logged in to glm (glm-5.3)"),
+            "起始模型取种子第一条：{text}"
+        );
+        assert_eq!(view.provider.as_deref(), Some("glm"));
+        // 本 harness 未注册 model factory ⇒ `login` 无法重建 model，接线器仍持有
+        // 启动时那个 mock。快照中的 `model` 只反映接线器（实际在跑的），故不断言它。
+        assert_eq!(view.logged_in_providers, vec!["glm".to_string()]);
+        // 目录进了缓存 ⇒ 同一次刷新的 `View` 里就有两条候选（不需要重启、不需要拉取）。
+        for id in ["glm-5.3", "glm-5.3-flash"] {
+            assert!(
+                view.available_models.iter().any(|c| c.model == id),
+                "登录后候选应含种子模型 {id}：{:?}",
+                view.available_models
+            );
+        }
     }
 
     /// `SetEffort` 的可见后果：视图里的档位随请求更新，`None` 清除回未设置。

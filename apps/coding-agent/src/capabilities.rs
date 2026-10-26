@@ -295,8 +295,8 @@ pub fn set_model(
 /// `None` = 清除覆盖，回落到配置默认（`YUSHAN_REASONING_EFFORT`，默认 `high`），
 /// 同样需要重建。
 ///
-/// 设置**照常保存**，即使当前 provider 不支持思考参数：切到支持的 provider 后
-/// 立刻生效；不支持时只在输出里多一条 warning（不阻断、不回 Err）。
+/// 设置**照常保存**，即使当前 provider 或该模型代际不接受思考参数：切到支持的
+/// provider / 模型后立刻生效；不接受时只在输出里多一条 warning（不阻断、不回 Err）。
 pub fn set_effort(
     config: &mut Config,
     wiring: &mut Wiring,
@@ -307,10 +307,13 @@ pub fn set_effort(
         .effective_reasoning_effort()
         .unwrap_or_else(|| "default".to_string());
     let mut lines = vec![format!("effort: {shown}")];
-    if effort.is_some() && !config.supports_reasoning_effort() {
+    // 门控按**模型级**判：同一 provider 上能否识别模型决定发不发（GLM 要求 id 解析出代际），
+    // 只说「provider 不支持」会误导。
+    if effort.is_some() && !config.accepts_reasoning_effort() {
         let provider = config.provider.as_deref().unwrap_or("custom");
         lines.push(format!(
-            "warning: provider {provider} 不支持思考参数；请求中不会发送思考字段"
+            "warning: provider {provider} / model {} 不接受思考参数；请求中不会发送思考字段",
+            config.model
         ));
     }
     // 与 `/model` 同规：无凭证时**清空**接线器的 model，绝不留下与 config 不一致的
@@ -1924,6 +1927,86 @@ mod tests {
             "应提示该 provider 不会发送思考字段：{out:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一 provider 上的**模型级**差异：`glm` 认该字段，但 id 解析不出 GLM 代际的模型一律
+    /// fail-closed（非 GLM 模型收到该字段可能返回 400）⇒ 必须有 warning，且设置照常保存
+    /// （不阻断）。提示要同时报 provider 与 model，只说「provider 不支持」会把用户引到错的
+    /// 修正方向。
+    ///
+    /// 对照组：`glm-5.3` 与 `glm-5.2` 都能被识别为 GLM 模型（实测两者都接受该字段，只是
+    /// 折叠后的档位不同）⇒ 无 warning；`opencode-go`（`Verbatim` 方言、模型无关）无 warning。
+    ///
+    /// 变异：把 `accepts_reasoning_effort()` 换回 `supports_reasoning_effort()` ⇒
+    /// 无法解析 id 那条 warning 断言变红；删除 warning 里的 `{model}` ⇒ 文案断言变红。
+    #[test]
+    fn set_effort_warns_when_model_rejects_effort() {
+        // `glm` + 无法解析的 id：provider 认字段，模型级 fail-closed ⇒ warning，但设置仍保存。
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://open.bigmodel.cn/api/paas/v4".into());
+        config.api_key = Some("sk-glm".into());
+        config.provider = Some("glm".into());
+        config.model = "some-unknown-id".into();
+        let mut wiring = test_wiring();
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+
+        assert_eq!(
+            config.effort,
+            Some(EffortLevel::High),
+            "模型不接受也必须保存设置"
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.contains("warning: provider glm / model some-unknown-id")),
+            "应同时指出 provider 与模型：{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // `glm-5.3`：同一 provider 的受支持模型 ⇒ 无 warning。
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://open.bigmodel.cn/api/paas/v4".into());
+        config.api_key = Some("sk-glm".into());
+        config.provider = Some("glm".into());
+        config.model = "glm-5.3".into();
+        let mut wiring = test_wiring();
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+        assert!(
+            !out.iter().any(|l| l.starts_with("warning:")),
+            "受支持的模型不得有 warning：{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // `glm-5.2`：同样受支持 ⇒ 无 warning（按代际阈值门控会在这里误报）。
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://open.bigmodel.cn/api/paas/v4".into());
+        config.api_key = Some("sk-glm".into());
+        config.provider = Some("glm".into());
+        config.model = "glm-5.2".into();
+        let mut wiring = test_wiring();
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+        assert!(
+            !out.iter().any(|l| l.starts_with("warning:")),
+            "glm-5.2 接受该字段，不得有 warning：{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // `opencode-go`：`Verbatim` 方言，档位原样透传 ⇒ 无 warning。
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://opencode.ai/zen/go/v1".into());
+        config.api_key = Some("sk-oc".into());
+        config.provider = Some("opencode-go".into());
+        config.model = "any-model".into();
+        let mut wiring = test_wiring();
+
+        let out = set_effort(&mut config, &mut wiring, Some(EffortLevel::High));
+        assert!(
+            !out.iter().any(|l| l.starts_with("warning:")),
+            "opencode-go 不得有 warning：{out:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

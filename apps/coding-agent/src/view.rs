@@ -243,12 +243,29 @@ mod tests {
         assert!(view.provider.is_none());
         assert!(view.model.is_none(), "无 model → 状态行显示 (no model)");
         assert!(view.logged_in_providers.is_empty());
-        assert_eq!(view.providers.len(), 4, "内置四个 provider");
+        assert_eq!(
+            view.providers.len(),
+            6,
+            "内置 provider 全部进 /login 选择器"
+        );
         assert!(view.provider_names().contains(&"deepseek".to_string()));
         assert!(
             view.provider_names().contains(&"opencode-go".to_string()),
             "opencode-go 必须出现在 /login 的 provider 选择器里"
         );
+        // GLM 两个端点（通用 / 编码）都在注册表里，且各自带内置 base ——
+        // 有内置 base 的 provider，`/login` 不该再多问一句 URL。
+        for name in ["glm", "glm-coding"] {
+            assert!(
+                view.provider_names().contains(&name.to_string()),
+                "{name} 必须在 /login 的 provider 选择器里：{:?}",
+                view.provider_names()
+            );
+            assert!(
+                !view.provider_needs_api_base_url(name),
+                "{name} 有内置 base → /login 不该多问一句"
+            );
+        }
         // **回归锚点**：内置 base 必须原样透传 —— `/login custom` 要靠这个空串
         // 判定「该追问 API base URL」。把 api_base 拍成空 → 本断言变红。
         assert!(
@@ -614,6 +631,90 @@ mod tests {
             !has_model(&view, "deepseek-chat"),
             "有目录时不得再掺静态条目：{:?}",
             view.available_models
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **种子目录进 `/model` 候选**：GLM 两个端点的模型名来自 registry 的内置种子
+    /// （`CatalogSource::Seed`，构造时已写进 `model_cache`），无需任何网络。
+    ///
+    /// 准入前提是**已登录** —— `available_models` 只收已登录 provider 的目录
+    /// （未登录时那一家的模型名无处可用：没有凭证就发不出请求）。故本用例先
+    /// `save_auth`，再断言候选。
+    ///
+    /// 变异：把 `build_view` 的填充循环改成只看 `Endpoint` 目录（或去掉种子预热）
+    /// ⇒ 本用例变红。
+    #[test]
+    fn test_build_view_glm_seed_catalog_enters_model_candidates() {
+        use crate::provider::AuthEntry;
+
+        let dir = temp_dir("glm_seed");
+        let mut cfg = Config::from_env().unwrap();
+        cfg.api_base = None;
+        cfg.api_key = None;
+        cfg.provider = Some("glm".into());
+        cfg.model = "glm-5.3".into();
+        cfg.registry.set_auth_override(dir.join("auth.json"));
+        // base 逐字取内置值（种子就是按这个 base 预热的）。
+        for name in ["glm", "glm-coding"] {
+            let base = cfg
+                .registry
+                .find_provider(name)
+                .expect("内置 provider")
+                .api_base
+                .clone();
+            cfg.registry
+                .save_auth(
+                    name,
+                    &AuthEntry {
+                        api_base: base,
+                        api_key: "sk-glm".into(),
+                        model: "glm-5.3".into(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+
+        let view = build_view(
+            &cfg,
+            &test_agent(),
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+            ThemeKind::default(),
+        );
+
+        for id in ["glm-5.3", "glm-5.3-flash"] {
+            assert!(
+                has_model(&view, id),
+                "GLM 种子目录应进 /model 候选：{id} 缺失 {:?}",
+                view.available_models
+            );
+        }
+        // 两个 GLM 端点目录相同 ⇒ 同名各占一行（靠 label 的 provider 前缀区分）。
+        let rows: Vec<_> = view
+            .available_models
+            .iter()
+            .filter(|c| c.model == "glm-5.3-flash")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "glm 与 glm-coding 的目录同名，应各占一行：{:?}",
+            view.available_models
+        );
+        // 窗口随种子落地（厂商未提供列表接口，这个值是目录里的唯一口径）。
+        assert_eq!(
+            cfg.registry.catalog_context_window("glm-5.3"),
+            Some(1_000_000),
+            "种子必须带上下文窗口"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

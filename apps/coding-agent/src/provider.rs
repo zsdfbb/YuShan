@@ -12,6 +12,19 @@ use ys_model_openai_compat::compat::ProviderCompat;
 /// （实测 `/chat/completions` 与 `/responses` 皆然）。
 pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
+/// 该 provider 的模型目录来源。
+#[derive(Debug, Clone)]
+pub enum CatalogSource {
+    /// 只有端点自报的 `/v1/models` 目录。
+    Endpoint,
+    /// 端点拿不到目录时的**内置种子**（顺序即 `/login` 的起始模型优先级）。
+    ///
+    /// 与 `Endpoint` 并存而非互斥：种子先进缓存，后续若端点真能列出目录，
+    /// `apply_model_cache` 会用真实目录覆盖同键条目。种子里的 `context_window`
+    /// 取自厂商模型表，属第二手信息（用户在 `config.json` 的覆盖仍然优先）。
+    Seed(&'static [(&'static str, usize)]),
+}
+
 /// 带元数据的已知 provider。
 #[derive(Debug, Clone)]
 pub struct ProviderInfo {
@@ -23,7 +36,26 @@ pub struct ProviderInfo {
     /// 值是 [`session_id`] 给的**进程级稳定** id —— 网关只要求「一段对话用同一个
     /// id」，不要求它在进程之间延续。
     pub session_header: Option<String>,
+    /// 该端点能给出模型名的方式（见 [`CatalogSource`]）。
+    pub catalog: CatalogSource,
+    /// `/model` 候选与 `/login` 起始模型最多取目录的多少条（`None` = 全部）。
+    ///
+    /// 存在的理由：厂商目录是**全量**模型表（实测智谱的 `/v1/models` 返回 17 条，含多代
+    /// 已过时的模型），而服务端返回顺序本身就是优先级（当代在前，实测两次请求一致）。
+    /// 取前 N 条即可只展示当代模型，无需维护一份必然过时的白名单。
+    ///
+    /// 只作用于**展示**（[`ProviderRegistry::models_for_provider`]）；
+    /// [`ProviderRegistry::model_cache`] 本体始终是全量目录。
+    pub catalog_limit: Option<usize>,
 }
+
+/// GLM 内置种子目录：`(模型 id, 上下文窗口 token)`。
+///
+/// 顺序即 `/login` 的起始模型。**兜底用**：通用端点的 `/v1/models` 能给出目录（实测
+/// 返回 17 条，带 `context_length`），种子在该端点拿不到目录时才生效；编码套餐端点的
+/// `/v1/models` 实测 404，故种子对 `glm-coding` 是**必需**的兜底。窗口取自厂商模型表的
+/// 「上下文」列（GLM-5.3 与 GLM-5.3-Flash 均为 1M）。
+const GLM_SEED_MODELS: &[(&str, usize)] = &[("glm-5.3", 1_000_000), ("glm-5.3-flash", 1_000_000)];
 
 /// auth.json 中按 provider 存储的凭证。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,7 +78,12 @@ pub struct ApiModel {
     ///
     /// 目录里报了就用它 —— 窗口的第一手来源（`Config::context_window_for` 的 ② 级）。
     /// 厂商不报（如 opencode-go 网关）才回退默认值。
-    #[serde(default)]
+    ///
+    /// 本仓统一的内部名字是 `context_window`；部分厂商在 `id` 同级用另一个拼写报同一个
+    /// 值（实测智谱的 `/v1/models` 报 `context_length`，`glm-5.3` 为 1048576），`alias`
+    /// 让两种拼写归一到本字段 —— 否则窗口永远读不到、一直回退兜底默认值（把 202752
+    /// 当成 1M 会让该压缩时不压缩，直至上下文溢出）。
+    #[serde(default, alias = "context_length")]
     pub context_window: Option<usize>,
 }
 
@@ -94,8 +131,15 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     /// 创建带内置 provider 的 registry。
     ///
-    /// 内置项只登记**端点与方言**（`api_base` / `compat` / 会话头）—— 模型名一律来自
-    /// 该端点的 `/v1/models` 目录，**不在代码里写死**。
+    /// 内置项登记**端点、方言、目录来源与展示上限**（`api_base` / `compat` / 会话头 /
+    /// `catalog` / `catalog_limit`）。目录来源是 [`CatalogSource::Endpoint`] 的 provider，
+    /// 模型名一律来自该端点的 `/v1/models` 目录，**不在代码里写死**。
+    ///
+    /// **契约**：[`CatalogSource::Seed`] 的种子在构造时即写入 [`Self::model_cache`]
+    /// （键同 `cache_key(api_base)`），因此种子 provider 在**未登录、未发任何请求**时
+    /// 就有完整目录 —— [`Self::models_for_provider`] / [`Self::models_for_base`] /
+    /// [`Self::catalog_context_window`] / [`Self::provider_for_model`] 无需为种子
+    /// 另开分支。种子条目没有 `owned_by` / 展示名，只有 `context_window`。
     pub fn new() -> Self {
         let providers = vec![
             ProviderInfo {
@@ -103,31 +147,93 @@ impl ProviderRegistry {
                 api_base: "https://api.deepseek.com".into(),
                 compat: ProviderCompat::deepseek(),
                 session_header: None,
+                catalog: CatalogSource::Endpoint,
+                catalog_limit: None,
             },
             ProviderInfo {
                 name: "minimax".into(),
                 api_base: "https://api.minimax.chat/v1".into(),
                 compat: ProviderCompat::minimax(),
                 session_header: None,
+                catalog: CatalogSource::Endpoint,
+                catalog_limit: None,
             },
             ProviderInfo {
                 name: "opencode-go".into(),
                 api_base: "https://opencode.ai/zen/go/v1".into(),
                 compat: ProviderCompat::opencode_go(),
                 session_header: Some(OPENCODE_SESSION_HEADER.into()),
+                catalog: CatalogSource::Endpoint,
+                catalog_limit: None,
+            },
+            ProviderInfo {
+                name: "glm".into(),
+                api_base: "https://open.bigmodel.cn/api/paas/v4".into(),
+                compat: ProviderCompat::glm(),
+                session_header: None,
+                catalog: CatalogSource::Seed(GLM_SEED_MODELS),
+                // 实测目录 17 条，服务端顺序当代在前 ⇒ 取前 3 条即是当代模型
+                // （`glm-5.3-flash` / `glm-5.3-flashx` / `glm-5.3`），第 4 条起已是上一代。
+                catalog_limit: Some(3),
+            },
+            ProviderInfo {
+                name: "glm-coding".into(),
+                api_base: "https://open.bigmodel.cn/api/coding/paas/v4".into(),
+                compat: ProviderCompat::glm(),
+                session_header: None,
+                catalog: CatalogSource::Seed(GLM_SEED_MODELS),
+                // 同 `glm`：编码端点与通用端点同一套模型表。
+                catalog_limit: Some(3),
             },
             ProviderInfo {
                 name: "custom".into(),
                 api_base: String::new(),
                 compat: ProviderCompat::standard(),
                 session_header: None,
+                catalog: CatalogSource::Endpoint,
+                catalog_limit: None,
             },
         ];
-        Self {
+        let mut reg = Self {
             providers,
             auth_store: HashMap::new(),
             model_cache: HashMap::new(),
             auth_override: None,
+        };
+        // 种子预热：构造期就把种子写进缓存，使拿不到目录的端点（编码套餐实测 404）
+        // 在登录/流式之前即有可用目录；能拿到目录的端点会用真实目录同键覆盖。
+        let seeds: Vec<(String, &'static [(&'static str, usize)])> = reg
+            .providers
+            .iter()
+            .filter_map(|p| match p.catalog {
+                CatalogSource::Seed(seed) => Some((p.api_base.clone(), seed)),
+                CatalogSource::Endpoint => None,
+            })
+            .collect();
+        for (base, seed) in seeds {
+            let models: Vec<ApiModel> = seed
+                .iter()
+                .map(|(id, window)| ApiModel {
+                    id: (*id).to_string(),
+                    owned_by: None,
+                    name: None,
+                    context_window: Some(*window),
+                })
+                .collect();
+            reg.model_cache.insert(cache_key(&base).to_string(), models);
+        }
+        reg
+    }
+
+    /// 该 provider 的内置种子目录（`None` = 只有端点目录可用）。
+    ///
+    /// 消费者：`/login` —— 有种子就不发 `/v1/models` 请求，直接把种子当目录交给
+    /// `capabilities::login`。种子的角色是**兜底**：通用端点的 `/v1/models` 能给出目录
+    /// （实测），而编码套餐端点的同一路径实测 404 —— 后者只能靠种子决定起始模型。
+    pub fn seed_catalog(&self, provider_name: &str) -> Option<&'static [(&'static str, usize)]> {
+        match self.find_provider(provider_name)?.catalog {
+            CatalogSource::Seed(seed) => Some(seed),
+            CatalogSource::Endpoint => None,
         }
     }
 
@@ -255,7 +361,7 @@ impl ProviderRegistry {
     }
 
     /// 存有凭证（已登录）的 provider 名称。
-    /// 按注册顺序返回（deepseek、minimax、custom）。
+    /// 按注册顺序返回。
     pub fn logged_in_providers(&self) -> Vec<String> {
         self.providers
             .iter()
@@ -326,10 +432,17 @@ impl ProviderRegistry {
 
     /// 需要拉 `/v1/models` 的 `(api_base, api_key)` 列表 —— 后台拉取的输入。
     ///
-    /// = **每个已登录 provider**（`api_base` 非空；空 base 无处可拉，如未配 URL 的
-    /// `custom`）+ **env 直连**（`env_direct` 给了且该 base 未被某个 auth 条目覆盖）。
-    /// 后者是 `/model` 候选与窗口在 `YUSHAN_API_BASE` 那条路径上的**唯一来源** ——
-    /// 那条路径 `provider` 恒为 `None`，registry 里没有它的名字。
+    /// 成员：
+    /// - **每个已登录 provider**（`api_base` 非空；空 base 无处可拉，如未配 URL 的
+    ///   `custom`）。**`Seed` provider 同样在内** —— 种子只是兜底，真实目录才是模型名的
+    ///   第一手来源（含 `context_length` 与展示顺序）；实测通用端点的 `/v1/models` 可用。
+    ///   拿不到时种子的条目原样留在缓存里。
+    /// - **env 直连**（`env_direct` 给了、且该 base 未被某个 auth 条目覆盖）。它是
+    ///   `/model` 候选与窗口在 `YUSHAN_API_BASE` 那条路径上的**唯一来源** —— 那条路径
+    ///   `provider` 恒为 `None`，registry 里没有它的名字。
+    ///
+    /// 拉取失败一律静默（不写缓存），故对没有目录接口的端点（编码套餐端点的
+    /// `/v1/models` 实测 404）代价只是一次被 `JoinSet` 并行的 5s 超时。
     ///
     /// 输入在**起屏前**从 registry 摘出，交给后台任务 —— 任务因此不借用 registry，
     /// 与 app 循环的写（[`Self::apply_model_cache`]）不共享任何状态。
@@ -405,19 +518,31 @@ impl ProviderRegistry {
         self.model_cache.extend(cache);
     }
 
-    /// 该 provider **拉到的**候选模型 id（未拉到 ⇒ 空）。
+    /// 该 provider 的**展示用**候选模型 id（未拉到 ⇒ 空），最多 `catalog_limit` 条。
     ///
     /// 唯一消费者：`view::build_view`（`/model` 浮层的候选）。模型名只有这一个来源 ——
     /// 拉不到就是没有，**不做静态回退**（写死的名字必然过时，且会与端点真正提供的
     /// 模型对不上）。
+    ///
+    /// **只截断展示这条路径**：厂商目录是全量表（实测智谱 17 条），而服务端返回顺序即
+    /// 优先级（当代在前），故 `catalog_limit` 取前 N 条。窗口查询与归属反查**不**走这里 ——
+    /// [`Self::catalog_context_window`] / [`Self::provider_for_model`] 直接读全量
+    /// [`Self::model_cache`]，否则用户手敲一个不在前 N 条里的模型名时，
+    /// 窗口会退回兜底默认值，导致该压缩时不压缩。
     pub fn models_for_provider(&self, name: &str) -> Vec<String> {
         let base = self
             .auth_store
             .get(name)
             .map(|e| e.api_base.clone())
             .or_else(|| self.find_provider(name).map(|p| p.api_base.clone()));
-        base.map(|base| self.models_for_base(&base))
-            .unwrap_or_default()
+        let limit = self.find_provider(name).and_then(|p| p.catalog_limit);
+        let models = base
+            .map(|base| self.models_for_base(&base))
+            .unwrap_or_default();
+        match limit {
+            Some(n) => models.into_iter().take(n).collect(),
+            None => models,
+        }
     }
 
     /// 某个 `api_base` 的目录（env 直连没有 provider 名，按 base 取）。
@@ -879,6 +1004,116 @@ mod tests {
         assert_eq!(reg.catalog_context_window("not-in-catalog"), None);
     }
 
+    /// 真实的智谱 `/v1/models` 形状：窗口字段名是 `context_length`（与 `id` 同级），
+    /// 而本仓统一的内部名字是 `context_window` —— `alias` 把两种拼写归一到同一字段。
+    ///
+    /// 变异自检：去掉 `ApiModel::context_window` 上的 `alias = "context_length"` ⇒
+    /// 前两个窗口读成 `None`（第三、四条用本仓拼写，仍为 `Some`），本用例变红。
+    #[test]
+    fn test_api_model_reads_context_length_alias() {
+        let body = r#"{"object":"list","data":[
+            {"id":"glm-5.3","name":"GLM-5.3","context_length":1048576,"max_output_length":131072},
+            {"id":"glm-5.3-flash","context_length":1048576},
+            {"id":"canonical-spelling","context_window":4096},
+            {"id":"no-window","created":1700000000}
+        ]}"#;
+        let parsed: ModelsResponse =
+            serde_json::from_str(body).expect("真实目录形状必须可解析（含未知字段）");
+        let windows: Vec<Option<usize>> = parsed.data.iter().map(|m| m.context_window).collect();
+        assert_eq!(
+            windows,
+            vec![Some(1_048_576), Some(1_048_576), Some(4096), None],
+            "context_length 与 context_window 两种拼写归一，未报窗口 ⇒ None"
+        );
+    }
+
+    /// 展示上限**只**作用于 `/model` 候选：GLM 的目录塞 5 条（实测服务端顺序的前 3 条
+    /// 加两条更靠后的条目）⇒ 候选恰好前 3 条且**保持服务端顺序**；缓存本体仍是全量，
+    /// 所以不在候选里的条目手敲时仍能查到自己的窗口。
+    ///
+    /// 变异自检：去掉 `models_for_provider` 里的 `take(limit)` ⇒ 第一条断言变成 5 条；
+    /// 改成把截断结果写回 `model_cache` ⇒ 第二条断言变红（后面的条目消失 ⇒ 窗口退回
+    /// 兜底默认值，正是上下文溢出的来源）。
+    #[test]
+    fn test_catalog_limit_truncates_display_only() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        let catalog: Vec<(&str, usize)> = vec![
+            ("glm-5.3-flash", 1_048_576),
+            ("glm-5.3-flashx", 1_048_576),
+            ("glm-5.3", 1_048_576),
+            // 更靠后的条目：不进展示候选，但手敲时窗口仍可查。
+            ("glm-alias-a", 202_752),
+            ("glm-alias-b", 65_536),
+        ];
+        reg.seed_cached_catalog(
+            "https://open.bigmodel.cn/api/paas/v4",
+            &catalog
+                .iter()
+                .map(|(id, window)| ApiModel {
+                    id: (*id).into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: Some(*window),
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(
+            reg.models_for_provider("glm"),
+            vec![
+                "glm-5.3-flash".to_string(),
+                "glm-5.3-flashx".to_string(),
+                "glm-5.3".to_string(),
+            ],
+            "取服务端顺序的前 3 条 —— 不重排、不按字母序"
+        );
+
+        // 截断只影响展示：后面的条目不在候选里，但窗口仍可查。
+        assert_eq!(
+            reg.models_for_base("https://open.bigmodel.cn/api/paas/v4")
+                .len(),
+            5,
+            "缓存本体仍是全量目录 —— 截断只发生在 models_for_provider 这一层"
+        );
+        assert_eq!(
+            reg.catalog_context_window("glm-alias-a"),
+            Some(202_752),
+            "窗口查询走全量目录，否则 202752 会被当成兜底 1M"
+        );
+        assert_eq!(reg.catalog_context_window("glm-alias-b"), Some(65_536));
+    }
+
+    /// `catalog_limit` 为 `None` 的 provider 全量返回：展示上限是**按 provider 的元数据**，
+    /// 不是全局行为。
+    #[test]
+    fn test_no_catalog_limit_returns_full_catalog() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+        assert_eq!(
+            reg.find_provider("deepseek").expect("已注册").catalog_limit,
+            None
+        );
+
+        let ids: Vec<String> = (0..6).map(|i| format!("deepseek-m{i}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        reg.seed_cached_models("https://api.deepseek.com", &refs);
+        assert_eq!(reg.models_for_provider("deepseek"), ids, "无上限 ⇒ 不截断");
+
+        // 两个 GLM provider 都有上限，且上限相同。
+        assert_eq!(
+            reg.find_provider("glm").expect("已注册").catalog_limit,
+            Some(3)
+        );
+        assert_eq!(
+            reg.find_provider("glm-coding")
+                .expect("已注册")
+                .catalog_limit,
+            Some(3)
+        );
+    }
+
     /// `fetch_targets`：已登录 provider + **env 直连**端点；env 的 base 已被某个
     /// auth 条目覆盖时**不重复**（同一端点只拉一次）。
     #[test]
@@ -906,5 +1141,212 @@ mod tests {
         let targets = reg.fetch_targets(env);
         assert_eq!(targets.len(), 1, "{targets:?}");
         assert_eq!(targets[0].1, "sk-auth", "auth 条目的凭证优先");
+    }
+
+    /// 两个 GLM 端点的内置元数据：base、方言与「无会话头」。
+    ///
+    /// 两端点的 API key **不通用**（编码端点与通用端点各自发 key），故它们是两个
+    /// 独立 provider —— 各自登录、各自持凭证。
+    #[test]
+    fn test_glm_provider_metadata() {
+        let reg = ProviderRegistry::new();
+
+        let glm = reg.find_provider("glm").expect("glm 已注册");
+        assert_eq!(
+            glm.api_base, "https://open.bigmodel.cn/api/paas/v4",
+            "通用端点的 base 决定请求 URL 与目录缓存键"
+        );
+        assert!(
+            glm.compat.has_reasoning_content,
+            "思考增量走 reasoning_content"
+        );
+        assert!(
+            glm.compat.supports_reasoning_effort,
+            "端点接受顶层 reasoning_effort（可用档位另由方言门控）"
+        );
+        assert_eq!(glm.session_header, None, "GLM 不要求会话头");
+
+        let coding = reg.find_provider("glm-coding").expect("glm-coding 已注册");
+        assert_eq!(
+            coding.api_base, "https://open.bigmodel.cn/api/coding/paas/v4",
+            "编码端点是另一个 base，混用会让编码套餐的 key 发到通用端点"
+        );
+        assert!(coding.compat.has_reasoning_content);
+        assert!(coding.compat.supports_reasoning_effort);
+        assert_eq!(coding.session_header, None);
+    }
+
+    /// 种子目录**只**挂在两个 GLM provider 上：其余 provider 的模型名只来自
+    /// 端点自己的 `/v1/models`。
+    #[test]
+    fn test_seed_catalog_only_for_glm_providers() {
+        let reg = ProviderRegistry::new();
+
+        let glm = reg.seed_catalog("glm").expect("glm 有种子");
+        let ids: Vec<&str> = glm.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec!["glm-5.3", "glm-5.3-flash"],
+            "顺序即 /login 的起始模型优先级"
+        );
+        assert_eq!(glm.len(), 2, "种子只有两条，端点目录拿不到时兜底");
+
+        let coding = reg.seed_catalog("glm-coding").expect("glm-coding 有种子");
+        assert_eq!(coding, glm, "编码端点与通用端点同一套模型 id 与窗口");
+
+        // 别的 provider 没种子 —— 它们的目录必须由端点自己报。
+        assert_eq!(reg.seed_catalog("deepseek"), None);
+        assert_eq!(reg.seed_catalog("custom"), None);
+        assert_eq!(reg.seed_catalog("nonexistent"), None);
+    }
+
+    /// 种子预热契约：**未登录、未发任何请求**时，GLM（及拿不到目录的 `glm-coding`）
+    /// 就已经有候选与窗口。
+    ///
+    /// 变异：去掉 `ProviderRegistry::new()` 里的种子写入 ⇒ 本用例全红（`/model`
+    /// 对 `glm-coding` 会一个候选都没有 —— 它那个端点的 `/v1/models` 实测 404）。
+    #[test]
+    fn test_glm_seed_preheats_catalog_without_login() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        assert!(
+            reg.logged_in_providers().is_empty(),
+            "前提：本用例不登录任何 provider"
+        );
+        assert_eq!(
+            reg.models_for_provider("glm"),
+            vec!["glm-5.3".to_string(), "glm-5.3-flash".to_string()],
+            "种子在构造时就进了缓存，候选不依赖任何网络请求"
+        );
+        assert_eq!(
+            reg.catalog_context_window("glm-5.3"),
+            Some(1_000_000),
+            "窗口随种子一起预置，否则 1M 上下文会被当作默认值"
+        );
+        assert_eq!(reg.catalog_context_window("glm-5.3-flash"), Some(1_000_000));
+    }
+
+    /// 真实目录**覆盖**种子（不是合并）：端点真能列出目录时，以端点为准。
+    #[test]
+    fn test_real_catalog_overrides_glm_seed() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        let fresh = vec![ApiModel {
+            id: "glm-6".into(),
+            owned_by: Some("zhipu".into()),
+            name: None,
+            context_window: Some(2_000_000),
+        }];
+        reg.apply_model_cache(HashMap::from([(
+            "https://open.bigmodel.cn/api/paas/v4".to_string(),
+            fresh,
+        )]));
+
+        assert_eq!(
+            reg.models_for_provider("glm"),
+            vec!["glm-6".to_string()],
+            "同键条目整体覆盖：种子里的 glm-5.3 不该残留在候选里"
+        );
+        assert!(
+            !reg.models_for_base("https://open.bigmodel.cn/api/paas/v4")
+                .contains(&"glm-5.3-flash".to_string()),
+            "覆盖不是合并 —— 种子里没被新目录列出的条目一并消失"
+        );
+        assert_eq!(reg.catalog_context_window("glm-6"), Some(2_000_000));
+        // 另一端点（glm-coding）的种子同键不同 base，不受本次覆盖影响。
+        assert_eq!(
+            reg.models_for_provider("glm-coding"),
+            vec!["glm-5.3".to_string(), "glm-5.3-flash".to_string()],
+            "覆盖只对同 base 生效，两个端点各持自己的目录"
+        );
+    }
+
+    /// `fetch_targets` 对**所有已登录 provider** 都拉目录，`Seed` 也不例外。
+    ///
+    /// 种子只是兜底：实测通用端点的 `/v1/models` 可用且返回 `context_length`，真实目录才是
+    /// 模型名与窗口的第一手来源；把它排除会让种子永久遮蔽真实目录（`apply_model_cache`
+    /// 根本没机会覆盖）。编码套餐端点虽然实测 404，代价也只是一次被 `JoinSet` 并行的 5s 超时。
+    ///
+    /// 变异自检：加回 `filter(|p| matches!(p.catalog, CatalogSource::Endpoint))` ⇒
+    /// 已登录的 glm / glm-coding 从 targets 里消失，本用例变红。
+    #[test]
+    fn test_fetch_targets_includes_seed_providers() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        for (name, base) in [
+            ("glm", "https://open.bigmodel.cn/api/paas/v4"),
+            ("glm-coding", "https://open.bigmodel.cn/api/coding/paas/v4"),
+            ("deepseek", "https://api.deepseek.com"),
+        ] {
+            reg.auth_store.insert(
+                name.to_string(),
+                AuthEntry {
+                    api_base: base.to_string(),
+                    api_key: format!("sk-{name}"),
+                    model: String::new(),
+                },
+            );
+        }
+
+        let targets = reg.fetch_targets(None);
+        let bases: Vec<&str> = targets.iter().map(|(b, _)| b.as_str()).collect();
+
+        assert_eq!(
+            targets.len(),
+            3,
+            "每个已登录 provider 都要拉 —— 种子只是兜底，真实目录才是第一手来源；实际 targets: {bases:?}"
+        );
+        assert!(
+            bases.contains(&"https://open.bigmodel.cn/api/paas/v4"),
+            "glm 必须拉真实目录，否则 context_length / 服务端顺序永远用不上：{bases:?}"
+        );
+        assert!(
+            bases.contains(&"https://open.bigmodel.cn/api/coding/paas/v4"),
+            "glm-coding 也照拉：该端点实测 404，失败静默而种子留在缓存里：{bases:?}"
+        );
+        assert!(
+            targets.contains(&(
+                "https://api.deepseek.com".to_string(),
+                "sk-deepseek".to_string()
+            )),
+            "端点型 provider 照常拉 —— 它的模型名没有别的来源：{bases:?}"
+        );
+    }
+
+    /// env 直连（`YUSHAN_API_BASE`）无论指向哪个 base 都要拉 —— 包括种子 provider 的 base。
+    ///
+    /// 那条路径 `provider` 恒为 `None`，目录是它与窗口的**唯一**来源；跳过它就只能吃种子
+    /// 的兜底窗口（`glm-5.2` 真实 202,752 会被当成 1M）。
+    ///
+    /// 变异自检：加回对 env base 的 `Seed` 比对 ⇒ 前两条断言变红。
+    #[test]
+    fn test_fetch_targets_includes_env_direct_on_seed_base() {
+        let mut reg = ProviderRegistry::new();
+        reg.set_auth_override(PathBuf::from("/nonexistent-auth.json"));
+
+        let glm_base = "https://open.bigmodel.cn/api/paas/v4";
+        assert_eq!(
+            reg.fetch_targets(Some((glm_base.to_string(), "sk-env".to_string()))),
+            vec![(glm_base.to_string(), "sk-env".to_string())],
+            "env 直连 GLM 也要拉真实目录 —— 种子只是兜底"
+        );
+        // 尾斜杠仅是写法差异，不影响成员判定。
+        assert_eq!(
+            reg.fetch_targets(Some((format!("{glm_base}/"), "sk-env".to_string())))
+                .len(),
+            1,
+            "带尾斜杠的同一 base 仍应进 targets"
+        );
+
+        // 非种子 base 照常拉：那条路径没有 provider 名，env 是唯一来源。
+        let other = "https://example.com/v1";
+        assert_eq!(
+            reg.fetch_targets(Some((other.to_string(), "sk-env".to_string()))),
+            vec![(other.to_string(), "sk-env".to_string())],
+            "未知端点必须照常拉，否则 env 直连的 /model 一个候选都没有"
+        );
     }
 }

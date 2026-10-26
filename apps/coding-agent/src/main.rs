@@ -826,14 +826,17 @@ pub(crate) fn run_start_fields(
         json!(config.provider.as_deref().unwrap_or("custom")),
     );
     fields.insert("gen_ai.request.model".into(), json!(config.model));
-    let effective_reasoning_effort = if config.current_compat().supports_reasoning_effort {
-        config.reasoning_effort()
-    } else {
-        None
-    };
+    // 记录的是 **wire 值**（模型代际门控与方言折叠之后），不是原始配置值：
+    // 请求体里没这个字段时为 `null`，GLM 的 `xhigh` 在这里显示为 `max`。
+    // 口径为**启动期配置默认**（`config.reasoning_effort()`），不含会话内 `/effort` 覆盖。
+    let wire_reasoning_effort = reasoning_effort_for(
+        &config.current_compat(),
+        &config.model,
+        config.reasoning_effort(),
+    );
     fields.insert(
         "gen_ai.request.reasoning_effort".into(),
-        effective_reasoning_effort
+        wire_reasoning_effort
             .map(|effort| json!(effort))
             .unwrap_or(Value::Null),
     );
@@ -1051,16 +1054,20 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     limits
 }
 
-/// provider 不声明支持时不发送推理强度，避免严格端点因未知字段 400。
+/// 本次请求实际要发的 `reasoning_effort`：能力位 + **模型级**方言共同决定。
+///
+/// 能力位只回答「这个 provider 认不认该字段」；GLM 一类端点还要求档位落在
+/// 该模型代际接受的集合里（非法值直接 400，不静默折叠），故门控与折叠都交给
+/// [`ProviderCompat::effort_for`]。
+///
+/// `None` = 整个字段不序列化：provider 不声明支持、或该模型代际不接受该字段时
+/// 一律不发，避免严格端点因未知字段 400。
 fn reasoning_effort_for(
     compat: &ys_model_openai_compat::compat::ProviderCompat,
+    model: &str,
     configured: Option<&str>,
 ) -> Option<String> {
-    if compat.supports_reasoning_effort {
-        configured.map(str::to_owned)
-    } else {
-        None
-    }
+    compat.effort_for(model, configured)
 }
 
 /// 每轮**固定开销**的 token 估算：system prompt + 工具表的 JSON spec。
@@ -2579,7 +2586,7 @@ fn build_configured_model(
     let key = cfg.api_key.as_ref()?;
     let compat = cfg.current_compat();
     let effective_effort = cfg.effective_reasoning_effort();
-    let reasoning_effort = reasoning_effort_for(&compat, effective_effort.as_deref());
+    let reasoning_effort = reasoning_effort_for(&compat, &cfg.model, effective_effort.as_deref());
     // `new` 自建 client（`owns_client == true`），故 `with_timeouts` 会按配置重建
     // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
     let retry = cfg.model_retry();
@@ -2915,7 +2922,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key = cfg.api_key.as_ref()?;
         let compat = cfg.current_compat();
         let effective_effort = cfg.effective_reasoning_effort();
-        let reasoning_effort = reasoning_effort_for(&compat, effective_effort.as_deref());
+        // 门控与折叠都按**本次构造的**模型名判：同一 provider 上的不同代际取值集合不同。
+        let reasoning_effort = reasoning_effort_for(&compat, name, effective_effort.as_deref());
         let retry = cfg.model_retry();
         let timeout = cfg.model_timeout();
         let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
@@ -4535,22 +4543,126 @@ mod tests {
 
     /// 推理强度只发给声明支持的 provider；配置存在也不能盲发给未知端点。
     ///
-    /// 变异：去掉 compat 守卫 ⇒ 第一条断言从 `None` 变成 `Some("high")`。
+    /// 声明支持也不等于每个模型都发：GLM 要求 id 能解析出代际（fail-closed），且可用档位
+    /// 随代际收缩（`glm-5.3` 只收 `low|high|max`，`glm-5.2` 自行映射，`< (5,2)` 原样透传）。
+    /// 故这里同时钉住**能力位**与**模型级方言**两条门。
+    ///
+    /// 变异：去掉 compat 守卫 ⇒ `standard` 断言从 `None` 变成 `Some("high")`；
+    /// 把 `Glm` 方言误用到所有 provider ⇒ `opencode_go` 的 `xhigh` 锚点变成 `max`；
+    /// 把 `< (5,2)` 分支的 `off` 映射去掉 ⇒ `glm-5` 的 `off` 锚点变成 `Some("off")`。
     #[test]
     fn reasoning_effort_is_gated_by_provider_compat() {
         use ys_model_openai_compat::compat::ProviderCompat;
 
+        // 能力位关：无论模型为何都不发。
+        for model in ["glm-5.3", "any-model"] {
+            assert_eq!(
+                reasoning_effort_for(&ProviderCompat::standard(), model, Some("high")),
+                None
+            );
+            assert_eq!(
+                reasoning_effort_for(&ProviderCompat::deepseek(), model, Some("high")),
+                None
+            );
+        }
+
+        // `Verbatim` 方言原样透传 —— 回归锚点：GLM 的折叠不得影响 opencode-go。
+        let opencode = ProviderCompat::opencode_go();
         assert_eq!(
-            reasoning_effort_for(&ProviderCompat::standard(), Some("high")),
-            None
-        );
-        assert_eq!(
-            reasoning_effort_for(&ProviderCompat::deepseek(), Some("high")),
-            None
-        );
-        assert_eq!(
-            reasoning_effort_for(&ProviderCompat::opencode_go(), Some("high")),
+            reasoning_effort_for(&opencode, "any-model", Some("high")),
             Some("high".to_string())
+        );
+        assert_eq!(
+            reasoning_effort_for(&opencode, "any-model", Some("xhigh")),
+            Some("xhigh".to_string())
+        );
+
+        // GLM：能力位 + id 可识别 + 按代际折叠到该代际真正接受的集合。
+        let glm = ProviderCompat::glm();
+        for (model, configured, expected) in [
+            ("glm-5.3", "xhigh", Some("max")),
+            ("glm-5.3", "off", Some("low")),
+            ("glm-5.3", "medium", Some("high")),
+            ("glm-5.3-flash", "minimal", Some("low")),
+            ("glm-5.2", "low", Some("high")),
+            // 5.2 之前的代际（`glm-5` 解析为 `(5, 0)`）实测接受全集（含 `xhigh`），原样透传。
+            ("glm-5", "high", Some("high")),
+            ("glm-5", "xhigh", Some("xhigh")),
+            // `off` 不是合法 wire 值（原样发返回 code 1210）⇒ `< (5,2)` 映射到 `minimal`。
+            ("glm-5", "off", Some("minimal")),
+            // 代际无法从 id 解析 ⇒ fail-closed。
+            ("unknown-model", "high", None),
+        ] {
+            assert_eq!(
+                reasoning_effort_for(&glm, model, Some(configured)).as_deref(),
+                expected,
+                "model = {model}, configured = {configured}"
+            );
+            // 无配置值时任何档位都不发。
+            assert_eq!(
+                reasoning_effort_for(&glm, model, None),
+                None,
+                "model = {model}, configured = None"
+            );
+        }
+    }
+
+    /// `run_start` 的 `gen_ai.request.reasoning_effort` 记录的是 **wire 值**：
+    /// 模型级门控与方言折叠**之后**的结果，而不是原始配置值。
+    ///
+    /// 变异：把这段改回只看 provider 能力位（`supports_reasoning_effort`）⇒
+    /// `glm-5.3` 从 `max` 变成 `xhigh`（折叠丢了）；把模型级门控改成只看代际 `≥ (5,2)`
+    /// ⇒ 无法解析 id 那条从 `null` 变成 `xhigh`（把不发的东西报成发了），两条断言均变红。
+    #[test]
+    fn run_start_records_wire_reasoning_effort() {
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&["YUSHAN_REASONING_EFFORT"]);
+        // SAFETY: 持有 env_lock，独占该 key 的修改与恢复。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", "xhigh") };
+
+        let mut config = config::Config::from_env().unwrap();
+        assert_eq!(
+            config.reasoning_effort(),
+            Some("xhigh"),
+            "前置：配置值是 `xhigh`（否则下面的折叠断言无法区分）"
+        );
+
+        // GLM 5.3：`xhigh` 折叠为 `max`。
+        config.provider = Some("glm".into());
+        config.model = "glm-5.3".into();
+        let fields = run_start_fields(&config, None, &[]);
+        assert_eq!(
+            fields["gen_ai.request.reasoning_effort"],
+            json!("max"),
+            "记录的必须是折叠后的 wire 值"
+        );
+
+        // 5.2 之前的代际：接受全集（含 `xhigh`）⇒ 原样记录。
+        config.model = "glm-5".into();
+        let fields = run_start_fields(&config, None, &[]);
+        assert_eq!(
+            fields["gen_ai.request.reasoning_effort"],
+            json!("xhigh"),
+            "5.2 之前的代际接受 `xhigh`，wire 值就是配置值"
+        );
+
+        // 无法解析出 GLM 代际的 id：不发 ⇒ `null`。
+        config.model = "unknown-model".into();
+        let fields = run_start_fields(&config, None, &[]);
+        assert_eq!(
+            fields["gen_ai.request.reasoning_effort"],
+            Value::Null,
+            "模型级门控 fail-closed 时请求体里没有该字段 ⇒ 必须记 `null`"
+        );
+
+        // `Verbatim` 方言：原样透传。
+        config.provider = Some("opencode-go".into());
+        config.model = "any-model".into();
+        let fields = run_start_fields(&config, None, &[]);
+        assert_eq!(
+            fields["gen_ai.request.reasoning_effort"],
+            json!("xhigh"),
+            "`Verbatim` 方言不得折叠"
         );
     }
 

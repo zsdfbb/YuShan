@@ -477,7 +477,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M18 | **退出后打 `session: <id>`**（ADR-0032）：TUI 退出（alt-screen 已恢复、transcript 已回放）后由 `main` 往 **stderr** 写一行 `session: <id>`，与 `-p` / `--json` 同文案同去处；只在**已落盘**时打（惰性新会话没跑过回合就没有文件）。会话号取自 `app_loop::SessionPathHandle` —— 启动态由 `run_interactive` 从 `Wiring` 播种、`/new` 后由 app 循环刷新，**不等 app 线程收摊**（长回合中途退出时正卡在模型调用里，等就取不到） | `apps/coding-agent/src/{main,app_loop}.rs` |
 | M19 | **`/resume` 运行期切换会话**（ADR-0033，取代 ADR-0026 决策 6）：无参 → 浮层（候选挂 `App.pending_sessions`，由 `resolve_session_pick` 决策、标签含**完整 id** 以供反解、Esc 取消、空列表只提示不弹浮层）；有参 → 直切。app 侧 `resume_session` **可失败步全部前置**（解析 → 读 meta → 纯解析模型四字段 → 构建候选 model），`wiring.resume_into` **open 成功才替换**句柄（失败 ⇒ 当前会话全不变）。UI 侧回放经 `Outbound::SessionResumed` → `reset_for_replay()` + `replay_lines()`，**必须显式 `RenderCache::reset()`**（回放是本 app **第一个**清屏/缩短 transcript 的操作）。启动期 `--resume` 复用同一通路、顺带修掉空屏（出站顺序 `SessionResumed` 先于启动提示）。**`-p` / `--json` 不受影响**（不收 `Outbound`） | `ys-protocol/src/{session,request,lib}.rs`；`ys-tui-coding/src/{cache,transcript,commands,prompter,app,run,lib}.rs`；`apps/coding-agent/src/{wiring,capabilities,main,app_loop,sessions}.rs`；`apps/coding-agent/tests/resume_cli.rs`；见 `docs/design-final/runtime-resume.md` |
 | M20 | **模态选择器带常驻筛选输入框**：`select_modal`（`run.rs`）在候选列表**之上**加一行输入框 —— 打开即可敲字，大小写不敏感**子串**匹配**整条候选串**，↑↓ 在**过滤后**的列表里移动，Enter 确认（**无匹配时不动作**，取消的唯一出口是 Esc），Esc 取消；`Backspace/Delete/←→/Home/End` 与 `Paste` 编辑筛选串。空查询 ⇒ 过滤结果 = 全体 ⇒ 行为与「纯列表」逐字一致。四个模态命令（provider / model / skill / session）**共用** `select_modal`，故筛选对它们一并生效。两条纯函数（`filter_indices` / `clamp_selection`）与 `modal_move` 并列抽出，理由相同：模态循环要真终端，语义只能靠纯函数钉进单测 —— 尤其 `clamp_selection`，查询收窄后不收敛 `selected` 会让 `filtered[selected]` 越界 panic。**筛选框为空时显示占位文案「输入以筛选…」**（可筛选这件事在输入框里说，**不进标题** —— 标题塞提示会把框撑到 60+ 列，窄终端下反被裁掉） | `crates/ys-tui-coding/src/{run,draw}.rs` |
-| M21 | **`/effort` 不镜像本地状态，且设置走模型重建**：① 与 `/thinking` 不同，`/effort <level>` **不经**「本地先写一行 + 镜像 Request」——档位真值在 app 侧 `Config.effort`，TUI 只读 `CodingView.effort`；本地先改会让 UI 早于 app 显示一个**尚未重建模型**的档位，命令成功与否也无从区分。无参显示是纯本地读快照。② 档位**随会话 meta 持久化**（`SessionMeta.effort`）：它描述「本会话想用什么思考深度」，与 `/thinking` 的显示偏好同属会话级状态；`/new` 不重置（同 `thinking_visible`），`/resume` 从目标 meta 还原并重建，`-p` / `--json` **只读不写**（不覆盖既有会话）。③ 有效档位经 `Config::effective_reasoning_effort()`（会话覆盖优先，否则配置默认 `high`）交给 `OpenAICompatibleConfig.reasoning_effort`，并按 `ProviderCompat::supports_reasoning_effort` 门控；只有**重建 model** 才能进请求；`set_effort` 与 `set_model` 同路径（无凭证 ⇒ `wiring.set_model(None)`），故下一个回合（含 subagent / compact 的工厂构造）自动继承，回合内不热切换 | `ys-tui-coding/src/{commands,events,view}.rs`；`apps/coding-agent/src/{config,capabilities,app_loop,main,view}.rs`；`crates/ys-protocol/src/request.rs`；`crates/ys-session/src/meta.rs`；见 `docs/design-final/effort.md` |
+| M21 | **`/effort` 不镜像本地状态，且设置走模型重建**：① 与 `/thinking` 不同，`/effort <level>` **不经**「本地先写一行 + 镜像 Request」——档位真值在 app 侧 `Config.effort`，TUI 只读 `CodingView.effort`；本地先改会让 UI 早于 app 显示一个**尚未重建模型**的档位，命令成功与否也无从区分。无参显示是纯本地读快照。② 档位**随会话 meta 持久化**（`SessionMeta.effort`）：它描述「本会话想用什么思考深度」，与 `/thinking` 的显示偏好同属会话级状态；`/new` 不重置（同 `thinking_visible`），`/resume` 从目标 meta 还原并重建，`-p` / `--json` **只读不写**（不覆盖既有会话）。③ 有效档位经 `Config::effective_reasoning_effort()`（会话覆盖优先，否则配置默认 `high`）交给 `ProviderCompat::effort_for(model, ..)`（provider 级能力位 + 模型级代际两层门控，并按方言折叠），产出写进 `OpenAICompatibleConfig.reasoning_effort`；只有**重建 model** 才能进请求；`set_effort` 与 `set_model` 同路径（无凭证 ⇒ `wiring.set_model(None)`），故下一个回合（含 subagent / compact 的工厂构造）自动继承，回合内不热切换 | `ys-tui-coding/src/{commands,events,view}.rs`；`apps/coding-agent/src/{config,capabilities,app_loop,main,view}.rs`；`crates/ys-protocol/src/request.rs`；`crates/ys-session/src/meta.rs`；见 `docs/design-final/effort.md` |
 
 ---
 
@@ -552,8 +552,8 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
 | `crates/ys-core/src/effort.rs` | 七档 `parse → as_wire → Display` 往返；serde 与 `as_wire` 逐档一致；`default` / 空串 / 未知值被拒并列出合法值；大小写与 trim | 改任一 wire 拼写 ⇒ 往返用例；删 `rename_all = "lowercase"` ⇒ serde 用例；把 `default` 当合法档位 ⇒ 非法值用例 |
 | `crates/ys-protocol/src/request.rs` | `SetEffort { Some(..) }` / `{ None }` 双向往返；老 JSON 形态仍可反序列化（外部标签 + 小写拼写） | 删 `None` 形态的往返 ⇒ 真实信道上清除请求解析失败；改变体标签 ⇒ legacy 用例 |
 | `crates/ys-session/src/meta.rs` | `effort` 往返（落盘为小写）；缺键 / `null` ⇒ `None`，旧首行仍可反序列化 | 删 `#[serde(default)]` / 把字段改成非 `Option` ⇒ 缺键用例 |
-| `adapters/model-openai-compatible/src/lib.rs` | `reasoning_effort` 显式值时原样序列化、`None` 时整个字段不出现；`constructors_pin_reasoning_effort_support` 钉住只有 `opencode-go` 声明支持 | 去掉 `skip_serializing_if` ⇒ 默认请求多出 `null`；关掉 `opencode-go` 能力位 ⇒ 构造器用例 |
-| `apps/coding-agent/src/capabilities.rs` | `set_effort` 保存 + 重建（factory 收到有效档位）+ 输出 `effort: high`；`None` 清除覆盖并输出配置默认 `high`；无凭证 ⇒ `wiring.model == None`；不支持的 provider 仍保存并给 warning；`/resume` 从目标 meta 还原并重建 | 只写 `config.effort` 不重建 ⇒ factory 断言；无凭证仍保留旧 model ⇒ 置空断言；漏 `cfg.effort = effort` ⇒ resume 用例 |
+| `adapters/model-openai-compatible/src/lib.rs` | `reasoning_effort` 显式值时原样序列化、`None` 时整个字段不出现；`constructors_pin_reasoning_effort_support` 钉住哪些 provider 声明支持（当前 `opencode-go` 与 `glm`），`effort_dialect_defaults_to_verbatim` 钉住默认方言 | 去掉 `skip_serializing_if` ⇒ 默认请求多出 `null`；关掉 `opencode-go` 能力位 ⇒ 构造器用例 |
+| `apps/coding-agent/src/capabilities.rs` | `set_effort` 保存 + 重建（factory 收到有效档位）+ 输出 `effort: high`；`None` 清除覆盖并输出配置默认 `high`；无凭证 ⇒ `wiring.model == None`；不发该字段时（provider 级或模型代际级）仍保存并给 warning，文案含 provider 与 model；`/resume` 从目标 meta 还原并重建 | 只写 `config.effort` 不重建 ⇒ factory 断言；无凭证仍保留旧 model ⇒ 置空断言；漏 `cfg.effort = effort` ⇒ resume 用例；把 `accepts_reasoning_effort()` 换回 `supports_reasoning_effort()` ⇒ 无法解析模型的 warning 用例 |
 | `apps/coding-agent/src/app_loop.rs` | `SetEffort` 臂产出 `Output` + 刷新 `View.effort`；`None` 清除覆盖后视图回到默认 `high`；`every_request_variant_is_handled` 覆盖该变体；回合末写入 / `/new` 保留 | 漏 `SetEffort` 臂 ⇒ `match` 不穷尽编译失败；只改 config 不刷视图 ⇒ `set_effort_updates_view`；回合末不写 ⇒ meta 用例 |
 | `apps/coding-agent/src/{main,view}.rs` | `finalize_turn_meta` 三态（写入 / 清除 / 不写）；启动期 `restore_effort_from_meta`；`CodingView.effort` 透传**有效**档位（覆盖或配置默认） | 无条件写 ⇒ 三态用例；视图写死 `None` ⇒ `test_build_view_passes_effort` |
 | `crates/ys-tui-coding/src/{commands,events}.rs` | 命令表 15 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例 |
@@ -1212,12 +1212,20 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 
 - `YUSHAN_REASONING_EFFORT` 取 `minimal|low|medium|high|xhigh|max`，大小写/空白归一化；
   未设置或非法值回落默认 **`high`**。非法值落一行诊断。
-- `Config::reasoning_effort()` 给出配置值；模型 factory 再按
-  `ProviderCompat::supports_reasoning_effort` 决定是否真正发送。当前只有
-  `opencode-go` 声明支持，其他 provider（含 `deepseek` / `minimax` / custom）继续不发送该字段。
+- `Config::reasoning_effort()` 给出配置值；模型 factory 再经**两层**门控决定是否真正发送、
+  以及发什么值：
+  - **provider 级** `ProviderCompat::supports_reasoning_effort` —— 当前 `opencode-go` 与
+    `glm` / `glm-coding` 声明支持；`deepseek` / `minimax` / custom 与未知端点不发送该字段。
+  - **模型级** `ProviderCompat::supports_effort(model)`（`Glm` 方言要求代际 ≥ 5.2，
+    无法解析代际时 fail-closed），实际下发值再由 `effort_for` 按方言折叠：
+    `glm-5.3` 上 `off|minimal|low → low`、`medium|high → high`、`xhigh|max → max`；
+    `glm-5.2` 上 `off|minimal → minimal`、`low|medium|high → high`、`xhigh|max → max`。
+    默认方言 `Verbatim` 逐字透传。详见 `docs/design-final/effort.md` §3 与
+    `docs/design-final/glm.md`。
 - `ChatCompletionRequest.reasoning_effort` 带 `skip_serializing_if`：库测试里 `None` 时
   wire JSON 不出现该键，`Some("low")` 时发送 `"reasoning_effort":"low"`。
-- `run_start` 记录实际生效的 `gen_ai.request.reasoning_effort`；provider 不支持时写 `null`。
+- `run_start` 的 `gen_ai.request.reasoning_effort` 记 **wire 值**（门控与折叠之后）；
+  字段不进请求时写 `null`。`app_loop` 的 `model_changed.reasoning_effort` 同一口径。
 
 真实 A/B（同模型 `opencode-go/deepseek-v4.1-flash`、`fact/1`）：旧行为中位 199.2s，
 `low` 为 72.4 / 88.6s 但质量 2/3，默认 `high` 三次为 64.4 / 100.7 / 201.4s，

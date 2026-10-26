@@ -503,12 +503,13 @@ impl Config {
         self.registry.compat_for(name)
     }
 
-    /// 当前 provider 是否声明接受 `reasoning_effort`。
+    /// 当前 provider **与当前模型** 是否接受 `reasoning_effort`。
     ///
-    /// 设置档位照常保存（切到支持的 provider 后立即生效），此处只决定是否给
-    /// 用户一条「本次请求不会发送思考字段」的提示。
-    pub fn supports_reasoning_effort(&self) -> bool {
-        self.current_compat().supports_reasoning_effort
+    /// 与 `ProviderCompat::supports_reasoning_effort` 的区别：后者只答「这个 provider 认不认
+    /// 该字段」，本函数还要求该模型 id 能被识别（GLM 需解析出 `glm-<major>.<minor>`，解析不出
+    /// 一律 fail-closed）。面向用户的「本次请求会不会发送思考字段」一律用本函数。
+    pub fn accepts_reasoning_effort(&self) -> bool {
+        self.current_compat().supports_effort(&self.model)
     }
 
     /// 当前 provider / api_base 要求的额外请求头（透传给适配器）。
@@ -886,6 +887,60 @@ mod tests {
         let compat = config.current_compat();
         assert!(!compat.has_reasoning_content);
         assert!(!compat.tool_calls_as_text);
+    }
+
+    /// `accepts_reasoning_effort` 是**模型级**判定：provider 能力位 + 该模型 id 的可解析性
+    /// 两条门都要过。
+    ///
+    /// GLM 的判据是**能否把 id 识别为 GLM 模型**（解析出 `glm-<major>.<minor>`），而不是代际
+    /// 是否够新：实测 5.2 及更早代际与 5.3 一样接受该字段，只是各自接受的档位集合不同
+    /// （允许值见 `ProviderCompat::effort_for` 的折叠表）。解析不出代际的 id 一律
+    /// fail-closed —— 非 GLM 模型收到该字段可能返回 400。
+    ///
+    /// 变异：把实现换成返回 `self.current_compat().supports_reasoning_effort` ⇒
+    /// `glm` + 无法解析 id 那条断言变红（从 `false` 变 `true`）。
+    #[test]
+    fn test_accepts_reasoning_effort_is_model_level() {
+        for (provider, model, expected) in [
+            // provider 级能力位就不支持：模型名无关。
+            ("deepseek", "deepseek-chat", false),
+            ("deepseek", "glm-5.3", false),
+            // `Verbatim` 方言没有模型级信息，信任能力位。
+            ("opencode-go", "any-model", true),
+            // GLM：能解析出代际就发（实测 5.2 及更早代际与 5.3 一样接受，只是档位集合不同）。
+            ("glm", "glm-5.3", true),
+            ("glm", "glm-5.3-flash", true),
+            ("glm", "glm-5.2", true),
+            // id 解析不出代际 ⇒ fail-closed。
+            ("glm", "not-glm-at-all", false),
+        ] {
+            let mut config = test_config(model);
+            config.provider = Some(provider.into());
+            assert_eq!(
+                config.accepts_reasoning_effort(),
+                expected,
+                "provider = {provider}, model = {model}"
+            );
+        }
+    }
+
+    /// 同一 provider 上 `ProviderCompat::supports_reasoning_effort` 与 `accepts_reasoning_effort`
+    /// **必须可分**：若两者总相等，模型级门控就白做了。
+    ///
+    /// 可分的形态是「provider 认字段，但模型 id 解析不出 GLM 代际」：GLM 的能力位为 `true`，
+    /// 而解析失败一律 fail-closed。代际新旧**不构成**差异 —— 实测 5.2 及更早代际也接受该字段。
+    #[test]
+    fn test_accepts_reasoning_effort_differs_from_provider_level() {
+        let mut config = test_config("some-unknown-id");
+        config.provider = Some("glm".into());
+        assert!(
+            config.current_compat().supports_reasoning_effort,
+            "provider 级：GLM 端点接受该字段"
+        );
+        assert!(
+            !config.accepts_reasoning_effort(),
+            "模型级：id 解析不出 GLM 代际 ⇒ fail-closed"
+        );
     }
 
     /// `request_headers` 跟着 `provider` / `api_base` 走：opencode-go 需要会话头，

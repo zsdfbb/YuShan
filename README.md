@@ -28,7 +28,7 @@
 同类工具都在往「大而全」走：语音、代码模式、插件市场、IDE 集成。**本项目反着走**：
 只做骨架，把重量留给别人。但仓库里有一个**能直接用的命令行 agent**，叫 `ys-coding-agent`——
 有 TUI，能读写文件、跑 shell、联网搜索，能开子 agent，能装 skill。
-不是 Demo，是日常真能拿来干活的工具。
+不是 Demo，是日常真能拿来干活的工具。本项目已经使用 ys-coding-agent 开发.
 
 ```console
 $ ys-coding-agent                       # 交互界面

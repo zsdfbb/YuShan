@@ -740,9 +740,15 @@ async fn unrelated_bad_request_does_not_trigger_stream_options_fallback() {
     );
 }
 
-/// 非法工具参数 JSON 是运行期诊断：必须进入 logger，仍按设计降级为 null。
+/// 非法工具参数 JSON 是运行期诊断：必须进入 logger，并按设计降级为**空对象**。
 ///
-/// 变异：改回 `eprintln!` ⇒ logger 为空且 TUI 会被污染。
+/// 降级目标不是 `Value::Null`：`arguments` 会随会话历史回传成
+/// `function.arguments` 字符串，`Value::Null` 序列化为字面量 `"null"`，实测
+/// minimax 对此返回 `400 (2013) invalid params`，且坏块已落盘 ⇒ 之后每个回合
+/// 都在 round=1 失败（只能 `/new` 自救）。空对象在工具层语义相同且线上合法。
+///
+/// 变异：把降级改回 `Value::Null` ⇒ `is_object` 与 `"{}"` 断言变红；
+/// 改回 `eprintln!` ⇒ logger 为空且 TUI 会被污染。
 #[tokio::test]
 async fn invalid_tool_arguments_warning_uses_logger() {
     let logs = logs();
@@ -762,7 +768,11 @@ data: [DONE]\n\n"
     let ys_core::ContentBlock::ToolUse { arguments, .. } = &response.message.content[0] else {
         panic!("应产出 ToolUse");
     };
-    assert_eq!(arguments, &serde_json::Value::Null);
+    assert!(
+        arguments.is_object(),
+        "降级必须产出 JSON 对象（线上 `\"{{}}\"`），不得是 null —— {arguments:?}"
+    );
+    assert_eq!(arguments, &serde_json::json!({}), "降级目标为空对象");
     let logs = logs.lock().unwrap().clone();
     assert!(
         logs.iter()

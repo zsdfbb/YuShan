@@ -21,13 +21,21 @@ use async_trait::async_trait;
 pub struct SessionRecovery {
     /// 为中断的 `ToolUse` 合成的 `ToolResult` 数量。
     pub repaired_tool_calls: usize,
+    /// 形状非法（非 JSON 对象）而被归一化为 `{}` 的 `ToolUse.arguments` 数量。
+    ///
+    /// 单独计数而非合并进 `repaired_tool_calls`：两者的用户可见后果不同 ——
+    /// 悬空调用是「少了一条工具结果」，参数非法是「会话会被端点持续 400 拒绕」
+    /// （实测 minimax），后者更需要用户知道。
+    pub normalized_tool_arguments: usize,
     /// 读取时跳过、无法判别为 `Message` 或 `SessionMeta` 的行数。
     pub skipped_lines: usize,
 }
 
 impl SessionRecovery {
     pub fn is_empty(&self) -> bool {
-        self.repaired_tool_calls == 0 && self.skipped_lines == 0
+        self.repaired_tool_calls == 0
+            && self.normalized_tool_arguments == 0
+            && self.skipped_lines == 0
     }
 }
 

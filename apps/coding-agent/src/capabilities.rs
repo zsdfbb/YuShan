@@ -581,6 +581,17 @@ pub fn session_recovery_notice(recovery: ys_session::SessionRecovery) -> String 
             recovery.repaired_tool_calls
         ));
     }
+    if recovery.normalized_tool_arguments > 0 {
+        let noun = if recovery.normalized_tool_arguments == 1 {
+            "tool call"
+        } else {
+            "tool calls"
+        };
+        parts.push(format!(
+            "normalized {} {noun} with non-object arguments",
+            recovery.normalized_tool_arguments
+        ));
+    }
     if recovery.skipped_lines > 0 {
         let noun = if recovery.skipped_lines == 1 {
             "line"
@@ -831,6 +842,7 @@ mod tests {
         assert_eq!(
             session_recovery_notice(SessionRecovery {
                 repaired_tool_calls: 1,
+                normalized_tool_arguments: 0,
                 skipped_lines: 0,
             }),
             "Session recovery: synthesized error results for 1 interrupted tool call."
@@ -838,6 +850,7 @@ mod tests {
         assert_eq!(
             session_recovery_notice(SessionRecovery {
                 repaired_tool_calls: 2,
+                normalized_tool_arguments: 0,
                 skipped_lines: 3,
             }),
             "Session recovery: synthesized error results for 2 interrupted tool calls; \
@@ -846,9 +859,30 @@ mod tests {
         assert_eq!(
             session_recovery_notice(SessionRecovery {
                 repaired_tool_calls: 0,
+                normalized_tool_arguments: 0,
                 skipped_lines: 1,
             }),
             "Session recovery: skipped 1 corrupt session line."
+        );
+        // 非对象参数的自愈必须单独可见：不报的话用户不知道「为何之前一直 400」。
+        assert_eq!(
+            session_recovery_notice(SessionRecovery {
+                repaired_tool_calls: 0,
+                normalized_tool_arguments: 2,
+                skipped_lines: 0,
+            }),
+            "Session recovery: normalized 2 tool calls with non-object arguments."
+        );
+        // 三个通道同时发生时按固定顺序拼接（repaired → normalized → skipped）。
+        assert_eq!(
+            session_recovery_notice(SessionRecovery {
+                repaired_tool_calls: 1,
+                normalized_tool_arguments: 1,
+                skipped_lines: 1,
+            }),
+            "Session recovery: synthesized error results for 1 interrupted tool call; \
+             normalized 1 tool call with non-object arguments; \
+             skipped 1 corrupt session line."
         );
     }
 

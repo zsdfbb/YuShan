@@ -939,14 +939,21 @@ impl ToolCallAccumulator {
         }
     }
 
-    /// 收敛为一个 `ToolUse` block。参数为空串（无参工具）时退化为 `null`。
+    /// 收敛为一个 `ToolUse` block。参数为空串（无参工具）时退化为 `{}`。
     fn into_content_block(self, log: &dyn Fn(&str)) -> ContentBlock {
-        // 已知降级：参数 JSON 非法时退化为 `Value::Null`（工具层看到空参数）。
-        // 这是保守兜底——不 panic，也不回喂错误结果（回喂涉及工具层协议，
-        // 超出适配器职责）；为使其可观测，非空但解析失败时打一条警告。
-        // 空串是「无参工具」的正常形态，不作为异常告警。
+        // 降级目标是**空对象 `{}`**，不是 `Value::Null`。
+        //
+        // `ContentBlock::ToolUse.arguments` 会随会话历史回传成
+        // `function.arguments` 字符串：`Value::Null` 序列化后是字面量 `"null"`，
+        // 而多家端点（实测 minimax 返回 `400 (2013) invalid params`）拒绝这个
+        // 形状——`arguments` 必须是 JSON **对象**。空对象在工具层语义相同
+        // （无参数），线上却是合法形态。
+        //
+        // 保守兜底：不 panic、不回喂错误结果（回喂涉及工具层协议，超出适配器
+        // 职责）；非空但解析失败时打一条警告以便观测。空串是「无参工具」的
+        // 正常形态，不作为异常告警。
         let arguments = if self.arguments.trim().is_empty() {
-            serde_json::Value::Null
+            serde_json::Value::Object(serde_json::Map::new())
         } else {
             match serde_json::from_str(&self.arguments) {
                 Ok(value) => value,
@@ -954,10 +961,10 @@ impl ToolCallAccumulator {
                     let prefix: String = self.arguments.chars().take(120).collect();
                     log(&format!(
                         "warning: model tool_call arguments for `{}` are not valid JSON \
-                         ({e}); falling back to null. arguments prefix: {prefix:?}",
+                         ({e}); falling back to {{}}. arguments prefix: {prefix:?}",
                         self.name
                     ));
-                    serde_json::Value::Null
+                    serde_json::Value::Object(serde_json::Map::new())
                 }
             }
         };
@@ -1219,12 +1226,26 @@ pub fn translate_request(
                     name,
                     arguments,
                 } => {
+                    // 出口兜底：`arguments` 必须是 JSON **对象**。
+                    //
+                    // 非对象值（尤其 `null`）序列化后会是字面量 `null` / `[]`，
+                    // 多家端点直接 400（实测 minimax：`400 (2013) invalid params`）。
+                    // 这里是**最后一道关口**：历史可能来自旧版本落盘的会话、手工编辑
+                    // 的 JSONL，或任何在别处生成的坏块 —— 只要放过去，就会每回合重放
+                    // 同一个错误，用户只能 `/new` 自救。
+                    //
+                    // 归一化不改语义（工具层看到的就是「无参数」），但保证线上合法。
+                    let arguments = if arguments.is_object() {
+                        arguments.to_string()
+                    } else {
+                        "{}".to_string()
+                    };
                     tool_calls.push(ChatToolCall {
                         id: id.0.clone(),
                         call_type: "function".into(),
                         function: ChatFunctionCall {
                             name: name.clone(),
-                            arguments: arguments.to_string(),
+                            arguments,
                         },
                     });
                 }
@@ -1345,6 +1366,84 @@ mod tests {
         assert_eq!(chat_req.messages.len(), 2); // system + user 各一条
         assert_eq!(chat_req.messages[0].role, "system");
         assert_eq!(chat_req.messages[1].role, "user");
+    }
+
+    /// **出口兜底**：`translate_request` 必须把非法 `arguments` 归一化为 `{}`。
+    ///
+    /// 这是最后一圈护栏：会话历史可能来自旧版本落盘的 JSONL、手工编辑，或任何在
+    /// 别处生成的坏块。只要 `null` 被发上线，minimax 就回 `400 (2013)`，且这个坏块
+    /// 已在历史里 ⇒ **每回合重放同一个错误**。
+    ///
+    /// 变异：把 `arguments.is_object()` 分支删掉（改回直接 `arguments.to_string()`）
+    /// ⇒ 本用例变红（拿到 `"null"` / `"[]"`）。
+    #[test]
+    fn translate_request_never_emits_non_object_tool_arguments() {
+        let config = OpenAICompatibleConfig {
+            api_base: "http://localhost".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            compat: ProviderCompat::standard(),
+        };
+
+        let bad_values = [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("null"),
+            serde_json::json!(42),
+        ];
+        for (i, bad) in bad_values.into_iter().enumerate() {
+            let request = ModelRequest {
+                messages: vec![ys_core::Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: ToolCallId(format!("call_{i}")),
+                        name: "edit".into(),
+                        arguments: bad.clone(),
+                    }],
+                }],
+                tools: vec![],
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                boundary: None,
+            };
+
+            let chat_req = translate_request(&request, &config).unwrap();
+            let serialized = &chat_req.messages[0].tool_calls.as_ref().unwrap()[0]
+                .function
+                .arguments;
+            assert_eq!(
+                serialized, "{}",
+                "非法 arguments（输入 {bad:?}）必须归一化为空对象，\
+                 不得线上发出 null / [] / 字面量"
+            );
+        }
+
+        // 合法的对象必须**原样保留**（归一化不得损害正常路径）。
+        let request = ModelRequest {
+            messages: vec![ys_core::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: ToolCallId("call_ok".into()),
+                    name: "edit".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                }],
+            }],
+            tools: vec![],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            boundary: None,
+        };
+        let chat_req = translate_request(&request, &config).unwrap();
+        let serialized = &chat_req.messages[0].tool_calls.as_ref().unwrap()[0]
+            .function
+            .arguments;
+        let parsed: serde_json::Value = serde_json::from_str(serialized).unwrap();
+        assert_eq!(parsed, serde_json::json!({"path": "a.rs"}));
     }
 
     #[test]
@@ -1508,6 +1607,70 @@ mod tests {
         assert_eq!(joined, "Hello, world");
         assert_eq!(joined, final_text, "增量拼接必须与终态文本逐字节相等");
         assert_eq!(response.finish_reason, FinishReason::Stop);
+    }
+
+    /// 空 `arguments` / 非法 JSON 的降级目标是**空对象 `{}`**，绝不是 `Value::Null`。
+    ///
+    /// 为什么必须钉住：`ToolUse.arguments` 会随会话历史回传为
+    /// `function.arguments` **字符串**。`Value::Null` 序列化后是字面量 `"null"`，
+    /// 实测 minimax 对此直接返回 `400 (2013) invalid params`（`arguments` 必须是
+    /// JSON 对象）。更糟的是这个 400 会**永久污染会话**：坏块已落盘，之后每个回合
+    /// 都在 round=1 失败（实测 turn 3 / turn 4 皆如此），用户只能 `/new` 自救。
+    ///
+    /// 变异：把任一降级分支改回 `serde_json::Value::Null`
+    /// ⇒ 下面的 `is_object` 断言变红。
+    #[test]
+    fn empty_or_invalid_tool_arguments_degrade_to_empty_object_not_null() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+
+        // ① 空串：无参工具的正常形态。
+        drive(
+            &mut buf,
+            &mut acc,
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_empty","function":{"name":"noargs","arguments":""}}]}}]}"#,
+        );
+        drive(&mut buf, &mut acc, b"\n");
+        // ② 非法 JSON：模型吐出被截断的参数。
+        drive(
+            &mut buf,
+            &mut acc,
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_bad","function":{"name":"edit","arguments":"{\"newText\":\"pub enum Content"}}]}}]}"#,
+        );
+        drive(&mut buf, &mut acc, b"\n");
+        drive(
+            &mut buf,
+            &mut acc,
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n",
+        );
+        drive(&mut buf, &mut acc, b"data: [DONE]\n");
+
+        let response = acc.finish().unwrap();
+        let uses: Vec<&ContentBlock> = response
+            .message
+            .content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .collect();
+        assert_eq!(uses.len(), 2, "两个工具调用都要收敛");
+
+        for block in uses {
+            let ContentBlock::ToolUse {
+                name, arguments, ..
+            } = block
+            else {
+                unreachable!()
+            };
+            assert!(
+                arguments.is_object(),
+                "`{name}` 的 arguments 必须是 JSON 对象（线上为 `{{}}`），\
+                 不得是 null —— 那会让 minimax 返回 400 (2013) 并污染会话。实际：{arguments:?}"
+            );
+            assert_eq!(arguments, &serde_json::json!({}), "`{name}` 应退化为空对象");
+            // 线上形态复核：序列化出的字符串必须是 "{}"，不是 "null"。
+            assert_eq!(arguments.to_string(), "{}", "`{name}` 线上形态必须是空对象");
+        }
     }
 
     /// 工具参数增量：同一 `index` 的 id/name/arguments 分多片下发，

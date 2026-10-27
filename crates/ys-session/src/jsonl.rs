@@ -32,8 +32,10 @@ impl JsonlSession {
             (None, Vec::new(), 0)
         };
         let repaired_tool_calls = repair_dangling_tool_calls(&mut messages);
+        let normalized_tool_arguments = normalize_tool_arguments(&mut messages);
         let recovery = SessionRecovery {
             repaired_tool_calls,
+            normalized_tool_arguments,
             skipped_lines,
         };
         let session = Self {
@@ -46,7 +48,7 @@ impl JsonlSession {
         };
         // 修复必须先落盘再交给调用方：只在内存里补结果会让下一次 resume 再次失败。
         // `flush_to_file` 沿用 tmp + rename；失败直接让 open 失败，不返回半修会话。
-        if repaired_tool_calls > 0 {
+        if repaired_tool_calls > 0 || normalized_tool_arguments > 0 {
             session.flush_to_file().await?;
         }
         Ok(session)
@@ -270,6 +272,31 @@ fn repair_dangling_tool_calls(messages: &mut Vec<Message>) -> usize {
     repaired
 }
 
+/// 归一化历史里**形状非法**的 `ToolUse.arguments`，返回修正的 block 数。
+///
+/// 契约与 [`repair_dangling_tool_calls`] 同源：会话文件可能来自旧版本、手工编辑，
+/// 或任何在别处生成的坏块，而 `arguments` 只允许是 JSON **对象**——非对象值
+/// （尤其 `null`）线上序列化为字面量 `null`，多家端点直接 400（实测 minimax
+/// `400 (2013) invalid params`），且**每个回合都会重放同一个错误**。
+///
+/// 归一化为 `{}` 不改语义（工具层看到的就是「无参数」），却让会话自愈：不必等
+/// 用户发现、也不必要求他 `/new`。与悬空 `ToolUse` 的修复一样，**必须先落盘再
+/// 交给调用方** —— 只在内存里改会让下一次 resume 再次失败。
+fn normalize_tool_arguments(messages: &mut [Message]) -> usize {
+    let mut fixed = 0usize;
+    for message in messages.iter_mut() {
+        for block in message.content.iter_mut() {
+            if let ContentBlock::ToolUse { arguments, .. } = block
+                && !arguments.is_object()
+            {
+                *arguments = serde_json::Value::Object(serde_json::Map::new());
+                fixed += 1;
+            }
+        }
+    }
+    fixed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +480,7 @@ mod tests {
             session.take_recovery(),
             Some(SessionRecovery {
                 repaired_tool_calls: 0,
+                normalized_tool_arguments: 0,
                 skipped_lines: 1,
             })
         );
@@ -669,10 +697,64 @@ mod tests {
             session.take_recovery(),
             Some(SessionRecovery {
                 repaired_tool_calls: 0,
+                normalized_tool_arguments: 0,
                 skipped_lines: 3,
             }),
             "坏行应计数并交给调用方记录，不得由库层直接打印"
         );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 存量会话里的**非法 `arguments` 自愈**：`null` 等非对象值必须被归一化为
+    /// `{}` 并**落盘**，否则每次 resume 都会把同一个 400 重放一遍。
+    ///
+    /// 实测根因：旧版本把「参数 JSON 解析失败」降级为 `Value::Null`，落盘后线上
+    /// 序列化为字面量 `null`，minimax 返回 `400 (2013) invalid params`，且之后每个
+    /// 回合都在 round=1 失败（只能 `/new` 自救）。
+    ///
+    /// 变异：删掉 `open()` 里的 `normalize_tool_arguments` 调用
+    /// ⇒ `take_recovery` 与 `reopened` 的断言均变红；只改内存不落盘 ⇒ `reopened` 变红。
+    #[tokio::test]
+    async fn non_object_tool_arguments_are_normalized_and_persisted() {
+        let path = temp_path("normalize_args");
+        let mut calls = tool_use_msg(&[("c1", "edit")]);
+        // 复现坏块：arguments 为 `null`（实际落盘后就是 `"ToolUse":{...,"arguments":null}`）。
+        calls.content[0] = ContentBlock::ToolUse {
+            id: ToolCallId("c1".into()),
+            name: "edit".into(),
+            arguments: serde_json::Value::Null,
+        };
+        write_messages(&path, &[calls, tool_result_msg(&[("c1", false)])]).await;
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(
+            session.take_recovery(),
+            Some(SessionRecovery {
+                repaired_tool_calls: 0,
+                normalized_tool_arguments: 1,
+                skipped_lines: 0,
+            }),
+            "非对象 arguments 必须计入修复摘要"
+        );
+        let ContentBlock::ToolUse { arguments, .. } = &session.messages()[0].content[0] else {
+            panic!("应仍为 ToolUse");
+        };
+        assert!(
+            arguments.is_object(),
+            "arguments 必须归一化为 JSON 对象，实际：{arguments:?}"
+        );
+
+        // **落盘**验证：重开不得再有修复（否则 resume 每次都报、且线上仍发 null）。
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert!(
+            reopened.recovery.is_none(),
+            "修复必须已落盘，重开不应再触发一次"
+        );
+        let ContentBlock::ToolUse { arguments, .. } = &reopened.messages()[0].content[0] else {
+            panic!("应仍为 ToolUse");
+        };
+        assert!(arguments.is_object(), "落盘后仍必须是对象");
 
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -687,6 +769,7 @@ mod tests {
             session.take_recovery(),
             Some(SessionRecovery {
                 repaired_tool_calls: 1,
+                normalized_tool_arguments: 0,
                 skipped_lines: 0,
             })
         );

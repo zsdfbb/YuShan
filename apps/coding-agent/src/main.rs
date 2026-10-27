@@ -4856,6 +4856,7 @@ mod tests {
     fn with_session_recovery_hint_preserves_existing_hint_and_skips_empty() {
         let recovery = ys_session::SessionRecovery {
             repaired_tool_calls: 1,
+            normalized_tool_arguments: 0,
             skipped_lines: 2,
         };
         let merged = with_session_recovery_hint(Some("原有提示".into()), Some(recovery))

@@ -140,12 +140,7 @@ impl Wiring {
         sessions_dir: PathBuf,
         path: Option<PathBuf>,
     ) -> Result<Self, SessionError> {
-        std::fs::create_dir_all(&sessions_dir).map_err(|e| {
-            SessionError::Storage(format!(
-                "failed to create sessions dir {}: {e}",
-                sessions_dir.display()
-            ))
-        })?;
+        ensure_sessions_dir(&sessions_dir)?;
         let path = path.unwrap_or_else(|| sessions_dir.join(format!("{}.jsonl", new_session_id())));
         let session = JsonlSession::open(&path).await?;
         Ok(Self {
@@ -158,16 +153,23 @@ impl Wiring {
         })
     }
 
-    /// **`/new`**：换新会话；旧会话文件保留（不删）。
+    /// 换新会话（`/new` 与 `/clear` 共用）；旧会话文件保留（不删、不改一个字节）。
     ///
-    /// 只 `JsonlSession::open`（**惰性**，不预建空文件）：新会话首次追加才落盘。
+    /// 只 `JsonlSession::open`（**惰性**，不预建空文件）：新会话首次追加才落盘 ——
+    /// 唯一的例外是 `ensure_sessions_dir` 会建**目录**（那一步不能推迟到 `flush_to_file`：
+    /// rename 要求父目录已在，而目录也可能在运行期被外部删掉）。
+    ///
     /// 顺序上**先 open 成功后才替换** `session` / `session_path`：任一步失败时状态
-    /// 保持原样，不会出现「会话未换却已丢历史」的半新半旧。
+    /// 保持原样，不会出现「会话未换却已丢历史」的半新半旧 —— `/clear` 依赖这条：
+    /// 失败时它必须**不**清屏（见 `capabilities::clear_session` 的 `bool` 返回值）。
     ///
     /// 返回新会话文件路径（一次性会话返回 `None`）。
     pub async fn new_session(&mut self) -> Result<Option<PathBuf>, SessionError> {
         match &self.sessions_dir {
             Some(dir) => {
+                // 与 [`Wiring::persistent_at`] 同规：目录不存在时首次 `flush_to_file`
+                // 的 rename 会失败（目录也可能在运行期被外部删掉）⇒ 换会话前先确保它在。
+                ensure_sessions_dir(dir)?;
                 let path = dir.join(format!("{}.jsonl", new_session_id()));
                 let session = JsonlSession::open(&path).await?;
                 self.session = Box::new(session);
@@ -330,6 +332,20 @@ impl Wiring {
         f(&mut meta);
         self.session.set_meta(meta).await
     }
+}
+
+/// 会话落盘目录：**两个**入口（`persistent_at` 与 `new_session`）共用。
+///
+/// 惰性落盘只在首次 `append` / `set_meta` 时 `flush_to_file`，那一步的 rename 要求
+/// 父目录已在 ⇒ 建目录不能只做在进程启动时。`sessions_dir` 若被一个**普通文件**占住
+/// （或父路径不可穿越），这里就是唯一会报错的地方。
+fn ensure_sessions_dir(dir: &Path) -> Result<(), SessionError> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        SessionError::Storage(format!(
+            "failed to create sessions dir {}: {e}",
+            dir.display()
+        ))
+    })
 }
 
 /// 会话 id：`{unix 秒}_{纳秒零填充}`。按字典序即时间序。

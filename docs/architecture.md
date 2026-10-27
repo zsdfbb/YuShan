@@ -658,7 +658,7 @@ transcript，`-p` / `--json` 走 stderr）。
 都发 `Request::ResumeSession{target}`。app 侧把「恢复一个既有会话」做成与启动期**共用的能力路径** ——
 同一条模型优先级链、同样的统计播种（`TurnStats` 由 meta 落值、`session_started` 不恢复）、同一份历史
 （经 `Outbound::SessionResumed` 回放上屏）。切换失败**不改状态**；切换是**替换而非合并** —— `Wiring.session`
-整体替换、内存里的旧 transcript 被丢弃、**磁盘上的旧文件不删**（`/new` 同此）。
+整体替换、内存里的旧 transcript 被丢弃、**磁盘上的旧文件不删**（`/new`、`/clear` 同此）。
 
 **meta 首行**（可缺省）：形状
 `{"type":"meta","v":1,"title":…,"provider":…,"model":…,"thinking_visible":…,"input_tokens":…,"output_tokens":…,"turns":…,"created_at":…}`；
@@ -759,7 +759,7 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 
 ## 14. `ys-tui-coding` 形态与命令分工
 
-**表在 TUI 侧**（`crates/ys-tui-coding/src/commands.rs`，14 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`crates/ys-tui-coding/src/commands.rs`，17 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app（`capabilities.rs`）。二者唯一契约是 `Request` ——
 漏实现是**编译错误**（app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -787,6 +787,7 @@ flowchart TB
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
 | `/new` | — | `NewSession` |
+| `/clear` | **清屏 + 清空上下文**（旧会话文件保留，可 `/resume` 找回）；回合中发出则先补一行提示，本回合结束后才执行 | `ClearSession` |
 | `/resume [id]` | 无参时**浮层选择**（会话列表，Esc 取消）；有参**直切** | `ListSessions` / `ResumeSession` |
 | `/compact` | 空闲 ⇒ 立即压；**回合中 ⇒ 改投 `Boundary::Compact`**，下一个轮边界执行（ADR-0052） | `Compact` |
 | `/export [path]` | — | `Export` |
@@ -797,7 +798,8 @@ flowchart TB
 
 **app 侧能力**（`apps/coding-agent/src/capabilities.rs`）：`login` / `logout` / `set_model` /
 `set_effort` / `new_session` / `compact` / `export` 每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
-`Outbound::Output`；`list_sessions` 返回 `Vec<SessionSummary>`（走 `Outbound::SessionList`）；
+`Outbound::Output`；`clear_session` 返回 `(Vec<String>, bool)` —— 那个 `bool` 就是「要不要清屏」，
+为真时 `app_loop` 先发 `Outbound::SessionCleared`、再发那些行；`list_sessions` 返回 `Vec<SessionSummary>`（走 `Outbound::SessionList`）；
 `resume_session` 返回「文本行 + 可选 `ResumedSession`」（成功后由 `app_loop` 组装
 `Outbound::SessionResumed`）。
 

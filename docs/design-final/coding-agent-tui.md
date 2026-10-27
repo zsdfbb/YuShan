@@ -336,7 +336,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 ## 6. 命令划分：TUI 侧表 vs app 侧能力
 
-**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，15 条 `CommandSpec`）：命令的**用户可见行为**
+**表在 TUI 侧**（`ys-tui-coding/src/commands.rs`，17 条 `CommandSpec`）：命令的**用户可见行为**
 （提示什么、问什么）归 UI；**能力实现**归 app。二者唯一契约是 `Request` —— 漏实现是**编译错误**
 （app 循环对 `Request` 的 `match` 必须穷尽），不会静默漂移。
 
@@ -363,6 +363,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | `/login` | **问 provider / api_key**（`Prompter` 浮层） | `Login` |
 | `/logout` | — | `Logout` |
 | `/new` | — | `NewSession` |
+| `/clear` | — （清屏由 app 回来的 `Outbound::SessionCleared` 触发） | `ClearSession` |
 | `/resume [id]` | 无参时**浮层列出现有会话**供选择（Esc 取消、空列表只提示）；有参直切 | `ListSessions` / `ResumeSession` |
 | `/compact` | 空闲 ⇒ 直发；**回合中 ⇒ 改投 `Boundary::Compact`**（轮边界执行，见 ADR-0052） | `Compact` |
 | `/export [path]` | — | `Export` |
@@ -374,13 +375,17 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 
 **app 侧能力**（`apps/coding-agent/src/capabilities.rs`）：`login` / `logout` / `set_model` /
 `set_effort` / `new_session` / `compact` / `export`，每个返回 `Vec<String>`（每项一行），由 `app_loop` 包成
-`Outbound::Output`。**本模块绝不 print**（TUI 起屏后 stderr/stdout 会冲掉整屏）。
-`new_session` / `compact` 是 `async`（碰 `Session`），`export` 是**同步**（见 §8）。
+`Outbound::Output`；`clear_session` 返回 `(Vec<String>, bool)` —— 第二个值即「要不要清屏」。**本模块绝不 print**（TUI 起屏后 stderr/stdout 会冲掉整屏）。
+`new_session` / `clear_session` / `compact` 是 `async`（碰 `Session`），`export` 是**同步**（见 §8）。
 
-> **回合中投递**：`/compact` 是**唯一**按 `is_turning` 分流去向的命令 —— 空闲走 `Request::Compact`
+> **回合中投递**：`/compact` 是唯一**改投边界**的命令 —— 空闲走 `Request::Compact`
 > （外层循环立即处理），回合中改投 `Boundary::Compact`（下一个轮边界执行），并在提交时当场
 > 补一行「已请求压缩，将在下一轮边界执行…」。理由：`request_rx` 只在回合之间被消费，
 > 回合中投 `Request` 要等整个回合跑完（实测 7 分钟）。见 ADR-0052。
+>
+> **`/clear` 也看 `is_turning`，但不改投**：回合中同样当场补一行「已请求清空，将在本回合结束后执行…」，
+> 而 `Request::ClearSession` **照常投进 `request_rx`** —— 那个信道只在回合之间被消费，请求由此自然延后到
+> 回合边界执行。清空不是轮边界动作（不投 `Boundary`）；当场也不清屏，否则正在跑的回合输出会被抹掉。
 >
 > **开始 / 结束两行提示**（两条路径都有）：`/compact` 会先给一行「Compacting context (~N tokens)…」，
 > 压完再给「Compacted: ~N → ~M tokens (… summarized, … kept)」。开始行必须在压缩那次 `await`
@@ -451,7 +456,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | D3 | app 循环伪代码把 `boundary_rx` 直接交给 `BasicLoop`（§7） | app 侧在 `select!` 里把 `boundary_rx` 收到的 `Boundary` **push 进每回合新建的 `QueueBoundarySource`** | ① app 循环在回合中已经 `select!` 着 `boundary_rx`，顺手泵进源即可；② 一次性源避免 `Abort` 标记跨回合污染（§4）。另加空闲期排空残留 |
 | D4 | app 循环伪代码在回合末**不排空**事件信道（§7） | 回合结束后 `while let Ok(env) = sink_rx.try_recv()` 排空 | `select!` 分支选择是随机的，可能先选中 `turn` 分支 —— 此刻 `RunFinished` 等收尾事件还躺在信道里；不排空会晚一整回合转发（`is_turning` 不复位、turn 摘要不显示） |
 | D5 | `CodingView` 字段清单「含 `ToolCallId → ToolCall` 映射，供工具结果回填」（§9 未决） | **视图不含映射**；结果回填靠 **UI 侧** `App` 自己的 `tool_index`（transcript 下标） | 视图只承载「状态行 / `/status`」要显示的东西；回填是渲染关注点，归 UI |
-| D6 | 命令表只有 §6 的 9 条 | 表里有 **15 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）、**`/resume`**（运行期切换会话落地后补，见 §8.2 M19）、**`/effort`**（思考档位落地后补，见 §8.2 M21）与 **`/theme`**（配色主题落地后补，见 §14.9） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md`；`/effort` 见 `docs/design-final/effort.md`；`/theme` 见 §14.9 与 ADR-0053 |
+| D6 | 命令表只有 §6 的 9 条 | 表里有 **17 条**，多出 `/thinking`、`/copy`（后者 §6 表里写「本地」但表头只有 9 行）、**`/skills`**（skills 特性落地后补，**已同时写回 design §6 表**，故不是偏离）、**`/resume`**（运行期切换会话落地后补，见 §8.2 M19）、**`/effort`**（思考档位落地后补，见 §8.2 M21）、**`/theme`**（配色主题落地后补，见 §14.9）与 **`/clear`**（清屏 + 换会话文件落地后补，见本节新增 M22） | `/thinking` 在 §2.1 UI 规格里出现（`/thinking on`），实现把它做成**本地命令**（`Thinking(Option<bool>)`，无参 toggle）；`/copy` 是 §6 表里的「本地」项；`/skills` 见 §8.2 M4；`/resume` 见 `docs/design-final/runtime-resume.md`；`/effort` 见 `docs/design-final/effort.md`；`/theme` 见 §14.9 与 ADR-0053；`/clear` 见 §8.2 M22 |
 | D7 | 初始化顺序编号为 1.信道 2.sink 3.阻塞 Wiring 4.Agent 5.view₀ 6.spawn（§7） | 实际 1+2.channel/sink → **4.Agent** → **3.阻塞 Wiring** → 5.view₀ → 6.spawn | Agent 构建不阻塞、不依赖 Wiring；先建 Agent 后建 Wiring 不破坏 R7 的承重结论（**阻塞早退发生在 spawn 之前**，`begin_turn` 只在 agent 真跑时发生） |
 | D8 | `ys-protocol` 里的 `Envelope` / `LifecyclePolicy`「迁往 ys-protocol」（review R1 建议） | 已迁；`ys-channel` 整 crate 删除 | 见 `core-channel.md` §8 |
 | D9 | 设计 §4 说 app 的 `format.rs`「只剩 `format_tokens`」 | app 的 `format.rs` **删除**；`format_tokens` / `format_duration` 落在 `ys-tui-coding/src/format.rs` | 唯一消费者（渲染）已在 TUI crate |
@@ -485,6 +490,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M19 | **`/resume` 运行期切换会话**（ADR-0033，取代 ADR-0026 决策 6）：无参 → 浮层（候选挂 `App.pending_sessions`，由 `resolve_session_pick` 决策、标签含**完整 id** 以供反解、Esc 取消、空列表只提示不弹浮层）；有参 → 直切。app 侧 `resume_session` **可失败步全部前置**（解析 → 读 meta → 纯解析模型四字段 → 构建候选 model），`wiring.resume_into` **open 成功才替换**句柄（失败 ⇒ 当前会话全不变）。UI 侧回放经 `Outbound::SessionResumed` → `reset_for_replay()` + `replay_lines()`，**必须显式 `RenderCache::reset()`**（回放是本 app **第一个**清屏/缩短 transcript 的操作）。启动期 `--resume` 复用同一通路、顺带修掉空屏（出站顺序 `SessionResumed` 先于启动提示）。**`-p` / `--json` 不受影响**（不收 `Outbound`） | `ys-protocol/src/{session,request,lib}.rs`；`ys-tui-coding/src/{cache,transcript,commands,prompter,app,run,lib}.rs`；`apps/coding-agent/src/{wiring,capabilities,main,app_loop,sessions}.rs`；`apps/coding-agent/tests/resume_cli.rs`；见 `docs/design-final/runtime-resume.md` |
 | M20 | **模态选择器带常驻筛选输入框**：`select_modal`（`run.rs`）在候选列表**之上**加一行输入框 —— 打开即可敲字，大小写不敏感**子串**匹配**整条候选串**，↑↓ 在**过滤后**的列表里移动，Enter 确认（**无匹配时不动作**，取消的唯一出口是 Esc），Esc 取消；`Backspace/Delete/←→/Home/End` 与 `Paste` 编辑筛选串。空查询 ⇒ 过滤结果 = 全体 ⇒ 行为与「纯列表」逐字一致。四个模态命令（provider / model / skill / session）**共用** `select_modal`，故筛选对它们一并生效。两条纯函数（`filter_indices` / `clamp_selection`）与 `modal_move` 并列抽出，理由相同：模态循环要真终端，语义只能靠纯函数钉进单测 —— 尤其 `clamp_selection`，查询收窄后不收敛 `selected` 会让 `filtered[selected]` 越界 panic。**筛选框为空时显示占位文案「输入以筛选…」**（可筛选这件事在输入框里说，**不进标题** —— 标题塞提示会把框撑到 60+ 列，窄终端下反被裁掉） | `crates/ys-tui-coding/src/{run,draw}.rs` |
 | M21 | **`/effort` 不镜像本地状态，且设置走模型重建**：① 与 `/thinking` 不同，`/effort <level>` **不经**「本地先写一行 + 镜像 Request」——档位真值在 app 侧 `Config.effort`，TUI 只读 `CodingView.effort`；本地先改会让 UI 早于 app 显示一个**尚未重建模型**的档位，命令成功与否也无从区分。无参显示是纯本地读快照。② 档位**随会话 meta 持久化**（`SessionMeta.effort`）：它描述「本会话想用什么思考深度」，与 `/thinking` 的显示偏好同属会话级状态；`/new` 不重置（同 `thinking_visible`），`/resume` 从目标 meta 还原并重建，`-p` / `--json` **只读不写**（不覆盖既有会话）。③ 有效档位经 `Config::effective_reasoning_effort()`（会话覆盖优先，否则配置默认 `high`）交给 `ProviderCompat::effort_for(model, ..)`（provider 级能力位 + 模型级代际两层门控，并按方言折叠），产出写进 `OpenAICompatibleConfig.reasoning_effort`；只有**重建 model** 才能进请求；`set_effort` 与 `set_model` 同路径（无凭证 ⇒ `wiring.set_model(None)`），故下一个回合（含 subagent / compact 的工厂构造）自动继承，回合内不热切换 | `ys-tui-coding/src/{commands,events,view}.rs`；`apps/coding-agent/src/{config,capabilities,app_loop,main,view}.rs`；`crates/ys-protocol/src/request.rs`；`crates/ys-session/src/meta.rs`；见 `docs/design-final/effort.md` |
+| M22 | **`/clear`：清屏 + 清空上下文，旧会话文件保留**：TUI 侧 `parse` 把 `/clear` 映射为 `Action::Request(Request::ClearSession)`；app 侧 `capabilities::clear_session` 复用 `Wiring::new_session()`（**换一个新会话文件**，旧文件一个字节不动 ⇒ 可 `/resume` 找回，也留给事后分析）。**不用 `Session::clear()`**：`JsonlSession::append` 每次都把内存里的 messages 全量重写目标文件，原地清空后再发一条消息，文件就被重写成只剩新消息，旧内容永久丢失。成功时 app 先发 `Outbound::SessionCleared`（UI 见它即 `App::reset_for_replay()` 清屏 —— 同一函数包含 `RenderCache` / 布局记忆 / 选区的重置），**再**发 `Output` 提示行；失败时只有 `Output` 错误行，屏上内容不动。回合中敲 `/clear`：当场给一行「已请求清空，将在本回合结束后执行…」，`Request` 照常投出、由 `request_rx` 在回合边界被消费（不改投 `Boundary`），当场**不清屏**（否则正在跑的回合输出会被抹掉）。与 `/new` 的差别：`/clear` 清屏，`/new` 不清；两者都保留旧会话文件 | `ys-protocol/src/request.rs`；`ys-tui-coding/src/{commands,app,events,cache}.rs`；`apps/coding-agent/src/{capabilities,app_loop}.rs` |
 
 ---
 
@@ -563,12 +569,13 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
 | `apps/coding-agent/src/capabilities.rs` | `set_effort` 保存 + 重建（factory 收到有效档位）+ 输出 `effort: high`；`None` 清除覆盖并输出配置默认 `high`；无凭证 ⇒ `wiring.model == None`；不发该字段时（provider 级或模型代际级）仍保存并给 warning，文案含 provider 与 model；`/resume` 从目标 meta 还原并重建 | 只写 `config.effort` 不重建 ⇒ factory 断言；无凭证仍保留旧 model ⇒ 置空断言；漏 `cfg.effort = effort` ⇒ resume 用例；把 `accepts_reasoning_effort()` 换回 `supports_reasoning_effort()` ⇒ 无法解析模型的 warning 用例 |
 | `apps/coding-agent/src/app_loop.rs` | `SetEffort` 臂产出 `Output` + 刷新 `View.effort`；`None` 清除覆盖后视图回到默认 `high`；`every_request_variant_is_handled` 覆盖该变体；回合末写入 / `/new` 保留 | 漏 `SetEffort` 臂 ⇒ `match` 不穷尽编译失败；只改 config 不刷视图 ⇒ `set_effort_updates_view`；回合末不写 ⇒ meta 用例 |
 | `apps/coding-agent/src/{main,view}.rs` | `finalize_turn_meta` 三态（写入 / 清除 / 不写）；启动期 `restore_effort_from_meta`；`CodingView.effort` 透传**有效**档位（覆盖或配置默认） | 无条件写 ⇒ 三态用例；视图写死 `None` ⇒ `test_build_view_passes_effort` |
-| `crates/ys-tui-coding/src/{commands,events}.rs` | 命令表 15 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例 |
+| `crates/ys-tui-coding/src/{commands,events,app,cache}.rs` | 命令表 17 条；`/effort` 四形态（无参本地、合法档位、`default`、非法值）；无参恰好一条 System 行且不发请求；有参只发一条 `SetEffort`、不改 transcript；`/status` 用规范拼写；`/clear` 映射到 `Request::ClearSession`、空闲时不写本地提示行、回合中照常投请求**不投 `Boundary`**、当场只多一条提示行；`Outbound::SessionCleared` 清屏且使 md 缓存失效；`/clear` 前后的旧会话文件逐字节不变 | 删 `default` 分支 ⇒ 四形态用例；把 `/effort` 接进 `/thinking` 的镜像路径 ⇒ 事件用例；删 `dispatch` 里 `/clear` 的 `is_turning` 提示行 ⇒ 回合中用例；把 `/clear` 改成 `Session::clear()` ⇒ 旧文件保留用例 |
 | `crates/ys-protocol/src/boundary.rs` | `Compact` 不置 `aborted`、参与 FIFO、`Debug` 不泄露正文、`has_pending_steer` **包含** `Compact` | 把 `push` 的 `Abort` 判定放宽到 `Compact` ⇒ abort 用例；扫描改回只匹配 `Steer(_)` ⇒ 探针用例 |
 | `crates/ys-loop/src/basic.rs` | 轮边界收到 `Compact` ⇒ 就地压（**不判阈值**）+ `purpose=Compaction` 上报 + 本轮只跑一轮；**收场前**收到 `Compact` ⇒ 压了但 `rounds` 不增 | 删 `Boundary::Compact` 臂 ⇒ 不压缩；把它设成 `consumed = true` ⇒ `rounds` 1→2 |
 | `crates/ys-tui-coding/src/events.rs` | 回合中 `/compact` ⇒ 投 `Boundary::Compact`、**不**投 `Request`、当场出一行反馈；空闲 `/compact` ⇒ 仍投 `Request::Compact` | 删 `is_turning` 分流分支 ⇒ 回合中用例；去掉守卫 ⇒ 空闲用例 |
 | `apps/coding-agent/src/app_loop.rs` | 回合中投 `Boundary::Compact` ⇒ 本回合出站序列里出现 `ContextCompacted`（不等回合结束） | 删 `Compact` 臂 ⇒ 不压缩 ⇒ 红 |
-| `scripts/doc-consistency.sh` | architecture.md 命令表含 `/effort` 且计数为 14 条 | 计数回退 / 命令表漏行 ⇒ 脚本非零退出 |
+| `apps/coding-agent/src/{capabilities,app_loop}.rs` | `clear_session` 换新会话文件且**旧文件逐字节不变**；成功返回 `(lines, true)`、失败返回 `(一行错误, false)`；`ClearSession` 臂的 `SessionCleared` 排在 `Output` **之前**、失败时**不发** `SessionCleared`（`clear_session_failure_sends_no_session_cleared`）；与 `/new` 一样切新 debug 文件并重置 `session_started` | 把 `true` 改成 `false` ⇒ 顺序 / 清屏断言变红；失败臂也发 `SessionCleared` ⇒ 失败路径用例（`clear_session_reports_failure_without_clearing` + `clear_session_failure_sends_no_session_cleared`）；退回 `Session::clear()` ⇒ 旧文件保留用例 |
+| `scripts/doc-consistency.sh` | architecture.md 命令表含 `/effort` 与 `/clear` 且计数为 17 条 | 计数回退 / 命令表漏行 ⇒ 脚本非零退出 |
 
 ---
 
@@ -578,7 +585,7 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
   无 model / 无事可压 / 摘要失败三条路径**都不动 session**，只给一行提示。（此条原为「占位」缺口，已闭合。）
 - `/copy` 无剪贴板集成（v1 把内容写进 transcript，手动选中）。
 - `/new` 后 `App.transcript` 不清（旧对话行仍在屏上；`CodingView.message_count` 已归零）—— 与
-  `core-channel.md` §7.7 记录的同一行为，本版未改。
+  `core-channel.md` §7.7 记录的同一行为，本版未改。需要清屏用 `/clear`（旧会话文件同样保留）。
 - `-p` / `--json` 无 steering 生产者：轮边界机制代码路径完整、有单测与跨 crate 集成覆盖，
   但 CLI 形态下无人投 `Boundary`（交互 TUI 才用得上）。
 - `ys-tui-coding` 的模态浮层与补全浮层共享 `Clear` 后覆盖渲染，未做统一的 `Overlay` 抽象
@@ -1044,7 +1051,7 @@ App::set_theme(kind)                       // 唯一入口
 
 #### 命令表
 
-`COMMANDS` 为 **15 条**（新增 `theme`，`arg_hint = Some("[name]")`）。`/theme` 在**三个面**上同源：
+`COMMANDS` 为 **17 条**（新增 `theme`，`arg_hint = Some("[name]")`）。`/theme` 在**三个面**上同源：
 命令表、补全浮层（`/them` → 唯一命中）、`/help` 正文。
 
 #### 紫色守卫

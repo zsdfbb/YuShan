@@ -353,6 +353,49 @@ pub async fn new_session(wiring: &mut Wiring) -> Vec<String> {
     }
 }
 
+/// `/clear`：清空对话上下文（换新会话文件），**旧会话文件保留**。
+///
+/// 与 [`new_session`] 走同一个能力（`Wiring::new_session`），差别只在文案：
+/// `/clear` 的用户预期是「清理」，不说清旧文件的去向，他就不知道还能不能找回 ——
+/// 故这里必须把**旧会话文件路径**打出来。
+///
+/// **不用 `Session::clear()`**：`JsonlSession::append` 每次都把内存里的 messages
+/// **全量重写**目标文件 ⇒ 原地清空后再发一条消息，旧内容就被重写掉了，与
+/// 「旧会话文件保留供事后分析」的需求直接冲突。
+///
+/// 返回值的第二个分量 = **是否成功**。调用方据此决定要不要发
+/// [`Outbound::SessionCleared`](ys_protocol::Outbound::SessionCleared)：失败绝不能
+/// 清屏，否则会出现「屏空了、历史其实还在」。
+///
+/// 变异：把成功分支的 `true` 改成 `false` ⇒ app_loop 侧的
+/// `clear_session_keeps_old_file_and_blanks_screen` 变红（该臂不再发出站消息）；
+/// 把失败分支的 `false` 改成 `true` ⇒ 本 crate 的
+/// `clear_session_reports_failure_without_clearing` 与 app_loop 侧的
+/// `clear_session_failure_sends_no_session_cleared` 同时变红（后者会多一条
+/// `SessionCleared` ⇒ 清屏而历史还在）。
+pub async fn clear_session(wiring: &mut Wiring) -> (Vec<String>, bool) {
+    // 换会话**之前**取旧路径 —— `new_session` 之后槽里已是新 id。
+    let old = wiring.session_path().map(Path::to_path_buf);
+    match wiring.new_session().await {
+        Ok(path) => {
+            let mut lines = vec!["Context cleared. The conversation starts fresh.".to_string()];
+            match old.as_ref() {
+                Some(prev) => {
+                    lines.push(format!("Previous transcript kept at: {}", prev.display()))
+                }
+                // 一次性会话：没有落盘文件可保留 ⇒ 明说，别让用户以为找得回来。
+                None => lines
+                    .push("This session was not persisted; nothing was kept on disk.".to_string()),
+            }
+            if let Some(p) = path {
+                lines.push(format!("New session: {}", p.display()));
+            }
+            (lines, true)
+        }
+        Err(e) => (vec![format!("Failed to clear context: {e}")], false),
+    }
+}
+
 /// 「没有 model」的唯一提示文案。
 ///
 /// 单点定义：`compact_blockers` 与 [`compact`] 的防御分支都取这一行。两条路各写一遍
@@ -1431,6 +1474,138 @@ mod tests {
         assert_eq!(reopened.messages().len(), 1, "新文件只含新会话内容");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/clear`（持久会话）：换到新文件、旧文件**一字不丢**，文案交代旧路径。
+    ///
+    /// 变异：把成功分支的 `true` 改成 `false` ⇒ 第一条断言变红；
+    /// 把 `Wiring::new_session` 换成 `ports().session.clear()` ⇒ 重开旧文件得 0 条（旧内容
+    /// 被重写）且路径不变，后两条断言变红。
+    #[tokio::test]
+    async fn clear_session_keeps_old_file() {
+        use ys_session::{JsonlSession, Session as _};
+
+        let dir = temp_dir("clearsession");
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        let old = wiring.session_path().unwrap().to_path_buf();
+        for text in ["hi", "there"] {
+            wiring
+                .ports()
+                .session
+                .append(ys_core::Message {
+                    role: ys_core::Role::User,
+                    content: vec![ys_core::ContentBlock::Text { text: text.into() }],
+                })
+                .await
+                .unwrap();
+        }
+
+        let (out, ok) = clear_session(&mut wiring).await;
+
+        assert!(ok, "持久会话换文件应成功：{out:?}");
+        let new = wiring.session_path().unwrap().to_path_buf();
+        assert_ne!(old, new, "应换到新会话文件");
+        assert!(wiring.session_messages().is_empty(), "上下文已清空");
+        assert!(
+            out.iter().any(|l| l.contains(&old.display().to_string())),
+            "文案必须交代旧会话文件去向：{out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("Context cleared")),
+            "首行应是清理提示：{out:?}"
+        );
+        // 旧文件仍在，且内容一字未动（换文件而非原地清空）。
+        assert!(old.exists(), "旧会话文件必须保留");
+        let reopened = JsonlSession::open(&old).await.unwrap();
+        assert_eq!(reopened.messages().len(), 2, "旧文件内容不得被重写");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/clear`（一次性会话）：没有落盘文件可保留 ⇒ 文案明说，别让用户以为找得回来。
+    #[tokio::test]
+    async fn clear_session_ephemeral_says_nothing_kept() {
+        let mut wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        wiring
+            .ports()
+            .session
+            .append(ys_core::Message {
+                role: ys_core::Role::User,
+                content: vec![ys_core::ContentBlock::Text { text: "hi".into() }],
+            })
+            .await
+            .unwrap();
+
+        let (out, ok) = clear_session(&mut wiring).await;
+
+        assert!(ok, "一次性会话换会话也应成功：{out:?}");
+        assert!(wiring.session_messages().is_empty(), "上下文已清空");
+        assert!(
+            out.iter().any(|l| l.contains("nothing was kept on disk")),
+            "必须明说没有落盘文件可保留：{out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("Previous transcript")),
+            "一次性会话没有旧路径可报：{out:?}"
+        );
+    }
+
+    /// `/clear`（失败）：报一行错误且 `ok == false`，**原会话一字不动**。
+    ///
+    /// 失败的现实构造：`sessions_dir` 被一个**普通文件**占住 ⇒ `Wiring::new_session`
+    /// 里建目录/打开新文件必然失败（无需 chmod，跨平台一致）。
+    ///
+    /// 变异：把 `Err` 分支的 `false` 改成 `true` ⇒ 第一条断言变红（app_loop 侧就会
+    /// 清屏，而历史其实还在）；把 `Err` 分支改成先换会话再报错（如先
+    /// `self.session = Box::new(MemorySession::new())`）⇒ 历史快照断言变红。
+    #[tokio::test]
+    async fn clear_session_reports_failure_without_clearing() {
+        let root = temp_dir("clearsession_fail");
+        let dir = root.join("sessions");
+        let mut wiring = Wiring::persistent_new(None, Box::new(CollectingSink::new()), dir.clone())
+            .await
+            .unwrap();
+        wiring
+            .ports()
+            .session
+            .append(ys_core::Message {
+                role: ys_core::Role::User,
+                content: vec![ys_core::ContentBlock::Text { text: "hi".into() }],
+            })
+            .await
+            .unwrap();
+        let before = wiring.session_messages().to_vec();
+        let old_path = wiring.session_path().map(Path::to_path_buf);
+
+        // 把落盘目录换成一个普通文件 —— 下一次换会话必然失败。
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a dir").unwrap();
+
+        let (out, ok) = clear_session(&mut wiring).await;
+
+        assert!(
+            !ok,
+            "换会话失败时必须返回 false（否则调用方会清屏）：{out:?}"
+        );
+        assert_eq!(out.len(), 1, "失败只报一行：{out:?}");
+        assert!(
+            out[0].starts_with("Failed to clear context"),
+            "失败文案：{out:?}"
+        );
+        assert_eq!(
+            wiring.session_messages(),
+            before.as_slice(),
+            "换会话失败时原会话消息必须原样保留"
+        );
+        assert_eq!(
+            wiring.session_path().map(Path::to_path_buf),
+            old_path,
+            "失败时不得换会话文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **开场判定 —— 会压时给一行带估算值的开始行**。

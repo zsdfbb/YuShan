@@ -196,8 +196,8 @@ TUI 输入
 | app 循环（`app_loop.rs`） | `set_effort_updates_view`（覆盖更新、清除后回到默认）；`every_request_variant_is_handled` 覆盖该变体；`turn_end_persists_effort_to_meta`；`effort_survives_new_session` | 漏 `SetEffort` 臂 ⇒ 编译失败；回合末不写 meta；`/new` 重置覆盖 |
 | 会话收尾（`main.rs`） | `finalize_turn_meta_effort_three_states`；`restore_effort_from_meta_three_states` | 无条件写 ⇒ 三态用例变红；启动恢复漏 meta |
 | 子 Agent（`subagent.rs`） | `named_model_cache_key_includes_effort`（默认 high 与覆盖 max 各构建一次） | 键退回只用模型名 ⇒ 第二次命中旧实例 |
-| 视图（`app` / TUI） | `test_build_view_passes_effort`；`test_effort_parse_forms`；`test_apply_local_effort_shows_current_level_and_usage` / `..._shows_default_when_unset`；`test_status_text_reports_effort`；`test_command_table_shape`（14 条）；`test_effort_with_argument_sends_set_effort_only`；`test_bare_effort_writes_one_local_line_and_sends_nothing` | 视图写死 `None`；删 `default` 分支；把 `/effort` 接进 `/thinking` 的镜像路径；无参也发请求 |
-| 文档一致性 | `scripts/doc-consistency.sh` 断言命令表含 `/effort`、计数 14 条 | 计数回退或命令表漏行 ⇒ 脚本非零退出 |
+| 视图（`app` / TUI） | `test_build_view_passes_effort`；`test_effort_parse_forms`；`test_apply_local_effort_shows_current_level_and_usage` / `..._shows_default_when_unset`；`test_status_text_reports_effort`；`test_command_table_shape`（17 条）；`test_effort_with_argument_sends_set_effort_only`；`test_bare_effort_writes_one_local_line_and_sends_nothing` | 视图写死 `None`；删 `default` 分支；把 `/effort` 接进 `/thinking` 的镜像路径；无参也发请求 |
+| 文档一致性 | `scripts/doc-consistency.sh` 断言命令表含 `/effort`、计数 17 条 | 计数回退或命令表漏行 ⇒ 脚本非零退出 |
 
 ## 7. 已知边界
 

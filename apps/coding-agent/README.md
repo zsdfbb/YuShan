@@ -119,6 +119,7 @@ $ ./target/release/ys-coding-agent -p "你好"
 | `/login` | 选 provider → 填 key →（无内置 base 时）填 API base，保存凭证 |
 | `/logout` | 登出并清除凭证 |
 | `/new` | 开新会话（旧的已落盘，可从 `/resume` 找回） |
+| `/clear` | 清空对话上下文并清屏；旧会话文件保留，可从 `/resume` 找回 |
 | `/resume [id]` | 无参：列出既有会话并选择；带 id：恢复指定会话 |
 | `/compact` | 压缩上下文；**回合中**发出则在下一个轮边界执行。会先给一行开始提示，结束后报告估算 token 前后值 |
 | `/export [path]` | 复制会话文件到 `path`；省略则等于「确认已落盘」（不会自拷贝） |

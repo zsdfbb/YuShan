@@ -29,6 +29,7 @@
 //!     SetThinking{visible} => { thinking_visible = visible; }   // 进程级镜像，无输出
 //!     SetTheme{theme} => { theme = parse(theme); 落盘 state.json }  // 进程级镜像 + Output
 //!     SetEffort/SetModel/Login/Logout/NewSession/Export => { 能力函数 → Output }
+//!     ClearSession => { 换新会话文件（旧文件保留） → SessionCleared + Output }
 //!     // Compact 是唯一先发一条的：开始行必须在压缩那次 `await` **之前**落地
 //!     Compact => { opening → Output(“Compacting…”); lines = compact(..) }
 //!     ListSessions/ResumeSession => { 会话列表 / 原子恢复 → SessionList/SessionResumed }
@@ -741,6 +742,47 @@ pub async fn run(
                         &debug_session_id,
                         &debug_tools,
                     );
+                }
+            }
+
+            Request::ClearSession => {
+                // **清理点（`/clear`）**：与 `/new` 完全一致 —— 旧会话整体作废，
+                // 进程组要杀、落盘目录要删（对清理后的新工作区无意义），且注册表条目
+                // 按**启动时**的槽值打标签 ⇒ 必须在换会话**之前**取旧 id。
+                let old_session = background_session_id(&wiring);
+                if let Some(session) = old_session.as_deref() {
+                    discard_session_backgrounds(&wiring, session);
+                }
+                let (out_lines, ok) = capabilities::clear_session(&mut wiring).await;
+                lines = out_lines;
+                // 新会话 = 新的会话起点（状态行的时长据此重置）。
+                session_started = Instant::now();
+                // 换会话也换了文件 —— 刷新给 `main` 的退出提示快照。
+                session_path.record(wiring.session_path());
+                // 与 `/new` 一样切新 debug 文件（旧文件自然结束）并开一个新的 run。
+                if let Some(sink) = debug.as_mut() {
+                    if let Some(path) = sink.path_for_session(wiring.session_path()) {
+                        sink.switch_file(&path);
+                    }
+                    debug_run += 1;
+                    sink.begin_run(debug_run, crate::unix_now_ms());
+                    debug_session_id = crate::session_id_for(wiring.session_path());
+                    if let Some(trace) = &model_trace {
+                        trace.attach(sink.handle(), debug_session_id.clone());
+                    }
+                    crate::emit_run_start(
+                        sink,
+                        &config,
+                        wiring.session_path(),
+                        &debug_session_id,
+                        &debug_tools,
+                    );
+                }
+                // **只在成功时清屏**：失败时清屏会出现「屏空了、历史其实还在」。
+                // 下发顺序由函数末尾的 `session_event` 保证排在 `Output` 之前（I2）——
+                // 反了的话清屏会把这条提示吃掉。
+                if ok {
+                    session_event = Some(Outbound::SessionCleared);
                 }
             }
 
@@ -2903,6 +2945,103 @@ mod tests {
         );
     }
 
+    /// `/clear`：清屏 + 清上下文 + **旧会话文件一字不动**。
+    ///
+    /// 两条硬契约：
+    /// 1. `SessionCleared` **先于** `Output` —— 反了的话 UI 的清屏会把提示行一起吃掉；
+    /// 2. 换新文件而不是原地清空 —— `JsonlSession::append` 全量重写目标文件，
+    ///    原地清空后再发消息就会把旧内容永久覆盖。
+    ///
+    /// 变异：把 `session_event = Some(Outbound::SessionCleared)` 挪到 `Output` 之后
+    /// （或改成不设）⇒ 顺序断言变红；把「换新文件」改成原地 `session.clear()` ⇒
+    /// `old_path` 仍带 2 条消息那条断言变红（路径不变且被重写）。
+    #[tokio::test]
+    async fn clear_session_keeps_old_file_and_blanks_screen() {
+        let model = MockModel::new("mock");
+        model.push_text("hello");
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let before = take_view(&mut msgs);
+        assert_eq!(before.message_count, 2, "user + assistant");
+        let old_path = before.session_path.clone().expect("持久会话应有文件");
+        assert!(old_path.exists(), "回合结束后会话文件应落盘");
+
+        h.requests.send(Request::ClearSession).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let after = take_view(&mut msgs);
+
+        // ① 出站顺序：`SessionCleared` 在前，`Output` 在后（I2）。
+        match msgs.as_slice() {
+            [Outbound::SessionCleared, Outbound::Output(_)] => {}
+            other => panic!("出站序列应为 [SessionCleared, Output]：{other:?}"),
+        }
+        // ② 屏空白。
+        assert_eq!(after.message_count, 0, "/clear 后上下文归零");
+        // ③ 旧文件仍在，且内容一字未丢。
+        assert!(old_path.exists(), "/clear 必须保留旧会话文件");
+        let reopened = ys_session::JsonlSession::open(&old_path).await.unwrap();
+        use ys_session::Session as _;
+        assert_eq!(
+            reopened.messages().len(),
+            2,
+            "旧文件不得被重写：{old_path:?}"
+        );
+        // ④ 换到了新文件。
+        let new_path = after.session_path.clone().expect("持久会话应有文件");
+        assert_ne!(old_path, new_path, "/clear 应换新会话文件");
+        assert_eq!(
+            h.session_path.get().as_ref(),
+            Some(&new_path),
+            "/clear 后退出提示快照应指向新会话文件"
+        );
+    }
+
+    /// `/clear` 失败：出站序列只有 `Output`（一行错误），**不发** `SessionCleared`。
+    ///
+    /// 理由：`SessionCleared` 会让 UI 清屏；换会话失败时历史仍在 ⇒ 清了屏就是
+    /// 「屏空了、历史还在」的错位。
+    ///
+    /// 失败构造：回合跑完后把 harness 的 `sessions/` 目录换成一个**普通文件** ⇒
+    /// `Wiring::new_session` 的建目录/开新文件必然失败（无需 chmod，跨平台一致）。
+    ///
+    /// 变异：把 `if ok` 去掉、改成无条件 `session_event = Some(Outbound::SessionCleared)`
+    /// ⇒ 首条断言（出站序列）变红；把 `capabilities::clear_session` 的 `Err` 臂
+    /// 改成 `(lines, true)` ⇒ 同上。
+    #[tokio::test]
+    async fn clear_session_failure_sends_no_session_cleared() {
+        let model = MockModel::new("mock");
+        model.push_text("hello");
+        let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
+
+        h.requests.send(prompt("hi")).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let before = take_view(&mut msgs);
+        assert_eq!(before.message_count, 2, "user + assistant");
+        let old_path = before.session_path.clone().expect("持久会话应有文件");
+        assert!(old_path.exists(), "回合结束后会话文件应落盘");
+
+        // 让下一次换会话必然失败：把落盘目录换成一个普通文件。
+        let dir = h.tmp.join("sessions");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a dir").unwrap();
+
+        h.requests.send(Request::ClearSession).await.unwrap();
+        let mut msgs = collect_until_view(&mut h).await;
+        let after = take_view(&mut msgs);
+
+        match msgs.as_slice() {
+            [Outbound::Output(line)] => assert!(
+                line.contains("Failed to clear context"),
+                "失败应报一行错误：{line}"
+            ),
+            other => panic!("失败时出站序列应恰为 [Output]，不得发 SessionCleared：{other:?}"),
+        }
+        assert_eq!(after.message_count, 2, "失败后历史必须原样留着");
+        assert_eq!(after.session_path, Some(old_path), "失败时不得换会话文件");
+    }
+
     /// 退出提示快照（[`SessionPathHandle`]）：启动态一播种就是首个会话文件；
     /// 普通回合不动它；`/new` 之后指向新文件。
     ///
@@ -3191,10 +3330,12 @@ mod tests {
         );
     }
 
-    /// 6. **`Request` 变体覆盖**：11 个变体中本用例发 9 个（`Prompt` + 6 个能力 +
-    ///    `SetThinking`；`ListSessions` / `ResumeSession` 需额外前置条件，`Compact`
-    ///    产出两条输出 —— 二者各另有用例），app 循环都必须处理并给出出站消息、不得
-    ///    panic（`Prompt` → 事件；6 个能力 → `Output` + `View`；`SetThinking` → 仅 `View`）。
+    /// 6. **`Request` 变体覆盖**：13 个变体中本用例发 8 个（`Prompt` + 6 个能力 +
+    ///    `SetThinking`；其余五个各另有用例：`ListSessions` / `ResumeSession` 需额外前置
+    ///    条件，`Compact` 产出两条输出，`ClearSession` 额外发一条 `SessionCleared`，
+    ///    `SetTheme` 只在主题名非法时警告一条），
+    ///    app 循环都必须处理并给出出站消息、不得 panic（`Prompt` → 事件；6 个能力 →
+    ///    `Output` + `View`；`SetThinking` → 仅 `View`）。
     #[tokio::test]
     async fn every_request_variant_is_handled() {
         let model = MockModel::new("mock");
@@ -3202,7 +3343,10 @@ mod tests {
         let mut h = spawn_app_loop(Box::new(model), true, Vec::new()).await;
         let export_path = h.temp_path("exported.jsonl");
 
-        // 除 `Prompt` 外、会产出 `Output` 的 7 个变体（`SetThinking` 无输出，单列）。
+        // 除 `Prompt` 外、会产出 `Output` 的变体共 11 个：下表 6 个恰好一条；
+        // `Compact` 两条（开始行 + 收场行）；`ClearSession` 先 `SessionCleared` 再 `Output`；
+        // `ListSessions` / `ResumeSession` 需额外前置条件；`SetTheme` 只在主题名非法时
+        // 警告一条 —— 后五者各自另有用例。
         let cases = vec![
             Request::SetEffort {
                 effort: Some(ys_core::EffortLevel::High),
@@ -3228,6 +3372,10 @@ mod tests {
             Request::NewSession,
             // ⚠️ `Compact` **不在**这个表里：它是唯一会产出**两条** `Output` 的变体
             // （开始行在压缩那次 `await` 之前落地，见它的专门用例）。
+            // ⚠️ `ClearSession` 也**不在**：它成功时先发一条 `SessionCleared`，
+            // 出站序列是 `[SessionCleared, Output]` 而不是 `[Output]`；顺序是硬契约
+            // （反了清屏会吃掉提示行），由 `clear_session_keeps_old_file_and_blanks_screen`
+            // 专门钉住。
         ];
         assert_eq!(cases.len(), 6, "6 个恰好输出一条 Output 的能力变体");
 

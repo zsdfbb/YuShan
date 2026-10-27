@@ -49,16 +49,19 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
 TUI 斜杠命令：
   以下斜杠命令仅在交互式 TUI 内可用，入口：先启动 TUI 然后输入 /。
   /help [command]      显示可用命令
+  /keybind             列出全部快捷键
   /status              显示当前配置与状态
   /skills              查看并选择一个 skill
   /copy                复制最后一条回复的 Markdown 原文到系统剪贴板
   /quit                退出
   /thinking [on|off]   开关思考内容的显示
   /effort [off|minimal|low|medium|high|xhigh|max|default]   设置模型思考档位
+  /theme [name]        切换配色主题（无参时浮层选择）
   /model [model_name]  切换模型（无参时浮层选择）
   /login               登录 provider 并保存凭证
   /logout              登出并清除凭证
   /new                 开新会话
+  /clear               清空上下文并清屏（旧会话文件保留，可 /resume 找回）
   /resume [id]         恢复既有会话（无参列出并选择）
   /compact             压缩上下文（先提示，再报告前后估算）
   /export [path]       导出会话到文件
@@ -86,5 +89,30 @@ mod tests {
         let rendered = format!("{}\n", help_text());
         assert!(rendered.ends_with('\n'));
         assert!(!rendered.ends_with("\n\n"), "help stdout 不得有双尾换行");
+    }
+
+    /// `--help` 的 TUI 命令段必须列全 [`ys_tui_coding::all_commands`] 的每一条。
+    ///
+    /// 这段文案是**手写**的（见模块头：零依赖、不读运行时状态），而 TUI 内的 `/help`
+    /// 由命令表生成 —— 两份同源信息一旦漂移，用户在启动前查到的命令清单就是错的。
+    /// 本用例把「漏一条」变成编译期之外可执行的失败：新增命令忘了补这里 ⇒ 变红。
+    ///
+    /// 变异：删掉 `/clear` 那行 ⇒ 本用例报「缺 /clear」。
+    #[test]
+    fn help_text_lists_every_builtin_command() {
+        // 只取斜杠命令段，避免环境变量里的同名子串误命中。
+        let section = HELP_TEXT
+            .split("TUI 斜杠命令：")
+            .nth(1)
+            .expect("`--help` 应含「TUI 斜杠命令」段");
+        let missing: Vec<&str> = ys_tui_coding::all_commands()
+            .iter()
+            .filter(|spec| !section.contains(&format!("/{} ", spec.name)))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "`--help` 的斜杠命令段漏了这些命令（行尾需带一个空格）：{missing:?}"
+        );
     }
 }

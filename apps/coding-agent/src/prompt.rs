@@ -257,10 +257,22 @@ fn tool_guidelines(tools: &[&str]) -> String {
                 .to_string(),
         );
     }
-    // 「过程叙述」：多轮工具任务中，用户看不到模型的思考，只能看到工具进出。让模型在**每批**
-    // 工具调用前给一句话说明正在做什么，把「改进过程迟迟没有回复」变成可见的进展。刻意限定
-    // 「一句话」而非一段 —— 只要工作型工具在场（`read` / `grep` / `find` / `ls` / `bash` /
-    // `edit` / `write` 任一）就值得提醒，否则（如纯检索类）不加，避免无谓增大固定前缀。
+    // 「过程叙述」：多轮工具任务中，用户看不到模型的思考，只能看到工具进出 ⇒ 完全沉默会让
+    // 「改进过程迟迟没有回复」变成黑箱。但**叙述本身也是成本**：它进 `output`（真金白银生成），
+    // 又留在会话里被之后**每一轮**重读 —— 实测一次 14 分钟探索写下 37 段、16,916 字符（≈4,229
+    // token），其中最长一段 2,464 字符是给内部假设做的论证。那段话对用户零价值，却要被重读几十次。
+    //
+    // 故三条**可判定**的约束，缺一条实测就会被突破：
+    //   ① 时机：只在**里程碑**（换了目标 / 得出结论 / 遇到梗阻），不是每批工具调用。
+    //   ② 长度：**≤ 120 字符**。「一句话」不可判定（一句话可以写 2,464 字符）。
+    //   ③ 内容：禁止假设与论证（「可能是因为」「我猜」「先验证 A 或 B」）—— 那属于内部推理。
+    //
+    // **「连续 N 次调用必须说一句」不写在这里** —— 模型看不到自己的累计调用次数，
+    // 这条已交给 harness 计数并在到阀时注入提醒（`RunLimits::narration_silence_tool_calls`）。
+    // 把它写进系统提示词只会得到一条模型无法执行的要求（需自己默默数调用）。
+    //
+    // 只要工作型工具在场（`read` / `grep` / `find` / `ls` / `bash` / `edit` / `write` 任一）
+    // 就值得提醒，否则（如纯检索类）不加，避免无谓增大固定前缀。
     if tools.iter().any(|t| {
         matches!(
             *t,
@@ -268,10 +280,11 @@ fn tool_guidelines(tools: &[&str]) -> String {
         )
     }) {
         guidelines.push(
-            "Before every batch of tool calls in multi-step work, write one concise user-facing \
-             sentence explaining what you are about to do. After a meaningful milestone, briefly \
-             state what was completed and what comes next. Keep updates to one sentence; do not \
-             expose private chain-of-thought"
+            "In multi-step work, narrate only at milestones (target changed, conclusion reached, \
+             or blocked) — not before every tool batch. Each update is **one short sentence** \
+             (hard limit 120 characters) saying what you did or will do, nothing else. Never state \
+             hypotheses or reasoning (\"maybe\", \"I suspect\", \"let me check whether A or B\") — \
+             those are internal and cost the user a large re-read on every later round"
                 .to_string(),
         );
     }
@@ -831,44 +844,74 @@ mod tests {
         );
     }
 
-    /// N18：「过程叙述」guideline 在工作型工具在场时出现、空工具表时不出现。
+    /// 「过程叙述」guideline 的**新契约**：只让模型在里程碑说话、限 120 字符、禁假设推理。
     ///
-    /// 反向断言（空工具表不得出现）是关键：少了它，「无条件 push」的实现也能过 ——
-    /// 而那会让固定前缀无谓变大（该句进 `fixed_prompt_tokens`）。
+    /// 历史教训（为什么这三条要分开钉）：旧措辞是「Before every batch … one concise sentence」，
+    /// 两条都不可判定 —— `every batch` 被照做成 37 次，`one sentence` 被写成 2,464 字符的论证。
+    /// ⇒ 现在每条约束都有**能不能被引用原文证明**的断言，而不是靠「测试绿了」。
     ///
-    /// 变异：把守卫从 `any(read|grep|find|ls|bash|edit|write)` 改成无条件 push ⇒
-    /// 第三条断言变红；把 `bash` 从匹配集合里删掉 ⇒ 第二条断言变红。
+    /// 反向断言（空工具表 / 纯检索工具表不得出现）仍然关键：少了它，「无条件 push」的实现
+    /// 也能过 —— 而那会让固定前缀无谓变大。
+    ///
+    /// 变异：① 把守卫改成无条件 push ⇒ 最后两条变红；② 把 `bash` 从匹配集合删掉 ⇒ bash 那条变红；
+    /// ③ 删掉 `120` ⇒ 长度断言变红；④ 改成「before every batch」⇒ 里程碑断言变红。
     #[test]
-    fn narration_guideline_appears_only_with_working_tools() {
+    fn narration_guideline_is_milestone_scoped_and_bounded() {
         let _guard = env_lock();
         let _env = no_global_prompt();
 
-        let sentence =
-            "- Before every batch of tool calls in multi-step work, write one concise user-facing";
+        // 定位这句 guideline 的**起头**（后续断言都在它上面做）。
+        let opener = "- In multi-step work, narrate only at milestones";
+        let marker = "narrate only at milestones";
 
         let with_read = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
         assert!(
-            with_read.contains(sentence),
+            with_read.contains(opener),
             "含 read 时应给「过程叙述」指引；prompt = {with_read}"
         );
+        // ① 时机：里程碑驱动，**不是**每批一次。
+        //
+        // 注意：新文案里带着 “not before every tool batch” 这半句（它是在**否定**旧行为），
+        // 所以负向断言只能针对**旧措辞的原文**（`Before every batch of tool calls`），
+        // 不能针对 `before every tool batch` 这种子串 —— 那会把新文案自己也判红。
         assert!(
-            with_read.contains("Keep updates to one sentence"),
-            "指引应限定「一句话」；prompt = {with_read}"
+            with_read.contains(marker),
+            "必须声明「仅在里程碑」；prompt = {with_read}"
+        );
+        // ② 长度：可判定的数字上限（旧措辞的「一句话」不可判定）。
+        assert!(
+            with_read.contains("120 characters"),
+            "必须给出可判定的字符上限；prompt = {with_read}"
+        );
+        // ②b 形态：「一句话」—— 模型按句组织语言，按字符数得先数。两条要同时在场。
+        assert!(
+            with_read.contains("one short sentence"),
+            "必须要求「一句话」而非仅字符数；prompt = {with_read}"
+        );
+        // ③ 内容：禁止假设与论证 —— 这是实测里最贵的那部分。
+        assert!(
+            with_read.contains("Never state hypotheses or reasoning"),
+            "必须禁止假设与推理外化；prompt = {with_read}"
+        );
+        // ④ 静默阀值**不属于系统提示** —— 模型数不准自己的调用次数，该由 harness 计数
+        //    并在到阀时注入提醒（`RunLimits::narration_silence_tool_calls`）。
+        assert!(
+            !with_read.contains("12 tool calls"),
+            "静默阀值不得写进系统提示（模型无法自己计数）；prompt = {with_read}"
+        );
+        // 旧措辞必须不再出现（否则新旧并存，模型会照旧的那句做）。
+        assert!(
+            !with_read.contains("Before every batch of tool calls"),
+            "旧的「每批都写」措辞必须移除；prompt = {with_read}"
         );
         assert!(
-            with_read.contains(
-                "Before every batch of tool calls in multi-step work, write one concise user-facing sentence"
-            ),
-            "工作过程 guideline 必须给出强制的批次前说明；prompt = {with_read}"
-        );
-        assert!(
-            with_read.contains("what was completed and what comes next"),
-            "工作过程 guideline 必须要求里程碑后说明进展；prompt = {with_read}"
+            !with_read.contains("Keep updates to one sentence"),
+            "不可判定的「一句话」措辞必须移除；prompt = {with_read}"
         );
 
         let with_bash = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
         assert!(
-            with_bash.contains(sentence),
+            with_bash.contains(opener),
             "含 bash 时应给「过程叙述」指引；prompt = {with_bash}"
         );
 
@@ -878,13 +921,13 @@ mod tests {
             "空工具表时不得出现该指引；prompt = {no_tools}"
         );
         assert!(
-            !no_tools.contains("Before every batch of tool calls"),
-            "空工具表时不得出现工作过程要求；prompt = {no_tools}"
+            !no_tools.contains(marker),
+            "空工具表时不得出现里程碑要求；prompt = {no_tools}"
         );
 
         let web_only = build_system_prompt(Path::new("/tmp"), &[spec("websearch")], &no_skills());
         assert!(
-            !web_only.contains("Before every batch of tool calls"),
+            !web_only.contains(marker),
             "纯检索工具表不得出现工作型进展要求；prompt = {web_only}"
         );
     }

@@ -40,6 +40,23 @@ const TRUNCATED_CONTINUE_PROMPT: &str = "Your previous response was cut off by t
      you left off; do not repeat what you already said. If you were about to make a tool call, \
      make it now (use a smaller payload if it is large).";
 
+/// 「闷头干活」提醒：本回合连续工具调用已达阀值而模型未输出正文时，主循环把它作为
+/// 一条 `User` 消息补进**下一轮的请求**（不落 session）。
+///
+/// 措辞四要点：
+/// 1. **点名事实**（你已经连续调了 N 次工具）—— 模型看不到这个计数，必须告诉它；
+/// 2. **点名代价**（每次调用都要一次完整模型往返）—— 否则模型会以为“少说话 = 更快”，
+///    而实测工具执行只占墙钟 2.8%，静默省不掉往返（那段 38 条静默实际让用户等了 9.4 分钟）；
+/// 3. **限定形态**（**一句话**、不超 120 字符、只说在做什么）—— 与系统提示里那条同源。
+///    「一句」比纯字符数更好执行：模型按句组织语言，按字符数反而要先数。
+/// 4. **禁止扩写**（不解释理由、不重述已找到的东西）—— 否则提醒会适得其反，
+///    变成又一段要反复重读的长文。
+const NARRATION_NUDGE_PROMPT: &str = "You have run several tool calls in a row without saying \
+     anything to the user. Each call costs a full model round-trip, so silence does not make this \
+     faster — it only leaves the user watching nothing happen. Before your next tool call, write \
+     one short sentence (at most 120 characters) telling the user what you are doing right now. \
+     One sentence only — do not explain your reasoning and do not restate what you already found.";
+
 /// 一次工具调用的超时预算：**工具声明值优先** → 否则 `limits.bash_timeout` → 否则 300s。
 ///
 /// 「优先」而非取 min：`bash_timeout` 管的是「shell 命令多久算卡死」，不该成为长任务
@@ -413,6 +430,20 @@ impl AgentLoop for BasicLoop {
         // 模型无限续写只会空烧 token，故以一次性标志封顶；仍被截断就如实收场。
         let mut truncated_continued = false;
 
+        // 「闷头干活」计数：本回合**连续**多少次工具调用而模型未输出正文。
+        //
+        // 必须由 harness 数：模型看不到自己的累计调用次数，把它写进系统提示词无效
+        // （它无法判定何时到阀）。详见 `RunLimits::narration_silence_tool_calls`。
+        // 阀值 `0` ⇒ 关闭，计数不增（下面只在 `silent_tool_calls >= 阀值` 时注入）。
+        let silence_threshold = ctx.limits.narration_silence_tool_calls;
+        let mut silent_tool_calls: usize = 0;
+        // 本轮**是否为提醒轮**：`Some` = 上一轮的工具调用已到阀，本轮的请求里要多带
+        // 一条「提醒模型说话」的消息。
+        //
+        // **只影响本轮请求，不落 session** —— 提醒是纠正当前行为的指令，不是对话内容。
+        // 若追加进会话，它会像之前的叙述一样被之后**每一轮**重读，反而把想省的成本加回去。
+        let mut narration_nudge = false;
+
         // 回合级工具输出闸门的**下界锚**：本回合新增消息的起点。必须在 Step 2 append
         // 用户消息**之前**取，否则用户消息会被当成可降级对象。
         let turn_start = ctx.session.messages().len();
@@ -574,8 +605,24 @@ impl AgentLoop for BasicLoop {
                 .await
                 .map_err(LoopError::Event)?;
             let tools = ctx.registry.specs().to_vec();
+            // 「闷头干活」提醒：**只影响本轮请求**，不落 session（见 `narration_nudge` 声明处）。
+            //
+            // 时机：上一轮的工具调用把 `silent_tool_calls` 推到阀值 ⇒ 本轮开头把一条
+            // `User` 消息补在消息末尾（照 `TRUNCATED_CONTINUE_PROMPT` 的 `User` 先例）。
+            // 注入后阀值翻倍 —— 模型若又沉默这么久，下一轮再来一条；不翻倍的话
+            // 它会**每轮都**挨一条，恰好变成我们想消除的“唠叨”。
+            let mut request_messages = ctx.session.messages().to_vec();
+            if narration_nudge {
+                request_messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: NARRATION_NUDGE_PROMPT.to_string(),
+                    }],
+                });
+                narration_nudge = false;
+            }
             let request = ModelRequest {
-                messages: ctx.session.messages().to_vec(),
+                messages: request_messages,
                 tools,
                 system: ctx.system_prompt.clone(),
                 boundary: ctx.boundary.clone(),
@@ -660,6 +707,12 @@ impl AgentLoop for BasicLoop {
                     text_content.push_str(text);
                 }
             }
+            // 「闷头干活」计数：模型本轮**是否有正文**决定连续计数是否归零。
+            //
+            // 放在 Step 8 之前取：本轮的 `tool_calls` 个数随后在 Step 9 执行完才累加。
+            // 判定「有正文」用 `!text_content.trim().is_empty()` 而不只看非空 ——
+            // 只有空白也算没说话（用户屏幕上没任何东西）。
+            let spoke = !text_content.trim().is_empty();
 
             // Step 8：检查 tool call
             let tool_calls: Vec<_> = assistant_message
@@ -1172,6 +1225,27 @@ impl AgentLoop for BasicLoop {
                 .append(tool_result_message)
                 .await
                 .map_err(|_| LoopError::Event(ys_core::EventError::SendFailed))?;
+
+            // 「闷头干活」计数推进（见 `silent_tool_calls` 声明处）。
+            //
+            // **只看本轮的 `tool_calls.len()`**，不能用 session 长度差 —— 会话已被压缩 /
+            // 降级重写过（Step 4b / Step 11），差值不可靠。
+            //
+            // 模型本轮说了话 ⇒ 连续计数归零（用户刚听到声音，不欠提醒）。
+            // 反之累加；到阀即置 `narration_nudge`，下一轮 Step 5 注入一条（**不落 session**）。
+            if silence_threshold > 0 {
+                if spoke {
+                    silent_tool_calls = 0;
+                } else {
+                    silent_tool_calls = silent_tool_calls.saturating_add(tool_calls.len());
+                    if silent_tool_calls >= silence_threshold {
+                        narration_nudge = true;
+                        // 阀值**翻倍**：否则模型若又沉默同样多次，每一轮都会挨一条，
+                        // 恰好变成我们想消除的唠叨。
+                        silent_tool_calls = 0;
+                    }
+                }
+            }
 
             // Step 11：回合级工具输出总量闸门 —— 超预算时降级**更早**的结果（头部截断 +
             // 续读指针），把当轮回喂 token 压下来。算法在 `crate::turn_budget`。
@@ -4968,6 +5042,297 @@ mod tests {
         assert!(
             count >= 2,
             "并行与串行两处构造点都要挂外层预算；count = {count}"
+        );
+    }
+
+    // ==================== 「闷头干活」提醒（narration nudge） ====================
+
+    /// 记录**每次收到的 `ModelRequest` 里是否带着提醒消息**的模型。
+    ///
+    /// 前 `silent_rounds` 轮都回一批工具调用（不输出任何正文 ⇒ 静默计数会累加），
+    /// 之后回终稿。断言看的是 `sampled` —— 每次 `complete()` 收到的请求消息里
+    /// 是否包含 `NARRATION_NUDGE_PROMPT`。
+    struct NudgeProbeModel {
+        /// 前多少轮只发工具调用（不发正文）。
+        silent_rounds: usize,
+        /// 每轮发几个工具调用。
+        calls_per_round: usize,
+        round: AtomicUsize,
+        /// 每次请求：`messages` 里是否含提醒。
+        sampled: Mutex<Vec<bool>>,
+    }
+
+    impl NudgeProbeModel {
+        fn new(silent_rounds: usize, calls_per_round: usize) -> Self {
+            Self {
+                silent_rounds,
+                calls_per_round,
+                round: AtomicUsize::new(0),
+                sampled: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn nudges(&self) -> Vec<bool> {
+            self.sampled.lock().unwrap().clone()
+        }
+
+        fn nudge_count(&self) -> usize {
+            self.nudges().iter().filter(|b| **b).count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for NudgeProbeModel {
+        fn model_id(&self) -> &str {
+            "nudge-probe"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            let saw = request.messages.iter().any(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text == NARRATION_NUDGE_PROMPT),
+                )
+            });
+            self.sampled.lock().unwrap().push(saw);
+
+            let round = self.round.fetch_add(1, Ordering::SeqCst);
+            if round < self.silent_rounds {
+                let content = (0..self.calls_per_round)
+                    .map(|i| ContentBlock::ToolUse {
+                        id: ys_core::ToolCallId(format!("n{round}-{i}")),
+                        name: "noop".into(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .collect();
+                return Ok(ys_model::ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content,
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                });
+            }
+            Ok(ys_model::ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// 一个什么也不做的工具 —— 只为让工具调用合法可执行。
+    struct NoopTool;
+
+    #[async_trait::async_trait]
+    impl Tool for NoopTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(
+                "noop",
+                "does nothing",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ys_core::ToolResult, ys_tool::ToolError> {
+            Ok(ys_core::ToolResult {
+                content: "ok".into(),
+                is_error: false,
+            })
+        }
+    }
+
+    async fn run_nudge(
+        model: &NudgeProbeModel,
+        threshold: usize,
+        max_rounds: u32,
+    ) -> MemorySession {
+        let registry = ToolRegistry::build(vec![Box::new(NoopTool) as Box<dyn Tool>]).unwrap();
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(max_rounds);
+        limits.narration_silence_tool_calls = threshold;
+        {
+            let mut ctx = make_ctx(model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        session
+    }
+
+    /// 连续静默到阀 ⇒ 下一轮请求里多一条提醒；提醒**不落 session**。
+    ///
+    /// 变异：① 删掉 Step 5 的注入 ⇒ 全 false；
+    ///       ② 改成 `>= 0` 无条件注入 ⇒ 第 1 轮就是 true；
+    ///       ③ 把提醒 `append` 进 session（而不是只拼进请求）⇒ 最后一条断言变红
+    ///          （会话里会出现一条 `NARRATION_NUDGE_PROMPT`，而它会进压缩 / 预算计算）。
+    #[tokio::test]
+    async fn narration_nudge_fires_at_threshold_without_persisting() {
+        // 每轮 1 个调用、阀值 3 ⇒ 第 3 轮结束后到阀，第 4 轮请求里应有提醒。
+        let model = NudgeProbeModel::new(6, 1);
+        let session = run_nudge(&model, 3, 20).await;
+        let nudges = model.nudges();
+
+        assert!(
+            nudges.len() > 3,
+            "用例要求跑到至少 4 轮才好断言；实际 {nudges:?}"
+        );
+        assert!(!nudges[0], "第 1 轮不可能带提醒（还没静默过）");
+        assert_eq!(
+            &nudges[1..3],
+            &[false, false],
+            "未到阀值前不得提前提醒；实际 {nudges:?}"
+        );
+        assert!(
+            nudges[3],
+            "第 3 轮后累计 3 次调用 ⇒ 第 4 轮必须带提醒；实际 {nudges:?}"
+        );
+
+        // 提醒**不得**落进会话（否则会被之后每一轮重读，也与压缩 / 预算口径混淆）。
+        let persisted = session.messages().iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == NARRATION_NUDGE_PROMPT))
+        });
+        assert!(!persisted, "提醒只应存在于当轮请求，不得写进会话");
+    }
+
+    /// 模型一说话，连续计数就归零 ⇒ 阀值永远到不了，一次都不提醒。
+    ///
+    /// 形状（阀值 3）：交错发「纯文字轮」与「1 个工具调用轮」——
+    /// `T, C, T, C, T, C, T, C, …`。若无归零，连续计数会累加到 3 并触发；
+    /// 有归零则每次都被 T 打断、永远不到阀。
+    ///
+    /// **为何不能直接用「每轮都有正文」的模型测**：那种模型一个工具都不发，
+    /// 计数恒为 0 ⇒ 删掉归零逻辑也照样绿（本条用例的第一版就死在这里，
+    /// 变异测试才暴露）。所以这里必须让“有正文”与“发工具”两件事**同存**。
+    ///
+    /// 变异：把「`spoke` ⇒ 归零」删掉（改成只累加）⇒ 本用例变红。
+    #[tokio::test]
+    async fn narration_nudge_resets_when_model_speaks() {
+        let registry = ToolRegistry::build(vec![Box::new(NoopTool) as Box<dyn Tool>]).unwrap();
+        let model = SpeakThenCallModel::new(6);
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(20);
+        limits.narration_silence_tool_calls = 3;
+        {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            model.nudge_count(),
+            0,
+            "每发一次工具前都说过话 ⇒ 连续计数永远被归零，不该出现提醒；实际 {:?}",
+            model.nudges()
+        );
+    }
+
+    /// 「先说一句、再发一个工具调用」，重复 `rounds` 轮，最后一轮收尾。
+    struct SpeakThenCallModel {
+        rounds: usize,
+        round: AtomicUsize,
+        sampled: Mutex<Vec<bool>>,
+    }
+
+    impl SpeakThenCallModel {
+        fn new(rounds: usize) -> Self {
+            Self {
+                rounds,
+                round: AtomicUsize::new(0),
+                sampled: Mutex::new(Vec::new()),
+            }
+        }
+        fn nudges(&self) -> Vec<bool> {
+            self.sampled.lock().unwrap().clone()
+        }
+        fn nudge_count(&self) -> usize {
+            self.nudges().iter().filter(|b| **b).count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for SpeakThenCallModel {
+        fn model_id(&self) -> &str {
+            "speak-then-call"
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            let saw = request.messages.iter().any(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, ContentBlock::Text { text } if text == NARRATION_NUDGE_PROMPT),
+                )
+            });
+            self.sampled.lock().unwrap().push(saw);
+
+            let round = self.round.fetch_add(1, Ordering::SeqCst);
+            // 正文与工具调用**同一轮**输出 —— 这是真实模型常见的形态，
+            // 也是能区分「归零」与「不归零」的唯一形状。
+            let content = if round < self.rounds {
+                vec![
+                    ContentBlock::Text {
+                        text: "checking".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: ys_core::ToolCallId(format!("s{round}")),
+                        name: "noop".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                ]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]
+            };
+            let has_tool = round < self.rounds;
+            Ok(ys_model::ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content,
+                },
+                usage: Usage::default(),
+                finish_reason: if has_tool {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                },
+            })
+        }
+    }
+
+    /// 阀值 `0` ⇒ **关闭**：无论静默多少轮都不提醒（既有消费者逐字节不变）。
+    ///
+    /// 变异：把 `if silence_threshold > 0` 去掉 ⇒ 阀值 0 会让第 1 轮就 `>= 0` 到阀
+    ///       （或永远到不了，取决于写法）⇒ 本用例变红。
+    #[tokio::test]
+    async fn narration_nudge_is_off_at_threshold_zero() {
+        let model = NudgeProbeModel::new(8, 2);
+        let _ = run_nudge(&model, 0, 20).await;
+        assert_eq!(
+            model.nudge_count(),
+            0,
+            "阀值 0 必须完全关闭提醒；实际 {:?}",
+            model.nudges()
         );
     }
 }

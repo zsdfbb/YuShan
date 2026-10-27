@@ -8,6 +8,19 @@ use std::time::Duration;
 /// 「单一真值」失效。`prompt.rs` 的 guideline 也应读同一个常量。
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
 
+/// 「闷头干活」提醒的默认阀值（连续多少次工具调用而模型未输出正文）。
+///
+/// 与 [`RunLimits::narration_silence_tool_calls`] 同源，放在本 crate 的理由与
+/// [`DEFAULT_MAX_PARALLEL_TOOLS`] 一致：`RunLimits::default()` 要能引用到它。
+///
+/// 取 **12** 的依据（本仓实测会话逐条回测）：
+/// - 上限 8  ⇒ 全程多插 4 条，最长等待 ≈ 2.0 分钟
+/// - 上限 **12** ⇒ 全程多插 **3** 条，最长等待 ≈ **3.0 分钟**
+/// - 上限 20 ⇒ 全程多插 1 条，最长等待 ≈ 5.0 分钟
+///
+/// 未加此阀时实测出现过**连续 38 条调用不吭声**的段 ≈ 565 s（9.4 分钟）。
+pub const DEFAULT_NARRATION_SILENCE_TOOL_CALLS: usize = 12;
+
 /// 一次 run 的执行限制
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -68,6 +81,23 @@ pub struct RunLimits {
     /// ② 「结果已 push 进边界源但无唤醒源」这条缝隙（`QueueBoundarySource::push` 是同步的，
     /// 不通知任何人）。
     pub subagent_poll: Duration,
+    /// 「闷头干活」的阀值：本回合累计**连续**这么多次工具调用而模型一个字都没说，
+    /// 主循环就往下一轮的请求里补一条**仅本轮可见**的提醒。
+    ///
+    /// # 为何必须由 harness 计数
+    ///
+    /// 模型看不到自己的累计调用次数 —— 把它写进系统提示词（「连续 N 次调用后说一句」）
+    /// 是无效的：它无法判定何时到阀。计数必须由能看到每次 `ToolUse` 的一方做。
+    ///
+    /// # 为何是「连续」而不仅是「累计」
+    ///
+    /// 阀值管的是「用户多久没听到声音」。模型一旦输出正文，计时就应归零 ——
+    /// 否则一个每轮都说话的回合也会在累计到 N 时挨一条莫名其妙的提醒。
+    ///
+    /// 默认 **12**：按本仓实测会话回测，上限 12 ⇒ 全程只多 3 条提醒，
+    /// 对应最长等待 ≈ 3 分钟（每轮 ≈ 14.9s，其中工具执行仅占 2.8%）。
+    /// `0` ⇒ 关闭（既有消费者逐字节不变）。
+    pub narration_silence_tool_calls: usize,
 }
 
 impl RunLimits {
@@ -97,6 +127,8 @@ impl Default for RunLimits {
             subagent_wait: Duration::from_secs(30 * 60),
             // 200ms：只兜 abort 延迟与边界源缝隙，不是状态轮询。
             subagent_poll: Duration::from_millis(200),
+            // 12：实测回测下全程只多 3 条提醒，最长静默 ≈ 3 分钟。
+            narration_silence_tool_calls: DEFAULT_NARRATION_SILENCE_TOOL_CALLS,
         }
     }
 }

@@ -1,8 +1,8 @@
 # 回合级工具输出闸门与空响应重试 — As-built
 
 > 性质：**实际建成记录**。上游设计见 `docs/arch/turn-output-and-feedback/design.md`（§4 与 ADR 决策 4
-> 列为「第二批」的两项）；计划见 `docs/design-plans/2026-10-13-turn-budget-and-retry.md` 与
-> `docs/exec-plans/2026-10-13-turn-budget-and-retry.md`。
+> 列为「第二批」的两项）；计划见 `docs/design-plans/completed/2026-10-13-turn-budget-and-retry.md` 与
+> `docs/exec-plans/completed/2026-10-13-turn-budget-and-retry.md`。
 > 日期：2026-10-13 ｜ 基线 `fece752`（本轮改动在其上，尚未 commit）。
 
 ## 一句话

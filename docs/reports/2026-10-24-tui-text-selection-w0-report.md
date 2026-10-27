@@ -1,6 +1,6 @@
 # W0 执行报告 — `layout.rs` 字形缓存地基
 
-> 对应 `docs/exec-plans/2026-10-24-tui-text-selection.md` 的 **T1 + T2**（波次 W0）。
+> 对应 `docs/exec-plans/completed/2026-10-24-tui-text-selection.md` 的 **T1 + T2**（波次 W0）。
 > 设计来源 `docs/arch/tui-text-selection/design.md` §2.2b / §2.3。
 > 基线：`d265f14`。
 

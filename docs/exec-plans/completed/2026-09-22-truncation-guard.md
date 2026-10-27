@@ -1,7 +1,7 @@
 # 截断保护（片 1）执行计划
 
 > 日期：2026-09-22
-> 设计计划：[`../design-plans/2026-09-22-truncation-guard.md`](../design-plans/2026-09-22-truncation-guard.md)
+> 设计计划：[`../design-plans/2026-09-22-truncation-guard.md`](../../design-plans/completed/2026-09-22-truncation-guard.md)
 > 决策：[ADR-0020](../adr/0020-truncation-guard.md) · as-built：[`../design-final/truncation-guard.md`](../design-final/truncation-guard.md) · 报告：[`../reports/2026-09-22-truncation-guard-report.md`](../reports/2026-09-22-truncation-guard-report.md)
 > 波次划分见 §3（同波文件集互不相交）。
 > 性质：**事后补录**（实现与验收均已完成，本文为记录归档，非实现前计划）。补录日期：2026-09-22。

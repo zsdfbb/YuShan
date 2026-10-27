@@ -1,6 +1,6 @@
 # 回合级工具输出闸门与空响应重试 — 修改报告
 
-> 日期：2026-10-13 ｜ 基线 `fece752` ｜ 设计 `docs/design-plans/2026-10-13-turn-budget-and-retry.md`
+> 日期：2026-10-13 ｜ 基线 `fece752` ｜ 设计 `docs/design-plans/completed/2026-10-13-turn-budget-and-retry.md`
 > 上游设计 `docs/arch/turn-output-and-feedback/design.md` ｜ as-built `docs/design-final/turn-budget-and-retry.md`
 
 ## 背景

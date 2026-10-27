@@ -4,7 +4,7 @@
 > 设计：`docs/arch/gap-closure/design-core-channel.md`（§3/§4/§5）
 > 决策：`docs/adr/0011-core-channel-design.md`、`docs/adr/0012-runtime-dependency-boundary.md`
 > 质量分析：`docs/arch/gap-closure/review.md`（3 个 🔴 / 5 个 🟡 已修订为 R1-R8）
-> 执行计划：`docs/exec-plans/2026-09-12-core-channel.md`
+> 执行计划：`docs/exec-plans/completed/2026-09-12-core-channel.md`
 > 日期：2026-09-12
 > 编排：`full`（多 crate + 新 crate + trait 变更 + 集成测试，需 design-plan + exec-plan 留档）
 

@@ -1,7 +1,7 @@
 # Subagent 可观测性与默认 Debug 验收报告
 
-- 执行计划：`docs/exec-plans/2026-10-19-subagent-observability-and-debug-defaults.md`
-- 设计计划：`docs/design-plans/2026-10-19-subagent-observability-and-debug-defaults.md`
+- 执行计划：`docs/exec-plans/completed/2026-10-19-subagent-observability-and-debug-defaults.md`
+- 设计计划：`docs/design-plans/completed/2026-10-19-subagent-observability-and-debug-defaults.md`
 - 决策记录：`docs/adr/0044-subagent-observability-and-debug-defaults.md`
 - 基线：`d5df3b76c12f20b86356d89e4f8522221b2ff3c7`
 - 备份分支：`sw-backup/2026-10-19-subagent-observability-and-debug-defaults`

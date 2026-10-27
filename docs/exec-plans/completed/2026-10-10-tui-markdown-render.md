@@ -6,7 +6,7 @@
 
 ## 上下文引用
 
-- 设计计划：`docs/design-plans/2026-10-10-tui-markdown-render.md`
+- 设计计划：`docs/design-plans/completed/2026-10-10-tui-markdown-render.md`
 - 设计：`docs/arch/tui-markdown-render/design.md`（§2 推荐设计、§5 风险、§6 交付顺序）
 - 决策：`docs/adr/0030-tui-markdown-render.md`
 - 复核：`docs/arch/tui-markdown-render/review.md`

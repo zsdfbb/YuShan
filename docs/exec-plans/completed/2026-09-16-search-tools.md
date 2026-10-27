@@ -1,7 +1,7 @@
 # 搜索工具（切片一）执行计划
 
 > 每个任务按目录划分，同一目录下的所有变更由一个 agent 完成。按依赖顺序执行。
-> 上下文引用：`docs/design-plans/2026-09-16-search-tools.md`
+> 上下文引用：`docs/design-plans/completed/2026-09-16-search-tools.md`
 
 ## 任务清单
 

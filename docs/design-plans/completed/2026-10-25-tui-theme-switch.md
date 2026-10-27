@@ -1,6 +1,6 @@
 # TUI 配色主题（5 套内置 + `/theme` 实时切换）设计计划
 
-> 本文是**任务拆分的依据**：测试合同编号 C1–C12 在 `docs/exec-plans/2026-10-25-tui-theme-switch.md`
+> 本文是**任务拆分的依据**：测试合同编号 C1–C12 在 `docs/exec-plans/completed/2026-10-25-tui-theme-switch.md`
 > 里逐条落到任务上。设计取向已由用户签字（D1–D5），实施阶段不再重开方案选择。
 
 ## 背景

@@ -1,7 +1,7 @@
 # 长程任务的「完成」（① 预算可配 + ② 完工复核 + ③ 超时重试）执行计划
 
 > 日期：2026-10-09
-> 设计计划：[`../design-plans/2026-10-09-long-horizon-completion.md`](../design-plans/2026-10-09-long-horizon-completion.md)
+> 设计计划：[`../design-plans/2026-10-09-long-horizon-completion.md`](../../design-plans/completed/2026-10-09-long-horizon-completion.md)
 > 设计定稿：[`../arch/long-horizon-completion/design.md`](../arch/long-horizon-completion/design.md)
 > 决策：[ADR-0027](../adr/0027-completion-check-and-round-budget.md) · [ADR-0028](../adr/0028-model-call-retry-and-timeout.md)
 > 基线：`master` @ `5eae60a`（工作区干净）

@@ -2,7 +2,7 @@
 
 > 每个任务按目录划分，同一目录下的所有变更由一个 agent 完成。
 > **依赖声明是并发调度的依据** —— Phase 3 据此合并执行单元并划分波次。
-> 参考设计计划：`docs/design-plans/2026-10-13-turn-budget-and-retry.md`
+> 参考设计计划：`docs/design-plans/completed/2026-10-13-turn-budget-and-retry.md`
 > 上游设计：`docs/arch/turn-output-and-feedback/design.md`（v2）
 
 ## 基线

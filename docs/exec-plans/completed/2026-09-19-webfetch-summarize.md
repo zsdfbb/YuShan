@@ -5,7 +5,7 @@
 
 ## 上下文引用
 
-参考设计计划：`docs/design-plans/2026-09-19-webfetch-summarize.md`
+参考设计计划：`docs/design-plans/completed/2026-09-19-webfetch-summarize.md`
 设计来源：`docs/arch/webfetch-summarize/design.md` + `docs/adr/0018-webfetch-summarize.md`
 
 ## 基线

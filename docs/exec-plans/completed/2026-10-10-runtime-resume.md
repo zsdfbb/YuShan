@@ -8,7 +8,7 @@
 
 ## 上下文引用
 
-- 设计计划：`docs/design-plans/2026-10-10-runtime-resume.md`
+- 设计计划：`docs/design-plans/completed/2026-10-10-runtime-resume.md`
 - 权威设计：`docs/arch/runtime-resume/design.md`（§3.2 接口 / §3.3 恢复步骤 / §5 不变量 I1–I13 / §6 切片）
 - 质量分析：`docs/arch/runtime-resume/review.md`（24 条发现 / 8 条 P1，均已回修进设计）
 - 现状与约束：`docs/arch/runtime-resume/context.md`

@@ -2,7 +2,7 @@
 
 - **基线 ref**：`9e0b492faa1ce65108d257269904364db9dfe10d`
 - **审查对象**：`crates/ys-tui-coding/src/run.rs` 的 panic 边界
-- **设计依据**：`docs/arch/tui-markdown-render/design.md` §2.11 + 不变量 8；`docs/adr/0030-tui-markdown-render.md` 决策 7；`docs/exec-plans/2026-10-10-tui-markdown-render.md` Task 5 / Task 6；测试合同 N9（`docs/design-plans/2026-10-10-tui-markdown-render.md`）
+- **设计依据**：`docs/arch/tui-markdown-render/design.md` §2.11 + 不变量 8；`docs/adr/0030-tui-markdown-render.md` 决策 7；`docs/exec-plans/completed/2026-10-10-tui-markdown-render.md` Task 5 / Task 6；测试合同 N9（`docs/design-plans/completed/2026-10-10-tui-markdown-render.md`）
 - **结论**：**可放行**。P0 = 0，P1 = 0；仅 2 条 P2（均为**测试守不住**的覆盖缺口，代码本身正确）。
 
 ---

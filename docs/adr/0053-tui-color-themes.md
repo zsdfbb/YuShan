@@ -225,8 +225,8 @@ M3 `theme_modal_step` 的 `Esc` 改成 `Confirm` → 还原用例红），且只
 
 ## 参考
 
-- 设计计划：[`docs/design-plans/2026-10-25-tui-theme-switch.md`](../design-plans/2026-10-25-tui-theme-switch.md)
+- 设计计划：[`docs/design-plans/completed/2026-10-25-tui-theme-switch.md`](../design-plans/completed/2026-10-25-tui-theme-switch.md)
   （D1–D5 决策、C1–C12 测试合同、5 套色值表）
-- 执行计划：[`docs/exec-plans/2026-10-25-tui-theme-switch.md`](../exec-plans/2026-10-25-tui-theme-switch.md)（T1–T17）
+- 执行计划：[`docs/exec-plans/completed/2026-10-25-tui-theme-switch.md`](../exec-plans/completed/2026-10-25-tui-theme-switch.md)（T1–T17）
 - 被反转的红线：[`docs/adr/0030-tui-markdown-render.md`](0030-tui-markdown-render.md)
 - as-built：[`docs/design-final/coding-agent-tui.md`](../design-final/coding-agent-tui.md) §14.9

@@ -5,7 +5,7 @@
 
 ## 上下文引用
 
-参考设计计划：`docs/design-plans/2026-10-19-subagent-observability-and-debug-defaults.md`
+参考设计计划：`docs/design-plans/completed/2026-10-19-subagent-observability-and-debug-defaults.md`
 
 ## 基线
 

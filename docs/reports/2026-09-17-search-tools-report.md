@@ -1,6 +1,6 @@
 # 搜索工具（切片一）— 修改报告
 
-> 日期：2026-09-17 ｜ 设计：`docs/design-plans/2026-09-16-search-tools.md` ｜ 执行：`docs/exec-plans/2026-09-16-search-tools.md`
+> 日期：2026-09-17 ｜ 设计：`docs/design-plans/completed/2026-09-16-search-tools.md` ｜ 执行：`docs/exec-plans/completed/2026-09-16-search-tools.md`
 > 决策：`docs/adr/0015-search-tools-via-external-binaries.md` ｜ 归档时两份计划移入各自 `completed/`
 
 ## 结果

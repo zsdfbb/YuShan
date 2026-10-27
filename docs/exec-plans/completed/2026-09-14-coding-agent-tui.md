@@ -1,6 +1,6 @@
 # Coding Agent TUI（路线 B）执行计划
 
-> 参考设计计划：`docs/design-plans/2026-09-14-coding-agent-tui.md`
+> 参考设计计划：`docs/design-plans/completed/2026-09-14-coding-agent-tui.md`
 > 决策基线：`docs/arch/coding-agent-tui/design.md` + `review.md`
 > 用户的编排授权：full，**直到完成不再逐任务确认**。
 

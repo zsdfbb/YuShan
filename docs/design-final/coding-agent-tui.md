@@ -1131,7 +1131,7 @@ App::set_theme(kind)                       // 唯一入口
 ## 15. debug 结构化执行日志（默认开启）— as-built
 
 设计见 `docs/arch/agent-observability/design.md` + `adr-debug-log.md`；执行计划
-`docs/exec-plans/2026-10-17-debug-log.md`。本节只记实际形态。
+`docs/exec-plans/completed/2026-10-17-debug-log.md`。本节只记实际形态。
 
 ### 15.1 开关与文件
 

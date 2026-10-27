@@ -5,7 +5,7 @@
 
 ## 上下文引用
 
-参考设计计划：`docs/design-plans/2026-10-21-cancellable-model-call.md`
+参考设计计划：`docs/design-plans/completed/2026-10-21-cancellable-model-call.md`
 以及 `docs/adr/0046-cancellable-model-call-and-abort-feedback.md`（决策来源）
 
 核心事实（已核实，实施时可直接采信）：

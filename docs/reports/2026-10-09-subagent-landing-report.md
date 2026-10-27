@@ -3,7 +3,7 @@
 > 日期：2026-10-09。依据：[ADR-0022](../../adr/0022-subagent-dispatch.md)（形态）、
 > [ADR-0029](../../adr/0029-subagent-landing-decisions.md)（落地裁定）、
 > `docs/arch/subagent-rebaseline/{context,design,review}.md`。
-> 执行计划：`docs/exec-plans/2026-10-09-subagent-landing.md`。
+> 执行计划：`docs/exec-plans/completed/2026-10-09-subagent-landing.md`。
 
 ## 结论
 

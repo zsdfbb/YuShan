@@ -4,8 +4,8 @@
 > 范围：sequential-workflow「核心信道 + Actor 模型」第一刀 = 迁移步 0-4 + 前置 Task 0。
 > 日期：2026-09-12
 > 上游文档：
-> - 计划 `docs/design-plans/2026-09-12-core-channel.md`
-> - 执行计划 `docs/exec-plans/2026-09-12-core-channel.md`（Task 0 + 18 任务）
+> - 计划 `docs/design-plans/completed/2026-09-12-core-channel.md`
+> - 执行计划 `docs/exec-plans/completed/2026-09-12-core-channel.md`（Task 0 + 18 任务）
 > - 设计 `docs/arch/gap-closure/design-core-channel.md`（含 R1-R9 勘误）
 > - 质量分析 `docs/arch/gap-closure/review.md`（R1-R8）
 >

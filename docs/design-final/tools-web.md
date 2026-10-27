@@ -1,6 +1,6 @@
 # web 工具（切片二：`websearch` / `webfetch`）— As-built
 
-> 性质：**实际建成记录**。设计见 `docs/design-plans/2026-09-18-tools-web.md`
+> 性质：**实际建成记录**。设计见 `docs/design-plans/completed/2026-09-18-tools-web.md`
 > + `docs/arch/tools-web/design.md`，决策见 `docs/adr/0016-web-tools-design.md`。
 > 日期：2026-09-18；**修订 2026-09-19**：补 `webfetch` 的**可选 `prompt` 摘要**，决策见
 > `docs/adr/0018-webfetch-summarize.md`。与摘要无关的既有内容**未动**。

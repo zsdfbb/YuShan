@@ -2,7 +2,7 @@
 
 > 性质：**实际建成记录**。设计见 `docs/arch/worktree/design.md`（+ `context.md`），决策见
 > `docs/adr/0034-worktree-cli.md`，质量分析见 `docs/arch/worktree/review.md`，计划见
-> `docs/design-plans/2026-10-11-worktree.md` 与 `docs/exec-plans/2026-10-11-worktree.md`。
+> `docs/design-plans/completed/2026-10-11-worktree.md` 与 `docs/exec-plans/completed/2026-10-11-worktree.md`。
 > 日期：2026-10-12 ｜ 基线 `555d7fe`。
 
 ## 一句话
@@ -148,5 +148,5 @@ linked worktree 内返回**树根**，派生落点会多一层错名，`worktree
 
 - `docs/adr/0034-worktree-cli.md` — 决策记录（含 U4 修订）
 - `docs/arch/worktree/{context,design,review}.md`
-- `docs/design-plans/2026-10-11-worktree.md`、`docs/exec-plans/2026-10-11-worktree.md`
+- `docs/design-plans/completed/2026-10-11-worktree.md`、`docs/exec-plans/completed/2026-10-11-worktree.md`
 - `docs/design-final/runtime-resume.md` — `SessionPathHandle` 范式与启动期 `--resume` 的 as-built

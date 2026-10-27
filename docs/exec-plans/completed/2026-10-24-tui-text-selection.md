@@ -5,7 +5,7 @@
 
 ## 上下文引用
 
-- 设计计划：`docs/design-plans/2026-10-24-tui-text-selection.md`（**任务拆分的依据，含 V1–V14 不变量编号**）
+- 设计计划：`docs/design-plans/completed/2026-10-24-tui-text-selection.md`（**任务拆分的依据，含 V1–V14 不变量编号**）
 - 权威设计：`docs/arch/tui-text-selection/design.md`
 - 上下文与实测事实：`docs/arch/tui-text-selection/context.md`
 - 审核与修复记录：`docs/arch/tui-text-selection/review.md`

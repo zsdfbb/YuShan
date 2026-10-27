@@ -1,12 +1,12 @@
 # TUI 配色主题（5 套内置 + `/theme` 实时切换）执行计划
 
 > 依赖声明是**并发调度的依据**：「涉及文件」有交集的任务**不得同波**。
-> 本计划的任务拆分依据是 `docs/design-plans/2026-10-25-tui-theme-switch.md`，其中测试合同编号 C1–C12
+> 本计划的任务拆分依据是 `docs/design-plans/completed/2026-10-25-tui-theme-switch.md`，其中测试合同编号 C1–C12
 > 与下文每个任务的「关联测试」一一对应。设计取向（D1–D5）已由用户签字，实施阶段不重开方案选择。
 
 ## 上下文引用
 
-- **设计计划**：`docs/design-plans/2026-10-25-tui-theme-switch.md`（**任务拆分的依据**，含 D1–D5 决策与 C1–C12 测试合同）
+- **设计计划**：`docs/design-plans/completed/2026-10-25-tui-theme-switch.md`（**任务拆分的依据**，含 D1–D5 决策与 C1–C12 测试合同）
 - **决策记录**：`docs/adr/0053-tui-color-themes.md`（本次新建；Phase 3 只写草稿，正式归档在 Phase 4）
 - **as-built 文档**：`docs/design-final/coding-agent-tui.md`（`:277` 讲 ✓/✗ 绿/红语义、`:781-782` 讲 `styles.rs` 的 23 方法覆写 —— 两者都要按主题改写）
 - **被反转的旧决策**：`docs/adr/0030-tui-markdown-render.md`（其中「不做 Theme/Palette」由 ADR-0053 反转；**本次不改 ADR-0030 正文**）

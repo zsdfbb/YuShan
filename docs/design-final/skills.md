@@ -1,7 +1,7 @@
 # Skills 支持 — As-built
 
 > 性质：**实际建成记录**。设计见 `docs/arch/skills/design.md`（+ 上游 `context.md`），
-> 决策见 `docs/adr/0019-skills.md`，设计计划见 `docs/design-plans/2026-09-21-skills.md`
+> 决策见 `docs/adr/0019-skills.md`，设计计划见 `docs/design-plans/completed/2026-09-21-skills.md`
 > （其 §4 记录了实现前的 5 条现实约束 D1–D5）。
 > 日期：2026-09-21
 
@@ -356,6 +356,6 @@ skills 落地后补的第四个**用户可见面**（此前三个：`/help` 只�
 - [`../../arch/skills/design.md`](../../arch/skills/design.md) — 设计（含 §CC 格式兼容性与候选对比）
 - [`../../arch/skills/context.md`](../../arch/skills/context.md) — 需求 / 约束 / D1 / D2 / D2′
 - [`../../adr/0019-skills.md`](../../adr/0019-skills.md) — 决策记录
-- [`../../design-plans/2026-09-21-skills.md`](../../design-plans/2026-09-21-skills.md) — 设计计划（§4 D1–D5 实现前约束）
+- [`../../design-plans/2026-09-21-skills.md`](../design-plans/completed/2026-09-21-skills.md) — 设计计划（§4 D1–D5 实现前约束）
 - [`../../adr/0017-compaction-hardening.md`](../../adr/0017-compaction-hardening.md) — 压缩加固（`fixed_prompt_tokens` 与它耦合）
 - [`./compaction.md`](./compaction.md) — 压缩 as-built（R8 的「估算器未对账」在其遗留清单里）

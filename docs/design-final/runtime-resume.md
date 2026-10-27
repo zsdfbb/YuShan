@@ -5,7 +5,7 @@
 > （**取代 ADR-0026 决策 6**）与 `docs/adr/0043-resume-repairs-interrupted-tool-calls.md`，
 > 质量分析见 `docs/arch/runtime-resume/review.md`
 > （24 条发现 / 8 条 P1，全部回修进设计），执行计划见
-> `docs/exec-plans/2026-10-10-runtime-resume.md`（含「波次修正」节）。
+> `docs/exec-plans/completed/2026-10-10-runtime-resume.md`（含「波次修正」节）。
 > 日期：2026-10-11 ｜ 基线 `eb3ff23`。
 
 ## 一句话
@@ -224,6 +224,6 @@ JSON stdout 也不会混入非 `Envelope` 行。
 
 - `docs/adr/0033-runtime-resume-command.md`（取代 ADR-0026 决策 6）
 - `docs/arch/runtime-resume/{context,design,review}.md`、`candidates/{a-minimal,b-extensible,c-performance}.md`
-- `docs/design-plans/2026-10-10-runtime-resume.md`、`docs/exec-plans/2026-10-10-runtime-resume.md`
+- `docs/design-plans/completed/2026-10-10-runtime-resume.md`、`docs/exec-plans/completed/2026-10-10-runtime-resume.md`
 - `docs/design-final/session-default-new.md`（被取代处已加标注）、`docs/design-final/coding-agent-tui.md`（命令表已更新）
 - `scripts/doc-consistency.sh`（本批文档订正的对账点）

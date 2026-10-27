@@ -7,7 +7,7 @@
 > 评审：[`../arch/long-horizon-completion/review.md`](../arch/long-horizon-completion/review.md)（`/arch-validate`）
 > 同类软件调研：[`../arch/long-horizon-completion/research.md`](../arch/long-horizon-completion/research.md)（Pi @ `47236c8`）
 > 基线：`master` @ `5eae60a`（工作区干净）
-> 性质：**实现前计划**（配套 exec-plan：[`../exec-plans/2026-10-09-long-horizon-completion.md`](../exec-plans/2026-10-09-long-horizon-completion.md)）
+> 性质：**实现前计划**（配套 exec-plan：[`../exec-plans/2026-10-09-long-horizon-completion.md`](../../exec-plans/completed/2026-10-09-long-horizon-completion.md)）
 
 **名称说明**：本计划的「完成」指**长程任务的收尾**，不含 todo / subagent / follow-up 闭环（那三者是另一问题类别的 ADR-0024 / ADR-0022，明确不做，见 §2）。
 

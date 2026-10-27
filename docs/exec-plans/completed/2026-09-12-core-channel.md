@@ -1,6 +1,6 @@
 # Execution Plan: 核心信道 + Actor 模型（第一刀：迁移步 0-4）
 
-> 设计计划：`docs/design-plans/2026-09-12-core-channel.md`
+> 设计计划：`docs/design-plans/completed/2026-09-12-core-channel.md`
 > 每个 `type: impl` 任务紧跟一个 `type: test` 任务配对（共 9 对 / 18 条）。
 > 任务编号前缀对应已批准计划的「步.子任务」编号（0.1 / 1.1 / 1.2 / 2.1 / 2.2 / 2.3 / 2.4 / 3.1 / 4.1）。
 > 另有 1 对**前置修复**任务（Task 0 / 0T，标题带「前置」前缀），**不计入**上述 18 条，也不属于迁移步 0-4。

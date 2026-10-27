@@ -9,7 +9,7 @@
 
 ## 上下文引用
 
-参考设计计划：`docs/design-plans/2026-10-21-background-command.md`
+参考设计计划：`docs/design-plans/completed/2026-10-21-background-command.md`
 设计来源：`docs/arch/execution-efficiency/design.md`（**§4.9 切片表**、§5 D1/D2、§6 验收口径、§7 残留风险、§8 不做的方向）
 决策记录：`docs/arch/execution-efficiency/adr-background-command-execution.md`（含 2026-10-21 定稿的三条架构级决策）
 现状/约束：`docs/arch/execution-efficiency/context.md`

@@ -1,6 +1,6 @@
 # `--debug` 结构化执行日志（P0）验收报告
 
-- 执行计划：`docs/exec-plans/2026-10-17-debug-log.md`（Task 1–18）
+- 执行计划：`docs/exec-plans/completed/2026-10-17-debug-log.md`（Task 1–18）
 - 设计：`docs/arch/agent-observability/design.md` + `adr-debug-log.md`
 - 基线：`7987b4b`（`chore(sw): baseline before debug-log`）
 - 验收日期：2026-10-17

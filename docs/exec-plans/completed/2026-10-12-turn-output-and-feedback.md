@@ -5,7 +5,7 @@
 
 ## 上下文引用
 
-参考设计计划：`docs/design-plans/2026-10-12-turn-output-and-feedback.md`
+参考设计计划：`docs/design-plans/completed/2026-10-12-turn-output-and-feedback.md`
 上游设计：`docs/arch/turn-output-and-feedback/design.md`（v2）
 
 ## 基线

@@ -1,7 +1,7 @@
 # turn-output-and-feedback — 实现审查报告（Phase 3）
 
 > 日期：2026-10-12 ｜ 基线 `43ad632c0ffef366102358db1f15d2b64901d5ed`
-> 设计：[`docs/arch/turn-output-and-feedback/design.md`]（v2）｜ 计划：`docs/design-plans/2026-10-12-turn-output-and-feedback.md`
+> 设计：[`docs/arch/turn-output-and-feedback/design.md`]（v2）｜ 计划：`docs/design-plans/completed/2026-10-12-turn-output-and-feedback.md`
 >
 > ⚠️ **审查者说明**：本轮 subagent 通道不可用（多次投递均未送达任务正文），按用户授权由**主 agent 自审**。
 > **自审弱于独立审查** —— 已用「字节级 `git diff` 基线 + 测试合同逐条核对 + 每项写清变异点」补偿，

@@ -136,6 +136,19 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
+- **Termux / Android 下 subagent 派发会把整个会话拖死（Android 12 phantom process killer）**：
+  排查记录见 `docs/reports/2026-10-27-termux-restart-under-subagent-report.md`。
+  **代码侧四条放大因素**（均已核实）：每回合最多 16 次派发且两个派发工具都声明并发安全
+  （`apps/coding-agent/src/subagent.rs:33`、`:1418`、`:1505`）；`LiveSubagents` **只有计数器没有准入闸**
+  （`apps/coding-agent/src/subagent.rs:347`、`:362`，全仓 `Semaphore` **零命中**）；`bash` 输出
+  `read_to_end` **无界累积**（`adapters/tools-basic/src/bash.rs:511`，截断在 `:209` 才做）；
+  子 agent 的 `CollectingSink` / `MemorySession` / 转录字符串**全量留内存**
+  （`crates/ys-event/src/collecting.rs:8`、`crates/ys-session/src/memory.rs:8`、`subagent.rs:1246`）。
+  ⬜ **待办**：R2（`bash` 有界收集，照 `exec.rs:179` 的 `run_bounded` 语义）无契约变更，可直接做；
+  R1（子 agent 并发闸）改 ADR-0022 决策 15 / ADR-0055 的语义边界 ⇒ **须先走 `arch-design`**。
+  ⚠️ 主因归属**尚未确认**：本机读不到 cgroup / `dmesg`，需用户侧提供「Termux 是否打出 `signal 9`」
+  与进程数峰值（报告 §5）。**确认前不要把 R1 当已定方案落地**。
+
 - **TUI 鼠标**（[ADR-0050](../adr/0050-tui-mouse-wheel-scroll.md) 滚轮 +
   [ADR-0051](../adr/0051-tui-text-selection.md) 拖选）：
   - ⬜ **模态浮层里的滚轮**：浮层自己读事件（`crates/ys-tui-coding/src/run.rs` 的

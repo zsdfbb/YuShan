@@ -9,9 +9,7 @@
 > 或 `docs/exec-plans/completed/`。新增条目前先问一句：这是**真的待办**，还是**有意不做**？
 > 后者属于设计决策，该进 ADR，不进本清单。
 >
-> 基线：`master` @ `7fd655b`（核实于 2026-10-21）。A1–A4 / B / C / D 沿用 `5af317e`（2026-10-17）的核实结果。
-> A5（execution-efficiency 的落地）已在 `825cd82` 落地并删除（合并进 `master`）。
-> A1–A4 / B / C / D 的核实结果**未**对 `825cd82` 重新核过 —— 基线仍是上行的 `7fd655b`。
+> 基线：`master` @ `39f4f95`（核实于 2026-10-27）。A1–A4 / B / C / D 的核实结果均在此基线重核过。
 
 ---
 
@@ -25,41 +23,38 @@ P0 已落地；P1、P2 是**设计文档自己排的阶段**，标注见
 | 阶段 | 缺什么 | 状态依据 |
 |---|---|---|
 | P1 | **适配器自检**（启动期检测旁路静默退化的缓解措施） | `design.md` §5 标 ⏳，全仓无自检代码 |
-| P1 | T5 的「进程被 `kill -9`」不 flush 退出 | `docs/exec-plans/2026-10-17-debug-log.md:454` 仍为 `[ ]` |
 | P2 | `state_change` 记录 | 全仓源码 grep `state_change` **零命中** |
 | P2 | jq 配方文档 | `design.md` §5 标 ⏳ |
 
 > P1 的 `model_attempt` / `context_compacted` / `context_compaction_failed` / `response_truncated`
 > **已落地**（`apps/coding-agent/src/debug_log.rs:508`、`main.rs:713`、`main.rs:723`），不在本清单内。
+>
+> P1 的「进程被 `kill -9` 不 flush 退出」**已不成立**：`debug_log.rs:922` 的 `write_line`
+> 直接 `write_all` 到文件、不经过 `BufWriter`，进程被杀最多丢整行、不留半行
+> （`docs/reports/2026-10-17-debug-log-report.md:22` 已把这一条记为 P0 验收事实）。
 
-### A2. debug-log 执行计划的文档归档
+### A2. subagent 落地的成本数字回填（N8 / 刀 7）
 
-`docs/exec-plans/2026-10-17-debug-log.md` 仍在 `exec-plans/` 根下（对比：其余十二份已在
-`exec-plans/completed/`）。验收报告见 `docs/reports/2026-10-17-debug-log-report.md`。
-
-### A3. subagent 落地的成本数字回填（N8 / 刀 7）
-
-`docs/design-plans/2026-10-09-subagent-landing.md:74` —— 需真实凭证跑一次派发，把读数写回
+`docs/design-plans/completed/2026-10-09-subagent-landing.md:74` —— 需真实凭证跑一次派发，把读数写回
 `docs/arch/subagent-rebaseline/design.md` §6.4。标记 `MANUAL_ACK_REQUIRED`。
 
 > 该计划的刀 0–6 **已落地**（`SubagentRunner` 全仓 28 处命中，`toolset.rs:592` 的父表 10 元断言存在）。
-> 因此 `docs/design-plans/2026-10-09-subagent-landing.md` 本身待归档到 `design-plans/completed/`。
 
-### A4. 子 agent 只读角色（多角色定义）
+### A3. 子 agent 只读角色（多角色定义）
 
 `docs/arch/subagent/design.md:827` 的 **P3（条件触发，本轮不做）** 表列出「多角色 agent 定义
 （frontmatter / 配置，含只读角色）」，触发条件 = 出现**第二个**内置角色的真实需求（`:834`）。
 设计已留口子：**子 agent 能力完全由创建时给它的工具表决定，不需要新机制**（`:647` D14 裁定；
 ADR-0022（accepted）`:132-133` 同文）。
 
-| 缺什么 | 状态依据（核实于 `e6f5f13`） |
+| 缺什么 | 状态依据（核实于 `39f4f95`） |
 |---|---|
-| 角色概念 / 只读开关 | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（`apps/coding-agent/src/toolset.rs:515`、`apps/coding-agent/src/prompt.rs:699` 的 `read_only` 命中是**并发安全**测试名，非角色定义） |
-| `build_tools` 无法按角色换表 | 签名零策略参数（`apps/coding-agent/src/toolset.rs:88`）；全仓**仅两处**构建工具表：装配期 `apps/coding-agent/src/assembly.rs:100`（子表）与派发期 `apps/coding-agent/src/subagent.rs:378`（每次派发重建） |
+| 角色概念 / 只读开关 | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（`apps/coding-agent/src/toolset.rs:517`、`apps/coding-agent/src/prompt.rs:782` 的 `read_only` 命中是**并发安全**测试名，非角色定义） |
+| `build_tools` 无法按角色换表 | 签名零策略参数（`apps/coding-agent/src/toolset.rs:88`）；生产路径全仓**仅两处**构建工具表：装配期 `apps/coding-agent/src/assembly.rs:143`（子表）与派发期 `apps/coding-agent/src/subagent.rs:980`（每次派发重建） |
 
 > ⚠️ **落地约束**：不可把角色做成 `subagent` 工具入参 —— 那会改 `ToolSpec`，动
-> `apps/coding-agent/src/toolset.rs:568` 的**前缀指纹锚**，且破掉「子表 JSON 是父表字节前缀」
-> 这条缓存优化（`apps/coding-agent/src/assembly.rs:119` 派发工具追加末位即为此）。
+> `apps/coding-agent/src/toolset.rs:570` 的**前缀指纹锚**，且破掉「子表 JSON 是父表字节前缀」
+> 这条缓存优化（`apps/coding-agent/src/toolset.rs:647` 的断言即为此）。
 > 宜做成**装配期多张预建表**（指纹只增不改）。
 >
 > **边界**：同表 `:835`「按任务类型动态裁剪子工具表」是**另一项**（R > 5 才回本，且破前缀），
@@ -69,14 +64,15 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 | 项 | ADR（accepted） | 全仓源码证据 | 计划 |
 |---|---|---|---|
-| **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15）；**协议格已由 ADR-0047 备好**（`Delivery{origin: System}`） | grep `follow_up` / `FollowUp` = **0** | `docs/design-plans/2026-09-15-follow-up.md`；协议见 `docs/adr/0047` || **长程 todo + `ToolPlugin` 装配缝** | ADR-0024（`:7`）supersede 0021 决策 5；ADR-0021（`:7`）决策 ③ | grep `ToolPlugin` = **0**、`todo.json` = **0**、`should_inject` = **0**；`adapters/tools-basic/src/` 只有 7 个文件工具，无 `todo.rs` | `docs/arch/long-horizon-todo/design.md`、`docs/arch/hooks-and-plugins/design.md` |
+| **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15） | grep `follow_up` / `FollowUp` = **0**；`DeliveryTarget` 也是 **0**（ADR-0047 的协议格**并未**落地） | `docs/design-plans/2026-09-15-follow-up.md`；协议见 `docs/adr/0047` |
+| **长程 todo + `ToolPlugin` 装配缝** | ADR-0024（`:7`）supersede 0021 决策 5；ADR-0021（`:7`）决策 ③ | grep `ToolPlugin` = **0**、`todo.json` = **0**、`should_inject` = **0**；`adapters/tools-basic/src/` 只有 7 个文件工具，无 `todo.rs` | `docs/arch/long-horizon-todo/design.md`、`docs/arch/hooks-and-plugins/design.md` |
 
 **这两项相互咬合**（0024 的推动判据「有未完成项」依赖 0014 的 follow-up 机制），
 宜按 **follow-up → todo** 的顺序推进。
 
 **Follow-up 的根因（已查明，2026-10-22 核实）**：「排到下一回合」这一路**不是缺实现，是缺协议格**——
 ADR-0013 删掉了旧 `Inbox` 的 `follow_up` 路（`docs/adr/0013-cancel-token-removal-boundary-source.md:37`），
-而 `Boundary` 枚举只有 `Steer` / `Abort` 两格（`crates/ys-protocol/src/boundary.rs:12-16`）。
+而 `Boundary` 枚举今天只有 `Steer` / `Deferred` / `Compact` / `Abort`（`crates/ys-protocol/src/boundary.rs:12`）。
 ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义时协议已被收敛掉。
 详见 `docs/arch/input-delivery-latency/context.md`。
 
@@ -102,7 +98,9 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 投递去向做成协议一等公民（`DeliveryTarget` / `Delivery`，`ys-protocol` 新文件），
 队列住在 **app 侧**（`app_loop`）**跨回合存活** ⇒ 既是「绝不丢失」的保证，
 也是 follow-up 缺的**协议格**（`Delivery{origin: System}`）。
-⇒ 本条从「代码零落地」变为「**协议已备，实现待做**」。
+⚠️ 但 **ADR-0047 自己标的是 `accepted (partial)`**，代码里 `DeliveryTarget` / `Delivery`
+**零命中**（`adapters/tools-basic/src/background.rs` 的 `Delivery` 是同名私有枚举，与协议无关）。
+⇒ 本条应读作「**协议仍缺，G1 / G3 / G5 / G6 未做**」，不是「协议已备」。
 
 **已落地的相关修复（2026-10-22，ADR-0049）**：
 「模型正要收尾时到达的插话**静默消失**」这个丢消息故障已修 ——
@@ -143,7 +141,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   router 自身调用只准 `off`/`low` 且用**类型**强制；deepseek-harness 的**子 agent 可清零**
   route 继承的 effort。
   **本仓现状**（核实于 2026-10-27）：子 agent 直接继承全局
-  （`apps/coding-agent/src/main.rs:2928-2930`）；**压缩摘要完全未设档位**
+  （`apps/coding-agent/src/main.rs:2928`）；**压缩摘要完全未设档位**
   （`crates/ys-loop/src/compact.rs` 全文无 `effort` 赋值）。
   ⬜ **待办**：E1（压缩摘要用最低档；`RoundPurpose::Compaction` 已有区分点，代价最小）→
   E2（子 agent 不默认继承）→ E3（探索/检索类低档，需先造「调用类型」概念）。
@@ -156,18 +154,19 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   **代码侧四条放大因素**（均已核实）：每回合最多 16 次派发且两个派发工具都声明并发安全
   （`apps/coding-agent/src/subagent.rs:33`、`:1418`、`:1505`）；`LiveSubagents` **只有计数器没有准入闸**
   （`apps/coding-agent/src/subagent.rs:347`、`:362`，全仓 `Semaphore` **零命中**）；`bash` 输出
-  `read_to_end` **无界累积**（`adapters/tools-basic/src/bash.rs:511`，截断在 `:209` 才做）；
+  `read_to_end` **无界累积**（`adapters/tools-basic/src/bash.rs:513`，截断在 `:209` 才做）；
   子 agent 的 `CollectingSink` / `MemorySession` / 转录字符串**全量留内存**
   （`crates/ys-event/src/collecting.rs:8`、`crates/ys-session/src/memory.rs:8`、`subagent.rs:1246`）。
-  ⬜ **待办**：R2（`bash` 有界收集，照 `exec.rs:179` 的 `run_bounded` 语义）无契约变更，可直接做；
+  ⬜ **待办**：R2（`bash` 有界收集，照 `exec.rs:218` 的 `run_bounded` 语义）无契约变更，可直接做；
   R1（子 agent 并发闸）改 ADR-0022 决策 15 / ADR-0055 的语义边界 ⇒ **须先走 `arch-design`**。
   ⚠️ 主因归属**尚未确认**：本机读不到 cgroup / `dmesg`，需用户侧提供「Termux 是否打出 `signal 9`」
   与进程数峰值（报告 §5）。**确认前不要把 R1 当已定方案落地**。
 
-- **TUI 鼠标**（[ADR-0050](../adr/0050-tui-mouse-wheel-scroll.md) 滚轮 +
-  [ADR-0051](../adr/0051-tui-text-selection.md) 拖选）：
+- **TUI 鼠标**（[ADR-0050](adr/0050-tui-mouse-wheel-scroll.md) 滚轮 +
+  [ADR-0051](adr/0051-tui-text-selection.md) 拖选）：
   - ⬜ **模态浮层里的滚轮**：浮层自己读事件（`crates/ys-tui-coding/src/run.rs` 的
-    `Prompter` 实现），`_ => {}` 掉鼠标 ⇒ 会话列表 / 模型列表超过一屏时**无法滚动**，
+    `Prompter` 实现），`select_modal` 的 `match` 末尾 `_ => {}` 掉鼠标（`run.rs:613`）
+    ⇒ 会话列表 / 模型列表超过一屏时**无法滚动**，
     只能靠方向键逐项移动（跨屏时会自动跟高亮）。补法：在 `select_modal` 的匹配里加
     `Event::Mouse` 臂改 `top` / 高亮。依据：ADR 风险表的「模态浮层里的滚轮」一行标**未做**。
 
@@ -177,7 +176,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   （MCP 长任务、后台 LSP、后台 subagent 的另一种形态）⇒ 那时把这三块抽成
   `ys-protocol` 的 `DeferredSink`（候选 B 的 §2.2）。不抽的代价：那 30 行会被复制第二遍。
 - **`kill_group` 仍是同步 fork**：已从锁内挪到锁外（ADR 同上），但仍是
-  `Command::new("sh")...status()` 的同步等待。`proc_group::kill_group_async` 已存在，
+  `Command::new("sh")...status()` 的同步等待。`proc_group::kill_group_async:40` 已存在，
   要彻底解决需把 `sweep` / `snapshot` 的签名改异步。
 
 - **PTC（程序化工具调用）—— 长期方向，本轮明确不做**（ADR-0048 决策）：
@@ -187,21 +186,20 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   的硬约束正面冲突，且约 2,500+ 行。**触发重开的条件**：上层项目给出执行边界，
   或轮数差距（同题对照 codex 6 轮 vs 我们 33 轮）成为主要瓶颈。
   设计依据 `docs/arch/session-latency/design.md` §4.3 决策点 1。
-- **`docs/arch/session-latency/` 的 D2（subagent 工具表约束）未做**：子 agent 现状拿到与父
-  **完全相同的 9 个工具**（`apps/coding-agent/src/subagent.rs:421`），需按角色换表
-  （ADR-0022 D14 已裁定「能力 = 创建时给的工具表」）。**但受前缀指纹锚约束**
-  （`apps/coding-agent/src/toolset.rs:568`）⇒ 须**装配期预建多张表**，
-  不可把角色做成 `subagent` 工具入参（会动 `ToolSpec`、破「子表 JSON 是父表字节前缀」）。
-  另需满足 D15「提示词不可见 + 执行时拒绝」双实现。**需先走 `arch-design`**。
 
-- **`toolset.rs` 的 `PATH` 改写会波及不持锁的用例**：`apps/coding-agent/src/toolset.rs:193`
+- **`docs/arch/session-latency/` 的 D2（subagent 工具表约束）**：与 **A3** 是同一件事的
+  `session-latency` 表述（子 agent 拿到与父**完全相同的 9 个工具**，`apps/coding-agent/src/subagent.rs:980`
+  每次派发重建），落地时合并处理；另需满足 D15「提示词不可见 + 执行时拒绝」双实现。
+
+- **`toolset.rs` 的 `PATH` 改写会波及不持锁的用例**：`apps/coding-agent/src/toolset.rs:195`
   的 `set_path` 把进程 `PATH` 指向空目录（它自己持 `env_lock` + RAII 还原，纪律是对的），
   但**别的**用例若要 `spawn` 一个按 `PATH` 解析的二进制（`sh` 等）而**不持同一把锁**，
   就会在窗口期内拿到 ENOENT ⇒ 表现为「命令静默启动失败、留下孤儿进程」。
   本仓后台命令用例已整段持 `env_lock` 绕开，**隐患本身仍在**（`AGENTS.md`「测试隔离」条）。
 - **`explore-speed` 的三条非目标**（`docs/arch/explore-speed/design.md:41`）：按 bash 命令契约判
   只读、拆第二个并发常量、动 `Tool::timeout()` 契约面 —— 本轮明确不做，需单独论证才重开。
-- **ADR 编号断档**：`docs/adr/` 缺 `0005` / `0006` / `0040`（`0005` 实际在
-  `docs/arch/coding-agent/adr-0005-infrastructure-approach.md`）。需确认是历史沿革还是遗漏。
+- **ADR 编号断档**：`docs/adr/` 缺 `0005` / `0006`（`0040` 已存在：
+  `docs/adr/0040-per-segment-tool-scheduling.md`；`0005` 实际在
+  `docs/arch/coding-agent/adr-0005-infrastructure-approach.md`）。需确认 `0006` 是历史沿革还是遗漏。
 - **`docs/arch/tui-turn-spacing/` 已实施但未归档**：代码在
-  `crates/ys-tui-coding/src/draw.rs:56`（`USER_GAP_ROWS = 2`），文档停在 `context.md`。
+  `crates/ys-tui-coding/src/draw.rs:61`（`USER_GAP_ROWS = 2`），文档停在 `context.md`。

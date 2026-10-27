@@ -262,10 +262,16 @@ fn tool_guidelines(tools: &[&str]) -> String {
     // 又留在会话里被之后**每一轮**重读 —— 实测一次 14 分钟探索写下 37 段、16,916 字符（≈4,229
     // token），其中最长一段 2,464 字符是给内部假设做的论证。那段话对用户零价值，却要被重读几十次。
     //
-    // 故三条**可判定**的约束，缺一条实测就会被突破：
-    //   ① 时机：只在**里程碑**（换了目标 / 得出结论 / 遇到梗阻），不是每批工具调用。
-    //   ② 长度：**≤ 120 字符**。「一句话」不可判定（一句话可以写 2,464 字符）。
-    //   ③ 内容：禁止假设与论证（「可能是因为」「我猜」「先验证 A 或 B」）—— 那属于内部推理。
+    // 故四条**可判定**的约束，缺一条实测就会被突破：
+    //   ① 开头：**新请求的第一个工具调用之前**必须先说一句要做什么 —— 否则用户看到的是
+    //      工具凭空发起，既不知道在做什么、也无从判断方向对不对。这是「聚焦需求」的唯一
+    //      时点：先复述意图，再动手。
+    //   ② 其余时机：只在**里程碑**（换了目标 / 得出结论 / 遇到梗阻），不是每批工具调用。
+    //   ③ 长度：**≤ 120 字符**。「一句话」不可判定（一句话可以写 2,464 字符）。
+    //   ④ 内容：禁止假设与论证（「可能是因为」「我猜」「先验证 A 或 B」）—— 那属于内部推理。
+    //
+    // ① 与 ② 不冲突：开头这一句是**最高优先级的里程碑**（回合起点），`②` 管的是它的**其余**
+    // 出现时机。缺 ① 的实测形态就是「发出需求后工具直接开跑」，用户全程没有落点。
     //
     // **「连续 N 次调用必须说一句」不写在这里** —— 模型看不到自己的累计调用次数，
     // 这条已交给 harness 计数并在到阀时注入提醒（`RunLimits::narration_silence_tool_calls`）。
@@ -280,11 +286,13 @@ fn tool_guidelines(tools: &[&str]) -> String {
         )
     }) {
         guidelines.push(
-            "In multi-step work, narrate only at milestones (target changed, conclusion reached, \
-             or blocked) — not before every tool batch. Each update is **one short sentence** \
-             (hard limit 120 characters) saying what you did or will do, nothing else. Never state \
-             hypotheses or reasoning (\"maybe\", \"I suspect\", \"let me check whether A or B\") — \
-             those are internal and cost the user a large re-read on every later round"
+            "Before the first tool call of a new request, state in **one short sentence** what you \
+             are about to do — the user must see the intent before any tool fires. After that, \
+             narrate only at milestones (target changed, conclusion reached, or blocked) — not \
+             before every tool batch. Each update is **one short sentence** (hard limit 120 \
+             characters) saying what you did or will do, nothing else. Never state hypotheses or \
+             reasoning (\"maybe\", \"I suspect\", \"let me check whether A or B\") — those are \
+             internal and cost the user a large re-read on every later round"
                 .to_string(),
         );
     }
@@ -844,9 +852,10 @@ mod tests {
         );
     }
 
-    /// 「过程叙述」guideline 的**新契约**：只让模型在里程碑说话、限 120 字符、禁假设推理。
+    /// 「过程叙述」guideline 的**新契约**：新请求的首个工具调用前先说一句、
+    /// 其余仅在里程碑说话、限 120 字符、禁假设推理。
     ///
-    /// 历史教训（为什么这三条要分开钉）：旧措辞是「Before every batch … one concise sentence」，
+    /// 历史教训（为什么这几条要分开钉）：旧措辞是「Before every batch … one concise sentence」，
     /// 两条都不可判定 —— `every batch` 被照做成 37 次，`one sentence` 被写成 2,464 字符的论证。
     /// ⇒ 现在每条约束都有**能不能被引用原文证明**的断言，而不是靠「测试绿了」。
     ///
@@ -854,14 +863,15 @@ mod tests {
     /// 也能过 —— 而那会让固定前缀无谓变大。
     ///
     /// 变异：① 把守卫改成无条件 push ⇒ 最后两条变红；② 把 `bash` 从匹配集合删掉 ⇒ bash 那条变红；
-    /// ③ 删掉 `120` ⇒ 长度断言变红；④ 改成「before every batch」⇒ 里程碑断言变红。
+    /// ③ 删掉 `120` ⇒ 长度断言变红；④ 改成「before every batch」⇒ 里程碑断言变红；
+    /// ⑤ 删掉开头那一句 ⇒ 「首个工具调用前说一句」断言变红。
     #[test]
     fn narration_guideline_is_milestone_scoped_and_bounded() {
         let _guard = env_lock();
         let _env = no_global_prompt();
 
         // 定位这句 guideline 的**起头**（后续断言都在它上面做）。
-        let opener = "- In multi-step work, narrate only at milestones";
+        let opener = "- Before the first tool call of a new request";
         let marker = "narrate only at milestones";
 
         let with_read = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
@@ -869,14 +879,26 @@ mod tests {
             with_read.contains(opener),
             "含 read 时应给「过程叙述」指引；prompt = {with_read}"
         );
-        // ① 时机：里程碑驱动，**不是**每批一次。
+        // ① 开头：新请求的首个工具调用前必须先声明意图。
+        //
+        // 这是「发出需求后工具直接开跑」的那个故障的守卫：缺它时模型可以一声不吭
+        // 连续调工具，用户全程没有落点、也无从判断方向对不对。
+        assert!(
+            with_read.contains("Before the first tool call"),
+            "必须要求首个工具调用前先说明意图；prompt = {with_read}"
+        );
+        assert!(
+            with_read.contains("the user must see the intent before any tool fires"),
+            "必须写明该句的理由（意图先于工具）；prompt = {with_read}"
+        );
+        // ② 其余时机：里程碑驱动，**不是**每批一次。
         //
         // 注意：新文案里带着 “not before every tool batch” 这半句（它是在**否定**旧行为），
         // 所以负向断言只能针对**旧措辞的原文**（`Before every batch of tool calls`），
         // 不能针对 `before every tool batch` 这种子串 —— 那会把新文案自己也判红。
         assert!(
             with_read.contains(marker),
-            "必须声明「仅在里程碑」；prompt = {with_read}"
+            "必须声明「其余仅在里程碑」；prompt = {with_read}"
         );
         // ② 长度：可判定的数字上限（旧措辞的「一句话」不可判定）。
         assert!(
@@ -916,9 +938,11 @@ mod tests {
         );
 
         let no_tools = build_system_prompt(Path::new("/tmp"), &[], &no_skills());
+        // 反向断言用 guideline 的**起头**，不用某个旧短语 —— 后者会随文案修改
+        // 静默变成恒真（`!contains(旧短语)` 在新文案里自然成立，根本验证不到门控）。
         assert!(
-            !no_tools.contains("multi-step tool work"),
-            "空工具表时不得出现该指引；prompt = {no_tools}"
+            !no_tools.contains(opener),
+            "空工具表时不得出现过程叙述指引；prompt = {no_tools}"
         );
         assert!(
             !no_tools.contains(marker),

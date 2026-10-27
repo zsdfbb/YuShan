@@ -432,6 +432,43 @@ provider 上**基本不成立**。
 ⚠️ 该组任务本身设计有问题（五档质量全为 0/4，含 `thinking=disabled`），
 **不能用于比较质量**；它只用于证明「思考能吃光预算」这个现象存在。
 
+### 已落地的修复（2026-10-27，代码已改）
+
+**给摘要路径关闭思考。** 这是上节结论 ① 与 ④ 的直接落地：
+
+| 改动 | 位置 |
+|---|---|
+| `ModelRequest.disable_thinking: Option<bool>`（`serde(skip)`，不破会话契约） | `crates/ys-model/src/request.rs` |
+| `ChatCompletionRequest.thinking: Option<ThinkingControl>` + `ThinkingControl { Enabled, Disabled }` | `adapters/model-openai-compatible/src/request.rs` |
+| `ProviderCompat.supports_thinking_control` 能力位（默认 `false`，仅 `deepseek()` 为 `true`） | `adapters/model-openai-compatible/src/compat.rs` |
+| 接线：`disable_thinking == Some(false) && supports_thinking_control` ⇒ 发 `{"type":"disabled"}` | `translate_request` |
+| 摘要路径设 `disable_thinking: Some(false)` | `crates/ys-loop/src/summarize.rs` |
+
+**几个刻意的取舍**：
+
+- 用 `Option<bool>` 而不是 `bool`：`None`（不干预）与 `false`（确定关闭）语义不同。
+  用 `bool` 会让**所有既有调用**默认关闭思考 —— 那是一次静默的行为变更。
+- **从不发 `enabled`**：那是 provider 默认值，发它只给不认识该字段的端点添风险。
+- **按 provider 门控**：GLM 明确「始终思考，不支持关闭」（code 1210），MiMo / 标准端点
+  未验证 ⇒ 只有 DeepSeek 方言声明支持。
+- `serde(skip)`: 与 `boundary` 同理，`ModelRequest` 是会话契约，加值字段会改序列化字节。
+
+**端到端验证**（`deepseek-flash`，真实页面，摘要路径的真实请求形状）：
+
+| 配置 | completion | reasoning | 墙钟 | 正文 | 质量命中 |
+|---|---|---|---|---|---|
+| 默认（服务端 `high`） | 457 | 153 | 2.36s | 110 词 | 4/4 |
+| **`thinking=disabled`** | **201（−56%）** | **—** | **1.36s（−42%）** | 93 词 | **4/4** |
+
+⇒ 成本与延迟双减，**关键信息一条没少**；思考版反而更啰嗦。
+
+**测试**：
+
+- `thinking_control_is_gated_and_optional_on_the_wire` —— 钉三件事：`None` 时字段不出现
+  （既有行为逐字节不变）、`Some(false)` + 支持 ⇒ 发 `disabled`、`Some(false)` + 不支持 ⇒ 不发。
+  三个变异（去掉门控 / 把 `None` 当关闭 / `disabled` 拼错）**均被抓住**。
+- `request_shape_is_lean_and_framed` 增一条 `disable_thinking == Some(false)` 断言。
+
 ### 对本仓的直接影响
 
 **全仓没有任何地方发送 `thinking` 字段**（`grep thinking adapters/` 只命中
@@ -442,10 +479,16 @@ provider 上**基本不成立**。
   `reasoning_effort`，用的是服务端默认 `high`。
 - `opencode_go()` 开了 `supports_reasoning_effort`，但同样不发 `thinking`。
 
-⇒ **本仓目前既不能关闭思考，也不能真正降档**：
+⇒ **修复前本仓既不能关闭思考，也不能真正降档**：
 `off` 配置面对 deepseek 是空操作（字段不发），对 opencode-go 会撞 422（`off` 非法）。
-**这是比「缺按类型分档」更基础的一个缺陷**，且它不需要任何架构改动就能修
-—— 只需在 wire 层加 `thinking` 字段。
+这是比「缺按类型分档」更基础的一个缺陷。
+
+> ✅ **已在同日修复**（见上节「已落地的修复」）：wire 层加了 `thinking` 开关，
+> 摘要路径已显式关闭思考。
+>
+> ⚠️ **仍未修的部分**：`/effort` 用户面仍不能表达「关闭思考」——
+> `EffortLevel::Off` 落到 wire 上对 deepseek 依旧是空操作（现在有了 `thinking` 字段，
+> 但还没把 `Off` 映射过去）。这是下一步（见「后续建议」）。
 
 ---
 

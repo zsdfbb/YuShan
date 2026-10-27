@@ -1326,6 +1326,16 @@ pub fn translate_request(
         max_tokens: config.max_tokens.or(request.max_tokens),
         temperature: config.temperature.or(request.temperature),
         reasoning_effort: config.reasoning_effort.clone(),
+        // 思考开关：只当**两边都要求**时才发。
+        //
+        // - `request.disable_thinking` 为 `None` 或 `Some(true)` ⇒ 不干预（既有行为不变）。
+        // - 只有调用方显式 `Some(false)`（关闭思考）**且** provider 声明支持 ⇒ 发 `disabled`。
+        //
+        // 刻意**不发 `enabled`**：那是 provider 默认值，发它只会给不认识该字段的端点添风险；
+        // 且「显式开启」从未被任何调用方需要。
+        thinking: (request.disable_thinking == Some(false)
+            && config.compat.supports_thinking_control)
+            .then_some(ThinkingControl::Disabled),
     })
 }
 
@@ -1359,6 +1369,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             boundary: None,
+            disable_thinking: None,
         };
 
         let chat_req = translate_request(&request, &config).unwrap();
@@ -1409,6 +1420,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 boundary: None,
+                disable_thinking: None,
             };
 
             let chat_req = translate_request(&request, &config).unwrap();
@@ -1437,6 +1449,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             boundary: None,
+            disable_thinking: None,
         };
         let chat_req = translate_request(&request, &config).unwrap();
         let serialized = &chat_req.messages[0].tool_calls.as_ref().unwrap()[0]
@@ -1473,6 +1486,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             boundary: None,
+            disable_thinking: None,
         };
 
         let chat_req = translate_request(&request, &config).unwrap();
@@ -1928,6 +1942,54 @@ mod tests {
         let present = translate_request(&request, &config).unwrap();
         let json = serde_json::to_value(&present).unwrap();
         assert_eq!(json["reasoning_effort"], "low", "{json}");
+    }
+
+    /// 「关闭思考」的 wire 形状与门控。
+    ///
+    /// 三件事一起钉：
+    ///  1. `disable_thinking: None`（既有调用）⇒ **整个 `thinking` 字段不出现** ——
+    ///     这是「既有行为逐字节不变」的结构保证；
+    ///  2. `Some(false)` + provider 支持 ⇒ 发 `{"type": "disabled"}`（不是 `off`，
+    ///     `off` 是非法 wire 值，实测 422）；
+    ///  3. `Some(false)` + provider **不支持** ⇒ 静默不发，不得因为调用方要求而误发。
+    ///
+    /// 变异：① 把 `None` 也当成关闭 ⇒ 第一条变红；② 去掉
+    /// `supports_thinking_control` 门控 ⇒ 第三条变红；③ 把 `disabled` 写成 `off`
+    /// ⇒ 第二条变红。
+    #[test]
+    fn thinking_control_is_gated_and_optional_on_the_wire() {
+        // ① 既有调用（None）⇒ 字段不出现。
+        let config = config_with(ProviderCompat::deepseek());
+        let request = ModelRequest::default();
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert!(
+            json.get("thinking").is_none(),
+            "既有调用不得出现 thinking 字段；json = {json}"
+        );
+
+        // ② 显式关闭 + provider 支持 ⇒ disabled。
+        let request = ModelRequest {
+            disable_thinking: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert_eq!(json["thinking"]["type"], "disabled", "json = {json}");
+
+        // ③ 显式关闭但 provider 不支持 ⇒ 不发。
+        let strict = config_with(ProviderCompat::standard());
+        let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
+        assert!(
+            json.get("thinking").is_none(),
+            "未声明支持的 provider 不得收到 thinking；json = {json}"
+        );
+
+        // `Some(true)` 也不发（provider 默认即开启，发它只增风险）。
+        let request = ModelRequest {
+            disable_thinking: Some(true),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert!(json.get("thinking").is_none(), "json = {json}");
     }
 
     /// 构造一个仅 compat 不同的最小 config。

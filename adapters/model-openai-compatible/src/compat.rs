@@ -32,6 +32,12 @@ pub struct ProviderCompat {
     pub supports_reasoning_effort: bool,
     /// `reasoning_effort` 的取值方言：见 [`EffortDialect`]。
     pub effort_dialect: EffortDialect,
+    /// 是否接受顶层 `thinking: {"type": "enabled"|"disabled"}` 开关。
+    ///
+    /// 默认关闭：未知兼容端点不应收到它们可能严格校验的扩展字段。
+    /// 目前只有 DeepSeek 方言**实测确认**接受该字段（见
+    /// [`ProviderCompat::deepseek`]）；GLM 明确「始终思考，不支持关闭」。
+    pub supports_thinking_control: bool,
 }
 
 /// 手写而非 derive：`supports_stream_usage` 的「默认」必须是 **true**。
@@ -46,6 +52,7 @@ impl Default for ProviderCompat {
             supports_stream_usage: true,
             supports_reasoning_effort: false,
             effort_dialect: EffortDialect::Verbatim,
+            supports_thinking_control: false,
         }
     }
 }
@@ -56,6 +63,10 @@ impl ProviderCompat {
             has_reasoning_content: true,
             // DeepSeek 兼容 OpenAI 的 stream_options.include_usage，流式末包带 usage。
             supports_stream_usage: true,
+            // 思考控制的权威口径见 <https://api-docs.deepseek.com/zh-cn/guides/thinking_mode>：
+            // `thinking: {"type": "enabled"|"disabled"}` 是**开关**，
+            // `reasoning_effort` 是**强度**，两者独立。
+            supports_thinking_control: true,
             ..Default::default()
         }
     }

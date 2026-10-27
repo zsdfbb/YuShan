@@ -22,6 +22,23 @@ pub struct ChatCompletionRequest {
     /// 保持既有端点行为不变；是否支持由具体 provider / model 决定。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// 思考开关。`None` 时整个字段不序列化（由 provider 默认决定）。
+    ///
+    /// 与 `reasoning_effort` 是**两个独立字段**：本字段管开/关，那个管强度。
+    /// 权威口径见 <https://api-docs.deepseek.com/zh-cn/guides/thinking_mode>。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingControl>,
+}
+
+/// 「思考开关」的 wire 形态。
+///
+/// 序列化为 `{"type": "enabled"|"disabled"}` —— `disabled` 是 DeepSeek 关闭思考的
+/// **唯一**合法表达（`reasoning_effort: "off"` 会返回 422 `unknown variant 'off'`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ThinkingControl {
+    Enabled,
+    Disabled,
 }
 
 /// `stream_options`：OpenAI 兼容端点用于让流式末包携带 usage 的开关。

@@ -78,6 +78,19 @@ impl ys_tool::Summarizer for ModelSummarizer<'_> {
             // 摘要调用**不挂边界源** ⇒ 摘要路径不参与取消
             // （取消只作用于主模型调用）。
             boundary: None,
+            // **关闭思考**：摘要是一个「只输出现有内容」的短任务，不需要推理。
+            //
+            // 两个理由，第二个是硬的：
+            // 1. 成本：实测（DeepSeek）`thinking=disabled` 让 completion −53%、
+            //    墙钟 −36%，质量未降。
+            // 2. **正确性**：思考会计入 `max_tokens`（`completion_tokens` 含
+            //    `reasoning_tokens`）。当内容较难时，思考能把 `SUMMARIZE_MAX_TOKENS`
+            //    全部吃掉、正文为 **0 词**（实测 `finish_reason` 为长度截断）。
+            //    即不关思考时，本方法的空响应错误就是这条路径的实际失败模式。
+            //
+            // `Some(false)` = 显式关闭；provider 不支持该字段时适配层会**静默不发**
+            // （`supports_thinking_control` 门控），不会因为这一行而误发。
+            disable_thinking: Some(false),
         };
 
         // 摘要不进事件系统（工具没有事件出口），流式增量直接丢弃。
@@ -239,6 +252,16 @@ mod tests {
         assert_eq!(
             req.temperature, None,
             "temperature 不得设置（会被静默覆盖）"
+        );
+
+        // **关闭思考**：摘要不需要推理，且思考会挤占 `max_tokens` —— 内容较难时
+        // 能把 1024 全吃光、正文为 0 词（实测 finish_reason 为长度截断）。
+        //
+        // 变异：改成 `None` 或 `Some(true)` ⇒ 本断言变红。
+        assert_eq!(
+            req.disable_thinking,
+            Some(false),
+            "摘要调用必须显式关闭思考：既省成本，也避免思考吃光 max_tokens 导致空正文"
         );
 
         // 单条 user 消息，prompt 与正文同处其中，正文被 <document> 围栏包住。

@@ -159,19 +159,6 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   ⚠️ 上述实测 n=1~3、单 provider，**只能作方向性判断**；落地前仍须按 `AGENTS.md`
   跑 `e2e_bench` 取基线。
 
-- **⚠️ 工具摘要可能在内容较难时返回空正文**（`max_tokens=1024` + 服务端默认 `high`）。
-  2026-10-27 实测（`deepseek-flash`）发现的**独立缺陷**，优先级高于「按类型分档」：
-  - 长任务上把 `max_tokens` 设为 2048，**默认档与 `max` 档都返回 0 词正文** ——
-    思考把整个输出预算吃光，`finish_reason` 为长度截断。
-  - 本仓 `crates/ys-loop/src/summarize.rs:40` 的 `SUMMARIZE_MAX_TOKENS = 1024`；
-    而 `ProviderCompat::deepseek()` 不开 `supports_reasoning_effort`（`compat.rs:54-61`）
-    ⇒ 服务端用**默认 `high`**。
-  ⇒ 工具摘要（webfetch / subagent）遇到较难内容时，有「思考吃掉 1024 预算、返回空摘要」的风险。
-  ⬜ **待办**：① 给摘要路径显式 `thinking: disabled`（同时省 53% completion 与 36% 墙钟）；
-  ② 或在摘要路径上把 `max_tokens` 提到足够大；③ 补一条回归测试 —— 摘要为空时应被识别，
-  而不是当作合法结果回喂给模型。
-  依据：`docs/arch/effort-per-call-type/context.md`「成本补充测量」§④。
-
 - **Termux / Android 下 subagent 派发会把整个会话拖死（Android 12 phantom process killer）**：
   排查记录见 `docs/reports/2026-10-27-termux-restart-under-subagent-report.md`。
   **代码侧四条放大因素**（均已核实）：每回合最多 16 次派发且两个派发工具都声明并发安全

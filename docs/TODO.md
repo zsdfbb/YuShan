@@ -134,20 +134,31 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
-- **推理强度只有全局档位，缺「按调用类型分档」**：对照记录见
-  `docs/reports/2026-10-27-reasoning-effort-comparison.md`。
-  **三家（pi / Codewhale / deepseek-harness）无一使用全局单一档位**：pi 按角色分档
-  （子 agent 传 `--thinking`、compaction 尊重 `thinkingLevel`、eval 直接 `off`）；Codewhale 的
-  router 自身调用只准 `off`/`low` 且用**类型**强制；deepseek-harness 的**子 agent 可清零**
-  route 继承的 effort。
-  **本仓现状**（核实于 2026-10-27）：子 agent 直接继承全局
-  （`apps/coding-agent/src/main.rs:2928`）；**压缩摘要完全未设档位**
-  （`crates/ys-loop/src/compact.rs` 全文无 `effort` 赋值）。
-  ⬜ **待办**：E1（压缩摘要用最低档；`RoundPurpose::Compaction` 已有区分点，代价最小）→
-  E2（子 agent 不默认继承）→ E3（探索/检索类低档，需先造「调用类型」概念）。
-  ⚠️ **落地前必须先跑 `e2e_bench` 取基线**：现有 A/B 只测过「发/不发」与 `low`
-  （`docs/arch/session-latency/design.md` §8.5，`low` 质量从 3/3 掉到 2/3）⇒
-  没有按调用类型分档的对照，直接改等于把掉质量的风险赌在直觉上。
+- **推理强度：本仓既不能关闭思考，也不能真正降档**（2026-10-27 已探明，
+  见 `docs/arch/effort-per-call-type/context.md`）。
+  探索与验证均已完成（源码直读 pi / codewhale / Claude Code + DeepSeek 官方文档 + 真实实测）。
+  **根因不是「缺按类型分档」，而是更基础的一层**：
+  - DeepSeek 的思考控制是**两个字段**：`thinking: {type: enabled|disabled}`（开关）与
+    `reasoning_effort`（强度，合法值只有 `low`/`high`/`max`，其余是别名折叠）。
+    **`off` 不是合法 wire 值**（实测 422）。
+  - 本仓**全仓没有任何地方发送 `thinking`**；且 `ProviderCompat::deepseek()` **未开**
+    `supports_reasoning_effort`（`compat.rs:54-61`）⇒ 对 deepseek 根本不发强度字段。
+    ⇒ `/effort` 配 `off` 对 deepseek 是**空操作**，对 opencode-go 会**撞 422**。
+  **实测**（`deepseek-flash`，n=3/档，真实页面摘要任务）：`thinking=disabled` 让 reasoning
+  tokens 归零、墙钟 −28%、质量未降（命中 3.67/4 vs 默认 3.33/4）；而 `effort` 在
+  low/high/max 间**无显著差异**（2.05s vs 2.12s，都 4/4）。
+  ⇒ **真正的杠杆是 `thinking`，不是 `effort`**。
+  ⬜ **待办（按顺序）**：
+  1. **wire 层加 `thinking` 开关** —— 零架构改动，只动 `ChatCompletionRequest` 与
+     `ProviderCompat` 能力位，顺带修掉 `/effort off` 的「配置与行为不一致」；
+  2. **工具摘要用 `thinking=disabled`** —— 与 Claude Code 的降级场景同构
+     （结果短、可重试、不进主上下文），已有固定短 system + `max_tokens=1024` 硬上限；
+  3. 按调用类型分发档位/开关 —— **到这一步才需要 arch-design**，且要解决
+     「档位冻在 model 实例、而主轮/压缩/工具摘要共用一个 `ctx.model`」这个结构障碍。
+  **明确不做**：压缩降档/关思考（pi 与 Claude Code 都不这么做，压缩结果会进会话）；
+  先做 per-turn 换模型（`docs/arch/per-turn-model-switch/` Q1 未决，代价远大于此）。
+  ⚠️ 上述实测 n=3、单任务、单 provider，**只能作方向性判断**；落地前仍须按 `AGENTS.md`
+  跑 `e2e_bench` 取基线。
 
 - **Termux / Android 下 subagent 派发会把整个会话拖死（Android 12 phantom process killer）**：
   排查记录见 `docs/reports/2026-10-27-termux-restart-under-subagent-report.md`。

@@ -71,6 +71,16 @@ pub enum Request {
     Logout,
     /// 开新会话（换 `Session` + 空队列）。
     NewSession,
+    /// 清空当前对话上下文（`/clear`）。
+    ///
+    /// **语义 = 换一个新会话文件**，不是 `Session::clear()`：`JsonlSession::append`
+    /// 每次都把内存里的 messages **全量重写**目标文件 ⇒ 原地清空后再发一条消息，
+    /// 文件就被重写成只剩新消息，旧内容永久丢失。换文件后旧文件一个字节不动，
+    /// 既能 `/resume` 找回，也留给事后分析。
+    ///
+    /// 与 [`Request::NewSession`] 的唯一差别：app 侧失败时**不动屏幕**，成功时额外
+    /// 发一条 [`Outbound::SessionCleared`]，UI 见它即清屏。
+    ClearSession,
     /// 压缩上下文。
     ///
     /// **响应是两条 `Outbound::Output`**（先开始行、再收场行）—— 这是 `Request` 里唯一的
@@ -112,6 +122,14 @@ pub enum Outbound<V> {
         /// 目标会话的完整历史 —— UI 侧负责转成 transcript 行。
         history: Vec<Message>,
     },
+    /// 上下文已清空（[`Request::ClearSession`] 的响应）—— UI 见它即**清屏**。
+    ///
+    /// **只在清空真的成功后发**：失败时只有 `Output`（错误行），屏上内容一个像素不动
+    /// —— 否则会出现「屏空了、历史其实还在」的错位。
+    ///
+    /// 出站顺序与 [`Outbound::SessionResumed`] 同规：**先于** `Output`，否则清屏会把
+    /// 它后面那条「旧会话保留在 …」一并吃掉。
+    SessionCleared,
     /// 退出。
     Quit,
 }
@@ -279,7 +297,21 @@ mod tests {
     fn test_request_unit_variants_roundtrip() {
         assert_roundtrip(&Request::Logout);
         assert_roundtrip(&Request::NewSession);
+        assert_roundtrip(&Request::ClearSession);
         assert_roundtrip(&Request::Compact);
+    }
+
+    /// `SessionCleared` 是无载荷单元变体，线格式为裸字符串 `"SessionCleared"`。
+    ///
+    /// 变异：给变体加上载荷（改成结构变体）⇒ 线格式断言变红。
+    #[test]
+    fn test_outbound_session_cleared_roundtrip() {
+        assert_roundtrip(&Outbound::<TestView>::SessionCleared);
+        assert_eq!(
+            serde_json::to_value(Outbound::<TestView>::SessionCleared).unwrap(),
+            json!("SessionCleared"),
+            "SessionCleared 线格式变化"
+        );
     }
 
     /// `Export.path` 的两种形态都要能过 serde：`Some` = 用户显式路径，

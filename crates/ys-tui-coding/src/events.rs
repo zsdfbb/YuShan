@@ -658,6 +658,19 @@ fn dispatch(
                 send_boundary(boundaries, Boundary::Compact);
                 return;
             }
+            // **回合中的 `/clear` 请求照常投出**，但不当场清屏。
+            //
+            // 不静默丢弃：`request_rx` 只在**回合之间**被消费 ⇒ 请求天然排到下一回合
+            // 边界执行（那时清屏是安全的）。
+            // 不当场清屏：否则正在跑的回合的输出会被抹掉，用户看到一片空白而回合
+            // 仍在写屏。
+            if matches!(req, Request::ClearSession) && app.is_turning {
+                app.transcript
+                    .push(crate::transcript::TranscriptLine::System(
+                        "已请求清空，将在本回合结束后执行…".into(),
+                    ));
+                app.follow = true;
+            }
             send_request(app, requests, req);
         }
         Action::Quit => app.should_quit = true,
@@ -1331,6 +1344,69 @@ mod tests {
             ch.next_boundary().is_none(),
             "空闲路径不该投边界消息（没有轮边界可等）"
         );
+    }
+
+    /// **回合中 `/clear` ⇒ 照常发 `Request::ClearSession`，并当场给一行提示**。
+    ///
+    /// 承重三点：
+    ///  1. 请求信道收到 `ClearSession` —— 不静默丢弃（`request_rx` 只在回合之间被消费，
+    ///     请求天然排到下一回合边界）；
+    ///  2. **不当场清屏** —— 否则正在跑的回合输出会被抹掉；
+    ///  3. 本地**立即出反馈行** —— 清屏要等回合结束才发生，用户此刻需要知道敲进去了。
+    ///
+    /// 变异：删掉 `dispatch` 里 `is_turning` 分支的提示行 ⇒ 本用例的断言 3 变红。
+    #[test]
+    fn clear_while_turning_defers_screen_but_reports() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        a.transcript.push(TranscriptLine::System("回合输出".into()));
+        a.input.insert_str("/clear");
+
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(
+            ch.next_request().expect("回合中 /clear 必须照常投请求"),
+            Request::ClearSession
+        );
+        assert!(
+            ch.next_boundary().is_none(),
+            "清空不是轮边界动作，不得投 Boundary"
+        );
+        assert_eq!(
+            a.transcript.len(),
+            2,
+            "当场只多一条提示行：{:?}",
+            a.transcript
+        );
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(s)) if s.contains("已请求清空")),
+            "必须当场给一行反馈：{:?}",
+            a.transcript
+        );
+        assert!(a.follow, "提示行落下后贴底");
+        assert!(a.is_turning, "请求清空不改回合态");
+    }
+
+    /// **空闲时 `/clear` 不发提示行** —— 请求立即执行，清屏由随后的
+    /// `Outbound::SessionCleared` 做，本地不需要先行占位。
+    ///
+    /// 变异：把 `is_turning` 守卫去掉（恒推提示行）⇒ 本用例红。
+    #[test]
+    fn clear_while_idle_sends_request_without_hint_line() {
+        let ch = channels();
+        let mut a = app();
+        a.input.insert_str("/clear");
+
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(ch.next_request().unwrap(), Request::ClearSession);
+        assert!(
+            a.transcript.is_empty(),
+            "空闲 /clear 不写本地提示（清屏由 SessionCleared 做）：{:?}",
+            a.transcript
+        );
+        assert!(!a.is_turning, "命令不是回合");
     }
 
     /// 空闲时提交**仍是** `Request::Prompt`（既有行为逐字节不变）。

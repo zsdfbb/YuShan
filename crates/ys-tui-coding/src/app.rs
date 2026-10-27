@@ -249,6 +249,10 @@ impl App {
                 self.thinking_visible = thinking_visible;
                 self.follow = true;
             }
+            // 上下文已清空（`/clear`）：只清屏，不回放任何内容 —— transcript 由
+            // [`App::reset_for_replay`] 清空后**保持空**。会话文件本身不动（旧文件
+            // 留给 `/resume` 与事后分析）。
+            Outbound::SessionCleared => self.reset_for_replay(),
         }
     }
 
@@ -270,20 +274,23 @@ impl App {
         self.layout.borrow_mut().reset();
     }
 
-    /// 回放（`/resume`）前的**清屏**：一次性重置全部与 transcript 同源的状态。
+    /// **清屏**：一次性重置全部与 transcript 同源的状态。
     ///
-    /// 缺一项都会留下跨会话的脏状态。**不在此重置 `thinking_visible`** —— 它由
-    /// [`App::apply_outbound`] 的 `SessionResumed` 臂单独按目标会话的 meta 设定
-    /// （语义不同：这里是清屏，那里是「跟随目标会话」）。
+    /// 两个调用方：`/resume` 的回放（[`App::apply_outbound`] 的 `SessionResumed` 臂，
+    /// 清完紧跟回放历史）与 `/clear`（同函数的 `SessionCleared` 臂，清完**保持空**）。
     ///
-    /// **也不重置 `theme`**：主题是全局偏好，`/resume` 换会话时不变。无需在这里补任何一行
+    /// 缺一项都会留下与本屏内容不对应的脏状态。**不在此重置 `thinking_visible`** ——
+    /// 它由 [`App::apply_outbound`] 的 `SessionResumed` 臂单独按目标会话的 meta 设定
+    /// （语义不同：这里是清屏，那里是「跟随目标会话」）；`/clear` 不动它。
+    ///
+    /// **也不重置 `theme`**：主题是全局偏好，换会话 / 清上下文时不变。无需在这里补任何一行
     /// —— 上一行的 `layout.reset()` 已清空 `EntryMemo`，下一帧 `sync` 自会按当前主题重建。
     ///
-    /// **也不清回合态**（`is_turning` / `turn_started_at` / `working_dot`）：清屏发生在
-    /// [`App::apply_outbound`] 收到 `SessionResumed` 时，**依赖该事件恒在回合边界抵达**
-    /// （app 线程在 `run_turn` 中阻塞、请求只在回合边界被处理），故此刻本无进行中的回合，
-    /// 回合态本就是空闲值。**若该前提将来变化**（设计 §7 已把「回合中拿到列表」列为遗留），
-    /// 这里必须重审 —— 否则旧回合的 `is_turning` / `turn_started_at` 会泄漏进回放后的新会话。
+    /// **也不清回合态**（`is_turning` / `turn_started_at` / `working_dot`）：两个调用方
+    /// 都在**回合边界**落地（app 线程在 `run_turn` 中阻塞、请求只在回合边界被处理），
+    /// 故此刻本无进行中的回合，回合态本就是空闲值。**若该前提将来变化**（设计 §7 已把
+    /// 「回合中拿到列表」列为遗留），这里必须重审 —— 否则旧回合的 `is_turning` /
+    /// `turn_started_at` 会泄漏进清屏后的新会话。
     fn reset_for_replay(&mut self) {
         // transcript 整体替换，任何按「槽下标」记忆的渲染产物都已失效（cache.rs 的
         // 等长碰撞陷阱 ⇒ 必须显式 reset，不能指望 `sync_len` 兜住）。
@@ -1998,6 +2005,67 @@ mod tests {
             "thinking 跟随目标会话的 meta（有意破例）"
         );
         assert!(a.follow, "回放后回到贴底");
+    }
+
+    /// `SessionCleared`（`/clear` 的响应）⇒ **只清屏**，不回放任何内容。
+    ///
+    /// 承重三点：transcript 变空且保持空、贴底（`follow` / `scroll_offset`）、与 transcript
+    /// 同源的渲染产物**全部失效** —— 最后一项用 markdown 缓存的等长碰撞探测（与
+    /// [`test_reset_for_replay_clears_every_same_source_state`] 同一手法）：清屏后写入**等长**
+    /// 的新内容必须重算，不得复用旧槽位。
+    ///
+    /// 变异：把该臂改成只 `self.transcript.clear()`（或调任何不完整的清屏）⇒ md 缓存
+    /// 复用旧产物，「必重算」断言与 `render_calls` 计数同时变红。
+    #[test]
+    fn test_apply_outbound_session_cleared_blanks_screen_without_replay() {
+        use crate::styles::AssistantStyles;
+        use crate::theme::ThemeKind;
+
+        let mut a = app();
+        a.transcript.push(TranscriptLine::User("旧的 Q".into()));
+        a.transcript.push(TranscriptLine::Assistant("AAAA".into()));
+        a.follow = false;
+        a.scroll_offset = 7;
+        a.last_total_rows = Some(3);
+        // 先把 "AAAA" 渲染进槽位 1（键 = 槽下标 + len + width 全同于下一段的 "BBBB"）。
+        crate::md::reset_render_calls();
+        {
+            let mut c = a.md_cache.borrow_mut();
+            c.sync_len(a.transcript.len());
+            c.lines_for(
+                1,
+                "AAAA",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                Instant::now(),
+            );
+        }
+        assert_eq!(crate::md::render_calls(), 1, "前置：AAAA 已入缓存");
+
+        a.apply_outbound(Outbound::SessionCleared);
+
+        assert!(a.transcript.is_empty(), "清屏后 transcript 必须为空");
+        assert!(a.follow, "清屏后回到贴底");
+        assert_eq!(a.scroll_offset, 0, "滚动归零");
+        assert!(a.last_total_rows.is_none(), "布局记忆清空");
+
+        // md_cache 已失效：等长内容必须重算（若复用旧槽位就会拿到 "AAAA" 的产物）。
+        {
+            let mut c = a.md_cache.borrow_mut();
+            let lines = c.lines_for(
+                1,
+                "BBBB",
+                60,
+                AssistantStyles::new(ThemeKind::default().palette()),
+                Instant::now(),
+            );
+            let flattened: String = lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                .collect();
+            assert_eq!(flattened, "BBBB", "SessionCleared 必须使 md_cache 失效");
+        }
+        assert_eq!(crate::md::render_calls(), 2, "清屏后等长内容必须重算");
     }
 
     /// **视窗原地不动**：用户往上翻之后，新内容到达**不得**把视窗拽回底部。

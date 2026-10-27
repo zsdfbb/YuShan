@@ -9,9 +9,10 @@
 //! 「长度相等即内容相同」的前提：transcript **只增不减**、Assistant 只经**尾部 `push_str`**
 //! 增长（无编辑历史）；用 `debug_assert!` 钉住这条前提。
 //!
-//! **回放是第一个打破「只增不减」的操作**：`/resume` 会用目标会话的历史**替换**（而非追加）
-//! transcript，调用方**必须在回放前显式 [`RenderCache::reset`]**。
-//! `/new` **不触**重置（它只换 session 句柄、不清 transcript）；`/resume` **触**。
+//! **回放（`/resume`）与 `/clear` 都会用更短的内容替换 transcript**（而非追加），
+//! 两者都打破「只增不减」这条前提 ⇒ 调用方**都必须显式 [`RenderCache::reset`]**
+//! （两者共用 `App::reset_for_replay` 这一个清屏入口）。
+//! `/new` **不触**重置（它只换 session 句柄、不清 transcript）；`/resume` 与 `/clear` **触**。
 //!
 //! ⚠️ **不能指望 `sync_len` 自动兜住**：[`RenderCache::sync_len`] 的「缩短」分支只在长度
 //! **变小**时走到。若调用方先 clear、再立刻 extend 到**相同长度**，长度看起来没变，会走

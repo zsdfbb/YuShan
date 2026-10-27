@@ -50,7 +50,7 @@ const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|
 /// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
 const EFFORT_DEFAULT_TOKEN: &str = "default";
 
-static COMMANDS: [CommandSpec; 16] = [
+static COMMANDS: [CommandSpec; 17] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -114,6 +114,11 @@ static COMMANDS: [CommandSpec; 16] = [
     CommandSpec {
         name: "new",
         description: "开新会话",
+        arg_hint: None,
+    },
+    CommandSpec {
+        name: "clear",
+        description: "清空对话上下文并清屏（会话文件保留，可 /resume 找回）",
         arg_hint: None,
     },
     CommandSpec {
@@ -335,6 +340,9 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
         "login" => Action::Prompt(PromptKind::Login),
         "logout" => Action::Request(Request::Logout),
         "new" => Action::Request(Request::NewSession),
+        // 与 `/new` 兄弟：都是换新会话文件（旧文件一个字节不动），差别只在 UI 侧
+        // —— `clear` 成功后 app 发 `Outbound::SessionCleared`，UI 见它即清屏。
+        "clear" => Action::Request(Request::ClearSession),
         // 无参 → 先拉列表（一次往返：`ListSessions` → `SessionList` → 浮层）；
         // 有参 → 直接把 id/路径交给 app 侧的 `sessions::resolve`（与 `/model` 双形态对称）。
         "resume" => {
@@ -918,6 +926,7 @@ mod tests {
             ("/login", Action::Prompt(PromptKind::Login)),
             ("/logout", Action::Request(Request::Logout)),
             ("/new", Action::Request(Request::NewSession)),
+            ("/clear", Action::Request(Request::ClearSession)),
             ("/resume", Action::Request(Request::ListSessions)),
             (
                 "/resume abc",
@@ -950,6 +959,9 @@ mod tests {
     /// 对齐的闭环在 app 侧：app 循环对 `Request` 的穷尽 `match` 是**编译错误**，
     /// 漏实现编不过。本测试只保证这张表本身完整（每条命令都真能产出请求，
     /// 而不是解析成 `None` / `Hint` 被悄悄吞掉）。
+    ///
+    /// 变异：删掉 `parse_with_skills` 的 `clear` 分支 ⇒ `/clear` 落进未知命令的
+    /// `Hint`，下面的 `缺 ClearSession` 断言变红。
     #[test]
     fn test_command_table_covers_every_request_variant() {
         let mut produced: Vec<Request> = [
@@ -958,6 +970,7 @@ mod tests {
             "/effort high",
             "/logout",
             "/new",
+            "/clear",
             "/resume",
             "/resume abc",
             "/compact",
@@ -1012,6 +1025,10 @@ mod tests {
         assert!(has(|r| matches!(r, Request::Login { .. })), "缺 Login");
         assert!(has(|r| matches!(r, Request::Logout)), "缺 Logout");
         assert!(has(|r| matches!(r, Request::NewSession)), "缺 NewSession");
+        assert!(
+            has(|r| matches!(r, Request::ClearSession)),
+            "缺 ClearSession"
+        );
         assert!(
             has(|r| matches!(r, Request::ListSessions)),
             "缺 ListSessions"
@@ -1288,7 +1305,7 @@ mod tests {
             names,
             vec![
                 "help", "keybind", "status", "skills", "copy", "quit", "thinking", "effort",
-                "theme", "model", "login", "logout", "new", "resume", "compact", "export",
+                "theme", "model", "login", "logout", "new", "clear", "resume", "compact", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );

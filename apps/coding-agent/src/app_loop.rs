@@ -645,7 +645,11 @@ pub async fn run(
                             Some(fetched) => {
                                 let mut catalog = match fetched {
                                     FetchModelsResult::Success(models) if !models.is_empty() => {
-                                        Some(models)
+                                        // **先过滤再选起始模型**：目录里可能有本仓用不了的
+                                        // 模型（实测 MiMo 把语音模型排在最前，而它们在
+                                        // chat 端点上必然 400）⇒ 不过滤的话 `/login`
+                                        // 会登到一个用不了的模型上。
+                                        Some(config.registry.filter_catalog(&base, models))
                                     }
                                     FetchModelsResult::Success(_) => {
                                         logging::log(&format!("login {base}: empty model list"));
@@ -660,6 +664,11 @@ pub async fn run(
                                         None
                                     }
                                 };
+                                // 过滤后可能**一条不剩**（目录里全是用不了的模型）——
+                                // 那等同于「拉不到目录」⇒ 走种子回落。
+                                if catalog.as_ref().is_some_and(|c| c.is_empty()) {
+                                    catalog = None;
+                                }
                                 // 目录拉不到时**回落到内置种子**：编码套餐端点的
                                 // `/v1/models` 实测 404，而种子在那里是唯一可用的模型名来源。
                                 // 种子已经在 `model_cache` 里（构造时预热），故不需要再写一次。

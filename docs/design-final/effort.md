@@ -80,7 +80,7 @@ TUI 输入
 门控是**两层**，两层都过才发字段：
 
 1. **provider 级**：`ProviderCompat.supports_reasoning_effort` —— 该端点认不认这个字段。
-   当前 `opencode-go` 与 `glm` / `glm-coding` 为 `true`；`deepseek` / `minimax` / custom /
+   当前 `opencode-go` 与 `glm` / `glm-coding` / `mimo` 为 `true`；`deepseek` / `minimax` / custom /
    未知端点默认 `false`，避免严格端点因未知顶层字段返回 400。
 2. **模型级**：`ProviderCompat.supports_effort(model)` —— 该**模型**接受与否。
    `EffortDialect::Verbatim`（默认）没有模型级信息，信任能力位；`EffortDialect::Glm`
@@ -112,11 +112,32 @@ TUI 输入
 - `Verbatim` 方言**逐字透传**（不 trim、不改写）：GLM 的折叠不得外溢到 `opencode-go`
   一类端点。
 
+**MiMo 折叠表**（`EffortDialect::Mimo`）：实测该端点的合法集为 `none|low|medium|high|max`，
+`minimal` / `xhigh` / `off` 直接 400（不静默折叠）：
+
+| 配置值 | MiMo wire |
+|---|---|
+| `off` | `low` |
+| `minimal` | `low` |
+| `low` | `low`（原样） |
+| `medium` | `medium`（原样） |
+| `high` | `high`（原样） |
+| `xhigh` | `max` |
+| `max` | `max`（原样） |
+
+- `off` 映射到 `low`（最低档）而**不是** `none`：`none` 是「关闭思考」，与 `off` 的
+  「最低思考强度」语义不同 —— 与 GLM 把 `off` 映射到 `minimal` 同一原则。
+- ⚠️ 该端点的 400 错误文案写「must be one of 'none', 'low', 'medium' or 'high'」，
+  **漏了 `max`** —— 实测 `max` 返回 200。故以实测为准，不按文案把 `max` 也排除。
+- 模型级门控：id 必须能识别为 MiMo 的 chat 模型（`mimo-` 前缀**且**前缀后有实际模型名
+  **且**不是语音模型**且**不是禁用模型），否则 fail-closed。
+- 详见 `docs/design-final/mimo.md`。
+
 - 适配器只做一件事：`OpenAICompatibleConfig.reasoning_effort` 原样序列化为顶层
   `reasoning_effort`；`None` 时整个字段不序列化。门控与折叠**全在 compat 层**，适配器
   不知道档位语义。
 - 档位 wire 拼写：`off|minimal|low|medium|high|xhigh|max`。`Verbatim` 方言下服务端折叠
-  （例如把 `medium` 当作 `high`）由 provider 自行负责；`Glm` 方言的折叠由本仓做。
+  （例如把 `medium` 当作 `high`）由 provider 自行负责；`Glm` / `Mimo` 方言的折叠由本仓做。
 - 不接受该字段时（provider 级或模型级）：设置**照常保存**；命令层输出一条 warning，
   同时报出 provider **与 model**（同一 provider 上不同代际接受与否不同，只说「provider
   不支持」会把用户引到错的修正方向）。切到接受该字段的 provider / 模型后立即生效。

@@ -124,8 +124,9 @@ $ ./scripts/cargo-build.sh build --release
 $ ./target/release/ys-coding-agent
 ```
 
-首次启动在界面里输入 `/login` 选 provider 并填入 key（`deepseek` / `minimax` 已内置端点，
-其他填自定义 base URL）。登录后直接说话即可。
+首次启动在界面里输入 `/login` 选 provider 并填入 key（`deepseek` / `minimax` /
+`opencode-go` / `glm` / `glm-coding` / `mimo` 已内置端点，`custom` 这类没内置 base 的
+会再问一句 base URL）。登录后直接说话即可。
 
 不想开界面：
 

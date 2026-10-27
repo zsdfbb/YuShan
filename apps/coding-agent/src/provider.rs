@@ -47,6 +47,20 @@ pub struct ProviderInfo {
     /// 只作用于**展示**（[`ProviderRegistry::models_for_provider`]）；
     /// [`ProviderRegistry::model_cache`] 本体始终是全量目录。
     pub catalog_limit: Option<usize>,
+    /// 该 provider 的目录**过滤规则**：只保留 id **不**命中任何一条的条目。
+    ///
+    /// 存在的理由：有些厂商的 `/v1/models` 把**不同能力类型**的模型混在一起
+    /// （实测小米 MiMo 的目录把语音识别 / 语音合成的模型排在**最前**），而本仓只跟
+    /// **chat 端点**对话 —— 非 chat 模型在 `/chat/completions` 上必然报错，选中即失败。
+    ///
+    /// **作用在目录进缓存之前**（不是只在展示层过滤）：`/login` 的起始模型取目录
+    /// **第一条**，只在展示层过滤的话，登录后当前模型仍会是一个用不了的音频模型。
+    ///
+    /// 匹配规则：**id 的 `-` 分段精确等于**任一条（大小写不敏感），而非子串包含
+    /// —— 子串匹配会被无关的连续字母误伤。
+    ///
+    /// `None` = 不过滤（绝大多数端点）。
+    pub catalog_exclude: Option<&'static [&'static str]>,
 }
 
 /// GLM 内置种子目录：`(模型 id, 上下文窗口 token)`。
@@ -56,6 +70,30 @@ pub struct ProviderInfo {
 /// `/v1/models` 实测 404，故种子对 `glm-coding` 是**必需**的兜底。窗口取自厂商模型表的
 /// 「上下文」列（GLM-5.3 与 GLM-5.3-Flash 均为 1M）。
 const GLM_SEED_MODELS: &[(&str, usize)] = &[("glm-5.3", 1_000_000), ("glm-5.3-flash", 1_000_000)];
+
+/// 小米 MiMo 的**目录排除词**：命中任一条的条目不进目录。
+///
+/// 实测该端点的 `/v1/models` 返回 7 条，**语音模型排在最前**：
+/// `mimo-v2.5-asr` / `mimo-v2.5-tts` / `mimo-v2.5-tts-voiceclone` /
+/// `mimo-v2.5-tts-voicedesign`，之后才是 chat 模型（`mimo-v2.6-flash` /
+/// `mimo-v2.6-pro` / `mimo-v2.6-pro-ultraspeed`）。
+///
+/// 这四个是**语音模型**而非 chat 模型，在 `/chat/completions` 上必然 400
+/// （`ASR request requires a user message with input_audio content` /
+/// `messages must contain an assistant role for TTS model`）—— 实测。
+///
+/// `ultraspeed` 是**用户明确禁用**的模型（不走 `/chat/completions` 的常规路径，
+/// 行为与前两者不同类），一并排除。
+///
+/// **按能力类型排除**（而非按「保留 `mimo-v2.6-` 前缀」的白名单）：白名单会把
+/// 未来新增的 chat 模型（如 `mimo-v3-`）一并误杀，而排除式能同时挡掉未来新增的
+/// 语音类型。
+///
+/// 词表**直接取适配器的常量**
+/// （[`ys_model_openai_compat::compat::MIMO_EXCLUDED_TOKENS`]）—— 目录过滤与
+/// 模型级门控必须用**同一批**模型，两处各写一遍必然漂移（目录里放行了一个模型，
+/// 门控却不认它 ⇒ 用户选中就 400）。
+const MIMO_EXCLUDED_TOKENS: &[&str] = ys_model_openai_compat::compat::MIMO_EXCLUDED_TOKENS;
 
 /// auth.json 中按 provider 存储的凭证。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +187,7 @@ impl ProviderRegistry {
                 session_header: None,
                 catalog: CatalogSource::Endpoint,
                 catalog_limit: None,
+                catalog_exclude: None,
             },
             ProviderInfo {
                 name: "minimax".into(),
@@ -157,6 +196,7 @@ impl ProviderRegistry {
                 session_header: None,
                 catalog: CatalogSource::Endpoint,
                 catalog_limit: None,
+                catalog_exclude: None,
             },
             ProviderInfo {
                 name: "opencode-go".into(),
@@ -165,6 +205,7 @@ impl ProviderRegistry {
                 session_header: Some(OPENCODE_SESSION_HEADER.into()),
                 catalog: CatalogSource::Endpoint,
                 catalog_limit: None,
+                catalog_exclude: None,
             },
             ProviderInfo {
                 name: "glm".into(),
@@ -175,6 +216,7 @@ impl ProviderRegistry {
                 // 实测目录 17 条，服务端顺序当代在前 ⇒ 取前 3 条即是当代模型
                 // （`glm-5.3-flash` / `glm-5.3-flashx` / `glm-5.3`），第 4 条起已是上一代。
                 catalog_limit: Some(3),
+                catalog_exclude: None,
             },
             ProviderInfo {
                 name: "glm-coding".into(),
@@ -184,6 +226,20 @@ impl ProviderRegistry {
                 catalog: CatalogSource::Seed(GLM_SEED_MODELS),
                 // 同 `glm`：编码端点与通用端点同一套模型表。
                 catalog_limit: Some(3),
+                catalog_exclude: None,
+            },
+            ProviderInfo {
+                name: "mimo".into(),
+                api_base: "https://api.xiaomimimo.com/v1".into(),
+                compat: ProviderCompat::mimo(),
+                session_header: None,
+                catalog: CatalogSource::Endpoint,
+                // 实测目录 7 条，过滤掉语音模型后只剩 3 条 chat 模型
+                // （`mimo-v2.6-flash` / `mimo-v2.6-pro` / `mimo-v2.6-pro-ultraspeed`），
+                // 故不设展示上限。
+                catalog_limit: None,
+                // 语音模型排在目录**最前**，且在 chat 端点上必然 400 ⇒ 必须过滤。
+                catalog_exclude: Some(MIMO_EXCLUDED_TOKENS),
             },
             ProviderInfo {
                 name: "custom".into(),
@@ -192,6 +248,7 @@ impl ProviderRegistry {
                 session_header: None,
                 catalog: CatalogSource::Endpoint,
                 catalog_limit: None,
+                catalog_exclude: None,
             },
         ];
         let mut reg = Self {
@@ -514,8 +571,43 @@ impl ProviderRegistry {
     ///
     /// 唯一生产调用点：`app_loop::run` —— 后台任务的结果经信道送回 app 循环，由它
     /// 写入。registry 的**唯一写者仍是 app 循环**（与 `build_view` 的读同线程）。
+    ///
+    /// **写入前按该 base 的规则过滤**（[`ProviderInfo::catalog_exclude`]）：缓存里
+    /// 不该出现用不了的模型 —— 否则 `/model` 候选、窗口查询、归属反查都会看到它们。
     pub fn apply_model_cache(&mut self, cache: ModelCache) {
-        self.model_cache.extend(cache);
+        for (base, models) in cache {
+            let models = self.filter_catalog(&base, models);
+            self.model_cache.insert(base, models);
+        }
+    }
+
+    /// 该 base 的**目录排除词**（`None` = 不过滤）。
+    ///
+    /// 按 `api_base` 反查 provider —— 目录缓存以 base 为键，而 provider 以名字索引。
+    fn catalog_exclude_for_base(&self, api_base: &str) -> Option<&'static [&'static str]> {
+        let key = cache_key(api_base);
+        self.providers
+            .iter()
+            .find(|p| !p.api_base.is_empty() && cache_key(&p.api_base) == key)
+            .and_then(|p| p.catalog_exclude)
+    }
+
+    /// 按该 base 的排除规则剔除目录条目（`None` 规则 ⇒ 原样返回）。
+    ///
+    /// **供「挑选起始模型」的路径使用**（`/login`、启动期目录采纳）：过滤必须发生在
+    /// 「取第一条」**之前** —— 否则起始模型会是一个用不了的模型（实测 MiMo 的目录
+    /// 把语音模型排在最前，`/login` 若不过滤就会登到一个语音模型上）。
+    ///
+    /// 匹配规则见 [`ProviderInfo::catalog_exclude`]：id 的 `-` 分段**精确等于**
+    /// 任一排除词（大小写不敏感）。
+    pub fn filter_catalog(&self, api_base: &str, models: Vec<ApiModel>) -> Vec<ApiModel> {
+        let Some(tokens) = self.catalog_exclude_for_base(api_base) else {
+            return models;
+        };
+        models
+            .into_iter()
+            .filter(|m| !ys_model_openai_compat::compat::id_has_token(&m.id, tokens))
+            .collect()
     }
 
     /// 该 provider 的**展示用**候选模型 id（未拉到 ⇒ 空），最多 `catalog_limit` 条。
@@ -603,6 +695,8 @@ fn cache_key(api_base: &str) -> &str {
 /// |---|---|---|
 /// | `MiniMax-M3` | 1M | MiniMax 官方 API 文档模型表 |
 /// | `MiniMax-M2.7` | 204,800 | 同上 |
+/// | `mimo-v2.6-pro` | 1,048,576 | 小米 MiMo 实测（超窗静默截断） |
+/// | `mimo-v2.6-flash` | 1,048,576 | 同上 |
 ///
 /// **刻意未收录**：MiniMax 其余模型（如 `MiniMax-Text-01`）。官方口径是「训练 1M /
 /// 推理可达 4M」，两条数字差 4 倍，**API 实际放行哪个无法确证** —— 宁可不填、回退
@@ -610,8 +704,12 @@ fn cache_key(api_base: &str) -> &str {
 /// 请写 `~/.yushan/config.json` 覆盖，或让端点自己在目录里报窗口。
 ///
 /// 表中值**刻意不取兜底默认值**：若表里全是它，这一级就**测不出来**。
-const KNOWN_MODEL_WINDOWS: &[(&str, usize)] =
-    &[("MiniMax-M3", 1_000_000), ("MiniMax-M2.7", 204_800)];
+const KNOWN_MODEL_WINDOWS: &[(&str, usize)] = &[
+    ("MiniMax-M3", 1_000_000),
+    ("MiniMax-M2.7", 204_800),
+    ("mimo-v2.6-pro", 1_048_576),
+    ("mimo-v2.6-flash", 1_048_576),
+];
 
 /// 查兜底表。未知 model 返回 `None`（调用方回退默认值）。
 ///
@@ -1174,6 +1272,154 @@ mod tests {
         assert!(coding.compat.has_reasoning_content);
         assert!(coding.compat.supports_reasoning_effort);
         assert_eq!(coding.session_header, None);
+    }
+
+    /// MiMo 的内置元数据：base、方言与「无会话头」。
+    ///
+    /// 实测：思考走 `reasoning_content`；端点接受顶层 `reasoning_effort`
+    /// （可用档位另由方言门控）；`tool_calls` 在 `tool_calls` 字段里。
+    #[test]
+    fn test_mimo_provider_metadata() {
+        let reg = ProviderRegistry::new();
+
+        let mimo = reg.find_provider("mimo").expect("mimo 已注册");
+        assert_eq!(
+            mimo.api_base, "https://api.xiaomimimo.com/v1",
+            "base 决定请求 URL 与目录缓存键"
+        );
+        assert!(
+            mimo.compat.has_reasoning_content,
+            "思考增量走 reasoning_content"
+        );
+        assert!(
+            mimo.compat.supports_reasoning_effort,
+            "端点接受顶层 reasoning_effort（可用档位另由方言门控）"
+        );
+        assert!(!mimo.compat.tool_calls_as_text);
+        assert_eq!(mimo.session_header, None, "MiMo 不要求会话头");
+        assert_eq!(
+            mimo.catalog_limit, None,
+            "过滤后只剩 chat 模型，不需要展示上限"
+        );
+    }
+
+    /// **目录过滤**：语音模型与用户禁用的模型不进目录。
+    ///
+    /// 实测 MiMo 的 `/v1/models` 把语音模型排在**最前**，且它们在 chat 端点上
+    /// 必然 400；`ultraspeed` 是用户明确禁用的模型。三者都不得进目录。
+    ///
+    /// 变异：去掉 `catalog_exclude` 过滤 ⇒ 本用例变红。
+    #[test]
+    fn test_mimo_catalog_excludes_unusable_models() {
+        let mut reg = ProviderRegistry::new();
+        let base = "https://api.xiaomimimo.com/v1";
+        reg.apply_model_cache(HashMap::from([(
+            base.to_string(),
+            vec![
+                ApiModel {
+                    id: "mimo-v2.5-asr".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+                ApiModel {
+                    id: "mimo-v2.5-tts".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+                ApiModel {
+                    id: "mimo-v2.5-tts-voiceclone".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+                ApiModel {
+                    id: "mimo-v2.5-tts-voicedesign".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+                ApiModel {
+                    id: "mimo-v2.6-flash".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+                ApiModel {
+                    id: "mimo-v2.6-pro".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+                ApiModel {
+                    id: "mimo-v2.6-pro-ultraspeed".into(),
+                    owned_by: None,
+                    name: None,
+                    context_window: None,
+                },
+            ],
+        )]));
+
+        let models = reg.models_for_base(base);
+        assert_eq!(
+            models,
+            vec!["mimo-v2.6-flash".to_string(), "mimo-v2.6-pro".to_string()],
+            "语音模型与禁用的 ultraspeed 都不进目录：{models:?}"
+        );
+    }
+
+    /// **过滤发生在「取第一条」之前** —— 否则 `/login` 的起始模型会是一个用不了的
+    /// 模型（实测 MiMo 目录首条是 `mimo-v2.5-asr`）。
+    ///
+    /// 变异：把 `filter_catalog` 从「取第一条前」挪到「取第一条后」⇒ 本用例变红。
+    #[test]
+    fn test_mimo_filter_runs_before_picking_the_first_model() {
+        let reg = ProviderRegistry::new();
+        let base = "https://api.xiaomimimo.com/v1";
+        let raw = vec![
+            ApiModel {
+                id: "mimo-v2.5-asr".into(),
+                owned_by: None,
+                name: None,
+                context_window: None,
+            },
+            ApiModel {
+                id: "mimo-v2.6-pro".into(),
+                owned_by: None,
+                name: None,
+                context_window: None,
+            },
+        ];
+        let filtered = reg.filter_catalog(base, raw);
+        assert_eq!(
+            filtered.first().map(|m| m.id.as_str()),
+            Some("mimo-v2.6-pro"),
+            "起始模型必须是过滤后的第一条"
+        );
+    }
+
+    /// 别的 provider **不过滤**目录：过滤规则只挂在 MiMo 上。
+    ///
+    /// 变异：把过滤规则误用到所有 provider ⇒ 本用例变红。
+    #[test]
+    fn test_catalog_exclude_only_applies_to_mimo() {
+        let mut reg = ProviderRegistry::new();
+        let base = "https://api.deepseek.com";
+        reg.apply_model_cache(HashMap::from([(
+            base.to_string(),
+            vec![ApiModel {
+                id: "some-asr-model".into(),
+                owned_by: None,
+                name: None,
+                context_window: None,
+            }],
+        )]));
+        assert_eq!(
+            reg.models_for_base(base),
+            vec!["some-asr-model".to_string()],
+            "非 MiMo 端点的目录不应被过滤"
+        );
     }
 
     /// 种子目录**只**挂在两个 GLM provider 上：其余 provider 的模型名只来自

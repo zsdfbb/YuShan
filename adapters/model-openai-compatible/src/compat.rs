@@ -6,6 +6,11 @@ pub enum EffortDialect {
     Verbatim,
     /// GLM：按模型代际折叠到该代际真正接受的档位集合；`off` 永不原样发出。
     Glm,
+    /// MiMo（小米）：按该端点实测接受的档位集合折叠。
+    ///
+    /// 实测合法集为 `none|low|medium|high|max` —— `minimal` / `xhigh` / `off`
+    /// 直接返回 400（不静默折叠），故本地必须先映射。
+    Mimo,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +103,22 @@ impl ProviderCompat {
         }
     }
 
+    /// 小米 MiMo（`api.xiaomimimo.com`）。
+    ///
+    /// 方言：思考增量走 `reasoning_content`（同 DeepSeek）；`tool_calls` 在
+    /// `tool_calls` 字段里（不是 text）；流式末包带 usage。
+    ///
+    /// 接受顶层 `reasoning_effort`，但可用档位是该端点自己的子集
+    /// （见 [`EffortDialect::Mimo`]）。
+    pub fn mimo() -> Self {
+        Self {
+            has_reasoning_content: true,
+            supports_reasoning_effort: true,
+            effort_dialect: EffortDialect::Mimo,
+            ..Default::default()
+        }
+    }
+
     /// 标准 / 未知端点：默认**开启**流式 usage，以拿到 token 统计。
     ///
     /// OpenAI 兼容端点普遍容忍未知顶层字段（反序列化到 struct 时忽略未知键），
@@ -126,6 +147,7 @@ impl ProviderCompat {
             // 原样透传的方言没有模型级信息，信任能力位。
             EffortDialect::Verbatim => true,
             EffortDialect::Glm => glm_generation(model).is_some(),
+            EffortDialect::Mimo => is_mimo_chat_model(model),
         }
     }
 
@@ -173,8 +195,86 @@ impl ProviderCompat {
                     },
                 }
             }
+            EffortDialect::Mimo => {
+                // 白名单之外的取值来自上游配置错误，不猜映射，直接不发。
+                match configured {
+                    "off" | "minimal" => Some("low".into()),
+                    "low" => Some("low".into()),
+                    "medium" => Some("medium".into()),
+                    "high" => Some("high".into()),
+                    "xhigh" | "max" => Some("max".into()),
+                    _ => None,
+                }
+            }
         }
     }
+}
+
+/// MiMo 音频模型的**能力标记**（id 的 `-` 分段里出现即判为音频）。
+///
+/// 该端点的目录把音频模型排在**最前**（实测 `/v1/models` 首条是 `mimo-v2.5-asr`），
+/// 且它们在 `/chat/completions` 上**必然 400**：
+///
+/// - `mimo-v2.5-asr` → `ASR request requires a user message with input_audio content`
+/// - `mimo-v2.5-tts` / `-tts-voiceclone` / `-tts-voicedesign`
+///   → `messages must contain an assistant role for TTS model`
+///
+/// 故音频 id 既不进 `/model` 候选，也不该收到 `reasoning_effort`。
+pub const MIMO_AUDIO_TOKENS: &[&str] = &["asr", "tts"];
+
+/// MiMo **不用于本仓**的模型标记（id 的 `-` 分段里出现即排除）。
+///
+/// `ultraspeed` 是**用户明确禁用**的模型：它不进 `/model` 候选，
+/// 也不该收到 `reasoning_effort`。
+pub const MIMO_DISABLED_TOKENS: &[&str] = &["ultraspeed"];
+
+/// MiMo **不进目录**的模型标记 —— [`MIMO_AUDIO_TOKENS`] 与
+/// [`MIMO_DISABLED_TOKENS`] 的**并集**。
+///
+/// 目录过滤用这一份，模型级门控用那两份；两处必须覆盖**同一批**模型
+/// （目录里放行了一个、门控却不认它 ⇒ 用户选中就 400）。一致性由
+/// `mimo_excluded_tokens_cover_audio_and_disabled` 钉住。
+pub const MIMO_EXCLUDED_TOKENS: &[&str] = &["asr", "tts", "ultraspeed"];
+
+/// id 的 `-` 分段里是否命中任一 token（大小写不敏感）。
+///
+/// **按分段精确匹配**，而非子串包含：子串匹配会被无关的连续字母误伤
+/// （如 `mimo-v2.6-classify` 里的 `asr`）。
+pub fn id_has_token(id: &str, tokens: &[&str]) -> bool {
+    id.split('-')
+        .any(|segment| tokens.iter().any(|t| segment.eq_ignore_ascii_case(t)))
+}
+
+/// 该 id 是否是 MiMo 的**音频**模型（非 chat 模型）。
+///
+/// 大小写不敏感。分段里出现 [`MIMO_AUDIO_TOKENS`] 任一项即判为音频。
+pub fn is_mimo_audio_model(model: &str) -> bool {
+    id_has_token(model, MIMO_AUDIO_TOKENS)
+}
+
+/// 该 id 是否是 MiMo **不用于本仓**的模型（用户明确禁用）。
+///
+/// 大小写不敏感。分段里出现 [`MIMO_DISABLED_TOKENS`] 任一项即命中。
+pub fn is_mimo_disabled_model(model: &str) -> bool {
+    id_has_token(model, MIMO_DISABLED_TOKENS)
+}
+
+/// 该 id 是否是 MiMo 的 **chat** 模型（可接受 `reasoning_effort`）。
+///
+/// 判据：id 以 `mimo-` 开头**且**不是音频模型**且**不是用户禁用的模型。
+///
+/// **识别不出 MiMo 模型 ⇒ `false`（fail-closed）**：与 GLM 方言同一原则 ——
+/// 「解析不出身份就不发」，避免把字段发给不接受它的端点。
+pub fn is_mimo_chat_model(model: &str) -> bool {
+    let Some(rest) = model
+        .get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("mimo-"))
+        .and_then(|_| model.get(5..))
+    else {
+        return false;
+    };
+    // 前缀之后必须有**实际的模型名**：`mimo-`（光秃秃的前缀）不是模型。
+    !rest.is_empty() && !is_mimo_audio_model(model) && !is_mimo_disabled_model(model)
 }
 
 /// 从模型 id 解析 GLM 代际 `(major, minor)`，无法解析时 `None`。
@@ -253,6 +353,7 @@ mod tests {
         assert!(!ProviderCompat::minimax().supports_reasoning_effort);
         assert!(ProviderCompat::opencode_go().supports_reasoning_effort);
         assert!(ProviderCompat::glm().supports_reasoning_effort);
+        assert!(ProviderCompat::mimo().supports_reasoning_effort);
     }
 
     /// GLM 的能力位：思考走 `reasoning_content`，流式末包带 usage，
@@ -291,6 +392,7 @@ mod tests {
             EffortDialect::Verbatim
         );
         assert_eq!(ProviderCompat::glm().effort_dialect, EffortDialect::Glm);
+        assert_eq!(ProviderCompat::mimo().effort_dialect, EffortDialect::Mimo);
     }
 
     /// `Verbatim` 方言逐字透传：不 trim、不改写，`None` 仍为 `None`。
@@ -461,5 +563,141 @@ mod tests {
             compat.effort_for("GLM-5.3", Some("medium")),
             Some("high".into())
         );
+    }
+
+    /// MiMo 的能力位：思考走 `reasoning_content`（同 DeepSeek），流式末包带 usage，
+    /// 接受顶层 `reasoning_effort`；tool_calls 仍在 `tool_calls` 里（不是 text）。
+    #[test]
+    fn mimo_capabilities() {
+        let compat = ProviderCompat::mimo();
+        assert!(compat.has_reasoning_content);
+        assert!(compat.supports_stream_usage);
+        assert!(compat.supports_reasoning_effort);
+        assert!(!compat.tool_calls_as_text);
+    }
+
+    /// MiMo 折叠表**逐档**（实测合法集 = `none|low|medium|high|max`）。
+    ///
+    /// 实测：`minimal` / `xhigh` / `off` 直接 400（`Param Incorrect`），
+    /// `max` 却被接受（错误文案只列了 `none|low|medium|high`，但实测 `max` 返回 200）
+    /// —— **以实测为准**，不按文案缩表。
+    ///
+    /// 变异：把 `off` 映射成 `none` ⇒ 本用例变红（`none` 是「关闭思考」，
+    /// 与 `off` 的「最低档」语义不同）；把 `xhigh` 映射成 `high` ⇒ 变红。
+    #[test]
+    fn mimo_folds_every_tier() {
+        let compat = ProviderCompat::mimo();
+        for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
+            assert!(compat.supports_effort(model), "model = {model}");
+            for (configured, expected) in [
+                ("off", "low"),
+                ("minimal", "low"),
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "high"),
+                ("xhigh", "max"),
+                ("max", "max"),
+            ] {
+                assert_eq!(
+                    compat.effort_for(model, Some(configured)).as_deref(),
+                    Some(expected),
+                    "model = {model}, configured = {configured}"
+                );
+            }
+            // 白名单之外的取值不猜映射，直接不发。
+            assert_eq!(compat.effort_for(model, Some("turbo")), None);
+            assert_eq!(compat.effort_for(model, None), None);
+        }
+    }
+
+    /// MiMo 的模型级门控：**音频模型不发**该字段，识别不出 MiMo 模型也不发。
+    ///
+    /// 实测音频模型在 `/chat/completions` 上必然 400（`ASR request requires...` /
+    /// `messages must contain an assistant role for TTS model`），故它们不属 chat 模型。
+    #[test]
+    fn mimo_gates_effort_by_model_identity() {
+        let compat = ProviderCompat::mimo();
+        // 音频模型 ⇒ fail-closed。
+        for model in [
+            "mimo-v2.5-asr",
+            "mimo-v2.5-tts",
+            "mimo-v2.5-tts-voiceclone",
+            "mimo-v2.5-tts-voicedesign",
+        ] {
+            assert!(!compat.supports_effort(model), "model = {model}");
+            assert_eq!(compat.effort_for(model, Some("high")), None);
+        }
+        // 用户禁用的模型 ⇒ fail-closed。
+        for model in ["mimo-v2.6-pro-ultraspeed", "mimo-v2.5-pro-ultraspeed"] {
+            assert!(!compat.supports_effort(model), "model = {model}");
+            assert_eq!(compat.effort_for(model, Some("high")), None);
+        }
+        // 识别不出 MiMo ⇒ fail-closed。
+        for model in ["test", "mimo", "mimo-", "", "gpt-4o"] {
+            assert!(!compat.supports_effort(model), "model = {model}");
+            assert_eq!(compat.effort_for(model, Some("high")), None);
+        }
+    }
+
+    /// 音频判定按 `-` 分段精确匹配、大小写不敏感。
+    ///
+    /// `tts-voiceclone` / `tts-voicedesign` 已被 `tts` 覆盖（实测它们就是 TTS 家族）。
+    #[test]
+    fn mimo_audio_detection_is_segment_exact_and_case_insensitive() {
+        assert!(is_mimo_audio_model("mimo-v2.5-asr"));
+        assert!(is_mimo_audio_model("mimo-v2.5-tts"));
+        assert!(is_mimo_audio_model("mimo-v2.5-tts-voiceclone"));
+        assert!(is_mimo_audio_model("mimo-v2.5-tts-voicedesign"));
+        assert!(is_mimo_audio_model("MIMO-V2.5-ASR"));
+        assert!(!is_mimo_audio_model("mimo-v2.6-pro"));
+        assert!(!is_mimo_audio_model("mimo-v2.6-flash"));
+        assert!(!is_mimo_audio_model("mimo-v2.6-pro-ultraspeed"));
+        // `ultraspeed` 是**用户禁用**而非音频模型 —— 两类分开判。
+        assert!(is_mimo_disabled_model("mimo-v2.6-pro-ultraspeed"));
+        assert!(!is_mimo_disabled_model("mimo-v2.6-pro"));
+        // 禁用的模型也不是本仓可用的 chat 模型。
+        assert!(!is_mimo_chat_model("mimo-v2.6-pro-ultraspeed"));
+        // 非 `mimo-` 前缀一律不算 MiMo chat 模型。
+        assert!(!is_mimo_chat_model("gpt-4o"));
+        assert!(is_mimo_chat_model("mimo-v2.6-pro"));
+        // 大小写不敏感。
+        assert!(is_mimo_chat_model("MIMO-V2.6-PRO"));
+    }
+
+    /// **一致性**：目录排除词表必须是「音频词表 ∪ 禁用词表」。
+    ///
+    /// 两处各写一遍必然漂移：目录里放行了一个模型、模型级门控却不认它 ⇒
+    /// 用户选中就 400（且 `/login` 会把它当起始模型）。
+    ///
+    /// 变异：给目录词表加一个词而不加到音频 / 禁用两份里 ⇒ 本用例变红。
+    #[test]
+    fn mimo_excluded_tokens_cover_audio_and_disabled() {
+        for token in MIMO_AUDIO_TOKENS.iter().chain(MIMO_DISABLED_TOKENS.iter()) {
+            assert!(MIMO_EXCLUDED_TOKENS.contains(token), "目录词表漏了 {token}");
+        }
+        assert_eq!(
+            MIMO_EXCLUDED_TOKENS.len(),
+            MIMO_AUDIO_TOKENS.len() + MIMO_DISABLED_TOKENS.len(),
+            "目录词表不应有音频 / 禁用两份之外的词"
+        );
+    }
+
+    /// 回归锚点：MiMo 的 wire 值**永远不出现**实测非法档位。
+    ///
+    /// 变异：把折叠表改回逐字透传 ⇒ 本用例变红。
+    #[test]
+    fn mimo_never_emits_illegal_tiers_on_the_wire() {
+        let compat = ProviderCompat::mimo();
+        for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
+            for configured in ["off", "minimal", "xhigh"] {
+                let sent = compat.effort_for(model, Some(configured));
+                assert!(sent.is_some(), "model = {model}, configured = {configured}");
+                let sent = sent.unwrap();
+                assert!(
+                    ["none", "low", "medium", "high", "max"].contains(&sent.as_str()),
+                    "model = {model}, configured = {configured} ⇒ 非法 wire 值 {sent}"
+                );
+            }
+        }
     }
 }

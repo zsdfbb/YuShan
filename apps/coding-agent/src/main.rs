@@ -1678,6 +1678,10 @@ fn adopt_first_catalog_model(
     base: &str,
     models: Vec<provider::ApiModel>,
 ) -> Result<(), &'static str> {
+    // **先过滤再取第一条**：目录里可能有本仓用不了的模型（实测 MiMo 把语音模型
+    // 排在最前，而它们在 chat 端点上必然 400）⇒ 不过滤的话起始模型会是一个
+    // 用不了的模型。
+    let models = config.registry.filter_catalog(base, models);
     let Some(first) = models.first() else {
         return Err("端点返回了空目录");
     };

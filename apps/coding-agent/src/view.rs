@@ -245,7 +245,7 @@ mod tests {
         assert!(view.logged_in_providers.is_empty());
         assert_eq!(
             view.providers.len(),
-            6,
+            7,
             "内置 provider 全部进 /login 选择器"
         );
         assert!(view.provider_names().contains(&"deepseek".to_string()));
@@ -255,7 +255,7 @@ mod tests {
         );
         // GLM 两个端点（通用 / 编码）都在注册表里，且各自带内置 base ——
         // 有内置 base 的 provider，`/login` 不该再多问一句 URL。
-        for name in ["glm", "glm-coding"] {
+        for name in ["glm", "glm-coding", "mimo"] {
             assert!(
                 view.provider_names().contains(&name.to_string()),
                 "{name} 必须在 /login 的 provider 选择器里：{:?}",

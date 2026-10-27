@@ -1222,7 +1222,7 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 - `Config::reasoning_effort()` 给出配置值；模型 factory 再经**两层**门控决定是否真正发送、
   以及发什么值：
   - **provider 级** `ProviderCompat::supports_reasoning_effort` —— 当前 `opencode-go` 与
-    `glm` / `glm-coding` 声明支持；`deepseek` / `minimax` / custom 与未知端点不发送该字段。
+    `glm` / `glm-coding` / `mimo` 声明支持；`deepseek` / `minimax` / custom 与未知端点不发送该字段。
   - **模型级** `ProviderCompat::supports_effort(model)`（`Glm` 方言要求代际 ≥ 5.2，
     无法解析代际时 fail-closed），实际下发值再由 `effort_for` 按方言折叠：
     `glm-5.3` 上 `off|minimal|low → low`、`medium|high → high`、`xhigh|max → max`；

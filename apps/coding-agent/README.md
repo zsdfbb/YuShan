@@ -58,7 +58,7 @@ $ ys-coding-agent --json --stats "..." 2>stats.log  # 背压统计单独进 stde
 首次启动没有凭证也能进界面，状态行会显示未配置模型。在 TUI 里：
 
 ```
-/login     选 provider（deepseek / minimax / opencode-go / glm / glm-coding 有内置端点；
+/login     选 provider（deepseek / minimax / opencode-go / glm / glm-coding / mimo 有内置端点；
            custom 这类没内置 base 的会再问一句 URL）→ 填 API key
 /model     无参开浮层选模型；也可 /model <name> 直接点名
 ```
@@ -66,6 +66,10 @@ $ ys-coding-agent --json --stats "..." 2>stats.log  # 背压统计单独进 stde
 `glm`（标准 API）与 `glm-coding`（Coding Plan 专属端点）是**两个独立 provider**：
 端点不同、API key **不通用**，各登各的。两者都没有模型列表接口，模型名来自内置种子
 （`glm-5.3` / `glm-5.3-flash`），登录过程不发网络请求。
+
+`mimo`（小米 MiMo）有模型列表接口，但那个目录把**语音模型排在最前**（`mimo-v2.5-asr` 等，
+在 chat 端点上必然报错）⇒ 本仓按能力类型过滤，目录里只剩 chat 模型
+（`mimo-v2.6-flash` / `mimo-v2.6-pro`）。详见 `docs/design-final/mimo.md`。
 
 凭证写入 `~/.yushan/auth.json`（Unix 上权限收紧），**之后启动自动加载**。
 `/logout` 清除。

@@ -372,6 +372,66 @@ reasoning tokens —— 因为 low 只是「少想」，不是「不想」。这
 这对**工具摘要**是直接的正面证据：`thinking=disabled` 在这类任务上是一笔**稳赚**的交易。
 ⚠️ 但 n=3 且单任务，只能作方向性判断，不能当验收依据。
 
+### 成本补充测量（2026-10-27 晚，n=1/档）
+
+> 为省额度只跑 1 次/档，**只用来判断方向与口径，不作任何定量结论**。
+> 前一组 n=3 的同配置方差极大（reasoning 53→166），所以下面百分比只能当量级看。
+
+**先钉住一个计费口径**：`completion_tokens` **包含** `reasoning_tokens`（子集关系）。
+证据：长任务里 `default` 与 `effort=max` 两组的 `completion_tokens` 恰等于
+`reasoning_tokens`（都是 2048，即 `max_tokens` 上限），且正文为空。⇒ 计费按
+`completion_tokens` 一项算，不要重复加 reasoning。
+
+**短任务**（摘要，真实页面 21.9 KB，`max_tokens=1024`）：
+
+| 配置 | completion | reasoning | 墙钟 | 质量命中 |
+|---|---|---|---|---|
+| 默认（thinking on, high） | 306 | 117 | 1.95s | 3/4 |
+| **`thinking=disabled`** | **145（−53%）** | **0** | **1.26s（−36%）** | 3/4 |
+| `effort=low` | 290（−5%） | 34 | 2.13s（**+9%**） | 4/4 |
+| `effort=high` | 352（+15%） | 64 | 2.09s | 4/4 |
+| `effort=max` | 374（+22%） | 75 | 2.19s | 4/4 |
+
+**长任务**（推理型，`max_tokens=2048`）：
+
+| 配置 | completion | reasoning | 墙钟 | 正文 |
+|---|---|---|---|---|
+| 默认 | **2048（触顶）** | 2048 | 11.3s | **空** |
+| `effort=max` | **2048（触顶）** | 2048 | 11.8s | **空** |
+| `effort=low` | 1660 | 1501 | 9.5s | 有（83 词） |
+| `effort=high` | 957 | 810 | 5.2s | 有（71 词） |
+| `thinking=disabled` | 106 | 0 | 1.0s | 有（53 词） |
+
+### 四条结论
+
+**① 真正的开关是 `thinking`，不是 `reasoning_effort`。**
+`thinking=disabled` 把 reasoning tokens 稳定打到 **0**；`effort=low` 仍有几十到上千个
+reasoning token —— low 只是「少想」，不是「不想」。这推翻了「把档位调到 `off` 就等于
+关闭思考」这条隐含假设。
+
+**② `effort=low` 的省钱效果很弱，而且不是单调的。**
+短任务只省 5% completion，墙钟反而慢 9%。四档在摘要任务上的差异落在一倍以内，
+**远小于 `thinking=disabled` 的 53%**。⇒ 「降 effort 省钱」这个直觉在本仓的实际
+provider 上**基本不成立**。
+
+**③ 关掉思考是唯一有显著收益的动作**：短任务 completion −53%、墙钟 −36%，质量未降；
+长任务 completion −95%、墙钟 −91%。
+
+**④ ⚠️ 长任务暴露一个独立的、可能更紧急的问题：`max_tokens` 偏小 + 默认 `high`
+会让正文完全为空。**
+
+默认档与 `max` 档都把 2048 的输出预算**全烧在思考上**，`finish_reason` 为长度截断，
+正文 0 词。这与本仓直接相关：
+
+- `crates/ys-loop/src/summarize.rs:40` 的 `SUMMARIZE_MAX_TOKENS = 1024`
+- 而 `ProviderCompat::deepseek()` 不发 `reasoning_effort` ⇒ 服务端用默认 **`high`**
+
+⇒ **工具摘要（webfetch / subagent）在内容较难时，存在「思考吃掉全部 1024 预算、
+返回空摘要」的风险**。这不是理论推演：上表 `default` 行就是同一现象。
+
+⚠️ 该组任务本身设计有问题（五档质量全为 0/4，含 `thinking=disabled`），
+**不能用于比较质量**；它只用于证明「思考能吃光预算」这个现象存在。
+
 ### 对本仓的直接影响
 
 **全仓没有任何地方发送 `thinking` 字段**（`grep thinking adapters/` 只命中

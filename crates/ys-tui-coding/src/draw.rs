@@ -1163,6 +1163,8 @@ fn stop_symbol(stop: &StopReason) -> &'static str {
         StopReason::Truncated => "✂",
         // 「空产出」不是错误也不是完成：用 ∅ 表示「回合结束了，但模型什么也没给出」。
         StopReason::NoOutput => "∅",
+        // 故障（provider 侧）：与 ✗（取消）刻意区分 —— 取消是意图，故障要追查。
+        StopReason::Failed => "!",
         _ => "?",
     }
 }
@@ -1178,6 +1180,7 @@ pub(crate) fn stop_key(stop: &StopReason) -> u64 {
         StopReason::Cancelled => 3,
         StopReason::Truncated => 4,
         StopReason::NoOutput => 5,
+        StopReason::Failed => 6,
         _ => 0,
     }
 }
@@ -1193,6 +1196,7 @@ fn stop_label(stop: &StopReason) -> &'static str {
         StopReason::MaxRounds => "max rounds",
         StopReason::Truncated => "truncated",
         StopReason::NoOutput => "no output",
+        StopReason::Failed => "failed",
         _ => "unknown",
     }
 }

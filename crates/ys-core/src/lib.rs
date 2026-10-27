@@ -98,6 +98,7 @@ mod tests {
             StopReason::Cancelled,
             StopReason::Truncated,
             StopReason::NoOutput,
+            StopReason::Failed,
         ];
         for r in reasons {
             let json = serde_json::to_string(&r).unwrap();
@@ -126,5 +127,17 @@ mod tests {
         assert_eq!(json, "\"NoOutput\"", "序列化字符串是对外契约，不得改名");
         let back: StopReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, StopReason::NoOutput);
+    }
+
+    // `Failed` 同 `Truncated` / `NoOutput`：加法式新增，会出现在 `RunFinished.stop_reason`
+    // 里并经 `--json` 打印 —— 序列化字符串是**对外契约**，必须钉死。
+    //
+    // 变异：把变体改名为 `Error` / `ProviderError` ⇒ 本用例变红（字面量变了）。
+    #[test]
+    fn test_stop_reason_failed_serde_roundtrip() {
+        let json = serde_json::to_string(&StopReason::Failed).unwrap();
+        assert_eq!(json, "\"Failed\"", "序列化字符串是对外契约，不得改名");
+        let back: StopReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, StopReason::Failed);
     }
 }

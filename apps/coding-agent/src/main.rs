@@ -2162,6 +2162,8 @@ async fn run_json_mode(
 fn single_turn_exit_code(result: &RunResult) -> i32 {
     match result.stop_reason {
         StopReason::Cancelled | StopReason::NoOutput => 1,
+        // 故障（provider 错误）：本回合**没跑完**，不能报 0 静默装作成功。
+        StopReason::Failed => 1,
         _ => 0,
     }
 }

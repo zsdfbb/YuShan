@@ -630,9 +630,33 @@ impl AgentLoop for BasicLoop {
             };
 
             // Step 6：通过 Forwarder 调用 model
-            let mut forwarder = Forwarder { sink: ctx.events };
-            let model_result = ctx.model.complete(request, &mut forwarder).await;
-            let response = match model_result {
+            //
+            // **流中断重试**（`stream_interrupt_retries`，默认 0 = 关闭）：
+            // provider 可以在 200 + 正常 ttfb 之后把流中途截断；适配器因
+            // 「已吐 delta」拒绝重试（重放会把已渲染文本再渲染一遍）。
+            // 那个理由只对「流边渲染给用户看」成立 —— 子 agent 的输出不进屏幕，
+            // 故可丢弃部分输出、用**同一请求**重发。会话未受污染（失败分支不
+            // `append`），因此重试幂等。
+            let mut stream_retries_left = ctx.limits.stream_interrupt_retries;
+            let response = loop {
+                let mut forwarder = Forwarder { sink: ctx.events };
+                match ctx.model.complete(request.clone(), &mut forwarder).await {
+                    // 只有 `Provider` 可重试：`Cancelled` 是用户意图，
+                    // `Sink` / `Serde` 是本地缺陷 —— 三者重发都无意义。
+                    Err(ys_model::ModelError::Provider(_)) if stream_retries_left > 0 => {
+                        stream_retries_left -= 1;
+                        // 告知消费端：本轮已发出的流式增量作废（重发从头开始）。
+                        // 子 agent 只取 `ToolResult`，多余 delta 对它无副作用；
+                        // TUI / `-p` 下本开关恒为 0，不会走到这里。
+                        emit(ctx.events, AgentEvent::ModelStreamDiscarded)
+                            .await
+                            .map_err(LoopError::Event)?;
+                        continue;
+                    }
+                    other => break other,
+                }
+            };
+            let response = match response {
                 Ok(response) => response,
                 // 中止**不是故障** ⇒ 不发 `RunFailed`，以 `Cancelled` 收场。
                 Err(ys_model::ModelError::Cancelled { partial }) => {

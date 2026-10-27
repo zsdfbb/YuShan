@@ -593,6 +593,16 @@ impl<'a> AppSubagentRunner<'a> {
         results: Arc<PendingResults>,
         live: Arc<LiveSubagents>,
     ) -> Self {
+        // 子 agent 输出**不进用户屏幕**（只交回最终 summary）⇒ 流中断后丢弃已收到的
+        // 部分输出、重发同一请求是安全的（`Err` 分支不 `append` 消息，会话未被污染）。
+        //
+        // 用 1 次重试：流中断是偶发故障（实测 6307 次 attempt 中 4 次，均在单个
+        // 网关故障窗口内）；一次就能拦住绝大多数，再多只会放大真正的持续故障。
+        //
+        // 在此统一设置（而非调用方）⇒ `new` / `shared` 两个入口不可能漂移。
+        let mut child_limits = child_limits;
+        child_limits.stream_interrupt_retries = 1;
+
         Self {
             parent_model,
             config,
@@ -658,6 +668,10 @@ impl SubagentSetup {
     ///
     /// 参数多是必然的：它冻结的是「一次派发需要的全部不变输入」，每个都得能在
     /// `/resume` 重建后重新给到。拆参数包只会把六个 `Arc::clone` 推给调用方。
+    ///
+    /// 注意：`child_limits` 里的 `stream_interrupt_retries` 由调用方给，本入口**不**覆写
+    /// —— 它与 [`Self::new`] 不同：后者是产品入口，必须无条件开启流中断重试；
+    /// 本入口给测试与恢复路径用，保留调用方的选择。
     #[allow(clippy::too_many_arguments)]
     pub fn shared(
         child_prompt: String,
@@ -987,9 +1001,9 @@ impl ChildTask {
         {
             Ok(child) => child,
             Err(e) => {
-                // 建不起来：留一份最小转录 + 诊断，语义与「跑起来但失败」一致。
-                let stop_reason = StopReason::Cancelled;
-                let cause = Some(CancelCause::Unknown);
+                // 建不起来：留一份最小转录 + 诊断。同样是**故障**，不是取消。
+                let stop_reason = StopReason::Failed;
+                let cause = None;
                 let details = vec![format!("子 agent 组装失败: {e}")];
                 let diagnostic = run_diagnostic(&stop_reason, cause, 0, &details);
                 let artifact = self
@@ -1078,9 +1092,15 @@ impl ChildTask {
                 }
             }
             Err(e) => {
-                // 「跑都跑不起来」仍尽量留转录；错误文本只进诊断，不伪装成父/子取消。
-                let stop_reason = StopReason::Cancelled;
-                let cause = Some(CancelCause::Unknown);
+                // 「跑都跑不起来」仍尽量留转录；错误文本只进诊断。
+                //
+                // 用 `Failed` 而非 `Cancelled`：这里是**故障**（provider 错误、
+                // 流中断等），不是用户取消。归成 `Cancelled` 会让诊断行变成
+                // `stop_reason=cancelled cause=unknown error=...provider error...`
+                // —— 自相矛盾，且把真故障埋在「用户取消」里。
+                let stop_reason = StopReason::Failed;
+                // 不是取消 ⇒ 不该有取消归因（`cancel_cause` 已按此语义实现）。
+                let cause = None;
                 let mut details = vec![format!("error={e}")];
                 let body = transcript_body(
                     &session,
@@ -1142,6 +1162,7 @@ fn stop_reason_label(stop_reason: &StopReason) -> &'static str {
         StopReason::Cancelled => "cancelled",
         StopReason::Truncated => "truncated",
         StopReason::NoOutput => "no-output",
+        StopReason::Failed => "failed",
         _ => "unknown",
     }
 }
@@ -2246,6 +2267,232 @@ mod tests {
         assert_eq!(run_diagnostic(&StopReason::Completed, None, 1, &[]), None);
     }
 
+    /// 故障（provider 错误）**不得**被归成取消 —— 这是 `Failed` 变体存在的理由。
+    ///
+    /// 事故背景：一次长会话的 provider 流中断导致子 agent 整段失败，
+    /// 诊断行却写成 `stop_reason=cancelled cause=unknown error=...SSE stream...`
+    /// —— 自相矛盾，且把真故障埋在「用户取消」里。
+    ///
+    /// 变异：把 `stop_reason_label` 里的 `Failed => "failed"` 删掉 ⇒ 第一条断言变红；
+    /// 让 `cancel_cause` 对 `Failed` 也返回 `Some(..)` ⇒ 第二条断言变红。
+    #[test]
+    fn failed_is_not_reported_as_cancellation() {
+        let failed = run_diagnostic(
+            &StopReason::Failed,
+            None,
+            341_923,
+            &["error=model provider error: SSE stream error".to_string()],
+        )
+        .expect("故障必须有诊断");
+
+        assert!(
+            failed.contains("stop_reason=failed"),
+            "故障必须标成 failed，实际: {failed}"
+        );
+        assert!(
+            !failed.contains("stop_reason=cancelled"),
+            "故障不得伪装成取消，实际: {failed}"
+        );
+        assert!(
+            !failed.contains("cause="),
+            "故障不是取消 ⇒ 不得有取消归因，实际: {failed}"
+        );
+        // 错误文本必须保留 —— 它是追查的唯一线索。
+        assert!(failed.contains("SSE stream error"), "实际: {failed}");
+
+        // 归因函数本身也必须守住这条：非取消一律 `None`。
+        for cancelled in [false, true] {
+            assert_eq!(
+                cancel_cause(&StopReason::Failed, cancelled, cancelled),
+                None,
+                "Failed 在任何取消状态下都不得有 cause"
+            );
+        }
+        // 对照：真取消仍有归因（防止上面的断言被“恒 None”洗白）。
+        assert_eq!(
+            cancel_cause(&StopReason::Cancelled, true, false),
+            Some(CancelCause::ParentTurnCancelled)
+        );
+    }
+
+    /// **端到端锁住 `Err` 分支**：model 返回 `Provider` 错误时，`ChildTask::execute`
+    /// 必须以 `Failed` 收场、**不带**取消归因，且错误文本仍在诊断里。
+    ///
+    /// 为何必须走真实路径：`failed_is_not_reported_as_cancellation` 直接构造
+    /// `StopReason::Failed`，**抓不到**「`Err` 分支写回 `Cancelled`」这个变异
+    /// （实测过：那次变异让它全绿）。本用例从 `runner.run` 进去，必经 `Err` 分支。
+    ///
+    /// 变异：把 `Err` 分支的 `StopReason::Failed` 改回 `Cancelled`
+    /// （并把 `cause` 改回 `Some(CancelCause::Unknown)`）⇒ 本用例变红。
+    #[tokio::test]
+    async fn provider_error_surfaces_as_failed_not_cancelled() {
+        use ys_model::{ModelError, ModelEventSink, ModelRequest, ModelResponse};
+        use ys_tools_web::FetchedDir;
+
+        /// 恒返回 provider 错误 —— 模拟流中断（`reason_class=stream`）。
+        struct FailingModel;
+        #[async_trait]
+        impl Model for FailingModel {
+            fn model_id(&self) -> &str {
+                "failing"
+            }
+            async fn complete(
+                &self,
+                _request: ModelRequest,
+                _sink: &mut dyn ModelEventSink,
+            ) -> Result<ModelResponse, ModelError> {
+                Err(ModelError::Provider(
+                    "SSE stream error: error decoding response body \
+                     (streaming already began; not retried)"
+                        .to_string(),
+                ))
+            }
+        }
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "yushan_subagent_failed_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let dir = Arc::new(SubagentsDir::at(base.join("subagents"), false));
+        let web = WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
+        let runner = AppSubagentRunner::new(
+            Some(Arc::new(FailingModel)),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            "你是子 agent".to_string(),
+            RunLimits::new(3),
+            Duration::from_secs(30),
+            base.clone(),
+            web,
+            dir,
+            Arc::new(UsageTotals::default()),
+            None,
+            Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
+        );
+
+        let out = runner.run("查 X", None, None).await.unwrap();
+        assert_eq!(
+            out.stop_reason,
+            StopReason::Failed,
+            "provider 错误必须归成 Failed"
+        );
+
+        let diag = out.diagnostic.expect("必须留诊断");
+        assert!(
+            diag.contains("stop_reason=failed"),
+            "诊断必须标 failed，实际: {diag}"
+        );
+        assert!(
+            !diag.contains("stop_reason=cancelled"),
+            "不得伪装成取消，实际: {diag}"
+        );
+        assert!(
+            !diag.contains("cause="),
+            "故障不是取消 ⇒ 无取消归因，实际: {diag}"
+        );
+        assert!(
+            diag.contains("SSE stream error"),
+            "必须保留错误文本: {diag}"
+        );
+
+        // 失败时不得伪装成“有产出”。
+        assert!(out.summary.is_empty(), "失败不得编摘要: {:?}", out.summary);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **流中断重试真的救回了任务**：先断一次、再成功 ⇒ 最终 `Completed`。
+    ///
+    /// 事故背景：provider 在 200 + 正常 ttfb 之后把流中途截断（实测 6307 次
+    /// attempt 中 4 次），子 agent 已跑了 100+ 次工具调用却整段作废。
+    /// 子 agent 的输出不进用户屏幕 ⇒ 丢弃部分输出、重发同一请求是安全的。
+    ///
+    /// 变异：把 `RunLimits::stream_interrupt_retries` 的默认值改成非零（污染 TUI
+    /// 行为）⇒ `stream_retry_default_is_off` 变红；把 `basic.rs` 的重试循环去掉
+    /// ⇒ 本用例变红（`Provider` 错误直接冒到 `Err` 分支）。
+    #[tokio::test]
+    async fn stream_interrupt_is_retried_and_task_survives() {
+        use ys_model::MockModel;
+
+        let base = unique_subagent_test_dir("stream_retry");
+        let model = MockModel::new("m");
+        // 第一次断流（模拟 SSE 截断），第二次成功。
+        model.push_error(
+            "SSE stream error: error decoding response body \
+             (streaming already began; not retried)",
+        );
+        model.push_text("重试后成功产出");
+
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        // `new` 无条件开启重试 ⇒ 直接用它验证产品路径。
+        let runner = test_runner(model, &base, dir, RunLimits::new(3));
+
+        let out = runner.run("查 X", None, None).await.unwrap();
+        assert_eq!(
+            out.stop_reason,
+            StopReason::Completed,
+            "流中断应被重试救回，不能整段失败（diagnostic={:?}）",
+            out.diagnostic
+        );
+        assert!(
+            out.summary.contains("重试后成功产出"),
+            "重试后的产出必须进摘要，实际: {}",
+            out.summary
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 重试是**有界的**：连断两次（只有 1 次额度）⇒ 第二次如实失败。
+    ///
+    /// 防止「无限重试把持续故障放大成 token 黑洞」。
+    ///
+    /// 变异：把 `stream_interrupt_retries` 从 1 改成 5 ⇒ 本用例变红（第二次会被重试）。
+    #[tokio::test]
+    async fn stream_interrupt_retry_is_bounded() {
+        use ys_model::MockModel;
+
+        let base = unique_subagent_test_dir("stream_retry_bounded");
+        let model = MockModel::new("m");
+        model.push_error("SSE stream error: first");
+        model.push_error("SSE stream error: second");
+        model.push_text("不应到达这里");
+
+        let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
+        let runner = test_runner(model, &base, dir, RunLimits::new(3));
+
+        let out = runner.run("查 X", None, None).await.unwrap();
+        assert_eq!(
+            out.stop_reason,
+            StopReason::Failed,
+            "额度用尽后必须如实失败，不能无限重试"
+        );
+        assert!(!out.summary.contains("不应到达这里"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 默认**关闭** —— TUI / `-p` 的行为必须逐字节不变。
+    ///
+    /// 客户端重发已开始的流会让用户眼前的文本重复一遍，主会话不能开。
+    ///
+    /// 变异：把 `RunLimits::default()` 的 `stream_interrupt_retries` 改成 1 ⇒ 变红。
+    #[test]
+    fn stream_retry_default_is_off() {
+        assert_eq!(
+            RunLimits::default().stream_interrupt_retries,
+            0,
+            "主会话（TUI / -p）不得重启已开始的流"
+        );
+        assert_eq!(RunLimits::new(5).stream_interrupt_retries, 0);
+    }
+
     #[tokio::test]
     async fn transcript_prefers_event_result_when_session_was_budget_elided() {
         use ys_session::Session;
@@ -2697,22 +2944,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// provider 错误（`Run` 返回 `Err`）⇒ `Failed` + **无**取消归因。
+    ///
+    /// 改名自 `app_runner_run_error_is_unknown_cause_and_sanitized`：旧名与旧断言钉的是
+    /// 「错误归成 `Cancelled` + `cause=unknown`」—— 那正是本次修掉的 bug
+    /// （诊断行自相矛盾，且把真故障埋在「用户取消」里）。
+    ///
+    /// 保留的部分：错误文本的清洗（去换行、去控制字符）与诊断长度上限。
     #[tokio::test]
-    async fn app_runner_run_error_is_unknown_cause_and_sanitized() {
+    async fn app_runner_run_error_is_failed_without_cause_and_sanitized() {
         use ys_model::MockModel;
 
         let base = unique_subagent_test_dir("run_error");
         let model = MockModel::new("m");
+        // 排两次：产品路径会重试 1 次（`AppSubagentRunner::new` 无条件开启），
+        // 只排一次会让重试时队列空而 panic。本用例验证的是「额度耗尽后如实上报」。
+        model.push_error("provider failed\nsecond line\r\u{7}");
         model.push_error("provider failed\nsecond line\r\u{7}");
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(2));
 
         let out = runner.run("失败", None, None).await.unwrap();
-        assert_eq!(out.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            out.stop_reason,
+            StopReason::Failed,
+            "provider 错误必须是故障"
+        );
         let diagnostic = out.diagnostic.expect("Run Err 必须有诊断");
         assert!(diagnostic.starts_with(DIAGNOSTIC_PREFIX));
-        assert!(diagnostic.contains("stop_reason=cancelled"));
-        assert!(diagnostic.contains("cause=unknown"));
+        assert!(diagnostic.contains("stop_reason=failed"));
+        assert!(
+            !diagnostic.contains("cause="),
+            "故障不是取消 ⇒ 不得有取消归因: {diagnostic}"
+        );
         assert!(diagnostic.contains("elapsed_ms="));
         assert!(diagnostic.contains("provider failed second line"));
         assert!(!diagnostic.chars().any(char::is_control));
@@ -2720,8 +2984,11 @@ mod tests {
 
         let artifact = out.artifact.expect("即使 Run Err 也应尽量写转录");
         let body = std::fs::read_to_string(artifact).unwrap();
-        assert!(body.contains("cause=unknown"));
-        assert!(body.contains("diagnostic=[diagnostic: stop_reason=cancelled"));
+        assert!(
+            !body.contains("cause=unknown"),
+            "转录不得带取消归因: {body}"
+        );
+        assert!(body.contains("diagnostic=[diagnostic: stop_reason=failed"));
 
         let _ = std::fs::remove_dir_all(&base);
     }

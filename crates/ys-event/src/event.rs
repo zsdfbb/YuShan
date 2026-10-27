@@ -70,6 +70,16 @@ pub enum AgentEvent {
     ModelThinkingDelta {
         text: String,
     },
+    /// 本轮的流式增量**全部作废**（provider 中途断流，将重发同一请求）。
+    ///
+    /// 消费端应丢弃自本轮开始以来收到的所有 `ModelTextDelta` / `ModelThinkingDelta`。
+    /// 只在 `RunLimits::stream_interrupt_retries > 0` 时可能发出 —— 默认 `0`
+    /// （TUI / `-p`）下本事件永不出现，故既有消费端无需处理。
+    ///
+    /// **为何必须单独一格、不能借用 `RoundUsage`**：那个变体会进 usage 累计，
+    /// 而重试此刻**零消耗**（被丢弃的那次已经计过费，不该也不该重计）。
+    /// 冒充它会把重试次数混进 token 统计里。
+    ModelStreamDiscarded,
     ToolCall {
         call: ToolCall,
     },

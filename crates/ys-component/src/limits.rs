@@ -98,6 +98,24 @@ pub struct RunLimits {
     /// 对应最长等待 ≈ 3 分钟（每轮 ≈ 14.9s，其中工具执行仅占 2.8%）。
     /// `0` ⇒ 关闭（既有消费者逐字节不变）。
     pub narration_silence_tool_calls: usize,
+    /// 流式中断后**重试整个模型轮**的次数上限（默认 `0` = 关闭）。
+    ///
+    /// 背景：provider 流可以返回 `200` + 正常 `ttfb`，然后在持续输出几十秒后
+    /// 被**中途截断**。此类故障归为 `ModelError::Provider`，且因为**已吐出 delta**
+    /// 而被适配器拒绝重试（重放会把已渲染文本再渲染一遍）。
+    ///
+    /// 但那个理由只对「流边渲染边给用户看」的路径成立。**子 agent 的输出不进
+    /// 用户屏幕**（它只把最终 summary 交回父），所以对子 agent 可以安全地丢弃
+    /// 已收到的部分输出、用**同一请求**从头重发 —— 会话未被污染（`Err` 分支不
+    /// `append` 任何消息），故重试是幂等的。
+    ///
+    /// 账：用一次重复的 token 支出，换回前面几十上百次工具调用的上下文不丢。
+    /// 只在子 agent 场景划算（重建上下文要几十轮），故默认 `0`，由 subagent
+    /// 的 child_limits 置非零。
+    ///
+    /// **只对 `ModelError::Provider` 生效**：`Cancelled` 是用户意图，`Sink` /
+    /// `Serde` 是本地缺陷 —— 三者重试都无意义。
+    pub stream_interrupt_retries: u32,
 }
 
 impl RunLimits {
@@ -129,6 +147,8 @@ impl Default for RunLimits {
             subagent_poll: Duration::from_millis(200),
             // 12：实测回测下全程只多 3 条提醒，最长静默 ≈ 3 分钟。
             narration_silence_tool_calls: DEFAULT_NARRATION_SILENCE_TOOL_CALLS,
+            // 0 = 关闭 ⇒ 既有行为逐字节不变（客户端不重发已开始的流）。
+            stream_interrupt_retries: 0,
         }
     }
 }

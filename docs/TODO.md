@@ -136,6 +136,21 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
+- **推理强度只有全局档位，缺「按调用类型分档」**：对照记录见
+  `docs/reports/2026-10-27-reasoning-effort-comparison.md`。
+  **三家（pi / Codewhale / deepseek-harness）无一使用全局单一档位**：pi 按角色分档
+  （子 agent 传 `--thinking`、compaction 尊重 `thinkingLevel`、eval 直接 `off`）；Codewhale 的
+  router 自身调用只准 `off`/`low` 且用**类型**强制；deepseek-harness 的**子 agent 可清零**
+  route 继承的 effort。
+  **本仓现状**（核实于 2026-10-27）：子 agent 直接继承全局
+  （`apps/coding-agent/src/main.rs:2928-2930`）；**压缩摘要完全未设档位**
+  （`crates/ys-loop/src/compact.rs` 全文无 `effort` 赋值）。
+  ⬜ **待办**：E1（压缩摘要用最低档；`RoundPurpose::Compaction` 已有区分点，代价最小）→
+  E2（子 agent 不默认继承）→ E3（探索/检索类低档，需先造「调用类型」概念）。
+  ⚠️ **落地前必须先跑 `e2e_bench` 取基线**：现有 A/B 只测过「发/不发」与 `low`
+  （`docs/arch/session-latency/design.md` §8.5，`low` 质量从 3/3 掉到 2/3）⇒
+  没有按调用类型分档的对照，直接改等于把掉质量的风险赌在直觉上。
+
 - **Termux / Android 下 subagent 派发会把整个会话拖死（Android 12 phantom process killer）**：
   排查记录见 `docs/reports/2026-10-27-termux-restart-under-subagent-report.md`。
   **代码侧四条放大因素**（均已核实）：每回合最多 16 次派发且两个派发工具都声明并发安全

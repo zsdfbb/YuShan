@@ -266,6 +266,7 @@ fn base_config(api_base: String) -> OpenAICompatibleConfig {
         max_tokens: None,
         temperature: None,
         reasoning_effort: None,
+        disable_thinking: false,
         compat: ProviderCompat {
             supports_stream_usage: false,
             ..ProviderCompat::standard()
@@ -685,6 +686,7 @@ async fn model_attempt_trace_marks_stream_options_fallback() {
         max_tokens: None,
         temperature: None,
         reasoning_effort: None,
+        disable_thinking: false,
         compat: ProviderCompat::standard(),
     };
     let model = OpenAICompatibleModel::with_client(config, no_proxy_client())

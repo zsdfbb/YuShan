@@ -451,6 +451,7 @@ async fn no_fallback_when_request_lacks_stream_options() {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            disable_thinking: false,
             compat: ProviderCompat::minimax(),
         },
         client,

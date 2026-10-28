@@ -46,6 +46,18 @@ pub struct OpenAICompatibleConfig {
     pub temperature: Option<f32>,
     /// 可选推理强度；`None` = 不发送该字段（默认，兼容所有端点）。
     pub reasoning_effort: Option<String>,
+    /// 构造期是否**确定要求关闭思考**（来自配置层的 `off`）。
+    ///
+    /// 与 `reasoning_effort` 的分工：
+    /// - `reasoning_effort` 是**强度**，且经 `ProviderCompat::effort_for` 折叠；
+    ///   对未声明支持的 provider 它会是 `None` ⇒ **携带不了「用户要 off」这个意愿**。
+    /// - 本字段是**开关**，与能力位 `supports_thinking_control` 配对。
+    ///
+    /// 两者独立：即使 `reasoning_effort` 被折叠或丢弃，本字段仍能生效。
+    /// 这是「`/effort off` 对 deepseek 曾是空操作」这个缺陷的修复点。
+    ///
+    /// 默认 `false`（既有行为不变）；只有配置层显式给 `off` 时才置 `true`。
+    pub disable_thinking: bool,
     pub compat: ProviderCompat,
 }
 
@@ -1326,14 +1338,13 @@ pub fn translate_request(
         max_tokens: config.max_tokens.or(request.max_tokens),
         temperature: config.temperature.or(request.temperature),
         reasoning_effort: config.reasoning_effort.clone(),
-        // 思考开关：只当**两边都要求**时才发。
+        // 思考开关：**两条来源取或**。
         //
-        // - `request.disable_thinking` 为 `None` 或 `Some(true)` ⇒ 不干预（既有行为不变）。
-        // - 只有调用方显式 `Some(false)`（关闭思考）**且** provider 声明支持 ⇒ 发 `disabled`。
+        // - 构造期（配置层 `off`）⇒ `config.disable_thinking`
+        // - 调用期（如摘要路径）⇒ `request.disable_thinking == Some(false)`
         //
-        // 刻意**不发 `enabled`**：那是 provider 默认值，发它只会给不认识该字段的端点添风险；
-        // 且「显式开启」从未被任何调用方需要。
-        thinking: (request.disable_thinking == Some(false)
+        // 刻不发 `enabled`：那是 provider 默认值，发它只给不认识该字段的端点添风险。
+        thinking: ((config.disable_thinking || request.disable_thinking == Some(false))
             && config.compat.supports_thinking_control)
             .then_some(ThinkingControl::Disabled),
     })
@@ -1354,6 +1365,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            disable_thinking: false,
             compat: ProviderCompat::standard(),
         };
 
@@ -1396,6 +1408,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            disable_thinking: false,
             compat: ProviderCompat::standard(),
         };
 
@@ -1469,6 +1482,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            disable_thinking: false,
             compat: ProviderCompat::standard(),
         };
 
@@ -1918,6 +1932,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            disable_thinking: false,
             compat: ProviderCompat::standard(),
         };
         let request = ModelRequest::default();
@@ -1992,6 +2007,40 @@ mod tests {
         assert!(json.get("thinking").is_none(), "json = {json}");
     }
 
+    /// 配置层 `off`（构造期 `disable_thinking`）也要能落到 wire。
+    ///
+    /// 这是「`/effort off` 对 deepseek 曾是空操作」的修复点：`off` 不是合法的
+    /// `reasoning_effort` 值，只能走 `thinking` 开关。故它与强度字段**相互独立**。
+    ///
+    /// 变异：把 `config.disable_thinking` 从接线里去掉（只留 `request.disable_thinking`）
+    /// ⇒ 本用例变红。
+    #[test]
+    fn config_level_off_maps_to_thinking_disabled() {
+        let mut config = config_with(ProviderCompat::deepseek());
+        // `reasoning_effort` 恒为 None（deepseek 未声明支持强度字段）。
+        assert!(config.reasoning_effort.is_none());
+
+        let request = ModelRequest::default();
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert!(
+            json.get("thinking").is_none(),
+            "默认不得关闭；json = {json}"
+        );
+
+        config.disable_thinking = true;
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert_eq!(
+            json["thinking"]["type"], "disabled",
+            "配置层 off 必须落成 thinking.disabled；json = {json}"
+        );
+
+        // 不支持该字段的端点：即使配置要求也**不得**发送。
+        let mut strict = config_with(ProviderCompat::standard());
+        strict.disable_thinking = true;
+        let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
+        assert!(json.get("thinking").is_none(), "json = {json}");
+    }
+
     /// 构造一个仅 compat 不同的最小 config。
     fn config_with(compat: ProviderCompat) -> OpenAICompatibleConfig {
         OpenAICompatibleConfig {
@@ -2001,6 +2050,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            disable_thinking: false,
             compat,
         }
     }

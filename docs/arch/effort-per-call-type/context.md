@@ -443,6 +443,9 @@ provider 上**基本不成立**。
 | `ProviderCompat.supports_thinking_control` 能力位（默认 `false`，仅 `deepseek()` 为 `true`） | `adapters/model-openai-compatible/src/compat.rs` |
 | 接线：`disable_thinking == Some(false) && supports_thinking_control` ⇒ 发 `{"type":"disabled"}` | `translate_request` |
 | 摘要路径设 `disable_thinking: Some(false)` | `crates/ys-loop/src/summarize.rs` |
+| `OpenAICompatibleConfig.disable_thinking: bool`（构造期，来自配置层 `off`） | `adapters/.../lib.rs` |
+| `Config::disable_thinking()`：只看生效档位是否 `off` | `apps/coding-agent/src/config.rs` |
+| `parse_reasoning_effort` 白名单补 `off`（原先 env 设 `off` 被静默丢弃） | `apps/coding-agent/src/config.rs` |
 
 **几个刻意的取舍**：
 
@@ -486,9 +489,14 @@ provider 上**基本不成立**。
 > ✅ **已在同日修复**（见上节「已落地的修复」）：wire 层加了 `thinking` 开关，
 > 摘要路径已显式关闭思考。
 >
-> ⚠️ **仍未修的部分**：`/effort` 用户面仍不能表达「关闭思考」——
-> `EffortLevel::Off` 落到 wire 上对 deepseek 依旧是空操作（现在有了 `thinking` 字段，
-> 但还没把 `Off` 映射过去）。这是下一步（见「后续建议」）。
+> ✅ **用户面也已接通**（同日第二刀）：`/effort off` 与
+> `YUSHAN_REASONING_EFFORT=off` 现在都会落到 `thinking: {"type": "disabled"}`。
+> 两条实现要点：
+> 1. `OpenAICompatibleConfig.disable_thinking: bool`（构造期），与
+>    `reasoning_effort` **相互独立** —— 因为 `off` 不是合法强度值，
+>    经 `effort_for()` 会被折叠或丢弃，携带不了这个意愿。
+> 2. `parse_reasoning_effort` 的白名单原先**漏了 `off`**（env 设 `off` 被静默丢弃），
+>    导致「`/effort off` 能关闭、env 设 `off` 却不能」的不一致 —— 已补上。
 
 ---
 

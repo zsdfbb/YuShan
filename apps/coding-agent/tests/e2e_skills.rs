@@ -280,6 +280,7 @@ async fn e2e_skills_section_input_token_delta() {
         max_tokens: Some(4096),
         temperature: Some(0.0),
         reasoning_effort: None,
+        disable_thinking: false,
         compat: ProviderCompat::deepseek(),
     });
 

@@ -2591,6 +2591,9 @@ fn build_configured_model(
     let compat = cfg.current_compat();
     let effective_effort = cfg.effective_reasoning_effort();
     let reasoning_effort = reasoning_effort_for(&compat, &cfg.model, effective_effort.as_deref());
+    // 与 `reasoning_effort` **相互独立**地判定「关闭思考」：`off` 不是 DeepSeek 的
+    // 合法强度值（422），只能走 `thinking` 开关。
+    let disable_thinking = cfg.disable_thinking();
     // `new` 自建 client（`owns_client == true`），故 `with_timeouts` 会按配置重建
     // 带 `connect_timeout` 的 client —— 见适配器 `with_timeouts` 的守卫。
     let retry = cfg.model_retry();
@@ -2605,6 +2608,7 @@ fn build_configured_model(
         max_tokens: None,
         temperature: Some(0.7),
         reasoning_effort,
+        disable_thinking,
         compat,
     })
     .with_retry(RetryConfig {
@@ -2928,6 +2932,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let effective_effort = cfg.effective_reasoning_effort();
         // 门控与折叠都按**本次构造的**模型名判：同一 provider 上的不同代际取值集合不同。
         let reasoning_effort = reasoning_effort_for(&compat, name, effective_effort.as_deref());
+        let disable_thinking = cfg.disable_thinking();
         let retry = cfg.model_retry();
         let timeout = cfg.model_timeout();
         let mut model = OpenAICompatibleModel::new(OpenAICompatibleConfig {
@@ -2938,6 +2943,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_tokens: None,
             temperature: Some(0.7),
             reasoning_effort,
+            disable_thinking,
             compat,
         })
         .with_retry(RetryConfig {

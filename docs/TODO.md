@@ -134,30 +134,31 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 ## D. 其他尾巴
 
-- **推理强度：本仓既不能关闭思考，也不能真正降档**（2026-10-27 已探明，
-  见 `docs/arch/effort-per-call-type/context.md`）。
-  探索与验证均已完成（源码直读 pi / codewhale / Claude Code + DeepSeek 官方文档 + 真实实测）。
-  **根因不是「缺按类型分档」，而是更基础的一层**：
-  - DeepSeek 的思考控制是**两个字段**：`thinking: {type: enabled|disabled}`（开关）与
-    `reasoning_effort`（强度，合法值只有 `low`/`high`/`max`，其余是别名折叠）。
-    **`off` 不是合法 wire 值**（实测 422）。
-  - 本仓**全仓没有任何地方发送 `thinking`**；且 `ProviderCompat::deepseek()` **未开**
-    `supports_reasoning_effort`（`compat.rs:54-61`）⇒ 对 deepseek 根本不发强度字段。
-    ⇒ `/effort` 配 `off` 对 deepseek 是**空操作**，对 opencode-go 会**撞 422**。
-  **实测**（`deepseek-flash`，真实页面摘要任务）：
-  - `thinking=disabled`：reasoning tokens 归零、completion −53%、墙钟 −36%、质量未降；
-  - `effort` 四档之间差异落在一倍以内，短任务上 `low` 只省 5% completion 且墙钟**更慢**。
-  ⇒ **真正的杠杆是 `thinking`，不是 `effort`**。「降 effort 省钱」在本仓 provider 上基本不成立。
-  ⬜ **待办（按顺序）**：
-  1. **wire 层加 `thinking` 开关** —— 零架构改动，只动 `ChatCompletionRequest` 与
-     `ProviderCompat` 能力位，顺带修掉 `/effort off` 的「配置与行为不一致」；
-  2. **工具摘要用 `thinking=disabled`** —— 见下一条（它还兼修一个空输出缺陷）；
-  3. 按调用类型分发档位/开关 —— **到这一步才需要 arch-design**，且要解决
-     「档位冻在 model 实例、而主轮/压缩/工具摘要共用一个 `ctx.model`」这个结构障碍。
+- **推理强度的「按调用类型分档」尚未做**（2026-10-27 探明，前两刀已落地）。
+  完整探索与验证见 `docs/arch/effort-per-call-type/context.md`。
+
+  **已落地**（同日）：
+  - wire 层 `thinking: {type: enabled|disabled}` 开关 + `ProviderCompat::supports_thinking_control`
+    能力位（仅 deepseek 声明支持；GLM 明确「始终思考」不支持关闭）；
+  - 工具摘要路径显式 `thinking=disabled`（顺带堵住「思考吃光 1024 预算 ⇒ 空正文」缺陷）；
+  - `/effort off` 与 `YUSHAN_REASONING_EFFORT=off` 都落到 `thinking=disabled`
+    （修掉两个不一致：`off` 曾是 deepseek 上的空操作；该 env 的解析白名单曾漏 `off`）。
+
+  **关键认知**（推翻了原来的任务前提）：
+  - DeepSeek 的思考控制是**两个字段** —— `thinking` 是开关、`reasoning_effort` 是强度
+    （合法值只有 `low`/`high`/`max`，其余是别名折叠）。**`off` 不是合法强度值**（422）。
+  - **真正的杠杆是开关，不是强度**：实测 `thinking=disabled` 让 completion −56%、
+    墙钟 −42%、质量未降；而 `effort` 四档差异落在一倍以内，短任务上 `low` 更慢。
+  - 四家里**只有 codewhale 真按调用类型分档**（Router 限 off/low，窄类型强制）；
+    pi 与 Claude Code 的压缩都用主模型同一档 ⇒ 「压缩降档」无先例。
+
+  ⬜ **剩余待办**：按调用类型分发档位/开关（如主轮 `high`、子 agent 按任务分）。
+  **到这一步才需要 arch-design**，且要解决结构障碍：档位冻在 model 实例里，
+  而主轮 / 压缩 / 工具摘要**共用一个 `ctx.model`**（`basic.rs:244/1011`、`compact.rs:365`、
+  `summarize.rs:87`）。两条出路 —— 每类调用拿不同实例（贵：丢连接池共享），
+  或把档位从实例搬到请求（`ModelRequest` 边信道，`disable_thinking` 已是先例）。
   **明确不做**：压缩降档/关思考（pi 与 Claude Code 都不这么做，压缩结果会进会话）；
   先做 per-turn 换模型（`docs/arch/per-turn-model-switch/` Q1 未决，代价远大于此）。
-  ⚠️ 上述实测 n=1~3、单 provider，**只能作方向性判断**；落地前仍须按 `AGENTS.md`
-  跑 `e2e_bench` 取基线。
 
 - **Termux / Android 下 subagent 派发会把整个会话拖死（Android 12 phantom process killer）**：
   排查记录见 `docs/reports/2026-10-27-termux-restart-under-subagent-report.md`。

@@ -372,6 +372,19 @@ impl Config {
         })
     }
 
+    /// 用户是否**确定要求关闭思考**（`/effort off` 或配置 `off`）。
+    ///
+    /// 与 [`Config::effective_reasoning_effort`] 的分工：
+    /// 后者是「强度取值」，要经各 provider 的折叠与门控；而「`off`」在不少端点
+    /// （实测 DeepSeek）**不是合法的 `reasoning_effort` 值**（返回 422），
+    /// 必须走 `thinking: {"type": "disabled"}` 开关。
+    ///
+    /// 故本判定与 `reasoning_effort` 的派生**相互独立** ——
+    /// 即使强度字段被折叠或丢弃，关闭思考的意愿仍能传到 wire 层。
+    pub fn disable_thinking(&self) -> bool {
+        self.effective_effort_level() == Some(EffortLevel::Off)
+    }
+
     /// 模型调用重试策略（`config.json` 的 `model_retry`，ADR-0028 决策 4）。
     pub fn model_retry(&self) -> ModelRetryConfig {
         self.user_config.model_retry
@@ -523,6 +536,12 @@ impl Config {
 }
 
 /// 解析推理强度。只接受主流 OpenAI 兼容取值；非法值落诊断后由调用方回落默认 `high`。
+/// 解析并白名单校验 `YUSHAN_REASONING_EFFORT`。
+///
+/// **`off` 在白名单内**：它是 `EffortLevel::Off` 的规范拼写，语义是「关闭思考」。
+/// 它不经 `reasoning_effort` 下发（那是强度字段，`off` 在多数端点上是非法值），
+/// 而是经 `Config::disable_thinking` 落到 `thinking` 开关。
+/// 若这里不收 `off`，该变量就无法表达关闭思考 —— 而 `/effort off` 能，两者会不一致。
 fn parse_reasoning_effort(value: Option<&str>) -> Option<String> {
     let value = value?.trim().to_ascii_lowercase();
     if value.is_empty() {
@@ -530,12 +549,12 @@ fn parse_reasoning_effort(value: Option<&str>) -> Option<String> {
     }
     if matches!(
         value.as_str(),
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     ) {
         Some(value)
     } else {
         crate::logging::log(&format!(
-            "ignoring YUSHAN_REASONING_EFFORT: expected minimal|low|medium|high|xhigh|max, got {value}"
+            "ignoring YUSHAN_REASONING_EFFORT: expected off|minimal|low|medium|high|xhigh|max, got {value}"
         ));
         None
     }
@@ -788,6 +807,39 @@ mod tests {
         assert_eq!(
             Config::from_env().unwrap().reasoning_effort(),
             Some(DEFAULT_REASONING_EFFORT)
+        );
+    }
+
+    /// `disable_thinking` 只看**生效档位是否为 `off`**，与 `reasoning_effort` 的派生独立。
+    ///
+    /// 它存在的理由：`off` 在 DeepSeek 上不是合法的 `reasoning_effort` 值（422），
+    /// 必须走 `thinking` 开关。故「强度字段被折叠/丢弃」不影响本判定。
+    ///
+    /// 变异：把实现改成读 `effective_reasoning_effort() == Some("off")` ⇒ 最后一条
+    /// env 默认 `off` 的断言仍过，但把 `effort = Some(Off)` 那条改成依赖折叠就会红；
+    /// 去掉 `effective_effort_level` 的回落分支 ⇒ env 默认段落变红。
+    #[test]
+    fn disable_thinking_tracks_off_level_only() {
+        let _guard = env_lock();
+        let _env = clear_api_env();
+        let mut config = Config::from_env().unwrap();
+
+        assert!(!config.disable_thinking(), "默认 high 不得关闭思考");
+        for level in [EffortLevel::High, EffortLevel::Low, EffortLevel::Max] {
+            config.effort = Some(level);
+            assert!(!config.disable_thinking(), "{level:?} 不是 off");
+        }
+        config.effort = Some(EffortLevel::Off);
+        assert!(config.disable_thinking(), "会话覆盖 off ⇒ 关闭思考");
+
+        // 配置层（env）默认也能表达 off，不依赖会话覆盖。
+        config.effort = None;
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", "off") };
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.disable_thinking(),
+            "env 默认 off 也应关闭思考（与 /effort off 同义）"
         );
     }
 

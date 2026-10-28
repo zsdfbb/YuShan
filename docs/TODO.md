@@ -153,10 +153,33 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
     pi 与 Claude Code 的压缩都用主模型同一档 ⇒ 「压缩降档」无先例。
 
   ⬜ **剩余待办**：按调用类型分发档位/开关（如主轮 `high`、子 agent 按任务分）。
-  **到这一步才需要 arch-design**，且要解决结构障碍：档位冻在 model 实例里，
-  而主轮 / 压缩 / 工具摘要**共用一个 `ctx.model`**（`basic.rs:244/1011`、`compact.rs:365`、
-  `summarize.rs:100`）。两条出路 —— 每类调用拿不同实例（贵：丢连接池共享），
-  或把档位从实例搬到请求（`ModelRequest` 边信道，`disable_thinking` 已是先例）。
+  **设计已出**（2026-10-28）⇒ [`docs/adr/0060-thinking-policy-per-call-kind.md`](adr/0060-thinking-policy-per-call-kind.md)
+  与 [`effort-per-call-type/design.md`](arch/effort-per-call-type/design.md)：
+  - 结论：**买类型形状，不买映射表** —— `disable_thinking: Option<bool>` 泛化为
+    `thinking: Option<ThinkingOverride>`，三个调用面各自设值；**不建 `CallKind` + `BTreeMap` 策略表**
+    （当前 4 槽位 3 个恒 `None`，间接层不产生行为差异）。
+  - 主轮开关进 `RunLimits.main_disable_thinking`，**默认 `None`**（承重默认，老调用方逐字节不变）。
+  - ⚠️ **收益口径已修正**：reasoning token **从不进会话历史**
+    （`lib.rs:1137` 只装 `text`/`tool_calls`；`ContentBlock` 无思考变体），
+    但输出单价是缓存命中的 **200 倍**（4 元 vs 0.02 元/百万）⇒ 必须按**金额**算。
+    **完整成本分析（口径、数据源、两次被推翻的估算）见
+    [`arch/effort-per-call-type/cost-analysis.md`](arch/effort-per-call-type/cost-analysis.md)**，
+    数据由 `python3 scripts/cost-audit.py` 零成本复现（DeepSeek、闲置价）：
+    缓存命中 35.7% / 未命中 29.8% / **reasoning 18.3%** / **工具参数 15.5%** / 可见正文 **1.8%**。
+    ⇒ 关思考可省 **18.3%**；削减叙述只值 **1.8%**（**不值得**为此改提示词或破缓存前缀）；
+    工具调用参数是被忽略的第二项。
+  - ✅ **P1 已落地**（2026-10-28）：`ProviderCompat::opencode_go()` 置 `supports_thinking_control`。
+    网关实测该字段被接受且生效（需推理任务 reasoning **430→0**）；真实 agent 链路核实
+    `/effort off` ⇒ reasoning 0，**不配时仍照旧思考 ⇒ 默认行为未变**。
+    三处变异（删能力位 / 无条件发 / 去门控）均被抓。
+  - ⚠️ 也**不采纳**「按轮序号衰减」（`Steer` 后误关，且无法表达「子 agent 起手就关」）。
+  ⬜ **仍待实跑**：`fact/1` A/B（n≥3）决定主轮默认值；基线跨 64.4–201.4 s ⇒ 中位差 <20% 记为不可判。
+  **测试分层**（便宜的先跑）：L0 `scripts/cost-audit.py` 零成本 → L1 `daily/2` 冒烟（约 1 分钟）
+  → L2 才上 `fact/1`。
+  结构障碍仍在：**强度**档位冻在 model 实例里，而主轮 / 压缩 / 工具摘要**共用一个 `ctx.model`**
+  （`basic.rs:244/1011`、`compact.rs:365`、`summarize.rs:100`）。两条出路 —— 每类调用拿不同实例
+  （贵：丢连接池共享），或把档位从实例搬到请求（`ModelRequest` 边信道）。
+  **开关**这一维已由 ADR-0060 走边信道解决；**强度**仍冻在实例（本次不改）。
   **明确不做**：压缩降档/关思考（pi 与 Claude Code 都不这么做，压缩结果会进会话）；
   先做 per-turn 换模型（`docs/arch/per-turn-model-switch/` Q1 未决，代价远大于此）。
 

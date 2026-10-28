@@ -2041,6 +2041,40 @@ mod tests {
         assert!(json.get("thinking").is_none(), "json = {json}");
     }
 
+    /// **能力位置位 ≠ 发送**：opencode-go 上默认请求体逐字节不变。
+    ///
+    /// 这是 P1 最关键的行为保证 —— 置位后若不配 `/effort off`，那些经网关的会话
+    /// **不得**开始收到一个它们以前没见过的字段。两者取或再门控，但两源默认都是「不干预」。
+    ///
+    /// 变异：把 `thinking` 的 `.then_some(...)` 改成无条件构造 ⇒ 本用例第一条变红；
+    /// 把 `config.disable_thinking || request.disable_thinking == Some(false)` 改成
+    /// 只看 `request` ⇒ 第二条变红。
+    #[test]
+    fn enabling_opencode_go_does_not_change_the_default_request_body() {
+        let config = config_with(ProviderCompat::opencode_go());
+        assert!(
+            config.compat.supports_thinking_control,
+            "前置：能力位已开启"
+        );
+        assert!(!config.disable_thinking, "前置：默认不要求关思考");
+
+        let request = ModelRequest::default();
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert!(
+            json.get("thinking").is_none(),
+            "能力位开启但未要求关思考时，不得发出 thinking；json = {json}"
+        );
+
+        // 配了 `off` 之后才落地。
+        let mut off = config_with(ProviderCompat::opencode_go());
+        off.disable_thinking = true;
+        let json = serde_json::to_value(translate_request(&request, &off).unwrap()).unwrap();
+        assert_eq!(
+            json["thinking"]["type"], "disabled",
+            "`/effort off` 必须能在网关方言上落地；json = {json}"
+        );
+    }
+
     /// 构造一个仅 compat 不同的最小 config。
     fn config_with(compat: ProviderCompat) -> OpenAICompatibleConfig {
         OpenAICompatibleConfig {

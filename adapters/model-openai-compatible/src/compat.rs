@@ -91,10 +91,23 @@ impl ProviderCompat {
     /// 网关实测接受顶层 `reasoning_effort`，故显式声明支持。
     /// `supports_stream_usage` 保持开启：网关放行 `stream_options.include_usage`；
     /// 若将来拒绝，适配器的「剥参数一次性回退」仍能兜住。
+    ///
+    /// **思考开关**：本仓的第一优选模型 `deepseek-*` 经本网关接入，而它是否真能
+    /// 关闭思考一度无人知道。实测（各 n=3）：短问答带
+    /// `thinking:{"type":"disabled"}` 时 `reasoning_tokens` **0 / 0 / 0**、
+    /// 不发送时 49 / 54 / 42；需推理任务（「说出 3 个 Rust 所有权规则」）为
+    /// **0 / 0 / 0** 对 **229 / 98 / 103**（合计 430）。
+    /// ⇒ **字段不被拒且开关真的生效**，故置位。
+    ///
+    /// ⚠️ 置位**不等于**发送：请求体里是否带 `thinking` 仍由 `config.disable_thinking`
+    /// 与 `request.disable_thinking` 共同决定（两者默认都是「不干预」）⇒
+    /// **不配 `/effort off` 时请求体逐字节不变**。
+    /// 同网关的 `minimax-*` 是否接受该字段**未测** ⇒ 本能力位不得据此扩散到别的方言。
     pub fn opencode_go() -> Self {
         Self {
             has_reasoning_content: true,
             supports_reasoning_effort: true,
+            supports_thinking_control: true,
             ..Default::default()
         }
     }
@@ -351,6 +364,36 @@ mod tests {
         assert!(compat.supports_stream_usage);
         assert!(compat.supports_reasoning_effort);
         assert!(!compat.tool_calls_as_text);
+    }
+
+    /// opencode go 声明**思考开关**能力位（第一优选模型 `deepseek-*` 经它接入）。
+    ///
+    /// 实测依据（直打网关，各 n=3）：短问答 `thinking:{type:disabled}` ⇒
+    /// `reasoning_tokens` 0/0/0 vs 不发送 49/54/42；需推理任务 0/0/0 vs 229/98/103。
+    /// 见 `docs/arch/effort-per-call-type/cost-analysis.md` §6。
+    ///
+    /// **反向断言同样承重**：不能因为「一家能用」就把它扩散到别的方言 ——
+    /// GLM 明确「始终思考」，standard / minimax 未测。
+    ///
+    /// 变异：把 `supports_thinking_control: true` 从 `opencode_go()` 删掉 ⇒ 第一条变红。
+    #[test]
+    fn opencode_go_and_deepseek_are_the_only_thinking_control_vendors() {
+        assert!(ProviderCompat::opencode_go().supports_thinking_control);
+        assert!(ProviderCompat::deepseek().supports_thinking_control);
+
+        // 不向后扩散：这些方言没有证据。
+        for compat in [
+            ProviderCompat::standard(),
+            ProviderCompat::default(),
+            ProviderCompat::glm(),
+            ProviderCompat::mimo(),
+            ProviderCompat::minimax(),
+        ] {
+            assert!(
+                !compat.supports_thinking_control,
+                "未实测的方言不得声明思考开关能力位"
+            );
+        }
     }
 
     /// 只有明确声明支持的 provider 才允许发送 `reasoning_effort`。

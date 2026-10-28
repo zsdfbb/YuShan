@@ -191,6 +191,18 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   上，只为后台 `bash` 一个生产用例服务。**触发重开的条件**：出现**第二个**后台任务类型
   （MCP 长任务、后台 LSP、后台 subagent 的另一种形态）⇒ 那时把这三块抽成
   `ys-protocol` 的 `DeferredSink`（候选 B 的 §2.2）。不抽的代价：那 30 行会被复制第二遍。
+- **TUI 渲染有两份独立失效键 —— 已出过一次真 bug，建议合并**（2026-10-28）：
+  `RenderCache`（`crates/ys-tui-coding/src/cache.rs`）按 `(槽, src.len(), width)` 缓存 md 产物、
+  且对「增长中」的条目**有意节流**（100ms 内沿用旧产物）；`TranscriptLayout`
+  （`crates/ys-tui-coding/src/layout.rs`）另按 `entry_sig`（assistant 只哈希 `s.len()`）决定要不要重渲染。
+  两者叠加时「源已更新 + 产物滞后」会被第二份键误判成「已是最新」⇒ 该条**永久停在半句话**。
+  已修（`cc26be3`：`lines_for` 返回 `stale`，滞后时写 `STALE_SIG` 哨兵），但**根因是两份键**。
+  ⬜ **建议**：让 `TranscriptLayout` 完全依赖 `RenderCache` 的命中判定，删掉 `entry_sig`
+  —— 否则两份键迟早再次漂移（下次可能不再是「能看出来」的形态）。
+  诊断与排除过程见 `docs/reports/2026-10-28-tui-stream-tail-diagnosis.md` §6。
+  改动面：`layout.rs` 的 memo 结构 + `cache.rs` 暴露一个「这一槽位是否最新」的查询，
+  生产路径只有 `draw.rs` 一处调用 ⇒ 不涉及对外契约。
+
 - **`kill_group` 仍是同步 fork**：已从锁内挪到锁外（ADR 同上），但仍是
   `Command::new("sh")...status()` 的同步等待。`proc_group::kill_group_async:40` 已存在，
   要彻底解决需把 `sweep` / `snapshot` 的签名改异步。

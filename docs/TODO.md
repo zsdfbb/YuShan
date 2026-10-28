@@ -155,7 +155,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   ⬜ **剩余待办**：按调用类型分发档位/开关（如主轮 `high`、子 agent 按任务分）。
   **到这一步才需要 arch-design**，且要解决结构障碍：档位冻在 model 实例里，
   而主轮 / 压缩 / 工具摘要**共用一个 `ctx.model`**（`basic.rs:244/1011`、`compact.rs:365`、
-  `summarize.rs:87`）。两条出路 —— 每类调用拿不同实例（贵：丢连接池共享），
+  `summarize.rs:100`）。两条出路 —— 每类调用拿不同实例（贵：丢连接池共享），
   或把档位从实例搬到请求（`ModelRequest` 边信道，`disable_thinking` 已是先例）。
   **明确不做**：压缩降档/关思考（pi 与 Claude Code 都不这么做，压缩结果会进会话）；
   先做 per-turn 换模型（`docs/arch/per-turn-model-switch/` Q1 未决，代价远大于此）。

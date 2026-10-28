@@ -71,7 +71,7 @@ Config::effective_reasoning_effort()          // 会话覆盖优先，否则配�
 |---|---|---|
 | `crates/ys-loop/src/basic.rs:634` | 主循环的模型轮 | 全局值 |
 | `crates/ys-loop/src/compact.rs:365` | 上下文压缩的摘要 | 全局值（**同一个 `ctx.model` 实例**） |
-| `crates/ys-loop/src/summarize.rs:87` | 工具侧摘要（webfetch / subagent） | 全局值（**同一个 `ctx.model` 实例**） |
+| `crates/ys-loop/src/summarize.rs:100` | 工具侧摘要（webfetch / subagent） | 全局值（**同一个 `ctx.model` 实例**） |
 
 后两处与主轮**共用同一个 `Arc<dyn Model>`**（`basic.rs:1011` 的 `ModelSummarizer { model: ctx.model }`、
 `basic.rs:244` 把 `ctx.model` 传给 `compact::execute`）。这正是「进程级档位」的结构根源：

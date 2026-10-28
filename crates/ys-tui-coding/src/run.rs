@@ -73,28 +73,70 @@ fn poll_interval(dragging_with_edge: bool) -> Duration {
     }
 }
 
-/// 把一批连续到达的鼠标事件合并成**最后一个**，并把碰到的首个非鼠标事件**推迟**返回。
+/// 一批连续到达的鼠标事件：**滚轮事件全留**（折叠成净量），其余只留**最后一个**；
+/// 碰到的首个非鼠标事件**推迟**返回。
 ///
-/// 触控板一次滑动会爆发 8–30 个事件，逐个走一遍 `draw`（每次约 150 µs）就是可见的卡顿
-/// （设计 §2.5）。合并不丢事件：非鼠标事件一律原样返回，由调用方在本轮消费。
+/// 触控板一次滑动会爆发 8–30 个事件（ADR-0050 决策 2）⇒ 分两种处理：
 ///
-/// 返回 `(最后一个鼠标事件, 被推迟的非鼠标事件)`。
+/// - **滚轮**：全部**保留**并折叠成**净滚动量**（[`events::fold_wheel`]）。
+///   只取最后一个会让「一次滑动」只滚一行 —— 与 ADR-0050 决策 2 的
+///   「按行累加才跟手」相反。批内只施加一次净位移（一次 `layout.sync`），
+///   位移与逐事件累加等价（夹取单调）。
+/// - **拖选 / 点击**：只留**最后一个**。这些事件的**坐标**是承重的
+///   （选区端点取自最后那个坐标），中间态没有意义；且逐个走一遍 `draw`
+///   （每次约 150 µs）就是可见的卡顿（ADR-0051 设计 §2.5）。
+///
+/// 合并不丢事件：非鼠标事件一律原样返回，由调用方在本轮消费。
+///
+/// **滚轮批有上限**（[`MAX_WHEEL_BATCH`]）：排空循环只在 `next()` 返回 `None` 时
+/// 结束，若事件源永不枯竭（缺陷的测试闭包、卡住的终端），`wheel` 会无界增长。
+/// 到上限即**停止继续读** —— 剩余事件仍留在终端队列里，下一轮循环自然消费；
+/// 批语义不变，只是把一批拆成几轮（真实突发只有 8–30 个，远达不到上限）。
+///
+/// 返回 `(滚轮事件批次, 最后一个非滚轮鼠标事件, 被推迟的非鼠标事件)`。
 fn coalesce(
     first: Event,
-    mut next: impl FnMut() -> Option<Event>,
-) -> (Option<Event>, Option<Event>) {
-    let mut mouse = match first {
-        Event::Mouse(_) => Some(first),
-        other => return (None, Some(other)),
-    };
-    while let Some(event) = next() {
+    next: impl FnMut() -> Option<Event>,
+) -> (Vec<Event>, Option<Event>, Option<Event>) {
+    let mut wheel: Vec<Event> = Vec::new();
+    let mut other_mouse: Option<Event> = None;
+    let mut deferred: Option<Event> = None;
+
+    let events = std::iter::once(first).chain(std::iter::from_fn(next));
+    for event in events {
         match event {
-            Event::Mouse(_) => mouse = Some(event),
+            Event::Mouse(m) if is_wheel(m.kind) => {
+                wheel.push(Event::Mouse(m));
+                if wheel.len() >= MAX_WHEEL_BATCH {
+                    break;
+                }
+            }
+            Event::Mouse(_) => other_mouse = Some(event),
             // 遇到非鼠标事件就停：**不 read 丢掉**，原样交给调用方。
-            other => return (mouse, Some(other)),
+            other => {
+                deferred = Some(other);
+                break;
+            }
         }
     }
-    (mouse, None)
+    (wheel, other_mouse, deferred)
+}
+
+/// 单批滚轮事件的上限 —— 内存护栏，不是业务参数。
+///
+/// 真实突发是 8–30 个（ADR-0050 决策 2），取 4096 留出两个数量级的余量；
+/// 它唯一的职责是让「排空循环」在任何 `next()` 实现下都**有界**，
+/// 否则一个永不结束的事件源就能把 `Vec` 吃到 OOM。
+const MAX_WHEEL_BATCH: usize = 4096;
+
+/// 该鼠标事件是不是**滚轮**（上下）。
+///
+/// 只有滚轮需要**批内累加**；水平滚动没有语义（对话是单列竖排），不进批次。
+fn is_wheel(kind: crossterm::event::MouseEventKind) -> bool {
+    matches!(
+        kind,
+        crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown
+    )
 }
 
 /// TUI 初始化 / 渲染过程中的 IO 失败。
@@ -212,6 +254,7 @@ fn setup_terminal() -> Result<Term, TuiError> {
 #[allow(clippy::too_many_arguments)]
 fn handle_round(
     app: &mut App,
+    wheel: &[Event],
     mouse: Option<Event>,
     deferred: Option<Event>,
     requests: &Sender<Request>,
@@ -221,6 +264,20 @@ fn handle_round(
     clip: &mut impl FnMut(&str),
     read: &mut impl FnMut() -> Option<String>,
 ) {
+    // **滚轮批先处理**：它是唯一需要「批内累加」的事件（ADR-0050 决策 2）。
+    // 批内只施加一次净位移 ⇒ 一次 `layout.sync`，位移与逐事件累加等价。
+    if !wheel.is_empty() {
+        let delta = events::fold_wheel(
+            &wheel
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Mouse(m) => Some(*m),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        events::scroll_wheel_batch(app, width, height, delta);
+    }
     if let Some(m) = mouse {
         events::handle_event(m, app, requests, boundaries, width, height);
     }
@@ -284,8 +341,8 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
         let poll = poll_interval(app.selection.is_dragging() && app.selection.edge() != 0);
         if crossterm::event::poll(poll)? {
             let first = crossterm::event::read()?;
-            // 触控板会爆发一串事件：只应用最后一个鼠标事件，非鼠标事件推到后面。
-            let (mouse, deferred) = coalesce(first, || {
+            // 触控板会爆发一串事件：滚轮**全留**（折叠成净量），其余只留最后一个。
+            let (wheel, mouse, deferred) = coalesce(first, || {
                 if !crossterm::event::poll(Duration::ZERO).ok()? {
                     return None;
                 }
@@ -293,6 +350,7 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             });
             handle_round(
                 app,
+                &wheel,
                 mouse,
                 deferred,
                 requests,
@@ -1261,7 +1319,144 @@ fn theme_index(kind: ThemeKind) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{MouseButton, MouseEventKind};
     use tokio::sync::mpsc;
+
+    // -----------------------------------------------------------------------
+    // 鼠标批次合并：滚轮全留，其余只留最后一个
+    // -----------------------------------------------------------------------
+
+    fn mouse_event(kind: MouseEventKind) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// **滚轮事件全保留**（回归：曾只留最后一个 ⇒ 一次滑动只滚 1 行）。
+    ///
+    /// 触控板一次滑动爆发 8–30 个滚轮事件；ADR-0050 决策 2 要求「按行累加才跟手」。
+    ///
+    /// 变异：把 `coalesce` 的滚轮分支改成「只留最后一个」（`other_mouse = Some(..)`）
+    /// ⇒ 本用例红。
+    #[test]
+    fn test_coalesce_keeps_all_wheel_events() {
+        let first = mouse_event(MouseEventKind::ScrollUp);
+        // **迭代器必须建在闭包外**：建在闭包内等于每次 `next()` 都从头再来，
+        // 于是永远有下一个事件 ⇒ `coalesce` 的排空循环永不结束，`wheel` 无界增长
+        // （实测 ~170 MB/s，一分钟吃满 10 GB）。模拟「事件流会结束」是这条用例的前提。
+        let mut rest = vec![
+            mouse_event(MouseEventKind::ScrollUp),
+            mouse_event(MouseEventKind::ScrollUp),
+            mouse_event(MouseEventKind::ScrollUp),
+        ]
+        .into_iter();
+        let (wheel, other, deferred) = coalesce(first, || rest.next());
+        assert_eq!(wheel.len(), 4, "4 个滚轮事件全要保留");
+        assert!(other.is_none(), "无其它鼠标事件");
+        assert!(deferred.is_none(), "无非鼠标事件");
+    }
+
+    /// **滚轮批有上界**：事件源给 1 万个滚轮事件，`coalesce` 到 [`MAX_WHEEL_BATCH`]
+    /// 就停读，剩余事件留给下一轮。
+    ///
+    /// 这是内存护栏的回归：排空循环只认 `next() == None` 作终点，没有上限时
+    /// 一个永不枯竭的事件源会让 `wheel` 无界增长（实测 ~170 MB/s 直到 OOM）。
+    ///
+    /// 变异：删掉 `coalesce` 里到上限的 `break` ⇒ `wheel.len()` 变成 10000，本用例红。
+    #[test]
+    fn test_coalesce_wheel_batch_is_bounded() {
+        let mut calls = 0usize;
+        let mut rest =
+            std::iter::repeat_with(|| mouse_event(MouseEventKind::ScrollUp)).take(10_000);
+        let (wheel, other, deferred) = coalesce(mouse_event(MouseEventKind::ScrollUp), || {
+            calls += 1;
+            rest.next()
+        });
+        assert_eq!(wheel.len(), MAX_WHEEL_BATCH, "批大小必须被上限夹住");
+        assert_eq!(
+            calls,
+            MAX_WHEEL_BATCH - 1,
+            "到上限即停止读取（首个事件来自 first，其余来自 next）"
+        );
+        assert!(other.is_none());
+        assert!(deferred.is_none());
+    }
+
+    /// **拖选类事件只留最后一个**（坐标是承重的：选区端点取自最后那个坐标）。
+    ///
+    /// 变异：把 `coalesce` 的非滚轮分支改成「也全留」⇒ 本用例红。
+    #[test]
+    fn test_coalesce_keeps_only_last_drag_event() {
+        let first = mouse_event(MouseEventKind::Down(MouseButton::Left));
+        let mut queue = vec![mouse_event(MouseEventKind::Drag(MouseButton::Left))].into_iter();
+        let (wheel, other, deferred) = coalesce(first, || queue.next());
+        assert!(wheel.is_empty(), "拖选不是滚轮");
+        assert_eq!(other.map(|e| matches!(e, Event::Mouse(m) if m.kind == MouseEventKind::Drag(MouseButton::Left))), Some(true), "留最后一个 Drag");
+        assert!(deferred.is_none());
+    }
+
+    /// **非鼠标事件原样推迟返回**（不丢）。
+    ///
+    /// 变异：把 `coalesce` 里非鼠标事件的分支改成 `continue`（丢掉）⇒ 本用例红。
+    #[test]
+    fn test_coalesce_defers_first_non_mouse_event() {
+        let key = Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ));
+        let mut pending = Some(key);
+        let (wheel, other, deferred) =
+            coalesce(mouse_event(MouseEventKind::ScrollUp), || pending.take());
+        assert_eq!(wheel.len(), 1, "滚轮仍保留");
+        assert!(other.is_none());
+        assert!(deferred.is_some(), "非鼠标事件必须推迟返回，不得丢");
+    }
+
+    /// **整条接线：一批滚轮事件 ⇒ 一次滑动滚多行**（用户侧「滑动很慢」的回归）。
+    ///
+    /// 缺陷所在正是接缝：`coalesce` 只留最后一个，下游再怎么累加也只有 1 行。
+    /// 故这里把 `coalesce` → `fold_wheel` → `scroll_wheel_batch` 串起来跑一遍，
+    /// 而不是只测其中一段。
+    ///
+    /// 变异：
+    /// - `coalesce` 的滚轮分支改回「只留最后一个」⇒ 只滚 1 行，红；
+    /// - `handle_round` 丢掉 `wheel` 参数 ⇒ 停在 0，红。
+    #[test]
+    fn test_handle_round_scrolls_many_rows_per_wheel_burst() {
+        let (req_tx, _req_rx) = mpsc::channel(8);
+        let (bnd_tx, _bnd_rx) = mpsc::channel(8);
+        let mut app = App::new(CodingView::for_test());
+        for i in 0..80 {
+            app.transcript
+                .push(TranscriptLine::User(format!("msg-{i}")));
+        }
+
+        // 触控板一次滑动：12 个同向滚轮事件。
+        let mut rest = (0..11)
+            .map(|_| mouse_event(MouseEventKind::ScrollUp))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let (wheel, mouse, deferred) =
+            coalesce(mouse_event(MouseEventKind::ScrollUp), || rest.next());
+        handle_round(
+            &mut app,
+            &wheel,
+            mouse,
+            deferred,
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |_: &str| {},
+            &mut || None,
+        );
+
+        assert_eq!(app.scroll_offset, 12, "一次滑动滚 12 行，不得只滚 1 行");
+        assert!(!app.follow, "向上滚即脱离跟随");
+    }
 
     // -----------------------------------------------------------------------
     // `/copy` 的载荷：OSC 52 剪贴板序列（含内联 base64）
@@ -1297,6 +1492,7 @@ mod tests {
         let mut written: Vec<String> = Vec::new();
         handle_round(
             &mut app,
+            &[],
             None,
             Some(key),
             &req_tx,
@@ -1323,6 +1519,7 @@ mod tests {
         let mut calls = 0;
         handle_round(
             &mut app,
+            &[],
             None,
             None,
             &req_tx,
@@ -1351,6 +1548,7 @@ mod tests {
         let mut written: Vec<String> = Vec::new();
         handle_round(
             &mut app,
+            &[],
             None,
             Some(key),
             &req_tx,
@@ -1368,6 +1566,7 @@ mod tests {
         app.pending_paste = true;
         handle_round(
             &mut app,
+            &[],
             None,
             None,
             &req_tx,
@@ -1395,6 +1594,7 @@ mod tests {
         let read_saw_write = Cell::new(false);
         handle_round(
             &mut app,
+            &[],
             None,
             None,
             &req_tx,
@@ -1412,6 +1612,7 @@ mod tests {
         app.pending_clipboard = Some("刚复制的".to_string());
         handle_round(
             &mut app,
+            &[],
             None,
             None,
             &req_tx,

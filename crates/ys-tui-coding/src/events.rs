@@ -186,6 +186,68 @@ pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
     }
 }
 
+/// 一批滚轮事件折叠成的**净滚动量**（视觉行）。
+///
+/// 触控板一次滑动会爆发 8–30 个 `ScrollUp` / `ScrollDown`（ADR-0050 决策 2：
+/// 「触控板一次滑动会被终端合批成多个事件；按行累加才跟手」）。故批内**不能**
+/// 只取最后一个（那样一次滑动只滚一行），而是**同向累加**。
+///
+/// `ScrollUp` 为正、`ScrollDown` 为负；两者抵消后即为净位移。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WheelDelta {
+    /// 净向上滚动的行数（正）。
+    pub up: usize,
+    /// 净向下滚动的行数（正）。
+    pub down: usize,
+}
+
+impl WheelDelta {
+    /// 记一次滚轮事件的方向。
+    pub fn push(&mut self, up: bool) {
+        if up {
+            self.up = self.up.saturating_add(1);
+        } else {
+            self.down = self.down.saturating_add(1);
+        }
+    }
+
+    /// 净滚动量（视觉行）：正 = 向上（远离底部），负 = 向下（回到贴底）。
+    ///
+    /// 同向抵消后取净值 —— 一次滑动里方向来回抖（触控板常见）时，
+    /// 净位移才是用户真正想要的位移。
+    pub fn net(self) -> isize {
+        self.up as isize - self.down as isize
+    }
+
+    /// 是否**没有任何**滚动。
+    pub fn is_empty(self) -> bool {
+        self.up == 0 && self.down == 0
+    }
+}
+
+/// 把一批滚轮事件折叠成一个**净滚动量**。
+///
+/// 批内的滚轮事件**只累加方向**（不带坐标）—— 滚轮与选区无关（坐标无意义）。
+///
+/// **`⇧` 按住的事件不计入**：`⇧` 是「让回终端原生选择」的开关
+/// （[`handle_mouse`] 里逐事件判定），按住时滚轮不得改变视窗。
+///
+/// 变异：把「同向累加」改成「只取最后一个」⇒ 一次滑动只滚一行的用例红。
+pub fn fold_wheel(events: &[MouseEvent]) -> WheelDelta {
+    let mut delta = WheelDelta::default();
+    for m in events {
+        if m.modifiers.contains(KeyModifiers::SHIFT) {
+            continue;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp => delta.push(true),
+            MouseEventKind::ScrollDown => delta.push(false),
+            _ => {}
+        }
+    }
+    delta
+}
+
 /// 用户**主动**滚动的入口：先清选区，再滚。
 ///
 /// 与 [`scroll`] 的分工是承重的：`selection::drag_tick`（拖到边缘的自动滚动）也调
@@ -193,6 +255,26 @@ pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
 fn scroll_clearing_selection(app: &mut App, width: u16, height: u16, delta: isize) {
     app.selection.clear();
     scroll(app, width, height, delta);
+}
+
+/// 一批滚轮事件的滚动入口：先清选区，再按**净量**滚一次。
+///
+/// **为什么批内只滚一次**：`scroll` 内部要 `compute_max_scroll` ⇒ 走
+/// `layout.sync`（O(条目数)）。批内逐事件调 `scroll` 就是 8–30 次全量同步，
+/// 正是批次合并当初要避开的成本。净量一次性施加 ⇒ **一次同步**，且位移与
+/// 逐事件累加**完全等价**（夹取是单调的）。
+///
+/// 净量为 0（方向来回抵消）⇒ **不动视窗**（但选区仍要清：用户主动滚动了）。
+pub(crate) fn scroll_wheel_batch(app: &mut App, width: u16, height: u16, delta: WheelDelta) {
+    app.selection.clear();
+    if delta.is_empty() {
+        return;
+    }
+    let net = delta.net();
+    if net == 0 {
+        return;
+    }
+    scroll(app, width, height, net);
 }
 
 /// 左键按下：在内区内那么建选区，在内区外则不开始。
@@ -2069,6 +2151,78 @@ mod tests {
         assert_eq!(a.scroll_offset, 0, "向下滑回到最新");
         assert!(a.follow, "回到底部即恢复跟随");
         assert!(a.input.text.is_empty(), "全程不碰输入框");
+    }
+
+    /// **一次触控板滑动 = 滚多行**（回归：批次合并曾把一批滚轮事件只留最后一个）。
+    ///
+    /// 触控板一次滑动会爆发 8–30 个 `ScrollUp`（ADR-0050 决策 2 明文：「触控板一次
+    /// 滑动会被终端合批成多个事件；**按行累加才跟手**，按页会飞过头」）。
+    ///
+    /// **本用例守的就是这条**：批内只取最后一个 ⇒ 一次滑动只滚 1 行 ⇒ 看起来「很慢」。
+    /// 这正是批次合并（ADR-0051 设计 §2.5）引入的副作用。
+    ///
+    /// 变异：
+    /// - 把 `fold_wheel` 改成「只取最后一个」⇒ 本用例红；
+    /// - 把 `scroll_wheel_batch` 改成不累加（恒 1 行）⇒ 本用例红。
+    #[test]
+    fn test_wheel_batch_accumulates_one_swipe_many_rows() {
+        let mut a = app_scrollable();
+        assert_eq!(a.scroll_offset, 0);
+
+        // 一次滑动爆发 12 个 ScrollUp。
+        let batch: Vec<MouseEvent> = (0..12)
+            .map(|_| mouse(MouseEventKind::ScrollUp, 10, 5))
+            .collect();
+        let delta = fold_wheel(&batch);
+        assert_eq!(delta.up, 12, "批内 12 个向上事件全都要计入");
+        assert_eq!(delta.net(), 12, "净量 = 12 行");
+
+        scroll_wheel_batch(&mut a, 120, 40, delta);
+        assert_eq!(a.scroll_offset, 12, "一次滑动滚 12 行，不得只滚 1 行");
+        assert!(!a.follow, "向上滚即脱离跟随");
+    }
+
+    /// **方向来回抵消 ⇒ 净量为 0 ⇒ 视窗不动**（触控板抖动不该让画面跳）。
+    ///
+    /// 变异：把 `net()` 改成「只看最后一个方向」⇒ 本用例红。
+    #[test]
+    fn test_wheel_batch_cancels_opposite_directions() {
+        let mut a = app_scrollable();
+
+        let batch: Vec<MouseEvent> = vec![
+            mouse(MouseEventKind::ScrollUp, 10, 5),
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            mouse(MouseEventKind::ScrollUp, 10, 5),
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+        ];
+        let delta = fold_wheel(&batch);
+        assert_eq!(delta.net(), 0, "两上两下 ⇒ 净量 0");
+
+        scroll_wheel_batch(&mut a, 120, 40, delta);
+        assert_eq!(a.scroll_offset, 0, "净量 0 ⇒ 视窗不动");
+        assert!(a.follow, "净量 0 ⇒ 仍贴底跟随");
+    }
+
+    /// **`⇧` 按住的滚轮不计入**（`⇧` = 让回终端原生选择，ADR-0051 决策 1）。
+    ///
+    /// 变异：把 `fold_wheel` 里的 `⇧` 过滤删掉 ⇒ 本用例红。
+    #[test]
+    fn test_wheel_batch_ignores_shift_held_events() {
+        let mut a = app_scrollable();
+
+        let shifted = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        let batch = vec![shifted; 5];
+        let delta = fold_wheel(&batch);
+        assert!(delta.is_empty(), "`⇧` 按住的事件不计入");
+        assert_eq!(delta.net(), 0);
+
+        scroll_wheel_batch(&mut a, 120, 40, delta);
+        assert_eq!(a.scroll_offset, 0, "`⇧`+滚轮不得改变视窗");
     }
 
     /// 水平滚动 / 按键 / 悬停 / 拖动一律**不动视窗**（不绑点击才能保留终端原生拖选）。

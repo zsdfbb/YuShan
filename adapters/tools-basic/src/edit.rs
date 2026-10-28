@@ -16,8 +16,11 @@ impl EditTool {
     }
 }
 
-/// 为模糊匹配规范化文本：NFKC + 智能引号 + 破折号 + 去空格
-fn fuzzy_normalize(s: &str) -> String {
+/// 为模糊匹配规范化文本的**单字符层**：NFKC + 智能引号 + 破折号 + 不间断空格 + 零宽字符。
+///
+/// 不做 `trim`、不折叠换行 —— 逐字符推进时依赖这一点：否则正文里的空格在累积时会丢掉，
+/// 含空白的 `oldText` 永远命中不了。
+fn normalize_chars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for ch in s.nfkc() {
         match ch {
@@ -33,7 +36,18 @@ fn fuzzy_normalize(s: &str) -> String {
             _ => result.push(ch),
         }
     }
-    result.trim().to_string()
+    result
+}
+
+/// 模糊比较的规范形：单字符规范化 + 行尾折叠（`\r\n` / `\r` → `\n`）+ `trim`。
+///
+/// 折叠与 `trim` 都会**改变文本长度**，因此只可用于比较，不可用于定位区间。
+fn fuzzy_normalize(s: &str) -> String {
+    normalize_chars(s)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string()
 }
 
 /// 检测换行风格：CRLF 占主导时返回 true
@@ -101,22 +115,6 @@ fn parse_edits(input: &Value) -> Result<Vec<(String, String)>, ToolError> {
     Ok(edits)
 }
 
-/// 尝试在 content 中查找 old_text：先精确匹配，再模糊匹配。
-/// 返回 (byte_offset, was_fuzzy) 或 None。
-fn find_match(content: &str, old_text: &str) -> Option<(usize, bool)> {
-    // 先精确匹配
-    if let Some(idx) = content.find(old_text) {
-        return Some((idx, false));
-    }
-
-    // 模糊匹配 —— 逐字符搜索
-    if let Some(idx) = find_match_fuzzy(content, old_text) {
-        return Some((idx, true));
-    }
-
-    None
-}
-
 #[async_trait::async_trait]
 impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
@@ -178,21 +176,35 @@ impl Tool for EditTool {
         // 在原始内容上应用所有 edits（非增量匹配）
         let mut result = content.to_string();
         let mut replaced_count = 0u32;
+        let mut fuzzy_ranges = Vec::new();
 
         for (old_text, new_text) in &edits {
-            // 替换前统计出现次数，确保唯一性
+            // 替换前统计层数，确保唯一性
             let count = result.matches(old_text.as_str()).count();
 
             if count == 0 {
-                // 尝试模糊匹配
-                if let Some((_offset, _was_fuzzy)) = find_match(content, old_text) {
-                    // 模糊匹配时，在当前 result 中重新查找
-                    if let Some(fuzzy_offset) = find_match_fuzzy(&result, old_text) {
-                        let end = fuzzy_offset + old_text.len();
-                        result.replace_range(fuzzy_offset..end, new_text);
+                // 精确匹配零命中，退到归一化匹配
+                let hits = fuzzy_find_all(&result, old_text);
+                for (offset, len) in hits.iter() {
+                    fuzzy_ranges.push(result[*offset..*offset + *len].to_string());
+                }
+                match hits.as_slice() {
+                    // 多处模糊命中 ⇒ 不知道改哪一处，拒绝而不是猜
+                    [_, _, ..] => {
+                        return Err(ToolError::Execution(format!(
+                            "oldText matches {} times in {path} after normalizing whitespace and \
+                             quotes, must match exactly once: {old_text:?}",
+                            hits.len()
+                        )));
+                    }
+                    // 替换范围用**实际匹配到的**字节长度：`old_text` 归一化前后的长度
+                    // 可以不相等（`trim` 与零宽字符移除都会改变长度）
+                    [(offset, len)] => {
+                        result.replace_range(*offset..*offset + *len, new_text);
                         replaced_count += 1;
                         continue;
                     }
+                    [] => {}
                 }
                 return Err(ToolError::Execution(format!(
                     "oldText not found in {path}: {old_text:?}"
@@ -227,40 +239,63 @@ impl Tool for EditTool {
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to write {path}: {e}")))?;
 
-        Ok(attach_notice(
-            ToolResult {
-                content: format!("Successfully replaced {replaced_count} block(s) in {path}."),
-                is_error: false,
-            },
-            path_notice.as_deref(),
-        ))
+        // 模糊命中必须在结果里说明：模型否则会以为自己精确命中，继续基于错误假设改文件
+        let fuzzy_notices: Vec<String> = fuzzy_ranges
+            .iter()
+            .map(|matched| {
+                format!(
+                    "edit: matched {matched:?} by normalizing whitespace and quotes (not an exact match)"
+                )
+            })
+            .collect();
+
+        let mut tool_result = ToolResult {
+            content: format!("Successfully replaced {replaced_count} block(s) in {path}."),
+            is_error: false,
+        };
+        ys_tool::append_notices(&mut tool_result.content, &fuzzy_notices);
+        Ok(attach_notice(tool_result, path_notice.as_deref()))
     }
 }
 
-/// 在给定 content 中使用模糊匹配查找 old_text
-fn find_match_fuzzy(content: &str, old_text: &str) -> Option<usize> {
-    let fuzzy_old = fuzzy_normalize(old_text);
+/// 在 content 中查找模糊命中的全部区间，每项为 `(byte_offset, byte_len)`。
+///
+/// 区间由**原文**逐字符推进得到，`byte_len` 是实际匹配到的字节长度，
+/// 与 `old_text.len()` **不保证相等**（`trim`、零宽字符移除、智能引号、不间断空格
+/// 都会让两侧长度不同）。调用方切片必须用它，不能用 `old_text.len()`。
+fn fuzzy_find_all(content: &str, old_text: &str) -> Vec<(usize, usize)> {
+    let target = fuzzy_normalize(old_text);
+    if target.is_empty() {
+        return Vec::new();
+    }
 
-    // 逐字符遍历 content，检查模糊匹配
-    let chars: Vec<char> = content.chars().collect();
-    let fuzzy_old_chars: Vec<char> = fuzzy_old.chars().collect();
-
-    for start in 0..chars.len() {
-        if start + fuzzy_old_chars.len() > chars.len() {
-            break;
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (start, start_char) in content.char_indices() {
+        // 起点空白属于被 `trim` 丢掉的部分，不属于命中区间
+        if start_char.is_whitespace() {
+            continue;
         }
 
-        let candidate: String = chars[start..start + fuzzy_old_chars.len()].iter().collect();
-        let fuzzy_candidate = fuzzy_normalize(&candidate);
+        let mut norm = String::new();
+        for (idx, ch) in content[start..].char_indices() {
+            // 行尾折叠：`\r\n` / `\r` 与 `\n` 等义（与 `fuzzy_normalize` 一致）
+            if ch == '\r' {
+                continue;
+            }
+            norm.push_str(&normalize_chars(&ch.to_string()));
 
-        if fuzzy_candidate == fuzzy_old {
-            // 将字符索引转换为字节索引
-            let byte_offset: usize = chars[..start].iter().map(|c| c.len_utf8()).sum();
-            return Some(byte_offset);
+            if norm == target {
+                hits.push((start, idx + ch.len_utf8()));
+                break;
+            }
+            // 已不是目标前缀 ⇒ 本起点不可能再命中
+            if !target.starts_with(&norm) {
+                break;
+            }
         }
     }
 
-    None
+    hits
 }
 
 #[cfg(test)]
@@ -455,6 +490,127 @@ mod tests {
         let written = std::fs::read(&file).unwrap();
         let written_str = String::from_utf8(written).unwrap();
         assert!(written_str.contains("\r\n"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模糊命中时的替换范围必须按**实际匹配到的文本**计算。
+    ///
+    /// 变异：把切片长度换回 `old_text.len()` ⇒ 本例 panic（越界）。
+    #[tokio::test]
+    async fn fuzzy_match_uses_actual_matched_length() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fuzzy.txt");
+        // 模型多带首尾空白 ⇒ 精确匹配 0 次，模糊命中范围比原串短 4 字节
+        std::fs::write(&file, "hello world").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let result = tool
+            .call(
+                json!({
+                    "path": "fuzzy.txt",
+                    "edits": [{ "oldText": "  hello world  ", "newText": "bye" }]
+                }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "bye");
+        // 模糊命中必须在结果里说明，模型才知道自己没精确命中
+        assert!(
+            result.content.contains("normaliz"),
+            "content = {}",
+            result.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 命中范围跨多字节字符（NBSP 占 2 字节）时，切片端点仍须落在字符边界上。
+    ///
+    /// 变异：仍用 `old_text.len()`（3 字节）⇒ 端点落进 NBSP 内部 ⇒ panic。
+    #[tokio::test]
+    async fn fuzzy_match_range_keeps_char_boundaries() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nbsp.txt");
+        // 文件里是不间断空格，模型打的是直空格
+        std::fs::write(&file, "x a\u{00A0}b y").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let result = tool
+            .call(
+                json!({
+                    "path": "nbsp.txt",
+                    "edits": [{ "oldText": "a b", "newText": "Z" }]
+                }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x Z y");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模糊命中保留原文边界字符（被 `trim` 吃掉的首尾空白不属于命中范围）。
+    #[tokio::test]
+    async fn fuzzy_match_preserves_original_boundary_whitespace() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("boundary.txt");
+        std::fs::write(&file, "hello world\nsecond line\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        tool.call(
+            json!({
+                "path": "boundary.txt",
+                "edits": [{ "oldText": "  hello world  \n", "newText": "bye" }]
+            }),
+            make_ctx(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "bye\nsecond line\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模糊匹配命中多处时同样必须拒绝，不能猜改哪一处。
+    #[tokio::test]
+    async fn fuzzy_match_multiple_locations_error() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fuzzy_multi.txt");
+        std::fs::write(&file, "a\u{00A0}b and a\u{00A0}b").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let result = tool
+            .call(
+                json!({
+                    "path": "fuzzy_multi.txt",
+                    "edits": [{ "oldText": "a b", "newText": "Z" }]
+                }),
+                make_ctx(),
+            )
+            .await;
+
+        let err = result.expect_err("ambiguous fuzzy match must be rejected");
+        assert!(err.to_string().contains("2 times"), "err = {err}");
+        // 拒绝时文件必须保持原样
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "a\u{00A0}b and a\u{00A0}b"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

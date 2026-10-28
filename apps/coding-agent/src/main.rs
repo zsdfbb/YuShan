@@ -1051,6 +1051,14 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     // 回合级工具结果预算：取窗口的 1/4（128k → 32k）。不新增 config 字段 —— 初值即可，
     // 真实会话再校准；`0` 会关闭闸门，故必须显式设非零。
     limits.max_turn_tool_result_tokens = config.context_window() / 4;
+    // 主轮关思考：**默认 `None`**（不干预）⇒ 未设 env 时行为逐字节不变。
+    //
+    // 用 env 而非配置项：先拿 A/B 读数，再决定要不要把它升格为默认值或用户配置。
+    // `on` 不是一个新的能力 —— provider 默认即开，表达它只会给不认识该字段的端点添风险。
+    limits.main_disable_thinking = match std::env::var(config::MAIN_THINKING_ENV).as_deref() {
+        Ok("off") => Some(true),
+        _ => None,
+    };
     limits
 }
 
@@ -4520,6 +4528,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir_default);
+    }
+
+    /// 主轮思考开关只认 `YUSHAN_MAIN_THINKING=off`，其余一律 `None`（不干预）。
+    ///
+    /// **默认 `None` 是承重默认**：没设 env 时主轮仍随 provider 默认思考，
+    /// 既有消费者的行为逐字节不变。`on` 刻意**不是**一个有效值 —— provider 默认即开，
+    /// 主动表达「开」只会给不认识该字段的端点添风险。
+    ///
+    /// 变异：把 `Ok("off") => Some(true)` 改成 `_ => Some(true)` ⇒ 第二条变红；
+    /// 把默认改成 `Some(false)` ⇒ 第一条变红。
+    #[test]
+    fn resolve_limits_reads_main_thinking_env() {
+        let _guard = crate::test_env::env_lock();
+        let _env = EnvRestore::capture(&[config::MAIN_THINKING_ENV]);
+
+        let mut config = config::Config::from_env().unwrap();
+        config.model = "any-model".into();
+
+        // 未设 ⇒ 不干预。
+        // SAFETY: 持有 env_lock，独占该 key。
+        unsafe { std::env::remove_var(config::MAIN_THINKING_ENV) };
+        assert_eq!(
+            resolve_limits(&config).main_disable_thinking,
+            None,
+            "未设 env 时必须是 None（既有行为逐字节不变）"
+        );
+
+        // `off` ⇒ 要求关闭。
+        // SAFETY: 同上。
+        unsafe { std::env::set_var(config::MAIN_THINKING_ENV, "off") };
+        assert_eq!(
+            resolve_limits(&config).main_disable_thinking,
+            Some(true),
+            "off 必须落成要求关闭"
+        );
+
+        // 其他值（含 `on`）⇒ 仍是不干预。
+        for other in ["on", "high", "OFF ", ""] {
+            // SAFETY: 同上。
+            unsafe { std::env::set_var(config::MAIN_THINKING_ENV, other) };
+            assert_eq!(
+                resolve_limits(&config).main_disable_thinking,
+                None,
+                "{other:?} 不是有效值，必须保持不干预"
+            );
+        }
     }
 
     /// **N16**：`resolve_limits` 把回合级工具结果预算设为 `context_window / 4`。

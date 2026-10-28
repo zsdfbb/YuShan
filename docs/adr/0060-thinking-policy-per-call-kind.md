@@ -90,19 +90,45 @@ proposed（2026-10-28；设计见 `docs/arch/effort-per-call-type/design.md`）
 provider 差异极大（`deepseek` 18.4% vs `MiniMax-M3.1-Flash` 5.0%）⇒ **不跨 provider 外推**。
 关思考仍**不能外推到主轮质量** —— `low` 已实测让 `fact/1` 从 3/3 掉到 2/3。
 
+## 实测结果（2026-10-28，DeepSeek 经 opencode-go，真实链路）
+
+| 判据 | 基线（默认思考） | 关思考 | 结论 |
+|---|---|---|---|
+| `daily/2` 质量 | Q+ | **Q+** | 不退化 |
+| `daily/2` 轮数 / 墙钟 | 10 / 43.3 s | **5 / 27.2 s** | 轮数减半，墙钟 −37% |
+| `fact/1` 质量（n=2 / n=3） | **Q+ ×2** | **Q+ ×2 + Q~ ×1** | **有方差** |
+| `fact/1` 成本 | 0.042–0.097 元 | 0.042–0.065 元 | 中位下降 |
+| 短检索任务成本 | 0.0276 元 | 0.0279 元 | **+1.1%（无收益）** |
+| 推理密集任务成本 | 0.0575 元 | **0.0388 元** | **−32.4%** |
+
+**两条结论**：
+
+1. **收益按任务形态分化**。短检索任务上 −100% reasoning 被工具参数与 input 抵消；
+   推理密集型才吃到那 18.3% 的大头。
+2. **`Q~` = 有引用指向不存在的位置**，3 次里 1 次 ⇒ **质量余量不为零**。
+
+## 决策 7：默认值**不改**
+
+收益（墙钟 −37%、推理密集成本 −32.4%）是真实的，但 `Q~` 意味着关思考会产出
+**指向不存在位置的引用** —— 那是最难被用户发现的一类错误。默认值面向所有人，
+所以保持 `None`，只由 `YUSHAN_MAIN_THINKING=off` 显式开启。
+
+要改默认值，前提是拿到更硬的证据：`fact/1` 连 5 次 Q+（当前 n=3，且已有 1 次 `Q~`），
+或换一个能覆盖改代码类任务的判据。
+
 ## Consequences
 
-- **正面**：主轮与子 agent 拿到「关思考」的可达路径，不必再全局 `/effort off`；
-  不破前缀缓存（`thinking` 是请求体顶层字段，不进 `messages`/`system`/`tools` 前缀）。
-- **负面**：新增一个 `RunLimits` 字段与一个 `ThinkingOverride` 类型；~8 处 `disable_thinking`
-  字面量需机械同步改（编译器全数报出）。
+- **正面**：主轮拿到「关思考」的可达路径；墙钟 −37%（`daily/2`）、推理密集任务成本 −32.4%。
+  不破前缀缓存（`thinking` 是 `#[serde(skip)]`，从不进序列化）。
+- **负面**：新增 `ThinkingOverride` 类型与 `RunLimits` 字段；约 10 处 `disable_thinking`
+  字面量已机械同步（编译器全数报出）。
 - **已知边界 A**：能力位**已置位**（`opencode-go` + `deepseek` 两家）。未配 `/effort off` 时
-  请求体**仍逐字节不变**（`config.disable_thinking = false`，已用真实链路验证）。
+  请求体**仍逐字节不变**（已用真实链路验证：默认仍 thinking 67 tokens）。
   未实测的方言（GLM / MiMo / standard / minimax）仍为 `false`，有反向断言钉住。
 - **已知边界 B**：用 `YUSHAN_API_BASE` 直连时 provider 名取 `custom`（`config.rs:515`），
-  拿`ProviderCompat::standard()` ⇒ 同样不发该字段。只有内置 provider 名才有能力位。
-- **未决**：主轮默认是否关思考，必须由 `fact/1` A/B（n≥3）决定；基线本身跨 64.4–201.4 s
-  （`ADR-0042`）⇒ **中位差 <20% 一律记为「不可判」**。
+  拿到 `ProviderCompat::standard()` ⇒ 不发该字段。只有内置 provider 名有能力位。
+- **已知边界 C**：**默认什么都不变**。要收益必须显式 `YUSHAN_MAIN_THINKING=off`。
+  这是 S7（质量余量不为零）的直接后果，不是遗漏。
 
 ## 关联
 

@@ -10,6 +10,12 @@ use crate::provider::ProviderRegistry;
 /// 默认推理强度。`high` 是该模型可接受的最低默认档，`low` 只留给显式实验。
 pub(crate) const DEFAULT_REASONING_EFFORT: &str = "high";
 
+/// 主轮思考开关的 **A/B 开关**（`apps/coding-agent/src/main.rs::resolve_limits`）。
+///
+/// 只是做完 A/B 前的临时入口：没设或不是 `off` 就保持 `None`（不干预）。
+/// 拿到质量与轮数读数后，再决定是升格为默认值还是加进 `config.json`。
+pub(crate) const MAIN_THINKING_ENV: &str = "YUSHAN_MAIN_THINKING";
+
 /// Model factory 函数类型。封装适配器特有的构建逻辑。
 /// config 不完整（缺 api_base/api_key）时返回 None。
 type ModelFactory = Box<dyn Fn(&Config) -> Option<Box<dyn Model>> + Send + Sync>;

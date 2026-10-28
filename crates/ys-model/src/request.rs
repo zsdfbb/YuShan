@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use ys_core::Message;
+use ys_core::{Message, ThinkingOverride};
 use ys_protocol::BoundarySource;
 use ys_tool::ToolSpec;
 
@@ -16,23 +16,24 @@ pub struct ModelRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
-    /// **关闭思考**（可选）—— 本次调用是否要让模型跳过推理。
+    /// **思考覆盖**（可选）—— 本次调用的思考开关 / 强度覆盖。
     ///
-    /// `None` = 不干预，由 provider 默认决定（DeepSeek 默认**开**且 effort `high`）。
-    /// `Some(false)` = 显式关闭思考。
+    /// `None` = 不干预，由 config 侧（`/effort`）与 provider 默认决定。
+    /// `Some(ThinkingOverride::off())` = 确定关闭思考。
     ///
-    /// **为什么用 `Option<bool>` 而不是 `bool`**：`None` 与 `false` 语义不同 ——
-    /// 前者是「随 provider 默认」，后者是「确定不要思考」。若用 `bool`，默认值 `false`
-    /// 将让**所有既有调用**主动关闭思考，这是一次静默的行为变更。
+    /// **为什么整个字段是 `Option`**：`None`（不干预）与「`thinking: Some(true)`」
+    /// 语义不同 —— 前者是「随既有决定」，后者是「确定要开」。若用非 `Option` 结构，
+    /// `Default` 就会让**所有既有调用**主动表态，那是一次静默的行为变更。
     ///
     /// **为何不用 `reasoning_effort = "off"`**：`off` 不是 DeepSeek 的合法 wire 值
     /// （实测返回 422 `unknown variant 'off'`），要关思考只能发
     /// `thinking: {"type": "disabled"}`。
     ///
     /// **不参与序列化**：与 [`Self::boundary`] 同理，`ModelRequest` 是会话契约的一部分，
-    /// 加值字段会改字节。
+    /// 加值字段会改字节。（此字段曾是 `disable_thinking: Option<bool>`，泛化时保持了
+    /// 同一条 `serde(skip)` 契约 ⇒ 序列化字节逐字节不变。）
     #[serde(skip, default)]
-    pub disable_thinking: Option<bool>,
+    pub thinking: Option<ThinkingOverride>,
     /// 轮边界控制源（可选）—— 模型调用期间的**中止**通道。
     ///
     /// `None` = 不支持中止（适配器不装探针，行为与不挂载时一致）。

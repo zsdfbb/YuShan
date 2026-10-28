@@ -54,6 +54,49 @@ pub struct ParseEffortLevelError {
     pub input: String,
 }
 
+/// 一次调用的**思考覆盖** —— 三个字段都是可选覆盖。
+///
+/// 存在理由：档位原本冻结在 model 实例里（`OpenAICompatibleConfig.reasoning_effort`），
+/// 而主轮 / 压缩 / 工具摘要**共用一个 `Arc<dyn Model>`** ⇒ 三类调用不可能分档。
+/// 本类型经 `ModelRequest` 的边信道下发，让「哪类调用用什么思考策略」成为调用点的属性。
+///
+/// # 为什么不做一个 `CallKind` 枚举 + 策略表
+///
+/// 调用面只有三处，且都在看得见的位置（`basic.rs` 主轮、`summarize.rs` 摘要、
+/// `compact.rs` 压缩）。当前三个槽位里有两个恒为 `None`，映射表这层间接**不产生
+/// 任何行为差异**。等第二个真实策略需求出现再加。
+///
+/// # 语义
+///
+/// - 每个字段 `None` = **不干预**：沿用 config 侧的决定（`/effort` 的全局档位）。
+/// - `thinking: Some(false)` = 确定关闭；`Some(true)` = 不表达（provider 默认即开，
+///   发它只给不认识该字段的端点添风险，故适配层从不发 `enabled`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThinkingOverride {
+    /// 思考开关覆盖。`None` = 随 config 侧决定；`Some(false)` = 确定关闭。
+    pub thinking: Option<bool>,
+    /// 强度覆盖（规范拼写，如 `"low"`）。`None` = 沿用实例冻结的档位。
+    ///
+    /// 用 `String` 而非 [`EffortLevel`]：provider 的档位集合各不相同，折叠与门控
+    /// 在适配器（`ProviderCompat::effort_for`），本类型只管传递。
+    pub effort: Option<String>,
+}
+
+impl ThinkingOverride {
+    /// 「确定关闭思考」的唯一构造点 —— 避免各调用点各写一份字段字面量。
+    pub fn off() -> Self {
+        Self {
+            thinking: Some(false),
+            effort: None,
+        }
+    }
+
+    /// 是否**确定要求关闭**。`None` / `Some(true)` 都不算。
+    pub fn disables_thinking(&self) -> bool {
+        self.thinking == Some(false)
+    }
+}
+
 impl FromStr for EffortLevel {
     type Err = ParseEffortLevelError;
 
@@ -147,5 +190,32 @@ mod tests {
             EffortLevel::XHigh
         );
         assert_eq!("Off".parse::<EffortLevel>().unwrap(), EffortLevel::Off);
+    }
+
+    /// `ThinkingOverride` 的**承重**语义：默认全 `None`（= 不干预）。
+    ///
+    /// 这是本次改动唯一的行为兼容点：`Default` 是「沿用既有决定」，
+    /// 而 `off()` 是「确定关闭」。两者不得合并。
+    ///
+    /// 变异：把 `Default` 改成「`thinking: Some(false)`」⇒ 第一条变红
+    /// （那会让所有既有调用静默关掉思考）。
+    #[test]
+    fn thinking_override_default_is_no_intervention() {
+        let d = ThinkingOverride::default();
+        assert_eq!(d.thinking, None, "默认必须是不干预，不是关闭");
+        assert_eq!(d.effort, None, "默认必须沿用实例档位");
+        assert!(!d.disables_thinking(), "默认不得被判成「要关」");
+
+        let off = ThinkingOverride::off();
+        assert_eq!(off.thinking, Some(false));
+        assert_eq!(off.effort, None, "关思考不改强度");
+        assert!(off.disables_thinking());
+
+        // `Some(true)` 不算「要关」—— 它是「不表达」，适配层从不发 `enabled`。
+        let explicit_on = ThinkingOverride {
+            thinking: Some(true),
+            ..Default::default()
+        };
+        assert!(!explicit_on.disables_thinking());
     }
 }

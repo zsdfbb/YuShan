@@ -7,7 +7,9 @@ use crate::turn_budget;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use ys_component::RuntimeContext;
-use ys_core::{ContentBlock, Message, Role, StopReason, ToolResult as CoreToolResult, Usage};
+use ys_core::{
+    ContentBlock, Message, Role, StopReason, ThinkingOverride, ToolResult as CoreToolResult, Usage,
+};
 use ys_event::{AgentEvent, RoundPurpose, emit};
 use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
@@ -626,6 +628,15 @@ impl AgentLoop for BasicLoop {
                 tools,
                 system: ctx.system_prompt.clone(),
                 boundary: ctx.boundary.clone(),
+                // 主轮的思考开关。`None`（默认）= 不干预 ⇒ 与改动前逐字节一致。
+                //
+                // 只影响**开关**，不改强度：强度仍冻在 model 实例里
+                // （`OpenAICompatibleConfig.reasoning_effort`）。
+                thinking: ctx
+                    .limits
+                    .main_disable_thinking
+                    .filter(|want_off| *want_off)
+                    .map(|_| ThinkingOverride::off()),
                 ..Default::default()
             };
 
@@ -5067,6 +5078,84 @@ mod tests {
             count >= 2,
             "并行与串行两处构造点都要挂外层预算；count = {count}"
         );
+    }
+
+    // ==================== 主轮的思考开关（`RunLimits::main_disable_thinking`） ====================
+
+    /// 记录每次 `complete()` 收到的 `ModelRequest.thinking`。
+    struct ThinkingProbeModel {
+        seen: Mutex<Vec<Option<ThinkingOverride>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ThinkingProbeModel {
+        fn model_id(&self) -> &str {
+            "thinking-probe"
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.seen.lock().unwrap().push(request.thinking.clone());
+            Ok(ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// 主轮把 `main_disable_thinking` 落成请求级 `thinking` 覆盖；默认 `None` 不改行为。
+    ///
+    /// 两半都是承重的：
+    ///  - `None`（默认）⇒ 请求里**没有**覆盖 —— 既有消费者的行为逐字节不变；
+    ///  - `Some(true)` ⇒ `ThinkingOverride::off()` —— 适配层据此发 `thinking.disabled`。
+    ///
+    /// 变异：把接入改成无条件 `Some(ThinkingOverride::off())` ⇒ 第一条变红；
+    /// 把 `.filter(|want_off| *want_off)` 删掉（`Some(false)` 也关）⇒ 第三条变红。
+    #[tokio::test]
+    async fn main_round_thinking_override_follows_limits() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+
+        for (setting, expect_off) in [(None, false), (Some(true), true), (Some(false), false)] {
+            let model = ThinkingProbeModel {
+                seen: Mutex::new(Vec::new()),
+            };
+            let mut session = MemorySession::new();
+            let mut events = CollectingSink::new();
+            let mut limits = limits_with_window(100_000, 0);
+            limits.main_disable_thinking = setting;
+
+            let result = {
+                let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+                BasicLoop
+                    .run_turn(AgentInput::text("go"), &mut ctx)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(result.stop_reason, StopReason::Completed);
+
+            let seen = model.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "本用例只有一轮主对话");
+            if expect_off {
+                assert_eq!(
+                    seen[0],
+                    Some(ThinkingOverride::off()),
+                    "setting = {setting:?} ⇒ 主轮必须要求关闭思考"
+                );
+            } else {
+                assert_eq!(
+                    seen[0], None,
+                    "setting = {setting:?} ⇒ 不得下发任何思考覆盖（默认逐字节不变）"
+                );
+            }
+        }
     }
 
     // ==================== 「闷头干活」提醒（narration nudge） ====================

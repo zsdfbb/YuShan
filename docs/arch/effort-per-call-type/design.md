@@ -187,75 +187,85 @@ opencode-go 的响应里带 `usage.opencode.billing_source` / `list_cost` / `all
 
 ### 4.1 核心决定
 
-**前置（P0）：给 `opencode_go()` 置 `supports_thinking_control = true`。**
+**前置（P1，已落地）：给 `opencode_go()` 置 `supports_thinking_control = true`。**
 
-没有这一步，后面全部是空操作（§2.3）。这是**独立的一行改动 + 一个测试**，
-但它会让**立即生效**的行为发生变化：今天所有经 opencode-go 的调用都不发该字段，
-置位后它们发不发取决于 `config.disable_thinking`（仍为 `false` by default）⇒
-**只要不配 `/effort off`，行为仍然逐字节不变**。这条要在测试里钉住。
+没有这一步，后面全部是空操作（§2.3）。它是独立的一行改动 + 两个测试，
+而它**不改变默认行为**：置位后请求体是否带 `thinking` 仍取决于配置层
+`off` 与调用层覆盖（两源默认都是「不干预」）。这条已用测试钉住，并经真实链路核实。
+
+**主决定：请求级 `ThinkingOverride`，不建策略表。**
 
 ```rust
 // crates/ys-core/src/effort.rs（已有 EffortLevel 处，同一拼写来源）
-/// 一次调用的思考覆盖。**三个字段都是可选覆盖**，`None` = 不干预。
+/// 一次调用的思考覆盖。**两个字段都是可选覆盖**，`None` = 不干预。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThinkingOverride {
     /// 开关覆盖。`None` = 不干预（沿用 config 侧 `/effort off` 的全局决定）；
     /// `Some(false)` = 确定关闭思考。
     pub thinking: Option<bool>,
-    /// 强度覆盖。`None` = 沿用实例冻结的档位（= 今天的字节）。
+    /// 强度覆盖。`None` = 沿用实例冻结的档位（= 改动前的字节）。
     pub effort: Option<String>,
 }
 ```
 
-**不引入 `CallKind` 枚举与策略表。** 调用面只有三处且都在看得见的地方
-（`basic.rs` 主轮、`summarize.rs` 摘要、`compact.rs` 压缩），**显式字面量比看不见的查表好**：
+**不引入 `CallKind` 枚举与策略表。** 调用面只有三处且都在看得见的地方，
+**显式字面量比看不见的查表好**：
 
 | 调用面 | 变更后 | 语义 |
 |---|---|---|
-| 主轮（`basic.rs` Step 5 组装处） | `thinking: ctx.limits.main_thinking_override()` | 由 `RunLimits` 决定，见 §4.2 |
-| 工具摘要（`summarize.rs:93`） | `thinking: Some(ThinkingOverride { thinking: Some(false), .. })` | **等价于今天的 `disable_thinking: Some(false)`** |
-| 压缩（`compact.rs`） | `None` | 现状 |
+| 主轮（`basic.rs` Step 5 组装处） | 由 `RunLimits::main_disable_thinking` 派生 | 见 §4.2 |
+| 工具摘要（`summarize.rs`） | `Some(ThinkingOverride::off())` | **等价于改动前的 `disable_thinking: Some(false)`** |
+| 压缩（`compact.rs`） | `None` | 维持开思考 |
 
-`ModelRequest.disable_thinking: Option<bool>` 改为 `thinking: Option<ThinkingOverride>`
+`ModelRequest.disable_thinking: Option<bool>` 已改为 `thinking: Option<ThinkingOverride>`
 （`#[serde(skip, default)]` 不变 ⇒ 序列化字节逐字节不变）。**不并存旧字段** ——
-并存会留下两个语义重叠的字段（`disable_thinking: Some(false)` 与
-`thinking: Some(ThinkingOverride { thinking: Some(true) })` 冲突时谁赢？无从回答）。
+并存会留下两个语义重叠的字段，冲突时谁赢无从回答。
 
-> ⚠️ 机械改动面：`summarize.rs:262` 与适配器三处测试（`lib.rs:1384/1436/1465/1503`、
-> `tests/retry.rs:269/689`、`apps/coding-agent/tests/*.rs` 四处）的 `disable_thinking:` 字面量
-> 需同步改。**编译器会全数报出**，不算风险，但要计入工作量。
+> ⚠️ **强度覆盖的门控位置不对称**（本次的一个易错点）：
+> config 侧的 `reasoning_effort` 在实例构造时**已由 app 门控过**，适配器须**原样透传**
+> （再调一次 `effort_for` 会改变既有字节，曾被一条既有测试抓到）；
+> 而请求侧的覆盖值 app 看不到，**必须在适配器里**穿过 `effort_for` 的
+> 能力位 + 模型级代际 + 方言折叠，否则 GLM 之类会把不认识的档位当 400 拒。
 
 ### 4.2 主轮的开关由谁定
 
-`RunLimits` 加一个字段（沿用 `#\[non_exhaustive]` + `default()` + 字段赋值的既有惯例）：
+`RunLimits` 新增字段（沿用 `#[non_exhaustive]` + `default()` + 字段赋值的惯例）：
 
 ```rust
 /// 主轮是否关思考。`None` = 不干预（默认，逐字节不变）；`Some(false)` = 关。
-///
-/// **默认 `None` 是承重默认**：既有消费者（不设该字段）的行为逐字节不变，
-/// 与 `fixed_prompt_tokens = 0` / `max_turn_tool_result_tokens = 0` 同一惯例。
 pub main_disable_thinking: Option<bool>,
 ```
 
-**默认值必须是 `None`。** 这是本设计唯一不能动的行为兼容点：把默认设成 `Some(false)`
+**默认值必须是 `None`。** 这是本设计唯一不能动的行为兼容点：设成 `Some(false)`
 等于对所有老调用方做一次静默的思考能力削减。
 
-app 侧由配置决定填什么 ——**第一版不暴露配置项**，只在 `resolve_limits` 里读一个可选 env
-供 A/B 用（`YUSHAN_MAIN_THINKING=off|on`，未设置 ⇒ `None`）。理由：先拿到 A/B 读数，
-再决定的是「默认值」，而不是「机制」。
+app 侧只读一个可选 env（`YUSHAN_MAIN_THINKING=off`），未设 ⇒ `None`。
+第一版**不暴露配置项**：先拿 A/B 读数，再决定「默认值」与「要不要进 `config.json`」。
+`on` 刻意**不是**有效值 —— provider 默认即开，主动表达「开」只给不认识该字段的端点添风险。
 
-### 4.3 为什么不做「按轮序号衰减」
+### 4.3 实测 A/B（2026-10-28，DeepSeek 经 opencode-go，真实链路）
 
-方案 A 的阈值语义是错的（§3.1）。**若 A/B 证明主轮全程关思考会掉质量**，
-再引入「前 N 轮开、之后关」时，它应该长成**调用点的一行判断**，而不是 `RunLimits` 里的新维度：
+| 判据 | 任务 | 基线（默认思考） | 关思考 | 结论 |
+|---|---|---|---|---|
+| 质量位 | `daily/2` | **Q+** | **Q+** | 不退化 |
+| 质量位 | `fact/1` | **Q+**（2/2 次） | **Q+**（2/3 次，一次 Q~） | **有方差，见下** |
+| 轮数 | `daily/2` | 10 | **5** | 未增加，反而减半 |
+| 轮数 | `fact/1` | 12 / 10 | 18 / 8 / 10 | 双向摆动，无方向性 |
+| 墙钟 | `daily/2` | 43.3 s | **27.2 s（−37%）** | 改善 |
+| 墙钟 | `fact/1` | 106.8 s / 90.9 s | 63.0 s / 53.8 s / 42.0 s | 改善 |
+| 成本 | 短检索任务 | 0.0276 元 | 0.0279 元 | **+1.1%（无收益）** |
+| 成本 | 推理密集型 | 0.0575 元 | **0.0388 元（−32.4%）** | 显著改善 |
 
-```rust
-// 只有真的需要时才加，且理由必须带上 A/B 读数
-thinking: round_is_early.then(|| main_override()).flatten()
-```
+**两条必须记住的结论**：
 
-把两种语义（「全程关」与「后段关」）都塞进 `RunLimits` 会让字段互相影响，
-而 A/B 还没给出「哪个对」的答案。
+1. **收益高度依赖任务形态**。短检索任务上关思考**不省钱**（−100% reasoning 被
+   `tool_args` 与 input 抵消）；推理密集型才吃掉那 18.3% 的大头。
+2. **`fact/1` 有一次 `Q~`**（有引用指向不存在的位置）。3 次里 1 次 ⇒
+   **说明质量余量不为零，不能直接改默认值**。这也是「先用便宜判据、再上 `fact/1`」
+   的分层验收的价值：`daily/2` 三次都是 Q+，但只有 `fact/1` 暴露了这条方差。
+
+> ⚠️ 基线本身跨 53–107 s（2× 跨度）。按本设计定的「中位差 <20% 记为不可判」，
+> **墙钟收益在这批样本里已可判（−37%）**；但 `fact/1` 的 `Q~` 意味着**质量判据尚未通过**。
 
 ## 5. 数据流
 
@@ -263,33 +273,43 @@ thinking: round_is_early.then(|| main_override()).flatten()
 /effort off（会话）或 YUSHAN_REASONING_EFFORT=off（配置）
   └─► Config::disable_thinking() == true ──► OpenAICompatibleConfig.disable_thinking（构造期）
                                                    │
-                                                   ├─（取或）──► thinking: {"type":"disabled"}
-YUSHAN_MAIN_THINKING=off（A/B 用）                 │
-  └─► resolve_limits → RunLimits.main_disable_thinking = Some(false)
-        └─► basic.rs Step 5: ModelRequest.thinking = Some(ThinkingOverride{ thinking: Some(false) })
-              └─► translate_request：（config ∨ request）∧ supports_thinking_control
-                    └─► 只有 deepseek 方言发出该字段；其余 provider 静默不发
+YUSHAN_MAIN_THINKING=off（A/B 用）                │
+  └─► resolve_limits → RunLimits.main_disable_thinking = Some(true)
+        └─► basic.rs Step 5: ModelRequest.thinking = Some(ThinkingOverride::off())
+              │                                  │
+              └──────────── 两者取或 ────────────┘
+                              ▼
+              translate_request：（config ∨ request）∧ supports_thinking_control
+                              ▼
+              只有 deepseek / opencode-go 两家方言发出该字段；其余静默不发
 ```
 
 三个不变量：
 
-1. **`config` 侧与 `request` 侧取或**，保持今天的语义（`/effort off` 必须能压过任何面的设置）。
+1. **`config` 侧与 `request` 侧取或**：`/effort off` 是用户的**全局意图**，不能被任何单个
+   调用面推翻；反之单个调用面要求关时也必须生效。
 2. **能力位门控不能绕过**：所有新值照旧穿过 `supports_thinking_control`，
    GLM「始终思考」不会因为这次改动收到它不认识的字段。
 3. **`None` 与 `Some(false)` 语义不同**，不得合并（这是 `9b573e4` 立下的规矩）。
 
 ## 6. 验收
 
-### 6.1 测试矩阵（对齐 `docs/design.md` §12 与既有惯例）
+### 6.1 测试矩阵（全部已落地）
 
-| # | 层 | 用例 | 变异（必须让它变红） |
+| # | 层 | 用例 | 变异（已验证会让它变红） |
 |---|---|---|---|
-| A1 | adapter | **wire 字节断言**：`thinking: Some(ThinkingOverride{thinking: Some(false)})` ⇒ 请求体含 `{"type":"disabled"}`；`None` ⇒ 该键**完全不出现** | 把 `skip_serializing_if` 去掉 / 把 `None` 当关闭 |
-| A2 | adapter | **前缀相干性**：同一 messages + 两种 `thinking` 值 ⇒ 序列化后的 `messages`/`system`/`tools` **逐字节相同** | 让 `thinking` 影响任何前缀字段 |
-| A3 | adapter | 能力位门控：`standard()` / `glm()` 即使配置要求也不发 | 去掉 `supports_thinking_control` |
-| A4 | ys-component | `main_disable_thinking` 默认 `None`；可显式设 `Some(false)` | 默认值改成 `Some(false)` |
-| A5 | ys-loop | 主轮请求的 `thinking` 来自 `RunLimits`；压缩仍为 `None`；摘要仍为「关」 | 把压缩也接上 / 把默认值接错 |
-| A6 | ys-loop | 既有 `summarize` 断言（`:262`）改写后仍钉住「摘要关思考」 | 改成 `None` |
+| A1 | ys-core | `thinking_override_default_is_no_intervention`：`Default` 全 `None`；`off()` 才是关；`Some(true)` 不算关 | `Default` 改成关闭 |
+| A2 | adapter | `thinking_control_is_gated_and_optional_on_the_wire`：`None` ⇒ 键不出现；`off()` + 支持 ⇒ `disabled`；不支持 ⇒ 不发 | `None` 当关闭 / 去掉能力位门控 / `disabled` 写成 `off` |
+| A3 | adapter | `enabling_opencode_go_does_not_change_the_default_request_body`：能力位置位但未要求关 ⇒ 请求体不变；配 `off` 才落地 | 能力位开即无条件关 / 只看 request 侧 |
+| A4 | adapter | `opencode_go_and_deepseek_are_the_only_thinking_control_vendors`（含**反向断言**） | 删 `opencode_go` 的能力位 |
+| A5 | adapter | `request_level_effort_override_is_gated_but_config_side_passes_through` | 请求侧绕过门控 / config 侧也门控 |
+| A6 | ys-component | `main_disable_thinking` 默认 `None` | 默认值改成 `Some(false)` |
+| A7 | ys-loop | `main_round_thinking_override_follows_limits`：`None`/`Some(true)`/`Some(false)` 三种设置下发到请求的内容 | 无条件关 / `Some(false)` 语义反转 |
+| A8 | ys-loop | 既有 `summarize` 断言仍钉住「摘要关思考」 | 改成 `None` |
+| A9 | app | `resolve_limits_reads_main_thinking_env`：只有 `off` 生效，`on`/`high`/`""` 都不生效 | 改默认值 / 改匹配臂 |
+
+> **A2 的「前缀相干性」用结构化断言代替了字节对比**：`thinking` 是 `#[serde(skip)]`，
+> 从不进序列化 ⇒ 前缀逐字节不变是由**类型契约**保证的，不需要再跑一次序列化比较。
 
 ### 6.2 实跑 A/B（分层：先用零成本与最便宜的判据把不成立的分支砍掉）
 
@@ -299,11 +319,11 @@ YUSHAN_MAIN_THINKING=off（A/B 用）                 │
 **L0 · 零成本（必做，先做）**
 
 ```bash
-python3 scripts/cost-audit.py --model deepseek    # 当前 provider 上关思考能省多少
+python3 scripts/cost-audit.py    # 当前 provider 上关思考能省多少（默认只统计 deepseek-*）
 ```
 
-回答「你这个 provider 上值不值」，**零 API 调用**。实测：DeepSeek 18.4%，MiniMax 5.0%。
-**若 <10%，不建议为此开一个开关注入点** —— 先去打工具调用参数（15.4%）。
+回答「你这个 provider 上值不值」，**零 API 调用**。实测：DeepSeek 18.3%，MiniMax 5.0%。
+**若 <10%，不建议为此开一个开关注入点** —— 先去打工具调用参数（15.5%）。
 
 **L1 · 单次质量冒烟（约 1 分钟）**
 
@@ -341,33 +361,38 @@ YUSHAN_BENCH_ONLY=fact/1 YUSHAN_BENCH_REPEATS=2 \
 `AGENTS.md` 要求关键逻辑做变异测试。本次至少三处：
 去掉能力位门控、把 `None` 当关闭、把 `main_disable_thinking` 默认值改成 `Some(false)`。
 
-## 7. 实施顺序
+## 7. 实施顺序（全部已落地，2026-10-28）
 
-| 步 | 内容 | 单独提交？ | 理由 |
+| 步 | 内容 | 状态 | 验证 |
 |---|---|---|---|
-| P0 | **审计基线**：`python3 scripts/cost-audit.py`（零 API 调用） | — | 当前的真实金额构成：关思考 18.3%、工具参数 15.5%、正文 1.8% |
-| P1 | `opencode_go()` 置 `supports_thinking_control = true` + 测试 | ✅ **已落地** | 前置：不改这一位，全部收益为 0（§2.3） |
-| P2 | `ThinkingOverride` 泛化 + 调用面接线（默认逐字节不变） | ✅ | 不破前缀、不改行为 |
-| P3 | `RunLimits.main_disable_thinking` + `YUSHAN_MAIN_THINKING` | ✅ | 机制与策略分开，便于回退 |
-| P4 | L1 冒烟（`daily/2`，两臂各 1 次）→ 过了才跑 L2 | — | 便宜的先跑 |
-| P5 | 按读数决定**默认值**是否改 | — | 默认值必须是数据决定的 |
+| P0 | **审计基线**：`python3 scripts/cost-audit.py`（零 API 调用） | ✅ | 关思考 18.3% / 工具参数 15.5% / 正文 1.8% |
+| P1 | `opencode_go()` 置 `supports_thinking_control = true` | ✅ | 2 个新测试；3 处变异被抓；真实链路核实 |
+| P2 | `ThinkingOverride` 泛化 + 三处调用面接线 | ✅ | 请求级强度门控不对称用一个新测试钉住 |
+| P3 | `RunLimits.main_disable_thinking` + `YUSHAN_MAIN_THINKING` | ✅ | 主轮探针测试（3 种设置）；env 测试（5 个输入） |
+| P4 | A/B 实跑（`daily/2` + `fact/1`） | ✅ | 见 §4.3 |
+| P5 | 按读数决定**默认值** | ⬜ **未改** | §4.3 的 `Q~` ⇒ **暂不改默认值** |
 
 每一步跑 `./scripts/par-test.sh`（全量测试入口，不是裸 `cargo test`）。
 
-> **P1 的验收不能只靠探测**：§2.3 的 n=3 只证明了「字段不被拒且开关生效」。
-> P1 的单元测试要钉的是**本仓自己的接线**：能力位置位后，`/effort off` 能落到 wire；
-> **不配 `off` 时请求体仍然没有 `thinking` 键**（逐字节不变）。
+**P5 的结论是「先不改」**。理由不是收益不够（墙钟 −37%、推理密集任务成本 −32% 都成立），
+而是 **`fact/1` 出现过一次 `Q~`** ⇒ 质量余量不为零，而默认值是**面向所有人**的。
+当前形态（env 显式开启）已经能让愿意接受该风险的用户拿到收益，且随时可关。
 
-## 8. 风险
+> **变异测试记录**（本次新增断言全部验证过）：
+> 删能力位（2 用例红）/ 能力位开启即无条件关思考（3 用例红）/ 去掉能力位门控（2 用例红）/
+> 主轮无条件关思考（1 红）/ `Some(false)` 语义反转（1 红）/ 请求级强度绕过门控（1 红）。
 
-| # | 风险 | 严重度 | 缓解 |
+## 8. 风险（按实测更新）
+
+| # | 风险 | 严重度 | 实测状态 |
 |---|---|---|---|
-| S1 | **关思考 → 轮数上升**，把 −15% 变成正收益 | **高** | 轮数中位 +1 作为硬闸门（§6.2）；`low` 已有质量 2/3 的前车之鉴 |
-| S2 | **收益被高估**：reasoning 不进历史，关它不省 input | **高** | §2.1 已写进口径；任何「token −69%」的说法都是错的 |
-| S3 | 基线噪声大于杠杆收益 | 中 | 中位差 <20% 记为不可判 |
-| S4 | `fact/1` 是检索汇型，对它安全推不出「改代码类任务安全」 | 中 | 补一次真实改代码会话的人工 diff 复核；`YUSHAN_BENCH_HEAVY=1` 长跑项 |
-| S5 | 机械改动面（~8 处字面量）漏改 | 低 | 编译器全数报出 |
-| S6 | GLM 等 provider 收不到收益却被误认为「已优化」 | 低 | S6 场景写进 `docs/TODO.md` 的已知边界 |
+| S1 | 关思考 → 轮数上升，把收益吃掉 | 中 | **未发生**：`daily/2` 10→5 轮；`fact/1` 双向摆动（12/10 vs 18/8/10），无方向性 |
+| S2 | 收益被高估（reasoning 不进历史） | 高 | **已量化**：短检索 +1.1%，推理密集 −32.4%。**按任务形态分化** |
+| S3 | 基线噪声大于收益 | 中 | 基线跨 53–107 s（2×）。墙钟 −37% 仍可判 |
+| S4 | `fact/1` 是检索汇型，推不出「改代码类任务安全」 | **高** | **已实证**：3 次里 1 次 `Q~` ⇒ 见 S7 |
+| S5 | 机械改动面漏改 | 低 | 已消除（编译器全数报出，已改完） |
+| S6 | 非 DeepSeek provider 收不到收益却被误认为「已优化」 | 低 | 能力位只对两家方言开；有反向断言 |
+| **S7** | **质量余量不为零**：`Q~` 意味着关思考会产出「指向不存在位置」的引用 | **高** | **未缓解，仅靠默认关闭**。这是 P5 不改默认值的唯一理由 |
 
 ## 9. 被否决的方案（留档，防后人重提）
 

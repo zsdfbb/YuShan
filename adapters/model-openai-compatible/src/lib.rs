@@ -1337,14 +1337,33 @@ pub fn translate_request(
             }),
         max_tokens: config.max_tokens.or(request.max_tokens),
         temperature: config.temperature.or(request.temperature),
-        reasoning_effort: config.reasoning_effort.clone(),
+        // 强度：请求级覆盖**优先**，否则沿用实例冻结的档位。
+        //
+        // 两条路的门控**不在同一处**，不要合并：
+        // - config 侧：构造实例时已由 app 通过 `reasoning_effort_for` →
+        //   [`ProviderCompat::effort_for`] 门控与折叠过，此处**原样透传**
+        //   （再调一次 `effort_for` 会对 `standard()` 之类重复门控，改变既有字节）。
+        // - 请求侧：app 看不到每次调用的覆盖值，故**必须在这里**穿过同一套
+        //   `effort_for`（能力位 + 模型级代际 + 方言折叠），否则会把非法值
+        //   发给严格端点（GLM 对不认识的档位直接 400）。
+        reasoning_effort: match request.thinking.as_ref().and_then(|p| p.effort.as_deref()) {
+            Some(level) => config.compat.effort_for(&config.model, Some(level)),
+            None => config.reasoning_effort.clone(),
+        },
         // 思考开关：**两条来源取或**。
         //
         // - 构造期（配置层 `off`）⇒ `config.disable_thinking`
-        // - 调用期（如摘要路径）⇒ `request.disable_thinking == Some(false)`
+        // - 调用期（如摘要路径）⇒ `request.thinking` 要求关
+        //
+        // 取或而非「请求优先」：`/effort off` 是用户的**全局意图**，
+        // 不能被任何单个调用面推翻；反之单个调用面要求关时也必须生效。
         //
         // 刻不发 `enabled`：那是 provider 默认值，发它只给不认识该字段的端点添风险。
-        thinking: ((config.disable_thinking || request.disable_thinking == Some(false))
+        thinking: ((config.disable_thinking
+            || request
+                .thinking
+                .as_ref()
+                .is_some_and(|p| p.disables_thinking()))
             && config.compat.supports_thinking_control)
             .then_some(ThinkingControl::Disabled),
     })
@@ -1353,6 +1372,7 @@ pub fn translate_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ys_core::ThinkingOverride;
     use ys_model::ModelRequest;
 
     // 简单测试：验证 translate_request 生成正确的 JSON
@@ -1381,7 +1401,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             boundary: None,
-            disable_thinking: None,
+            thinking: None,
         };
 
         let chat_req = translate_request(&request, &config).unwrap();
@@ -1433,7 +1453,7 @@ mod tests {
                 max_tokens: None,
                 temperature: None,
                 boundary: None,
-                disable_thinking: None,
+                thinking: None,
             };
 
             let chat_req = translate_request(&request, &config).unwrap();
@@ -1462,7 +1482,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             boundary: None,
-            disable_thinking: None,
+            thinking: None,
         };
         let chat_req = translate_request(&request, &config).unwrap();
         let serialized = &chat_req.messages[0].tool_calls.as_ref().unwrap()[0]
@@ -1500,7 +1520,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             boundary: None,
-            disable_thinking: None,
+            thinking: None,
         };
 
         let chat_req = translate_request(&request, &config).unwrap();
@@ -1962,11 +1982,11 @@ mod tests {
     /// 「关闭思考」的 wire 形状与门控。
     ///
     /// 三件事一起钉：
-    ///  1. `disable_thinking: None`（既有调用）⇒ **整个 `thinking` 字段不出现** ——
+    ///  1. `thinking: None`（既有调用）⇒ **整个 `thinking` 字段不出现** ——
     ///     这是「既有行为逐字节不变」的结构保证；
-    ///  2. `Some(false)` + provider 支持 ⇒ 发 `{"type": "disabled"}`（不是 `off`，
+    ///  2. `ThinkingOverride::off()` + provider 支持 ⇒ 发 `{"type": "disabled"}`（不是 `off`，
     ///     `off` 是非法 wire 值，实测 422）；
-    ///  3. `Some(false)` + provider **不支持** ⇒ 静默不发，不得因为调用方要求而误发。
+    ///  3. 要求关闭 + provider **不支持** ⇒ 静默不发，不得因为调用方要求而误发。
     ///
     /// 变异：① 把 `None` 也当成关闭 ⇒ 第一条变红；② 去掉
     /// `supports_thinking_control` 门控 ⇒ 第三条变红；③ 把 `disabled` 写成 `off`
@@ -1984,7 +2004,7 @@ mod tests {
 
         // ② 显式关闭 + provider 支持 ⇒ disabled。
         let request = ModelRequest {
-            disable_thinking: Some(false),
+            thinking: Some(ThinkingOverride::off()),
             ..Default::default()
         };
         let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
@@ -2000,7 +2020,10 @@ mod tests {
 
         // `Some(true)` 也不发（provider 默认即开启，发它只增风险）。
         let request = ModelRequest {
-            disable_thinking: Some(true),
+            thinking: Some(ThinkingOverride {
+                thinking: Some(true),
+                effort: None,
+            }),
             ..Default::default()
         };
         let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
@@ -2039,6 +2062,48 @@ mod tests {
         strict.disable_thinking = true;
         let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
         assert!(json.get("thinking").is_none(), "json = {json}");
+    }
+
+    /// 请求级强度覆盖：**穿过 `effort_for` 的门控与折叠**，config 侧仍原样透传。
+    ///
+    /// 两条路刻意不同：config 侧在实例构造时已由 app 门控过，适配器再门控一次会改变
+    /// 既有字节；请求侧是 app 看不到的逐调用值，**必须**在此门控，否则 GLM 会把不认识的
+    /// 档位当 400 拒。
+    ///
+    /// 变异：把请求侧改成 `Some(level) => Some(level.to_string())`（跳过门控）⇒
+    /// `standard()` 那两条断言变红；把 config 侧也改成 `effort_for` ⇒ 最后一条变红。
+    #[test]
+    fn request_level_effort_override_is_gated_but_config_side_passes_through() {
+        // 声明支持强度的方言：请求覆盖生效。
+        let config = config_with(ProviderCompat::opencode_go());
+        let request = ModelRequest {
+            thinking: Some(ThinkingOverride {
+                thinking: None,
+                effort: Some("low".into()),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        assert_eq!(json["reasoning_effort"], "low", "json = {json}");
+
+        // 未声明支持的方言：请求覆盖**不得**绕门控。
+        let strict = config_with(ProviderCompat::standard());
+        let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
+        assert!(
+            json.get("reasoning_effort").is_none(),
+            "standard 不接受强度，请求覆盖也不得绕过；json = {json}"
+        );
+
+        // 无请求覆盖 ⇒ 完全回到既有路径（config 值原样透传，不再门控）。
+        let mut config = config_with(ProviderCompat::standard());
+        config.reasoning_effort = Some("low".into());
+        let json =
+            serde_json::to_value(translate_request(&ModelRequest::default(), &config).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["reasoning_effort"], "low",
+            "config 侧必须原样透传（既有行为）；json = {json}"
+        );
     }
 
     /// **能力位置位 ≠ 发送**：opencode-go 上默认请求体逐字节不变。

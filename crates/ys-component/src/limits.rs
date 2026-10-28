@@ -98,6 +98,24 @@ pub struct RunLimits {
     /// 对应最长等待 ≈ 3 分钟（每轮 ≈ 14.9s，其中工具执行仅占 2.8%）。
     /// `0` ⇒ 关闭（既有消费者逐字节不变）。
     pub narration_silence_tool_calls: usize,
+    /// 主轮是否**关闭思考**。`None` = 不干预（默认）；`Some(false)` = 关。
+    ///
+    /// # 为何默认是 `None`
+    ///
+    /// **承重默认**：既有消费者（不设该字段）的行为逐字节不变，沿用
+    /// `fixed_prompt_tokens = 0` / `max_turn_tool_result_tokens = 0` 的惯例。
+    /// 设成 `Some(false)` 等于对所有老调用方做一次静默的思考能力削减。
+    ///
+    /// # 为何只覆盖主轮
+    ///
+    /// 工具摘要已恒为关（`summarize.rs`，理由含「思考吃光 1024 预算 ⇒ 空正文」）；
+    /// 压缩**保持开**（结果会进会话，错了要付后续每轮的代价，见 `docs/TODO.md`）。
+    /// 子 agent 复用本字段？**不** —— 子 agent 由 `assembly.rs` 克隆父 `limits`，
+    /// 故它继承父的选择；要分开就得给子 agent 单独的字段，等真实需求出现再说。
+    ///
+    /// 成本口径：DeepSeek 实测关思考可省 **18.3%** 总费用
+    /// （`docs/arch/effort-per-call-type/cost-analysis.md`）。
+    pub main_disable_thinking: Option<bool>,
     /// 流式中断后**重试整个模型轮**的次数上限（默认 `0` = 关闭）。
     ///
     /// 背景：provider 流可以返回 `200` + 正常 `ttfb`，然后在持续输出几十秒后
@@ -147,6 +165,8 @@ impl Default for RunLimits {
             subagent_poll: Duration::from_millis(200),
             // 12：实测回测下全程只多 3 条提醒，最长静默 ≈ 3 分钟。
             narration_silence_tool_calls: DEFAULT_NARRATION_SILENCE_TOOL_CALLS,
+            // None = 不干预 ⇒ 既有行为逐字节不变（主轮仍随 provider 默认思考）。
+            main_disable_thinking: None,
             // 0 = 关闭 ⇒ 既有行为逐字节不变（客户端不重发已开始的流）。
             stream_interrupt_retries: 0,
         }

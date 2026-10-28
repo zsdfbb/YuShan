@@ -10,7 +10,7 @@
 //! ⚠️ **本模块不负责**「不可信内容」的防御 —— 全部防御只有下方固定系统提示词里的一条规则
 //! 与调用方输出里的标题行标注（设计 §7 风险 1：**安慰剂级，不得宣传为防护**）。
 
-use ys_core::{ContentBlock, EventError, Message, Role};
+use ys_core::{ContentBlock, EventError, Message, Role, ThinkingOverride};
 use ys_model::{Model, ModelEvent, ModelEventSink, ModelRequest};
 
 /// 摘要调用的**固定**系统提示词（设计 §2.3 逐字）。
@@ -88,9 +88,9 @@ impl ys_tool::Summarizer for ModelSummarizer<'_> {
             //    全部吃掉、正文为 **0 词**（实测 `finish_reason` 为长度截断）。
             //    即不关思考时，本方法的空响应错误就是这条路径的实际失败模式。
             //
-            // `Some(false)` = 显式关闭；provider 不支持该字段时适配层会**静默不发**
-            // （`supports_thinking_control` 门控），不会因为这一行而误发。
-            disable_thinking: Some(false),
+            // `ThinkingOverride::off()` = 显式关闭；provider 不支持该字段时适配层会
+            // **静默不发**（`supports_thinking_control` 门控），不会因为这一行而误发。
+            thinking: Some(ThinkingOverride::off()),
         };
 
         // 摘要不进事件系统（工具没有事件出口），流式增量直接丢弃。
@@ -257,11 +257,15 @@ mod tests {
         // **关闭思考**：摘要不需要推理，且思考会挤占 `max_tokens` —— 内容较难时
         // 能把 1024 全吃光、正文为 0 词（实测 finish_reason 为长度截断）。
         //
-        // 变异：改成 `None` 或 `Some(true)` ⇒ 本断言变红。
+        // 变异：改成 `None` 或 `Some(ThinkingOverride::default())` ⇒ 本断言变红。
         assert_eq!(
-            req.disable_thinking,
-            Some(false),
+            req.thinking,
+            Some(ThinkingOverride::off()),
             "摘要调用必须显式关闭思考：既省成本，也避免思考吃光 max_tokens 导致空正文"
+        );
+        assert!(
+            req.thinking.as_ref().is_some_and(|p| p.disables_thinking()),
+            "也必须能被适配层读成「要关闭」"
         );
 
         // 单条 user 消息，prompt 与正文同处其中，正文被 <document> 围栏包住。

@@ -115,11 +115,12 @@ enum SubagentWait {
 async fn wait_for_subagents(
     ctx: &mut RuntimeContext<'_>,
     rounds: u32,
+    compaction: &mut Usage,
 ) -> Result<SubagentWait, LoopError> {
     let started = std::time::Instant::now();
     loop {
         // ① 结果/插话可能已经到了 —— 复用**同一条** drain，不另写注入逻辑。
-        match drain_boundary(ctx, rounds).await? {
+        match drain_boundary(ctx, rounds, compaction).await? {
             BoundaryDrain::Consumed => return Ok(SubagentWait::Arrived),
             BoundaryDrain::Aborted => return Ok(SubagentWait::Aborted),
             BoundaryDrain::Empty => {}
@@ -175,6 +176,7 @@ fn has_running_subagents(ctx: &RuntimeContext<'_>) -> bool {
 async fn drain_boundary(
     ctx: &mut RuntimeContext<'_>,
     rounds: u32,
+    compaction: &mut Usage,
 ) -> Result<BoundaryDrain, LoopError> {
     // **先克隆 `Arc` 再循环**：`Compact` 要 `&mut ctx`（压缩本体写 session / 发事件），
     // 若仍借用 `ctx.boundary` 会与它冲突。克隆只加一次引用计数。
@@ -211,7 +213,7 @@ async fn drain_boundary(
             // 不带来新的模型输入，而 `Consumed` 在三处调用点的语义都是「模型有新东西
             // 要看 ⇒ 继续循环」。设了它会让收场路径凭空多跑一轮空模型调用。
             Boundary::Compact => {
-                run_compaction(ctx, rounds).await?;
+                run_compaction(ctx, rounds, compaction).await?;
             }
             Boundary::Abort => return Ok(BoundaryDrain::Aborted),
         }
@@ -232,7 +234,11 @@ async fn drain_boundary(
 /// 返回是否真的压了：`false` = `plan()` 返回 `None`（消息太少 / 无合法切点）。
 ///
 /// 失败语义（B-3）：**session 一个字节都不动**，只发 `ContextCompactionFailed`。
-async fn run_compaction(ctx: &mut RuntimeContext<'_>, rounds: u32) -> Result<bool, LoopError> {
+async fn run_compaction(
+    ctx: &mut RuntimeContext<'_>,
+    rounds: u32,
+    compaction: &mut Usage,
+) -> Result<bool, LoopError> {
     let policy = &ctx.limits.compaction;
     let window = ctx.limits.context_window;
     let fixed = ctx.limits.fixed_prompt_tokens;
@@ -255,6 +261,10 @@ async fn run_compaction(ctx: &mut RuntimeContext<'_>, rounds: u32) -> Result<boo
             // 成本口径必须先于写回上报：摘要调用的 token 已经真实消耗，
             // 若 `replace_all` 失败会提前 `?` 返回 —— 放在写回前，写回失败
             // 也不丢成本口径；顺序上仍在 `ContextCompacted` 之前。
+            //
+            // 同一笔消耗也进回合账本：`RunFinished.usage` 不含压缩（逐字节承诺），
+            // 故必须另立字段，否则 `/status` 与 meta 都会偏小。
+            *compaction = compaction.clone() + outcome.usage.clone();
             emit(
                 ctx.events,
                 AgentEvent::RoundUsage {
@@ -425,6 +435,13 @@ impl AgentLoop for BasicLoop {
     ) -> Result<RunResult, LoopError> {
         let mut rounds: u32 = 0;
         let mut total_usage = Usage::default();
+        // 缓存读数**逐轮**累加：`miss = input − hit` 只在单轮里成立，
+        // 而 `total_usage` 的 input 无条件相加、hit 缺席时不参与相加（不对称）。
+        // 故绝不能从聚合后的 `total_usage` 派生（见 `RunResult::cache_reading`）。
+        let mut cache_reading: Option<(u32, u32)> = None;
+        // 压缩消耗**与主对话分开记**：`RunFinished.usage` 不含它（逐字节承诺），
+        // 故另立一个累计对象，随 `RunResult` 出去。
+        let mut compaction_usage = Usage::default();
         let mut consecutive_errors: HashMap<String, u32> = HashMap::new();
         // 空响应**只重试一次**；本回合内一旦重试过，再空就如实收场。
         let mut empty_retried = false;
@@ -465,6 +482,8 @@ impl AgentLoop for BasicLoop {
             return Ok(RunResult {
                 stop_reason: StopReason::Cancelled,
                 usage: Usage::default(),
+                cache_reading: None,
+                compaction_usage: Usage::default(),
                 rounds: 0,
                 final_message: None,
             });
@@ -502,6 +521,8 @@ impl AgentLoop for BasicLoop {
                 return Ok(RunResult {
                     stop_reason: StopReason::Cancelled,
                     usage: total_usage,
+                    cache_reading,
+                    compaction_usage: compaction_usage.clone(),
                     rounds,
                     final_message: None,
                 });
@@ -522,6 +543,8 @@ impl AgentLoop for BasicLoop {
                 return Ok(RunResult {
                     stop_reason: StopReason::MaxRounds,
                     usage: total_usage,
+                    cache_reading,
+                    compaction_usage: compaction_usage.clone(),
                     rounds,
                     final_message: None,
                 });
@@ -561,7 +584,7 @@ impl AgentLoop for BasicLoop {
                 // 的 `every_request_variant_is_handled` 会走到这里，它安全**只因为**
                 // 不触发 model 调用（`MockModel` 空队列 `remove(0)` 会 panic）。
                 if fixed < trigger && estimated + fixed > trigger {
-                    run_compaction(ctx, rounds).await?;
+                    run_compaction(ctx, rounds, &mut compaction_usage).await?;
                 }
             }
 
@@ -574,7 +597,7 @@ impl AgentLoop for BasicLoop {
             // 轮询）总是先行命中并提前返回，本分支几乎不可达；唯一窗口是 Step 4b
             // 上下文压缩 `await` 期间 Abort 才到达 —— 探针已过、消息刚到。保留它是
             // 为了在压缩耗时较长时不至于漏掉一次中止（宁可晚一轮，不可丢失）。
-            match drain_boundary(ctx, rounds).await? {
+            match drain_boundary(ctx, rounds, &mut compaction_usage).await? {
                 BoundaryDrain::Empty | BoundaryDrain::Consumed => {}
                 BoundaryDrain::Aborted => {
                     emit(
@@ -590,6 +613,8 @@ impl AgentLoop for BasicLoop {
                     return Ok(RunResult {
                         stop_reason: StopReason::Cancelled,
                         usage: total_usage,
+                        cache_reading,
+                        compaction_usage: compaction_usage.clone(),
                         rounds,
                         final_message: None,
                     });
@@ -693,6 +718,8 @@ impl AgentLoop for BasicLoop {
                     return Ok(RunResult {
                         stop_reason: StopReason::Cancelled,
                         usage: total_usage,
+                        cache_reading,
+                        compaction_usage: compaction_usage.clone(),
                         rounds,
                         final_message,
                     });
@@ -716,6 +743,12 @@ impl AgentLoop for BasicLoop {
             // 先复制本轮 usage 再累加：`RoundUsage` 上报的是**单轮**消耗，
             // 而 `total_usage` 是回合累计（会随终局事件一起发出）。
             let round_usage = response.usage.clone();
+            if let Some((hit, miss)) = round_usage.cache_split() {
+                cache_reading = Some(match cache_reading {
+                    Some((h, m)) => (h.saturating_add(hit), m.saturating_add(miss)),
+                    None => (hit, miss),
+                });
+            }
             total_usage = total_usage + response.usage;
             // 逐轮 usage 上报：位置固定在 `RoundStarted` 之后、`ToolCall` / `RunFinished`
             // 之前 —— 每条模型轮恰好一条。走自由函数 `emit()`（异步慢路径），不得走
@@ -809,7 +842,7 @@ impl AgentLoop for BasicLoop {
                     //
                     // **收场前也要拉一次轮边界** —— 与下面的正常收场路径同理由：
                     // 这段窗口内到达的插话不能随边界源一起销毁。
-                    match drain_boundary(ctx, rounds).await? {
+                    match drain_boundary(ctx, rounds, &mut compaction_usage).await? {
                         BoundaryDrain::Empty => {}
                         // 取到插话 ⇒ 先把它交给模型看（模型还没说完，这正是它该看到的东西）。
                         BoundaryDrain::Consumed => continue,
@@ -827,6 +860,8 @@ impl AgentLoop for BasicLoop {
                             return Ok(RunResult {
                                 stop_reason: StopReason::Cancelled,
                                 usage: total_usage,
+                                cache_reading,
+                                compaction_usage: compaction_usage.clone(),
                                 rounds,
                                 final_message: None,
                             });
@@ -850,6 +885,8 @@ impl AgentLoop for BasicLoop {
                     return Ok(RunResult {
                         stop_reason: StopReason::Truncated,
                         usage: total_usage,
+                        cache_reading,
+                        compaction_usage: compaction_usage.clone(),
                         rounds,
                         final_message: final_msg,
                     });
@@ -943,7 +980,7 @@ impl AgentLoop for BasicLoop {
                 // 边界源的消息）。
                 //
                 // 取到插话就**继续本轮循环**：模型下一轮就能看到它，用户不必等整个回合结束。
-                match drain_boundary(ctx, rounds).await? {
+                match drain_boundary(ctx, rounds, &mut compaction_usage).await? {
                     BoundaryDrain::Empty => {
                         // 【ADR-0055】还有子 agent 在跑 ⇒ **不许收场**。
                         //
@@ -951,7 +988,7 @@ impl AgentLoop for BasicLoop {
                         // 结果只能进跨回合投递表、等用户下次敲字 —— 提示词里那句
                         // “结果会在下一回合送到” 在这条路径上是假的。
                         if has_running_subagents(ctx) {
-                            match wait_for_subagents(ctx, rounds).await? {
+                            match wait_for_subagents(ctx, rounds, &mut compaction_usage).await? {
                                 // 有结果/插话到了 ⇒ 把它作为同一回合的下一轮输入。
                                 SubagentWait::Arrived => continue,
                                 SubagentWait::Aborted => {
@@ -968,6 +1005,8 @@ impl AgentLoop for BasicLoop {
                                     return Ok(RunResult {
                                         stop_reason: StopReason::Cancelled,
                                         usage: total_usage,
+                                        cache_reading,
+                                        compaction_usage: compaction_usage.clone(),
                                         rounds,
                                         final_message: None,
                                     });
@@ -993,6 +1032,8 @@ impl AgentLoop for BasicLoop {
                         return Ok(RunResult {
                             stop_reason: StopReason::Cancelled,
                             usage: total_usage,
+                            cache_reading,
+                            compaction_usage: compaction_usage.clone(),
                             rounds,
                             final_message: None,
                         });
@@ -1022,6 +1063,8 @@ impl AgentLoop for BasicLoop {
                 return Ok(RunResult {
                     stop_reason,
                     usage: total_usage,
+                    cache_reading,
+                    compaction_usage: compaction_usage.clone(),
                     rounds,
                     final_message: final_msg,
                 });
@@ -1614,6 +1657,71 @@ mod tests {
     /// - 删掉 Step 7 的 `emit` ⇒ 本用例红（`turn_usages` 为空）。
     /// - 把 `round_usage` 换成 `total_usage.clone()` ⇒ 第 2 轮断言红（累计 `Some(14)` ≠
     ///   单轮 `Some(7)`）。
+    /// **M9 变异测试**：`cache_reading` 必须**逐轮**累加，不得从聚合 `usage` 派生。
+    ///
+    /// 构造（两轮）：第 1 轮 `(input=1000, hit=Some(900))`、第 2 轮 `(input=1000, hit=None)`。
+    /// 正确（逐轮累加）：`(900, 100)` ⇒ 命中率 90%。
+    /// 错误（聚合派生 `input − hit`）：`input=2000, hit=900` ⇒ `(900, 1100)` ⇒ 45%。
+    ///
+    /// 变异：删掉 `run_turn` 里 `round_usage.cache_split()` 那段累加 ⇒
+    /// `cache_reading` 变 `None`（或从聚合派生后变 `(900,1100)`）⇒ 本用例变红。
+    #[tokio::test]
+    async fn cache_reading_accumulates_per_round_not_from_total() {
+        let (spy, calls) = SpyTool::new();
+        let registry = ToolRegistry::build(vec![Box::new(spy)]).unwrap();
+        let model = UsageModel::new();
+        model.push_tool_call(
+            "spy",
+            serde_json::json!({}),
+            Usage {
+                input_tokens: 1000,
+                output_tokens: 10,
+                prompt_cache_hit_tokens: Some(900),
+                ..Default::default()
+            },
+        );
+        model.push_text(
+            "done",
+            Usage {
+                input_tokens: 1000,
+                output_tokens: 20,
+                prompt_cache_hit_tokens: None, // 第 2 轮不报
+                ..Default::default()
+            },
+        );
+
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let result = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                limits_with_window(1000, 0),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "前置：跑满两轮");
+
+        // 回合累计：两轮 input 相加，hit 只算上报的那轮 —— 这就是「不对称」的来源。
+        assert_eq!(
+            result.usage.prompt_cache_hit_tokens,
+            Some(900),
+            "聚合后的 hit 只含上报轮"
+        );
+        assert_eq!(result.usage.input_tokens, 2000, "聚合后的 input 含两轮");
+
+        assert_eq!(
+            result.cache_reading,
+            Some((900, 100)),
+            "必须逐轮累加 (900, 100)；从聚合 input 派生会错成 (900, 1100)"
+        );
+    }
+
     /// - 把 emit 挪到 `RoundStarted` 之前 ⇒ 顺序断言红。
     #[tokio::test]
     async fn round_usage_emitted_once_per_turn_round() {
@@ -1765,7 +1873,7 @@ mod tests {
         let mut session = MemorySession::new();
         seed_large_session(&mut session).await;
         let mut events = CollectingSink::new();
-        {
+        let result = {
             let mut ctx = make_ctx(
                 &model,
                 &registry,
@@ -1776,8 +1884,23 @@ mod tests {
             BasicLoop
                 .run_turn(AgentInput::text("go"), &mut ctx)
                 .await
-                .unwrap();
-        }
+                .unwrap()
+        };
+
+        // `compaction_usage` 必须**独立**于 `usage` 记账：前者是压缩，后者只含主对话轮。
+        // 变异：把 `run_compaction` 里的 `*compaction = ...` 删掉 ⇒ 本条变红（零值）。
+        assert_eq!(
+            result.compaction_usage, summary_usage,
+            "本回合压缩消耗必须记进 RunResult.compaction_usage"
+        );
+        assert_eq!(
+            result.usage, turn_usage,
+            "RunResult.usage 不得吞掉压缩消耗（只含主对话轮）"
+        );
+        assert_ne!(
+            result.compaction_usage, result.usage,
+            "两者是兄弟字段，压缩时必然不同"
+        );
 
         let compaction = compaction_usages(&events);
         assert_eq!(
@@ -4108,7 +4231,7 @@ mod tests {
     /// ② 回合**继续跑了一轮**（`rounds == 2`）⇒ 模型下一轮就能看到它；
     /// ③ 插话出现在**第二轮**的模型请求里。
     ///
-    /// 变异：把收场前的 `drain_boundary(ctx, rounds).await?` 整段删掉 ⇒
+    /// 变异：把收场前的 `drain_boundary(ctx, rounds, &mut compaction_usage).await?` 整段删掉 ⇒
     /// ①「会话里有插话」与 ③「第二轮请求含插话」两条断言同时变红。
     #[tokio::test]
     async fn steer_arriving_during_final_answer_is_not_lost() {

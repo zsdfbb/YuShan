@@ -1751,7 +1751,7 @@ async fn persist_single_turn(
     result: &RunResult,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stats = seed_stats(wiring);
-    stats.record(&result.usage);
+    stats.record_result(result);
     let model = wiring.model_id().map(str::to_string);
     finalize_turn_meta(
         wiring,
@@ -1921,7 +1921,14 @@ async fn run_single_turn(
     // 子 agent 的 usage **上卷**：预算独立、记账上卷（ADR-0029 决策）。
     let outcome = match outcome {
         Ok(mut r) => {
-            r.usage = r.usage + totals.drain();
+            let (subagent, subagent_cache) = totals.drain();
+            if let Some((hit, miss)) = subagent_cache {
+                r.cache_reading = Some(match r.cache_reading {
+                    Some((h, m)) => (h.saturating_add(hit), m.saturating_add(miss)),
+                    None => (hit, miss),
+                });
+            }
+            r.usage = r.usage + subagent;
             // 空产出在**一次性模式**下必须留一行可见说明（`-p` 只打文本增量，否则 stderr
             // 与 stdout 都为空 = 静默）。退出码由 [`single_turn_exit_code`] 给 `1`。
             if r.stop_reason == StopReason::NoOutput {
@@ -4238,18 +4245,24 @@ mod tests {
         let cancelled = RunResult {
             stop_reason: StopReason::Cancelled,
             usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 0,
             final_message: None,
         };
         let completed = RunResult {
             stop_reason: StopReason::Completed,
             usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 1,
             final_message: None,
         };
         let no_output = RunResult {
             stop_reason: StopReason::NoOutput,
             usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 1,
             final_message: None,
         };
@@ -5331,6 +5344,8 @@ mod tests {
                 output_tokens: 5,
                 ..Default::default()
             },
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 1,
             final_message: None,
         };

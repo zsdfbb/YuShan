@@ -92,6 +92,18 @@ pub struct CodingView {
     pub available_models: Vec<ModelEntry>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    /// 缓存读数 `(hit, miss)`；`None` = provider 从未上报（显示 `-`，不是 `0%`）。
+    ///
+    /// **已投影的显示值**："provider 是否上报"的解释权在 `ys-core`，
+    /// 渲染层不做这个判断，只拿聚合好的元组。
+    pub cache_tokens: Option<(u32, u32)>,
+    /// 命中率整数百分比；`None` = 无读数（显示 `-`）。
+    pub cache_hit_pct: Option<u8>,
+    /// 压缩消耗（已投影的显示结论）；`None` = 本 run 没压缩过。
+    ///
+    /// 元组为 `(压缩 input, 压缩 output)`，与主对话轮的
+    /// `total_input_tokens` / `total_output_tokens` **并列**而非子集。
+    pub compaction_tokens: Option<(u32, u32)>,
     pub turn_count: u32,
     /// 会话起点（`session_duration_str` 由此派生；`/new` 后换新）。
     pub session_started: Instant,
@@ -141,6 +153,9 @@ impl Default for CodingView {
             available_models: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            cache_tokens: None,
+            cache_hit_pct: None,
+            compaction_tokens: None,
             turn_count: 0,
             session_started: Instant::now(),
             executed: std::time::Duration::ZERO,
@@ -218,6 +233,9 @@ impl CodingView {
             }],
             total_input_tokens: 0,
             total_output_tokens: 0,
+            cache_tokens: None,
+            cache_hit_pct: None,
+            compaction_tokens: None,
             turn_count: 0,
             session_started: Instant::now(),
             executed: std::time::Duration::ZERO,

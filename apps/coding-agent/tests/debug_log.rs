@@ -862,6 +862,16 @@ fn t2_json_is_additive_and_filtered_output_matches_baseline_golden() {
         !stdout.contains("reasoning_tokens"),
         "provider 未上报时不得出现 reasoning_tokens 键\nstdout:\n{stdout}"
     );
+    // 同一契约适用于缓存桶：`None`（未上报）不写键 —— 因此 `prompt_cache_miss_tokens`
+    // （恒 `None`）**永不出现**，`prompt_cache_hit_tokens` 只在有读数时出现。
+    assert!(
+        !stdout.contains("prompt_cache_miss_tokens"),
+        "`miss` 恒 `None`，不得写出该键\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("prompt_cache_hit_tokens"),
+        "本轮 provider 未上报缓存明细 ⇒ 不得写出该键\nstdout:\n{stdout}"
+    );
 
     // 过滤 `RoundUsage` 行后与基线二进制生成的 golden 逐字节相同。
     let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
@@ -884,6 +894,8 @@ fn t2_json_is_additive_and_filtered_output_matches_baseline_golden() {
 ///
 /// 必须用**改动前**（基线 `7987b4b`）构建的二进制运行；用本工作树二进制会
 /// 把被测实现自己的输出固化成「基线」，恒等比较就失去意义。
+///
+/// golden 存的是**过滤后**的形态（`without_round_usage`），与 T2 的比较对象同形。
 #[test]
 #[ignore = "手动生成基线 golden：需要 7987b4b 构建出的二进制"]
 fn write_baseline_golden() {
@@ -891,10 +903,11 @@ fn write_baseline_golden() {
         .map(PathBuf::from)
         .expect("必须设置 YUSHAN_BASELINE_BIN 指向基线二进制");
     let (out, _sandbox) = t2_run(&bin);
+    let golden = without_round_usage(&out.stdout);
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, &out.stdout).unwrap();
-    eprintln!("wrote {} ({} bytes)", path.display(), out.stdout.len());
+    std::fs::write(&path, &golden).unwrap();
+    eprintln!("wrote {} ({} bytes)", path.display(), golden.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -972,12 +985,13 @@ fn t7_compaction_and_turn_usage_appear_together() {
         usage,
         // `Usage` 的序列化形态只有这些字段：`total_tokens` 由 provider 上报，
         // 但落进 `Usage` 时已折算为 input + output，不再单独保留键。
+        //
+        // 缓存两桶本轮**都没上报**（`UsageSpec` 不带缓存字段）⇒ `None` ⇒
+        // `skip_serializing_if` 不写键。`miss` 恒 `None`，永不出现。
         &json!({
             "input_tokens": 111,
             "output_tokens": 22,
             "reasoning_tokens": 5,
-            "prompt_cache_hit_tokens": 0,
-            "prompt_cache_miss_tokens": 0,
         }),
         "压缩 usage 必须等于摘要调用的 usage：{usage}"
     );

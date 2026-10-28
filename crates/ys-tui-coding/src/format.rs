@@ -16,6 +16,21 @@ pub fn format_tokens(n: u32) -> String {
     }
 }
 
+/// token 计数的显示值：**0 写成 `-`**（状态行与 `/status` 的 tokens 行共用）。
+///
+/// 「有没有读数」这个判断不在渲染层 —— `-` 只表示「这个计数是零」，
+/// 而「provider 未上报」由 `cache` 行单独说明。
+///
+/// 变异：把 `n == 0` 分支去掉 ⇒ 无读数的会话会被渲染成 `↑0 ↓0`
+/// （把「没测到」当成「用了 0」），`draw` 与 `commands` 两侧的断言变红。
+pub fn format_tokens_or_dash(n: u32) -> String {
+    if n == 0 {
+        "-".to_string()
+    } else {
+        format_tokens(n)
+    }
+}
+
 /// 会话时长：`Ns` / `Nm Ms` / `Nh Mm`（设计 §2.2 的 `1m23s` 形态）。
 ///
 /// 最小单位是秒 —— 秒以下的精度对「会话开了多久」没有意义。
@@ -41,6 +56,16 @@ mod tests {
         assert_eq!(format_tokens(1_000), "1.0k");
         assert_eq!(format_tokens(1_247), "1.2k");
         assert_eq!(format_tokens(1_000_000), "1.0M");
+    }
+
+    /// `format_tokens_or_dash`：**零写成 `-`**、非零照旧走 `format_tokens`。
+    ///
+    /// 变异：去掉 `n == 0` 分支 ⇒ 首次断言变红（`0` 会渲染成「0」）。
+    #[test]
+    fn test_format_tokens_or_dash() {
+        assert_eq!(format_tokens_or_dash(0), "-", "零 = 无读数，不是 0");
+        assert_eq!(format_tokens_or_dash(1), "1");
+        assert_eq!(format_tokens_or_dash(1_200), "1.2k", "非零走原阶梯");
     }
 
     /// 阶梯**边界**必须钉死（进位点两侧）。

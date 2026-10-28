@@ -765,12 +765,35 @@ fn status_text(app: &App, width: usize) -> String {
         }
         segs.push(format!("{:.0}s", app.turn_elapsed_secs()));
     }
-    if app.view.total_input_tokens > 0 || app.view.total_output_tokens > 0 {
+    // token 段：**只要有任何读数就显示** ——「总量为 0」不是隐藏条件，
+    // 否则全程不上报 usage 的会话永远看不到用量。
+    //
+    // 隐藏条件 = 「完全无读数」：既没 token 总量、也没缓存读数、也没压缩消耗。
+    // 无读数时两侧写 `-`。
+    let has_reading = app.view.cache_tokens.is_some()
+        || app.view.compaction_tokens.is_some()
+        || app.view.total_input_tokens > 0
+        || app.view.total_output_tokens > 0;
+    if has_reading {
         segs.push(format!(
             "↑{} ↓{}",
-            crate::format::format_tokens(app.view.total_input_tokens),
-            crate::format::format_tokens(app.view.total_output_tokens),
+            crate::format::format_tokens_or_dash(app.view.total_input_tokens),
+            crate::format::format_tokens_or_dash(app.view.total_output_tokens),
         ));
+        // 缓存子段：无读数不追加（`↑X ↓Y` 已足够）；有读数但算不出百分比 ⇒ `-`。
+        if app.view.cache_tokens.is_some() {
+            match app.view.cache_hit_pct {
+                Some(pct) => segs.push(format!("缓存 {pct}%")),
+                None => segs.push("缓存 -".to_string()),
+            }
+        }
+        // 压缩与主对话轮**并列**，单独成段；全零（没压过 / 压失败）时省略。
+        if let Some((input, output)) = app.view.compaction_tokens {
+            segs.push(format!(
+                "压缩 {}",
+                crate::format::format_tokens(input.saturating_add(output))
+            ));
+        }
     }
     if app.view.turn_count > 0 {
         segs.push(format!("{} 轮", app.view.turn_count));
@@ -2395,6 +2418,65 @@ mod tests {
         let txt = status_text(&app, 200);
         assert!(!txt.contains("第 5 轮"), "回合外不得显示轮号：{txt}");
         assert!(txt.contains("deepseek-chat"), "{txt}");
+    }
+
+    /// 没压过 / 没缓存读数 / 没 token 总量 ⇒ token 段**整段不出现**。
+    ///
+    /// 与下面的 [`test_status_shows_token_segment_when_there_is_any_reading`]
+    /// 形成对照：两者各自的隐藏条件边。
+    ///
+    /// 变异：把隐藏条件改回「token 总量为 0」（不看 `cache_tokens`）⇒
+    /// 本用例仍绿、但下一个用例变红。
+    #[test]
+    fn test_status_hides_token_segment_when_no_reading_at_all() {
+        let app = app_with(CodingView::for_test());
+        let txt = status_text(&app, 200);
+        assert!(!txt.contains('↑'), "无任何读数 ⇒ 不显示 token 段：{txt}");
+    }
+
+    /// **无 token 总量但有缓存读数** ⇒ 状态行**不得整段隐藏**，
+    /// 且两侧显示 `-`（不是「0」—— 没有可信数字时不要数）。
+    ///
+    /// 这是「全程无读数会话看不到用量」那条缺口的正面用例：
+    /// 只要 provider 报过一次缓存，即便主轮 input/output 全为 0 也要显示。
+    #[test]
+    fn test_status_shows_token_segment_when_there_is_any_reading() {
+        let app = app_with(CodingView {
+            cache_tokens: Some((900, 100)),
+            cache_hit_pct: Some(90),
+            ..CodingView::for_test()
+        });
+        let txt = status_text(&app, 200);
+        assert!(txt.contains("↑- ↓-"), "无总量时两侧写 -：{txt}");
+        assert!(txt.contains("缓存 90%"), "命中率子段：{txt}");
+        assert!(!txt.contains("压缩"), "没压过不追加压缩段：{txt}");
+    }
+
+    /// 有缓存读数但算不出百分比（分母全零）⇒ `缓存 -`，**不是** `0%`、
+    /// 也不是「不追加」。
+    #[test]
+    fn test_status_cache_segment_without_pct_renders_dash() {
+        let app = app_with(CodingView {
+            cache_tokens: Some((0, 0)),
+            cache_hit_pct: None,
+            ..CodingView::for_test()
+        });
+        let txt = status_text(&app, 200);
+        assert!(txt.contains("缓存 -"), "算不出百分比 ⇒ `缓存 -`：{txt}");
+    }
+
+    /// 压缩消耗与主对话轮**并列**成段，数值取 `input + output`。
+    #[test]
+    fn test_status_shows_compaction_segment() {
+        let app = app_with(CodingView {
+            total_input_tokens: 100,
+            total_output_tokens: 10,
+            compaction_tokens: Some((4_000, 600)),
+            ..CodingView::for_test()
+        });
+        let txt = status_text(&app, 200);
+        assert!(txt.contains("↑100 ↓10"), "主轮 token 段：{txt}");
+        assert!(txt.contains("压缩 4.6k"), "压缩段取 input+output：{txt}");
     }
 
     #[test]

@@ -731,11 +731,21 @@ pub fn spec_line(spec: &CommandSpec) -> String {
 /// `/status` 的正文（数据全部来自 [`CodingView`]）。
 pub fn status_text(view: &CodingView) -> String {
     let dash = || "-".to_string();
+    // token 行：**无读数不省略**，两侧写 `-`（省略等于把「没测到」藏起来）。
     let tokens = format!(
         "↑{} ↓{}",
-        crate::format::format_tokens(view.total_input_tokens),
-        crate::format::format_tokens(view.total_output_tokens),
+        crate::format::format_tokens_or_dash(view.total_input_tokens),
+        crate::format::format_tokens_or_dash(view.total_output_tokens),
     );
+    // 缓存行：三态分开报 —— 无读数写明「provider 未上报」，
+    // 有读数但算不出百分比（全零分母）给 `-`，其余给整数百分比。
+    let cache = match view.cache_tokens {
+        None => "- (provider 未上报)".to_string(),
+        Some((hit, miss)) => match view.cache_hit_pct {
+            Some(pct) => format!("{hit} / {miss}（{pct}%）"),
+            None => format!("{hit} / {miss}（-）"),
+        },
+    };
     let logged_in = if view.logged_in_providers.is_empty() {
         dash()
     } else {
@@ -774,6 +784,18 @@ pub fn status_text(view: &CodingView) -> String {
         format!("model      {}", view.model_label()),
         format!("effort: {effort}"),
         format!("tokens     {tokens}"),
+        format!("cache      {cache}"),
+    ]
+    .into_iter()
+    // 压缩行**仅在有消耗时出现** —— 没压过的会话不必多一行全程为 `-` 的字段。
+    .chain(view.compaction_tokens.map(|(input, output)| {
+        format!(
+            "compaction ↑{} ↓{}",
+            crate::format::format_tokens_or_dash(input),
+            crate::format::format_tokens_or_dash(output)
+        )
+    }))
+    .chain([
         format!("turns      {}", view.turn_count),
         format!("messages   {}", view.message_count),
         // **两个时长口径**：`duration` = 存活（进程起止），`executed` = 执行（Σ 回合实际占用）。
@@ -794,7 +816,8 @@ pub fn status_text(view: &CodingView) -> String {
         format!("tools      {tools}"),
         format!("skills     {skills}"),
         format!("cwd        {}", view.cwd.display()),
-    ]
+    ])
+    .collect::<Vec<_>>()
     .join("\n")
 }
 
@@ -1238,6 +1261,92 @@ mod tests {
         assert!(
             s.starts_with("effort: default（用法：/effort "),
             "None 显示 default：{s}"
+        );
+    }
+
+    /// `/status` 的缓存行：三态必须分开报 —— 无读数写「provider 未上报」，
+    /// 有读数给 `hit / miss（pct%）`，算不出百分比给 `-`。
+    ///
+    /// 变异：把 `None` 分支也拼成 `hit / miss`（或直接省略该行）⇒
+    /// 第一条断言变红 —— 用户会以为「没测到」就是「0 命中」。
+    #[test]
+    fn status_text_reports_cache_readings_and_unreported() {
+        let line_of = |v: &CodingView, key: &str| {
+            status_text(v)
+                .lines()
+                .find(|l| l.starts_with(key))
+                .map(|l| l.to_string())
+        };
+
+        // ① 无读数：明确写「provider 未上报」，不省略行。
+        let view = CodingView::for_test();
+        let cache = line_of(&view, "cache").expect("无读数也要有 cache 行");
+        assert!(
+            cache.contains("provider 未上报"),
+            "无读数必须写明原因：{cache}"
+        );
+
+        // ② 有读数 + 可算百分比。
+        let view = CodingView {
+            cache_tokens: Some((900, 100)),
+            cache_hit_pct: Some(90),
+            ..CodingView::for_test()
+        };
+        assert_eq!(
+            line_of(&view, "cache").unwrap(),
+            "cache      900 / 100（90%）"
+        );
+
+        // ③ 有读数但算不出百分比。
+        let view = CodingView {
+            cache_tokens: Some((0, 0)),
+            cache_hit_pct: None,
+            ..CodingView::for_test()
+        };
+        assert_eq!(line_of(&view, "cache").unwrap(), "cache      0 / 0（-）");
+    }
+
+    /// `/status` 的 tokens 行：**无读数不省略**（写 `-`），有读数照旧。
+    #[test]
+    fn status_text_tokens_line_uses_dash_without_reading() {
+        let line_of = |v: &CodingView| {
+            status_text(v)
+                .lines()
+                .find(|l| l.starts_with("tokens"))
+                .expect("`/status` 应有 tokens 行")
+                .to_string()
+        };
+
+        let view = CodingView::for_test();
+        assert_eq!(
+            line_of(&view),
+            "tokens     ↑- ↓-",
+            "无读数写 - 而不是藏起来"
+        );
+
+        let view = CodingView {
+            total_input_tokens: 1_200,
+            total_output_tokens: 345,
+            ..CodingView::for_test()
+        };
+        assert_eq!(line_of(&view), "tokens     ↑1.2k ↓345");
+    }
+
+    /// `/status` 的压缩行：**仅在有消耗时出现**（没压过的会话不多一行全 `-`）。
+    #[test]
+    fn status_text_compaction_line_only_when_compacted() {
+        let has = |v: &CodingView| status_text(v).lines().any(|l| l.starts_with("compaction"));
+
+        assert!(!has(&CodingView::for_test()), "没压过 ⇒ 无 compaction 行");
+
+        let view = CodingView {
+            compaction_tokens: Some((4_000, 600)),
+            ..CodingView::for_test()
+        };
+        let text = status_text(&view);
+        assert!(
+            text.contains("compaction ↑4.0k ↓600"),
+            "压过 ⇒ 报两个计数：{text}"
         );
     }
 

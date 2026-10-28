@@ -123,7 +123,11 @@ pub struct UsageTotals {
     input: AtomicU64,
     output: AtomicU64,
     hit: AtomicU64,
+    /// 未命中累计。与 `hit` 配对：**只在 `hit` 上报时才累加对应的 miss**，
+    /// 不可从聚合后的 `input − hit` 派生（那会把没上报的子调用整个 input 算成未命中）。
     miss: AtomicU64,
+    /// 是否有任一子调用上报了缓存命中读数（`Some(0)` 也算上报）。
+    hit_reported: AtomicBool,
     /// 推理 token 累计；仅当至少一次子调用上报了 `Some(_)` 时才有意义
     /// （是否上报由 `reasoning_reported` 记录）。
     reasoning: AtomicU64,
@@ -132,16 +136,29 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    pub fn add(&self, u: &Usage) {
+    /// 记账一个**子 agent 回合结果**。
+    ///
+    /// `cache` 取 `RunResult::cache_reading`（loop 的**逐轮**累加值），
+    /// **不得**从 `run.usage` 派生：那是回合聚合，`input_tokens` 对没上报的轮也累加过，
+    /// 而 `hit` 缺席时不参与相加 —— 减法会把缺报轮整段算成未命中。
+    pub fn add_run(&self, run: &ys_loop::RunResult) {
+        self.add(&run.usage, run.cache_reading);
+    }
+
+    /// 记账一份用量 + 一份**显式的**缓存读数（`None` = 没有读数）。
+    ///
+    /// `hit` 与 `miss` 必须在**同一条件**下累加，否则聚合后无法靠减法还原。
+    pub fn add(&self, u: &Usage, cache: Option<(u32, u32)>) {
         self.input
             .fetch_add(u.input_tokens as u64, Ordering::Relaxed);
         self.output
             .fetch_add(u.output_tokens as u64, Ordering::Relaxed);
-        self.hit
-            .fetch_add(u.prompt_cache_hit_tokens as u64, Ordering::Relaxed);
-        self.miss
-            .fetch_add(u.prompt_cache_miss_tokens as u64, Ordering::Relaxed);
         // 只有上报了才累加并置位：`None` = 未上报，`Some(0)` = 真 0，两者不可折叠。
+        if let Some((h, m)) = cache {
+            self.hit.fetch_add(h as u64, Ordering::Relaxed);
+            self.miss.fetch_add(m as u64, Ordering::Relaxed);
+            self.hit_reported.store(true, Ordering::Relaxed);
+        }
         if let Some(v) = u.reasoning_tokens {
             self.reasoning.fetch_add(v as u64, Ordering::Relaxed);
             self.reasoning_reported.store(true, Ordering::Relaxed);
@@ -150,19 +167,28 @@ impl UsageTotals {
 
     /// 取走累计值并清零（回合末一次）。
     ///
-    /// `reasoning_tokens`：任何子调用报过 ⇒ `Some(累计)`（含累计为 0 的情形）；
-    /// 一次都没报过 ⇒ `None`。不能像其他字段那样恒写 0 —— 那会把「未上报」与「真 0」
-    /// 折叠，且会把已上报的推理 token 静默丢弃。
-    pub fn drain(&self) -> Usage {
+    /// `prompt_cache_hit_tokens`：任何子调用报过 ⇒ `Some(累计)`（含累计为 0 的情形）；
+    /// 一次都没报过 ⇒ `None`。
+    /// `prompt_cache_miss_tokens` 恒 `None` —— 它等于 `input − hit`，不落地。
+    /// `reasoning_tokens` 同 `hit`：任何子调用报过 ⇒ `Some(累计)`；一次都没报过 ⇒ `None`。
+    /// 两者都不能恒写 0 —— 那会把「未上报」与「真 0」折叠，且会把已上报的值静默丢弃。
+    pub fn drain(&self) -> (Usage, Option<(u32, u32)>) {
+        let hit_reported = self.hit_reported.swap(false, Ordering::Relaxed);
+        let hit = self.hit.swap(0, Ordering::Relaxed) as u32;
+        let miss = self.miss.swap(0, Ordering::Relaxed) as u32;
         let reported = self.reasoning_reported.swap(false, Ordering::Relaxed);
         let reasoning = self.reasoning.swap(0, Ordering::Relaxed) as u32;
-        Usage {
+        let usage = Usage {
             input_tokens: self.input.swap(0, Ordering::Relaxed) as u32,
             output_tokens: self.output.swap(0, Ordering::Relaxed) as u32,
-            prompt_cache_hit_tokens: self.hit.swap(0, Ordering::Relaxed) as u32,
-            prompt_cache_miss_tokens: self.miss.swap(0, Ordering::Relaxed) as u32,
+            prompt_cache_hit_tokens: hit_reported.then_some(hit),
+            prompt_cache_miss_tokens: None,
             reasoning_tokens: reported.then_some(reasoning),
-        }
+        };
+        // `miss` 必须**单独**带出：`usage.cache_split()` 会拿聚合后的 `input`
+        // 去减，而 `input` 对没上报的子调用也累加过 —— 那会把它们的整个 input
+        // 算成未命中（与 `RunResult::cache_reading` 同一个坑）。
+        (usage, hit_reported.then_some((hit, miss)))
     }
 }
 
@@ -1057,7 +1083,7 @@ impl ChildTask {
 
         match result {
             Ok(run) => {
-                self.totals.add(&run.usage);
+                self.totals.add_run(&run);
                 let summary =
                     ensure_files_section(&transcript_summary(&session, run.final_message.as_ref()));
                 let stop_reason = run.stop_reason;
@@ -1638,27 +1664,99 @@ mod tests {
     #[test]
     fn usage_totals_accumulate_and_drain() {
         let t = UsageTotals::default();
-        t.add(&Usage {
+        let u = Usage {
             input_tokens: 3,
             output_tokens: 2,
-            prompt_cache_hit_tokens: 1,
-            prompt_cache_miss_tokens: 2,
+            prompt_cache_hit_tokens: Some(1),
+            prompt_cache_miss_tokens: None,
             reasoning_tokens: None,
-        });
-        t.add(&Usage {
+        };
+        t.add(&u, u.cache_split());
+        let u = Usage {
             input_tokens: 4,
             output_tokens: 5,
-            prompt_cache_hit_tokens: 6,
-            prompt_cache_miss_tokens: 7,
+            prompt_cache_hit_tokens: Some(6),
+            prompt_cache_miss_tokens: None,
             reasoning_tokens: None,
-        });
-        let d = t.drain();
+        };
+        t.add(&u, u.cache_split());
+        let (d, cache) = t.drain();
         assert_eq!((d.input_tokens, d.output_tokens), (7, 7));
+        assert_eq!(d.prompt_cache_hit_tokens, Some(7), "只累加上报过的轮");
         assert_eq!(
-            (d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens),
-            (7, 9)
+            d.prompt_cache_miss_tokens, None,
+            "`miss` 恒 `None`：由 `input − hit` 推导，不落地"
         );
-        assert_eq!(t.drain().input_tokens, 0, "drain 后清零");
+        // 该次调用 miss = saturating_sub(input − hit)：
+        //   (input=3, hit=1) ⇒ miss=2 ；(input=4, hit=6) ⇒ miss=0（provider 异常，饱和）
+        // 故累加结果是 (1+6, 2+0) = (7, 2)。
+        // 若从聚合 input 派生（7 − 7 = 0）会错成 (7, 0)。
+        assert_eq!(
+            cache,
+            Some((7, 2)),
+            "上卷的缓存读数必须是逐次累加的 (hit, miss)，不能从聚合 input 派生"
+        );
+        assert_eq!(t.drain().0.input_tokens, 0, "drain 后清零");
+    }
+
+    /// **M8 变异测试**：混合上报时 `(hit, miss)` 必须逐次累加，不能从聚合 `input` 派生。
+    ///
+    /// 构造：子调用 A `(input=1000, hit=900)`、B `(input=1000, hit=None)`。
+    /// - 正确（逐次累加）：`(900, 100)` ⇒ 命中率 90%
+    /// - 若从聚合 `input` 派生：`input=2000, hit=900` ⇒ `(900, 1100)` ⇒ 命中率 45%
+    ///
+    /// 变异：把 `drain` 的第二个返回值改成 `usage.cache_split()`
+    /// （即从聚合 `Usage` 派生）⇒ 本用例从 `(900,100)` 变 `(900,1100)` ⇒ 变红。
+    #[test]
+    fn usage_totals_cache_readings_accumulate_per_call() {
+        let t = UsageTotals::default();
+        let u = Usage {
+            input_tokens: 1000,
+            prompt_cache_hit_tokens: Some(900),
+            ..Default::default()
+        };
+        t.add(&u, u.cache_split());
+        let u = Usage {
+            input_tokens: 1000,
+            ..Default::default() // hit = None：未上报
+        };
+        t.add(&u, u.cache_split());
+        let (usage, cache) = t.drain();
+        assert_eq!(usage.input_tokens, 2000, "input 对未上报的子调用也累加");
+        assert_eq!(
+            cache,
+            Some((900, 100)),
+            "必须逐次累加：未上报的子调用不得把其 input 算成未命中"
+        );
+    }
+
+    /// 子调用全都不报缓存命中 ⇒ 上卷为 `None`（未上报，不得伪造 0）。
+    ///
+    /// 变异说明：把 `drain` 的 `prompt_cache_hit_tokens` 改成恒 `Some(hit)` ⇒ 本测试变红。
+    #[test]
+    fn usage_totals_cache_hit_none_when_unreported() {
+        let t = UsageTotals::default();
+        let u = Usage {
+            input_tokens: 10,
+            ..Default::default()
+        };
+        t.add(&u, u.cache_split());
+        assert_eq!(t.drain().0.prompt_cache_hit_tokens, None);
+    }
+
+    /// 有一个子调用报 `Some(0)` ⇒ 上卷为 `Some(0)`（真 0 不能折叠成 `None`）。
+    ///
+    /// 变异说明：`add` 里按 `v > 0` 而非 `Some(_)` 置位 ⇒ 本测试变红；
+    /// `drain` 里写成 `(hit > 0).then_some(...)` ⇒ 本测试同样变红。
+    #[test]
+    fn usage_totals_cache_hit_keeps_reported_zero() {
+        let t = UsageTotals::default();
+        let u = Usage {
+            prompt_cache_hit_tokens: Some(0),
+            ..Default::default()
+        };
+        t.add(&u, u.cache_split());
+        assert_eq!(t.drain().0.prompt_cache_hit_tokens, Some(0));
     }
 
     /// 子调用全都不报 reasoning ⇒ 上卷为 `None`（未上报，不得伪造 0）。
@@ -1667,15 +1765,17 @@ mod tests {
     #[test]
     fn usage_totals_reasoning_none_when_unreported() {
         let t = UsageTotals::default();
-        t.add(&Usage {
+        let u = Usage {
             input_tokens: 1,
             ..Default::default()
-        });
-        t.add(&Usage {
+        };
+        t.add(&u, u.cache_split());
+        let u = Usage {
             input_tokens: 2,
             ..Default::default()
-        });
-        assert_eq!(t.drain().reasoning_tokens, None);
+        };
+        t.add(&u, u.cache_split());
+        assert_eq!(t.drain().0.reasoning_tokens, None);
     }
 
     /// 有一个子调用报 `Some(0)` ⇒ 上卷为 `Some(0)`（真 0 不能折叠成 `None`）。
@@ -1685,11 +1785,12 @@ mod tests {
     #[test]
     fn usage_totals_reasoning_keeps_reported_zero() {
         let t = UsageTotals::default();
-        t.add(&Usage {
+        let u = Usage {
             reasoning_tokens: Some(0),
             ..Default::default()
-        });
-        assert_eq!(t.drain().reasoning_tokens, Some(0));
+        };
+        t.add(&u, u.cache_split());
+        assert_eq!(t.drain().0.reasoning_tokens, Some(0));
     }
 
     /// 多次上报 ⇒ 相加；`None` 不影响已上报的累计。
@@ -1699,21 +1800,24 @@ mod tests {
     #[test]
     fn usage_totals_reasoning_sums_reported_values() {
         let t = UsageTotals::default();
-        t.add(&Usage {
+        let u = Usage {
             reasoning_tokens: Some(3),
             ..Default::default()
-        });
-        t.add(&Usage {
+        };
+        t.add(&u, u.cache_split());
+        let u = Usage {
             reasoning_tokens: None,
             ..Default::default()
-        });
-        t.add(&Usage {
+        };
+        t.add(&u, u.cache_split());
+        let u = Usage {
             reasoning_tokens: Some(4),
             ..Default::default()
-        });
-        assert_eq!(t.drain().reasoning_tokens, Some(7));
+        };
+        t.add(&u, u.cache_split());
+        assert_eq!(t.drain().0.reasoning_tokens, Some(7));
         // drain 后清零，且「是否上报」也复位。
-        assert_eq!(t.drain().reasoning_tokens, None);
+        assert_eq!(t.drain().0.reasoning_tokens, None);
     }
 
     #[test]
@@ -1940,8 +2044,8 @@ mod tests {
                     usage: Usage {
                         input_tokens: 11,
                         output_tokens: 7,
-                        prompt_cache_hit_tokens: 9,
-                        prompt_cache_miss_tokens: 2,
+                        prompt_cache_hit_tokens: Some(9),
+                        prompt_cache_miss_tokens: None,
                         reasoning_tokens: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1994,13 +2098,14 @@ mod tests {
             std::path::Path::new(&artifact).exists(),
             "转录文件应存在: {artifact}"
         );
-        let up = totals.drain();
+        let (up, up_cache) = totals.drain();
         assert_eq!((up.input_tokens, up.output_tokens), (11, 7), "usage 应上卷");
+        assert_eq!(up.prompt_cache_hit_tokens, Some(9), "缓存读数也应上卷");
         assert_eq!(
-            (up.prompt_cache_hit_tokens, up.prompt_cache_miss_tokens),
-            (9, 2),
-            "缓存读数也应上卷"
+            up.prompt_cache_miss_tokens, None,
+            "`miss` 不再落地，由 `input − hit` 推导"
         );
+        assert_eq!(up_cache, Some((9, 2)), "上卷的 (hit, miss) 逐次累加");
 
         // fail-closed：指定 model 名 ⇒ Err（不静默回退）。
         let err = runner

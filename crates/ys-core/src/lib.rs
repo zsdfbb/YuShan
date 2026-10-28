@@ -74,20 +74,57 @@ mod tests {
         let a = Usage {
             input_tokens: 10,
             output_tokens: 20,
-            prompt_cache_hit_tokens: 7,
-            prompt_cache_miss_tokens: 3,
+            prompt_cache_hit_tokens: Some(7),
+            prompt_cache_miss_tokens: None,
             reasoning_tokens: None,
         };
         let b = Usage {
             input_tokens: 1,
             output_tokens: 2,
-            prompt_cache_hit_tokens: 5,
-            prompt_cache_miss_tokens: 4,
+            prompt_cache_hit_tokens: Some(5),
+            prompt_cache_miss_tokens: None,
             reasoning_tokens: None,
         };
         let c = a + b;
-        assert_eq!(c.prompt_cache_hit_tokens, 12);
-        assert_eq!(c.prompt_cache_miss_tokens, 7);
+        assert_eq!(c.prompt_cache_hit_tokens, Some(12));
+        assert_eq!(
+            c.prompt_cache_miss_tokens, None,
+            "`miss` 恒 `None`：由 `input − hit` 推导，不落地"
+        );
+    }
+
+    /// 三个 `Option` 桶共用同一条 `Add` 规则：两侧都 `Some` 才相加，
+    /// 否则继承已上报侧，**不得**把 `Some(0)` 折叠成 `None`。
+    ///
+    /// 变异：把任一侧的 `(x, None) => x` / `(None, y) => y` 改成「`Some(0)` 也退回 `None`」
+    /// ⇒ 前两条断言变红；把相加分支删掉 ⇒ 第三条变红。
+    #[test]
+    fn test_usage_add_shares_one_rule_across_option_buckets() {
+        let with = |hit, miss, reasoning| Usage {
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: miss,
+            reasoning_tokens: reasoning,
+            ..Default::default()
+        };
+        let zero = with(Some(0), Some(0), Some(0));
+        let absent = with(None, None, None);
+        let three = with(Some(3), Some(3), Some(3));
+        let four = with(Some(4), Some(4), Some(4));
+
+        let sum = zero.clone() + absent.clone();
+        assert_eq!(sum.prompt_cache_hit_tokens, Some(0), "Some(0) + None");
+        assert_eq!(sum.prompt_cache_miss_tokens, Some(0), "Some(0) + None");
+        assert_eq!(sum.reasoning_tokens, Some(0), "Some(0) + None");
+
+        let sum = absent + zero;
+        assert_eq!(sum.prompt_cache_hit_tokens, Some(0), "None + Some(0)");
+        assert_eq!(sum.prompt_cache_miss_tokens, Some(0), "None + Some(0)");
+        assert_eq!(sum.reasoning_tokens, Some(0), "None + Some(0)");
+
+        let sum = three + four;
+        assert_eq!(sum.prompt_cache_hit_tokens, Some(7), "Some(3) + Some(4)");
+        assert_eq!(sum.prompt_cache_miss_tokens, Some(7), "Some(3) + Some(4)");
+        assert_eq!(sum.reasoning_tokens, Some(7), "Some(3) + Some(4)");
     }
 
     #[test]

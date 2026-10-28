@@ -113,6 +113,17 @@ pub fn build_view(
         available_models,
         total_input_tokens: stats.total_input_tokens,
         total_output_tokens: stats.total_output_tokens,
+        // 缓存三态在**这里**拍定：`cache_reported == false` ⇒ `None`（显示 `-`），
+        // 而 `Some` 里的真 0 原样透传（与「未上报」可区分）。
+        cache_tokens: stats
+            .cache_reported
+            .then_some((stats.total_cache_hit_tokens, stats.total_cache_miss_tokens)),
+        cache_hit_pct: stats.cache_hit_pct(),
+        // 压缩与主对话轮并列：没压过 ⇒ `None`（整段省略），压过 ⇒ 两个计数。
+        compaction_tokens: stats.has_compaction().then_some((
+            stats.compaction_usage().input_tokens,
+            stats.compaction_usage().output_tokens,
+        )),
         turn_count: stats.turn_count,
         session_started,
         executed: stats.executed,
@@ -437,6 +448,136 @@ mod tests {
             view.executed,
             std::time::Duration::from_secs(95),
             "执行时长必须从 TurnStats 透传到快照（否则 /status 永远显示 0）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缓存三态透传：**有读数 / 无读数 / 真 0** 在快照里必须可区分。
+    ///
+    /// 这是「渲染层不判断是否上报」的关键分界：`ys-core` 已经把
+    /// `cache_reported` 折成 `Option`，本处只负责原样搬运。
+    ///
+    /// 变异：把 `cache_tokens` 改成 `Some((hit, miss))`（不论是否上报）⇒
+    /// 「无读数」那一条变红（会从 `None` 变成 `Some((0, 0))`，静默把
+    /// 「测不到」渲染成「0% 命中」）。
+    #[test]
+    fn test_build_view_projects_cache_three_states() {
+        let dir = temp_dir("cache_proj");
+        let cfg = Config::from_env().unwrap();
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+        let project = |stats: &TurnStats| {
+            build_view(
+                &cfg,
+                &agent,
+                &wiring,
+                &cfg.registry,
+                &state,
+                stats,
+                Instant::now(),
+                ThemeKind::default(),
+            )
+        };
+
+        // ① 无读数：provider 从没报过 ⇒ 三个字段全 `None`。
+        let mut unreported = TurnStats::default();
+        unreported.record(&ys_core::Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        });
+        let v = project(&unreported);
+        assert_eq!(v.cache_tokens, None, "没上报 ⇒ cache_tokens 为 None");
+        assert_eq!(v.cache_hit_pct, None, "没上报 ⇒ 命中率为 None（显示 -）");
+
+        // ② 真 0 命中：上报了 `hit = 0` ⇒ `Some((0, 100))` + `Some(0)`。
+        let mut zero = TurnStats::default();
+        zero.record(&ys_core::Usage {
+            input_tokens: 100,
+            prompt_cache_hit_tokens: Some(0),
+            ..Default::default()
+        });
+        let v = project(&zero);
+        assert_eq!(
+            v.cache_tokens,
+            Some((0, 100)),
+            "真 0 命中必须与「未上报」可区分"
+        );
+        assert_eq!(v.cache_hit_pct, Some(0), "真 0 ⇒ 0%");
+
+        // ③ 有读数：`hit = 98` ⇒ `Some((98, 2))` + `Some(98)`。
+        let mut hit = TurnStats::default();
+        hit.record(&ys_core::Usage {
+            input_tokens: 100,
+            prompt_cache_hit_tokens: Some(98),
+            ..Default::default()
+        });
+        let v = project(&hit);
+        assert_eq!(v.cache_tokens, Some((98, 2)));
+        assert_eq!(v.cache_hit_pct, Some(98));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 压缩桶透传：没压过 ⇒ `None`（`/status` / 状态行整段省略），
+    /// 压过 ⇒ `Some((input, output))`。
+    ///
+    /// 变异：把 `has_compaction().then_some(..)` 改成 `Some((..))` ⇒
+    /// 第一条断言变红（没压过的会话会多出一行全零的 `compaction`）。
+    #[test]
+    fn test_build_view_projects_compaction_tokens() {
+        let dir = temp_dir("compaction_proj");
+        let cfg = Config::from_env().unwrap();
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+        let project = |stats: &TurnStats| {
+            build_view(
+                &cfg,
+                &agent,
+                &wiring,
+                &cfg.registry,
+                &state,
+                stats,
+                Instant::now(),
+                ThemeKind::default(),
+            )
+        };
+
+        let v = project(&TurnStats::default());
+        assert_eq!(v.compaction_tokens, None, "没压过 ⇒ None");
+
+        let mut compacted = TurnStats::default();
+        compacted.record_result(&ys_loop::RunResult {
+            stop_reason: ys_core::StopReason::Completed,
+            usage: ys_core::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            },
+            cache_reading: None,
+            compaction_usage: ys_core::Usage {
+                input_tokens: 4_000,
+                output_tokens: 600,
+                ..Default::default()
+            },
+            rounds: 1,
+            final_message: None,
+        });
+        let v = project(&compacted);
+        assert_eq!(
+            v.compaction_tokens,
+            Some((4_000, 600)),
+            "压缩 input/output 原样透传"
+        );
+        assert_eq!(
+            (v.total_input_tokens, v.total_output_tokens),
+            (100, 10),
+            "主对话轮桶不被压缩污染"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

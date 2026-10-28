@@ -1072,15 +1072,17 @@ impl<'s> StreamAccumulator<'s> {
 
                 // usage 尾包：累积最后一个非空值（末包覆盖前值即可）。
                 if let Some(usage) = usage {
-                    // 缓存字段**两种方言**都要认：DeepSeek 报 `prompt_cache_*`，
+                    // 两种方言的缓存读数在这里归一：DeepSeek 报 `prompt_cache_*`，
                     // OpenAI 兼容网关报 `prompt_tokens_details.cached_tokens`。
                     // 只认一家 ⇒ 另一家的读数恒为「无」，会把「缓存生效」误判成「测不到」。
-                    let (cache_hit, cache_miss) = usage.cache_tokens();
+                    let (prompt_total, cache_hit) = usage.cache_reading();
                     self.usage = Some(Usage {
-                        input_tokens: usage.prompt_tokens,
+                        // `input_tokens` = provider 回报的 prompt **总量**（含缓存命中）。
+                        input_tokens: prompt_total,
                         output_tokens: usage.completion_tokens,
                         prompt_cache_hit_tokens: cache_hit,
-                        prompt_cache_miss_tokens: cache_miss,
+                        // `miss = input − hit` 可推导，不落地。
+                        prompt_cache_miss_tokens: None,
                         // `None`（明细块缺失）与 `Some(0)`（显式报 0）原样保留，
                         // 供上层决定是否写出该字段。
                         reasoning_tokens: usage.reasoning_tokens(),
@@ -2216,10 +2218,14 @@ mod tests {
         assert_eq!(response.usage.input_tokens, 11);
         assert_eq!(response.usage.output_tokens, 7);
         assert_eq!(
-            response.usage.prompt_cache_hit_tokens, 9,
+            response.usage.prompt_cache_hit_tokens,
+            Some(9),
             "缓存命中读数必须从 provider 尾包解析出来"
         );
-        assert_eq!(response.usage.prompt_cache_miss_tokens, 2);
+        assert_eq!(
+            response.usage.prompt_cache_miss_tokens, None,
+            "`miss` 由 `input − hit` 推导，不落地"
+        );
         assert_eq!(
             response.usage.reasoning_tokens,
             Some(4),
@@ -2227,7 +2233,8 @@ mod tests {
         );
     }
 
-    /// 未上报缓存字段的端点：`ChatUsage` 仍能反序列化（按 0），不失败。
+    /// 未上报缓存字段的端点：`ChatUsage` 仍能反序列化（按 0），不失败；
+    /// 但落进 `Usage` 时是 **`None`**（无读数），不是 `Some(0)`。
     #[test]
     fn streamed_usage_without_cache_fields_defaults_to_zero() {
         let mut sink = RecordingModelSink::default();
@@ -2246,8 +2253,32 @@ mod tests {
         drive(&mut buf, &mut acc, b"data: [DONE]\n");
         let response = acc.finish().unwrap();
         assert_eq!(response.usage.input_tokens, 3);
-        assert_eq!(response.usage.prompt_cache_hit_tokens, 0);
-        assert_eq!(response.usage.prompt_cache_miss_tokens, 0);
+        assert_eq!(
+            response.usage.prompt_cache_hit_tokens, None,
+            "provider 没报缓存明细 ⇒ 无读数，不得推成 0 命中"
+        );
+        assert_eq!(response.usage.prompt_cache_miss_tokens, None);
+    }
+
+    /// 显式报 `cached_tokens: 0` 的端点：真 0 命中必须是 `Some(0)`，不得折叠成 `None`。
+    #[test]
+    fn streamed_usage_with_explicit_zero_cache_is_reported() {
+        let mut sink = RecordingModelSink::default();
+        let mut acc = StreamAccumulator::new(&mut sink, false);
+        let mut buf: Vec<u8> = Vec::new();
+        drive(
+            &mut buf,
+            &mut acc,
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9760,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n",
+        );
+        drive(&mut buf, &mut acc, b"data: [DONE]\n");
+        let response = acc.finish().unwrap();
+        assert_eq!(response.usage.input_tokens, 9760);
+        assert_eq!(
+            response.usage.prompt_cache_hit_tokens,
+            Some(0),
+            "显式 0 是真 0，不得与未上报混同"
+        );
     }
 
     /// 流里从头到尾没有 usage（端点不支持 `include_usage`）时，

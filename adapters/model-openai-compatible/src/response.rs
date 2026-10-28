@@ -7,12 +7,15 @@ pub struct ChatUsage {
     /// 部分兼容端点不返回该字段；缺失时按 0 计，不使整包反序列化失败。
     #[serde(default)]
     pub total_tokens: u32,
-    /// DeepSeek 方言的 prompt cache 命中 token 数（缺失按 0）。
+    /// DeepSeek 方言的 prompt cache 命中 token 数。
+    ///
+    /// `Option` 而非 `u32`：**字段缺席**（不报缓存）与**显式报 0**（真 0 命中）
+    /// 是两件事，混同会让「测不到」被渲染成「0% 命中」。
     #[serde(default)]
-    pub prompt_cache_hit_tokens: u32,
-    /// 同上，未命中部分（缺失按 0）。
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// 同上，未命中部分。
     #[serde(default)]
-    pub prompt_cache_miss_tokens: u32,
+    pub prompt_cache_miss_tokens: Option<u32>,
     /// **OpenAI 标准形状**的明细：`{"cached_tokens": N}`。
     ///
     /// 与上面两个字段是**两家不同方言**：DeepSeek 报前者，OpenAI 兼容网关
@@ -43,23 +46,29 @@ pub struct CompletionTokensDetails {
 }
 
 impl ChatUsage {
-    /// 归一化成 `(命中, 未命中)`，**兼容两种方言**；**两样都没有时返回 `(0, 0)`**。
+    /// 归一成 `(prompt_total, Option<hit>)`，兼容两种方言。
     ///
-    /// - **DeepSeek 方言**：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 直接用。
-    /// - **OpenAI 形状**：认 `prompt_tokens_details.cached_tokens`，未命中一侧由
-    ///   `prompt_tokens - 命中` 推出（该形状不单独报未命中）。
-    /// - **两样都不在场** ⇒ `(0, 0)`，表示**没有读数**。**不得**推成「全部未命中」——
-    ///   那是编数：上层要靠 `(0,0)` 把「provider 没报」与「缓存全没命中」区分开。
-    pub fn cache_tokens(&self) -> (u32, u32) {
-        if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
-            return (self.prompt_cache_hit_tokens, self.prompt_cache_miss_tokens);
+    /// - **DeepSeek 方言**：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+    ///   **任一在场**即算有读数 —— `Some(0)`（显式报的真 0 命中）与字段缺席是两件事，
+    ///   不得用 `> 0` 混同（那会让「测不到」变成「0% 命中」）。只报 miss 时反推 hit。
+    /// - **OpenAI 形状**：认 `prompt_tokens_details.cached_tokens`。
+    /// - **两样都不在场** ⇒ `None`，表示**没有读数**。**不得**推成「全部未命中」。
+    ///
+    /// `miss` 不返回：它等于 `prompt_total - hit`，由 `Usage::cache_split()` 推导。
+    pub fn cache_reading(&self) -> (u32, Option<u32>) {
+        if let Some(hit) = self.prompt_cache_hit_tokens {
+            return (self.prompt_tokens, Some(hit));
+        }
+        if let Some(miss) = self.prompt_cache_miss_tokens {
+            // 只报未命中：`hit = prompt − miss`（方言没单独给命中数）。
+            return (
+                self.prompt_tokens,
+                Some(self.prompt_tokens.saturating_sub(miss)),
+            );
         }
         match &self.prompt_tokens_details {
-            Some(d) => (
-                d.cached_tokens,
-                self.prompt_tokens.saturating_sub(d.cached_tokens),
-            ),
-            None => (0, 0),
+            Some(d) => (self.prompt_tokens, Some(d.cached_tokens)),
+            None => (self.prompt_tokens, None),
         }
     }
 
@@ -132,34 +141,56 @@ mod tests {
     /// `prompt_tokens_details.cached_tokens`。只认一家 ⇒ 另一家恒为「无读数」，
     /// 会把「缓存明明命中」误判成「测不到缓存」。
     ///
-    /// 变异：把 `cache_tokens` 的回落分支删掉（直接返回 DeepSeek 那两个字段）
+    /// 变异：把 `cache_reading` 的回落分支删掉（直接返回 DeepSeek 那两个字段）
     /// ⇒ 第二条断言变红。
     #[test]
-    fn cache_tokens_handles_both_dialects() {
-        // DeepSeek 方言
+    fn cache_reading_handles_both_dialects() {
+        // DeepSeek 方言：`miss` 由 `prompt - hit` 推导，不在本函数里算。
         let ds = parse(
             r#"{"prompt_tokens":9735,"completion_tokens":1,
                 "prompt_cache_hit_tokens":9600,"prompt_cache_miss_tokens":135}"#,
         );
-        assert_eq!(ds.cache_tokens(), (9600, 135));
+        assert_eq!(ds.cache_reading(), (9735, Some(9600)));
 
         // OpenAI 标准形状（实测 opencode-go 只报这个）
         let oa = parse(
             r#"{"prompt_tokens":9760,"completion_tokens":4,
                 "prompt_tokens_details":{"cached_tokens":9728}}"#,
         );
-        assert_eq!(oa.cache_tokens(), (9728, 32), "未命中一侧由总量推出");
+        assert_eq!(oa.cache_reading(), (9760, Some(9728)));
 
-        // 两样都没有 ⇒ 全 0（这是**「没有读数」**，不是「没命中」；由上层区分）
+        // 两样都没有 ⇒ `None`（这是**「没有读数」**，不是「没命中」）
         let none = parse(r#"{"prompt_tokens":11,"completion_tokens":7}"#);
-        assert_eq!(none.cache_tokens(), (0, 0));
+        assert_eq!(none.cache_reading(), (11, None));
 
-        // 首调用：OpenAI 形状显式报 0 命中
+        // 首调用：OpenAI 形状**显式**报 0 命中 —— 真 0 不是未上报。
         let first = parse(
             r#"{"prompt_tokens":9760,"completion_tokens":4,
                 "prompt_tokens_details":{"cached_tokens":0}}"#,
         );
-        assert_eq!(first.cache_tokens(), (0, 9760), "未命中应等于全部输入");
+        assert_eq!(
+            first.cache_reading(),
+            (9760, Some(0)),
+            "显式报 0 必须落在 Some(0)，不得折叠成 None"
+        );
+
+        // DeepSeek 方言**显式**报 `hit=0, miss=1000`（真实形态：整段 prompt 都没命中）。
+        let ds_miss = parse(
+            r#"{"prompt_tokens":1000,"completion_tokens":7,
+                "prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":1000}"#,
+        );
+        assert_eq!(
+            ds_miss.cache_reading(),
+            (1000, Some(0)),
+            "DS 显式 hit=0 是真 0 命中，不得用 `> 0` 误判成未上报"
+        );
+
+        // 只报 miss：hit 由 `prompt − miss` 反推（方言没单独给命中数）。
+        let miss_only = parse(
+            r#"{"prompt_tokens":1000,"completion_tokens":7,
+                "prompt_cache_miss_tokens":250}"#,
+        );
+        assert_eq!(miss_only.cache_reading(), (1000, Some(750)));
     }
 
     /// 推理 token：整块明细缺失 ⇒ `None`；显式 `0` ⇒ `Some(0)`。

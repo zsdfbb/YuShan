@@ -135,8 +135,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: 5,
                     output_tokens: 3,
-                    prompt_cache_hit_tokens: 4,
-                    prompt_cache_miss_tokens: 1,
+                    prompt_cache_hit_tokens: Some(4),
+                    prompt_cache_miss_tokens: None,
                     reasoning_tokens: None,
                 },
             })
@@ -151,7 +151,7 @@ mod tests {
         let ok = as_dyn.run("查一下 X", Some("m1"), None).await.unwrap();
         assert_eq!(ok.summary, "查一下 X :: model=Some(\"m1\") aborted=false");
         assert_eq!(ok.artifact.as_deref(), Some("/tmp/transcript.md"));
-        assert_eq!(ok.usage.prompt_cache_hit_tokens, 4);
+        assert_eq!(ok.usage.prompt_cache_hit_tokens, Some(4));
 
         assert_eq!(as_dyn.run("", None, None).await.unwrap_err(), "空任务");
     }

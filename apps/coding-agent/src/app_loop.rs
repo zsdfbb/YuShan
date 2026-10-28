@@ -511,7 +511,7 @@ pub async fn run(
                 match run_turn_once(&mut ctx, AgentInput::new(message)).await {
                     Ok(outcome) => match outcome {
                         Ok(result) => {
-                            ctx.stats.record(&result.usage);
+                            ctx.stats.record_result(&result);
                             // **执行口径**的时长累加：与上面的 usage 同一位置 ⇒
                             // 「token 统计」与「时长统计」覆盖同一批回合。
                             // 失败回合也计入（模型跑过了就是占用了墙钟）⇒ 见下。
@@ -1530,7 +1530,17 @@ async fn run_turn_once(
     // 追加进 `RunResult.usage` ⇒ 下游（`TurnStats` / meta / 退出码）看到真实总消耗。
     let outcome = match outcome {
         Ok(mut r) => {
-            r.usage = r.usage + ctx.subagent_totals.drain();
+            let (subagent, subagent_cache) = ctx.subagent_totals.drain();
+            // 缓存读数也要上卷。`subagent_cache` 是累加器**逐次**累加出来的
+            // `(hit, miss)`，不能从 `subagent`（聚合 `Usage`）派生 ——
+            // 那里的 `input` 对没上报的子调用也累加过，减法会把它们算成未命中。
+            if let Some((hit, miss)) = subagent_cache {
+                r.cache_reading = Some(match r.cache_reading {
+                    Some((h, m)) => (h.saturating_add(hit), m.saturating_add(miss)),
+                    None => (hit, miss),
+                });
+            }
+            r.usage = r.usage + subagent;
             Ok(r)
         }
         Err(e) => Err(e),
@@ -2126,6 +2136,8 @@ mod tests {
         let ok: TurnOutcome = Ok(ys_loop::RunResult {
             stop_reason: StopReason::Completed,
             usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 4,
             final_message: None,
         });

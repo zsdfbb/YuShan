@@ -259,7 +259,10 @@ impl RoundClock {
                     );
                     fields.insert(
                         "gen_ai.usage.cache_read.input_tokens".to_string(),
-                        json!(usage.prompt_cache_hit_tokens),
+                        match usage.prompt_cache_hit_tokens {
+                            Some(tokens) => json!(tokens),
+                            None => Value::Null,
+                        },
                     );
                     // 「没上报」写 `null`，绝不伪装成 0：真 0 与缺失语义不同。
                     fields.insert(
@@ -273,9 +276,9 @@ impl RoundClock {
                     // 「input/output 是否有读数」推断是否上报，故 `false` **不能**被读作
                     // 「确定没上报」。以下情况都会误判成 `false`：
                     // - 真实上报 `input = 0 && output = 0`（如空响应）；
-                    // - provider 只填 `total_tokens`，或只填缓存计数
-                    //   （`prompt_cache_hit/miss > 0` 而 input/output 为 0）。
-                    // 要判定「确实没上报」，需与 provider 的原始响应对照。
+                    // - provider 只填 `total_tokens`。
+                    // 要判定「确实没上报」，需与 provider 的原始响应对照；
+                    // 缓存读数有独立信号（`prompt_cache_hit_tokens` 的 `Option`）。
                     fields.insert(
                         "usage_reported".to_string(),
                         json!(usage.input_tokens > 0 || usage.output_tokens > 0),
@@ -423,21 +426,10 @@ impl RoundClock {
 ///
 /// 两种「没有」都要归为 `None`，否则会把排查引到错的方向：
 /// - **失败回合**压根拿不到 `RunResult`。
-/// - **provider 不上报**：用量存在（`input_tokens > 0`）但缓存两个字段时间为 0。
-///   这时「0 命中」与「没上报」在数值上完全一样 —— 一律记「没有读数」，
-///   而不是伪造成「缓存 0% 命中」。
+/// - **provider 不上报**缓存明细（`prompt_cache_hit_tokens` 为 `None`）。
+///   一律记「没有读数」，而不是伪造成「缓存 0% 命中」。
 pub(crate) fn turn_cache(outcome: &Result<RunResult, LoopError>) -> Option<(u32, u32)> {
-    let usage = &outcome.as_ref().ok()?.usage;
-    if usage.prompt_cache_hit_tokens == 0
-        && usage.prompt_cache_miss_tokens == 0
-        && usage.input_tokens > 0
-    {
-        return None;
-    }
-    Some((
-        usage.prompt_cache_hit_tokens,
-        usage.prompt_cache_miss_tokens,
-    ))
+    outcome.as_ref().ok()?.cache_reading
 }
 
 /// 回合边界日志行 —— 两条入口**同格式**，便于跨入口 grep 比对。
@@ -530,20 +522,27 @@ mod tests {
         }
     }
 
+    /// 造一份缓存读数：`hit` 命中 + `miss` 未命中 = `input_tokens` 总量。
+    ///
+    /// `miss` 不存储 —— 它由 `input − hit` 推导；本助手就是按这条恒等式构造的。
     fn usage(hit: u32, miss: u32) -> Usage {
         Usage {
-            input_tokens: 0,
+            input_tokens: hit + miss,
             output_tokens: 0,
-            prompt_cache_hit_tokens: hit,
-            prompt_cache_miss_tokens: miss,
+            prompt_cache_hit_tokens: Some(hit),
+            prompt_cache_miss_tokens: None,
             reasoning_tokens: None,
         }
     }
 
+    /// 单轮结果：`cache_reading` 由该轮 `usage` 派生（单轮里 `input − hit` 是恒等式）。
     fn result_with(usage: Usage) -> Result<RunResult, LoopError> {
+        let cache_reading = usage.cache_split();
         Ok(RunResult {
             stop_reason: StopReason::Completed,
             usage,
+            cache_reading,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 1,
             final_message: None,
         })
@@ -700,11 +699,12 @@ mod tests {
         );
     }
 
-    /// 缓存读数：**有 input 却缓存两栏全 0** ⇒ `None`（provider 没上报），
-    /// 不能被当成「缓存 0% 命中」—— 那会把排查引到错的方向。
+    /// 缓存读数：**未上报**（`prompt_cache_hit_tokens: None`）⇒ `None`，
+    /// 不能被当成「缓存 0% 命中」—— 那会把排查引到错的方向；
+    /// 而**显式报 0** 必须仍是 `Some((0, input))`。
     ///
-    /// 变异：① 把 `input_tokens > 0` 那个条件去掉 ⇒ 第二条断言变红（真读数被伪装成 0% 命中）；
-    /// ② 把 `as_ref().ok()?` 改成 `Some(...)` 兜底 ⇒ 第三条断言变红。
+    /// 变异：① 把 `cache_split()` 改成 `unwrap_or((0, input))` 兜底 ⇒ 第二条断言变红；
+    /// ② 把 `as_ref().ok()?` 改成 `Some(...)` 兜底 ⇒ 第四条断言变红。
     #[test]
     fn turn_cache_separates_unreported_from_zero_hit() {
         assert_eq!(
@@ -718,17 +718,25 @@ mod tests {
             usage: Usage {
                 input_tokens: 29_993,
                 output_tokens: 149,
-                prompt_cache_hit_tokens: 0,
-                prompt_cache_miss_tokens: 0,
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
                 reasoning_tokens: None,
             },
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
             rounds: 2,
             final_message: None,
         };
         assert_eq!(
             turn_cache(&Ok(unreported)),
             None,
-            "有 input 却缓存两栏全 0 ⇒ 服务端没上报，不是 0% 命中"
+            "未上报缓存明细 ⇒ 没有读数，不是 0% 命中"
+        );
+
+        assert_eq!(
+            turn_cache(&result_with(usage(0, 29_993))),
+            Some((0, 29_993)),
+            "显式报 0 命中是真读数，不得当成未上报"
         );
 
         assert_eq!(
@@ -913,8 +921,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: 100,
                     output_tokens: 20,
-                    prompt_cache_hit_tokens: 80,
-                    prompt_cache_miss_tokens: 20,
+                    prompt_cache_hit_tokens: Some(80),
+                    prompt_cache_miss_tokens: None,
                     reasoning_tokens: Some(7),
                 },
             }),
@@ -1074,8 +1082,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: 0,
                     output_tokens: 0,
-                    prompt_cache_hit_tokens: 80,
-                    prompt_cache_miss_tokens: 20,
+                    prompt_cache_hit_tokens: Some(80),
+                    prompt_cache_miss_tokens: None,
                     reasoning_tokens: None,
                 },
             }),

@@ -710,6 +710,22 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 `main::session_exit_line` 唯一给出（**只对已落盘的会话**打印 —— 惰性新会话若一个回合都没跑过就没有
 文件，打出的 id `--resume` 也找不到），详见 ADR-0032。
 
+**用量三个数的关系（`--json` 与任何外部消费方必读）**：
+
+| 字段 | 含义 | 是否含压缩 |
+|---|---|---|
+| `RunFinished.usage` | 本回合**主对话轮**的消耗 | ❌ **不含** |
+| `RoundUsage{purpose:"compaction"}` | 每次压缩摘要调用的消耗 | — |
+| `RunResult.compaction_usage` | 本回合**成功**压缩的累计（仅 app 内部可见） | ✅ 仅压缩 |
+
+**本回合总花费 ≈ `RunFinished.usage` + 所有 `purpose:"compaction"` 行的和。**
+只想看「模型轮花了多少」就只读 `RunFinished.usage`；想看「这个回合总共烧了多少」
+必须把两者相加。**已知缺口**：压缩失败路径不计（失败时摘要调用可能已真实消耗，见 ADR-0061 D5）。
+
+同一个坑还有一处：**命中率的分母是 `hit + miss`，不是 `input_tokens`**。
+`input_tokens` 是 provider 回报的 prompt **总量（含缓存命中）**（ADR-0061 D1），
+拿它当分母会算出错误的百分比。
+
 **日志文件**（`apps/coding-agent/src/logging.rs`）：手写极简 logger —— 追加写、行首 `[unix秒]` 前缀、
 **best-effort**（目录创建 / 打开 / 写入的任何 IO 错误一律静默忽略，返回值 `()`，不 panic、不传播）。
 **不引新依赖**。`app_loop` 也用它记录「回合失败」与「app 循环异常退出」（不打扰用户）。

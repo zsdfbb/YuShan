@@ -32,7 +32,10 @@
 **承重边界**：
 
 - 判别只写在 `Usage`（把 `round_clock.rs:429` 的日志专用版本搬进去），app 侧复用它。
-- `ys-tui-coding` **不依赖 `ys-runtime`** ⇒ TUI 不认识 `Usage`，只能由 app 推**已投影的结论**。
+- `ys-tui-coding` **不依赖 `ys-runtime`**（编译器强制，防它认识 `Agent`），但它**依赖 `ys-core`**
+  —— `Usage` 就在 `ys_core` 里，TUI 在技术上有权读它。判别仍留在 app 侧，理由不是「看不到」，
+  而是：①**UI 线程无 runtime 上下文**（它用 `blocking_send`）②**provider 语义的解释权集中
+  在 `ys-core` 一处**，不撒到渲染层。
 - 压缩归因**不新建通道**：`RoundUsage{purpose}` 早已带 usage，本轮只是让 loop 也记账。
 
 ---
@@ -59,12 +62,27 @@ provider 只填 `total_tokens` 等）。
 ### 2.2 P0-2 · app 算结论，TUI 只画
 
 ```
-TurnStats::record(&result.usage)        O(1)  0 alloc
-  └─ TurnStats 内部：hit/miss 计数 + reported 标志（照抄 reasoning_tokens 的既有模式）
-      └─ cache_hit_pct() -> Option<u8>   ← 分母恒为 hit + miss，绝不取 input_tokens
-          └─ CodingView { cache: Option<(u32,u32)>, cache_hit_pct: Option<u8> }
-              └─ draw / commands：`缓存 99%`  vs  `缓存 -`
+逐轮： RoundUsage{ usage }  ──► TurnStats::record_round(&usage)
+                                  ├─ usage.cache_split() -> Option<(hit, miss)>
+                                  │     None ⇒ 只 counted_unreported += 1，不碰分母
+                                  │     Some ⇒ cache_hit += hit; cache_miss += miss
+                                  └─ （即：**逐轮累加**，不在聚合后的 Usage 上再算）
+
+逐回合：RunResult ──► TurnStats::record_turn(&result)      ← 只累计 input/output/回合数
+
+投影： TurnStats::cache_hit_pct() -> Option<u8>            ← 分母恒为 hit + miss
+         └─ CodingView { cache: Option<(u32,u32)>, cache_hit_pct: Option<u8> }
+             └─ draw / commands：`缓存 99%`  vs  `缓存 -`
 ```
+
+**为何必须逐轮而不是逐回合**（承重，写错会让命中率静默偏低）：
+
+`input_tokens` 在 `Add` 里**无条件相加**，而 `hit` 缺席时**不参与相加** —— 两者不对称。
+若只拿回合聚合后的 `Usage` 去算 `input − hit`，缺报那一轮的 input 会被当成未命中。
+
+实测本仓 4,915 条 `round_usage`：缺报轮**全部**是 `(0, 0)`，故当前数据不触发；
+但 3 个会话存在「同会话混合上报」（如 `1793013602`：68/182 轮 `input==0`），
+且 `/model` 切换后同一会话可跨 provider ⇒ 混合在功能上可达。**逐轮累加把这条路堵死。**
 
 **`None` → `-`、`Some(0)` → `0%` 只判一次**，在 app 侧。TUI 不做除法、不判「未上报」。
 
@@ -113,8 +131,23 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// `(hit, miss)`；`None` = 没有可用读数。
-    /// `miss = input_tokens.saturating_sub(hit)` —— 可推导，故不存储。
+    /// `(hit, miss)`；`None` = **本对象自带缓存读数**。
+    ///
+    /// `miss = input_tokens.saturating_sub(hit)` —— 单轮可推导，故不存储。
+    ///
+    /// # 聚合前提（承重，误用会让命中率静默偏高）
+    ///
+    /// 只有在「缓存读数缺席时 `input_tokens` 也为 0」时，`input − hit` 才能在
+    /// **多轮累加**后仍等于真实 `miss`。若某个 provider 回了 prompt 却不回缓存明细，
+    /// 那些轮到整个 `input` 会被算成未命中 ⇒ **命中率偏低**。
+    ///
+    /// 实测（本仓 4,915 条 `round_usage`）：缺报轮次**全部**是 `(0, 0)`，
+    /// 故当前数据不触发；但这是**观察归纳，不是 provider 契约**。
+    ///
+    /// 因此：**永远不要在聚合后的 `Usage` 上调本函数**。
+    /// 聚合必须**逐轮调用本函数**、把 `(hit, miss)` 累加进专用计数器（见 `TurnStats`）。
+    /// 原因：`input_tokens` 无条件相加，而 `hit` 缺席时不参与相加 —— 两者不对称，
+    /// 聚合后的 `input − hit` 会把缺报轮的 input 当成未命中。
     #[inline] pub fn cache_split(&self) -> Option<(u32, u32)>;
     #[inline] pub fn is_cache_reported(&self) -> bool;   // = hit.is_some()
 }
@@ -132,10 +165,13 @@ pub struct RunResult {
     pub stop_reason: StopReason,
     /// 本回合**主对话轮**消耗。含义不变。
     pub usage: Usage,
-    /// 本回合压缩（自动 + 手动 `/compact`）消耗；**全零 = 没压过**。
+    /// 本回合压缩（自动 + 手动 `/compact`）的**成功**消耗；**全零 = 没压过或压失败**。
+    ///
+    /// ⚠️ **失败路径不计**（已知缺口，ADR D5）：压缩失败时摘要调用可能已真实烧掉 token，
+    /// 但 `Err` 分支拿不到 `outcome.usage`。故本字段**不是**「本回合压缩总花费」。
     ///
     /// 与 `usage` 是**兄弟**，不是子集：`RunFinished.usage` 不含它（逐字节承诺）。
-    /// 本回合总花费 = `usage + compaction_usage`。
+    /// 本回合总花费 ≈ `usage + compaction_usage`（失败压缩的漏计是已知偏差）。
     pub compaction_usage: Usage,
     pub rounds: u32,
     pub final_message: Option<Message>,
@@ -150,8 +186,18 @@ async fn run_compaction(
 
 // ── M4 · apps/coding-agent/src/status.rs + ys-tui-coding/src/view.rs ────────
 impl TurnStats {
-    /// 命中率千分位 → 整数百分比；`None` = 无读数（渲染成 `-`）。
-    /// 只有 `hit == hit + miss` 才给 100，避免四舍五入把 99.x 说成满命中。
+    /// **逐轮**记账：缓存读数只在这里累加。
+    ///
+    /// 不在回合聚合后的 `Usage` 上再算 —— `input` 无条件相加而 `hit` 会缺席，两者不对称。
+    /// 缺报轮只增 `unreported_rounds`，**不碰**分母。
+    pub fn record_round(&mut self, usage: &Usage);
+
+    /// 逐回合记账：只累计 input/output/回合数/时长，**不碰**缓存桶。
+    pub fn record_turn(&mut self, result: &RunResult);
+
+    /// 命中率整数百分比；`None` = 无读数（渲染成 `-`），或本轮尚未上报过缓存。
+    /// 分母恒为 `hit + miss`（**只含上报过的轮**）；只有 `hit == hit + miss` 才给 100，
+    /// 避免四舍五入把 99.x 说成满命中。
     pub fn cache_hit_pct(&self) -> Option<u8>;
 }
 pub struct CodingView {
@@ -311,7 +357,14 @@ B 下该字段与上报完整度无关，是唯一能无条件比较的量。
 机械但需逐点确认，建议单独 commit。不加 `#[non_exhaustive]`（那会让 app 侧测试无法构造字面量）。
 
 **R5 · 压缩失败路径仍漏账。** `Err` 分支拿不到 `outcome.usage`。本设计不修（见 D5），
-在 `design-final` 写明缺口。
+在 `design-final` 写明缺口。**`compaction_usage` 的 doc 必须写明「成功」限定** ——
+否则读者会把零值读成「没压过」，而实际可能是「压了、失败、已经烧了钱」。
+
+**R9 · 命中率聚合的口径敏感度（审核新增）。** `input` 无条件相加而 `hit` 缺席时不参与相加，
+两者不对称 ⇒ **一旦在回合聚合后的 `Usage` 上算 `input − hit`，缺报轮次的整个 input 会被当成未命中**。
+实测 4,915 条 `round_usage` 里缺报轮全部是 `(0,0)`，故当前数据不触发；但 3 个会话存在
+「同会话混合上报」、且 `/model` 切换可跨 provider ⇒ 功能上可达。缓解：**逐轮**累加（`record_round`），
+并由变异测试 M7 钉住。
 
 **R6 · `prompt_cache_miss_tokens` 成死字段。** 恒 `None`，保留只为老 JSONL 反序列化。
 删除会让老会话静默丢值，故留。
@@ -334,7 +387,8 @@ B 下该字段与上报完整度无关，是唯一能无条件比较的量。
 | ③ P0-2 | `TurnStats` / `CodingView` / `/status` / 状态栏 | ~130 | ~110 | ~240 |
 | **合计** | | **~280** | **~285** | **~565 行** |
 
-顺序：**① → ② → ③**（③ 依赖前两者的数据）。每期单独跑
+顺序：**① 与 ② 可并行，③ 必须最后**（③ 要同时读 `cache_split()`（①的产物）
+与 `compaction_usage`（②的产物））。每期单独跑
 `./scripts/cargo-build.sh` + `./scripts/par-test.sh` 可绿。
 
 ### 8.2 改动文件清单
@@ -362,7 +416,7 @@ B 下该字段与上报完整度无关，是唯一能无条件比较的量。
 
 | 文件 | 改动 |
 |---|---|
-| `apps/coding-agent/src/status.rs` | `TurnStats` 缓存计数 + `reported` 标志 + `compaction` 桶；`cache_hit_pct()` |
+| `apps/coding-agent/src/status.rs` | `TurnStats` 拆 `record_round`（逐轮，缓存桶只在此累加）与 `record_turn`（逐回合）；`unreported_rounds` 计数；`cache_hit_pct()` |
 | `apps/coding-agent/src/view.rs` | 投影 `cache_tokens` / `cache_hit_pct` / `compaction_usage`；三态透传用例 |
 | `crates/ys-tui-coding/src/view.rs` | `CodingView` 加三字段；`Default` / `for_test()` 补字段 |
 | `crates/ys-tui-coding/src/draw.rs` | 状态栏隐藏条件由「总量为 0」改为「无读数」；追加 `· 缓存 N%` |
@@ -385,6 +439,7 @@ B 下该字段与上报完整度无关，是唯一能无条件比较的量。
 | M4 | `RunResult.usage` 并入 `compaction_usage` | `RunFinished.usage` 不含压缩的用例 |
 | M5 | `Some(0)` 被折叠成 `None` | 「首调用真 0 命中」用例显示 `-` 而非 `0%` |
 | M6 | `hit == total` 才 `100%` 的判据改成四舍五入 | R7 用例（99.6% 必须显示 99） |
+| **M7** | `TurnStats` 改成在**回合聚合后的 `Usage`** 上算 `input − hit` | **跨轮混合用例**：1 轮 `(1000, Some(900))` + 1 轮 `(1000, None)` ⇒ 逐轮口径命中率 90%，聚合口径跌到 30% ⇒ 必红 |
 
 ---
 

@@ -207,7 +207,7 @@ impl TranscriptLayout {
             {
                 continue;
             }
-            let lines = render_entry(
+            let rendered = render_entry(
                 transcript,
                 cache,
                 idx,
@@ -216,6 +216,7 @@ impl TranscriptLayout {
                 theme,
                 now,
             );
+            let RenderedEntry { lines, stale } = rendered;
             let render_sig = lines_hash(&lines);
             let previous = self.entries[idx].take();
             // 折行真的换了才算一次「重算」—— 产物没变（流式节流窗口内）不计入。
@@ -237,6 +238,14 @@ impl TranscriptLayout {
                 Some(previous) if reused => previous.row_starts,
                 _ => line_row_starts(&lines, width),
             };
+            // **产物滞后时不得推进 `sig`**：`sig` 的语义是「这份产物对应的源状态」。
+            // 若在这里记下源的新哈希、而产物还是上一帧的短版本，下一帧 `sig` 相同
+            // ⇒ 命中并 `continue` ⇒ 那份完整产物永远没人来取，该条永久停在半句话上
+            // （用户实测的「半句话」缺陷）。写回旧源哈希 ⇒ 下一帧必然重算。
+            //
+            // 旧 memo 被 `take()` 走了，故这里用「源长度减一」以外没有可靠旧值 —— 用一个
+            // 不可能等于任何真实 sig 的哨兵即可：它只需保证**下一帧不命中**。
+            let sig = if stale { STALE_SIG } else { sig };
             self.entries[idx] = Some(EntryMemo {
                 sig,
                 render_sig,
@@ -515,9 +524,9 @@ fn render_entry(
     thinking_visible: bool,
     theme: Palette,
     now: Instant,
-) -> Vec<Line<'static>> {
+) -> RenderedEntry {
     let mut out = Vec::new();
-    crate::draw::push_transcript_line(
+    let stale = crate::draw::push_transcript_line(
         &mut out,
         &transcript[idx],
         width,
@@ -527,7 +536,14 @@ fn render_entry(
         idx,
         now,
     );
-    out
+    RenderedEntry { lines: out, stale }
+}
+
+/// [`render_entry`] 的产物：行 + **这份行是否滞后于源**。
+struct RenderedEntry {
+    lines: Vec<Line<'static>>,
+    /// `true` = 源比产物长（流式节流窗口内）。此时**不得**把本条目的 `sig` 推进到源的新状态。
+    stale: bool,
 }
 
 /// 条目内视觉行号 → [`RowRef::off`]。
@@ -615,6 +631,16 @@ fn lines_hash(lines: &[Line<'static>]) -> u64 {
     hash
 }
 
+/// 「本条目产物滞后于源」的哨兵 sig。
+///
+/// 产物来自流式节流窗口时写入它，使**下一帧必然不命中**并重新渲染。
+/// 代价是一次多余的重算；收益是该条目不会永久停在半句话上。
+///
+/// 不需要与真实 sig 无碰撞：任何真实 sig 撞上它只会导致**多算一次**，
+/// 不会导致错误命中（命中判定是 `memo.sig == sig`，而真实 sig 撞上哨兵的那一帧
+/// 仍然要重算 —— 语义安全，只是省不下那一次）。
+const STALE_SIG: u64 = u64::MAX;
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -651,6 +677,86 @@ mod tests {
             TranscriptLine::User("继续".into()),
             TranscriptLine::Assistant("| 名称 | 值 |\n| -- | -- |\n| 中文 | 数字 |\n".into()),
         ])
+    }
+
+    /// **回归：流式结束后静止若干帧，末条必须显示到最后一段增量。**
+    ///
+    /// 复现路径（用户实测的「半句话」）：
+    ///   1. 某个 assistant 条目正在流式增长 —— 增量之间的间隔短于 `RENDER_THROTTLE`，
+    ///      于是 `RenderCache` 沿用上次产物（**有意的节流**）；
+    ///   2. 流停了，但那一条仍是 transcript 末尾 ⇒ `sync_len` 的「增长即上一条结束」
+    ///      分支**永不触发**，`forced` 一直是 `false`；
+    ///   3. 之后每一帧的节流窗口都已过期，`RenderCache` 会重算并返回完整产物，但
+    ///      `TranscriptLayout` 的 memo 用 `entry_sig`（只含 `s.len()`）判「没变」⇒
+    ///      **直接 `continue`，根本不读那份新产物**。
+    ///
+    /// 结果：屏上的末条永久停在某个中间状态。追加新条目后才自愈 —— 这正好解释了
+    /// 「工作时半句、`/resume` 或下一段输出后又完整」。
+    ///
+    /// 变异：让第 1 帧与第 2 帧**都不追加新条目**、且把第 2 帧的时刻压在窗口内，
+    /// 而第 3 帧过窗 —— 若实现把「节流给出的旧产物」当成最终态写进 memo，本用例红。
+    #[test]
+    fn streaming_tail_settles_after_idle_frames() {
+        let w = 80u16;
+        let full = "第一段完整的话，后面还有很多内容要展开。";
+        // 只流出前 6 个字符时的中间态。
+        let head: String = full.chars().take(6).collect();
+
+        let mut app = app_with(vec![TranscriptLine::Assistant(head.clone())]);
+        let t0 = Instant::now();
+        let mut cache = app.md_cache.borrow_mut();
+        let mut layout = TranscriptLayout::default();
+
+        // 第 1 帧：节流窗口内 —— 有意的中间态（此时短是正常的）。
+        layout.sync(
+            &app.transcript,
+            &mut cache,
+            app.thinking_visible,
+            ThemeKind::default().palette(),
+            w,
+            t0,
+        );
+
+        // 源文本长完了（模拟后续增量已并入 transcript）。
+        app.transcript = vec![TranscriptLine::Assistant(full.to_string())];
+
+        // 第 2 帧：**落在节流窗口内** —— 缓存此时有意返回旧（更短）的产物，
+        // 但源文本已经长完了。这一帧正是把「新 sig + 旧产物」同时写进 memo 的地方。
+        layout.sync(
+            &app.transcript,
+            &mut cache,
+            app.thinking_visible,
+            ThemeKind::default().palette(),
+            w,
+            t0 + crate::cache::RENDER_THROTTLE / 2,
+        );
+
+        // 第 3 帧：已过节流窗口。**源文本没再变**（sig 与上一帧相同）。
+        // 正确行为：这一帧必须重新渲染并把完整文本显示出来。
+        layout.sync(
+            &app.transcript,
+            &mut cache,
+            app.thinking_visible,
+            ThemeKind::default().palette(),
+            w,
+            t0 + crate::cache::RENDER_THROTTLE * 10,
+        );
+
+        let rendered: String = layout
+            .entries
+            .last()
+            .and_then(|e| e.as_ref())
+            .map(|e| {
+                e.lines
+                    .iter()
+                    .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        assert!(
+            rendered.contains(full),
+            "流式结束后末条必须完整；实际渲染 = {rendered:?}（源 = {full:?}）"
+        );
     }
 
     /// **N4（layout 层）**：逐条目的折行行数之和 == 整段折行的行数。

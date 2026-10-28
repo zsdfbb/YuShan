@@ -989,15 +989,18 @@ pub(crate) fn push_transcript_line(
     cache: &mut crate::cache::RenderCache,
     idx: usize,
     now: Instant,
-) {
+) -> bool {
     if let TranscriptLine::Assistant(s) = item {
         // assistant markdown 走缓存 + `md::render`。
         // 样式表从**入参色板**构造：换成默认主题会让「切了主题 markdown 还是旧配色」。
         let styles = crate::styles::AssistantStyles::new(palette);
-        out.extend(cache.lines_for(idx, s, width, styles, now).iter().cloned());
-        return;
+        let rendered = cache.lines_for(idx, s, width, styles, now);
+        out.extend(rendered.lines.iter().cloned());
+        return rendered.stale;
     }
     push_non_assistant(out, item, width, thinking_visible, palette);
+    // 非 assistant 条目每帧现算，不存在「滞后于源」这回事。
+    false
 }
 
 /// 非 `Assistant` 变体 → 行（TUI 与退出回放共用，行为一致）。

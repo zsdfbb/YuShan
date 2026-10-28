@@ -54,6 +54,28 @@ struct Slot {
     forced: bool,
 }
 
+/// [`RenderCache::lines_for`] 的返回：行 + **这份行是否滞后于源**。
+///
+/// `stale = true` 只可能出现在流式节流窗口内 —— 此时返回的是上一帧的（更短的）产物。
+/// 它存在的唯一理由：让调用方能区分「源已渲染完」与「源还在长、这是旧图」。
+/// 若把后者当成前者记住，那一条就会**永久**停在半句话上（`layout::EntryMemo.sig` 契约）。
+pub(crate) struct Rendered<'a> {
+    /// 渲染产物（借用缓存槽位）。
+    pub lines: &'a [Line<'static>],
+    /// `true` = 源比这份产物长，下一帧（越过节流窗口后）会给出更长的产物。
+    pub stale: bool,
+}
+
+/// 让只关心「拿到行」的调用方（测试与退出回放）继续按切片用 —— `.iter()` / `.len()` /
+/// 索引都能直接写在返回值上，不必逐处改成 `.lines`。**`stale` 必须显式读**，
+/// 不存在隐式丢弃。
+impl<'a> std::ops::Deref for Rendered<'a> {
+    type Target = [Line<'static>];
+    fn deref(&self) -> &Self::Target {
+        self.lines
+    }
+}
+
 /// assistant 渲染产物的记忆缓存 + 流式节流状态。
 ///
 /// 节流状态**存在本结构内**（它记住每条上次算出什么、何时算的），令布局同步
@@ -171,7 +193,7 @@ impl RenderCache {
         width: usize,
         styles: AssistantStyles,
         now: Instant,
-    ) -> &[Line<'static>] {
+    ) -> Rendered<'_> {
         if self.slots.len() <= idx {
             self.slots.resize_with(idx + 1, || None);
         }
@@ -192,8 +214,16 @@ impl RenderCache {
             // 不写 slot ⇒ 每次取用都重算（`hit` 已因 oversized 恒 false）。非重入 `borrow_mut`。
             self.scratch = md::render(src, width, styles);
             self.streaming = Some(idx);
-            return &self.scratch;
+            return Rendered {
+                lines: &self.scratch,
+                stale: false,
+            };
         }
+        // **产物是否滞后于源**：命中但源已更长 ⇒ 本次返回的是上一帧的（更短）产物。
+        // 这只能发生在节流窗口内（`hit` 的第二条分支）。调用方若把这个中间态当成
+        // 「这份源已经渲染完」记下来，那一条就会永久停在半句话上 —— 见 layout 的
+        // `EntryMemo.sig` 契约。
+        let stale = hit && src.len() > self.slots[idx].as_ref().map_or(0, |s| s.len);
         if !hit {
             // 「长度相等即内容相同」的前提：同宽度下源文本只增不减。
             debug_assert!(
@@ -212,11 +242,12 @@ impl RenderCache {
             });
         }
         self.streaming = Some(idx);
-        self.slots[idx]
+        let lines = self.slots[idx]
             .as_ref()
             .expect("slot 已在上方填充")
             .lines
-            .as_slice()
+            .as_slice();
+        Rendered { lines, stale }
     }
 
     /// 该槽位当前是否**空**（未缓存）—— 供用例钉住「超长单条没进缓存」。
@@ -387,7 +418,7 @@ mod tests {
         assert_eq!(md::render_calls(), 2);
         // 再取回 idx 0/1，窗口内均命中
         assert_eq!(
-            flat_all(cache.lines_for(
+            flat_all(&cache.lines_for(
                 0,
                 "one",
                 60,
@@ -397,7 +428,7 @@ mod tests {
             "one"
         );
         assert_eq!(
-            flat_all(cache.lines_for(
+            flat_all(&cache.lines_for(
                 1,
                 "two",
                 60,
@@ -572,7 +603,7 @@ mod tests {
         let total = md::render_calls();
         assert!(total <= 11, "总渲染次数应 ≤ 11（实际 {total}）");
         assert_eq!(
-            flat_len(lines),
+            flat_len(&lines),
             1000,
             "结束时必须完整渲染到最后一段增量（否则尾部增量永久不显示）"
         );

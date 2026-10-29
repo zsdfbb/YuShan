@@ -179,17 +179,12 @@ impl BashTool {
     }
 }
 
-/// 把子进程输出组装成工具结果：stdout + stderr 合并、超限尾截断、非零退码标错。
+/// 把 stdout 与 stderr 合并成**一条**文本（stdout 在前；stderr 前若无换行补一个）。
 ///
-/// `note` 是这次调用的一条**事实**（当前唯一来源：[`redundant_root_cd`]），追加在
-/// 正文之后、退码行之前。它**不影响** `is_error` —— 命令本身失败时，注记与
-/// `Command exited with code …` 并存，且退码行仍是最后一行。
-fn render_result(
-    stdout: &[u8],
-    stderr: &[u8],
-    exit_code: Option<i32>,
-    note: Option<&str>,
-) -> ToolResult {
+/// 单独抽出来是因为它有两个消费者：渲染（[`render_result`]）与全文落盘
+/// （[`spill_full_output`]）。两者必须是**同一份字节**，否则落盘文件的头部
+/// 与模型看到的尾部对不上。
+fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
 
@@ -203,19 +198,38 @@ fn render_result(
         }
         combined.push_str(&stderr);
     }
+    combined
+}
 
+/// 把子进程输出组装成工具结果：stdout + stderr 合并、超限尾截断、非零退码标错。
+///
+/// `note` 是这次调用的一条**事实**（当前唯一来源：[`redundant_root_cd`]），追加在
+/// 正文之后、退码行之前。它**不影响** `is_error` —— 命令本身失败时，注记与
+/// `Command exited with code …` 并存，且退码行仍是最后一行。
+///
+/// `full_output` 是**未被截断**的完整输出；仅在发生截断时才用它落盘，
+/// 并在结果里给出路径 —— 否则被丢掉的头部对模型**永久不可达**，
+/// 它只能重跑命令重新碰运气。
+fn render_result(
+    stdout: &[u8],
+    stderr: &[u8],
+    exit_code: Option<i32>,
+    note: Option<&str>,
+    full_output: Option<&str>,
+) -> ToolResult {
+    let combined = combine_output(stdout, stderr);
     // 尾截断由 `ys_tool::truncate` 统一实现；「丢弃了多少行」的通知由本工具前插。
     // `total_lines - shown_lines` 即被丢弃的行数（= 原实现里的 `skipped`）。
     let truncated = ys_tool::tail(&combined, ys_tool::MAX_LINES, ys_tool::MAX_BYTES);
     let mut content = truncated.content;
     if truncated.shown_lines < truncated.total_lines {
-        content.insert_str(
-            0,
-            &format!(
-                "[Truncated {} lines.]\n\n",
-                truncated.total_lines - truncated.shown_lines
-            ),
-        );
+        let dropped = truncated.total_lines - truncated.shown_lines;
+        // 完整输出落盘失败不影响主结果 —— 只是少了「去哪看全文」这条路。
+        let pointer = full_output
+            .and_then(spill_full_output)
+            .map(|p| format!(" Full output: {p}"))
+            .unwrap_or_default();
+        content.insert_str(0, &format!("[Truncated {dropped} lines.{pointer}]\n\n"));
     }
 
     // 注记追加在**正文之后、退码行之前**（两条「关于本次执行」的元信息相邻）：
@@ -242,6 +256,39 @@ fn render_result(
         content,
         is_error: false,
     }
+}
+
+/// 把完整输出落盘，返回路径。
+///
+/// **只在发生截断时调用** —— 未截断时模型已经拿到了全部内容，落盘是纯浪费。
+///
+/// 落点：`<bg_root>/bash-full/<pid>-<seq>.log`。与后台命令输出共用同一根目录
+/// （`YUSHAN_BG_DIR` 或 `<temp_dir>/yushan-bg`），理由相同：**不落进用户仓库**。
+///
+/// **目录层次不能深于 `root/<dir>/<file>`**：启动期的 `sweep_bg_root` 只扫两层，
+/// 多一层子目录就会让这些文件**永远不被清理**。故 `bash-full` 充当「会话目录」的角色，
+/// pid 写进文件名而不是目录名。序号是进程内原子计数器 + pid：并行调用不撞名。
+///
+/// **失败一律返回 `None`**（只读文件系统、无临时目录权限等）：少了全文指针
+/// 不该把一次成功的命令变成错误结果。
+fn spill_full_output(text: &str) -> Option<String> {
+    spill_into(&crate::background::BackgroundTasks::default_root(), text)
+}
+
+/// [`spill_full_output`] 的**注入式**内核 —— 根目录由调用方给出。
+///
+/// 拆出来是为了可测：验证目录层次不靠改进程级 env（那在并行测试里是数据竞争，
+/// 与本仓「注入优于全局」的惯例一致，参 `SearchBackends::detect_from`）。
+fn spill_into(bg_root: &std::path::Path, text: &str) -> Option<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let root = bg_root.join("bash-full");
+    std::fs::create_dir_all(&root).ok()?;
+    let pid = std::process::id();
+    let path = root.join(format!("{pid}-{}.log", SEQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&path, text).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// 命令是否以「`cd` 到本工具 workspace 同一个目录」开头 —— 是即判为冗余。
@@ -406,7 +453,7 @@ fn steered_result(stdout: &[u8], stderr: &[u8], note: Option<&str>) -> ToolResul
         None => STEER_NOTE.to_string(),
     };
     // 退出码传 `None`：是我们杀掉的，`code` 不承载语义（见 `render_result` 的既有约定）。
-    render_result(stdout, stderr, None, Some(&combined))
+    render_result(stdout, stderr, None, Some(&combined), None)
 }
 
 #[async_trait::async_trait]
@@ -583,7 +630,15 @@ impl Tool for BashTool {
 
         match outcome {
             Ok((stdout, stderr, exit_code)) => {
-                Ok(render_result(&stdout, &stderr, exit_code, note.as_deref()))
+                // 未截断的完整输出（与 `render_result` 内的合并顺序逐字节一致）。
+                let full = combine_output(&stdout, &stderr);
+                Ok(render_result(
+                    &stdout,
+                    &stderr,
+                    exit_code,
+                    note.as_deref(),
+                    Some(&full),
+                ))
             }
             // **超时转后台**：进程不杀，过继给注册表，结果由完成通知送达。
             //
@@ -1703,8 +1758,10 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(
-            result.content.starts_with("[Truncated 1752 lines.]\n\n"),
-            "通知文案（含丢弃行数）必须精确；实际开头：{:?}",
+            result
+                .content
+                .starts_with("[Truncated 1752 lines. Full output: "),
+            "通知文案（含丢弃行数）必须精确，并带全文路径；实际开头：{:?}",
             result.content.chars().take(80).collect::<String>()
         );
         // 通知 2 行（正文 + 空行）+ 保留的 1248 行。
@@ -1718,6 +1775,95 @@ mod tests {
             result.content.lines().skip(2).all(|l| l == "x".repeat(40)),
             "保留正文应全为 40 字节行"
         );
+    }
+
+    /// 截断时必须给出**完整输出**的落盘路径，且该路径真的能读到被丢掉的那部分。
+    ///
+    /// 没有它，被尾截断丢掉的**头部**（往往就是第一个报错）对模型永久不可达，
+    /// 它只能重跑命令重新碰运气。
+    ///
+    /// 变异：把 `render_result` 里的 `spill_full_output` 调用改成 `None` ⇒
+    /// 第一段「必须带 Full output」变红。
+    #[tokio::test]
+    async fn test_bash_truncation_spills_full_output() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let ctx = make_ctx();
+        // 首行是哨兵（会被尾截断丢掉），后面 3000 行撑满字节闸。
+        let input = json!({
+            "command":
+                "echo SENTINEL_HEAD; awk 'BEGIN { s=\"\"; for (i=0;i<40;i++) s=s \"x\"; for (i=0;i<3000;i++) print s }'"
+        });
+
+        let result = tool.call(input, ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Full output:"),
+            "截断必须给出全文路径；实际开头：{:?}",
+            result.content.chars().take(200).collect::<String>()
+        );
+        // 哨兵行在保留的尾部里**看不到**（证明真的被截断了）。
+        assert!(!result.content.contains("SENTINEL_HEAD"));
+
+        // 从通知里抽出路径，验证完整输出真的落了盘、且含被丢掉的首行。
+        let path = result
+            .content
+            .split("Full output: ")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .expect("Full output: 后应跟路径")
+            .trim()
+            .to_string();
+        let spilled = std::fs::read_to_string(&path).expect("落盘文件必须可读");
+        assert!(
+            spilled.contains("SENTINEL_HEAD"),
+            "完整输出必须包含被截断丢掉的首行；path = {path}"
+        );
+        assert_eq!(spilled.lines().count(), 3001, "完整输出不得被截断");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 落盘路径的**目录层次必须与 `sweep_bg_root` 对得上**（`root/<dir>/<file>`）。
+    ///
+    /// 多一层子目录 ⇒ 启动期清扫扫不到 ⇒ 这些文件**永远不被清理**，
+    /// 长期运行在 `<temp_dir>` 里无界累积。
+    ///
+    /// 变异：把落点改回 `<bg_root>/bash-full/<pid>/<n>.log`（三层）⇒ 本用例变红。
+    #[test]
+    fn spill_path_is_two_levels_below_bg_root() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = spill_into(&dir, "body").expect("应能落盘");
+        let rel = std::path::Path::new(&path)
+            .strip_prefix(&dir)
+            .expect("落点必须在 bg_root 之下");
+
+        // 恰好 `bash-full/<file>` 两段。
+        assert_eq!(
+            rel.components().count(),
+            2,
+            "目录层次必须是 root/<dir>/<file>，否则 sweep_bg_root 扫不到；rel = {rel:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "body");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **未截断时不得落盘** —— 模型已经拿到全部内容，写盘是纯浪费。
+    ///
+    /// 变异：把 `spill_full_output` 提到截断判断之外 ⇒ 本用例变红。
+    #[tokio::test]
+    async fn test_bash_no_spill_when_not_truncated() {
+        let tool = BashTool::new(PathBuf::from("."));
+        let result = tool
+            .call(json!({ "command": "echo short" }), make_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(!result.content.contains("Full output:"));
+        assert!(!result.content.contains("[Truncated"));
     }
 
     // ==================== 冗余 `cd` 的事实回显（见 `redundant_root_cd`） ====================
@@ -1935,8 +2081,10 @@ mod tests {
         let result = tool.call(input, make_ctx()).await.unwrap();
 
         assert!(
-            result.content.starts_with("[Truncated 1752 lines.]\n\n"),
-            "截断通知仍须在最前；实际开头：{:?}",
+            result
+                .content
+                .starts_with("[Truncated 1752 lines. Full output: "),
+            "截断通知仍须在最前（带全文路径）；实际开头：{:?}",
             result.content.chars().take(60).collect::<String>()
         );
         assert!(

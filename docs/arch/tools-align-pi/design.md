@@ -182,8 +182,18 @@ pub fn parse_<provider>(body: &serde_json::Value) -> Vec<SearchHit>;  // 每 pro
 
 **`ls` 扫描上限**：`read_dir` 边读边计数，**超 20000 条即停**（防超大目录无界读），再排序取 `limit`（500）。
 
-**`--hidden`：不加**。加它会把 `.git/` 对象也纳入扫描（token 灾难）；代价是搜不到 `.github/workflows/*.yml`
-一类隐藏路径 —— **记为已知取舍**（需要时用 `find`）。
+**`--hidden`：加，同时用 `--glob=!.git/` 挡住对象库**。两个参数是一对：
+
+- 单独 `--hidden` ⇒ `.git/` 里的 commit 内容一并进结果（token 灾难）；
+- 单独排除而无 `--hidden` ⇒ `.github/workflows/*.yml`、`.claude/`、`.cargo/config.toml`
+  这类隐藏路径**永远搜不到**，而它们恰是配置排查的高频目标。
+
+rg 对 `.git/` **没有**硬编码豁免（`--hidden` 下 `rg -l 'ref:'` 会命中 `.git/HEAD`，
+ripgrep 15.1.0 实测），所以排除必须显式写。用等号形式 `--glob=!.git/` 是为了不跟
+用户传入的 `--glob` 争参数位。降级路径（POSIX `grep -r`）保持原有的 `--exclude-dir` 列表。
+
+> 早先版本记为「不加 `--hidden`」的取舍，前提（「加它必然搜进 `.git/`」）只对了一半：
+> 搜进 `.git/` 是**可排除的**，不该因此放弃隐藏路径。
 
 ### 1.5 提示词来源（解 review R5）
 

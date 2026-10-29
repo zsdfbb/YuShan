@@ -32,7 +32,7 @@ apps/coding-agent/src/prompt.rs      build_system_prompt(cwd, &[ToolSpec])，清
 
 **探测**：`SearchBackends::detect_from(path)` 纯 PATH 扫描 + 可执行位检查，**不 spawn、不探版本**；注入式（非 `OnceLock`）→ 降级路径可确定性测试。`fd` 认 Debian 别名 `fdfind`。
 
-**降级语义**：排除目录 `.git`/`target`/`node_modules`/`dist`/`build`/`.venv` **只作用于降级路径**（rg/fd 自带 `.gitignore`）。原生侧**不加 `--hidden`**。含 `/` 的 glob 在 rg 下归一为 `**/` 前缀；以 `/` 开头的 glob 明确报错。降级时启动期 stderr 一行提示。
+**降级语义**：排除目录 `.git`/`target`/`node_modules`/`dist`/`build`/`.venv` **只作用于降级路径**（rg/fd 自带 `.gitignore`）。原生侧**加 `--hidden` 并用 `--glob=!.git/` 挡对象库** —— 两个参数是一对，只出现任一个都是错的（单独 `--hidden` 搜进 `.git/`；单独排除则 `.github/workflows/*.yml` 等隐藏路径不可搜）。含 `/` 的 glob 在 rg 下归一为 `**/` 前缀；以 `/` 开头的 glob 明确报错。降级时启动期 stderr 一行提示。
 
 **`ls`**：纯 `read_dir`，**不起子进程**；扫描上限 20000 条；大小写不敏感排序；目录带 `/`；含 dotfile。
 

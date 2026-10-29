@@ -368,10 +368,15 @@ impl GrepTool {
     }
 }
 
-/// `rg --json --line-number --color=never […] -- PATTERN PATH`。
+/// `rg --json --line-number --color=never --hidden --glob=!.git/ […] -- PATTERN PATH`。
 ///
-/// **不加 `--hidden`**：会把 `.git/` 里的东西一并搜出来（token 灾难）；代价是搜不到
-/// `.github/workflows/*.yml` 一类隐藏路径 —— 已记为取舍（R4）。
+/// **`--hidden` 必须配 `--glob=!.git/`**：前者让 `.github/workflows/*.yml` 这类
+/// 隐藏路径可搜（它们恰是配置排查的高频目标），后者挡住 `.git/` 对象库
+/// （否则一次搜索就把 commit 内容倒进上下文）。两个参数是一对，单独出现任一个都是错的。
+///
+/// 用户给的 `--glob` **不覆盖**这个排除：排除用 `--glob=!.git/`（等号形式）单独占一个
+/// 位置参数，不跟用户的值争参数位。
+///
 /// **绝不省路径参数**（F3）：`rg` 在非 tty 下会改读 stdin，挂到 deadline。
 fn rg_argv(
     pattern: &str,
@@ -385,6 +390,8 @@ fn rg_argv(
         "--json".into(),
         "--line-number".into(),
         "--color=never".into(),
+        "--hidden".into(),
+        "--glob=!.git/".into(),
     ];
     if ignore_case {
         argv.push("--ignore-case".into());
@@ -668,6 +675,65 @@ mod tests {
                 fd: None,
             },
         )
+    }
+
+    /// `--hidden` 与 `--glob=!.git/` 必须**成对出现**。
+    ///
+    /// 单独 `--hidden` ⇒ 搜进 `.git/` 对象库（token 灾难）；单独排除而无 `--hidden`
+    /// ⇒ `.github/workflows/*.yml` 这类隐藏路径永远搜不到（配置排查的高频目标）。
+    ///
+    /// 变异：删掉 `--hidden` ⇒ 第一条断言变红；删掉 `--glob=!.git/` ⇒ 第二条变红。
+    #[test]
+    fn rg_argv_pairs_hidden_with_git_exclusion() {
+        let argv = rg_argv("pat", &[PathBuf::from(".")], None, false, false, 0);
+        assert!(argv.iter().any(|a| a == "--hidden"), "argv = {argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--glob=!.git/"),
+            "必须挡住 .git/；argv = {argv:?}"
+        );
+
+        // 用户给 `glob` 时，排除仍在、且不与用户值争参数位。
+        let with_glob = rg_argv("pat", &[PathBuf::from(".")], Some("*.rs"), false, false, 0);
+        assert!(with_glob.iter().any(|a| a == "--glob=!.git/"));
+        assert!(with_glob.windows(2).any(|w| w == ["--glob", "*.rs"]));
+    }
+
+    /// 端到端：真的能搜到隐藏路径，且真的搜不进 `.git/`。
+    ///
+    /// 用真 `rg` 跑一个临时 git 仓库（无 rg 时跳过 —— 这是后端缺失，不是本用例要验的）。
+    ///
+    /// 变异：从 `rg_argv` 删掉 `--glob=!.git/` ⇒ 第二段「不得出现 `.git/`」变红；
+    /// 删掉 `--hidden` ⇒ 第一段「必须找到 ci.yml」变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rg_searches_hidden_paths_but_not_dot_git() {
+        let Some(rg) = SearchBackends::detect().rg else {
+            return;
+        };
+        let dir = test_dir("grep-hidden");
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+        // 造一个真的 `.git` 目录（不是 worktree 的 gitfile），否则挡不挡都看不出来。
+        std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let tool = rg_tool(&rg, &dir);
+
+        let hidden = call(&tool, json!({ "pattern": "name: ci" })).await;
+        assert!(
+            hidden.content.contains("ci.yml"),
+            "隐藏路径必须可搜；content = {}",
+            hidden.content
+        );
+
+        let git = call(&tool, json!({ "pattern": "refs/heads" })).await;
+        assert!(
+            !git.content.contains(".git/"),
+            ".git/ 内的内容不得进入结果；content = {}",
+            git.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 走**降级路径**（真 `grep`）的工具。

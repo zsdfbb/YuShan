@@ -94,7 +94,23 @@ impl Tool for ReadTool {
             ));
         }
 
-        let start = offset.unwrap_or(1).saturating_sub(1).min(total_lines);
+        // `offset` 越界**必须报错**，不能钳到末尾返回空：空结果会让模型以为
+        // 「文件就这么多」，而实际是它猜错了行号 —— 那是静默的谎。
+        let start = match offset.unwrap_or(1) {
+            0 => 0,
+            o if o > total_lines => {
+                return Ok(attach_notice(
+                    ToolResult {
+                        content: format!(
+                            "Offset {o} is beyond end of file ({total_lines} lines total)"
+                        ),
+                        is_error: true,
+                    },
+                    path_notice.as_deref(),
+                ));
+            }
+            o => o - 1,
+        };
         let end = limit
             .map(|l| (start + l).min(total_lines))
             .unwrap_or(total_lines);
@@ -217,13 +233,22 @@ impl ReadTool {
 ///
 /// 单文件路径（`call`）与多文件路径（`read_many`）**共用**同一份渲染 ——
 /// 否则两条路径的行号/区间语义会漂移。
+///
+/// 越界的 `offset` 返回一条明确的错误行，而不是空串：多文件批次里单个目标出错
+/// 不拖垮整批（与 [`ReadTool::read_many`] 的纪律一致），但错误必须可见。
 fn render_one(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
     if total == 0 {
         return String::new();
     }
-    let start = offset.unwrap_or(1).saturating_sub(1).min(total);
+    let start = match offset.unwrap_or(1) {
+        0 => 0,
+        o if o > total => {
+            return format!("Offset {o} is beyond end of file ({total} lines total)");
+        }
+        o => o - 1,
+    };
     let end = limit.map(|l| (start + l).min(total)).unwrap_or(total);
     lines[start..end]
         .iter()
@@ -487,6 +512,88 @@ mod tests {
         assert!(result.content.contains("c"));
         assert!(!result.content.contains("a"));
         assert!(!result.content.contains("d"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// `offset` 越界必须**报错**，不得静默返回空串。
+    ///
+    /// 空结果会让模型以为「文件就这么多」，而实际是它猜错了行号 —— 那是静默的谎。
+    ///
+    /// 变异：把 `call` 里的越界分支改回 `.min(total_lines)`（钳到末尾）⇒ 第一段
+    /// `is_error` 断言变红、第二段「内容必须非空」断言也变红。
+    #[tokio::test]
+    async fn test_read_offset_beyond_eof_is_an_error() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file = dir.join("short.txt");
+        tokio::fs::write(&file, "a\nb\nc\n").await.unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let result = tool
+            .call(json!({ "path": "short.txt", "offset": 99 }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "越界 offset 必须是错误结果");
+        assert!(
+            result.content.contains("beyond end of file"),
+            "错误文案须说清原因；content = {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("3 lines total"),
+            "错误文案须给出真实行数供模型纠正；content = {}",
+            result.content
+        );
+
+        // 边界：`offset` == total 是**合法**的（读最后一行），不得误报。
+        let last = tool
+            .call(json!({ "path": "short.txt", "offset": 3 }), make_ctx())
+            .await
+            .unwrap();
+        assert!(
+            !last.is_error,
+            "offset == 总行数应合法；content = {}",
+            last.content
+        );
+        assert!(last.content.contains('c'));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 多文件批次里单个目标越界：**不拖垮整批**，但错误必须在正文里可见。
+    ///
+    /// 变异：让 `render_one` 对越界返回空串（旧行为）⇒ 第一条断言变红。
+    #[tokio::test]
+    async fn test_read_many_offset_beyond_eof_is_visible_per_file() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        tokio::fs::write(dir.join("one.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("two.txt"), "x\ny\n")
+            .await
+            .unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let result = tool
+            .call(
+                json!({ "path": "one.txt", "paths": ["one.txt", "two.txt"], "offset": 50 }),
+                make_ctx(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.content.contains("beyond end of file"),
+            "越界必须逐文件可见；content = {}",
+            result.content
+        );
+        // 两个文件都越界 ⇒ 整批仍有输出（不是空），且带分隔头。
+        assert_eq!(result.content.matches("beyond end of file").count(), 2);
+        assert!(result.content.contains("=== one.txt ==="));
+        assert!(result.content.contains("=== two.txt ==="));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

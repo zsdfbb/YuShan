@@ -33,8 +33,11 @@ impl Tool for ReadTool {
                         "description": "Several files to read in ONE call (e.g. [\"Cargo.toml\", \"README.md\"]). Relative paths resolve against the workspace root. Supersedes `path`. Prefer this over chaining `cat a && cat b` through bash."
                     },
                     "limit": { "type": "number", "description": "Maximum number of lines to read" }
-                },
-                "required": ["path"]
+                }
+                // 不设 `required`：`path` 与 `paths` 二选一，二者都缺时由 `call` 报
+                // `InvalidInput("missing 'path'")`。整键省略而非 `"required": []` ——
+                // 省略是 JSON Schema / OpenAI 兼容面里「无必填属性」的常规写法，
+                // 也避开部分校验器对空数组的额外挑剔；`path` 单用时仍是事实上的必填。
             }),
         )
     }
@@ -448,6 +451,103 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// **A2 契约**：`path` 与 `paths` 二选一，因此 schema 的 `required` 不得再强制
+    /// `path`（否则模型只给 `paths` 时会被 schema 校验挡在调用之前，而 `call` 明明支持）。
+    ///
+    /// 本仓库的写法是**整键省略**：`required` 键不存在即「无必填属性」。
+    ///
+    /// 变异：把 `"required": ["path"]` 加回 schema ⇒ 本用例变红。
+    #[test]
+    fn spec_does_not_require_path() {
+        let params = ReadTool::new(PathBuf::from(".")).spec().parameters;
+        assert!(
+            params.get("required").is_none(),
+            "`path` 与 `paths` 二选一，schema 不得声明必填属性；parameters = {params}"
+        );
+        assert!(
+            params["properties"].get("path").is_some()
+                && params["properties"].get("paths").is_some(),
+            "两个入口都必须保留在 properties 里：{params}"
+        );
+    }
+
+    /// **A2 契约**：只给 `paths`（≥2 项）即可成功，走 `read_many` 的分隔头形态。
+    ///
+    /// 与 `multi_file_reads_in_one_call_with_headers` 互补：那条测多文件语义，
+    /// 这条钉住「schema 允许、实现接受」这一对契约同时成立。
+    #[tokio::test]
+    async fn paths_only_reads_multiple_files_with_headers() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        tokio::fs::write(dir.join("a.txt"), "alpha\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("b.txt"), "beta\n").await.unwrap();
+
+        let result = ReadTool::new(dir.clone())
+            .call(json!({ "paths": ["a.txt", "b.txt"] }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(!result.is_error, "只给 paths 必须成功：{}", result.content);
+        assert!(result.content.contains("=== a.txt ==="));
+        assert!(result.content.contains("=== b.txt ==="));
+        assert!(result.content.contains("alpha") && result.content.contains("beta"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// **A2 契约**：`path` 与 `paths` 都不给 ⇒ `InvalidInput("missing 'path'")`。
+    ///
+    /// schema 不再兜底必填，运行时兜底必须仍在 —— 否则空参数会静默读到 workspace 根。
+    ///
+    /// 变异：删掉 `call` 里的 `ok_or_else(|| ToolError::InvalidInput(...))` ⇒ 变红。
+    #[tokio::test]
+    async fn missing_path_and_paths_is_invalid_input() {
+        let err = ReadTool::new(PathBuf::from("."))
+            .call(json!({}), make_ctx())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ToolError::InvalidInput(msg) if msg.contains("missing 'path'")),
+            "空参数必须是 InvalidInput 且点名 missing 'path'；err = {err:?}"
+        );
+    }
+
+    /// **A2 契约**：`paths` 只有 1 项时回落单文件读（无分隔头、行号形态不变）。
+    ///
+    /// 钉住 `>= 2` 的阈值；改成 `>= 1` 会让单目标也走 `read_many` 而多出分隔头。
+    ///
+    /// 变异：把 `targets.len() >= 2` 改成 `>= 1` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn single_entry_paths_falls_back_to_single_file_read() {
+        let dir = test_dir();
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        tokio::fs::write(dir.join("one.txt"), "only\n")
+            .await
+            .unwrap();
+
+        let result = ReadTool::new(dir.clone())
+            .call(json!({ "paths": ["one.txt"] }), make_ctx())
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            !result.content.contains("=== "),
+            "单元素 paths 应退化为单文件形态（无分隔头）：{}",
+            result.content
+        );
+        assert!(
+            result.content.starts_with("     1\t"),
+            "单文件行号形态必须不变：{}",
+            result.content
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 单文件路径**逐字节不变**（不含分隔头、行号形态不变）。

@@ -90,15 +90,23 @@ struct Entry {
 #[async_trait::async_trait]
 impl Tool for GrepTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            "grep",
+        // 描述里的输出上限必须由实现常量插值：模型按描述规划取数，字面量一旦与常量分叉，
+        // 模型就会按错误预算规划。grep 的字节上限是**专用**预算 `GREP_MAX_RESULT_BYTES`
+        // （比通用 `ys_tool::MAX_BYTES` 更紧），行数上限仍是通用的 `ys_tool::MAX_LINES`。
+        let description = format!(
             "Search file contents for a pattern. Returns matching lines with file paths and line \
              numbers. Respects .gitignore when ripgrep (rg) is available; the POSIX fallback \
              (grep -r) does NOT and instead skips .git/target/node_modules/dist/build/.venv. \
              A `glob` containing '/' (e.g. 'src/*.rs') matches at any depth under the search \
              target when rg is available; the POSIX fallback rejects such globs (use a basename \
              glob like '*.rs' there). Returns at most `limit` matches (default 100); long lines \
-             are cut to 500 chars and output is capped to 2000 lines / 50KB.",
+             are cut to 500 chars and output is capped to {} lines / {} KiB.",
+            ys_tool::MAX_LINES,
+            GREP_MAX_RESULT_BYTES / 1024,
+        );
+        ToolSpec::new(
+            "grep",
+            description,
             json!({
                 "type": "object",
                 "properties": {
@@ -292,10 +300,14 @@ impl GrepTool {
             };
         }
 
-        let (lines, limit_reached, lines_truncated) = render_entries(entries, limit, context);
+        let (lines, limit_reached, lines_truncated, total_matches) =
+            render_entries(entries, limit, context);
         // ★ 专用预算（收紧）：grep 单条结果按 `GREP_MAX_RESULT_BYTES` 截断，低于通用 `MAX_BYTES`。
         let truncated = ys_tool::head_lines(&lines, ys_tool::MAX_LINES, GREP_MAX_RESULT_BYTES);
         let rendered_bytes: usize = lines.iter().map(|l| l.len()).sum();
+        // 字节/行截断一旦发生，`limit` 就不再是瓶颈：此时再建议加大 limit 是**错误建议**
+        // （16 KiB 预算先于 limit 用尽，加大 limit 一条也多拿不到，只多烧一轮）。
+        let byte_truncated = truncated.hit.is_some() || bounded.stdout.len() >= BYTE_CAP;
 
         let mut notices: Vec<String> = Vec::new();
         if context_clamped {
@@ -304,9 +316,24 @@ impl GrepTool {
                  more surrounding lines"
             ));
         }
-        if limit_reached {
+        if byte_truncated {
+            // 合并为**一条可执行**的 notice：总数 + 实际展示量 + 「加大 limit 无用」+ 收窄指引。
+            // 报告的是渲染后的**行数**（含 context 行），与 `head_lines` 的计数口径一致。
+            let cap = if truncated.hit.is_some() {
+                format!("{} KiB", GREP_MAX_RESULT_BYTES / 1024)
+            } else {
+                format!("{} MiB", BYTE_CAP / (1024 * 1024))
+            };
             notices.push(format!(
-                "{limit} matches limit reached. Use limit={} for more",
+                "{total_matches} matches found; showing the first {} lines (output capped at {cap}). \
+                 Raising `limit` will not return more — narrow with `glob`, `path`, or a tighter \
+                 `pattern`.",
+                truncated.shown_lines
+            ));
+        } else if limit_reached {
+            // 仅 limit 触发时加大 limit 是**正确**建议；顺带报出总数，让模型知道还差多少。
+            notices.push(format!(
+                "{total_matches} matches found; showing {limit}. Use limit={} for more",
                 limit.saturating_mul(2)
             ));
         }
@@ -566,9 +593,14 @@ fn parse_grep_line(line: &str, search_root: &Path) -> Option<Entry> {
 
 /// 把条目渲染成输出行；`limit` 之外的命中丢弃（**context 行不计入 limit**）。
 ///
-/// 返回 `(行, 是否因 limit 截断, 是否有超长行被截)`。上下文窗口按「同一文件、行号连续」收集，
-/// 且不重复输出已被上一条命中的后置上下文覆盖过的行。
-fn render_entries(entries: &[Entry], limit: usize, context: usize) -> (Vec<String>, bool, bool) {
+/// 返回 `(行, 是否因 limit 截断, 是否有超长行被截, 命中总数)`。末位是**截断前**的命中总数：
+/// notice 需要区分「limit 之外还有命中」与「字节预算装不下」，而 `limit` 只能看到前者。
+/// 上下文窗口按「同一文件、行号连续」收集，且不重复输出已被上一条命中的后置上下文覆盖过的行。
+fn render_entries(
+    entries: &[Entry],
+    limit: usize,
+    context: usize,
+) -> (Vec<String>, bool, bool, usize) {
     let total_matches = entries.iter().filter(|e| e.kind == Kind::Match).count();
     let limit_reached = total_matches > limit;
 
@@ -621,7 +653,7 @@ fn render_entries(entries: &[Entry], limit: usize, context: usize) -> (Vec<Strin
         i = j;
     }
 
-    (lines, limit_reached, lines_truncated)
+    (lines, limit_reached, lines_truncated, total_matches)
 }
 
 /// 一行渲染：命中 `path:line: text`，上下文 `path-line- text`（与 Pi 同形）。
@@ -675,6 +707,23 @@ mod tests {
                 fd: None,
             },
         )
+    }
+
+    /// **描述即契约**：spec 文案里的字节上限必须等于 `GREP_MAX_RESULT_BYTES`。
+    ///
+    /// 模型按描述里的预算规划取数；若文案写成通用上限（`ys_tool::MAX_BYTES` = 50 KiB）
+    /// 而实现按 16 KiB 截断，模型会低估截断概率、给出错误的后续策略。
+    ///
+    /// 变异：把描述里的插值改回字面量 `50KB`（或任何与常量不符的值）⇒ 本用例变红。
+    #[test]
+    fn spec_byte_cap_matches_result_budget() {
+        let tool = GrepTool::new(PathBuf::from("."), SearchBackends::posix_only());
+        let d = tool.spec().description;
+        let expected = format!("{} KiB", GREP_MAX_RESULT_BYTES / 1024);
+        assert!(
+            d.contains(&expected),
+            "描述里的字节上限必须由 GREP_MAX_RESULT_BYTES 插值（应含 `{expected}`）；description = {d}"
+        );
     }
 
     /// `--hidden` 与 `--glob=!.git/` 必须**成对出现**。
@@ -1199,9 +1248,13 @@ mod tests {
     }
 
     /// `limit` 的单位是**条命中**：超出的命中被丢弃，且 notice **必须显式报出**（不静默）。
+    /// 仅 limit 触发（总字节远小于 16 KiB）时，加大 limit 是**正确**建议，故保留
+    /// `Use limit=…`，并顺带报出命中总数。
     ///
     /// 变异：把 `limit_reached` 的 notice 删掉 → 本用例的文案断言变红
     /// （结果集不变，正是「静默截断」的危险形态）。
+    /// 变异：把「仅 limit」也走字节截断的合并文案（含 `Raising \`limit\` will not return more`）
+    /// → 本用例「不含 Raising」断言变红。
     #[cfg(unix)]
     #[tokio::test]
     async fn test_grep_native_limit_truncates_and_notices() {
@@ -1234,8 +1287,15 @@ mod tests {
         assert!(
             result
                 .content
-                .contains("2 matches limit reached. Use limit=4 for more"),
+                .contains("3 matches found; showing 2. Use limit=4 for more"),
             "截断必须显式报出；实际：{}",
+            brief(&result.content)
+        );
+        assert!(
+            !result
+                .content
+                .contains("Raising `limit` will not return more"),
+            "仅 limit 触发时加大 limit 有效，不得说它无用；实际：{}",
             brief(&result.content)
         );
 
@@ -1274,7 +1334,7 @@ mod tests {
         assert_eq!(
             tail,
             format!(
-                "1 matches limit reached. Use limit=2 for more. \
+                "2 matches found; showing 1. Use limit=2 for more. \
                  Some lines truncated to {} chars. Use the read tool to see full lines]",
                 ys_tool::GREP_MAX_LINE_CHARS
             ),
@@ -1491,11 +1551,16 @@ mod tests {
 
     // ── 结果规模：专用预算（真收窄）+ 软阈值 + context 上限 ──────────────
 
-    /// **N1**：渲染超 `GREP_MAX_RESULT_BYTES`(16 KiB) ⇒ 正文被截到预算内，且截断 notice **带收窄指引**。
+    /// **N1**：渲染超 `GREP_MAX_RESULT_BYTES`(16 KiB) ⇒ 正文被截到预算内，且 notice **带收窄指引**。
+    ///
+    /// 字节截断时 `limit` 已不是瓶颈（16 KiB 先于 limit 用尽），故 notice **不得**再给
+    /// `Use limit=…` 的错误建议，必须报出总数并明确「加大 limit 不会返回更多」。
     ///
     /// 变异：把 `head_lines(.., GREP_MAX_RESULT_BYTES)` 换回 `ys_tool::MAX_BYTES`（50 KiB）
     /// → 「正文字节 ≤ 预算」断言变红（100 行 × ~390 B ≈ 38 KiB 不再被截）。
     /// 变异：删掉截断 notice 里的收窄措辞 → 「含 Narrow the search」断言变红。
+    /// 变异：在字节截断时仍输出 `Use limit=…`（即把 `byte_truncated` 分支改回无条件
+    /// `if limit_reached`）→ 「notice 不含 Use limit=」断言变红。
     #[cfg(unix)]
     #[tokio::test]
     async fn test_grep_truncates_to_result_budget_with_narrowing_hint() {
@@ -1530,6 +1595,22 @@ mod tests {
         assert!(
             notices.contains("Truncated") && notices.contains("Narrow the search"),
             "截断 notice 必须带收窄指引；实际：{notices}"
+        );
+        // 字节截断下加大 limit 拿不到更多：不得给出这条错误建议。
+        assert!(
+            !notices.contains("Use limit="),
+            "字节截断时不得再建议加大 limit；实际：{notices}"
+        );
+        assert!(
+            notices.contains("100 matches found")
+                && notices.contains("Raising `limit` will not return more"),
+            "合并 notice 必须报出总数并说明加大 limit 无收益；实际：{notices}"
+        );
+        assert!(
+            notices.contains("`glob`")
+                && notices.contains("`path`")
+                && notices.contains("`pattern`"),
+            "合并 notice 必须给出可执行的收窄指引；实际：{notices}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1593,6 +1674,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&big_dir);
         let _ = std::fs::remove_dir_all(&small_dir);
+    }
+
+    /// **N2b**：命中数 ≤ limit 且总字节远小于预算 ⇒ **无任何规模 notice**。
+    ///
+    /// 变异：把 `limit_reached` 判成 `total_matches >= limit`（等号）⇒ 本用例变红；
+    /// 变异：让 `byte_truncated` 恒真（或误用 `bounded.stdout.len() > 0`）⇒ 本用例变红。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_grep_no_notice_when_neither_limit_nor_bytes_trigger() {
+        let dir = test_dir("grep_no_notice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let abs = dir.join("src/a.rs").to_string_lossy().into_owned();
+        let body: String = (1..=3)
+            .map(|i| {
+                format!(
+                    "printf '%s\\n' '{}'\n",
+                    rg_match_jsonl(&abs, i, &format!("hit{i}"))
+                )
+            })
+            .collect();
+        let rg = fake_bin(&dir, "rg", &body);
+
+        let result = call(
+            &rg_tool(&rg, &dir),
+            json!({ "pattern": "hit", "limit": 100 }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", brief(&result.content));
+        assert!(
+            result.content.contains("src/a.rs:1: hit1"),
+            "正常命中必须渲染；实际：{}",
+            brief(&result.content)
+        );
+        for forbidden in [
+            "Use limit=",
+            "matches found",
+            "Raising `limit`",
+            "Truncated",
+            "result is large",
+        ] {
+            assert!(
+                !result.content.contains(forbidden),
+                "未触发截断时不得出现 `{forbidden}`；实际：{}",
+                brief(&result.content)
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **N3**：`context` 超 `MAX_CONTEXT`(5) ⇒ 被钳制 + notice；后置 context 行数 ≤ 5。

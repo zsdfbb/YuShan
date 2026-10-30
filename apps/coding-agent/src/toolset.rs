@@ -606,6 +606,7 @@ mod tests {
     ///  3. 系统提示（空 skill catalogue）的指纹可复现。
     ///
     /// 变异：把 [`build_tools`] 里 `grep`/`find` 互换 ⇒ 顺序断言与指纹都变红。
+    /// 变异：改任一工具的 description ⇒ 本用例变红。
     #[test]
     fn prefix_fingerprint_is_anchored_and_stable() {
         let _guard = env_lock();
@@ -676,12 +677,16 @@ mod tests {
         // 指纹非零（占位断言，防止函数被误改成恒 0）。
         assert_ne!(fp_tools, 0);
         assert_ne!(fp_prompt, 0);
-        // 当前锚点（漂移时这两个数字会变 —— 变化本身即是信号；本模块禁止 print 宏，故用注释记录）：
-        //   tools = 0xeced4483ff29ef22
-        // 只为**工具表**记值：`fp_tools` 与运行环境无关（`ToolSpec` 里不含任何路径）。
+        // 工具表指纹锚：任何工具名 / 描述 / schema 的改动都会让它变化。
+        // **变化本身即是信号** —— 它会平移模型看到的前缀、使所有用户的缓存冷启动一次，
+        // 所以必须显式更新这个数字，让 diff 暴露这次漂移。
+        // 只为**工具表**记值：`ToolSpec` 里不含任何路径，故 `fp_tools` 与运行环境无关。
         // `fp_prompt` **不入锚** —— 它含 `Current working directory: <临时目录>`，逐次运行都不同，
-        // 只由上一条「同一目录两次构建一致」的断言守卫。
-        // （若因有意改动而漂移，请在此更新这两个值，让 diff 显式暴露这次漂移。）
+        // 只由「同一目录两次构建一致」那条断言守卫。
+        assert_eq!(
+            fp_tools, 0xc3a96ba4de69115au64,
+            "工具表指纹漂移：确认是有意的工具面改动，再更新此锚点"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

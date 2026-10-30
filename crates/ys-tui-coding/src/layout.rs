@@ -795,6 +795,12 @@ mod tests {
         }
     }
 
+    /// 剥掉零宽断点 —— 布局层产出的行含它们（见 `crate::breakpoints`），
+    /// 而断言关心的是**可见文本**。
+    fn strip_zwsp(s: &str) -> String {
+        s.chars().filter(|c| *c != '\u{200B}').collect()
+    }
+
     /// 视窗的两端：**顶行**取到内容的第一行，**末行**取到内容的最后一行。
     #[test]
     fn test_window_anchors_at_both_ends() {
@@ -833,10 +839,12 @@ mod tests {
         let head = layout.window(0, 1);
         assert_eq!(head.skip_rows, 0, "顶行不必跳过行内偏移");
         assert_eq!(head.lines.len(), 1, "只要一行");
+        // 行内容含 CJK 零宽断点（`breakpoints::with_cjk_breakpoints`）⇒ 比对前先剥掉，
+        // 否则 `contains("问题")` 会被 `问\u{200B}题` 判成不匹配。
+        let head_text = strip_zwsp(&head.lines[0].to_string());
         assert!(
-            head.lines[0].to_string().contains("问题"),
-            "顶行必须是第一条内容：{:?}",
-            head.lines[0].to_string()
+            head_text.contains("问题"),
+            "顶行必须是第一条内容：{head_text:?}"
         );
 
         let tail = layout.window(total - 1, 1);

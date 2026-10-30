@@ -1126,6 +1126,49 @@ App::set_theme(kind)                       // 唯一入口
    `table_header` / `table_cell` / `definition_term` / `definition_description` 取 `fg`，表头与术语的
    层次只靠 `BOLD`，不引第二套前景色。
 
+### 14.10 CJK 断点（非 assistant 变体的折行）— as-built
+
+**问题**：ratatui 的 `Paragraph` **只在空白处断行**（`ratatui-widgets` 的 `WordWrapper`：
+`word_found = non_whitespace_previous && is_whitespace`）。中文没有词间空格 ⇒ 一整串 CJK 被当成
+**一个词**：它在当前行放不下时**整体**被推到下一行，当前行只剩前缀那几个字。
+
+实测（宽 80，首行实际占用列数）：
+
+| 变体 | 首行占用 | 剩什么 |
+|---|---|---|
+| `User` | 1 | 只剩 `> ` |
+| `Thinking` | 3 | 只剩 `⌁ ` |
+| `Error` | 6 | 只剩 `Error: ` |
+| `Tool` | 10 | 只剩 `⏺ bash` |
+| `Assistant` | 满宽 | **正常** |
+
+`Assistant` 正常的原因正是答案：它经 `md::render`（`tui_markdown`），那一步已在渲染期生成断点。
+
+**机制**（`crates/ys-tui-coding/src/breakpoints.rs`）：在**相邻 CJK 之间**插入 U+200B（ZWSP）。
+ratatui 显式认它作断点（`ratatui-core` 的 `Grapheme::is_whitespace`：`symbol == ZWSP || …`），且宽 0：
+
+- **不占列** ⇒ 折行位置之外的一切宽度计算不受影响；
+- **不写入 `Buffer`**（实测「含 ZWSP 的单元格数 = 0」）⇒ 屏幕上看不见，复制选区也拿不到，
+  `selection.rs` **无需改动**。
+
+**落点两处**（不是逐变体各插一遍）：
+
+1. `push_transcript_line` 的**单一出口**：`push_non_assistant` 产出的行统一过 `add_cjk_breakpoints`
+   —— 覆盖 `User` / `Thinking` / `Error` / `System`。新增变体自动被覆盖。
+2. `Tool` 分支**自己折行**（`wrap_limited`）⇒ 断点必须在折行**之前**插入，否则 `wrap_words`
+   看不到可断位置。同时 `wrap_words` 改认「空格**或** ZWSP」作分词符（`split_at_breaks`）——
+   只认空格时，`bash <长中文>` 会把 `bash ` 单独留在首行。
+
+**为何不在 `push_non_assistant` 内部逐变体加**：该函数被退出回放（`transcript_plain_lines`）复用，
+而回放会把行再交给 `wrap_plain` 按列硬折 —— 那里不需要也不该看到零宽字符。
+
+**为何不自己按宽度预折 CJK**：那会引入第二次折行，与 `Paragraph` 的口径必须严格一致，否则
+§18 的 N4 不变式（整段折行 == 逐行折行之和）破裂、滚动错位。断点方案不改变列宽语义，
+`Paragraph` 仍是唯一实际渲染者。
+
+**不覆盖 emoji**：判据取 Unicode 区段而非「宽度 == 2」—— 在 ZWJ 连接的表情序列中间插断点会把
+一个组合表情切断，那是破坏而不是断行。
+
 ---
 
 ## 15. debug 结构化执行日志（默认开启）— as-built

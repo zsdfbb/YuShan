@@ -32,6 +32,7 @@
 //! 代价与收益：agent 不能跑在 `run()` 里，TUI 也不认识 `Agent`。
 
 mod app;
+mod breakpoints;
 mod cache;
 mod commands;
 mod completion;

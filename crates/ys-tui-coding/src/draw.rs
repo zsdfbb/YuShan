@@ -1021,9 +1021,32 @@ pub(crate) fn push_transcript_line(
         out.extend(rendered.lines.iter().cloned());
         return rendered.stale;
     }
+    let from = out.len();
     push_non_assistant(out, item, width, thinking_visible, palette);
+    // CJK 断点：**只在这一条出口**加，不在 `push_non_assistant` 内部逐变体加。
+    //
+    // 理由：`push_non_assistant` 同时被退出回放（[`transcript_plain_lines`]）复用，
+    // 而回放会把行再交给 [`wrap_plain`] 按列硬折 —— 那里不需要也不该看到零宽字符。
+    // 集中在出口处做，则**新增变体自动被覆盖**，不会漏（漏了不报错，只会静默退回
+    // 「中文被当成一个词」的旧行为）。
+    add_cjk_breakpoints(&mut out[from..]);
     // 非 assistant 条目每帧现算，不存在「滞后于源」这回事。
     false
+}
+
+/// 给行的每个 span 加 CJK 断点（原地改写）。
+///
+/// 只接**本条目刚产出的行**（调用方传切片）—— 在共享 `out` 上就地追加时，
+/// 早先条目已在的行不该被重新处理（虽幂等、无正确性风险，但会白白复制字符串）。
+fn add_cjk_breakpoints(lines: &mut [Line<'static>]) {
+    for line in lines.iter_mut() {
+        for span in line.spans.iter_mut() {
+            match crate::breakpoints::with_cjk_breakpoints(&span.content) {
+                std::borrow::Cow::Borrowed(_) => {}
+                std::borrow::Cow::Owned(text) => span.content = text.into(),
+            }
+        }
+    }
 }
 
 /// 非 `Assistant` 变体 → 行（TUI 与退出回放共用，行为一致）。
@@ -1116,6 +1139,10 @@ pub(crate) fn push_non_assistant(
             } else {
                 format!("{name} {summary}")
             };
+            // 工具行**自己折行**（`wrap_limited`）⇒ 断点必须在折行**之前**插入，
+            // 否则 `wrap_words` 看不到可断位置，中文串仍被当成一个词。
+            // 其余变体交给 `Paragraph` 折行，断点在出口处统一补（`add_cjk_breakpoints`）。
+            let text = crate::breakpoints::with_cjk_breakpoints(&text);
             let rows = wrap_limited(&text, budget, max_rows);
             let last = rows.len().saturating_sub(1);
             for (i, row) in rows.into_iter().enumerate() {
@@ -1332,12 +1359,19 @@ fn wrap_limited(s: &str, width: usize, max_rows: usize) -> Vec<String> {
     rows
 }
 
-/// 按显示宽度折行：贪心装词，词间在空格处断；词本身超宽则按列硬断。
+/// 按显示宽度折行：贪心装词，在**空格或零宽断点**处断；词本身超宽则按列硬断。
+///
+/// 断点（U+200B）与空格同等对待：CJK 没有词间空格，若只认空格，一整串中文就是
+/// 一个「词」—— 它放不下一行时会被硬断，且**先**把当前行推出去（`bash ` 单独占一行）。
+/// 认零宽断点后，中文串被切成可装填的小段，当前行的剩余列数得以用满。
+///
+/// 注意：这里**不**自行插入断点（那是 [`crate::breakpoints::with_cjk_breakpoints`] 的职责），
+/// 只负责「遇到了就当作可断位置」。故纯 ASCII 文本的行为逐字不变。
 fn wrap_words(s: &str, width: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for token in s.split_inclusive(' ') {
+    for token in split_at_breaks(s) {
         let tw = display_width(token);
         if cur_w + tw <= width {
             cur.push_str(token);
@@ -1375,6 +1409,26 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
         rows.push(String::new());
     }
     rows
+}
+
+/// 按「空格或零宽断点」切词，分隔符跟随其前的片段（同 `split_inclusive`）。
+///
+/// 零宽断点留在片段尾部而不是行首：它宽 0、不写入 `Buffer`，留在行尾无副作用；
+/// 若留在行首，下一轮装填会先看到一个宽 0 的字符，逻辑上仍成立但读起来多余。
+fn split_at_breaks(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        if ch == ' ' || ch == '\u{200B}' {
+            let end = i + ch.len_utf8();
+            out.push(&s[start..end]);
+            start = end;
+        }
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
 }
 
 /// 按显示宽度贪心硬 wrap（退出打印用；不做断词）。
@@ -1465,6 +1519,187 @@ mod tests {
 
     fn app_with(view: CodingView) -> App {
         App::new(view)
+    }
+
+    // ── CJK 断点（`breakpoints.rs` 的渲染层守卫） ──────────────────────────
+
+    /// 渲染出的字符行里，`buf` 每行**实际占用**的列数（末个非空白格的位置 + 其宽度）。
+    fn row_used_cols(row: &[ratatui::buffer::Cell]) -> usize {
+        let mut last = 0;
+        for (i, c) in row.iter().enumerate() {
+            if c.symbol().trim().is_empty() {
+                continue;
+            }
+            last = i + display_width(c.symbol());
+        }
+        last
+    }
+
+    /// Chat 区内**内容行**的实际占用列数（跳过标题行、下方空白、Input 边框）。
+    fn content_row_widths(app: &mut App, w: u16) -> Vec<usize> {
+        let backend = TestBackend::new(w, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let bw = buf.area().width as usize;
+        let mut out = Vec::new();
+        for (i, row) in buf.content().chunks(bw).enumerate() {
+            if i == 0 {
+                continue; // Chat 标题行
+            }
+            let text: String = row.iter().map(|c| c.symbol()).collect();
+            let text = text.trim_end();
+            if text.starts_with('┌') || text.starts_with('│') || text.starts_with('└') {
+                break; // Input 边框：Chat 区到此为止
+            }
+            if text.is_empty() {
+                continue;
+            }
+            out.push(row_used_cols(row));
+        }
+        out
+    }
+
+    /// 一段足够长的中文（无空格 ⇒ 断词器找不到断点）。
+    const CJK_LONG: &str = "这个函数的职责是把事件发到信道里它先试同步快路径满了就把事件缓冲进溢出区然后再继续补充一些内容以便跨行";
+
+    /// **非 assistant 变体也要能断行**。
+    ///
+    /// 这是本缺陷的核心守卫：`WordWrapper` 只在空白处断，中文整串被当成一个词 ⇒
+    /// 放不下就整体下移，首行只剩前缀那几个字。实测（宽 80）：`User` 首行仅 1 列、
+    /// `Thinking` 3 列、`Error` 6 列、`Tool` 10 列。
+    ///
+    /// 断言口径是**首行必须占到足够宽**，而不是「行数等于某个数」——
+    /// 后者会随措辞变化，前者直接表达「不许没填满就换行」。
+    ///
+    /// **变异**：删掉 `push_transcript_line` 里的 `add_cjk_breakpoints` 调用 ⇒ 四条全红。
+    #[test]
+    fn every_variant_breaks_cjk_without_orphan_prefix() {
+        let variants: Vec<(&str, TranscriptLine)> = vec![
+            ("User", TranscriptLine::User(CJK_LONG.into())),
+            ("Thinking", TranscriptLine::Thinking(CJK_LONG.into())),
+            ("Error", TranscriptLine::Error(CJK_LONG.into())),
+            (
+                "Tool",
+                TranscriptLine::Tool {
+                    id: ToolCallId("c1".into()),
+                    name: "bash".into(),
+                    summary: CJK_LONG.into(),
+                    result: None,
+                    success: true,
+                },
+            ),
+        ];
+        for w in [60u16, 80, 100] {
+            for (label, item) in &variants {
+                let mut app = app_with(CodingView::for_test());
+                app.thinking_visible = true;
+                app.transcript.push(item.clone());
+                let widths = content_row_widths(&mut app, w);
+                assert!(
+                    widths.len() >= 2,
+                    "{label} @ w={w}：前提是这段中文要跨行，实际只有 {} 行",
+                    widths.len()
+                );
+                let first = widths[0];
+                // 门槛取满宽的 60%：够宽以排除「只剩前缀」，又不要求恰好填满
+                // （末字是宽字符时可能留 1 列）。
+                assert!(
+                    first * 10 >= (w as usize) * 6,
+                    "{label} @ w={w}：首行只占 {first} 列就换行了（满 {w}）——\
+                     中文被当成一个词、整体被推到下一行。各行占用 {widths:?}"
+                );
+            }
+        }
+    }
+
+    /// 断点**不进入屏幕内容**，且**不改变可见字形**。
+    ///
+    /// 两件事各钉一条：
+    ///
+    /// 1. 字符画里不得出现 U+200B —— ZWSP 宽度为 0，ratatui 不把它写进 `Buffer`。
+    /// 2. 去掉空白后，屏幕上的可见字符必须**恰好等于**源文本。这条比「不出现 ZWSP」
+    ///    更强：断点若换成任何**可见**字符（普通空格、`·`…），第 2 条立刻红 ——
+    ///    而只查 `\u{200B}` 是抓不到那种改法的（实测过：把 ZWSP 换成 `' '` 后
+    ///    单查 U+200B 仍然通过）。
+    ///
+    /// **变异**：① 断点改用宽度非 0 的字符 ⇒ 第 1 / 2 条红；
+    ///           ② 渲染路径改写 / 丢失源字符 ⇒ 第 2 条红。
+    #[test]
+    fn breakpoints_never_reach_the_screen() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User(CJK_LONG.into()));
+        let rows = rows_of(&mut app, 60, 30);
+        let joined = rows.join("\n");
+        assert!(
+            !joined.contains('\u{200B}'),
+            "零宽断点不得出现在屏幕上：{joined:?}"
+        );
+
+        // 只看 Chat 区（跳过标题行、下方空白与 Input 边框），去掉全部空白后比对。
+        // `rows_of` 按字符拼接，宽字符的续格是空格 ⇒ 必须去空白才能与源文本比。
+        let body: String = rows
+            .iter()
+            .skip(1)
+            .take_while(|r| !r.starts_with('┌'))
+            .flat_map(|r| r.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // 用户行带 `> ` 前缀，去掉它再比。
+        let visible = body.trim_start_matches('>');
+        assert_eq!(
+            visible, CJK_LONG,
+            "屏幕上的可见字符必须恰好等于源文本（断点只能是零宽且不落屏）"
+        );
+    }
+
+    /// 纯 ASCII 内容**逐字不变** —— 断点是加法，不得改写原有文本。
+    ///
+    /// **变异**：把 `with_cjk_breakpoints` 改成无条件重排 / 改写字符 ⇒ 本用例红。
+    #[test]
+    fn ascii_content_is_untouched() {
+        let src = "bash cargo test --workspace --all-features";
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::Tool {
+            id: ToolCallId("c1".into()),
+            name: "bash".into(),
+            summary: src.into(),
+            result: None,
+            success: true,
+        });
+        let rows = rows_of(&mut app, 100, 30);
+        let joined = rows.join("\n");
+        assert!(joined.contains(src), "ASCII 摘要必须原样出现：{joined}");
+        assert!(!joined.contains('\u{200B}'), "ASCII 不该产生断点");
+    }
+
+    /// 断点后**折行仍与滚动数学一致**（N4 不变式不被破坏）。
+    ///
+    /// `layout.rs` 的视窗切片依赖「整段折行 == 逐行折行之和」。断点改变了折行位置 ⇒
+    /// 必须重验这条等式：否则滚动位置与画面会错位（本仓出过的真 bug）。
+    #[test]
+    fn cjk_breakpoints_keep_line_count_consistent() {
+        let src = CJK_LONG;
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User(src.into()));
+        for w in [40u16, 60, 80, 100] {
+            let rows = rows_of(&mut app, w, 30);
+            let inner_w = crate::draw::chat_viewport(&app, w, 30).0;
+            let total = Paragraph::new(build_text(&app, inner_w as usize, Instant::now()))
+                .wrap(Wrap { trim: false })
+                .line_count(inner_w);
+            // 实际画出来的非空行数不得超过 line_count（超出即说明两者口径分叉）。
+            let painted = rows
+                .iter()
+                .skip(1)
+                .take_while(|r| !r.starts_with('┌'))
+                .filter(|r| !r.trim().is_empty())
+                .count();
+            assert!(
+                painted <= total,
+                "w={w}：画了 {painted} 行，但 line_count 只报 {total} —— 折行口径分叉，滚动会错位"
+            );
+        }
     }
 
     /// 渲染成「按行」的字符画（行尾裁剪便于断言）。

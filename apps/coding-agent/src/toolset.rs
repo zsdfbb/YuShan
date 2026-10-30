@@ -605,8 +605,21 @@ mod tests {
     ///     子 agent 每次派发都重建表，`spec()` 若非纯函数会让子自己的缓存跨派发抖动）；
     ///  3. 系统提示（空 skill catalogue）的指纹可复现。
     ///
-    /// 变异：把 [`build_tools`] 里 `grep`/`find` 互换 ⇒ 顺序断言与指纹都变红。
-    /// 变异：改任一工具的 description ⇒ 本用例变红。
+    /// # 两个指纹锚各覆盖什么
+    ///
+    /// - `fp_tools`：**只**覆盖基础 9 元（子 agent 的工具表）。它守的是子表自身的
+    ///   字节稳定性，对追加段完全无感。
+    /// - `fp_parent`：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent` / `subagent_async`）
+    ///   共 **12 元**，与 `assembly.rs` 的生产父表同形。追加段工具的 schema 漂移
+    ///   在 `fp_tools` 那里是**静默的**（本会话已实际发生过一次：给 `subagent` 加
+    ///   `mode` 参数后 `fp_tools` 纹丝不动），故必须由父表锚补上。
+    ///
+    /// # 变异
+    ///
+    /// 变异：把 [`build_tools`] 里 `grep`/`find` 互换 ⇒ 顺序断言与两个指纹都变红。
+    /// 变异：改任一**基础**工具的 description ⇒ `fp_tools` 与 `fp_parent` 都变红。
+    /// 变异：改 `subagent` 的 description ⇒ `fp_parent` 变红、`fp_tools` 不变
+    /// （这正是父表锚存在的理由）。
     #[test]
     fn prefix_fingerprint_is_anchored_and_stable() {
         let _guard = env_lock();
@@ -621,32 +634,36 @@ mod tests {
         let json = serde_json::to_string(&specs).unwrap();
         let fp_tools = fnv1a64(json.as_bytes());
 
-        // **父表锚点**：父表 = 这 9 元 + `bash_bg` + 派发工具（末位）⇒ **11 元**，且父 JSON
-        // 是子 JSON 的**字节前缀 + 追加项**（子表命中父的前缀缓存）。
+        // **父表锚点**：父表 = 这 9 元 + `bash_bg` + `subagent` + `subagent_async` ⇒ **12 元**
+        // （与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的**字节前缀 + 追加项**
+        // （子表命中父的前缀缓存）。
         //
-        // 两个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
-        // 真看到的那份 schema。`subagent_async` 由 `assembly.rs` 再追加在更后面，不进本锚点。
+        // 三个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
+        // 真看到的那份 schema。
         let mut parent_specs = specs.clone();
         parent_specs.push(bash_bg_spec(&dir));
         parent_specs.push(crate::subagent::SubagentTool::new(Duration::from_secs(60)).spec());
+        parent_specs.push(crate::subagent::SubagentAsyncTool::new().spec());
         assert_eq!(
             parent_specs.len(),
-            11,
-            "父表应为 11 元（9 基础 + bash_bg + subagent）"
+            12,
+            "父表应为 12 元（9 基础 + bash_bg + subagent + subagent_async）"
         );
         assert_eq!(
-            parent_specs[parent_specs.len() - 2..]
+            parent_specs[parent_specs.len() - 3..]
                 .iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<&str>>(),
-            vec!["bash_bg", "subagent"],
-            "追加段顺序即契约：后台工具在派发工具**之前**（否则子表不再是父的字节前缀）"
+            vec!["bash_bg", "subagent", "subagent_async"],
+            "追加段顺序即契约：后台工具在派发工具**之前**、`subagent_async` 在 `subagent` \
+             **之后**（与 assembly.rs 尾断言逐项一致，否则子表不再是父的字节前缀）"
         );
         let parent_json = serde_json::to_string(&parent_specs).unwrap();
         assert!(
             parent_json.starts_with(&json[..json.len() - 1]),
             "父表 JSON 必须是子表 JSON 的字节前缀（去掉末尾 `]`）+ 追加项"
         );
+        let fp_parent = fnv1a64(parent_json.as_bytes());
 
         // 2) 同一份表构造两次 → 逐字节相同。
         let (tools2, _) = build_tools(&dir, offline_web());
@@ -686,6 +703,12 @@ mod tests {
         assert_eq!(
             fp_tools, 0xc3a96ba4de69115au64,
             "工具表指纹漂移：确认是有意的工具面改动，再更新此锚点"
+        );
+        // 父表指纹锚：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent` / `subagent_async`）。
+        // `fp_tools` 只覆盖子表，追加段工具的 schema 漂移在它那里是静默的 —— 这里补上。
+        assert_eq!(
+            fp_parent, 0x83800653804a04eeu64,
+            "父表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -7,7 +7,7 @@
 //! 每回合派发总量上限、`model` 名解析失败 fail-closed、产物目录 sweep + 环境变量覆盖口。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,7 +23,8 @@ use ys_protocol::{Boundary, BoundarySource, QueueBoundarySource};
 use ys_runtime::{AgentBuilder, AgentPorts};
 use ys_session::{MemorySession, Session};
 use ys_tool::{
-    SubagentOutcome, SubagentRunner, Tool, ToolContext, ToolError, ToolResult, ToolSpec,
+    SubagentMode, SubagentOutcome, SubagentRunner, Tool, ToolContext, ToolError, ToolResult,
+    ToolSpec,
 };
 use ys_tools_web::WebConfig;
 
@@ -31,6 +32,12 @@ use ys_tools_web::WebConfig;
 pub const MAX_SUMMARY_BYTES: usize = 8 * 1024;
 /// 每回合派发次数上限（ADR-0022 决策 15；ADR-0029 §5①）。超限返回**响亮的 `Err`**。
 pub const DEFAULT_MAX_DISPATCHES_PER_TURN: u32 = 16;
+/// `explore` 模式的轮数上限：调查任务到点强制交卷，返回已找到的内容。
+/// 无界探索会让墙钟被最慢的子 agent 拖死（实测 20+ 分钟）。
+pub const EXPLORE_MAX_ROUNDS: u32 = 8;
+
+/// `explore` 模式的墙钟预算。
+pub const EXPLORE_WALL_CLOCK: Duration = Duration::from_secs(300);
 /// 产物保留期 —— 启动期 sweep 超过此龄的文件（只对 Primary 档）。
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 派发工具外闸相对**子预算**的宽限：让协作路径（watchdog → 轮边界）先赢，
@@ -578,6 +585,8 @@ pub struct AppSubagentRunner<'a> {
     /// 拿不出稳定引用。
     model_cache: SubagentModelCache,
     child_prompt: String,
+    /// 探索模式的系统提示（只读、带 `path:line` 输出契约）。
+    explore_prompt: String,
     child_limits: RunLimits,
     child_budget: Duration,
     workspace: PathBuf,
@@ -609,6 +618,7 @@ impl<'a> AppSubagentRunner<'a> {
         config: Option<&'a crate::config::Config>,
         model_cache: SubagentModelCache,
         child_prompt: String,
+        explore_prompt: String,
         child_limits: RunLimits,
         child_budget: Duration,
         workspace: PathBuf,
@@ -634,6 +644,7 @@ impl<'a> AppSubagentRunner<'a> {
             config,
             model_cache,
             child_prompt,
+            explore_prompt,
             child_limits,
             child_budget,
             workspace,
@@ -655,6 +666,8 @@ impl<'a> AppSubagentRunner<'a> {
 /// `child_budget`）—— 缓存相干性要求它们不含任何时间 / 会话相关量。
 pub struct SubagentSetup {
     child_prompt: String,
+    /// 探索模式的系统提示；`shared` 未显式给出时回退到 `child_prompt`。
+    explore_prompt: String,
     child_limits: RunLimits,
     child_budget: Duration,
     workspace: PathBuf,
@@ -710,6 +723,7 @@ impl SubagentSetup {
         live: Arc<LiveSubagents>,
     ) -> Self {
         Self {
+            explore_prompt: child_prompt.clone(),
             child_prompt,
             child_limits,
             child_budget,
@@ -720,6 +734,15 @@ impl SubagentSetup {
             results,
             live,
         }
+    }
+
+    /// 显式给出探索模式的系统提示（装配端在构造后调用）。
+    ///
+    /// 保留 [`shared`](Self::shared) 的原签名，是为了让未使用探索模式的调用方
+    /// （测试 / 恢复路径）零改动；未设置时探索模式退化为通用提示。
+    pub fn with_explore_prompt(mut self, explore_prompt: String) -> Self {
+        self.explore_prompt = explore_prompt;
+        self
     }
 
     /// 派发工具的外闸（子预算 + 宽限，构造期注入）。
@@ -756,6 +779,7 @@ impl SubagentSetup {
             config,
             self.model_cache.clone(),
             self.child_prompt.clone(),
+            self.explore_prompt.clone(),
             self.child_limits.clone(),
             self.child_budget,
             self.workspace.clone(),
@@ -780,6 +804,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         &self,
         prompt: &str,
         model: Option<&str>,
+        mode: SubagentMode,
         boundary: Option<&dyn BoundarySource>,
     ) -> Result<SubagentOutcome, String> {
         // `boundary` 参数保留在 trait 签名里（`ToolContext` 的通用挂载点），但
@@ -790,7 +815,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         // fail-closed：未支持按名构造模型时**绝不静默回退到父模型**。
         let resolved = self.resolve_model(model)?;
         self.take_dispatch_slot()?;
-        let child_limits = self.child_limits_for(model);
+        let child_limits = self.child_limits_for(model, mode);
 
         // 执行交给 owned 的 `ChildTask` —— 同步 `run` 与异步 `spawn` **共用同一份**
         // 执行逻辑（否则两条路径的行为会漂移：结果打包、诊断、usage 上卷全在手写两份）。
@@ -798,7 +823,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         // 同步路径也占额：模型自己就在等这一发，但父回合的收场判据必须看到它
         // （否则「在等的子 agent」不计入 `running()` ⇒ 判据偏乐观）。
         Ok(self
-            .child_task(resolved, child_limits, self.live.enter())
+            .child_task(resolved, child_limits, self.live.enter(), mode)
             .execute(prompt.to_string())
             .await)
     }
@@ -838,11 +863,12 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         &self,
         prompt: &str,
         model: Option<&str>,
+        mode: SubagentMode,
         _boundary: Option<&dyn BoundarySource>,
     ) -> Result<String, String> {
         let resolved = self.resolve_model(model)?;
         self.take_dispatch_slot()?;
-        let child_limits = self.child_limits_for(model);
+        let child_limits = self.child_limits_for(model, mode);
         let results = self.results.clone();
 
         // 句柄 = 本回合第 N 次派发（`take_dispatch_slot` 已自增 ⇒ 直接取当前值）。
@@ -850,7 +876,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let handle = format!("sa{}", self.dispatched.load(Ordering::Relaxed));
         // **先占额、再 spawn**：`ChildTask` 持有守卫 ⇒ `execute` 的每条退出路径
         // （组装失败 / Ok / Err / future 被 drop）都由 `Drop` 回归。
-        let task = self.child_task(resolved, child_limits, self.live.enter());
+        let task = self.child_task(resolved, child_limits, self.live.enter(), mode);
         let prompt = prompt.to_string();
         let handle_for_task = handle.clone();
 
@@ -960,10 +986,16 @@ impl AppSubagentRunner<'_> {
     ///
     /// 必须走 `effective_context_window_for`：父级封顶（`context_cap_tokens`）对子
     /// agent 同样生效，否则子 agent 会绕过上限。
-    fn child_limits_for(&self, model: Option<&str>) -> RunLimits {
+    ///
+    /// `explore` 额外把轮数压到 [`EXPLORE_MAX_ROUNDS`]：调查任务必须**有界**，
+    /// 到点交卷比「搜遍每个角落」更有价值。父配置更低时保留父的更低值。
+    fn child_limits_for(&self, model: Option<&str>, mode: SubagentMode) -> RunLimits {
         let mut limits = self.child_limits.clone();
         if let (Some(cfg), Some(name)) = (self.config, model) {
             limits.context_window = cfg.effective_context_window_for(name);
+        }
+        if mode == SubagentMode::Explore {
+            limits.max_rounds = limits.max_rounds.min(EXPLORE_MAX_ROUNDS);
         }
         limits
     }
@@ -973,12 +1005,19 @@ impl AppSubagentRunner<'_> {
         model: Arc<dyn Model>,
         child_limits: RunLimits,
         guard: LiveGuard,
+        mode: SubagentMode,
     ) -> ChildTask {
         ChildTask {
             model,
             child_prompt: self.child_prompt.clone(),
+            explore_prompt: self.explore_prompt.clone(),
+            mode,
             child_limits,
-            child_budget: self.child_budget,
+            // 探索是调查任务，墙钟必须有界：与父预算取 `min`，父配置更紧时听父的。
+            child_budget: match mode {
+                SubagentMode::Explore => self.child_budget.min(EXPLORE_WALL_CLOCK),
+                SubagentMode::General => self.child_budget,
+            },
             workspace: self.workspace.clone(),
             web: self.web.clone(),
             dir: self.dir.clone(),
@@ -997,6 +1036,9 @@ impl AppSubagentRunner<'_> {
 struct ChildTask {
     model: Arc<dyn Model>,
     child_prompt: String,
+    explore_prompt: String,
+    /// 本次派发的用途：决定工具集与系统提示。
+    mode: SubagentMode,
     child_limits: RunLimits,
     child_budget: Duration,
     workspace: PathBuf,
@@ -1011,6 +1053,21 @@ struct ChildTask {
     _live: LiveGuard,
 }
 
+/// 按模式产出子 agent 的工具表。
+///
+/// 探索模式从同一张基础表里**按名字**去掉 `write` / `edit`，不复制构造逻辑 ——
+/// 工具表只有一处装配接缝（`toolset::build_tools`），模式只是过滤器。
+fn child_tools(mode: SubagentMode, workspace: &Path, web: WebConfig) -> Vec<Box<dyn Tool>> {
+    let (tools, _hint) = crate::toolset::build_tools(workspace, web);
+    match mode {
+        SubagentMode::General => tools,
+        SubagentMode::Explore => tools
+            .into_iter()
+            .filter(|tool| !matches!(tool.spec().name.as_str(), "write" | "edit"))
+            .collect(),
+    }
+}
+
 impl ChildTask {
     /// 跑完一个子 agent，返回结果。
     ///
@@ -1020,12 +1077,16 @@ impl ChildTask {
     async fn execute(self, prompt: String) -> SubagentOutcome {
         let started = Instant::now();
         let parent_cancelled_probe = self.parent_boundary.clone();
-        let (tools, _hint) = crate::toolset::build_tools(&self.workspace, self.web.clone());
+        let tools = child_tools(self.mode, &self.workspace, self.web.clone());
+        let system_prompt = match self.mode {
+            SubagentMode::General => self.child_prompt.clone(),
+            SubagentMode::Explore => self.explore_prompt.clone(),
+        };
         let mut child = match AgentBuilder::new()
             .tools(tools)
             .limits(self.child_limits.clone())
             .working_dir(self.workspace.clone(), self.workspace.clone())
-            .system_prompt(self.child_prompt.clone())
+            .system_prompt(system_prompt)
             .build()
         {
             Ok(child) => child,
@@ -1392,6 +1453,7 @@ async fn run_or_steer(
     runner: &dyn SubagentRunner,
     prompt: &str,
     model: Option<&str>,
+    mode: SubagentMode,
     boundary: Option<&dyn BoundarySource>,
 ) -> Dispatch {
     let wait_steer = async {
@@ -1408,7 +1470,7 @@ async fn run_or_steer(
     };
     tokio::select! {
         biased;
-        out = runner.run(prompt, model, boundary) => Dispatch::Done(out),
+        out = runner.run(prompt, model, mode, boundary) => Dispatch::Done(out),
         _ = wait_steer => Dispatch::Steered,
     }
 }
@@ -1428,7 +1490,23 @@ fn steered_dispatch_result() -> ToolResult {
     }
 }
 
-/// 派发工具：schema `{description, prompt, [model]}`，把调用转给 `ToolContext.subagent`。
+/// 解析 `mode` 参数：缺省 / `"general"` ⇒ `General`；`"explore"` ⇒ `Explore`；
+/// 其余任何值（含非字符串）⇒ `InvalidInput`。
+///
+/// fail-closed：拼错模式名时静默回退成 `general` 会让调用方以为拿到了只读 agent，
+/// 实际却给了写权限 —— 这类「静默的谎」必须报错。
+fn parse_subagent_mode(input: &Value) -> Result<SubagentMode, ToolError> {
+    match input.get("mode") {
+        None => Ok(SubagentMode::General),
+        Some(Value::String(s)) if s == "general" => Ok(SubagentMode::General),
+        Some(Value::String(s)) if s == "explore" => Ok(SubagentMode::Explore),
+        Some(other) => Err(ToolError::InvalidInput(format!(
+            "`mode` 只能是 `general` 或 `explore`，收到 {other}"
+        ))),
+    }
+}
+
+/// 派发工具：schema `{description, prompt, [model], [mode]}`，把调用转给 `ToolContext.subagent`。
 pub struct SubagentTool {
     /// 外闸 = 子预算 + 宽限（ADO-0029 修正 2）。
     outer_timeout: Duration,
@@ -1451,7 +1529,9 @@ impl Tool for SubagentTool {
                 "properties": {
                     "description": {"type": "string", "description": "3-5 word label for the user (shown in the tool line)"},
                     "prompt": {"type": "string", "description": "Complete self-contained task; the sub-agent does NOT see this conversation"},
-                    "model": {"type": "string", "description": "Optional model override"}
+                    "model": {"type": "string", "description": "Optional model override"},
+                    "mode": {"type": "string", "enum": ["general", "explore"],
+                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent one cohesive, well-scoped question and state what a complete answer looks like — open-ended audits make it explore without end."}
                 },
                 "required": ["description", "prompt"]
             }),
@@ -1475,10 +1555,11 @@ impl Tool for SubagentTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("`prompt` 必填".into()))?;
         let model = input.get("model").and_then(|v| v.as_str());
+        let mode = parse_subagent_mode(&input)?;
         let runner = ctx
             .subagent
             .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
-        let out = match run_or_steer(runner, prompt, model, ctx.boundary).await {
+        let out = match run_or_steer(runner, prompt, model, mode, ctx.boundary).await {
             Dispatch::Done(out) => out.map_err(ToolError::Execution)?,
             // 插话：放弃等待（子 agent 已取消），回合继续。
             Dispatch::Steered => return Ok(steered_dispatch_result()),
@@ -1544,7 +1625,9 @@ impl Tool for SubagentAsyncTool {
                 "properties": {
                     "description": {"type": "string", "description": "3-5 word label for the user (shown in the tool line)"},
                     "prompt": {"type": "string", "description": "Complete self-contained task; the sub-agent does NOT see this conversation"},
-                    "model": {"type": "string", "description": "Optional model override"}
+                    "model": {"type": "string", "description": "Optional model override"},
+                    "mode": {"type": "string", "enum": ["general", "explore"],
+                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent one cohesive, well-scoped question and state what a complete answer looks like — open-ended audits make it explore without end."}
                 },
                 "required": ["description", "prompt"]
             }),
@@ -1562,11 +1645,12 @@ impl Tool for SubagentAsyncTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("`prompt` 必填".into()))?;
         let model = input.get("model").and_then(|v| v.as_str());
+        let mode = parse_subagent_mode(&input)?;
         let runner = ctx
             .subagent
             .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
         let handle = runner
-            .spawn(prompt, model, ctx.boundary)
+            .spawn(prompt, model, mode, ctx.boundary)
             .map_err(ToolError::Execution)?;
         Ok(ToolResult {
             content: format!(
@@ -1855,6 +1939,7 @@ mod tests {
                 &self,
                 prompt: &str,
                 _model: Option<&str>,
+                _mode: SubagentMode,
                 _boundary: Option<&dyn BoundarySource>,
             ) -> Result<SubagentOutcome, String> {
                 Ok(SubagentOutcome {
@@ -1925,6 +2010,7 @@ mod tests {
                 &self,
                 _prompt: &str,
                 _model: Option<&str>,
+                _mode: SubagentMode,
                 _boundary: Option<&dyn BoundarySource>,
             ) -> Result<SubagentOutcome, String> {
                 std::future::pending::<()>().await;
@@ -1993,6 +2079,7 @@ mod tests {
                 &self,
                 prompt: &str,
                 _model: Option<&str>,
+                _mode: SubagentMode,
                 _boundary: Option<&dyn BoundarySource>,
             ) -> Result<SubagentOutcome, String> {
                 Ok(SubagentOutcome {
@@ -2005,10 +2092,193 @@ mod tests {
             }
         }
 
-        match run_or_steer(&CompletingRunner, "干活", None, None).await {
+        match run_or_steer(&CompletingRunner, "干活", None, SubagentMode::General, None).await {
             Dispatch::Done(Ok(out)) => assert_eq!(out.summary, "摘要:干活"),
             _ => panic!("无边界源时应正常派发并返回结果"),
         }
+    }
+
+    /// `mode` 解析：缺省 / `"general"` ⇒ `General`，`"explore"` ⇒ `Explore`，
+    /// 其余值（含非字符串）⇒ `InvalidInput`。
+    ///
+    /// 变异 1：缺省分支返回 `Explore` ⇒ 第一条变红。
+    /// 变异 2：未知值静默回退 `General` ⇒ `bogus` 断言变红。
+    /// 变异 3：非字符串走 `and_then(as_str)` 落到缺省 ⇒ 最后一条变红。
+    #[test]
+    fn subagent_mode_parses_and_rejects_unknown() {
+        assert_eq!(
+            parse_subagent_mode(&serde_json::json!({})).unwrap(),
+            SubagentMode::General,
+            "缺省必须是 general"
+        );
+        assert_eq!(
+            parse_subagent_mode(&serde_json::json!({"mode": "general"})).unwrap(),
+            SubagentMode::General
+        );
+        assert_eq!(
+            parse_subagent_mode(&serde_json::json!({"mode": "explore"})).unwrap(),
+            SubagentMode::Explore
+        );
+        assert!(matches!(
+            parse_subagent_mode(&serde_json::json!({"mode": "bogus"})).unwrap_err(),
+            ToolError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            parse_subagent_mode(&serde_json::json!({"mode": 1})).unwrap_err(),
+            ToolError::InvalidInput(_)
+        ));
+    }
+
+    /// 两个派发工具的 `mode` 描述都必须交代**何时**该用 `explore`（多个独立、多轮），
+    /// 以及小查找**不该**派发 —— 否则模型只会看到「只读、带引用」，把它当廉价查找工具。
+    ///
+    /// 变异：删掉 `SEVERAL INDEPENDENT exploration questions` 或 `search directly`
+    /// ⇒ 对应断言变红。
+    #[test]
+    fn subagent_mode_description_states_when_to_explore() {
+        let tools: [Box<dyn Tool>; 2] = [
+            Box::new(SubagentTool::new(Duration::from_secs(60))),
+            Box::new(SubagentAsyncTool::new()),
+        ];
+        for tool in tools {
+            let spec = tool.spec();
+            let description = spec.parameters["properties"]["mode"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} 的 mode 描述必须是字符串", spec.name));
+            assert!(
+                description.contains("SEVERAL INDEPENDENT exploration questions"),
+                "{} 的 mode 描述须交代触发条件；description = {description}",
+                spec.name
+            );
+            assert!(
+                description.contains("search directly"),
+                "{} 的 mode 描述须交代小查找自己搜；description = {description}",
+                spec.name
+            );
+        }
+    }
+
+    /// 工具调用层同样 fail-closed：拼错的 `mode` 在挂载 runner 之前就被拒绝。
+    ///
+    /// 变异：`SubagentTool::call` 忽略 `parse_subagent_mode` 的 `Err` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn subagent_tool_rejects_bogus_mode() {
+        let tool = SubagentTool::new(Duration::from_secs(60));
+        let bare = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."));
+        let err = tool
+            .call(
+                serde_json::json!({"description": "d", "prompt": "x", "mode": "bogus"}),
+                bare,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    /// 探索子表恰 7 元且**不含** `write` / `edit`；通用子表仍 9 元。
+    ///
+    /// 变异 1：`Explore` 分支原样返回基础表 ⇒ 元数与名字断言变红。
+    /// 变异 2：过滤器改成去掉 `read` ⇒ 名字序列断言变红。
+    #[test]
+    fn explore_child_toolset_is_seven_without_writers() {
+        use ys_tools_web::FetchedDir;
+
+        let base = unique_subagent_test_dir("mode_tools");
+        let web = || WebConfig::offline(FetchedDir::Temp(base.join("fetched")));
+
+        let general = child_tools(SubagentMode::General, &base, web());
+        let general_names: Vec<String> = general.iter().map(|t| t.spec().name).collect();
+        assert_eq!(general_names.len(), 9, "通用子表仍是 9 元");
+        assert!(general_names.contains(&"write".to_string()));
+        assert!(general_names.contains(&"edit".to_string()));
+
+        let explore = child_tools(SubagentMode::Explore, &base, web());
+        let explore_names: Vec<String> = explore.iter().map(|t| t.spec().name).collect();
+        assert_eq!(explore_names.len(), 7, "探索子表应为 7 元");
+        assert_eq!(
+            explore_names,
+            vec![
+                "read",
+                "bash",
+                "grep",
+                "find",
+                "ls",
+                "websearch",
+                "webfetch"
+            ],
+            "探索表是通用表按名字去掉 write/edit 后的子序列"
+        );
+        assert!(
+            !explore_names.iter().any(|n| n == "write" || n == "edit"),
+            "探索子 agent 不得拿到写工具"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 模式在**真实子执行路径**上生效：`execute` 按 mode 选提示与工具表。
+    ///
+    /// 只测 `child_tools` 不够 —— 若 `ChildTask` 不把 `mode` 带进去，选择函数再对也没用。
+    /// 这里从 `runner.run` 进去，读模型实际收到的 `system` / `tools`。
+    ///
+    /// 变异 1：`execute` 恒用 `self.child_prompt` ⇒ 第二条 system 断言变红。
+    /// 变异 2：`child_task` 丢掉 `mode`（恒 `General`）⇒ 第二条 tools 断言变红。
+    #[tokio::test]
+    async fn mode_selects_prompt_and_toolset_at_the_child_runner() {
+        use ys_tools_web::FetchedDir;
+
+        let base = unique_subagent_test_dir("mode_plumbing");
+        let model = Arc::new(RecordingModel::new("rec"));
+        model.push_text("general done").push_text("explore done");
+        let runner = AppSubagentRunner::new(
+            Some(model.clone()),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            "GENERAL-CHILD-PROMPT".to_string(),
+            "EXPLORE-CHILD-PROMPT".to_string(),
+            RunLimits::new(2),
+            Duration::from_secs(30),
+            base.clone(),
+            WebConfig::offline(FetchedDir::Temp(base.join("fetched"))),
+            Arc::new(SubagentsDir::at(base.join("artifacts"), false)),
+            Arc::new(UsageTotals::default()),
+            None,
+            Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
+        );
+
+        runner
+            .run("g", None, SubagentMode::General, None)
+            .await
+            .unwrap();
+        runner
+            .run("e", None, SubagentMode::Explore, None)
+            .await
+            .unwrap();
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].system.as_deref(),
+            Some("GENERAL-CHILD-PROMPT"),
+            "general 必须用 child_prompt"
+        );
+        assert_eq!(requests[0].tools.len(), 9, "general 工具表 9 元");
+        assert_eq!(
+            requests[1].system.as_deref(),
+            Some("EXPLORE-CHILD-PROMPT"),
+            "explore 必须用 explore_prompt"
+        );
+        assert_eq!(requests[1].tools.len(), 7, "explore 工具表 7 元");
+        assert!(
+            !requests[1]
+                .tools
+                .iter()
+                .any(|t| t.name == "write" || t.name == "edit"),
+            "explore 不得拿到写工具"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2073,6 +2343,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "你是子 agent".to_string(),
+            "explore prompt".to_string(),
             RunLimits::new(3),
             Duration::from_secs(30),
             base.clone(),
@@ -2084,7 +2355,10 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
 
-        let out = runner.run("查 X", None, None).await.unwrap();
+        let out = runner
+            .run("查 X", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
         assert!(
             out.summary.contains("子 agent 的结论"),
@@ -2112,7 +2386,7 @@ mod tests {
 
         // fail-closed：指定 model 名 ⇒ Err（不静默回退）。
         let err = runner
-            .run("x", Some("other-model"), None)
+            .run("x", Some("other-model"), SubagentMode::General, None)
             .await
             .unwrap_err();
         assert!(err.contains("fail-closed"));
@@ -2143,6 +2417,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             String::new(),
+            "explore prompt".to_string(),
             RunLimits::new(2),
             Duration::from_secs(30),
             base.clone(),
@@ -2154,9 +2429,15 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {
-            runner.run("t", None, None).await.unwrap();
+            runner
+                .run("t", None, SubagentMode::General, None)
+                .await
+                .unwrap();
         }
-        let err = runner.run("t", None, None).await.unwrap_err();
+        let err = runner
+            .run("t", None, SubagentMode::General, None)
+            .await
+            .unwrap_err();
         assert!(err.contains("上限"), "超限应响亮报错: {err}");
 
         let _ = std::fs::remove_dir_all(&base);
@@ -2238,6 +2519,7 @@ mod tests {
                 Some(&config),
                 cache.clone(),
                 "child".to_string(),
+                "explore prompt".to_string(),
                 RunLimits::new(2),
                 Duration::from_secs(30),
                 base.clone(),
@@ -2248,7 +2530,10 @@ mod tests {
                 Arc::new(PendingResults::default()),
                 Arc::new(LiveSubagents::default()),
             );
-            runner.run("x", Some("shared-name"), None).await.unwrap()
+            runner
+                .run("x", Some("shared-name"), SubagentMode::General, None)
+                .await
+                .unwrap()
         };
         assert!(
             first.summary.contains("echo:shared-name:high"),
@@ -2264,6 +2549,7 @@ mod tests {
                 Some(&config),
                 cache.clone(),
                 "child".to_string(),
+                "explore prompt".to_string(),
                 RunLimits::new(2),
                 Duration::from_secs(30),
                 base.clone(),
@@ -2274,7 +2560,10 @@ mod tests {
                 Arc::new(PendingResults::default()),
                 Arc::new(LiveSubagents::default()),
             );
-            runner.run("x", Some("shared-name"), None).await.unwrap()
+            runner
+                .run("x", Some("shared-name"), SubagentMode::General, None)
+                .await
+                .unwrap()
         };
         assert!(
             second.summary.contains("echo:shared-name:max"),
@@ -2473,6 +2762,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "你是子 agent".to_string(),
+            "explore prompt".to_string(),
             RunLimits::new(3),
             Duration::from_secs(30),
             base.clone(),
@@ -2484,7 +2774,10 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
 
-        let out = runner.run("查 X", None, None).await.unwrap();
+        let out = runner
+            .run("查 X", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(
             out.stop_reason,
             StopReason::Failed,
@@ -2541,7 +2834,10 @@ mod tests {
         // `new` 无条件开启重试 ⇒ 直接用它验证产品路径。
         let runner = test_runner(model, &base, dir, RunLimits::new(3));
 
-        let out = runner.run("查 X", None, None).await.unwrap();
+        let out = runner
+            .run("查 X", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(
             out.stop_reason,
             StopReason::Completed,
@@ -2575,7 +2871,10 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(3));
 
-        let out = runner.run("查 X", None, None).await.unwrap();
+        let out = runner
+            .run("查 X", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(
             out.stop_reason,
             StopReason::Failed,
@@ -2783,6 +3082,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "child prompt".to_string(),
+            "explore prompt".to_string(),
             limits,
             Duration::from_secs(30),
             base.to_path_buf(),
@@ -2835,6 +3135,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "child prompt".to_string(),
+            "explore prompt".to_string(),
             limits,
             child_budget,
             base.to_path_buf(),
@@ -2881,6 +3182,7 @@ mod tests {
             Some(&config),
             Arc::new(Mutex::new(HashMap::new())),
             "child prompt".to_string(),
+            "explore prompt".to_string(),
             parent_limits,
             Duration::from_secs(30),
             base.clone(),
@@ -2893,19 +3195,143 @@ mod tests {
         );
 
         assert_eq!(
-            runner.child_limits_for(Some("MiniMax-M3")).context_window,
+            runner
+                .child_limits_for(Some("MiniMax-M3"), SubagentMode::General)
+                .context_window,
             200_000,
             "子模型声明 1M 也必须被父级 cap 封到 200k"
         );
         assert_eq!(
-            runner.child_limits_for(None).context_window,
+            runner
+                .child_limits_for(None, SubagentMode::General)
+                .context_window,
             200_000,
             "不指定模型时继承父窗口"
         );
         assert_eq!(
-            runner.child_limits_for(Some("small-sub")).context_window,
+            runner
+                .child_limits_for(Some("small-sub"), SubagentMode::General)
+                .context_window,
             128_000,
             "低于 cap 的子模型保持自身声明值"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **explore 有界**：轮数压到 [`EXPLORE_MAX_ROUNDS`]，且父配置更低时听父的；
+    /// `general` 保持父值逐字节不变。
+    ///
+    /// 变异：① 把 `min(EXPLORE_MAX_ROUNDS)` 改成直接赋值 ⇒ 父配置 3 的断言变红；
+    ///       ② 删掉 `Explore` 分支 ⇒ explore 轮数回到父值 10，变红；
+    ///       ③ 把 cap 套到所有 mode ⇒ `general` 断言变红（general 语义被改动）。
+    #[test]
+    fn explore_child_limits_cap_rounds_but_general_is_unchanged() {
+        let base = unique_subagent_test_dir("explore_rounds");
+        let dir = Arc::new(SubagentsDir::at(base.join("subagents"), false));
+        let mut limits = RunLimits::default();
+        limits.max_rounds = 10;
+        limits.context_window = 200_000;
+
+        let runner = test_runner(RecordingModel::new("m"), &base, dir, limits.clone());
+
+        assert_eq!(
+            runner
+                .child_limits_for(None, SubagentMode::Explore)
+                .max_rounds,
+            EXPLORE_MAX_ROUNDS,
+            "不指定模型时 explore 轮数也必须有界"
+        );
+        assert_eq!(
+            runner
+                .child_limits_for(Some("any-model"), SubagentMode::Explore)
+                .max_rounds,
+            EXPLORE_MAX_ROUNDS,
+            "指定模型时 explore 轮数也必须有界"
+        );
+
+        let general = runner.child_limits_for(None, SubagentMode::General);
+        assert_eq!(general.max_rounds, 10, "general 必须保留父的轮数配置");
+        assert_eq!(
+            general.context_window, 200_000,
+            "general 的其余字段必须逐字沿用父值"
+        );
+
+        // 父配置更紧时，explore 不得把轮数**放大**。
+        limits.max_rounds = 3;
+        let tighter = test_runner(
+            RecordingModel::new("m2"),
+            &base,
+            Arc::new(SubagentsDir::at(base.join("subagents-tight"), false)),
+            limits,
+        );
+        assert_eq!(
+            tighter
+                .child_limits_for(None, SubagentMode::Explore)
+                .max_rounds,
+            3,
+            "父配置更低时必须取父值（min 语义）"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **explore 墙钟有界**：与父预算取 `min`；`general` 保持父预算。
+    ///
+    /// 变异：① `Explore` 分支恒 `self.child_budget` ⇒ 首条变红（600s ≠ 300s）；
+    ///       ② 恒 `EXPLORE_WALL_CLOCK` ⇒ general 断言与「父更紧」断言变红。
+    #[test]
+    fn explore_child_budget_caps_wall_clock_but_general_keeps_parent() {
+        let base = unique_subagent_test_dir("explore_budget");
+        let limits = RunLimits::default();
+        let parent_budget = Duration::from_secs(600);
+
+        let runner = test_runner_with_budget(
+            RecordingModel::new("m"),
+            &base,
+            Arc::new(SubagentsDir::at(base.join("subagents"), false)),
+            limits.clone(),
+            parent_budget,
+        );
+        let explore = runner.child_task(
+            Arc::new(RecordingModel::new("child-e")),
+            limits.clone(),
+            runner.live.enter(),
+            SubagentMode::Explore,
+        );
+        assert_eq!(
+            explore.child_budget, EXPLORE_WALL_CLOCK,
+            "explore 必须把墙钟压到预算上限"
+        );
+        let general = runner.child_task(
+            Arc::new(RecordingModel::new("child-g")),
+            limits.clone(),
+            runner.live.enter(),
+            SubagentMode::General,
+        );
+        assert_eq!(
+            general.child_budget, parent_budget,
+            "general 必须逐字沿用父预算"
+        );
+
+        // 父预算更紧时，explore 不得把墙钟**放大**。
+        let tight_budget = Duration::from_secs(60);
+        let tighter = test_runner_with_budget(
+            RecordingModel::new("m2"),
+            &base,
+            Arc::new(SubagentsDir::at(base.join("subagents-tight"), false)),
+            limits.clone(),
+            tight_budget,
+        );
+        let explore_tight = tighter.child_task(
+            Arc::new(RecordingModel::new("child-t")),
+            limits,
+            tighter.live.enter(),
+            SubagentMode::Explore,
+        );
+        assert_eq!(
+            explore_tight.child_budget, tight_budget,
+            "父预算更低时必须取父值（min 语义）"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -2943,6 +3369,7 @@ mod tests {
             None,
             Arc::new(Mutex::new(HashMap::new())),
             "child prompt".to_string(),
+            "explore prompt".to_string(),
             RunLimits::new(3),
             Duration::from_secs(30),
             base.clone(),
@@ -2956,7 +3383,9 @@ mod tests {
 
         // ① `spawn` 立刻返回（不等子 agent 跑完）。
         let started = Instant::now();
-        let handle = runner.spawn("查一下", None, None).expect("应能启动");
+        let handle = runner
+            .spawn("查一下", None, SubagentMode::General, None)
+            .expect("应能启动");
         assert!(
             started.elapsed() < Duration::from_millis(150),
             "spawn 必须立刻返回（实际 {:?}）",
@@ -3007,7 +3436,10 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(4));
 
-        let out = runner.run("读文件", None, None).await.unwrap();
+        let out = runner
+            .run("读文件", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
         assert_eq!(out.diagnostic, None);
         let artifact = out.artifact.expect("应写转录");
@@ -3060,7 +3492,10 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner_arc(model.clone(), &base, dir, limits);
 
-        let out = runner.run("预算回归", None, None).await.unwrap();
+        let out = runner
+            .run("预算回归", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
         let requests = model.requests();
         assert_eq!(requests.len(), 3, "两批工具后应发生第三次模型请求");
@@ -3101,7 +3536,10 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(5));
 
-        let out = runner.run("重复 id", None, None).await.unwrap();
+        let out = runner
+            .run("重复 id", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         let body = std::fs::read_to_string(out.artifact.expect("应写转录")).unwrap();
         assert!(
             !body.contains("FIRST_DUP_RESULT"),
@@ -3136,7 +3574,10 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(2));
 
-        let out = runner.run("失败", None, None).await.unwrap();
+        let out = runner
+            .run("失败", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(
             out.stop_reason,
             StopReason::Failed,
@@ -3181,7 +3622,10 @@ mod tests {
             RunLimits::new(2),
         );
 
-        let out = runner.run("写失败", None, None).await.unwrap();
+        let out = runner
+            .run("写失败", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
         assert_eq!(out.artifact, None);
         assert!(
@@ -3220,7 +3664,7 @@ mod tests {
         );
 
         let out = runner
-            .run("取消", None, Some(parent.as_ref()))
+            .run("取消", None, SubagentMode::General, Some(parent.as_ref()))
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
@@ -3249,7 +3693,10 @@ mod tests {
             Duration::from_millis(5),
         );
 
-        let out = runner.run("子预算", None, None).await.unwrap();
+        let out = runner
+            .run("子预算", None, SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
         let diagnostic = out.diagnostic.expect("子预算取消必须有诊断");
         assert!(
@@ -3286,7 +3733,7 @@ mod tests {
             parent.push(Boundary::Abort);
         };
         let (out, ()) = tokio::join!(
-            runner.run("父取消", None, Some(parent.as_ref())),
+            runner.run("父取消", None, SubagentMode::General, Some(parent.as_ref())),
             cancel_parent
         );
         let out = out.unwrap();

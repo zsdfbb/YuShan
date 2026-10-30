@@ -11,6 +11,18 @@ use std::pin::Pin;
 use ys_core::{StopReason, Usage};
 use ys_protocol::BoundarySource;
 
+/// 子 agent 的用途。决定子 agent 的系统提示与工具集。
+///
+/// 只影响子 agent 自身：父回合的等待、收场判据（ADR-0055）与结果通道不因模式而变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubagentMode {
+    /// 通用派发：能读写，拿回摘要（默认）。
+    #[default]
+    General,
+    /// 只读探索：调查并回报带 `文件:行号` 的结论，不给写工具。
+    Explore,
+}
+
 /// 一次派发的结果。
 ///
 /// **摘要已由实现方按预算硬截断** —— 截断责任在代码，不在提示词。
@@ -38,6 +50,8 @@ pub struct SubagentOutcome {
 #[async_trait]
 pub trait SubagentRunner: Send + Sync {
     /// `model = None` ⇒ 用**当前**模型（缓存最暖、零额外配置）。
+    /// `mode` 只决定子 agent 的系统提示与工具集（见 [`SubagentMode`]）；父回合语义
+    /// 不变 —— 父仍然等它、仍走 ADR-0055 收场判据。
     /// `boundary` = 父回合的边界源；实现方**只透传 `is_aborted`，绝不 `take`**。
     ///
     /// `Err` = **产不出结果**（如 `model` 名解析失败）。**绝不静默回退到父模型** ——
@@ -48,10 +62,13 @@ pub trait SubagentRunner: Send + Sync {
         &self,
         prompt: &str,
         model: Option<&str>,
+        mode: SubagentMode,
         boundary: Option<&dyn BoundarySource>,
     ) -> Result<SubagentOutcome, String>;
 
     /// **后台派发**：立刻返回句柄，子 agent 在后台跑；**结果会自动注入会话**。
+    ///
+    /// `mode` 与 [`Self::run`] 同义：只影响子 agent 的提示与工具集。
     ///
     /// `Err` = **启动失败**（模型名解析失败 / 本回合额度用尽）。与 [`Self::run`] 同一
     /// fail-closed 纪律：绝不静默回退到父模型。
@@ -75,6 +92,7 @@ pub trait SubagentRunner: Send + Sync {
         &self,
         _prompt: &str,
         _model: Option<&str>,
+        _mode: SubagentMode,
         _boundary: Option<&dyn BoundarySource>,
     ) -> Result<String, String> {
         Err("本实现不支持后台派发".to_string())
@@ -121,6 +139,7 @@ mod tests {
             &self,
             prompt: &str,
             model: Option<&str>,
+            _mode: SubagentMode,
             boundary: Option<&dyn BoundarySource>,
         ) -> Result<SubagentOutcome, String> {
             if prompt.is_empty() {
@@ -148,12 +167,21 @@ mod tests {
         let fake = FakeRunner;
         let as_dyn: &dyn SubagentRunner = &fake;
 
-        let ok = as_dyn.run("查一下 X", Some("m1"), None).await.unwrap();
+        let ok = as_dyn
+            .run("查一下 X", Some("m1"), SubagentMode::General, None)
+            .await
+            .unwrap();
         assert_eq!(ok.summary, "查一下 X :: model=Some(\"m1\") aborted=false");
         assert_eq!(ok.artifact.as_deref(), Some("/tmp/transcript.md"));
         assert_eq!(ok.usage.prompt_cache_hit_tokens, Some(4));
 
-        assert_eq!(as_dyn.run("", None, None).await.unwrap_err(), "空任务");
+        assert_eq!(
+            as_dyn
+                .run("", None, SubagentMode::Explore, None)
+                .await
+                .unwrap_err(),
+            "空任务"
+        );
     }
 
     /// runner 能看到父的 abort 探针（用真实 `QueueBoundarySource` 验证）。
@@ -162,7 +190,10 @@ mod tests {
         let parent = ys_protocol::QueueBoundarySource::new();
         parent.push(ys_protocol::Boundary::Abort);
         let fake = FakeRunner;
-        let out = fake.run("t", None, Some(&parent)).await.unwrap();
+        let out = fake
+            .run("t", None, SubagentMode::General, Some(&parent))
+            .await
+            .unwrap();
         assert!(out.summary.contains("aborted=true"));
     }
 }

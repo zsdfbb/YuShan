@@ -144,10 +144,20 @@ impl AgentFactory {
         let child_specs: Vec<_> = base_tools.iter().map(|t| t.spec()).collect();
         let child_prompt = prompt::build_system_prompt(workspace, &child_specs, &self.catalogue);
 
-        // 子预算与主 agent 同源，但 `fixed_prompt_tokens` 必须填**子表**的值 ——
-        // 否则子会话会系统性晚触发压缩。
+        // 探索模式从同一张子表里按名字去掉写工具（7 元）—— 装配逻辑只有一份，
+        // 模式只是过滤器；提示词单独构建（只读角色 + `path:line` 输出契约）。
+        let explore_specs: Vec<_> = child_specs
+            .iter()
+            .filter(|spec| !matches!(spec.name.as_str(), "write" | "edit"))
+            .cloned()
+            .collect();
+        let explore_prompt =
+            prompt::build_explore_prompt(workspace, &explore_specs, &self.catalogue);
+
+        // 子预算与主 agent 同源，但 `fixed_prompt_tokens` 必须填**探索子表**的值 ——
+        // 两种模式共用同一份预算，取更紧的那份（只读表）作为固定开销基线。
         let mut child_limits = self.limits.clone();
-        child_limits.fixed_prompt_tokens = fixed_prompt_tokens(&child_prompt, &child_specs);
+        child_limits.fixed_prompt_tokens = fixed_prompt_tokens(&explore_prompt, &explore_specs);
         let subagent = SubagentSetup::shared(
             child_prompt,
             child_limits,
@@ -157,7 +167,8 @@ impl AgentFactory {
             self.subagents_dir.clone(),
             self.subagent_results.clone(),
             self.subagent_live.clone(),
-        );
+        )
+        .with_explore_prompt(explore_prompt);
 
         // 父表 = 基础 9 元 + `bash_bg` + 派发工具**追加末位**
         // （子 tools JSON 仍是父的字节前缀 ⇒ 命中缓存）。

@@ -94,6 +94,89 @@ pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogue
     segments.join("\n\n")
 }
 
+/// 探索子 agent 的输出契约（纯常量）。
+///
+/// 与主 agent 的「过程叙述」相对：子 agent 的读者是父模型，不是用户 —— 它要的是
+/// 可核对的结论，不是面向人的铺垫与建议。
+///
+/// **必须有界**：要求「`Not found:` 列出搜过哪里」会鼓励穷举 —— 要填满那一节
+/// 就必须把每个角落都搜一遍。契约改为「一句结论 + 至多 5 条发现 + 一句未确认」，
+/// 让交卷成本低于继续探索。
+const EXPLORE_REPORT_FORMAT: &str = "Report format:\n\
+- Answer the question in one sentence first (at most 2 lines).\n\
+- Then at most 5 findings, one line each: `path:line — fact`.\n\
+- If you could not confirm part of the question, say so in one line. Do not list every\n  \
+place you looked.\n\
+- No preamble, no restating the task, no recommendations, no file dumps.";
+
+/// 探索子 agent 的**检索方法**（纯常量）。
+///
+/// 每条都对应一个可观测的轮数 / 成本契约：
+/// - 定位与上下文用**一条**聚合命令（`rg -n --context`），而不是「先定位再读」——
+///   每次消息都是一次完整模型往返，聚合命令把 10 轮降到 6 轮。
+/// - `grep` 的结果有 **16 KiB 硬上限**：这是模型无法从工具描述推断的事实，
+///   输出被截断时只能收窄模式 / 路径，加大 `limit` 不会返回更多。
+/// - 只要文件名时用 `rg -l`：避免把正文搬进上下文。
+/// - 只回答被问到的问题：无界审计会让探索失去终点；核对由调用方负责。
+const EXPLORE_SEARCH_METHOD: &str = "How to search:\n\
+- Locate and show context in ONE command (`rg -n --context 2 …`), not locate-then-read.\n\
+- If output is truncated, narrow with `-g`, a path, or a tighter pattern. Raising `limit`\n  \
+will not return more — grep caps its result at 16 KiB.\n\
+- Use `rg -l` when you only need file names.\n\
+- Answer the question that was asked; do not expand the audit beyond it. The caller verifies.";
+
+/// 构建**探索子 agent** 的系统提示。
+///
+/// # 与 [`build_system_prompt`] 的差异
+///
+/// 1. 角色行改为探索语义（只读、带引用）；
+/// 2. guidelines 去掉「过程叙述」那一条 —— 子 agent 的输出不面向用户；
+/// 3. 追加 [`EXPLORE_REPORT_FORMAT`] 输出契约；
+/// 4. **不加载项目上下文**（AGENTS.md / YUSHAN.md）。探索 agent 只需定位事实，
+///    项目约定段（约 6.8k token）是每轮前缀成本，且会诱导它「按规范做事」而不是
+///    「尽快定位」；主 agent 仍带着它。
+///
+/// 其余段（cwd、skill 目录）逐字沿用同一套渲染：本次对比只改「角色 + 输出契约 +
+/// 工具集」这一个变量。
+///
+/// # 不走自定义 prompt 短路
+///
+/// `.yushan/SYSTEM.md` / `~/.yushan/SYSTEM.md` 是用户对**主 agent** 的接管；
+/// 探索子 agent 需要自己的输出契约，命中自定义文件时短路会让它退化成主 agent 的
+/// 提示，模式对比即失效。
+pub fn build_explore_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogue) -> String {
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let tool_list: Vec<String> = names
+        .iter()
+        .map(|name| format!("- {name}: {}", tool_snippet(name)))
+        .collect();
+    let tool_list = tool_list.join("\n");
+    let guidelines = render_guidelines(&names, false);
+
+    let head = format!(
+        "You are an exploration agent. You investigate a codebase or its documents and report \
+         findings with exact citations. You do not modify anything.\n\n\
+         Available tools:\n{tool_list}\n\nGuidelines:\n{guidelines}\n\n{EXPLORE_SEARCH_METHOD}\n\n\
+         {EXPLORE_REPORT_FORMAT}"
+    );
+
+    let cwd_block = cwd_section(cwd);
+    let skills_block = if tools.iter().any(|t| t.name == "read") && !catalogue.lines.is_empty() {
+        Some(skill_section(
+            &catalogue.lines,
+            tools.iter().any(|t| t.name == "subagent"),
+        ))
+    } else {
+        None
+    };
+
+    let mut segments: Vec<String> = vec![cwd_block, head];
+    if let Some(s) = skills_block {
+        segments.push(s);
+    }
+    segments.join("\n\n")
+}
+
 /// cwd 段 —— **整条提示的第一段**。
 ///
 /// # 只有事实，没有禁令
@@ -192,6 +275,14 @@ fn tool_snippet(name: &str) -> &'static str {
 }
 
 fn tool_guidelines(tools: &[&str]) -> String {
+    render_guidelines(tools, true)
+}
+
+/// guideline 列表的**唯一**渲染处。
+///
+/// `narrate = false` 只去掉「过程叙述」那一条：它服务于面向用户的进展可见性，
+/// 而子 agent 的输出只回给父模型。其余条目按工具表门控，两种提示共享同一份文案。
+fn render_guidelines(tools: &[&str], narrate: bool) -> String {
     let mut guidelines: Vec<String> = Vec::new();
 
     if tools.contains(&"edit") {
@@ -298,12 +389,15 @@ fn tool_guidelines(tools: &[&str]) -> String {
     //
     // 只要工作型工具在场（`read` / `grep` / `find` / `ls` / `bash` / `edit` / `write` 任一）
     // 就值得提醒，否则（如纯检索类）不加，避免无谓增大固定前缀。
-    if tools.iter().any(|t| {
-        matches!(
-            *t,
-            "read" | "grep" | "find" | "ls" | "bash" | "edit" | "write"
-        )
-    }) {
+    // `narrate = false`（探索子 agent）时整条不渲染：它的读者是父模型，不是用户。
+    if narrate
+        && tools.iter().any(|t| {
+            matches!(
+                *t,
+                "read" | "grep" | "find" | "ls" | "bash" | "edit" | "write"
+            )
+        })
+    {
         guidelines.push(
             "Before the first tool call of a new request, state in **one short sentence** what you \
              are about to do — the user must see the intent before any tool fires. After that, \
@@ -426,6 +520,16 @@ fn tool_guidelines(tools: &[&str]) -> String {
         guidelines.push(
             "A subagent is not free: it is another inference call plus another system prompt — \
              use it to save context, not to look busy"
+                .to_string(),
+        );
+        // 派发探索只在「多个独立、每个都要多轮」的问题上划算：子 agent 每问多付
+        // 约 25–30 s 固定开销（冷启动 + 独立系统提示），一两个小查找父 agent 自己搜更快。
+        // 成批派发才是收益点 —— 同批调用进 `Segment::Parallel`。
+        guidelines.push(
+            "Delegate exploration only when you have several independent questions that each need \
+             many rounds: send them in ONE message as `subagent` with `mode=\"explore\"` so they run \
+             in parallel, then trust their `path:line` findings. For one or two small lookups, search \
+             directly — an agent's cold start costs more than the lookup itself."
                 .to_string(),
         );
     }
@@ -1631,5 +1735,252 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 派发探索的**触发条件**只在父表有 `subagent` 时渲染，且必须写明
+    /// 「多个独立问题 + 一条消息成批 + 小查找自己搜」。
+    ///
+    /// 变异：① 删掉 `mode=\"explore\"` 或 `in ONE message` ⇒ 正向断言变红；
+    /// ② 去掉 `tools.contains(&"subagent")` 门控 ⇒ 反向断言变红。
+    #[test]
+    fn delegate_exploration_guideline_gated_on_subagent() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let parent = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("grep"), spec("subagent")],
+            &no_skills(),
+        );
+        assert!(
+            parent
+                .contains("Delegate exploration only when you have several independent questions"),
+            "父表有 subagent 时应渲染派发探索指引；prompt = {parent}"
+        );
+        assert!(
+            parent.contains("mode=\"explore\""),
+            "指引须点明 `mode=\"explore\"`；prompt = {parent}"
+        );
+        assert!(
+            parent.contains("in ONE message"),
+            "指引须要求成批放进一条消息；prompt = {parent}"
+        );
+        assert!(
+            parent.contains("For one or two small lookups, search directly"),
+            "指引须说明小查找自己搜更快；prompt = {parent}"
+        );
+
+        let child = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("grep")],
+            &no_skills(),
+        );
+        assert!(
+            !child.contains("Delegate exploration only when"),
+            "无 subagent 时不得渲染派发探索指引；prompt = {child}"
+        );
+    }
+
+    // ─────────────────────────── 探索子 agent（mode=explore） ───────────────────────────
+
+    /// 探索提示的差异：探索角色行、`path:line` 输出契约、**不含**叙述条目。
+    ///
+    /// 反向断言是关键：`narrate = false` 的实现若仍渲染「过程叙述」，子 agent 会
+    /// 被要求向用户汇报进展 —— 而它的读者是父模型，那条指令只增成本。
+    ///
+    /// 变异 1：把角色行改回 `You are a coding agent` ⇒ 角色断言变红。
+    /// 变异 2：删掉 `EXPLORE_REPORT_FORMAT` ⇒ `path:line — fact` / `at most 5 findings` 变红。
+    /// 变异 3：`render_guidelines` 忽略 `narrate` 参数 ⇒ 叙述断言变红。
+    #[test]
+    fn explore_prompt_has_role_and_report_contract_without_narration() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("explore_prompt");
+
+        let specs: Vec<ToolSpec> = [
+            "read",
+            "bash",
+            "grep",
+            "find",
+            "ls",
+            "websearch",
+            "webfetch",
+        ]
+        .iter()
+        .map(|name| spec(name))
+        .collect();
+        let prompt = build_explore_prompt(&dir, &specs, &no_skills());
+
+        assert!(
+            prompt.contains(
+                "You are an exploration agent. You investigate a codebase or its documents \
+                 and report findings with exact citations. You do not modify anything."
+            ),
+            "探索角色行必须逐字在场；prompt = {prompt}"
+        );
+        assert!(
+            prompt.contains("path:line — fact"),
+            "输出契约必须给出 `path:line — fact` 形状；prompt = {prompt}"
+        );
+        assert!(
+            prompt.contains("at most 5 findings"),
+            "输出契约必须有界（至多 5 条发现）；prompt = {prompt}"
+        );
+        assert!(
+            !prompt.contains("listing what you searched for"),
+            "输出契约不得再要求穷举「搜过哪里」；prompt = {prompt}"
+        );
+        assert!(
+            !prompt.contains("Before the first tool call of a new request"),
+            "探索子 agent 不得出现「过程叙述」guideline（其读者不是用户）；prompt = {prompt}"
+        );
+        // 其余 guideline 仍在：只去掉叙述那一条，不是整份列表被跳过。
+        assert!(
+            prompt.contains("Explore with one command"),
+            "只读工具在场时聚合探索指引仍须渲染；prompt = {prompt}"
+        );
+        // 工具清单沿用同一格式（`- name: snippet`）。
+        assert!(
+            prompt.contains("- read: Read file contents"),
+            "工具清单须沿用既有格式；prompt = {prompt}"
+        );
+        // cwd 段仍在最前。
+        assert!(
+            prompt.starts_with(&format!("Current working directory: {}", dir.display())),
+            "cwd 段须保留且在最前；prompt = {prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探索提示**不加载**项目上下文：AGENTS.md 段是每轮前缀成本（约 6.8k token），
+    /// 且会诱导探索 agent「按规范做事」而不是「尽快定位」。
+    ///
+    /// 正向对照（主 agent 仍带该段）是必要的：否则磁盘上没有 AGENTS.md 时，
+    /// 「不含 `<project_context>`」会因为没东西可加而假绿。
+    ///
+    /// 变异：把 `build_explore_prompt` 里删掉的 `load_project_context` 段加回去 ⇒
+    /// 第一条断言变红。
+    #[test]
+    fn explore_prompt_skips_project_context_but_keeps_cwd() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("explore_no_context");
+        std::fs::write(dir.join("AGENTS.md"), "PROJECT-CONVENTION-MARKER").unwrap();
+
+        let specs = [spec("read"), spec("bash")];
+        let explore = build_explore_prompt(&dir, &specs, &no_skills());
+        let main = build_system_prompt(&dir, &specs, &no_skills());
+
+        assert!(
+            main.contains("<project_context>") && main.contains("PROJECT-CONVENTION-MARKER"),
+            "对照：主 agent 必须仍加载项目上下文；prompt = {main}"
+        );
+        assert!(
+            !explore.contains("<project_context>")
+                && !explore.contains("PROJECT-CONVENTION-MARKER"),
+            "探索提示不得加载项目上下文；prompt = {explore}"
+        );
+        assert!(
+            explore.starts_with(&format!("Current working directory: {}", dir.display())),
+            "cwd 段须保留且在最前；prompt = {explore}"
+        );
+        assert!(
+            explore.contains("You are an exploration agent."),
+            "角色行须仍在；prompt = {explore}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探索提示**不走**自定义 prompt 短路：用户给主 agent 的 `SYSTEM.md` 不得接管
+    /// 探索子 agent 的输出契约。
+    ///
+    /// 变异：在 `build_explore_prompt` 开头加 `if let Some(custom) = find_custom_prompt(cwd)
+    /// { return custom; }` ⇒ 本用例变红（探索角色行消失）。
+    #[test]
+    fn explore_prompt_ignores_custom_system_prompt() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("explore_custom");
+        let system_dir = dir.join(".yushan");
+        std::fs::create_dir_all(&system_dir).unwrap();
+        std::fs::write(system_dir.join("SYSTEM.md"), "Custom system prompt").unwrap();
+
+        let prompt = build_explore_prompt(&dir, &[spec("read")], &no_skills());
+        assert!(
+            prompt.contains("You are an exploration agent."),
+            "探索提示不得被 SYSTEM.md 短路；prompt = {prompt}"
+        );
+        assert_ne!(prompt, "Custom system prompt");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探索提示带**工具形状的检索方法**：一条聚合命令、16 KiB 上限、`rg -l`、不越界。
+    ///
+    /// 16 KiB 是模型无法从工具描述推断的事实（`grep` 有硬上限，加大 `limit` 无用）。
+    ///
+    /// 变异：删掉 `EXPLORE_SEARCH_METHOD` 或其中任一条 ⇒ 对应断言变红。
+    #[test]
+    fn explore_prompt_has_tool_shaped_search_method() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("explore_search_method");
+
+        let specs = [spec("read"), spec("grep"), spec("bash")];
+        let prompt = build_explore_prompt(&dir, &specs, &no_skills());
+        for fragment in [
+            "How to search:",
+            "16 KiB",
+            "rg -l",
+            "do not expand the audit beyond it",
+        ] {
+            assert!(
+                prompt.contains(fragment),
+                "探索提示须含检索方法片段 `{fragment}`；prompt = {prompt}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 主 agent 的提示主体**逐字节不变**（`mode` 只影响子 agent）。
+    ///
+    /// 观测手段：把临时 cwd 归一成 `<cwd>` 后取 `build_system_prompt` 的指纹。
+    /// 只哈希 `<project_context>` 之前的段 —— 那一段由本函数生成，不含运行环境内容
+    /// （项目上下文来自磁盘上的 AGENTS.md，随机器而变，不属本函数的字节契约）。
+    ///
+    /// 变异：改角色行、工具清单形状、任一条 guideline 的文案或顺序 ⇒ 指纹变化。
+    #[test]
+    fn main_system_prompt_body_is_byte_stable() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+        let dir = unique_dir("main_prompt_bytes");
+
+        let specs: Vec<ToolSpec> = EXPECTED_ORDER.iter().map(|name| spec(name)).collect();
+        let prompt = build_system_prompt(&dir, &specs, &no_skills());
+        let body = prompt
+            .split("\n\n<project_context>")
+            .next()
+            .expect("split 至少返回一段");
+        let normalized = body.replace(&dir.display().to_string(), "<cwd>");
+        assert_eq!(
+            fnv1a64(normalized.as_bytes()),
+            0xb238d36795e45d24u64,
+            "主 agent 提示主体漂移：确认是有意改动，再更新此锚点"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FNV-1a 64 —— 指纹只用于发现字节漂移，不要求抗碰撞。
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
     }
 }

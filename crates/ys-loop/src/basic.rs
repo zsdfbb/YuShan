@@ -2431,6 +2431,7 @@ mod tests {
                 &self,
                 _prompt: &str,
                 _model: Option<&str>,
+                _mode: ys_tool::SubagentMode,
                 _boundary: Option<&dyn ys_protocol::BoundarySource>,
             ) -> Result<ys_tool::SubagentOutcome, String> {
                 unimplemented!("probe 不应被调用")
@@ -5083,6 +5084,7 @@ mod tests {
             &self,
             _prompt: &str,
             _model: Option<&str>,
+            _mode: ys_tool::SubagentMode,
             _boundary: Option<&dyn ys_protocol::BoundarySource>,
         ) -> Result<ys_tool::SubagentOutcome, String> {
             Err("not used".into())

@@ -97,6 +97,7 @@ mod tests {
             &self,
             _prompt: &str,
             _model: Option<&str>,
+            _mode: crate::subagent::SubagentMode,
             _boundary: Option<&dyn ys_protocol::BoundarySource>,
         ) -> Result<crate::subagent::SubagentOutcome, String> {
             unimplemented!()

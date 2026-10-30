@@ -819,9 +819,11 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
     }
 }
 
-/// 退出恢复：把完整对话写回主屏 scrollback，再离开 alt-screen。
+/// 退出恢复：把**退出摘要**写回主屏 scrollback，再离开 alt-screen。
 ///
-/// 照搬旧 `ui/mod.rs:142-174` 的 pi 语义（逐行 2K 清行，无残影、无 padding 行）。
+/// 摘要只有 session id / 模型 / 用量 / 时长这几行（见 [`draw::exit_summary_lines`]）
+/// —— **不回放对话内容**：整段对话每次退出都刷满主屏，长会话里更是把终端历史
+/// 整个堆没；要看内容用 `--resume`。
 ///
 /// **不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到
 /// 进入 alt-screen 时的位置 —— 也就是本 app 自己那段启动输出（stderr 的降级提示、
@@ -836,9 +838,7 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(
     terminal: &mut Terminal<B>,
     app: &App,
 ) {
-    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-    let width = (cols as usize).clamp(10, 400);
-    let lines = draw::transcript_plain_lines(app, width);
+    let lines = draw::exit_summary_lines(app);
 
     let mut out = std::io::stdout();
     let _ = write!(out, "{}", exit_payload(&lines));

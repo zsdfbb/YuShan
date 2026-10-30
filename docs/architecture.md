@@ -701,11 +701,11 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 |---|---|---|
 | **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
-| **退出时** | `session: <id>`（TUI 退出回放**之后**写主屏；`-p` / `--json` 收尾） | **stderr** |
+| **退出时** | `session: <id>`（TUI 退出**摘要写回主屏之后**写 stderr；`-p` / `--json` 收尾） | **stderr** |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
 | **debug 运行期间（默认开启）** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
 
-**退出时**是第三类时机：TUI 已退 alt-screen（`restore_terminal` 把对话回放到 stdout），此刻写 stderr
+**退出时**是第三类时机：TUI 已退 alt-screen（`restore_terminal` 已把**一行退出摘要**写回 stdout），此刻写 stderr
 的字节落在主屏、不会被冲掉，也不污染 `-p` 的模型文本 / `--json` 的逐行 `Envelope`。内容由
 `main::session_exit_line` 唯一给出（**只对已落盘的会话**打印 —— 惰性新会话若一个回合都没跑过就没有
 文件，打出的 id `--resume` 也找不到），详见 ADR-0032。
@@ -840,7 +840,8 @@ flowchart TB
 - **输入区**：多行（`Shift/Alt+Enter` 换行、`Enter` 提交）；启用 bracketed paste（`Event::Paste`
   原样 `insert_str`）；`InputBuffer.cursor` 是 **char 索引**，退格走字节边界求区间再 `replace_range`
   —— 修掉了旧 `ui/events.rs:131` 的 `cursor - 1` 落在多字节字符中间导致的**中文退格 panic**。
-- **退出**：无条件恢复终端 —— 把完整对话 wrap 后逐行写回**主屏 scrollback**，再离开 alt-screen。
+- **退出**：无条件恢复终端 —— 把**一行退出摘要**（model / 用量 / 轮数 / 时长）写回**主屏 scrollback**，
+  再离开 alt-screen；**不回放对话内容**（看内容用 `--resume`）。
 
 ---
 

@@ -820,7 +820,7 @@ pub(crate) fn build_text(app: &App, width: usize, now: Instant) -> Text<'static>
 }
 
 /// `build_text` 的完整形态：显式传入 thinking 可见性
-/// （TUI 与退出回放共用同一个开关值）。
+/// （TUI 与测试对照路径共用同一个开关值）。
 #[cfg(test)]
 fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant) -> Text<'static> {
     let palette = chrome(app);
@@ -876,7 +876,7 @@ fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant
 /// 故它后面的条目仍按**前一个可见条目**算边界。
 ///
 /// 只返回**计数**、不代插入（两条渲染路径的目标容器不同：TUI 是 `Vec<Line>`、
-/// 退出回放是 `Vec<String>`）。
+/// 对照路径是 `Vec<String>`）。
 pub(crate) fn gap_rows(
     item: &TranscriptLine,
     prev_class: Option<LineClass>,
@@ -896,8 +896,8 @@ pub(crate) fn gap_rows(
 /// 的 `Thinking`，按下标会误判成非首条，顶部凭空多两行。
 ///
 /// 只返回**计数**、不代插入：两个渲染循环的目标容器不同（TUI 是 `Vec<Line>`、
-/// 退出回放是 `Vec<String>`），共享的是规则而不是插入动作。**不得**把本判断下沉进
-/// [`push_non_assistant`]：退出回放（[`transcript_plain_lines`]）每条都新开一个局部
+/// 对照路径是 `Vec<String>`），共享的是规则而不是插入动作。**不得**把本判断下沉进
+/// [`push_non_assistant`]：对照路径（[`transcript_plain_lines`]）每条都新开一个局部
 /// `Vec<Line>` 再 extend，在那个 vec 上判空恒为真 ⇒ 会给**每条**用户行都加空行。
 fn user_gap_rows(item: &TranscriptLine, has_visible_before: bool) -> usize {
     if has_visible_before && matches!(item, TranscriptLine::User(_)) {
@@ -954,8 +954,8 @@ impl LineClass {
 
 /// 本条目是否产出**可见行** —— 留白规则的可见性判据。
 ///
-/// 两条渲染路径（TUI / 退出回放）**共用**本判据 ⇒ 留白在两边必然一致。
-/// 不看「实际产出了几行」而看「内容是否可见」：回放路径的 assistant 走 raw
+/// 两条渲染路径（TUI / 对照路径）**共用**本判据 ⇒ 留白在两边必然一致。
+/// 不看「实际产出了几行」而看「内容是否可见」：对照路径的 assistant 走 raw
 /// `split('\n')`，空串会产出 1 个空行；而 TUI 路径的 `md::render("")` 产出 0 行。
 /// 若用「产出行数」当判据，两条路径会在**空 assistant** 之后给出不同的留白。
 ///
@@ -1025,8 +1025,8 @@ pub(crate) fn push_transcript_line(
     push_non_assistant(out, item, width, thinking_visible, palette);
     // CJK 断点：**只在这一条出口**加，不在 `push_non_assistant` 内部逐变体加。
     //
-    // 理由：`push_non_assistant` 同时被退出回放（[`transcript_plain_lines`]）复用，
-    // 而回放会把行再交给 [`wrap_plain`] 按列硬折 —— 那里不需要也不该看到零宽字符。
+    // 理由：`push_non_assistant` 同时被对照路径（`transcript_plain_lines`）复用，
+    // 而那里会把行再交给 [`wrap_plain`] 按列硬折 —— 不需要也不该看到零宽字符。
     // 集中在出口处做，则**新增变体自动被覆盖**，不会漏（漏了不报错，只会静默退回
     // 「中文被当成一个词」的旧行为）。
     add_cjk_breakpoints(&mut out[from..]);
@@ -1049,7 +1049,7 @@ fn add_cjk_breakpoints(lines: &mut [Line<'static>]) {
     }
 }
 
-/// 非 `Assistant` 变体 → 行（TUI 与退出回放共用，行为一致）。
+/// 非 `Assistant` 变体 → 行（TUI 与对照路径共用，行为一致）。
 ///
 /// `palette` 按值传入：颜色已烘进 `Line`，故取色必须由持有主题真值的一方给出 ——
 /// 本函数拿不到 `App`，若在这里重新取默认色板，切主题后这些行会保持旧配色。
@@ -1254,12 +1254,50 @@ fn stop_label(stop: &StopReason) -> &'static str {
     }
 }
 
-/// 退出时写回主屏 scrollback 的**纯文本**完整对话。
+/// 退出时写回主屏 scrollback 的**退出摘要**。
 ///
-/// `Assistant` 走 **raw 路径**（设计 §2.10）：按 `\n` 原样切行、整行单色、**不预折行、
-/// 不经缓存** —— 主屏留**原始 markdown 源**（可复制可搜），折行交给终端。
-/// 其它变体行为不变（仍按显示宽度 wrap）。
-/// thinking 遵守 `app.thinking_visible`（默认隐藏，`/thinking on` 后可见）。
+/// **不打印对话内容**：alt-screen 里的对话在主屏历史里本就没留痕，而整段回放会在
+/// 每次退出时刷满主屏（长会话尤其）—— 用户要的通常只是「用了多少、跑了多久」，
+/// 重新看内容用 `--resume`。故这里只给一行元信息：
+///
+/// ```text
+/// model: provider/model · ↑12.3k ↓4.5k · 3 轮 · 5m2s
+/// ```
+///
+/// 规则：
+/// - `model:` 行恒出现 —— `model_label` 在无模型时自报「未配置」，是退出时最该留的信息。
+/// - 用量段只在**有读数**时追加（与状态行同一判据），答「这局花了多少」。
+/// - `session: <id>` **不在这里**：它由 `main` 写 stderr（TUI 退出路径已有一条），
+///   再说一遍是噪音。
+///
+/// 依赖的都是 `CodingView` 快照（由 app 线程推来），不读 transcript。
+pub(crate) fn exit_summary_lines(app: &App) -> Vec<String> {
+    let view = &app.view;
+    let mut segs = vec![view.model_label()];
+    let has_reading = view.cache_tokens.is_some()
+        || view.compaction_tokens.is_some()
+        || view.total_input_tokens > 0
+        || view.total_output_tokens > 0;
+    if has_reading {
+        segs.push(format!(
+            "↑{} ↓{}",
+            crate::format::format_tokens_or_dash(view.total_input_tokens),
+            crate::format::format_tokens_or_dash(view.total_output_tokens),
+        ));
+    }
+    if view.turn_count > 0 {
+        segs.push(format!("{} 轮", view.turn_count));
+    }
+    segs.push(view.session_duration_str());
+    vec![format!("model: {}", segs.join(" · "))]
+}
+
+/// transcript → **纯文本**逐行（按**显示宽度** wrap）。
+///
+/// **仅测试用**：它是「整段折行」参考路径的纯文本对照 —— 视窗化渲染
+/// （[`crate::layout`]）的等价性用例拿它与 TUI 路径比对留白行数。
+/// 退出回放**不再**用它（见 [`exit_summary_lines`]），故不得在非测试代码里调用。
+#[cfg(test)]
 pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -1431,7 +1469,8 @@ fn split_at_breaks(s: &str) -> Vec<&str> {
     out
 }
 
-/// 按显示宽度贪心硬 wrap（退出打印用；不做断词）。
+/// 按显示宽度贪心硬 wrap（仅供测试对照路径；不做断词）。
+#[cfg(test)]
 fn wrap_plain(s: &str, width: usize) -> Vec<String> {
     if s.is_empty() {
         return vec![String::new()];
@@ -1456,8 +1495,8 @@ fn wrap_plain(s: &str, width: usize) -> Vec<String> {
 /// 并给出光标落在哪一视觉行的哪一显示列。
 ///
 /// 渲染（[`draw_input`]）、高度（[`input_height`]）与光标定位**共用**本函数 ——
-/// 三者必须基于同一份折行结果，否则会「画在一行、光标在另一行」。折行规则与退出
-/// 回放 [`wrap_plain`] 同源：按列贪心、不断词。
+/// 三者必须基于同一份折行结果，否则会「画在一行、光标在另一行」。折行规则与
+/// [`wrap_plain`] 同源：按列贪心、不断词。
 ///
 /// 光标恰好停在「填满一行的行尾」时，会多折出一个空行把光标放到它的行首，免得
 /// 光标列 `== width` 越界。故在那一处，行数依赖光标位置 —— 这是有意的：行数要
@@ -2323,10 +2362,10 @@ mod tests {
         );
     }
 
-    /// 两条渲染路径的**留白必须一致** —— 否则退出回放与 TUI 内形状不同。
+    /// 两条渲染路径的**留白必须一致** —— 否则对照路径与 TUI 内形状不同。
     ///
-    /// 退出回放（`transcript_plain_lines`）与 TUI（`build_text_with`）共用 `gap_rows`，
-    /// 本用例钉住二者**行数**相同（不比较内容：assistant 在回放走 raw、TUI 走 md 渲染，
+    /// 对照路径（`transcript_plain_lines`）与 TUI（`build_text_with`）共用 `gap_rows`，
+    /// 本用例钉住二者**行数**相同（不比较内容：assistant 在对照路径走 raw、TUI 走 md 渲染，
     /// 形状本就有意不同）。
     ///
     /// **变异**：只在一侧加块边界留白（两条路径分叉）⇒ 本用例红。
@@ -2413,6 +2452,45 @@ mod tests {
         }
     }
 
+    /// 退出摘要只给元信息，**不回放对话内容**。
+    ///
+    /// **变异**：`exit_summary_lines` 改回 `transcript_plain_lines`（回放对话）⇒ 下面
+    /// 「不含对话正文」与行数断言变红。
+    #[test]
+    fn exit_summary_has_no_transcript_content() {
+        let mut app = app_with(CodingView::for_test());
+        app.transcript.push(TranscriptLine::User("机密提问".into()));
+        app.transcript
+            .push(TranscriptLine::Assistant("机密回答".into()));
+        app.view.total_input_tokens = 1_200;
+        app.view.total_output_tokens = 345;
+        app.view.turn_count = 2;
+
+        let lines = exit_summary_lines(&app);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("机密"), "退出不得回放对话内容：{lines:?}");
+        assert_eq!(lines.len(), 1, "摘要恒为一行：{lines:?}");
+        assert!(lines[0].starts_with("model: "), "{lines:?}");
+        assert!(
+            joined.contains("↑1.2k ↓345") && joined.contains("2 轮"),
+            "有读数时带用量与轮数：{lines:?}"
+        );
+        assert!(!joined.contains('>'), "不得出现对话前缀 `> `：{lines:?}");
+        assert!(
+            !joined.contains("session:"),
+            "session 行归 main 的 stderr，摘要不得重复：{lines:?}"
+        );
+    }
+
+    /// 无读数时**不编造** `↑0 ↓0`（与状态行同一判据：零 = 没测到）。
+    #[test]
+    fn exit_summary_omits_usage_without_reading() {
+        let app = app_with(CodingView::for_test());
+        let line = exit_summary_lines(&app).join("\n");
+        assert!(!line.contains('↑'), "无读数不得显示用量：{line:?}");
+        assert!(!line.contains("0 轮"), "零轮不显式标出：{line:?}");
+    }
+
     #[test]
     fn test_summary_render_matches_plain_transcript() {
         let expected = "✗ cancelled · 2 rounds · 1.3s";
@@ -2426,7 +2504,7 @@ mod tests {
         let tui = rows_of(&mut app, 120, 40).join("\n");
         let plain = transcript_plain_lines(&app, 120);
         assert!(tui.contains(expected), "TUI Summary 应含完整标签：{tui}");
-        assert_eq!(plain, vec![expected], "退出回放应与 TUI 使用同一格式");
+        assert_eq!(plain, vec![expected], "对照路径应与 TUI 使用同一格式");
     }
 
     #[test]

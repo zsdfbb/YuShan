@@ -258,8 +258,8 @@ provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoni
 判据是「该条目之前**已有可见行**」而**不是**「下标 > 0」：`/thinking off` 时首条若是 `Thinking`，
 它不产出行，按下标会把紧接的首条提问误判成非首条、顶部凭空多两行。
 相邻两条 `User`（回合中插话 / 排队回声）之间**同样留白** —— 规则统一为「非首条可见即留」，不按上一条是不是 `User` 特判。
-`user_gap_rows` **只返回计数**，两个渲染循环各自落到自己那层容器（TUI 的 `Vec<Line>` / 退出回放的 `Vec<String>`）；
-**不得**把判断下沉进 `push_non_assistant` —— 回放每条都新开一个局部 `Vec<Line>` 再 extend，在其上判空恒真，
+`user_gap_rows` **只返回计数**，两个渲染循环各自落到自己那层容器（TUI 的 `Vec<Line>` / 测试对照路径的 `Vec<String>`）；
+**不得**把判断下沉进 `push_non_assistant` —— 对照路径每条都新开一个局部 `Vec<Line>` 再 extend，在其上判空恒真，
 会给**每条**用户行都加空行。空白行经 `build_text` 进入那份唯一的 `Text`，故 `max_scroll_offset` 的
 视觉行数**自动含它**（TUI 画面与滚动数学无分叉可能）。
 
@@ -284,12 +284,12 @@ provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoni
 与上面的 `USER_GAP_ROWS` **正交** —— 那条按**条目类型**（问答之间），这条按**块类别**（块类型之间）；
 两条规则**叠加**（`User` 之前最多 2 + 1 = 3 行）。`Thinking` → `Tool` 同类**不留白**（同一行动块）。
 
-留白与缩进由 `gap_rows` **统一计算**，两条渲染路径（TUI 的 `build_text_with`、退出回放的
-`transcript_plain_lines`）共用同一套规则 ⇒ TUI 画面、滚动数学、退出回放三者一致
-（回放侧 assistant 走 raw、与 TUI 内不同形是**有意**的，但留白与缩进必须一致）。
+留白与缩进由 `gap_rows` **统一计算**，两条渲染路径（TUI 的 `build_text_with`、**仅测试用**的
+`transcript_plain_lines`）共用同一套规则 ⇒ TUI 画面、滚动数学、参考路径三者一致
+（参考路径侧 assistant 走 raw、与 TUI 内不同形是**有意**的，但留白与缩进必须一致）。
 「可见」判据是 `is_visible`：**不可见条目**（`/thinking off` 下的思考、空 assistant）既**不留白**
 （否则留下无人消费的**孤立空行**）、也**不推进**「上一条类别」（否则多切一个块边界）——
-它们在屏上不存在。注意该判据**不能**用「实际产出了几行」代替：回放侧空 assistant 走 raw
+它们在屏上不存在。注意该判据**不能**用「实际产出了几行」代替：参考路径的空 assistant 走 raw
 会产出 1 个空行，TUI 侧 `md::render("")` 产出 0 行，用产出行数会让两边在空 assistant 之后
 给出不同留白。
 
@@ -321,10 +321,9 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 `Ctrl-E`（Cocoa 文本框的老规矩），故绑这两个即等价于「`⌘` + 左右」可用；要按**词**移动则用
 `Ctrl`/`⌥` + 左右。用户若改过键映射，可在终端里跑 `cat -v` 看实际发出的字节序列自查。
 
-**退出**：无条件恢复终端 —— 把完整对话按当前宽度 wrap 后逐行写回**主屏 scrollback**，再离开
-alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinking 遵守 `thinking_visible`（默认隐藏，`/thinking on` 后退出可见）。
-**assistant 行的回放走 raw 路径**（按 `\n` 原样切行、不经 md 渲染 + 缓存）⇒ 主屏 scrollback 里留
-**原始 markdown 源**（可复制、可搜索、可 grep），折行交给终端；其余变体行为不变（详见 §14.6）。
+**退出**：无条件恢复终端 —— 把**一行退出摘要**（`model: provider/model · ↑↓tokens · N 轮 · 时长`）写回
+**主屏 scrollback**，再离开 alt-screen。**不回放对话内容**：长会话整段回放会把主屏与终端历史刷满，
+要看内容用 `--resume`（会话号由 `main` 另行打到 stderr，见 M18）。
 
 > **回放不做绝对定位**：`LeaveAlternateScreen`（`CSI ?1049l`）已把光标恢复到**进入 alt-screen 时**
 > 的位置 —— 也就是本 app 自己那段启动输出的下一行。回放从那里往下写即可。**不得** `MoveTo(0, 0)`：
@@ -486,7 +485,7 @@ alt-screen（pi 语义：退出后对话仍在终端历史里可翻）。thinkin
 | M15 | **panic hook 的 `panic_hook_body<T>(restore, delegate, info)` 泛型化**：泛型 `T` 是为**可单测**（`PanicHookInfo` 无法在测试里构造，单测传一个假 `T` 即可断言「先恢复、后 delegate」）；`restore_sequence()` 由 `exit_payload`（正常退出）与 panic hook **共用**（四条命令各改一个互不相干的模式位；唯一先后约束是「退 alt-screen 必须在回放段之前」—— 回放落点靠 `?1049l` 恢复） | `ys-tui-coding/src/run.rs` |
 | M16 | **绘制路径不得 panic**：`push_non_assistant` 的 `Assistant` 分支从 `unreachable!()` 改为**降级为 raw** + `debug_assert!(false, …)`（测试期大声、生产期降级）—— 绘制 panic 会把终端留在 raw mode（§14.7）。该分支正常不可达（两个调用点都提前分流 Assistant） | `ys-tui-coding/src/draw.rs` |
 | M17 | **turn 中 Ctrl+C 两段式**（ADR-0031）：第一次投 `Boundary::Abort` + 写一行 transcript 回执「再按一次 Ctrl-C 退出」；第二次 `should_quit = true`（与 Ctrl-D 同一条退出路径）。标记 `App.abort_requested` **随回合生命周期复位**（进 turn 的三处 + `finish_turn`），否则上一回合按过的 Ctrl-C 会让下一回合的第一次直接退出 | `ys-tui-coding/src/{events,app}.rs` |
-| M18 | **退出后打 `session: <id>`**（ADR-0032）：TUI 退出（alt-screen 已恢复、transcript 已回放）后由 `main` 往 **stderr** 写一行 `session: <id>`，与 `-p` / `--json` 同文案同去处；只在**已落盘**时打（惰性新会话没跑过回合就没有文件）。会话号取自 `app_loop::SessionPathHandle` —— 启动态由 `run_interactive` 从 `Wiring` 播种、`/new` 后由 app 循环刷新，**不等 app 线程收摊**（长回合中途退出时正卡在模型调用里，等就取不到） | `apps/coding-agent/src/{main,app_loop}.rs` |
+| M18 | **退出后打 `session: <id>`**（ADR-0032）：TUI 退出（alt-screen 已恢复、**一行退出摘要**已写回主屏）后由 `main` 往 **stderr** 写一行 `session: <id>`，与 `-p` / `--json` 同文案同去处；只在**已落盘**时打（惰性新会话没跑过回合就没有文件）。会话号取自 `app_loop::SessionPathHandle` —— 启动态由 `run_interactive` 从 `Wiring` 播种、`/new` 后由 app 循环刷新，**不等 app 线程收摊**（长回合中途退出时正卡在模型调用里，等就取不到） | `apps/coding-agent/src/{main,app_loop}.rs` |
 | M19 | **`/resume` 运行期切换会话**（ADR-0033，取代 ADR-0026 决策 6）：无参 → 浮层（候选挂 `App.pending_sessions`，由 `resolve_session_pick` 决策、标签含**完整 id** 以供反解、Esc 取消、空列表只提示不弹浮层）；有参 → 直切。app 侧 `resume_session` **可失败步全部前置**（解析 → 读 meta → 纯解析模型四字段 → 构建候选 model），`wiring.resume_into` **open 成功才替换**句柄（失败 ⇒ 当前会话全不变）。UI 侧回放经 `Outbound::SessionResumed` → `reset_for_replay()` + `replay_lines()`，**必须显式 `RenderCache::reset()`**（回放是本 app **第一个**清屏/缩短 transcript 的操作）。启动期 `--resume` 复用同一通路、顺带修掉空屏（出站顺序 `SessionResumed` 先于启动提示）。**`-p` / `--json` 不受影响**（不收 `Outbound`） | `ys-protocol/src/{session,request,lib}.rs`；`ys-tui-coding/src/{cache,transcript,commands,prompter,app,run,lib}.rs`；`apps/coding-agent/src/{wiring,capabilities,main,app_loop,sessions}.rs`；`apps/coding-agent/tests/resume_cli.rs`；见 `docs/design-final/runtime-resume.md` |
 | M20 | **模态选择器带常驻筛选输入框**：`select_modal`（`run.rs`）在候选列表**之上**加一行输入框 —— 打开即可敲字，大小写不敏感**子串**匹配**整条候选串**，↑↓ 在**过滤后**的列表里移动，Enter 确认（**无匹配时不动作**，取消的唯一出口是 Esc），Esc 取消；`Backspace/Delete/←→/Home/End` 与 `Paste` 编辑筛选串。空查询 ⇒ 过滤结果 = 全体 ⇒ 行为与「纯列表」逐字一致。四个模态命令（provider / model / skill / session）**共用** `select_modal`，故筛选对它们一并生效。两条纯函数（`filter_indices` / `clamp_selection`）与 `modal_move` 并列抽出，理由相同：模态循环要真终端，语义只能靠纯函数钉进单测 —— 尤其 `clamp_selection`，查询收窄后不收敛 `selected` 会让 `filtered[selected]` 越界 panic。**筛选框为空时显示占位文案「输入以筛选…」**（可筛选这件事在输入框里说，**不进标题** —— 标题塞提示会把框撑到 60+ 列，窄终端下反被裁掉） | `crates/ys-tui-coding/src/{run,draw}.rs` |
 | M21 | **`/effort` 不镜像本地状态，且设置走模型重建**：① 与 `/thinking` 不同，`/effort <level>` **不经**「本地先写一行 + 镜像 Request」——档位真值在 app 侧 `Config.effort`，TUI 只读 `CodingView.effort`；本地先改会让 UI 早于 app 显示一个**尚未重建模型**的档位，命令成功与否也无从区分。无参显示是纯本地读快照。② 档位**随会话 meta 持久化**（`SessionMeta.effort`）：它描述「本会话想用什么思考深度」，与 `/thinking` 的显示偏好同属会话级状态；`/new` 不重置（同 `thinking_visible`），`/resume` 从目标 meta 还原并重建，`-p` / `--json` **只读不写**（不覆盖既有会话）。③ 有效档位经 `Config::effective_reasoning_effort()`（会话覆盖优先，否则配置默认 `high`）交给 `ProviderCompat::effort_for(model, ..)`（provider 级能力位 + 模型级代际两层门控，并按方言折叠），产出写进 `OpenAICompatibleConfig.reasoning_effort`；只有**重建 model** 才能进请求；`set_effort` 与 `set_model` 同路径（无凭证 ⇒ `wiring.set_model(None)`），故下一个回合（含 subagent / compact 的工厂构造）自动继承，回合内不热切换 | `ys-tui-coding/src/{commands,events,view}.rs`；`apps/coding-agent/src/{config,capabilities,app_loop,main,view}.rs`；`crates/ys-protocol/src/request.rs`；`crates/ys-session/src/meta.rs`；见 `docs/design-final/effort.md` |
@@ -854,10 +853,13 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 - `total_rows` / `draw::max_scroll_offset` **只服务事件路径**（`App::compute_max_scroll` ← ↑↓ 滚动 / resize
   夹取 `scroll_offset`），该路径**自取** `Instant::now()`。
 
-### 14.6 回放走 raw
+### 14.6 退出摘要，不回放对话
 
-- `transcript_plain_lines` 的 `Assistant` 分支走 raw 路径：按 `\n` 原样切行、无样式、不经缓存
-  ⇒ 退出后主屏 scrollback 留**原始 markdown 源**（可复制、可搜索）。其他变体行为不变。
+- `exit_summary_lines` 只产出**一行** `model: provider/model · ↑↓tokens · N 轮 · 时长`
+  —— 依赖 `CodingView` 快照，不读 transcript。用量段沿用状态行的「有读数才显示」判据
+  （零 = 没测到，不写 `↑0 ↓0`）；`session: <id>` 不在其中（归 `main` 的 stderr，见 M18）。
+- `transcript_plain_lines` 降为 **`#[cfg(test)]`**：它只剩「整段折行」参考路径的用途，
+  被视窗化渲染的等价性用例当作 TUI 路径的对照（留白行数必须一致）。
 - `/copy` 本就读原始串，未改。
 
 ### 14.7 panic 边界
@@ -1018,7 +1020,7 @@ App::set_theme(kind)                       // 唯一入口
 |---|---|---|
 | `↑` / `↓` | `Preview(prev/next)` | 立即 `set_theme`（环形，`ALL` 顺序即展示顺序） |
 | `Esc` | `Restore(opened_with)` | 还原到打开前的主题，**不落盘**（`Cancelled` ⇒ 不发请求） |
-| `Ctrl-C` | 先还原，再 `Err(PromptError::Quit)` | 与浮层其余模态一致（`Ctrl-C` = 关程序）；先还原是为了让退出回放的 scrollback 用回原配色 |
+| `Ctrl-C` | 先还原，再 `Err(PromptError::Quit)` | 与浮层其余模态一致（`Ctrl-C` = 关程序）；先还原是为了让退出摘要的 scrollback 用回原配色 |
 | `Enter` | `Confirm(selected)` | `Confirmed` ⇒ 调用方发 `Request::SetTheme`（落盘）并补一行 `theme: <name>` |
 | 其余 | `Ignore` | 本浮层无查询框，不做过滤 |
 
@@ -1159,8 +1161,8 @@ ratatui 显式认它作断点（`ratatui-core` 的 `Grapheme::is_whitespace`：`
    看不到可断位置。同时 `wrap_words` 改认「空格**或** ZWSP」作分词符（`split_at_breaks`）——
    只认空格时，`bash <长中文>` 会把 `bash ` 单独留在首行。
 
-**为何不在 `push_non_assistant` 内部逐变体加**：该函数被退出回放（`transcript_plain_lines`）复用，
-而回放会把行再交给 `wrap_plain` 按列硬折 —— 那里不需要也不该看到零宽字符。
+**为何不在 `push_non_assistant` 内部逐变体加**：该函数被测试对照路径（`transcript_plain_lines`）复用，
+而那里会把行再交给 `wrap_plain` 按列硬折 —— 不需要也不该看到零宽字符。
 
 **为何不自己按宽度预折 CJK**：那会引入第二次折行，与 `Paragraph` 的口径必须严格一致，否则
 §18 的 N4 不变式（整段折行 == 逐行折行之和）破裂、滚动错位。断点方案不改变列宽语义，

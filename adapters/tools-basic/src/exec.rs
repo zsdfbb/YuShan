@@ -226,6 +226,12 @@ pub async fn run_bounded(
     let mut cmd = Command::new(prog);
     cmd.args(args)
         .current_dir(cwd)
+        // **stdin 必须显式接 `/dev/null`**：agent 进程的 stdin 不保证会 EOF
+        // （交互式 TUI 下它是一根常开的终端/管道）。本原语服务的 `rg` / `fd` /
+        // `grep` / `find` 在**没有路径参数**时会从 stdin 读 —— 若子进程继承 agent
+        // 的 stdin，它们会永久等不到输入结束，一直阻塞到 `deadline`（调用方看到的
+        // 就是「超时」）。`Stdio::null()` 让这类命令立刻读到 EOF 并按正常语义返回。
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // 外层超时 drop future 时连带杀子进程（与 `bash.rs` 同款，防泄漏）。
@@ -430,6 +436,97 @@ mod tests {
         assert!(b.stderr.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 子进程**不得继承 agent 的 stdin** —— `rg` / `grep` 等无路径参数时会从 stdin 读，
+    /// stdin 永不 EOF 就会永久阻塞到 `deadline`。
+    ///
+    /// **稳定复现**：本用例重新执行**当前测试二进制**，把它的 stdin 接成一根永不关闭的
+    /// 管道（`Stdio::piped()`，父侧持有写端且**不 drop**）。内层进程再调 [`run_bounded`]，
+    /// 于是被测子进程继承到的 stdin 与生产里 agent 的 stdin 同形（永不 EOF）。
+    /// 直接在本进程里跑不够：测试自身的 stdin 可能是 TTY 或 `/dev/null`，那样即使有
+    /// bug 也读得到 EOF，缺陷不复现。
+    ///
+    /// 变异：去掉 `run_bounded` 的 `.stdin(Stdio::null())` ⇒ 内层 `sh -c 'cat'` 永远等
+    /// 不到 EOF ⇒ 撞上 2s deadline 返回 `TimedOut` ⇒ 内层断言失败、退出码非 0 ⇒ 本用例变红。
+    #[test]
+    fn run_bounded_does_not_inherit_agent_stdin() {
+        const INNER: &str = "YS_RUN_BOUNDED_STDIN_INNER";
+        const MARKER: &str = "YS_RUN_BOUNDED_STDIN_MARKER";
+
+        if std::env::var_os(INNER).is_some() {
+            // 内层：留下 marker，防「过滤器没命中、0 个测试也退出 0」的假绿。
+            if let Some(marker) = std::env::var_os(MARKER) {
+                std::fs::write(marker, b"ran").expect("写 marker");
+            }
+
+            let rt = tokio::runtime::Runtime::new().expect("建 tokio runtime");
+            rt.block_on(async {
+                let dir = test_dir("stdin_null");
+                std::fs::create_dir_all(&dir).unwrap();
+                let args = vec!["-c".to_string(), "cat".to_string()];
+
+                let started = Instant::now();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    run_bounded(
+                        Path::new("sh"),
+                        &args,
+                        &dir,
+                        1024 * 1024,
+                        Duration::from_secs(2),
+                        None,
+                    ),
+                )
+                .await
+                .expect("run_bounded 不应挂起（2s deadline 应有界）");
+                let elapsed = started.elapsed();
+
+                let b = result.expect("读 stdin 的命令必须正常返回，不是 ToolError");
+                assert_eq!(
+                    b.stop,
+                    Stop::Eof,
+                    "必须读到 EOF 正常退出，而不是被 deadline 杀掉"
+                );
+                assert_eq!(b.code, Some(0), "cat 应正常退出");
+                assert!(b.stdout.is_empty(), "没有输入 ⇒ 输出为空");
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "应远小于 2s deadline；实际 {elapsed:?}（说明 stdin 未被接成 null）"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            });
+            return;
+        }
+
+        // 外层：起一根永不关闭的管道作为内层测试进程的 stdin。
+        let exe = std::env::current_exe().expect("取当前测试二进制");
+        let marker = test_dir("stdin_null_marker").join("ran");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("exec::tests::run_bounded_does_not_inherit_agent_stdin")
+            .env(INNER, "1")
+            .env(MARKER, &marker)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("重新执行测试二进制");
+        // **关键**：把写端从 `Child` 里取出来自己持有。`Child::wait` 会 drop stdin
+        // （std 为防死锁而关闭它），那样管道就 EOF 了、缺陷不复现。
+        let stdin = child.stdin.take().expect("stdin 已 piped");
+        let status = child.wait().expect("等内层测试退出");
+        drop(stdin);
+
+        assert!(
+            marker.exists(),
+            "内层用例没有被执行（过滤器未命中）—— 无法证明 stdin 契约"
+        );
+        assert!(
+            status.success(),
+            "内层用例失败（{status:?}）：子进程很可能继承了永不 EOF 的 stdin"
+        );
+        let _ = std::fs::remove_dir_all(marker.parent().unwrap());
     }
 
     /// `Eof`（非零退码）：**退出码 3 不是 `Err`** —— 原样 `Ok`，由调用方按退出码语义判定

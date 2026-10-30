@@ -73,7 +73,7 @@ accepted（2026-10-21）
 | `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息（顶部） |
 | `↑` `↓` | 逐视觉行滚动（脱离底部即停止跟随） |
 | `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1**（原为写死的 10 行） |
-| 滚轮 / 触控板上下 | 逐**1 视觉行**滚动（[ADR-0050](0050-tui-mouse-wheel-scroll.md)；需 `EnableMouseCapture`，故裸拖选失效） |
+| 滚轮 / 触控板上下 | 逐 **3 视觉行**滚动（[ADR-0050](0050-tui-mouse-wheel-scroll.md)；需 `EnableMouseCapture`，故裸拖选失效） |
 | `Home` | 输入行首（**裸** `Home` 仍归输入光标，与 `End` 刻意不对称） |
 
 **不绑 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（`Terminal.app` / `iTerm2` 的出厂映射

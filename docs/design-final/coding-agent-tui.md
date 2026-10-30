@@ -1365,7 +1365,7 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 | `↑` | 输入框**按视觉行上移**（软换行也算一行）→ 到首行才取会话内历史 → 历史空则逐视觉行滚动 | 
 | `↓` | 输入框**按视觉行下移** → 到底才回落：浏览态内取历史下一条（越过最新即还原草稿并退出浏览态），否则逐视觉行滚动 |
 | `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1**（聊天滚动的主入口） |
-| 滚轮 / 触控板上下 | 逐 **1 视觉行**滚动聊天（与输入历史**无关**）；脱离底部即停止跟随 |
+| 滚轮 / 触控板上下 | 逐 **3 视觉行**滚动聊天（与输入历史**无关**）；脱离底部即停止跟随 |
 | `Home` / `End` | 输入**当前行**的行首 / 行尾（`Ctrl-E` 与 `End` 同义；`Ctrl-A` **不是**行首，见下） |
 | `Ctrl-End` / `Ctrl-Down` | 跳到最新消息 |
 | `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息 |
@@ -1404,7 +1404,8 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
 
 **滚轮归应用**（ADR-0050）：`run::setup_terminal` 开 `EnableMouseCapture`，
-`events::handle_mouse` 只认 `ScrollUp` / `ScrollDown`（其余鼠标事件忽略）。
+`events::handle_mouse` 只认 `ScrollUp` / `ScrollDown`（其余鼠标事件忽略）；
+**每事件 3 视觉行**（`events::WHEEL_ROWS`，单事件与批路径共用 `WheelDelta::rows()` 折算）。
 不开捕获时终端把滚轮译成 `↑` / `↓` ⇒ 滑触控板翻的是**输入历史**而不是对话。
 捕获期间终端原生拖选失效的代价，已由**应用内选区 + 松手即复制**（ADR-0051）消掉 ——
 裸左键拖选即可复制，`⇧`+拖选则把原生选择**让回**终端。

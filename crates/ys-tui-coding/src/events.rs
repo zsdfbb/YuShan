@@ -122,8 +122,10 @@
 //! - **只处理滚动**：`Down` / `Up`（键按下）、`Moved`（悬停）一律忽略 —— 不绑点击，
 //!   也就不会与拖选抢事件。
 //! - **左右滚动忽略**：聊天是单列竖排，水平分量没有语义。
-//! - **步长 = 1 视觉行**（不是 `PageUp` 的一页）：`ScrollUp` / `ScrollDown` 是离散的
-//!   「滚一格」事件，触控板滑动会被终端合批成多个事件；按行算才跟手。
+//! - **步长 = [`WHEEL_ROWS`] 视觉行 / 事件**（既不是 1 行，也不是 `PageUp` 的一页）：
+//!   `ScrollUp` / `ScrollDown` 是离散的「滚一格」事件，触控板一次滑动只爆发 8–30 个
+//!   （ADR-0050 决策 2）⇒ 按 1 行算时整次滑动也翻不过一屏，观感就是「滑不动」；
+//!   按一页算又会飞过头。取 3 行：一次滑动 24–90 行，慢滑仍可逐段对位。
 //! - **模态浮层不吃滚轮**：浮层自己读事件（`run.rs` 的 `Prompter` 实现），它 `_ => {}`
 //!   掉鼠标 —— 浮层内容不滚动，捕获仍开着只为不丢状态。
 
@@ -165,8 +167,8 @@ pub fn handle_event(
 
 /// 鼠标事件。
 ///
-/// - **滚轮上下**：滚聊天，步长 1 视觉行（见模块文档「滚轮」段）；属**用户主动**滚动，
-///   走 [`scroll_clearing_selection`]（ADR-0051 决策 6：滚一下就清选区）。
+/// - **滚轮上下**：滚聊天，每事件 [`WHEEL_ROWS`] 视觉行（见模块文档「滚轮」段）；属
+///   **用户主动**滚动，与批路径共用 [`scroll_wheel_batch`] —— 两条路只有一份位移折算。
 /// - **左键三态**（按下 / 拖动 / 松开）：应用内选区的生命周期（ADR-0051）。
 /// - **`⇧` 按住**：直接返回，把原生选择让回终端（决策 1）。
 /// - 其余（水平滚动 / 悬停 / 其它键）：不绑任何动作。
@@ -176,8 +178,10 @@ pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
         return;
     }
     match m.kind {
-        MouseEventKind::ScrollUp => scroll_clearing_selection(app, width, height, 1),
-        MouseEventKind::ScrollDown => scroll_clearing_selection(app, width, height, -1),
+        MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),
+        MouseEventKind::ScrollDown => {
+            scroll_wheel_batch(app, width, height, WheelDelta::one(false))
+        }
         MouseEventKind::Down(MouseButton::Left) => begin_selection(app, m, width, height),
         MouseEventKind::Drag(MouseButton::Left) => extend_selection(app, m, width, height),
         MouseEventKind::Up(MouseButton::Left) => finish_selection(app, m, width, height),
@@ -185,6 +189,16 @@ pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
         _ => {}
     }
 }
+
+/// 一个滚轮事件滚动的**视觉行数**。
+///
+/// 触控板一次滑动爆发 8–30 个事件（ADR-0050 决策 2），故单事件位移决定整次滑动的
+/// 幅度：取 1 行 ⇒ 整次滑动不到一屏（用户观感「滑不动」）；取一页 ⇒ 一次轻滑就飞过
+/// 整屏。3 行是两头之间的取值 —— 40 行终端上约 1/10 屏 / 事件。
+///
+/// 与 `PageUp` / `PageDown`（视窗高度 − 1）互不影响；`↑` / `↓` 的逐行滚动也不经过
+/// 这个常量（它们是键盘的逐行语义）。
+pub const WHEEL_ROWS: isize = 3;
 
 /// 一批滚轮事件折叠成的**净滚动量**（视觉行）。
 ///
@@ -202,6 +216,16 @@ pub struct WheelDelta {
 }
 
 impl WheelDelta {
+    /// 单方向**一格**（一次 `ScrollUp` / `ScrollDown` 折算来的滚动量）。
+    ///
+    /// 单事件路径（[`handle_mouse`]）与批路径因此共用同一份折算逻辑，
+    /// 不会出现「CLI 批路径滚 3 行、单事件滚 1 行」这种只在一处生效的偏差。
+    pub fn one(up: bool) -> Self {
+        let mut delta = Self::default();
+        delta.push(up);
+        delta
+    }
+
     /// 记一次滚轮事件的方向。
     pub fn push(&mut self, up: bool) {
         if up {
@@ -211,7 +235,7 @@ impl WheelDelta {
         }
     }
 
-    /// 净滚动量（视觉行）：正 = 向上（远离底部），负 = 向下（回到贴底）。
+    /// 净滚动量（**事件数**）：正 = 向上（远离底部），负 = 向下（回到贴底）。
     ///
     /// 同向抵消后取净值 —— 一次滑动里方向来回抖（触控板常见）时，
     /// 净位移才是用户真正想要的位移。
@@ -219,9 +243,12 @@ impl WheelDelta {
         self.up as isize - self.down as isize
     }
 
-    /// 是否**没有任何**滚动。
-    pub fn is_empty(self) -> bool {
-        self.up == 0 && self.down == 0
+    /// 折算成**视觉行**的净位移 —— 正 = 向上（远离底部）。
+    ///
+    /// 这里是 [`WHEEL_ROWS`] 的**唯一**乘算点：`net()` 只数事件，换算集中在 `rows()`，
+    /// 单事件路径与批路径都读它。
+    pub fn rows(self) -> isize {
+        self.net().saturating_mul(WHEEL_ROWS)
     }
 }
 
@@ -257,7 +284,7 @@ fn scroll_clearing_selection(app: &mut App, width: u16, height: u16, delta: isiz
     scroll(app, width, height, delta);
 }
 
-/// 一批滚轮事件的滚动入口：先清选区，再按**净量**滚一次。
+/// 一批滚轮事件的滚动入口：先清选区，再按**净量 × [`WHEEL_ROWS`]** 滚一次。
 ///
 /// **为什么批内只滚一次**：`scroll` 内部要 `compute_max_scroll` ⇒ 走
 /// `layout.sync`（O(条目数)）。批内逐事件调 `scroll` 就是 8–30 次全量同步，
@@ -265,12 +292,10 @@ fn scroll_clearing_selection(app: &mut App, width: u16, height: u16, delta: isiz
 /// 逐事件累加**完全等价**（夹取是单调的）。
 ///
 /// 净量为 0（方向来回抵消）⇒ **不动视窗**（但选区仍要清：用户主动滚动了）。
+/// 单事件路径也走本函数（[`WheelDelta::one`]）—— 位移折算只有一份。
 pub(crate) fn scroll_wheel_batch(app: &mut App, width: u16, height: u16, delta: WheelDelta) {
     app.selection.clear();
-    if delta.is_empty() {
-        return;
-    }
-    let net = delta.net();
+    let net = delta.rows();
     if net == 0 {
         return;
     }
@@ -2133,16 +2158,19 @@ mod tests {
         a.history.record("旧的一次提交");
         assert_eq!(a.scroll_offset, 0);
 
-        // 向上滑：一事件 = 一视觉行，输入框与历史浏览态都不动。
+        // 向上滑：一事件 = [`WHEEL_ROWS`] 视觉行，输入框与历史浏览态都不动。
         handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 5), &mut a, 120, 40);
-        assert_eq!(a.scroll_offset, 1, "滚轮步长 = 1 视觉行");
+        assert_eq!(
+            a.scroll_offset, WHEEL_ROWS as usize,
+            "滚轮步长 = WHEEL_ROWS 视觉行"
+        );
         assert!(!a.follow, "向上滑即脱离跟随");
         assert!(a.input.text.is_empty(), "滚轮不得把历史填进输入框");
         assert!(!a.history.is_browsing(), "滚轮不进入历史浏览态");
 
-        // 再向上：逐行累加，不是整页。
+        // 再向上：按事件数线性累加，幅度仍远小于一页。
         handle_mouse(mouse(MouseEventKind::ScrollUp, 10, 5), &mut a, 120, 40);
-        assert_eq!(a.scroll_offset, 2);
+        assert_eq!(a.scroll_offset, (WHEEL_ROWS * 2) as usize);
 
         // 向下滑：回到贴底并恢复跟随。
         for _ in 0..2 {
@@ -2158,11 +2186,15 @@ mod tests {
     /// 触控板一次滑动会爆发 8–30 个 `ScrollUp`（ADR-0050 决策 2 明文：「触控板一次
     /// 滑动会被终端合批成多个事件；**按行累加才跟手**，按页会飞过头」）。
     ///
-    /// **本用例守的就是这条**：批内只取最后一个 ⇒ 一次滑动只滚 1 行 ⇒ 看起来「很慢」。
-    /// 这正是批次合并（ADR-0051 设计 §2.5）引入的副作用。
+    /// **本用例守的就是这条**：批内只取最后一个 ⇒ 一次滑动只滚 1 个事件的量 ⇒ 看起来
+    /// 「很慢」。这正是批次合并（ADR-0051 设计 §2.5）引入的副作用。
+    ///
+    /// 衰减细节：`net()` 数**事件**，`rows()` 才乘 [`WHEEL_ROWS`] —— 故 12 个事件是
+    /// 36 行，而不是 12 行。两者分开断言，才能区分「累加丢了」与「乘算丢了」。
     ///
     /// 变异：
-    /// - 把 `fold_wheel` 改成「只取最后一个」⇒ 本用例红；
+    /// - 把 `fold_wheel` 改成「只取最后一个」⇒ `net()` 变 1，本用例红；
+    /// - 把 `rows()` 的乘算删掉（返回 `net()`）⇒ 行数断言红；
     /// - 把 `scroll_wheel_batch` 改成不累加（恒 1 行）⇒ 本用例红。
     #[test]
     fn test_wheel_batch_accumulates_one_swipe_many_rows() {
@@ -2175,10 +2207,19 @@ mod tests {
             .collect();
         let delta = fold_wheel(&batch);
         assert_eq!(delta.up, 12, "批内 12 个向上事件全都要计入");
-        assert_eq!(delta.net(), 12, "净量 = 12 行");
+        assert_eq!(delta.net(), 12, "净量 = 12 个事件");
+        assert_eq!(
+            delta.rows(),
+            12 * WHEEL_ROWS,
+            "12 个事件 = 12 × WHEEL_ROWS 行"
+        );
 
         scroll_wheel_batch(&mut a, 120, 40, delta);
-        assert_eq!(a.scroll_offset, 12, "一次滑动滚 12 行，不得只滚 1 行");
+        assert_eq!(
+            a.scroll_offset,
+            (12 * WHEEL_ROWS) as usize,
+            "一次滑动滚 36 行，不得只滚 1 个事件的量"
+        );
         assert!(!a.follow, "向上滚即脱离跟随");
     }
 
@@ -2218,8 +2259,8 @@ mod tests {
         };
         let batch = vec![shifted; 5];
         let delta = fold_wheel(&batch);
-        assert!(delta.is_empty(), "`⇧` 按住的事件不计入");
-        assert_eq!(delta.net(), 0);
+        assert_eq!(delta.net(), 0, "`⇧` 按住的事件不计入");
+        assert_eq!(delta.rows(), 0, "净量为 0 个事件 ⇒ 0 视觉行");
 
         scroll_wheel_batch(&mut a, 120, 40, delta);
         assert_eq!(a.scroll_offset, 0, "`⇧`+滚轮不得改变视窗");
@@ -2274,7 +2315,10 @@ mod tests {
             120,
             40,
         );
-        assert_eq!(a.scroll_offset, 1, "鼠标事件必须进入滚动处理");
+        assert_eq!(
+            a.scroll_offset, WHEEL_ROWS as usize,
+            "鼠标事件必须进入滚动处理"
+        );
     }
 
     // -----------------------------------------------------------------------

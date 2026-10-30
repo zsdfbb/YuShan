@@ -579,7 +579,7 @@ static KEYBINDINGS: [KeyBinding; 21] = [
     },
     KeyBinding {
         keys: "滚轮 / 触控板",
-        action: "逐 1 视觉行滚动对话（不影响输入历史）",
+        action: "逐 3 视觉行滚动对话（不影响输入历史）",
         group: KeyGroup::Scroll,
         note: None,
     },
@@ -669,7 +669,7 @@ pub fn keybind_text() -> String {
 const KEY_HELP_BRIEF: &str = "键位（完整表：/keybind）：
   ↑ ↓                输入框内先按视觉行移光标；到首/末行才取历史 / 滚动对话
   PageUp / PageDown  翻页；Ctrl+↑ / Ctrl+Home 最早，Ctrl+↓ / Ctrl+End 最新
-  滚轮 / 触控板上下   逐行滚动对话（不影响输入历史）
+  滚轮 / 触控板上下   逐段滚动对话（不影响输入历史）
   Home / End         输入行首 / 行尾（Ctrl+E 也是行尾）
   Ctrl+A             全选输入框（随后 Backspace 清空）
   Ctrl+V             粘贴系统剪贴板（读不到时用终端的 Ctrl+Shift+V）

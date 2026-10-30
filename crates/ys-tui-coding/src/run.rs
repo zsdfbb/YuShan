@@ -1417,12 +1417,13 @@ mod tests {
 
     /// **整条接线：一批滚轮事件 ⇒ 一次滑动滚多行**（用户侧「滑动很慢」的回归）。
     ///
-    /// 缺陷所在正是接缝：`coalesce` 只留最后一个，下游再怎么累加也只有 1 行。
+    /// 缺陷所在正是接缝：`coalesce` 只留最后一个，下游再怎么累加也只有 1 个事件的量。
     /// 故这里把 `coalesce` → `fold_wheel` → `scroll_wheel_batch` 串起来跑一遍，
-    /// 而不是只测其中一段。
+    /// 而不是只测其中一段。断言写 `12 ×` [`events::WHEEL_ROWS`]：步长与事件数各自
+    /// 可变异（本用例同时守住两处）。
     ///
     /// 变异：
-    /// - `coalesce` 的滚轮分支改回「只留最后一个」⇒ 只滚 1 行，红；
+    /// - `coalesce` 的滚轮分支改回「只留最后一个」⇒ 只滚 1 个事件的量，红；
     /// - `handle_round` 丢掉 `wheel` 参数 ⇒ 停在 0，红。
     #[test]
     fn test_handle_round_scrolls_many_rows_per_wheel_burst() {
@@ -1454,8 +1455,17 @@ mod tests {
             &mut || None,
         );
 
-        assert_eq!(app.scroll_offset, 12, "一次滑动滚 12 行，不得只滚 1 行");
+        assert_eq!(
+            app.scroll_offset,
+            12 * ys_tui_coding_wheel_rows(),
+            "一次滑动滚 12 个事件的量，不得只滚 1 个"
+        );
         assert!(!app.follow, "向上滚即脱离跟随");
+    }
+
+    /// [`events::WHEEL_ROWS`] 的转写（`isize` → `usize`，断言用）。
+    fn ys_tui_coding_wheel_rows() -> usize {
+        crate::events::WHEEL_ROWS as usize
     }
 
     // -----------------------------------------------------------------------

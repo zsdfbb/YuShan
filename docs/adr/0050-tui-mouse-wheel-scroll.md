@@ -38,17 +38,24 @@ App Exposé，字节到不了终端），MacBook 内置键盘**没有独立的 P
   其余（`ScrollLeft` / `ScrollRight` / `Down` / `Up` / `Drag` / `Moved`）**一律忽略**。
 - `handle_event` 增加 `Event::Mouse(m) => handle_mouse(..)` 分支。
 
-### 2. 滚轮 = 逐视觉行滚聊天，与输入历史完全无关
+### 2. 滚轮 = 滚聊天，每事件 3 视觉行
 
-复用 `↑` 在「历史为空」时的回落路径（`scroll(app, width, height, ±1)`）：
+单事件位移经 `WHEEL_ROWS`（`events.rs` = 3）折算，**唯一乘算点**是
+`WheelDelta::rows()` —— 单事件路径（`handle_mouse`）与批路径（`scroll_wheel_batch`）
+都读它，故不存在「一处滚 3 行、另一处滚 1 行」的偏差。
 
 | 事件 | 行为 |
 |---|---|
-| `ScrollUp` | `scroll(.., +1)` —— 往旧内容，脱离底部即 `follow = false` |
-| `ScrollDown` | `scroll(.., -1)` —— 往新内容，回到底部即恢复 `follow = true` |
+| `ScrollUp` | 滚 +3 视觉行 —— 往旧内容，脱离底部即 `follow = false` |
+| `ScrollDown` | 滚 −3 视觉行 —— 往新内容，回到底部即恢复 `follow = true` |
 
-- **步长 = 1 视觉行**，不是 `PageUp` 的一页。`ScrollUp` / `ScrollDown` 是**离散的
-  「滚一格」**事件，触控板一次滑动会被终端合批成多个事件；按行累加才跟手，按页会飞过头。
+**为什么不是 1 行**：`ScrollUp` / `ScrollDown` 是**离散的「滚一格」**事件，触控板
+一次滑动爆发 8–30 个（见背景）。按 1 行算，整次滑动最多 30 行 —— 40 行终端上翻
+不过一屏，观感就是「滑不动」。**为什么不是一页**：按页算一次轻滑就飞过整屏。
+3 行是两头之间的取值（一事件约 1/10 屏）。
+
+- 位移在**批内只施加一次**：净量 ×3 一次性落盘 ⇒ 一次 `layout.sync`，与逐事件
+  累加等价（夹取单调）。
 - 与 `↑↓`、`PageUp` / `PageDown` 共享同一个 `scroll()` —— 夹取、`follow` 翻转、
   `max_scroll` 计算全部只有一份。
 
@@ -104,6 +111,12 @@ App Exposé，字节到不了终端），MacBook 内置键盘**没有独立的 P
 
 - 否决理由：见决策 2 的步长论证。实测触控板一次轻滑产生多个事件，按页会一次翻过整屏。
 
+### E. 维持「每事件 1 视觉行」
+
+- 否决理由：初版（2026-10-23）取值。实测触控板一次滑动 8–30 个事件 ⇒ 整次最多 30 行，
+  在 40 行终端上**翻不过一屏** —— 与后来「滑动还是很慢」的反馈一致。ADR-0051 的批次
+  合并修好了「整次只滚 1 行」，但没改这个基数。
+
 ## 风险与规避
 
 | 风险 | 规避 |
@@ -111,7 +124,7 @@ App Exposé，字节到不了终端），MacBook 内置键盘**没有独立的 P
 | 退出后鼠标捕获泄漏，拖选失效 | 进**共享**恢复序列（正常 + panic 两条路径）；`restore_sequence_contains_terminal_state_restore` 断言 `?1006l` 与 `?1000l` 都在 |
 | 滚轮未来被误接回输入历史 | `test_wheel_scrolls_chat_and_never_input_history` 的**前提是 history 非空** —— 若历史为空，滚轮行为与「`↑` 回落滚动」同形，反而抓不到这个 bug |
 | 水平滚动 / 点击被顺手绑上动作 | `test_other_mouse_events_are_ignored` 逐个事件断言视窗不动 |
-| 步长被改成整页 | 同上用例断言精确的 `+1` / `+2` / `-1` / `-2` |
+| 步长被改成整页 / 退回 1 行 | 两条用例断言精确的 `±WHEEL_ROWS` 与 `12 × WHEEL_ROWS`；后者另分断 `net()`（事件数）与 `rows()`（视觉行）⇒ 乘算丢了也红 |
 | 分派分支被 `_ => {}` 吞掉 | `test_handle_event_routes_mouse_to_scroll` 走完整 `handle_event` |
 | 模态浮层里的滚轮 | 浮层自读事件（`run.rs` 的 `Prompter` 实现），`_ => {}` 掉鼠标 —— 浮层内容不滚动，捕获开着只为不丢状态。**未做**，见 TODO |
 

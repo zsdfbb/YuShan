@@ -32,7 +32,7 @@ MUTATIONS = [
     (
         "M1 滚轮 ScrollUp 接到输入历史",
         EV,
-        "        MouseEventKind::ScrollUp => scroll_clearing_selection(app, width, height, 1),",
+        "        MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),",
         "        MouseEventKind::ScrollUp => {\n"
         "            if let Some(t) = app.history.prev(&app.input.text) {\n"
         "                app.input.clear();\n"
@@ -44,7 +44,7 @@ MUTATIONS = [
     (
         "M2 滚轮步长改成一页",
         EV,
-        "        MouseEventKind::ScrollUp => scroll_clearing_selection(app, width, height, 1),",
+        "        MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),",
         "        MouseEventKind::ScrollUp => {\n            scroll_clearing_selection(app, width, height, page_rows(app, width, height))\n        }",
         "test_wheel_scrolls_chat_and_never_input_history",
     ),
@@ -72,9 +72,16 @@ MUTATIONS = [
     (
         "M6 ScrollDown 方向反了",
         EV,
-        "        MouseEventKind::ScrollDown => scroll_clearing_selection(app, width, height, -1),",
-        "        MouseEventKind::ScrollDown => scroll_clearing_selection(app, width, height, 1),",
+        "WheelDelta::one(false)",
+        "WheelDelta::one(true)",
         "test_wheel_scrolls_chat_and_never_input_history",
+    ),
+    (
+        "M7 每事件退回到 1 视觉行（WHEEL_ROWS 失效）",
+        EV,
+        "        self.net().saturating_mul(WHEEL_ROWS)",
+        "        self.net()",
+        "test_wheel_batch_accumulates_one_swipe_many_rows",
     ),
 ]
 

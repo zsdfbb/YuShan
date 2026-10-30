@@ -34,10 +34,25 @@ pub const MAX_SUMMARY_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_DISPATCHES_PER_TURN: u32 = 16;
 /// `explore` 模式的轮数上限：调查任务到点强制交卷，返回已找到的内容。
 /// 无界探索会让墙钟被最慢的子 agent 拖死（实测 20+ 分钟）。
-pub const EXPLORE_MAX_ROUNDS: u32 = 8;
+///
+/// 取 **16** 的依据（2026-10-30 实测）：旧值 8 下，3 个「多子问题核查」子 agent
+/// **全部撞满**，而每轮只花 1.9–4.7 s ⇒ 真正的约束是轮数，不是时间。
+/// 16 轮 ≈ 30–75 s，仍远在 [`EXPLORE_WALL_CLOCK`] 内；成本增量主要是
+/// **未命中**的那部分（前缀缓存命中率实测 80–99%），远低于按无缓存估算的倍数。
+pub const EXPLORE_MAX_ROUNDS: u32 = 16;
 
 /// `explore` 模式的墙钟预算。
+///
+/// 与 [`EXPLORE_MAX_ROUNDS`] 是**或**关系：任一先到即进入收卷轮。
+/// 它约束的是「工具卡住 / 单轮特别慢」这类时间风险，而不是常规探索长度
+/// （16 轮实测只需 30–75 s）。
 pub const EXPLORE_WALL_CLOCK: Duration = Duration::from_secs(300);
+
+/// 收卷轮的独立宽限：进入收卷轮后墙钟判定再推迟这么久。
+///
+/// 收卷轮自己需要一次模型往返（实测 2–5 s）。不留宽限时，一个恰好卡在预算
+/// 到点处的收卷轮会被立刻判超时 ⇒ 白跑一趟。取 60 s：比一次往返宽裕一个量级。
+pub const EXPLORE_FINAL_REPORT_GRACE: Duration = Duration::from_secs(60);
 /// 产物保留期 —— 启动期 sweep 超过此龄的文件（只对 Primary 档）。
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// 派发工具外闸相对**子预算**的宽限：让协作路径（watchdog → 轮边界）先赢，
@@ -989,6 +1004,10 @@ impl AppSubagentRunner<'_> {
     ///
     /// `explore` 额外把轮数压到 [`EXPLORE_MAX_ROUNDS`]：调查任务必须**有界**，
     /// 到点交卷比「搜遍每个角落」更有价值。父配置更低时保留父的更低值。
+    ///
+    /// 同时给它配上**收卷轮**与墙钟：到点不是直接切断，而是让模型把已找到的东西
+    /// 整理成最终答复 —— 实测撞上限时最后一条 assistant 消息只是一句过渡语，
+    /// 真正的成果全在工具结果里，直接切断等于丢掉整个探索。
     fn child_limits_for(&self, model: Option<&str>, mode: SubagentMode) -> RunLimits {
         let mut limits = self.child_limits.clone();
         if let (Some(cfg), Some(name)) = (self.config, model) {
@@ -996,6 +1015,9 @@ impl AppSubagentRunner<'_> {
         }
         if mode == SubagentMode::Explore {
             limits.max_rounds = limits.max_rounds.min(EXPLORE_MAX_ROUNDS);
+            limits.wall_clock = Some(EXPLORE_WALL_CLOCK);
+            limits.final_report_grace = EXPLORE_FINAL_REPORT_GRACE;
+            limits.final_report_prompt = Some(EXPLORE_FINAL_REPORT_PROMPT.to_string());
         }
         limits
     }
@@ -1317,6 +1339,15 @@ fn collect_raw_tool_results(events: &[AgentEvent]) -> HashMap<ToolCallId, String
 const CHILD_TASK_SUFFIX: &str = "\n\nWhen you are done, end your reply with a `## Files` section \
      listing the files you created or changed (write `(none)` if you changed nothing).";
 
+/// `explore` 到点时的收卷提示（交给 `ys_loop` 的 `RunLimits::final_report_prompt`）。
+///
+/// 与系统提示里的 `EXPLORE_REPORT_FORMAT` 同向（先一句结论、再 `path:line — fact`），
+/// 但**必须自包含**：它是末尾追加的一条 `User` 消息，模型此刻已被探索带偏，
+/// 不能假设它还记得系统提示里的格式要求。
+///
+/// 只要求「用已有结果作答」，**不**要求它再做任何检索 —— 后者正是要停止的事。
+const EXPLORE_FINAL_REPORT_PROMPT: &str = "The exploration budget is spent.";
+
 /// 保证摘要尾部有一段**固定形状**的产物节（ADR-0022 决策 16）。
 ///
 /// 把「这一段在不在」从**子 agent 的自觉**变成 **runner 的保证**：父能可靠区分
@@ -1329,18 +1360,55 @@ fn ensure_files_section(summary: &str) -> String {
 }
 
 /// 从子会话取一段给父看的摘要（**硬截断**）。
+///
+/// 三条回退路径，按「信息密度」排序：
+/// 1. `final_message`（模型最后一次带正文的答复）—— 通常就是它整理好的报告；
+/// 2. 会话里**最后一条带正文的 assistant 消息**；
+/// 3. **工具结果**：探索形态下模型常把事实放在工具结果里、正文只写一句过渡语
+///    （实测：8 轮里只有第 1 轮有正文，而关键符号全在 `bash` 输出里）。此时不抢险
+///    就等于丢掉整场探索。
+///
+/// ⚠️ 第 2 条**必须按角色过滤**：工具结果与 `Steer` 都走 `Role::User`，不过滤就会把
+/// 用户的任务原文（或一条工具结果）当成摘要返回 —— 那比空摘要更糟，因为父 agent 会
+/// 以为子 agent 什么都没找到而重新派发。
+///
+/// 第 3 条取**最后一条**而非拼接：工具结果动辄几 KB，拼几条就撞 `MAX_SUMMARY_BYTES`，
+/// 而末尾那条往往就是模型临收卷前看的那一眼。
 fn transcript_summary(session: &MemorySession, final_message: Option<&ys_core::Message>) -> String {
     let text = final_message
         .map(text_of)
         .filter(|t| !t.trim().is_empty())
         .or_else(|| {
             session.messages().iter().rev().find_map(|m| {
+                if m.role != Role::Assistant {
+                    return None;
+                }
                 let t = text_of(m);
+                (!t.trim().is_empty()).then_some(t)
+            })
+        })
+        .or_else(|| {
+            session.messages().iter().rev().find_map(|m| {
+                let t = tool_text_of(m);
                 (!t.trim().is_empty()).then_some(t)
             })
         })
         .unwrap_or_default();
     truncate_bytes(&text, MAX_SUMMARY_BYTES)
+}
+
+/// 把一条消息里的**工具结果**拼成文本（非工具结果的消息返回空串）。
+///
+/// 与 [`text_of`] 互补：后者只认 `Text`，而探索的成果主要在 `ToolResult` 里。
+fn tool_text_of(m: &ys_core::Message) -> String {
+    m.content
+        .iter()
+        .filter_map(|b| match b {
+            ys_core::ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn text_of(m: &ys_core::Message) -> String {
@@ -1531,7 +1599,7 @@ impl Tool for SubagentTool {
                     "prompt": {"type": "string", "description": "Complete self-contained task; the sub-agent does NOT see this conversation"},
                     "model": {"type": "string", "description": "Optional model override"},
                     "mode": {"type": "string", "enum": ["general", "explore"],
-                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent one cohesive, well-scoped question and state what a complete answer looks like — open-ended audits make it explore without end."}
+                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. It has a hard budget of about 16 rounds and 300s; when either runs out it is told to stop and report what it has. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent ONE cohesive question and state what a complete answer looks like — open-ended audits make it explore without end, and a task with many sub-questions will spend its whole budget without finishing any of them."}
                 },
                 "required": ["description", "prompt"]
             }),
@@ -1627,7 +1695,7 @@ impl Tool for SubagentAsyncTool {
                     "prompt": {"type": "string", "description": "Complete self-contained task; the sub-agent does NOT see this conversation"},
                     "model": {"type": "string", "description": "Optional model override"},
                     "mode": {"type": "string", "enum": ["general", "explore"],
-                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent one cohesive, well-scoped question and state what a complete answer looks like — open-ended audits make it explore without end."}
+                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. It has a hard budget of about 16 rounds and 300s; when either runs out it is told to stop and report what it has. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent ONE cohesive question and state what a complete answer looks like — open-ended audits make it explore without end, and a task with many sub-questions will spend its whole budget without finishing any of them."}
                 },
                 "required": ["description", "prompt"]
             }),
@@ -3222,15 +3290,23 @@ mod tests {
     /// **explore 有界**：轮数压到 [`EXPLORE_MAX_ROUNDS`]，且父配置更低时听父的；
     /// `general` 保持父值逐字节不变。
     ///
-    /// 变异：① 把 `min(EXPLORE_MAX_ROUNDS)` 改成直接赋值 ⇒ 父配置 3 的断言变红；
-    ///       ② 删掉 `Explore` 分支 ⇒ explore 轮数回到父值 10，变红；
-    ///       ③ 把 cap 套到所有 mode ⇒ `general` 断言变红（general 语义被改动）。
+    /// 父值刻意取**大于**常量的数：这样「取 `min`」与「直接赋值」才可区分。
+    /// 父值若小于常量，两种实现给出同一个数 ⇒ 断言失去鉴别力。
+    ///
+    /// ⚠️ **断言用字面量而非 `EXPLORE_MAX_ROUNDS`**：写成常量会让测试随常量一起变，
+    /// 于是「把 16 改回 8」这类改动静默通过。预算是产品决策，改它必须显式改测试。
+    ///
+    /// 变异：① 把 `min(EXPLORE_MAX_ROUNDS)` 改成直接赋值 ⇒ explore 断言变红；
+    ///       ② 删掉 `Explore` 分支 ⇒ explore 轮数回到父值 40，变红；
+    ///       ③ 把 cap 套到所有 mode ⇒ `general` 断言变红（general 语义被改动）；
+    ///       ④ 把常量改回 8 ⇒ explore 断言变红。
     #[test]
     fn explore_child_limits_cap_rounds_but_general_is_unchanged() {
         let base = unique_subagent_test_dir("explore_rounds");
         let dir = Arc::new(SubagentsDir::at(base.join("subagents"), false));
         let mut limits = RunLimits::default();
-        limits.max_rounds = 10;
+        // 必须 > explore 上限，否则 `min` 与直接赋值不可区分。
+        limits.max_rounds = 40;
         limits.context_window = 200_000;
 
         let runner = test_runner(RecordingModel::new("m"), &base, dir, limits.clone());
@@ -3239,22 +3315,48 @@ mod tests {
             runner
                 .child_limits_for(None, SubagentMode::Explore)
                 .max_rounds,
-            EXPLORE_MAX_ROUNDS,
-            "不指定模型时 explore 轮数也必须有界"
+            16,
+            "不指定模型时 explore 轮数也必须有界（锚点：预算 16 轮）"
         );
         assert_eq!(
             runner
                 .child_limits_for(Some("any-model"), SubagentMode::Explore)
                 .max_rounds,
-            EXPLORE_MAX_ROUNDS,
-            "指定模型时 explore 轮数也必须有界"
+            16,
+            "指定模型时 explore 轮数也必须有界（锚点：预算 16 轮）"
         );
 
         let general = runner.child_limits_for(None, SubagentMode::General);
-        assert_eq!(general.max_rounds, 10, "general 必须保留父的轮数配置");
+        assert_eq!(general.max_rounds, 40, "general 必须保留父的轮数配置");
         assert_eq!(
             general.context_window, 200_000,
             "general 的其余字段必须逐字沿用父值"
+        );
+
+        // explore 必须**同时**配上收卷轮与墙钟：撞上限时让模型整理已有结果，
+        // 而不是直接切断（切断会丢掉整场探索 —— 实测最后一条 assistant 消息
+        // 往往只是一句过渡语）。
+        let explore = runner.child_limits_for(None, SubagentMode::Explore);
+        assert_eq!(
+            explore.wall_clock,
+            Some(EXPLORE_WALL_CLOCK),
+            "explore 必须带墙钟预算"
+        );
+        assert_eq!(
+            explore.final_report_prompt.as_deref(),
+            Some(EXPLORE_FINAL_REPORT_PROMPT),
+            "explore 必须带收卷提示"
+        );
+        assert_eq!(
+            explore.final_report_grace, EXPLORE_FINAL_REPORT_GRACE,
+            "explore 必须给收卷轮留宽限，否则临界点进入的收卷轮会白跑"
+        );
+
+        // general **不得**继承这三项：那是 explore 的有界语义，不是通用行为。
+        assert_eq!(general.wall_clock, None, "general 不得被加上墙钟预算");
+        assert_eq!(
+            general.final_report_prompt, None,
+            "general 不得被加上收卷提示"
         );
 
         // 父配置更紧时，explore 不得把轮数**放大**。
@@ -3745,5 +3847,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+    /// 摘要抢救的三条回退路径，按信息密度排序。
+    ///
+    /// 变异：删掉第三条（工具结果）⇒ 本用例第一个断言变红 —— 那正是实测里
+    /// 「8 轮只有第 1 轮有正文、关键符号全在工具结果里」的形态，删掉等于丢掉整场探索。
+    #[tokio::test]
+    async fn transcript_summary_falls_back_to_tool_results() {
+        use ys_core::{ContentBlock, Message, Role, ToolCallId};
+
+        fn text_msg(role: Role, text: &str) -> Message {
+            Message {
+                role,
+                content: vec![ContentBlock::Text { text: text.into() }],
+            }
+        }
+        fn tool_msg(content: &str) -> Message {
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_call_id: ToolCallId("t1".into()),
+                    content: content.into(),
+                    is_error: false,
+                }],
+            }
+        }
+
+        // ① `final_message` 优先：它就是模型整理好的报告。
+        let mut session = MemorySession::new();
+        session.append(text_msg(Role::User, "task")).await.unwrap();
+        session
+            .append(tool_msg("FINDING: a.rs:1 — x"))
+            .await
+            .unwrap();
+        let final_msg = text_msg(Role::Assistant, "REPORT");
+        assert_eq!(
+            transcript_summary(&session, Some(&final_msg)),
+            "REPORT",
+            "有 final_message 时直接用它"
+        );
+
+        // ② 无 final_message ⇒ 会话里最后一条带正文的 assistant 消息。
+        session
+            .append(text_msg(Role::Assistant, "EARLIER TEXT"))
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript_summary(&session, None),
+            "EARLIER TEXT",
+            "无 final_message 时回退到最后一条正文"
+        );
+
+        // ③ 只有工具结果（正文全空）⇒ 必须从工具结果里抢救，而不是返回空串。
+        //    这正是「撞轮数上限」的典型形态。
+        let mut silent = MemorySession::new();
+        silent.append(text_msg(Role::User, "task")).await.unwrap();
+        silent
+            .append(tool_msg("FINDING: a.rs:1 — x"))
+            .await
+            .unwrap();
+        let rescued = transcript_summary(&silent, None);
+        assert!(
+            rescued.contains("FINDING: a.rs:1 — x"),
+            "无正文时必须从工具结果抢救；实际 {rescued:?}"
+        );
     }
 }

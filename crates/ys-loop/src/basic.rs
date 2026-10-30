@@ -1,11 +1,10 @@
-use std::collections::HashMap;
-use std::time::Duration;
-
 use super::{AgentInput, AgentLoop, LoopError, ModelSummarizer, RunResult};
 use crate::compact;
 use crate::turn_budget;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use ys_component::RuntimeContext;
 use ys_core::{
     ContentBlock, Message, Role, StopReason, ThinkingOverride, ToolResult as CoreToolResult, Usage,
@@ -114,6 +113,43 @@ fn advance_batch_nudge(
 fn tool_budget(tool: &dyn Tool, limits: &ys_component::RunLimits) -> Duration {
     tool.timeout()
         .unwrap_or_else(|| Duration::from_secs(limits.bash_timeout.unwrap_or(300)))
+}
+
+/// 收卷轮的触发原因。
+///
+/// 两者都是「到点」：轮数约束 token 成本，墙钟约束时间风险（工具卡住、单轮特别慢）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalReportCause {
+    /// 撞 `max_rounds`。
+    MaxRounds,
+    /// 撞 `wall_clock`。
+    WallClock,
+}
+
+/// 判定本回合是否**到点**（轮数 / 墙钟）。
+///
+/// 返回 `None` = 正常跑下一轮；`Some(cause)` = 已到点。
+///
+/// ⚠️ **本函数与 `final_report_prompt` 无关**：到点与否是硬事实，而「到点后
+/// 是收卷还是直接切断」是调用点的策略。两者合并写会把「未配提示词 ⇒ 不判上限」
+/// 当成副作用 —— 那会让 `max_rounds` 对未配置的调用方完全失效（回合永不结束）。
+fn deadline_reached(
+    limits: &ys_component::RunLimits,
+    rounds: u32,
+    elapsed: Duration,
+) -> Option<FinalReportCause> {
+    // 轮数先判：两者同时到点时，`MaxRounds` 是更贴切的归因（它才是硬上限）。
+    if rounds >= limits.max_rounds {
+        return Some(FinalReportCause::MaxRounds);
+    }
+    match limits.wall_clock {
+        // `final_report_grace` 是**给收卷轮自己的**宽限：进入收卷轮后墙钟判定推迟
+        // 这么多，否则一个在预算到点前一瞬进入的收卷轮会立刻被判超时、白跑一趟。
+        Some(budget) if elapsed >= budget + limits.final_report_grace => {
+            Some(FinalReportCause::WallClock)
+        }
+        _ => None,
+    }
 }
 
 /// 轮边界拉取的**结果**。
@@ -497,6 +533,14 @@ impl AgentLoop for BasicLoop {
         // 模型无限续写只会空烧 token，故以一次性标志封顶；仍被截断就如实收场。
         let mut truncated_continued = false;
 
+        // 收卷轮状态：`None` = 尚未进入；`Some(reason)` = 本回合已经/正在跑收卷轮。
+        //
+        // **只进一次**：收卷轮保留原工具表（不破前缀缓存），模型仍可能发起工具调用
+        // ⇒ 若无此一次性闸，上限就形同虚设。收卷轮之后无论有无工具调用都强制收场。
+        let mut final_report: Option<FinalReportCause> = None;
+        // 墙钟起点：回合开始处取一次，之后只读。`wall_clock: None` 时永不使用。
+        let turn_started = Instant::now();
+
         // 「闷头干活」计数：本回合**连续**多少次工具调用而模型未输出正文。
         //
         // 必须由 harness 数：模型看不到自己的累计调用次数，把它写进系统提示词无效
@@ -591,26 +635,49 @@ impl AgentLoop for BasicLoop {
                 });
             }
 
-            // Step 4：在调用 model 之前检查最大 round 数
-            if rounds >= ctx.limits.max_rounds {
-                emit(
-                    ctx.events,
-                    AgentEvent::RunFinished {
-                        stop_reason: StopReason::MaxRounds,
-                        usage: total_usage.clone(),
+            // Step 4：到点检查（轮数 / 墙钟）。
+            //
+            // 三条路径，按顺序：
+            // 1. **已在收卷轮里** ⇒ 无条件收场。收卷轮保留原工具表以不破前缀缓存，
+            //    模型仍可能发起工具调用；若无这道一次性闸，上限就形同虚设。
+            // 2. **未到点** ⇒ 正常跑下一轮。
+            // 3. **首次到点**：配了 `final_report_prompt` ⇒ 本轮转为收卷轮；
+            //    未配（库默认）⇒ **原样切断**，行为与改动前逐字节一致。
+            let reached = final_report
+                .or_else(|| deadline_reached(&ctx.limits, rounds, turn_started.elapsed()));
+            if let Some(cause) = reached {
+                // 1 或 3-未配：直接收场。只有「首次到点 **且** 配了提示词」才放行。
+                let enter_final_report =
+                    final_report.is_none() && ctx.limits.final_report_prompt.is_some();
+                if !enter_final_report {
+                    let stop_reason = match cause {
+                        FinalReportCause::MaxRounds => StopReason::MaxRounds,
+                        // 墙钟到点不是「故障」，但也不是用户取消 —— 沿用 `MaxRounds`
+                        // 会把归因说错。本仓无专门的预算变体，故取 `Cancelled`（与子 agent
+                        // 的 watchdog 同一口径：预算到点 = 取消）。
+                        FinalReportCause::WallClock => StopReason::Cancelled,
+                    };
+                    emit(
+                        ctx.events,
+                        AgentEvent::RunFinished {
+                            stop_reason: stop_reason.clone(),
+                            usage: total_usage.clone(),
+                            rounds,
+                        },
+                    )
+                    .await
+                    .map_err(LoopError::Event)?;
+                    return Ok(RunResult {
+                        stop_reason,
+                        usage: total_usage,
+                        cache_reading,
+                        compaction_usage: compaction_usage.clone(),
                         rounds,
-                    },
-                )
-                .await
-                .map_err(LoopError::Event)?;
-                return Ok(RunResult {
-                    stop_reason: StopReason::MaxRounds,
-                    usage: total_usage,
-                    cache_reading,
-                    compaction_usage: compaction_usage.clone(),
-                    rounds,
-                    final_message: None,
-                });
+                        final_message: None,
+                    });
+                }
+                // 首次到点 ⇒ 本轮转为收卷轮，往下走正常的请求组装。
+                final_report = Some(cause);
             }
 
             // Step 4b：上下文压缩检查（T11e）—— 算法本体在 `crate::compact`（ADR-0017 决策 1）。
@@ -709,7 +776,33 @@ impl AgentLoop for BasicLoop {
             // 优先级固定 `narration > A4 > A6`，**每轮至多一条**；未选中的标志保留到
             // 下一轮（不清零）—— 同时发三条会浪费 token 且互相稀释。
             let mut request_messages = ctx.session.messages().to_vec();
-            if narration_nudge {
+            // 收卷轮指令**优先级最高**：它要模型停止取数、把已有结果写成最终答复。
+            // 与三条提醒同形（保留 tools、末尾追加一条 `User`）—— 前缀逐字不变 ⇒ 命中缓存。
+            // 同时把三条提醒全部作废：收卷轮里它们只会与「现在交卷」互相稀释。
+            if let Some(cause) = final_report {
+                let hint = match cause {
+                    FinalReportCause::MaxRounds => "the round budget for this task is exhausted",
+                    FinalReportCause::WallClock => "the time budget for this task is exhausted",
+                };
+                request_messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: format!(
+                            "{}\n\nHarness hint: {hint}. Stop investigating now — do not call any \
+                             more tools. Report what you already found: answer the question first, \
+                             then list the concrete findings you have (file:line and the fact), and \
+                             name anything you could not confirm. This is your final answer.",
+                            ctx.limits
+                                .final_report_prompt
+                                .as_deref()
+                                .unwrap_or_default()
+                        ),
+                    }],
+                });
+                narration_nudge = false;
+                batch_nudge = false;
+                soft_round_advice = false;
+            } else if narration_nudge {
                 request_messages.push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
@@ -6086,6 +6179,279 @@ mod tests {
             model.sampled().iter().all(|p| !p.soft_round),
             "阈值 0 必须完全关闭 A6；实际 {:?}",
             model.sampled()
+        );
+    }
+
+    // ── 收卷轮（`final_report_prompt`） ─────────────────────────────
+
+    /// 探针：记录每轮请求里是否带收卷指令、是否仍带着工具表。
+    struct FinalReportProbeModel {
+        /// 前多少轮只发工具调用（不发正文）。
+        tool_rounds: usize,
+        round: AtomicUsize,
+        /// 每次请求：`(带收卷指令, 工具表非空)`。
+        sampled: Mutex<Vec<(bool, bool)>>,
+    }
+
+    /// 请求次数硬上限：越过即 panic。
+    ///
+    /// 存在的理由：本探针恒发工具调用，若上限判定失效（例如删掉收卷轮的一次性闸），
+    /// 回合就是**忙循环** —— 外部 `tokio::time::timeout` 抓不住它（future 从不 `Pending`），
+    /// 表现为整个测试进程挂住而不是变红。故计数必须在这里做。
+    const FINAL_REPORT_PROBE_MAX_CALLS: usize = 64;
+
+    impl FinalReportProbeModel {
+        fn new(tool_rounds: usize) -> Self {
+            Self {
+                tool_rounds,
+                round: AtomicUsize::new(0),
+                sampled: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sampled(&self) -> Vec<(bool, bool)> {
+            self.sampled.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for FinalReportProbeModel {
+        fn model_id(&self) -> &str {
+            "final-report-probe"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            // 收卷指令是**拼接文本**（提示词 + 固定尾句），故用 `contains` 而非
+            // `contains_prompt` 的精确相等匹配。
+            self.sampled.lock().unwrap().push((
+                request.messages.iter().any(|m| {
+                    m.content.iter().any(|b| {
+                        matches!(b, ContentBlock::Text { text } if text.contains(FINAL_REPORT_SENTINEL))
+                    })
+                }),
+                !request.tools.is_empty(),
+            ));
+
+            let round = self.round.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                round < FINAL_REPORT_PROBE_MAX_CALLS,
+                "回合跑了 {} 轮仍未收场 —— 到点判定失效（忙循环，超时抓不住）",
+                FINAL_REPORT_PROBE_MAX_CALLS
+            );
+            if round < self.tool_rounds {
+                return Ok(ys_model::ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ys_core::ToolCallId(format!("f{round}")),
+                            name: "noop".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                });
+            }
+            Ok(ys_model::ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "report".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// 收卷指令的**可识别前缀**（与 `final_report_prompt` 的取值一致）。
+    const FINAL_REPORT_SENTINEL: &str = "WRAP_UP_SENTINEL";
+
+    /// 跑一个回合。**挂起保护在探针里**（见 [`FinalReportProbeModel::complete`]）。
+    ///
+    /// 不能用 `tokio::time::timeout` 兜底：本探针的 `complete` 立即返回 `Ready`，
+    /// 回合一旦永不收场就是个**忙循环** —— future 从不 `Pending`，定时器永远得不到
+    /// 一次 poll，超时不会触发。故上限必须由探针自己数。
+    async fn run_final_report(
+        model: &FinalReportProbeModel,
+        limits: RunLimits,
+    ) -> (MemorySession, CollectingSink) {
+        let registry = ToolRegistry::build(vec![Box::new(NoopTool) as Box<dyn Tool>]).unwrap();
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(model, &registry, &mut session, &mut events, limits);
+            let _ = BasicLoop.run_turn(AgentInput::text("go"), &mut ctx).await;
+        }
+        (session, events)
+    }
+
+    /// 未配置 `final_report_prompt` ⇒ **原样切断**：不额外跑一轮，收场 `MaxRounds`。
+    ///
+    /// 这是**回归守卫**：收卷轮特性不得改变未启用它的调用方的行为。
+    /// 变异：把 Step 4 的 `enter_final_report` 判定删掉（无条件进入收卷轮）
+    /// ⇒ 请求数变成 3 且会注入空提示词。
+    #[tokio::test]
+    async fn final_report_is_off_by_default() {
+        let model = FinalReportProbeModel::new(usize::MAX);
+        let (_, events) = run_final_report(&model, RunLimits::new(2)).await;
+
+        assert_eq!(model.sampled().len(), 2, "max_rounds=2 ⇒ 恰好 2 次请求");
+        assert!(
+            model.sampled().iter().all(|(hint, _)| !*hint),
+            "默认不得注入收卷指令；实际 {:?}",
+            model.sampled()
+        );
+        let finished = events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RunFinished { stop_reason, .. } => Some(stop_reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished, vec![StopReason::MaxRounds]);
+    }
+
+    /// 配置了收卷提示 ⇒ 到点**多跑一轮**并注入指令，且该轮**保留工具表**（不破前缀缓存）。
+    ///
+    /// 变异：① 删掉 Step 5 的收卷注入 ⇒ `hint` 全 false；
+    ///       ② 把收卷轮改成空工具表 ⇒ 第二列变 false（前缀缓存会被打掉）；
+    ///       ③ 去掉「只给一次」的一次性闸 ⇒ 请求数变成 4（收卷轮又调了工具）。
+    #[tokio::test]
+    async fn final_report_runs_once_and_keeps_tools() {
+        let model = FinalReportProbeModel::new(usize::MAX);
+        let mut limits = RunLimits::new(2);
+        limits.final_report_prompt = Some(FINAL_REPORT_SENTINEL.to_string());
+        let (_, events) = run_final_report(&model, limits).await;
+
+        let sampled = model.sampled();
+        assert_eq!(sampled.len(), 3, "2 轮 + 1 轮收卷；实际 {sampled:?}");
+        assert_eq!(
+            &sampled[0..2],
+            &[(false, true), (false, true)],
+            "前两轮不带收卷指令；实际 {sampled:?}"
+        );
+        assert_eq!(
+            sampled[2],
+            (true, true),
+            "第 3 轮必须带收卷指令**且保留工具表**（空表会破前缀缓存）；实际 {sampled:?}"
+        );
+
+        // 收卷轮之后必须真的收场，不能因为模型又调了工具而无限续。
+        let finished = events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RunFinished { stop_reason, .. } => Some(stop_reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished, vec![StopReason::MaxRounds]);
+    }
+
+    /// 收卷轮**只给一次**：模型在收卷轮里又发起工具调用，也必须强制收场。
+    ///
+    /// 变异：把 Step 4 的 `if final_report.is_some()` 分支删掉 ⇒ 本用例超时 / 请求数暴涨。
+    #[tokio::test]
+    async fn final_report_gives_up_after_one_round_even_if_model_calls_tools() {
+        // 永远发工具调用：若不设一次性闸，回合永远不会结束。
+        let model = FinalReportProbeModel::new(usize::MAX);
+        let mut limits = RunLimits::new(1);
+        limits.final_report_prompt = Some(FINAL_REPORT_SENTINEL.to_string());
+        let (_, events) = run_final_report(&model, limits).await;
+
+        assert_eq!(
+            model.sampled().len(),
+            2,
+            "1 轮 + 1 轮收卷后必须收场；实际 {:?}",
+            model.sampled()
+        );
+        assert!(model.sampled()[1].0, "第 2 轮是收卷轮");
+        let finished = events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RunFinished { stop_reason, .. } => Some(stop_reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished, vec![StopReason::MaxRounds]);
+    }
+
+    /// 墙钟到点同样触发收卷轮，且收场归因为 `Cancelled`（预算到点 = 取消，不是故障）。
+    #[tokio::test]
+    async fn wall_clock_triggers_final_report() {
+        let model = FinalReportProbeModel::new(usize::MAX);
+        let mut limits = RunLimits::new(u32::MAX);
+        limits.final_report_prompt = Some(FINAL_REPORT_SENTINEL.to_string());
+        // 零预算 ⇒ 第 1 轮就到点（不必真的等）。
+        limits.wall_clock = Some(Duration::ZERO);
+        let (_, events) = run_final_report(&model, limits).await;
+
+        let sampled = model.sampled();
+        assert_eq!(sampled.len(), 1, "首轮即为收卷轮；实际 {sampled:?}");
+        assert_eq!(sampled[0], (true, true), "收卷轮带指令且保留工具表");
+        let finished = events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RunFinished { stop_reason, .. } => Some(stop_reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished, vec![StopReason::Cancelled]);
+    }
+
+    /// `deadline_reached` 的纯逻辑：**与是否配提示词无关**；轮数先于墙钟归因。
+    ///
+    /// ⚠️ 这条「与提示词无关」是**承重**的：曾把「未配提示词」写成该函数的早退，
+    /// 后果是 `max_rounds` 对未配置的调用方**完全失效**（回合永不结束）。
+    /// 「到点后是收卷还是切断」属于调用点策略，不属本函数。
+    ///
+    /// 变异：把 `if limits.final_report_prompt.is_none() { return None; }` 加回来
+    /// ⇒ 第一个断言变红（配不配提示词都该到点）。
+    #[test]
+    fn deadline_reached_prefers_max_rounds() {
+        let mut limits = RunLimits::new(5);
+        assert_eq!(
+            deadline_reached(&limits, 99, Duration::from_secs(99)),
+            Some(FinalReportCause::MaxRounds),
+            "未配置收卷提示时，轮数上限照样必须到点（否则 max_rounds 失效）"
+        );
+        assert_eq!(
+            deadline_reached(&limits, 0, Duration::from_secs(99)),
+            None,
+            "未配墙钟 ⇒ 时间不参与判定"
+        );
+
+        limits.final_report_prompt = Some("x".into());
+        limits.wall_clock = Some(Duration::from_secs(10));
+        assert_eq!(deadline_reached(&limits, 4, Duration::from_secs(9)), None);
+        assert_eq!(
+            deadline_reached(&limits, 5, Duration::from_secs(9)),
+            Some(FinalReportCause::MaxRounds)
+        );
+        assert_eq!(
+            deadline_reached(&limits, 1, Duration::from_secs(10)),
+            Some(FinalReportCause::WallClock)
+        );
+        // 两者同时到点 ⇒ 归因为轮数（硬上限更贴切）。
+        assert_eq!(
+            deadline_reached(&limits, 5, Duration::from_secs(10)),
+            Some(FinalReportCause::MaxRounds)
+        );
+        // 宽限把墙钟判定整体推迟。
+        limits.final_report_grace = Duration::from_secs(5);
+        assert_eq!(deadline_reached(&limits, 1, Duration::from_secs(14)), None);
+        assert_eq!(
+            deadline_reached(&limits, 1, Duration::from_secs(15)),
+            Some(FinalReportCause::WallClock)
         );
     }
 }

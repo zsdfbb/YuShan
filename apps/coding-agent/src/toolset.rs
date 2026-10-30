@@ -706,8 +706,12 @@ mod tests {
         );
         // 父表指纹锚：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent` / `subagent_async`）。
         // `fp_tools` 只覆盖子表，追加段工具的 schema 漂移在它那里是静默的 —— 这里补上。
+        //
+        // 2026-10-30 漂移：`subagent` / `subagent_async` 的 `mode` 描述写明「约 16 轮 / 300s」
+        // 硬预算（旧描述不提预算，模型无从据此控制问题粒度）。`fp_tools` 未变 ——
+        // 那两项在追加段，不在基础 9 元表里。
         assert_eq!(
-            fp_parent, 0x83800653804a04eeu64,
+            fp_parent, 0x76e0bbd866bc74b8u64,
             "父表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
 

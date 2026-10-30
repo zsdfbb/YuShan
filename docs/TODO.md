@@ -49,7 +49,8 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 | 缺什么 | 状态依据（核实于 `39f4f95`） |
 |---|---|
-| 角色概念 / 只读开关 | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（`apps/coding-agent/src/toolset.rs:517`、`apps/coding-agent/src/prompt.rs:782` 的 `read_only` 命中是**并发安全**测试名，非角色定义） |
+| 多角色定义（frontmatter / 配置） | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（2026-10-30 重核）。**但「角色概念」本身已部分落地**：`SubagentMode { General, Explore }` 已是公开类型（`crates/ys-tool/src/subagent.rs:18`），`Explore` 由工具表过滤实现（`apps/coding-agent/src/subagent.rs:1060` `child_tools` 按名字去掉 `write` / `edit`）。缺的是**第三个角色**与**配置驱动**，不是「只读」这件事 |
+| ~~「只读开关」零命中~~ | 旧依据 `toolset.rs:517` / `prompt.rs:782` **已失效**（2026-10-30 重核：前者现在是 `only_read_only_tools_are_concurrency_safe` 的文档注释、后者是 `tool_list_is_derived_from_specs_order_verbatim`；现存的 `read_only` 用例是 `prompt.rs:997`）。该依据曾把 explore 的落地读成「零命中」，误判过一项状态 |
 | `build_tools` 无法按角色换表 | 签名零策略参数（`apps/coding-agent/src/toolset.rs:88`）；生产路径全仓**仅两处**构建工具表：装配期 `apps/coding-agent/src/assembly.rs:143`（子表）与派发期 `apps/coding-agent/src/subagent.rs:980`（每次派发重建） |
 
 > ⚠️ **落地约束**：不可把角色做成 `subagent` 工具入参 —— 那会改 `ToolSpec`，动
@@ -231,3 +232,5 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   `docs/arch/coding-agent/adr-0005-infrastructure-approach.md`）。需确认 `0006` 是历史沿革还是遗漏。
 - **`docs/arch/tui-turn-spacing/` 已实施但未归档**：代码在
   `crates/ys-tui-coding/src/draw.rs:61`（`USER_GAP_ROWS = 2`），文档停在 `context.md`。
+
+

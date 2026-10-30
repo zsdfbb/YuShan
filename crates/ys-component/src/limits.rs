@@ -167,6 +167,40 @@ pub struct RunLimits {
     /// 每回合重置，触发后阈值 ×2；不产生事件、不落 session、不中断回合。
     /// 默认 `0` = 关闭（**核心默认**）。app 默认 [`DEFAULT_SOFT_ROUND_ADVICE_AT`]。
     pub soft_round_advice_at: usize,
+    /// **收卷轮提示词**：到点（轮数或墙钟）时，用**同一条工具表**再跑一次模型，
+    /// 让它把已找到的东西整理成最终答复，而不是直接切断。
+    ///
+    /// # 为何不是「空工具表」
+    ///
+    /// 本仓的摘要请求用空 `tools`（`ys-loop` 的 `compact`），那是**有意的** ——
+    /// 它本就不指望继承主调用的前缀缓存。但收卷轮**恰恰要**继承：`tools` 处在请求
+    /// 最前面，一变即整段前缀失效，一次收卷会把几十万 token 按全价重算。
+    /// 故此处保留原工具表、只在消息末尾追加一条 `User` 指令 —— 与
+    /// [`narration_silence_tool_calls`](Self::narration_silence_tool_calls) / A4 / A6
+    /// 三条提醒同构（见 `ys-loop` 的 `basic.rs` 提醒注入段）。
+    ///
+    /// # 代价与边界
+    ///
+    /// - 多**一次**模型往返，仅当回合真的撞到上限才发生；不撞上限零成本。
+    /// - 只给**一次**机会：收卷轮之后无论模型是否又发起工具调用，都强制收场
+    ///   （否则「保留 tools」会让上限形同虚设）。
+    /// - `None`（默认）= 保持原行为：到点直接以 `MaxRounds` / `Cancelled` 收场。
+    pub final_report_prompt: Option<String>,
+    /// **墙钟预算**（收卷轮之前）。从回合开始计，超时即进入收卷轮。
+    ///
+    /// 与 [`max_rounds`](Self::max_rounds) 是**或**关系：任一先到即收卷。
+    /// 两者都存在是因为它们约束的东西不同 —— 轮数约束 token 成本，墙钟约束
+    /// 「工具卡住 / 单轮特别慢」这类时间风险。
+    ///
+    /// 默认 `None` = 不约束（既有行为逐字节不变）。
+    pub wall_clock: Option<Duration>,
+    /// **收卷轮的独立宽限**：进入收卷轮后，墙钟预算再放宽这么多。
+    ///
+    /// 存在的理由：收卷轮本身要一次模型往返。若不留宽限，一个恰好在预算到点
+    /// 前一瞬进入的收卷轮会立刻被下一轮检查判为超时 ⇒ 收卷轮白跑。
+    ///
+    /// 默认 `Duration::ZERO` ⇒ 无宽限（配 `wall_clock: None` 时完全无影响）。
+    pub final_report_grace: Duration,
 }
 
 impl RunLimits {
@@ -206,6 +240,12 @@ impl Default for RunLimits {
             batch_nudge_at_tool_calls: 0,
             // 0 = 关闭（核心默认）⇒ 老调用方逐字节不变；app 侧显式设 60。
             soft_round_advice_at: 0,
+            // None = 到点直接收场（既有行为逐字节不变）；app 侧给子 agent 设 Some。
+            final_report_prompt: None,
+            // None = 不约束墙钟；既有行为逐字节不变。
+            wall_clock: None,
+            // ZERO = 无宽限；配 `wall_clock: None` 时完全无影响。
+            final_report_grace: Duration::ZERO,
         }
     }
 }

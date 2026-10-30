@@ -5,6 +5,12 @@
 > `docs/exec-plans/completed/2026-10-13-turn-budget-and-retry.md`。
 > 日期：2026-10-13 ｜ 基线 `fece752`（本轮改动在其上，尚未 commit）。
 
+> **本期变更（2026-10-29，A5）**：回合级预算现由**有效窗口**派生 ——
+> `resolve_limits` 设 `max_turn_tool_result_tokens = effective_context_window() / 4`
+> （200k ⇒ **50k**；`apps/coding-agent/src/main.rs`）。该值**只在 `resolve_limits` 算一次**：
+> 运行中 `/model` 换模型时 `set_context_window` 只刷新窗口，**不重算**本值。
+> 详见 `docs/design-final/task-latency-levers.md` §A5。
+
 ## 一句话
 
 第一批把「**单条**工具结果规模」收进边界、让「空产出」可见；第二批收两个尾：**回合级工具输出总量闸门**（一个回合内**多条**结果不再累积放大——超预算时降级**更早**的结果为「头部 + 续读指针」，最新一条保留）与**空响应重试一次**（只有思考、没有正文/工具调用时先催一句，仍空才如实判 `NoOutput`），并补一条「过程叙述」guideline。

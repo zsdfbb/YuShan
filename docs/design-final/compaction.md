@@ -5,6 +5,12 @@
 > 质量分析见 `docs/arch/skills-and-compaction/review.md`。
 > 日期：2026-09-19
 
+> **本期变更（2026-10-29，A5）**：窗口入口改为**有效窗口**
+> `Config::effective_context_window() = min(声明, context_cap_tokens)`，默认 cap **200_000**、
+> `0` = 不封顶（`apps/coding-agent/src/config.rs`）。`trigger_at` / `keep_budget` 的公式与
+> `CompactPolicy` 一行未改，二者随窗口一起下移（200k ⇒ 触发 170k、保留 20k）。
+> 生产调用点见 `docs/design-final/task-latency-levers.md` §A5。
+
 ## 一句话
 
 压缩从 `BasicLoop` 里的**无名副作用**变成 `ys-loop::compact` 的显式两步

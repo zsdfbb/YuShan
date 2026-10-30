@@ -1567,6 +1567,11 @@ Chat / Input / Status 三块。`ui_with` 已切出 `chunks[]`，故高亮层**�
 
 - `/model` 的输出追加一行 `Context window: <值> (source: <标签>)`
   （`apps/coding-agent/src/capabilities.rs:279`）；走 `Outbound::Output` → transcript，**绝不 print**。
+- **`/status` 的 context 行同口径（2026-10-29，A5）**：`CodingView.context_window` 是
+  **effective**（封顶后的值）、`context_window_declared` 是声明值；两者都存在且不等时渲染
+  `200k / 1M (capped)`，相等或 declared 缺失时逐字节退回单值原样
+  （`crates/ys-tui-coding/src/commands.rs` 的 `status_text`）。`format_context_window` 的
+  k / M 档均为**截断**（`999_999` ⇒ `999k`）。详见 `docs/design-final/task-latency-levers.md` §A5。
 - 内建兜底表是**精确匹配**，只收录 `MiniMax-M3` / `MiniMax-M2.7`；其余模型落 ④。
   用户级覆盖的 JSON 键是 `context_window`（内部字段名才叫 `windows`，
   `apps/coding-agent/src/config.rs:31`）。

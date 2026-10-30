@@ -73,6 +73,22 @@ SSE 尾包 usage
   └─ /status crates/ys-tui-coding/src/commands.rs:742-797
 ```
 
+## 回合级读数记录：`run_reading`（2026-10-29，A1）
+
+debug 日志新增一条**段记录** `ev="run_reading"`，每回合一条、随回合收尾产生：
+
+- **载荷**：`line`（人读的定形行，与 `-p` / TUI 的文本出口同一串）+ 顶层结构化数字字段
+  `turn / rounds / tools / tpr_x100 / ttft_ms / gen_ms / tools_ms / input_med`；
+  `cache_pct` 只在 `line` 里（它可能是 `n/a`，不是数字）。
+- **落点**：`apps/coding-agent/src/main.rs` 的 `record_run_reading[_fields]`；
+  TUI 路径（`app_loop.rs`）只拿到文本，故从 `line` 反解数字字段，键顺序与
+  `RoundClock::summary_fields` 一致。
+- **消费者**：`e2e_bench` 的 `Reading` 从中取 `tpr_x100` / `input_med`；`single_call_rounds`
+  由同份 debug 的 `round_end.tool_calls == 1` 兜底派生（生产记录不写该键）。
+- **允许名单**：`tests/debug_log.rs` 的段记录白名单已加入 `run_reading`（它随回合收尾产生，
+  不是逐增量事件）。
+- 逐轮 `round_end` 的既有字段（`ttft_ms` / `gen_ms` / `tools_ms` / `tool_calls` 等）不变。
+
 ## 三个用途的归因
 
 | 用途 | 落在哪 | 是否计入 `RunFinished.usage` | 记账点 |

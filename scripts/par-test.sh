@@ -65,16 +65,27 @@ cd "$(dirname "$0")/.." || exit 1
 WORK="${TMPDIR:-/tmp}"
 EXES="$WORK/yushan-par-test-exes.$$"
 FAILED="$WORK/yushan-par-test-failed.$$"
+BUILD_OUT="$WORK/yushan-par-test-build.$$.json"
+BUILD_ERR="$WORK/yushan-par-test-build.$$.err"
 mkdir -p "$FAILED" || exit 1
-trap 'rm -f "$EXES"; rm -rf "$FAILED"' EXIT
+trap 'rm -f "$EXES" "$BUILD_OUT" "$BUILD_ERR"; rm -rf "$FAILED"' EXIT
 
 # ── 1) 构建并取出全部测试二进制 ──
 #
 # 走 `cargo-build.sh` 而不是裸 `cargo`：测试构建同样是 `.rcgu.o` 的生产者，
 # 而它是 agent 最常跑的一类命令（一次 `--tests` 就净增数千条目）。
 if [ "$DO_BUILD" -eq 1 ]; then
-  if ! ./scripts/cargo-build.sh test --workspace --no-run --message-format=json 2>"$WORK/yushan-par-test-build.$$.err" \
-    | python3 -c '
+  # 构建输出先落盘再解析：管道会把退出码交给最后一个命令（python3），
+  # cargo 的失败会被静默吞掉（本脚本刻意不开 `set -e`，见文件头）。
+  ./scripts/cargo-build.sh test --workspace --no-run --message-format=json \
+    >"$BUILD_OUT" 2>"$BUILD_ERR"
+  build_status=$?
+  if [ "$build_status" -ne 0 ]; then
+    echo "par-test: 构建失败（退出码 $build_status）" >&2
+    cat "$BUILD_ERR" >&2 2>/dev/null
+    exit 1
+  fi
+  python3 -c '
 import sys, json
 for line in sys.stdin:
     try:
@@ -88,13 +99,13 @@ for line in sys.stdin:
     exe = m.get("executable")
     if exe:
         print(exe)
-' > "$EXES"; then
-    echo "par-test: 构建失败" >&2
-    cat "$WORK/yushan-par-test-build.$$.err" >&2 2>/dev/null
-    rm -f "$WORK/yushan-par-test-build.$$.err"
+' <"$BUILD_OUT" >"$EXES"
+  parse_status=$?
+  rm -f "$BUILD_OUT" "$BUILD_ERR"
+  if [ "$parse_status" -ne 0 ]; then
+    echo "par-test: 解析构建输出失败（退出码 $parse_status）" >&2
     exit 1
   fi
-  rm -f "$WORK/yushan-par-test-build.$$.err"
 else
   # 不构建时直接复用上一次的清单（最快的路径：改完代码忘了构建会跑到旧二进制，
   # 故仅在显式要求时使用）。

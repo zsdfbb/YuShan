@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use ys_component::{DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS, DEFAULT_SOFT_ROUND_ADVICE_AT};
 use ys_core::EffortLevel;
 use ys_model::Model;
 
@@ -9,6 +10,9 @@ use crate::provider::ProviderRegistry;
 
 /// 默认推理强度。`high` 是该模型可接受的最低默认档，`low` 只留给显式实验。
 pub(crate) const DEFAULT_REASONING_EFFORT: &str = "high";
+
+/// 有效上下文窗口的默认上限（token）。`context_cap_tokens = 0` 表示不封顶。
+pub const DEFAULT_CONTEXT_CAP_TOKENS: usize = 200_000;
 
 /// 主轮思考开关的 **A/B 开关**（`apps/coding-agent/src/main.rs::resolve_limits`）。
 ///
@@ -46,6 +50,15 @@ struct RawUserConfig {
     /// 收场前等待在跑子 agent 的上限，单位**秒**（ADR-0055）。
     #[serde(default)]
     subagent_wait_secs: Option<serde_json::Value>,
+    /// 有效上下文窗口上限（token）。`0` = 不封顶。
+    #[serde(default)]
+    context_cap_tokens: Option<serde_json::Value>,
+    /// A4 批处理提醒阈值（回合内累计工具调用数）。`0` = 关闭。
+    #[serde(default)]
+    batch_nudge_at_tool_calls: Option<serde_json::Value>,
+    /// A6 轮数软提醒阈值（回合内轮数）。`0` = 关闭。
+    #[serde(default)]
+    soft_round_advice_at: Option<serde_json::Value>,
     #[serde(default)]
     model_retry: RawModelRetry,
     #[serde(default)]
@@ -147,6 +160,15 @@ struct UserConfig {
     /// 与 `max_turn_duration_secs` **不是同一个东西**：后者是「一个请求能占多少墙钟」，
     /// 本值是「模型已经答完、子 agent 还在跑时，父回合愿意为它再挂多久」。
     subagent_wait_secs: Option<u64>,
+    /// 有效窗口上限覆盖（`0` = 不封顶）。`None` = 未给 ⇒ 默认
+    /// [`DEFAULT_CONTEXT_CAP_TOKENS`]。
+    context_cap_tokens: Option<usize>,
+    /// A4 批处理提醒阈值覆盖（回合内累计工具调用数，`0` = 关闭）。`None` = 未给 ⇒ 默认
+    /// [`DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS`]。
+    batch_nudge_at_tool_calls: Option<usize>,
+    /// A6 轮数软提醒阈值覆盖（`0` = 关闭）。`None` = 未给 ⇒ 默认
+    /// [`DEFAULT_SOFT_ROUND_ADVICE_AT`]。
+    soft_round_advice_at: Option<usize>,
     /// 重试策略（逐字段独立，缺省已由 [`ModelRetryConfig::default`] 填好）。
     model_retry: ModelRetryConfig,
     /// 超时旋钮（逐字段独立，缺省已由 [`ModelTimeoutConfig::default`] 填好）。
@@ -309,6 +331,67 @@ impl Config {
     /// 当前 model 的 context window **及其来源**（同 [`Self::context_window_with_source_for`]）。
     pub fn context_window_with_source(&self) -> (usize, ContextWindowSource) {
         self.context_window_with_source_for(&self.model)
+    }
+
+    /// 压缩与回合预算实际使用的窗口：`min(context_window(), context_cap_tokens)`。
+    /// `context_cap_tokens == 0` ⇒ 不封顶（返回声明窗口）。
+    ///
+    /// # 为什么用「有效窗口」而不是给 `CompactPolicy` 加 `trigger_cap`
+    ///
+    /// `trigger_at` / `keep_budget` / 回合工具预算三处都从**同一个窗口**派生；把上限
+    /// 放在窗口入口，一个 `min()` 就让三者同时对齐（200k 窗口 ⇒ 触发 170k、保留 20k、
+    /// 回合预算 50k），`CompactPolicy` 的算法与不变量一行不改。若改成
+    /// `trigger_cap`，三处会各自出现一个上限，容易漂移。
+    ///
+    /// # 与 [`context_window`](Self::context_window) 的区别
+    ///
+    /// `context_window` / `context_window_for` 回答「这个模型**声明**能吃多少」
+    /// （用户覆盖 → provider 目录 → 内建表 → 默认），是展示与解析口径；
+    /// 本函数回答「我们**实际喂多少**」，是压缩与预算口径。两者只在封顶时不同。
+    pub fn effective_context_window(&self) -> usize {
+        self.effective_context_window_for(&self.model)
+    }
+
+    /// 按**给定模型名**取有效窗口（同 [`Self::effective_context_window`]）。
+    ///
+    /// 复用 [`Self::context_window_for`] 的四级解析，不复制判定逻辑 —— 否则子模型
+    /// 解析与主模型解析会漂移（子 agent 换模型却继承父窗口是静默错）。
+    pub fn effective_context_window_for(&self, model: &str) -> usize {
+        let declared = self.context_window_for(model);
+        match self.context_cap_tokens() {
+            0 => declared,
+            cap => declared.min(cap),
+        }
+    }
+
+    /// 有效上下文窗口上限（`config.json` 的 `context_cap_tokens`）。
+    ///
+    /// 缺省 [`DEFAULT_CONTEXT_CAP_TOKENS`]；`0` = 不封顶。只影响
+    /// [`effective_context_window`](Self::effective_context_window) 派生的压缩触发点、
+    /// 保留量与回合工具预算，不改变 [`context_window`](Self::context_window) 的声明值
+    /// （后者仍用于展示「模型声明多大」）。
+    pub fn context_cap_tokens(&self) -> usize {
+        self.user_config
+            .context_cap_tokens
+            .unwrap_or(DEFAULT_CONTEXT_CAP_TOKENS)
+    }
+
+    /// A4 批处理提醒阈值（`config.json` 的 `batch_nudge_at_tool_calls`）。
+    ///
+    /// 缺省 [`DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS`]；`0` = 关闭（接线器据此不启用）。
+    pub fn batch_nudge_at_tool_calls(&self) -> usize {
+        self.user_config
+            .batch_nudge_at_tool_calls
+            .unwrap_or(DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS)
+    }
+
+    /// A6 轮数软提醒阈值（`config.json` 的 `soft_round_advice_at`）。
+    ///
+    /// 缺省 [`DEFAULT_SOFT_ROUND_ADVICE_AT`]；`0` = 关闭。
+    pub fn soft_round_advice_at(&self) -> usize {
+        self.user_config
+            .soft_round_advice_at
+            .unwrap_or(DEFAULT_SOFT_ROUND_ADVICE_AT)
     }
 
     /// 压缩策略：`config.json` 的比例覆盖叠在 [`ys_component::CompactPolicy::default`] 上。
@@ -595,6 +678,17 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
         sanitize_uint("max_turn_duration_secs", raw.max_turn_duration_secs, 1u64);
     user.subagent_wait_secs = sanitize_uint("subagent_wait_secs", raw.subagent_wait_secs, 1u64);
 
+    // 三项都允许 0：`context_cap_tokens = 0` 表示不封顶，两个提醒阈值 0 表示关闭，
+    // 都是显式语义而非「非法值」。故下限传 0，不沿用上面「0 立即到顶」的判据。
+    user.context_cap_tokens = sanitize_uint("context_cap_tokens", raw.context_cap_tokens, 0usize);
+    user.batch_nudge_at_tool_calls = sanitize_uint(
+        "batch_nudge_at_tool_calls",
+        raw.batch_nudge_at_tool_calls,
+        0usize,
+    );
+    user.soft_round_advice_at =
+        sanitize_uint("soft_round_advice_at", raw.soft_round_advice_at, 0usize);
+
     // 重试 / 超时**逐字段独立**覆盖：未给的项保持默认（照 `compaction` 的
     // `trigger_ratio` / `keep_ratio` 关系）。重试三项允许 0（`max_attempts: 0` = 不重试、
     // 延迟 0 = 不退避），超时两项不允许 0（0 无意义）。
@@ -639,8 +733,9 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
 }
 
 /// 「取无符号整数 + 落日志」的通用校验（`max_rounds` / `max_turn_duration_secs` /
-/// `model_retry` / `model_timeout` 共用）。`min` 是最小合法值（标量与超时旋钮取 1、
-/// 重试三项取 0）。
+/// `model_retry` / `model_timeout` / 有效窗口与两个提醒阈值共用）。`min` 是最小合法值
+/// （标量与超时旋钮取 1；重试三项与 `context_cap_tokens` / `batch_nudge_at_tool_calls` /
+/// `soft_round_advice_at` 取 0 —— 后三者 0 有显式语义：不封顶 / 关闭）。
 ///
 /// `as_u64()` 同时挡下负值、浮点、字符串、布尔、对象、数组；再与 `min` 比较。
 /// `None` 入参（未给）**静默**返回 `None`；给了值但非法则落一行日志并返回 `None`，
@@ -1800,5 +1895,180 @@ mod tests {
                 "case {name} 应回落默认"
             );
         }
+    }
+
+    // ───── 有效窗口与提醒阈值（A5 / A4 / A6） ─────
+
+    /// 三个顶层标量的合法解析：非零值被采纳，`0` 是**显式语义**（不封顶 / 关闭），
+    /// 不得被当成非法值丢弃。
+    #[test]
+    fn test_latency_scalars_parse_legal_values_including_zero() {
+        let mut config = test_config("deepseek-chat");
+        config.user_config = parse_user_config(
+            r#"{
+                "context_cap_tokens": 300000,
+                "batch_nudge_at_tool_calls": 8,
+                "soft_round_advice_at": 120
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.context_cap_tokens(), 300_000);
+        assert_eq!(config.batch_nudge_at_tool_calls(), 8);
+        assert_eq!(config.soft_round_advice_at(), 120);
+
+        let mut config = test_config("deepseek-chat");
+        config.user_config = parse_user_config(
+            r#"{
+                "context_cap_tokens": 0,
+                "batch_nudge_at_tool_calls": 0,
+                "soft_round_advice_at": 0
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.context_cap_tokens(), 0, "0 = 不封顶");
+        assert_eq!(config.batch_nudge_at_tool_calls(), 0, "0 = 关闭");
+        assert_eq!(config.soft_round_advice_at(), 0, "0 = 关闭");
+    }
+
+    /// 三个标量缺省时回落到产品默认值（200k / 12 / 60）。
+    #[test]
+    fn test_latency_scalars_default_when_unconfigured() {
+        let config = test_config("deepseek-chat");
+        assert_eq!(config.context_cap_tokens(), DEFAULT_CONTEXT_CAP_TOKENS);
+        assert_eq!(config.context_cap_tokens(), 200_000);
+        assert_eq!(config.batch_nudge_at_tool_calls(), 12);
+        assert_eq!(config.soft_round_advice_at(), 60);
+    }
+
+    /// 非法值（负数 / 字符串 / 浮点 / null / bool）逐条丢弃、回落到默认，
+    /// 且**不影响同一份文件里的其他键**；全程不 panic。
+    #[test]
+    fn test_latency_scalars_invalid_dropped_individually() {
+        for key in [
+            "context_cap_tokens",
+            "batch_nudge_at_tool_calls",
+            "soft_round_advice_at",
+        ] {
+            for (case, value) in [
+                ("negative", "-1"),
+                ("string", "\"200000\""),
+                ("float", "1.5"),
+                ("null", "null"),
+                ("bool", "true"),
+            ] {
+                let json = format!(r#"{{"{key}": {value}}}"#);
+                let user = parse_user_config(&json).unwrap();
+                assert!(
+                    user.context_cap_tokens.is_none()
+                        && user.batch_nudge_at_tool_calls.is_none()
+                        && user.soft_round_advice_at.is_none(),
+                    "case {key}/{case} 应被丢弃"
+                );
+
+                let mut config = test_config("deepseek-chat");
+                config.user_config = user;
+                assert_eq!(
+                    config.context_cap_tokens(),
+                    DEFAULT_CONTEXT_CAP_TOKENS,
+                    "case {key}/{case} 应回落默认"
+                );
+                assert_eq!(
+                    config.batch_nudge_at_tool_calls(),
+                    DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS,
+                    "case {key}/{case} 应回落默认"
+                );
+                assert_eq!(
+                    config.soft_round_advice_at(),
+                    DEFAULT_SOFT_ROUND_ADVICE_AT,
+                    "case {key}/{case} 应回落默认"
+                );
+            }
+        }
+
+        // 只丢非法那一条：同文件其他键照常生效。
+        let user = parse_user_config(
+            r#"{
+                "context_cap_tokens": "bad",
+                "batch_nudge_at_tool_calls": 8,
+                "soft_round_advice_at": 120
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(user.context_cap_tokens, None);
+        assert_eq!(user.batch_nudge_at_tool_calls, Some(8));
+        assert_eq!(user.soft_round_advice_at, Some(120));
+    }
+
+    /// `min(声明, cap)`：1M 声明 + 200k cap ⇒ 200k，且**声明值不变**。
+    #[test]
+    fn effective_context_window_caps_declared_1m_to_200k() {
+        let mut config = test_config("MiniMax-M3");
+        assert_eq!(config.context_window(), 1_000_000);
+        config.user_config = parse_user_config(r#"{"context_cap_tokens": 200000}"#).unwrap();
+        assert_eq!(config.context_window(), 1_000_000, "声明值不受上限影响");
+        assert_eq!(config.effective_context_window(), 200_000);
+    }
+
+    /// `context_cap_tokens = 0` ⇒ 不封顶，有效窗口等于声明窗口。
+    #[test]
+    fn effective_context_window_cap_zero_disables_cap() {
+        let mut config = test_config("MiniMax-M3");
+        config.user_config = parse_user_config(r#"{"context_cap_tokens": 0}"#).unwrap();
+        assert_eq!(config.effective_context_window(), 1_000_000);
+    }
+
+    /// 声明窗口低于上限时保持声明值（128k + cap 200k ⇒ 128k）。
+    #[test]
+    fn effective_context_window_keeps_declared_below_cap() {
+        let mut config = test_config("small-model");
+        config.user_config = parse_user_config(
+            r#"{
+                "context_window": {"small-model": 128000},
+                "context_cap_tokens": 200000
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.context_window(), 128_000);
+        assert_eq!(config.effective_context_window(), 128_000);
+    }
+
+    /// `effective_context_window_for(子模型)` 复用同一 cap：子模型声明 1M ⇒ 200k；
+    /// 声明低于 cap 的子模型保持自己的值（不继承父模型窗口）。
+    #[test]
+    fn effective_context_window_for_submodel_uses_parent_cap() {
+        let mut config = test_config("deepseek-chat");
+        config.user_config = parse_user_config(
+            r#"{
+                "context_window": {"small-sub": 128000},
+                "context_cap_tokens": 200000
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.effective_context_window_for("MiniMax-M3"), 200_000);
+        assert_eq!(
+            config.effective_context_window_for("small-sub"),
+            128_000,
+            "低于 cap 的子模型窗口应保持自身声明值"
+        );
+    }
+
+    /// 未配置任何键时，默认 cap 200k 会把默认模型的 1M 声明封到 200k
+    /// （未知模型的 1M 兜底同样被封）。
+    #[test]
+    fn effective_context_window_default_caps_unconfigured_1m_model() {
+        let config = test_config("MiniMax-M3");
+        assert_eq!(config.context_window(), 1_000_000);
+        assert_eq!(
+            config.effective_context_window(),
+            DEFAULT_CONTEXT_CAP_TOKENS
+        );
+
+        let config = test_config("unknown-model-xyz");
+        assert_eq!(config.context_window(), 1_000_000);
+        assert_eq!(
+            config.effective_context_window(),
+            DEFAULT_CONTEXT_CAP_TOKENS
+        );
     }
 }

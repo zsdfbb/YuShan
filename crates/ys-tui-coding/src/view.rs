@@ -121,7 +121,11 @@ pub struct CodingView {
     pub skills: Vec<SkillEntry>,
     /// 因整表字节预算被收起的 skill 条数（`/status` 可见；默认预算下恒为 0）。
     pub skills_omitted: usize,
+    /// **实际喂入**的 context window（封顶后的值）—— 压缩与回合预算都用它。
     pub context_window: Option<usize>,
+    /// 模型**声明**的 context window（未封顶时的值）。与 [`Self::context_window`]
+    /// （effective）不等时说明存在主动封顶，`/status` 需要同时显示两者。
+    pub context_window_declared: Option<usize>,
     pub session_path: Option<PathBuf>,
     /// 首次运行（无 `auth.json` 凭证）—— 用于欢迎语。
     pub is_first_run: bool,
@@ -164,6 +168,7 @@ impl Default for CodingView {
             skills: Vec::new(),
             skills_omitted: 0,
             context_window: None,
+            context_window_declared: None,
             session_path: None,
             is_first_run: true,
             effort: None,
@@ -259,6 +264,7 @@ impl CodingView {
             // （默认预算下真实运行恒为 0）。
             skills_omitted: 3,
             context_window: Some(65_536),
+            context_window_declared: Some(65_536),
             session_path: None,
             is_first_run: false,
             effort: None,

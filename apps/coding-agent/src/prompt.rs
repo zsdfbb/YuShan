@@ -208,39 +208,58 @@ fn tool_guidelines(tools: &[&str]) -> String {
     if tools.contains(&"write") {
         guidelines.push("Use write only for new files or complete rewrites".to_string());
     }
-    if tools.contains(&"read") {
-        guidelines.push("Use read to examine files instead of cat or sed".to_string());
-    }
-    if tools.contains(&"grep") {
+    // 写入走**结构化工具**，不走脚本：`edit` 的 `edits[].oldText` 精确匹配是变更安全性的
+    // 唯一校验点，而 `sed` / `awk` / `python -c` 之类的脚本化写入绕过了它 —— 匹配失败、
+    // 改错位置都不会被拦住。拆成多次调用本身没有代价（每次仍是一次往返），故不必为了
+    // 「少调几次」而牺牲校验。
+    //
+    // 门控：`edit` / `write` 任一在场才渲染 —— 这条文案只引用这两个工具，缺了就成悬空指令。
+    if tools.contains(&"edit") || tools.contains(&"write") {
         guidelines.push(
-            "Use grep to search file contents instead of running grep through bash".to_string(),
+            "Write with edit and write, never with scripts: one edit call per file (multiple \
+             entries for multiple locations in that same file), one write call per new file. \
+             Splitting writes across several calls is fine — a scripted mutation skips the \
+             exact-match check."
+                .to_string(),
         );
     }
-    if tools.contains(&"find") {
-        guidelines
-            .push("Use find to locate files instead of running find through bash".to_string());
-    }
-    if tools.contains(&"ls") {
-        guidelines
-            .push("Use ls to list directories instead of running ls through bash".to_string());
-    }
-    // 多目标探索走**多条工具调用**：只有工具通道才保留 `.gitignore` 语义与统一的截断 /
-    // notice 形态；只读批次真的并行（工具侧声明 `is_concurrency_safe`），故这条不只是「更好看」。
+    // 探索走**一条聚合命令产出完整答案**，不走逐轮小查询：问题若是跨多文件的查找或聚合
+    // （「找出每个 X」「按 crate 统计 Y」「带行号列出所有 Z」），应规划整次检索、用一条命令
+    // 直接吐出完整答案（对路径的 `for` 循环、`rg -n --context 2`、`awk`）。每条消息都是一次
+    // 完整的模型往返，故十条小查询要付十次往返，而一条命令一次产出。
     //
-    // **但「面」操作要留出 shell 的口子**：`read` 只吃单个 `path`，故"读一个目录下全部
-    // markdown"这类**覆盖面**动作在结构化工具里**表达不出来**，只能靠 shell 通配 / 循环。
-    // 原先把整类 shell 串联一并禁掉，等于把面操作也禁了 —— 单点读取仍优先结构化工具。
+    // 契约的核心是**强制综合**：命令必须自己完成筛选与汇总，而不是只把素材捞回来；它不限制
+    // 调用数 —— 需要串联的探索仍可多步进行。
+    //
+    // 不写成「把独立命令放进同一条消息」：实测该措辞会被理解成「多跑几条命令」，模型转而做
+    // 广度枚举而非集中验证，总调用数 +33%、轮数 +35%，而「调用/轮」比例几乎不变
+    // （1.50 → 1.48）—— 增加的是命令总量，不是每次往返的产出。
+    //
+    // `.gitignore` 语义与有界输出是聚合命令必须自己守的两点：`rg` 默认尊重 .gitignore，
+    // 用 `-m` / `-l` / `| head -n` 截断，避免一次聚合把上下文撑爆。
+    //
+    // 提示词不写「用 read/grep/find/ls 代替 bash」这类逐工具禁令：它们会把本可聚合的
+    // 检索拆成逐个结构化调用，正是轮数膨胀的来源；结构化工具的胜出场景由下一条正向陈述。
+    //
+    // 门控：只读工具（`read` / `grep` / `find` / `ls`）任一在场才渲染 —— 文案引用 `rg` 与
+    // `read paths=[...]`，没有这些工具时模型无从执行。
     if tools
         .iter()
         .any(|t| matches!(*t, "read" | "grep" | "find" | "ls"))
     {
         guidelines.push(
-            "To inspect several files or directories, send several tool calls in one message — \
-             read-only calls in a batch run in parallel. For a whole directory or a glob, one \
-             shell loop is fine and beats enumerating paths by hand; keep single-file reads on \
-             the structured tools. To search several targets at once, pass `grep` a `paths` \
-             array in ONE call instead of chaining `grep a && grep b` through bash — chaining \
-             loses .gitignore semantics and the unified truncation form"
+            "Explore with one command, not one round per look. When the question is a lookup or an \
+             aggregation across many files — \"find every X\", \"count Y per crate\", \"show all Z with \
+             line numbers\" — plan the whole retrieval and write ONE command that emits the complete \
+             answer: a `for` loop over paths, `rg -n --context 2`, an `awk`. Every message is a full \
+             model round-trip, so ten small queries cost ten round-trips for what one command produces \
+             at once. `rg` respects .gitignore; bound the output with `-m`, `-l`, or `| head -n`."
+                .to_string(),
+        );
+        guidelines.push(
+            "Reach for read/grep/find/ls when the next step genuinely depends on what you just saw, \
+             when you need offset/limit continuation on a single file, or when one targeted lookup is \
+             already the whole answer — `read paths=[...]` covers a handful of known files in one call."
                 .to_string(),
         );
     }
@@ -410,6 +429,21 @@ fn tool_guidelines(tools: &[&str]) -> String {
                 .to_string(),
         );
     }
+
+    // 任务边界：只做用户要求的事。必要步骤（读取/搜索、对改动代码跑检查、修复自身改动造成的
+    // 破坏）免问；其余（无关重构、新文件/文档、依赖变更、大范围格式化、额外测试、超出要求的
+    // commit/push）先一行提议并等待。单发模式不能问时只做被要求的部分并列出未做项。
+    // 与具体工具无关，故无条件渲染 —— 只有 `bash` 时同样在场。
+    guidelines.push(
+        "Do exactly what the user asked; do not add work they did not request. \
+         Necessary steps are allowed without asking: reading/searching to understand the task, \
+         running checks on code you changed, and fixing breakage your own change caused. \
+         Everything else must be proposed first — unrelated refactors, new files or docs, \
+         dependency changes, broad reformatting, extra test suites, or committing/pushing \
+         beyond what was asked. State the proposal in one line and wait for the user's answer. \
+         If you cannot ask (single-shot run), do only what was asked and list the extra work as not done."
+            .to_string(),
+    );
 
     guidelines.push("Be concise in your responses".to_string());
     guidelines.push("Show file paths clearly when working with files".to_string());
@@ -777,40 +811,160 @@ mod tests {
         );
     }
 
-    /// 「多目标 ⇒ 发多条调用」这条 guideline **只在只读工具在场时**出现。
+    /// 探索指引要求**一条命令产出完整答案**（强制综合），并把旧的「用结构化工具代替 bash」
+    /// 四条彻底移除。
     ///
-    /// 它之所以是承重的：工具通道保住了 `.gitignore` 语义与统一的截断 / notice，而把若干
-    /// 命令拼进一条 bash 会全丢掉；同时只读批次**真的并行**（工具侧声明
-    /// `is_concurrency_safe`，见 `apps/coding-agent/src/toolset.rs` 的准入表测试）。
+    /// 承重语义：`ONE command` 要求命令自己完成筛选与汇总、`rg -n --context` 给出聚合手段、
+    /// `Every message is a full model round-trip` 说明代价模型、`.gitignore` 语义与有界输出
+    /// 的手段 —— 这些都是模型写命令时的直接输入。
     ///
-    /// 反向断言（只有 `bash` 时不得出现）同样关键：模型不该被建议用不存在的工具。
+    /// 反向断言同样关键：`SAME message` 会被理解成「多跑几条命令」，实测总调用数 +33%、
+    /// 轮数 +35%（广度枚举而非减少往返），不得再出现；`back-to-back inside one round` 是同一
+    /// 措辞的伴生短语，同样不得出现。旧四条把可聚合的检索拆成逐轮结构化调用，也不得再出现。
     ///
-    /// 变异：把守卫从 `any(read|grep|find|ls)` 改成无条件 push ⇒ 第二条断言变红。
+    /// 变异：把 `ONE command` 改回 `SAME message`（或补上 `back-to-back inside one round`）
+    /// ⇒ 对应反向断言变红；
+    /// 删掉 `Explore with one command` ⇒ 正向断言变红；
+    /// 删掉 `rg -n --context` 或 `.gitignore` ⇒ 对应断言变红；
+    /// 恢复 `Use read to examine files instead of cat or sed`（或 grep 那条）⇒ 反向断言变红。
     #[test]
-    fn multi_target_guideline_appears_only_with_read_only_tools() {
+    fn explore_guideline_prefers_one_aggregating_command() {
         let _guard = env_lock();
         let _env = no_global_prompt();
 
-        let with_tools = build_system_prompt(
+        let prompt = build_system_prompt(
             Path::new("/tmp"),
             &[spec("read"), spec("grep"), spec("bash")],
             &no_skills(),
         );
+
+        for fragment in [
+            "Explore with one command",
+            "ONE command",
+            "rg",
+            ".gitignore",
+        ] {
+            assert!(
+                prompt.contains(fragment),
+                "探索指引须含 `{fragment}`；prompt = {prompt}"
+            );
+        }
         assert!(
-            with_tools.contains(
-                "- To inspect several files or directories, send several tool calls in one message"
-            ),
-            "有只读工具时应给「多目标发多条调用」的指引；prompt = {with_tools}"
+            !prompt.contains("SAME message"),
+            "`SAME message` 会诱导广度枚举（实测调用 +33%、轮数 +35%），必须移除；prompt = {prompt}"
         );
         assert!(
-            with_tools.contains("read-only calls in a batch run in parallel"),
-            "指引应点明并行这一事实（否则它只是风格偏好）；prompt = {with_tools}"
+            !prompt.contains("back-to-back inside one round"),
+            "`back-to-back inside one round` 属同一措辞的伴生短语，必须移除；prompt = {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use read to examine files instead of cat or sed"),
+            "旧的「用 read 代替 cat/sed」必须移除；prompt = {prompt}"
+        );
+        assert!(
+            !prompt.contains("instead of running grep through bash"),
+            "旧的「用 grep 代替 bash grep」必须移除；prompt = {prompt}"
+        );
+    }
+
+    /// 探索两条指引**只在只读工具在场时**出现。
+    ///
+    /// 正向：`read` 在场即渲染，且给出结构化工具的胜出场景（依赖下一步、offset/limit 续读、
+    /// 单次定向查询）。
+    ///
+    /// 反向断言（只有 `bash` 时不得出现）是关键：文案引用 `rg` 与 `read paths=[...]`，
+    /// 模型在没有这些工具时照做只会得到不存在的工具名。
+    ///
+    /// 变异：把守卫从 `any(read|grep|find|ls)` 改成无条件 push ⇒ 反向断言变红。
+    #[test]
+    fn explore_guideline_appears_only_with_read_only_tools() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_read = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
+        assert!(
+            with_read.contains("Explore with one command"),
+            "只读工具在场时应给聚合探索指引；prompt = {with_read}"
+        );
+        assert!(
+            with_read.contains("Reach for read/grep/find/ls when the next step genuinely depends"),
+            "须正向陈述结构化工具的胜出场景；prompt = {with_read}"
         );
 
         let bash_only = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
         assert!(
-            !bash_only.contains("send several tool calls in one message"),
-            "只有 bash 时不得出现该指引；prompt = {bash_only}"
+            !bash_only.contains("Explore with one command"),
+            "只有 bash 时不得出现聚合探索指引；prompt = {bash_only}"
+        );
+        assert!(
+            !bash_only.contains("Reach for read/grep/find/ls"),
+            "只有 bash 时不得出现结构化工具胜出场景；prompt = {bash_only}"
+        );
+    }
+
+    /// 写入指引：仍走 `edit` / `write`，禁脚本化变更；拆多次调用是允许的。
+    ///
+    /// 承重语义：`never with scripts`（脚本化写入绕过 `oldText` 精确匹配校验）与
+    /// `Splitting writes across several calls is fine`（拆调用本身没有代价）。
+    ///
+    /// 反向断言：`edit` / `write` 都不在场时不得出现 —— 文案只引用这两个工具。
+    ///
+    /// 变异：删掉 `never with scripts` ⇒ 第一条变红；删掉 `Splitting writes across several
+    /// calls is fine` ⇒ 第二条变红；把守卫改成无条件 push ⇒ 反向断言变红。
+    #[test]
+    fn write_guideline_keeps_edits_structured() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_edit = build_system_prompt(Path::new("/tmp"), &[spec("edit")], &no_skills());
+        assert!(
+            with_edit.contains("never with scripts"),
+            "edit 在场时须禁止脚本化写入；prompt = {with_edit}"
+        );
+        assert!(
+            with_edit.contains("Splitting writes across several calls is fine"),
+            "须说明拆多次写入没有代价；prompt = {with_edit}"
+        );
+
+        let no_writers = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
+        assert!(
+            !no_writers.contains("never with scripts"),
+            "edit/write 都不在场时不得出现写入指引；prompt = {no_writers}"
+        );
+    }
+
+    /// A7 任务边界 guideline：与具体工具无关，`bash` 在场时必须出现；
+    /// 含「必要步骤免问」与「不能问就只做被要求的部分并列出未做项」两句。
+    ///
+    /// 变异：① 把它挪进 `tools.contains(...)` 分支 ⇒ bash-only 断言变红；
+    /// ② 删掉 `Necessary steps are allowed without asking` ⇒ 必要步骤断言变红；
+    /// ③ 删掉 `do only what was asked and list the extra work as not done` ⇒ 单发模式断言变红。
+    #[test]
+    fn task_boundary_guideline_appears_with_bash_and_has_two_constraints() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_bash = build_system_prompt(Path::new("/tmp"), &[spec("bash")], &no_skills());
+        assert!(
+            with_bash.contains(
+                "- Do exactly what the user asked; do not add work they did not request."
+            ),
+            "bash 在场时必须出现任务边界 guideline；prompt = {with_bash}"
+        );
+        assert!(
+            with_bash.contains("Necessary steps are allowed without asking"),
+            "须写明「必要步骤免问」；prompt = {with_bash}"
+        );
+        assert!(
+            with_bash.contains("do only what was asked and list the extra work as not done"),
+            "须写明「不能问就只做被要求的部分并列出未做项」；prompt = {with_bash}"
+        );
+
+        // 与工具无关：空工具表也应出现（它不是工具建议，而是任务边界）。
+        let no_tools = build_system_prompt(Path::new("/tmp"), &[], &no_skills());
+        assert!(
+            no_tools.contains("Do exactly what the user asked"),
+            "任务边界 guideline 与工具无关，空工具表也应出现；prompt = {no_tools}"
         );
     }
 

@@ -957,10 +957,13 @@ impl AppSubagentRunner<'_> {
 
     /// 子换 model ⇒ 窗口必须按**子模型**取（继承父窗口是**静默错**：32k 模型按 1M
     /// 判 ⇒ 不压缩 ⇒ 撞窗）。默认继承时不改（与父同值）。
+    ///
+    /// 必须走 `effective_context_window_for`：父级封顶（`context_cap_tokens`）对子
+    /// agent 同样生效，否则子 agent 会绕过上限。
     fn child_limits_for(&self, model: Option<&str>) -> RunLimits {
         let mut limits = self.child_limits.clone();
         if let (Some(cfg), Some(name)) = (self.config, model) {
-            limits.context_window = cfg.context_window_for(name);
+            limits.context_window = cfg.effective_context_window_for(name);
         }
         limits
     }
@@ -2842,6 +2845,70 @@ mod tests {
             Arc::new(PendingResults::default()),
             Arc::new(LiveSubagents::default()),
         )
+    }
+
+    /// **A5 回归钉（D3）**：父级封顶必须对子 agent 生效。
+    ///
+    /// 父 `limits.context_window = 200k`、config 的 `context_cap_tokens = 200k`，
+    /// 子模型声明 1M ⇒ 子窗口必须是 **200k**，而不是声明的 1M。
+    ///
+    /// 变异：把 `child_limits_for` 改回 `context_window_for(name)` ⇒ 子窗口变
+    /// `1_000_000` ⇒ 本条变红（子 agent 绕过父级封顶）。
+    #[test]
+    fn child_limits_for_uses_effective_window_not_declared() {
+        let base = unique_subagent_test_dir("child_limits_effective");
+        let path = base.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "context_window": { "small-sub": 128000 },
+                "context_cap_tokens": 200000
+            }"#,
+        )
+        .unwrap();
+
+        let mut config = {
+            let _guard = crate::test_env::env_lock();
+            crate::config::Config::from_env().unwrap()
+        };
+        config.model = "parent-model".into();
+        config.load_user_config(&path);
+
+        let mut parent_limits = RunLimits::default();
+        parent_limits.context_window = 200_000;
+        let runner = AppSubagentRunner::new(
+            None,
+            Some(&config),
+            Arc::new(Mutex::new(HashMap::new())),
+            "child prompt".to_string(),
+            parent_limits,
+            Duration::from_secs(30),
+            base.clone(),
+            WebConfig::offline(ys_tools_web::FetchedDir::Temp(base.join("fetched"))),
+            Arc::new(SubagentsDir::at(base.join("subagents"), false)),
+            Arc::new(UsageTotals::default()),
+            None,
+            Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
+        );
+
+        assert_eq!(
+            runner.child_limits_for(Some("MiniMax-M3")).context_window,
+            200_000,
+            "子模型声明 1M 也必须被父级 cap 封到 200k"
+        );
+        assert_eq!(
+            runner.child_limits_for(None).context_window,
+            200_000,
+            "不指定模型时继承父窗口"
+        );
+        assert_eq!(
+            runner.child_limits_for(Some("small-sub")).context_window,
+            128_000,
+            "低于 cap 的子模型保持自身声明值"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **异步派发的核心**：`spawn` 立刻返回句柄，完成后结果作为 `Boundary::Deferred`

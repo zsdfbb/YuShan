@@ -852,7 +852,9 @@ pub(crate) fn run_start_fields(
         json!({
             "max_rounds": limits.max_rounds,
             "wall_clock_ms": config.max_turn_duration().as_millis() as u64,
-            "context_window": limits.context_window,
+            // 原字段名保留（既有日志消费方按它读**声明值**）；新增 effective 并列。
+            "context_window": config.context_window(),
+            "context_window_effective": limits.context_window,
         }),
     );
     fields.insert("tools".into(), Value::Array(tools));
@@ -916,6 +918,69 @@ pub(crate) fn record_turn_end(
     debug_record(sink, session_id, "turn_end", Some(turn), None, fields);
 }
 
+/// `run_reading`：回合级读数行落进 debug 日志。
+///
+/// `line` 是**人读出口**、也是既有格式契约；结构化数字字段由
+/// [`record_run_reading_fields`] 写入。本入口只拿到文本（TUI 路径），故从 `line`
+/// 反解数字字段 —— 它和 [`RoundClock::summary_fields`] 出自同一行，不会出现两套口径。
+pub(crate) fn record_run_reading(sink: &mut DebugSink, session_id: &str, turn: u32, line: &str) {
+    let fields = parse_reading_fields(line);
+    record_run_reading_fields(sink, session_id, turn, line, &fields);
+}
+
+/// 写 `run_reading` 的结构化字段。
+///
+/// `line` 保留为**人读出口**与既有格式契约；`turn` / `rounds` / `tools` /
+/// `tpr_x100` / `ttft_ms` / `gen_ms` / `tools_ms` / `input_med` 另以顶层数字字段落盘，
+/// 供 bench 等离线分析直接读取，免得再从文本里 grep。
+pub(crate) fn record_run_reading_fields(
+    sink: &mut DebugSink,
+    session_id: &str,
+    turn: u32,
+    line: &str,
+    fields: &[(&'static str, u128)],
+) {
+    let mut map = Map::new();
+    map.insert("line".into(), json!(line));
+    for &(key, value) in fields {
+        map.insert(key.into(), json!(value));
+    }
+    debug_record(sink, session_id, "run_reading", Some(turn), None, map);
+}
+
+/// 从读数行反解数字字段；键顺序与 [`RoundClock::summary_fields`] 一致。
+///
+/// 只认 `key=数字` 的精确形态，避免 `tools` 误中 `tools_ms` 一类前缀。
+fn parse_reading_fields(line: &str) -> Vec<(&'static str, u128)> {
+    const KEYS: [&str; 8] = [
+        "turn",
+        "rounds",
+        "tools",
+        "tpr_x100",
+        "ttft_ms",
+        "gen_ms",
+        "tools_ms",
+        "input_med",
+    ];
+    KEYS.iter()
+        .filter_map(|key| reading_field(line, key).map(|value| (*key, value)))
+        .collect()
+}
+
+/// 取 `key=<数字>` 的值；键不存在或后面不是数字时返回 `None`。
+fn reading_field(line: &str, key: &str) -> Option<u128> {
+    let pattern = format!("{key}=");
+    let start = line.find(&pattern)? + pattern.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
 /// `boundary` 记录：`phase` ∈ `enqueued` / `observed`，`kind` ∈ `abort` / `steer`。
 pub(crate) fn record_boundary(
     sink: &mut DebugSink,
@@ -934,18 +999,33 @@ pub(crate) fn record_boundary(
     debug_record(sink, session_id, "boundary", turn, None, fields);
 }
 
+/// [`consume_events`] 的产物：事件流累计轮数 + 回合级读数行。
+///
+/// 读数行由**消费者侧**的 [`RoundClock`] 汇总（口径与 TUI 入口一致）；调用方负责
+/// 把它写到 stderr（`-p` / `--json`）—— **绝不写 stdout**，那是对外事件流的契约。
+struct ConsumeOutcome {
+    rounds: u32,
+    reading: String,
+    /// 与 `reading` 同源的数字字段（见 [`RoundClock::summary_fields`]）。
+    reading_fields: Vec<(&'static str, u128)>,
+}
+
 /// 消费事件流，直到收到终局事件（`RunFinished` / `RunFailed`）。
 ///
 /// **终止条件是终局事件，不是信道关闭** —— sender 在 Agent 里，
 /// Agent 不 drop 信道就不会关闭；若等关闭会死锁。
 ///
 /// 每个事件 `on_event` 写出后 `flush()`（保证 `-p` 增量实时可见）。
+///
+/// `turn` 是**回合号**（`-p` / `--json` 恒为 1，取自 `begin_turn(1)` 的同一取值），
+/// 只用于读数行的 `turn=` 字段。
 async fn consume_events<W, F>(
     mut rx: mpsc::Receiver<Envelope>,
     mut w: W,
     mut on_event: F,
     mut debug: Option<DebugTap<'_>>,
-) -> io::Result<u32>
+    turn: u32,
+) -> io::Result<ConsumeOutcome>
 where
     W: Write,
     F: FnMut(&mut W, &Envelope) -> io::Result<()>,
@@ -986,7 +1066,11 @@ where
             for line in clock.take_lines() {
                 logging::log(&line);
             }
-            return Ok(observed_rounds);
+            return Ok(ConsumeOutcome {
+                rounds: observed_rounds,
+                reading: clock.summary_line(turn),
+                reading_fields: clock.summary_fields(turn),
+            });
         }
     }
     for line in clock.take_lines() {
@@ -994,7 +1078,11 @@ where
     }
     // 信道关闭（正常路径不依赖此分支：agent 不 drop 信道）——不 panic，正常收尾。
     w.flush()?;
-    Ok(observed_rounds)
+    Ok(ConsumeOutcome {
+        rounds: observed_rounds,
+        reading: clock.summary_line(turn),
+        reading_fields: clock.summary_fields(turn),
+    })
 }
 
 /// 组装 agent（无状态执行器）。
@@ -1045,12 +1133,21 @@ pub(crate) fn build_agent(
 /// 只能 `default()` + 字段赋值。
 fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     let mut limits = ys_component::RunLimits::default();
-    limits.context_window = config.context_window();
+    // 压缩与回合预算一律用**有效窗口**（`min(声明, context_cap_tokens)`），
+    // 声明窗口只用于展示。
+    limits.context_window = config.effective_context_window();
     limits.compaction = config.compact_policy();
     limits.max_rounds = config.max_rounds();
-    // 回合级工具结果预算：取窗口的 1/4（128k → 32k）。不新增 config 字段 —— 初值即可，
-    // 真实会话再校准；`0` 会关闭闸门，故必须显式设非零。
-    limits.max_turn_tool_result_tokens = config.context_window() / 4;
+    // 回合级工具结果预算：取**有效窗口**的 1/4（200k → 50k）。不新增 config 字段 ——
+    // 初值即可，真实会话再校准；`0` 会关闭闸门，故必须显式设非零。
+    //
+    // **只在 `resolve_limits` 算一次**：运行中 `/model` 换模型时
+    // `set_context_window` 只刷新窗口，**不重算**本值（既有行为，本期不改）。
+    limits.max_turn_tool_result_tokens = config.effective_context_window() / 4;
+    // A4 / A6 的应用默认值：库面默认 0（关闭）⇒ 老调用方逐字节不变；
+    // app 侧走配置的 12 / 60。
+    limits.batch_nudge_at_tool_calls = config.batch_nudge_at_tool_calls();
+    limits.soft_round_advice_at = config.soft_round_advice_at();
     // 主轮关思考：**默认 `None`**（不干预）⇒ 未设 env 时行为逐字节不变。
     //
     // 用 env 而非配置项：先拿 A/B 读数，再决定要不要把它升格为默认值或用户配置。
@@ -1103,8 +1200,8 @@ fn fixed_cost_note(limits: &ys_component::RunLimits) -> Option<String> {
     }
     Some(format!(
         "[yushan] 每轮固定开销（system prompt + 工具表）≈ {} token，已达压缩触发点 {} token \
-         （context_window = {}）—— 压缩无从下手，长会话会直接撞窗口。请调大 context_window、\
-         或给部分 skill 标 `disable-model-invocation` 以减少 skill 目录。",
+         （有效 context_window = {}）—— 压缩无从下手，长会话会直接撞窗口。请调大 context_window / \
+         context_cap_tokens、或给部分 skill 标 `disable-model-invocation` 以减少 skill 目录。",
         limits.fixed_prompt_tokens, trigger, limits.context_window
     ))
 }
@@ -1967,10 +2064,10 @@ async fn consume_print_events<W: Write>(
     w: W,
     debug: Option<&mut DebugSink>,
     session_id: &str,
-) -> io::Result<(bool, u32)> {
+) -> io::Result<(bool, ConsumeOutcome)> {
     let mut printed_any = false;
     let tap = debug.map(|sink| DebugTap { sink, session_id });
-    let rounds = consume_events(
+    let consumed = consume_events(
         rx,
         w,
         |w, env| {
@@ -1981,9 +2078,10 @@ async fn consume_print_events<W: Write>(
             Ok(())
         },
         tap,
+        1,
     )
     .await?;
-    Ok((printed_any, rounds))
+    Ok((printed_any, consumed))
 }
 
 /// 把背压读数摘要写到 **stderr**（固定不污染 stdout 的 JSON / 文本流）。
@@ -2000,6 +2098,33 @@ fn report_channel_stats(handle: &ChannelStatsHandle, force: bool) {
     if let Some(line) = line {
         eprintln!("{line}");
     }
+}
+
+/// 一次性模式的收尾顺序：先把已汇总的读数行写到 `stderr`，再传播错误。
+///
+/// 读数行必须在 `run_result` 的 `?` **之前**落盘：回合失败时 `run_result` 为
+/// `Err` 会提前返回，但消费侧已排空、读数已算出，仍应让用户看到（设计
+/// `design.md`「终局事件后写 stderr」）。
+///
+/// 错误优先级：回合错误先于消费错误（模型错误是用户真正要看的）。
+/// 消费失败时没有读数可写 —— 不编造行，只传播错误。
+fn finish_after_reading<ER, EC, T>(
+    stderr: &mut impl Write,
+    run_result: Result<RunResult, ER>,
+    consume_result: Result<T, EC>,
+    reading: Option<&str>,
+) -> Result<(RunResult, T), Box<dyn std::error::Error>>
+where
+    ER: std::error::Error + 'static,
+    EC: std::error::Error + 'static,
+{
+    if let Some(line) = reading {
+        // 与 `eprintln!` 一致：stderr 写失败不改变退出语义。
+        let _ = writeln!(stderr, "{line}");
+    }
+    let result = run_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let consumed = consume_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok((result, consumed))
 }
 
 /// `-p` 模式：并发消费事件流，把文本增量实时写到 stdout。
@@ -2052,9 +2177,14 @@ async fn run_print_mode(
     );
 
     // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计（成功时仍以 `RunResult` 为准）。
-    if let Ok((_, observed)) = &consume_result {
-        *observed_rounds = *observed;
+    if let Ok((_, consumed)) = &consume_result {
+        *observed_rounds = consumed.rounds;
     }
+    // 读数行在消费侧汇总；debug 记录与 stderr 出口共用同一份文本。
+    let reading = consume_result
+        .as_ref()
+        .ok()
+        .map(|(_, consumed)| (consumed.reading.clone(), consumed.reading_fields.clone()));
     if let Some(sink) = reborrow_sink(&mut debug) {
         // `Cancelled` ⇒ 补 `observed`：`enqueued` 说明 Abort 已投递（在
         // `run_single_turn` 内与 `push` 同刻写），`observed` 说明回合确实看到了它。
@@ -2073,13 +2203,19 @@ async fn run_print_mode(
             deadline.saturating_duration_since(Instant::now()),
             round_clock::turn_cache(&run_result),
         );
+        if let Some((line, fields)) = &reading {
+            record_run_reading_fields(sink, session_id, 1, line, fields);
+        }
     }
 
     // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
     report_channel_stats(stats, force_stats);
-    let result = run_result?;
-    let (printed_any, observed) = consume_result?;
-    *observed_rounds = observed;
+    // 读数行走 **stderr**：stdout 承载模型增量流，必须保持干净。
+    // 回合失败时 `run_result` 为 `Err`，但读数已算出 —— 先写读数再传播（回合错误优先）。
+    let reading_line = reading.as_ref().map(|(line, _)| line.as_str());
+    let (result, (printed_any, consumed)) =
+        finish_after_reading(&mut io::stderr(), run_result, consume_result, reading_line)?;
+    *observed_rounds = consumed.rounds;
 
     if printed_any {
         println!();
@@ -2135,13 +2271,18 @@ async fn run_json_mode(
             debug
                 .as_deref_mut()
                 .map(|sink| DebugTap { sink, session_id }),
+            1,
         ),
     );
 
     // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计。
-    if let Ok(observed) = &consume_result {
-        *observed_rounds = *observed;
+    if let Ok(consumed) = &consume_result {
+        *observed_rounds = consumed.rounds;
     }
+    let reading = consume_result
+        .as_ref()
+        .ok()
+        .map(|consumed| (consumed.reading.clone(), consumed.reading_fields.clone()));
     if let Some(sink) = reborrow_sink(&mut debug) {
         if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
             record_boundary(sink, session_id, Some(1), "observed", "abort", None);
@@ -2158,11 +2299,18 @@ async fn run_json_mode(
             deadline.saturating_duration_since(Instant::now()),
             round_clock::turn_cache(&run_result),
         );
+        if let Some((line, fields)) = &reading {
+            record_run_reading_fields(sink, session_id, 1, line, fields);
+        }
     }
 
     report_channel_stats(stats, force_stats);
-    let result = run_result?;
-    *observed_rounds = consume_result?;
+    // 读数行走 **stderr**：stdout 是逐行 `Envelope` 流，必须保持干净。
+    // 回合失败时 `run_result` 为 `Err`，但读数已算出 —— 先写读数再传播（回合错误优先）。
+    let reading_line = reading.as_ref().map(|(line, _)| line.as_str());
+    let (result, consumed) =
+        finish_after_reading(&mut io::stderr(), run_result, consume_result, reading_line)?;
+    *observed_rounds = consumed.rounds;
     Ok(result)
 }
 
@@ -3901,7 +4049,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_events(rx, &mut out, write_json_envelope, None),
+            consume_events(rx, &mut out, write_json_envelope, None, 1),
         )
         .await;
 
@@ -3954,7 +4102,7 @@ mod tests {
                         session_id: "test-session",
                     }
                 ),
-                consume_events(rx, &mut out, write_json_envelope, None),
+                consume_events(rx, &mut out, write_json_envelope, None, 1),
             )
         })
         .await;
@@ -4089,7 +4237,7 @@ mod tests {
                     session_id: "test-session",
                 }
             ),
-            consume_events(rx, &mut out, write_json_envelope, None),
+            consume_events(rx, &mut out, write_json_envelope, None, 1),
         );
         run_result.expect("run_turn 应成功");
         consume_result.expect("consume 应成功");
@@ -4217,7 +4365,7 @@ mod tests {
                         session_id: "test-session",
                     }
                 ),
-                consume_events(rx, &mut out, write_json_envelope, None),
+                consume_events(rx, &mut out, write_json_envelope, None, 1),
             )
         })
         .await;
@@ -4486,8 +4634,13 @@ mod tests {
         let limits = resolve_limits(&config);
 
         assert_eq!(
-            limits.context_window, 262_144,
-            "context_window 必须来自 config（config.json 的按 model 覆盖）"
+            limits.context_window, 200_000,
+            "有效窗口 = min(声明 262144, 默认 cap 200000)"
+        );
+        assert_eq!(
+            limits.context_window,
+            config.effective_context_window(),
+            "resolve_limits 必须走 effective 口径"
         );
         assert_ne!(
             limits.context_window,
@@ -4589,12 +4742,13 @@ mod tests {
         }
     }
 
-    /// **N16**：`resolve_limits` 把回合级工具结果预算设为 `context_window / 4`。
+    /// **N16**：`resolve_limits` 把回合级工具结果预算设为**有效窗口**的 1/4。
     ///
-    /// 断言选与默认值不同的窗口（`262_144` ⇒ `65_536`），且预算非零（`0` 会关闭闸门）。
+    /// 声明 262144 被默认 cap 200000 封顶 ⇒ 预算 50000（而非声明值的 65536）。
+    /// 断言选与默认值不同的窗口，且预算非零（`0` 会关闭闸门）。
     ///
-    /// 变异：把 `limits.max_turn_tool_result_tokens = config.context_window() / 4;` 这行
-    /// 删掉 ⇒ 落回默认 `0` ⇒ 变红；把 `/ 4` 改成别的比例 ⇒ 变红。
+    /// 变异：把 `limits.max_turn_tool_result_tokens = config.effective_context_window() / 4;`
+    /// 这行删掉 ⇒ 落回默认 `0` ⇒ 变红；改回声明窗口 ⇒ 65536 ⇒ 变红；把 `/ 4` 改成别的比例 ⇒ 变红。
     #[test]
     fn resolve_limits_sets_turn_budget_from_window() {
         let _guard = crate::test_env::env_lock();
@@ -4607,15 +4761,343 @@ mod tests {
         config.load_user_config(&path);
 
         let limits = resolve_limits(&config);
-        assert_eq!(limits.context_window, 262_144, "前置：窗口取自 config");
         assert_eq!(
-            limits.max_turn_tool_result_tokens, 65_536,
-            "回合级预算必须 == context_window / 4"
+            limits.context_window, 200_000,
+            "前置：有效窗口被封到默认 cap"
+        );
+        assert_eq!(
+            limits.max_turn_tool_result_tokens, 50_000,
+            "回合级预算必须 == effective_context_window / 4"
         );
         assert_ne!(
             limits.max_turn_tool_result_tokens, 0,
             "预算不得为 0（0 = 关闭闸门）"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A4 / A6 的应用默认值必须从 config 接进 `RunLimits`：缺省 12 / 60；
+    /// 配置显式 `0` 时保持 0（关闭）。
+    ///
+    /// 变异：删掉 `resolve_limits` 里的两行赋值 ⇒ 落回库面默认 0 ⇒ 默认段变红；
+    /// 把 config 的 0 覆盖成默认值 ⇒ 第二段变红。
+    #[test]
+    fn resolve_limits_sets_reminder_thresholds_from_config() {
+        let _guard = crate::test_env::env_lock();
+
+        let mut config = config::Config::from_env().unwrap();
+        config.model = "reminder-model".into();
+        let limits = resolve_limits(&config);
+        assert_eq!(limits.batch_nudge_at_tool_calls, 12, "app 默认 A4 阈值");
+        assert_eq!(limits.soft_round_advice_at, 60, "app 默认 A6 阈值");
+        assert_ne!(
+            limits.batch_nudge_at_tool_calls,
+            ys_component::RunLimits::default().batch_nudge_at_tool_calls,
+            "必须与库面默认 0 分离（防恒真）"
+        );
+        assert_ne!(
+            limits.soft_round_advice_at,
+            ys_component::RunLimits::default().soft_round_advice_at,
+            "必须与库面默认 0 分离（防恒真）"
+        );
+
+        // 显式 0 ⇒ 关闭；不得被 app 默认 12 / 60 覆盖。
+        let dir = unique_tmp_dir("resolve_limits_reminders_zero");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{ "batch_nudge_at_tool_calls": 0, "soft_round_advice_at": 0 }"#,
+        )
+        .unwrap();
+        let mut config = config::Config::from_env().unwrap();
+        config.model = "reminder-model".into();
+        config.load_user_config(&path);
+        let limits = resolve_limits(&config);
+        assert_eq!(limits.batch_nudge_at_tool_calls, 0, "0 = 关闭");
+        assert_eq!(limits.soft_round_advice_at, 0, "0 = 关闭");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D5：`run_start` 并列记录**声明窗口**与**有效窗口**，原字段名保持声明值。
+    ///
+    /// 变异：把 `context_window` 改成 effective（或删掉 `_effective`）⇒ 本条变红。
+    #[test]
+    fn run_start_records_declared_and_effective_context_window() {
+        let _guard = crate::test_env::env_lock();
+        let mut config = config::Config::from_env().unwrap();
+        config.model = "MiniMax-M3".into(); // 内置表声明 1M
+
+        let fields = run_start_fields(&config, None, &[]);
+        assert_eq!(
+            fields["limits"]["context_window"],
+            json!(1_000_000),
+            "原字段名保留声明值（既有日志消费方）"
+        );
+        assert_eq!(
+            fields["limits"]["context_window_effective"],
+            json!(200_000),
+            "新增字段给出默认 cap 下的有效窗口"
+        );
+    }
+
+    /// `-p` / `--json` 的读数行由消费者侧汇总：stdout 保持干净，读数只经返回值
+    /// 交给调用方写 stderr。
+    ///
+    /// 变异：把读数行也写进 `w` ⇒ stdout 断言变红；`turn` 不取自入参 ⇒ 首段变红。
+    #[tokio::test]
+    async fn consume_events_returns_run_reading_and_keeps_stdout_clean() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(env(AgentEvent::RoundStarted { round: 1 }))
+            .await
+            .unwrap();
+        tx.send(env(delta("a"))).await.unwrap();
+        tx.send(env(finished())).await.unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let consumed = consume_events(rx, &mut out, write_json_envelope, None, 7)
+            .await
+            .unwrap();
+
+        assert!(
+            consumed.reading.starts_with("turn=7 rounds=1 "),
+            "读数行必须带调用方给的回合号：{}",
+            consumed.reading
+        );
+        assert!(
+            consumed.reading.contains("tpr_x100="),
+            "读数行必须是 summary_line 的定形输出：{}",
+            consumed.reading
+        );
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            !stdout.contains("tpr_x100") && !stdout.contains("turn=7 rounds="),
+            "读数行不得混入 stdout：{stdout}"
+        );
+    }
+
+    /// 回合失败（模型错误）时，收尾仍要把已算出的读数行写到 stderr。
+    ///
+    /// 生产调用点 [`finish_after_reading`] 在传播 `run_result` 的 `Err` **之前**
+    /// 写读数；此处用真实失败回合（`MockModel::push_error` ⇒ `RunFailed` +
+    /// `run_single_turn` 返回 `Err`）驱动，再以 `Vec<u8>` 代 stderr 断言：
+    /// - 读数行确实出现；
+    /// - stdout 仍干净（错误回合无文本增量 ⇒ 空）；
+    /// - 返回 `Err` ⇒ 调用方走非零退出路径，且暴露的是回合错误。
+    ///
+    /// 变异：把读数行移到 `result?` 之后 ⇒ 本用例 stderr 为空、断言变红。
+    #[tokio::test]
+    async fn failed_turn_still_writes_reading_line_to_stderr() {
+        let model = MockModel::new("m");
+        model.push_error("provider boom");
+
+        let (sink, rx) = ChannelSink::new(
+            DEFAULT_CHANNEL_CAPACITY,
+            LifecyclePolicy::StopWhenConsumerGone,
+        );
+        let mut agent = build_agent(
+            String::new(),
+            PathBuf::from("."),
+            Vec::new(),
+            default_limits(),
+        )
+        .unwrap();
+        let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
+
+        let mut stdout: Vec<u8> = Vec::new();
+        let (run_result, consume_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run_single_turn(
+                    &mut agent,
+                    &mut wiring,
+                    SingleTurnInputs {
+                        input: AgentInput::text("hi"),
+                        budget: Duration::from_secs(60),
+                        config: None,
+                        subagent: None,
+                        debug: None,
+                        session_id: "test-session",
+                    }
+                ),
+                consume_print_events(rx, &mut stdout, None, "test-session"),
+            )
+        })
+        .await
+        .expect("失败回合也应在超时内收场");
+
+        assert!(run_result.is_err(), "模型错误应使回合失败");
+        let (printed_any, consumed) = consume_result
+            .as_ref()
+            .expect("RunFailed 是终局事件，消费应成功");
+        assert!(!*printed_any, "错误回合没有文本增量");
+        assert!(stdout.is_empty(), "stdout 必须干净（读数只进 stderr）");
+        let reading = consumed.reading.clone();
+
+        let mut stderr: Vec<u8> = Vec::new();
+        let outcome = finish_after_reading(&mut stderr, run_result, consume_result, Some(&reading));
+
+        let err = outcome
+            .err()
+            .expect("回合错误必须继续传播（调用方据此非零退出）");
+        assert!(
+            err.to_string().contains("provider boom"),
+            "暴露的应是回合错误：{err}"
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(
+            stderr.contains(&reading),
+            "回合失败时 stderr 仍须含读数行：{stderr:?}（读数 {reading:?}）"
+        );
+        assert_eq!(
+            stderr.trim_end().lines().count(),
+            1,
+            "stderr 恰为一行读数：{stderr:?}"
+        );
+    }
+
+    /// 收尾的错误优先级与「无读数不编造行」：
+    /// 消费失败时没有读数 ⇒ stderr 保持干净；回合与消费都失败 ⇒ 暴露回合错误。
+    #[test]
+    fn finish_after_reading_skips_missing_reading_and_prefers_turn_error() {
+        let mut stderr: Vec<u8> = Vec::new();
+        let err = finish_after_reading(
+            &mut stderr,
+            Err::<RunResult, _>(io::Error::other("turn boom")),
+            Err::<(), _>(io::Error::other("consume boom")),
+            None,
+        )
+        .err()
+        .expect("两个错误都必须传播");
+        assert!(
+            err.to_string().contains("turn boom"),
+            "回合错误优先于消费错误：{err}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "消费失败没有读数可写，不得编造行：{stderr:?}"
+        );
+    }
+
+    /// debug 开启时 `run_reading` 必须落一条记录（`ev` 是开放的 `&'static str`）。
+    ///
+    /// 变异：`record_run_reading` 改用别的 `ev`（或不写）⇒ 本条变红。
+    #[test]
+    fn run_reading_debug_record_is_written_when_debug_enabled() {
+        let dir = unique_tmp_dir("run_reading");
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV, debug_log::DEBUG_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
+            std::env::set_var(debug_log::DEBUG_ENV, "1");
+        }
+
+        let session = dir.join("2026-10-29-reading.jsonl");
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
+        let path = debug_log::debug_path_for(Some(&session), &log_dir);
+        let mut sink =
+            debug_log::open_enabled(true, Some(&session), Some(&log_dir)).expect("sink 应打开");
+        record_run_reading(
+            &mut sink,
+            "2026-10-29-reading",
+            2,
+            "turn=2 rounds=3 tools=4",
+        );
+        sink.flush("RunFinished");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let record = content
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["ev"] == "run_reading")
+            .expect("debug 开启时应产生 run_reading 记录");
+        assert_eq!(record["turn"], json!(2));
+        assert_eq!(record["line"], json!("turn=2 rounds=3 tools=4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 生产 `run_reading` 记录必须**同时**带 `line` 与结构化数字字段 ——
+    /// bench 的 N16 门禁直接读 `tpr_x100` / `input_med`，只写 `line` 会让它恒读假 0。
+    ///
+    /// 变异：`record_run_reading` 只写 `line` ⇒ 两个数字字段断言变红。
+    #[test]
+    fn run_reading_debug_record_carries_structured_fields() {
+        let dir = unique_tmp_dir("run_reading_fields");
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV, debug_log::DEBUG_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe {
+            std::env::set_var(crate::logging::LOG_DIR_ENV, &dir);
+            std::env::set_var(debug_log::DEBUG_ENV, "1");
+        }
+
+        let session = dir.join("2026-10-29-reading-fields.jsonl");
+        let log_dir = crate::logging::resolve_log_dir().expect("测试日志目录应可解析");
+        let path = debug_log::debug_path_for(Some(&session), &log_dir);
+        let mut sink =
+            debug_log::open_enabled(true, Some(&session), Some(&log_dir)).expect("sink 应打开");
+
+        // 一轮、一次工具调用、一条 input=128 的 usage ⇒ tpr_x100=100、input_med=128。
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+        let _ = clock.observe(&env(AgentEvent::RoundStarted { round: 1 }), t0);
+        let _ = clock.observe(&env(delta("x")), t0 + Duration::from_millis(10));
+        let _ = clock.observe(
+            &env(AgentEvent::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId("c1".into()),
+                    name: "read".into(),
+                    arguments: Value::Null,
+                },
+            }),
+            t0 + Duration::from_millis(20),
+        );
+        let _ = clock.observe(
+            &env(AgentEvent::ToolResult {
+                id: ToolCallId("c1".into()),
+                result: ys_core::ToolResult {
+                    content: "ok".into(),
+                    is_error: false,
+                },
+            }),
+            t0 + Duration::from_millis(30),
+        );
+        let _ = clock.observe(
+            &env(AgentEvent::RoundUsage {
+                purpose: ys_event::RoundPurpose::Turn,
+                round: 1,
+                usage: Usage {
+                    input_tokens: 128,
+                    output_tokens: 4,
+                    ..Default::default()
+                },
+            }),
+            t0 + Duration::from_millis(40),
+        );
+        // 开第二轮即关闭第一轮（累加进 totals）。
+        let _ = clock.observe(
+            &env(AgentEvent::RoundStarted { round: 2 }),
+            t0 + Duration::from_millis(50),
+        );
+
+        let line = clock.summary_line(1);
+        record_run_reading(&mut sink, "2026-10-29-reading-fields", 1, &line);
+        sink.flush("RunFinished");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let record = content
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["ev"] == "run_reading")
+            .expect("debug 开启时应产生 run_reading 记录");
+        assert_eq!(record["line"], json!(line), "人读出口保留");
+        assert_eq!(record["tpr_x100"], json!(100), "1 轮 1 次工具调用");
+        assert_eq!(record["input_med"], json!(128));
+        assert_eq!(record["rounds"], json!(1));
+        assert_eq!(record["tools"], json!(1));
+        assert_eq!(record["turn"], json!(1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5821,7 +6303,7 @@ mod tests {
         tx.send(env(delta("a"))).await.unwrap();
         tx.send(env(finished())).await.unwrap();
         let mut out: Vec<u8> = Vec::new();
-        consume_events(rx, &mut out, write_json_envelope, None)
+        consume_events(rx, &mut out, write_json_envelope, None, 1)
             .await
             .unwrap();
 
@@ -5899,7 +6381,7 @@ mod tests {
             }
             drop(tx);
             let mut out: Vec<u8> = Vec::new();
-            consume_events(rx, &mut out, write_json_envelope, None)
+            consume_events(rx, &mut out, write_json_envelope, None, 1)
                 .await
                 .unwrap();
             out
@@ -5946,7 +6428,7 @@ mod tests {
         tx.send(env(finished())).await.unwrap();
         drop(tx);
         let mut out: Vec<u8> = Vec::new();
-        consume_events(rx, &mut out, write_json_envelope, None)
+        consume_events(rx, &mut out, write_json_envelope, None, 1)
             .await
             .unwrap();
         let finished_line = String::from_utf8(out)

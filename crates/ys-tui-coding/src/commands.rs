@@ -728,6 +728,27 @@ pub fn spec_line(spec: &CommandSpec) -> String {
     line
 }
 
+/// context window 的缩写：`200k` / `1M` / `262k`。
+///
+/// 与 [`crate::format::format_tokens`] 的区别：窗口是**容量上限**，整千/整百万时
+/// 不带小数（`200k` 而非 `200.0k`）；非整千向下取整到 k（`262_144` ⇒ `262k`），
+/// 非整百万保留一位小数（`1_048_576` ⇒ `1.0M`）。取整而非四舍五入保证边界稳定
+/// —— `999_999` 不会进位成 `1000k`。
+fn format_context_window(n: usize) -> String {
+    if n >= 1_000_000 {
+        if n.is_multiple_of(1_000_000) {
+            format!("{}M", n / 1_000_000)
+        } else {
+            // 截断而非四舍五入（与 k 档同规则）：`1_999_999` ⇒ `1.9M`，不进位成 `2.0M`。
+            format!("{}.{}M", n / 1_000_000, (n / 100_000) % 10)
+        }
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
 /// `/status` 的正文（数据全部来自 [`CodingView`]）。
 pub fn status_text(view: &CodingView) -> String {
     let dash = || "-".to_string();
@@ -770,10 +791,18 @@ pub fn status_text(view: &CodingView) -> String {
     } else {
         format!("{} ({} omitted)", view.skills.len(), view.skills_omitted)
     };
-    let ctx = view
-        .context_window
-        .map(|c| c.to_string())
-        .unwrap_or_else(dash);
+    // context 行：只有 declared 与 effective **都存在且不等**时才并列显示
+    // （effective 在前，declared 在后）并标 `(capped)`；相等或 declared 缺失
+    // 保持单值原样 —— 这是既有快照的逐字节契约。
+    let ctx = match (view.context_window, view.context_window_declared) {
+        (Some(effective), Some(declared)) if effective != declared => format!(
+            "{} / {} (capped)",
+            format_context_window(effective),
+            format_context_window(declared)
+        ),
+        (Some(effective), _) => effective.to_string(),
+        (None, _) => dash(),
+    };
     let effort = view
         .effort
         .map(|level| level.to_string())
@@ -2021,5 +2050,73 @@ mod tests {
 
         view.skills.clear();
         assert_eq!(line(&view), "skills     -", "无 skill 与其余空字段同形");
+    }
+
+    /// context window 的缩写：整千/整百万不带小数，边界向下取整不越级。
+    ///
+    /// 变异：把 k 档改成 `{:.1}k` ⇒ `200k` / `262k` 断言变红；
+    /// 把整百万判断去掉 ⇒ `1M` 变 `1.0M`。
+    #[test]
+    fn format_context_window_abbreviates_stably() {
+        assert_eq!(format_context_window(200_000), "200k");
+        assert_eq!(format_context_window(1_000_000), "1M");
+        assert_eq!(format_context_window(262_144), "262k");
+        assert_eq!(format_context_window(999_999), "999k", "不得进位成 1000k");
+        assert_eq!(format_context_window(1_048_576), "1.0M");
+        assert_eq!(format_context_window(1_500_000), "1.5M");
+        assert_eq!(
+            format_context_window(1_999_999),
+            "1.9M",
+            "M 档与 k 档同为截断，不得进位成 2.0M"
+        );
+        assert_eq!(format_context_window(65_536), "65k");
+        assert_eq!(format_context_window(999), "999", "<1000 原样");
+    }
+
+    /// `/status` 的 context 行：declared ≠ effective 时并列两值并标 `(capped)`；
+    /// 相等或 declared 缺失时保持单值（逐字节沿用既有快照行为）。
+    ///
+    /// 变异：去掉 `(capped)` 分支 ⇒ 第一条断言变红；把相等/缺失也走并列分支
+    /// ⇒ 后两条断言变红。
+    #[test]
+    fn status_text_reports_capped_and_single_context_window() {
+        let line = |v: &CodingView| {
+            status_text(v)
+                .lines()
+                .find(|l| l.starts_with("context "))
+                .expect("`/status` 应有 context 行")
+                .to_string()
+        };
+
+        // declared ≠ effective ⇒ effective 在前、declared 在后 + `(capped)`。
+        let view = CodingView {
+            context_window: Some(200_000),
+            context_window_declared: Some(1_000_000),
+            ..CodingView::for_test()
+        };
+        let capped = line(&view);
+        assert_eq!(capped, "context    200k / 1M (capped)");
+        assert!(capped.contains("(capped)"), "{capped}");
+        assert!(capped.contains("200k") && capped.contains("1M"), "{capped}");
+
+        // 相等 ⇒ 单值，raw 数字（既有行为）。
+        let view = CodingView {
+            context_window: Some(65_536),
+            context_window_declared: Some(65_536),
+            ..CodingView::for_test()
+        };
+        let single = line(&view);
+        assert_eq!(single, "context    65536");
+        assert!(!single.contains("(capped)"), "{single}");
+
+        // declared 缺失 ⇒ 退回单值（与既有快照行为一致）。
+        let view = CodingView {
+            context_window: Some(65_536),
+            context_window_declared: None,
+            ..CodingView::for_test()
+        };
+        let legacy = line(&view);
+        assert_eq!(legacy, "context    65536");
+        assert!(!legacy.contains("(capped)"), "{legacy}");
     }
 }

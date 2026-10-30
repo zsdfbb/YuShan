@@ -44,6 +44,10 @@
 //! | `YUSHAN_BENCH_CLEAN` | 空 | 设了才删临时目录（**默认保留**，见下） |
 //! | `YUSHAN_BENCH_PROTOCOL` | `chat` | 协议面档位：`chat` / `responses`（非法值回退 `chat`） |
 //! | `YUSHAN_BENCH_BASE` | 空 | 覆盖子进程的 `YUSHAN_API_BASE`（协议面 A/B 用） |
+//! | `YUSHAN_BENCH_OUT` | 空 | 汇总 JSON 的固定落盘路径；已存在时**追加**到数组。未设置 ⇒ 写本次 run 目录 |
+//!
+//! 每条结果（提示 × repeat）另落一条 JSON 记录到 `bench-summary.json`，供跨轮对比；
+//! **stdout 表格是字节稳定的契约**，新增读数只进 JSON，不改表格。
 //!
 //! ⚠️ **默认保留证据**：临时目录里有每次运行的**逐轮日志**（`logs/yushan.log`）、
 //! 会话转录与 stdout/stderr。跑一次基准要真金白银，删掉就没法回溯「那些轮是怎么长出来的」——
@@ -84,7 +88,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// 提示集：`(名字, 任务文本, 是否长跑)`。
 ///
@@ -169,6 +173,16 @@ struct Reading {
     cache_miss: u128,
     /// 质量位（机械核对的结果；跑完拿到答案后才回填，见 `quality_of`）。
     quality: Quality,
+    /// 每轮工具调用数 ×100（整数口径，避免浮点）。取自 debug 的 `run_reading`。
+    tpr_x100: u128,
+    /// 每轮输入 token 中位数。取自 debug 的 `run_reading`。
+    input_med: u128,
+    /// 只有 1 个工具调用的轮数。取自 debug 的 `run_reading`；记录没带该字段时
+    /// 由 `round_end.tool_calls == 1` 的轮数兜底。
+    single_call_rounds: u32,
+    /// 是否读到 `run_reading` 记录。为假时上面三个字段在 JSON 里写 `null` ——
+    /// 「没有读数」不得伪装成 0。
+    run_reading_seen: bool,
 }
 
 impl Reading {
@@ -183,6 +197,57 @@ impl Reading {
             100 * self.gen_ms / total,
             100 * self.tools_ms / total,
         )
+    }
+
+    /// 一条结果的 JSON 形态。
+    ///
+    /// `run_reading` 缺失时三个新字段写 `null`，与 stdout 表格里的「-」同义；
+    /// 其余字段沿用表格口径（整数毫秒 / 计数 / 质量位短标签）。
+    fn to_json(self) -> Value {
+        let reading_field = |value: u128| {
+            if self.run_reading_seen {
+                u128_json(value)
+            } else {
+                Value::Null
+            }
+        };
+        json!({
+            "wall_ms": u128_json(self.wall_ms),
+            "rounds": self.rounds,
+            "ttft_ms": u128_json(self.ttft_ms),
+            "gen_ms": u128_json(self.gen_ms),
+            "tools_ms": u128_json(self.tools_ms),
+            "attempts": u128_json(self.attempts),
+            "retried_attempts": u128_json(self.retried_attempts),
+            "retry_wait_ms": u128_json(self.retry_wait_ms),
+            "cache_hit": u128_json(self.cache_hit),
+            "cache_miss": u128_json(self.cache_miss),
+            "cache_pct": cache_pct(self.cache_hit, self.cache_miss),
+            "quality": self.quality.label(),
+            "tpr_x100": reading_field(self.tpr_x100),
+            "input_med": reading_field(self.input_med),
+            "single_call_rounds": reading_field(u128::from(self.single_call_rounds)),
+        })
+    }
+
+    /// 吸收一条 `run_reading` debug 记录。
+    ///
+    /// 只要记录存在就置 `run_reading_seen`（「记录在、字段缺」与「记录不在」
+    /// 在 JSON 里要能区分）。`single_call_rounds` 缺失时用 `derived` 兜底 ——
+    /// 该值由同一份 debug 里的 `round_end.tool_calls` 数出来，不额外假设 schema。
+    fn absorb_run_reading(&mut self, value: &Value, derived: u32) {
+        self.run_reading_seen = true;
+        // 生产记录同时带 `line` 与顶层数字字段。顶层缺失时从 `line` 反解 ——
+        // 「有记录却读成假 0」比「没有记录」更具误导性，故必须有这条兜底。
+        let line = value.get("line").and_then(Value::as_str);
+        let read = |key: &str| {
+            json_u128(value, key).or_else(|| line.and_then(|line| field(line, &format!("{key}="))))
+        };
+        self.tpr_x100 = read("tpr_x100").unwrap_or(0);
+        self.input_med = read("input_med").unwrap_or(0);
+        self.single_call_rounds = read("single_call_rounds")
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(derived);
     }
 }
 
@@ -237,19 +302,44 @@ fn json_u128(value: &Value, key: &str) -> Option<u128> {
     value.get(key)?.as_u64().map(u128::from)
 }
 
+/// `u128` → JSON 数字。基准读数远小于 `u64::MAX`；超出时饱和（不 panic）。
+fn u128_json(value: u128) -> Value {
+    Value::from(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
 /// 解析本次运行的 debug JSONL。
 ///
 /// 以第一条 `run_end` 为界：同一会话文件可能含多次 `--resume` 运行，基准的一次
 /// 子进程只对应第一个 run。`model_attempt` 与 `round_usage` 提供文本日志没有的
 /// 重试/退避/缓存读数。
+///
+/// `run_reading` 是**可选**记录（A1 的出口；落盘顺序不保证在 `run_end` 之前）：
+/// 在第一个 `run_end` 之前或之后读到都吸收；遇到下一次 `run_start` 即停止。
+/// 完全没有该记录时三个新字段保持 0 且 `run_reading_seen = false`，不 panic。
 fn parse_debug_text(text: &str) -> Option<Reading> {
     let mut reading = Reading::default();
     let mut saw_round = false;
+    let mut finished = false;
+    // `run_reading` 没带 `single_call_rounds` 时的兜底：同一份 debug 里
+    // `round_end.tool_calls == 1` 的轮数。
+    let mut derived_single_call_rounds = 0u32;
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        match value.get("ev").and_then(Value::as_str) {
+        let ev = value.get("ev").and_then(Value::as_str);
+        if finished {
+            match ev {
+                // 下一次 `--resume` 的 run 从这里开始：本 run 的读数到此为止。
+                Some("run_start") => break,
+                Some("run_reading") => {
+                    reading.absorb_run_reading(&value, derived_single_call_rounds)
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match ev {
             Some("round_end") => {
                 saw_round = true;
                 reading.rounds = reading.rounds.saturating_add(1);
@@ -262,6 +352,9 @@ fn parse_debug_text(text: &str) -> Option<Reading> {
                 reading.tools_ms = reading
                     .tools_ms
                     .saturating_add(json_u128(&value, "tools_ms").unwrap_or(0));
+                if json_u128(&value, "tool_calls") == Some(1) {
+                    derived_single_call_rounds = derived_single_call_rounds.saturating_add(1);
+                }
             }
             Some("model_attempt") => {
                 reading.attempts = reading.attempts.saturating_add(1);
@@ -278,7 +371,8 @@ fn parse_debug_text(text: &str) -> Option<Reading> {
                 reading.cache_hit = reading.cache_hit.saturating_add(hit);
                 reading.cache_miss = reading.cache_miss.saturating_add(input.saturating_sub(hit));
             }
-            Some("run_end") => return saw_round.then_some(reading),
+            Some("run_reading") => reading.absorb_run_reading(&value, derived_single_call_rounds),
+            Some("run_end") => finished = true,
             _ => {}
         }
     }
@@ -439,6 +533,104 @@ fn cache_pct(hit: u128, miss: u128) -> String {
         .checked_div(total)
         .map(|pct| format!("{pct}%"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+// ─────────────────────────────── 汇总落盘 ───────────────────────────────
+
+/// 汇总 JSON 的固定落盘路径开关。
+const BENCH_OUT_ENV: &str = "YUSHAN_BENCH_OUT";
+
+/// 汇总 JSON 的落盘路径。
+///
+/// `YUSHAN_BENCH_OUT` 存在且非空 ⇒ 用它（固定路径，跨运行追加）；否则写本次
+/// run 目录。空串视同未设置，与仓库其他 env 的口径一致。
+fn bench_summary_path(run_root: &Path) -> PathBuf {
+    match std::env::var(BENCH_OUT_ENV) {
+        Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+        _ => run_root.join("bench-summary.json"),
+    }
+}
+
+/// 一条落盘记录：读数 + 定位信息（提示名 / 第几次 repeat / 协议面）。
+fn bench_record(name: &str, repeat: usize, protocol: Protocol, reading: &Reading) -> Value {
+    let mut record = reading.to_json();
+    if let Value::Object(fields) = &mut record {
+        fields.insert("name".to_string(), json!(name));
+        fields.insert("repeat".to_string(), json!(repeat));
+        fields.insert("protocol".to_string(), json!(protocol.label()));
+    }
+    record
+}
+
+/// 追加一条记录到 JSON 数组。
+///
+/// 语义：文件不存在 / 空 ⇒ 新建数组；已是数组 ⇒ 追加。选「追加」而非「覆盖」，
+/// 是为了 `YUSHAN_BENCH_OUT` 指向固定路径时能跨运行对比。
+///
+/// 文件存在但内容损坏（非法 JSON / 顶层不是数组）时**先改名备份再写**，
+/// 绝不把历史基准记录当空数组静默清空；备份也失败则跳过本次写入。
+/// 落盘失败只告警：读数已经打印在 stdout，基准本身不该因此失败。
+fn append_json_record(path: &Path, record: Value) {
+    if let Err(error) = try_append_json_record(path, record) {
+        eprintln!("  ! 写 {} 失败：{error}", path.display());
+    }
+}
+
+fn try_append_json_record(path: &Path, record: Value) -> std::io::Result<()> {
+    let mut records = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Array(items)) => items,
+            // 读成功但内容不是数组 / 不是合法 JSON：**绝不当作空数组覆盖** ——
+            // 那是付费基准的历史记录。先改名备份，备份失败就跳过本次写入。
+            _ => {
+                let backup = corrupt_backup_path(path);
+                if let Err(error) = std::fs::rename(path, &backup) {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{} 不是合法 JSON 数组，备份到 {} 失败，跳过本次写入：{error}",
+                            path.display(),
+                            backup.display()
+                        ),
+                    ));
+                }
+                eprintln!(
+                    "  ! {} 不是合法 JSON 数组，已备份到 {}",
+                    path.display(),
+                    backup.display()
+                );
+                Vec::new()
+            }
+        },
+        // 文件不存在（或读不到）⇒ 新建数组，与既有语义一致。
+        Err(_) => Vec::new(),
+    };
+    records.push(record);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text =
+        serde_json::to_string_pretty(&Value::Array(records)).map_err(std::io::Error::other)?;
+    text.push('\n');
+    std::fs::write(path, text)
+}
+
+/// 损坏文件的备份路径：`<name>.corrupt-<pid>-<进程内序号>`。
+///
+/// 序号用原子计数 + `process::id()`，与全仓测试隔离约定一致。
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bench-summary.json");
+    path.with_file_name(format!(
+        "{name}.corrupt-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 // ─────────────────────────────── 协议面 ───────────────────────────────
@@ -787,6 +979,8 @@ fn bench_report() {
     // 长跑项默认不跑（见 `PROMPTS` 的说明）；点名或显式开关才跑。
     let heavy_enabled = std::env::var("YUSHAN_BENCH_HEAVY").is_ok();
     let root = temp_dir("bench");
+    // 汇总 JSON：每条结果追加一条；`YUSHAN_BENCH_OUT` 可指向跨运行复用的固定路径。
+    let summary_path = bench_summary_path(&root);
     // 协议面档位：决定记录表里的「协议」列（base 由 `YUSHAN_BENCH_BASE` 覆盖）。
     let protocol = protocol_from_env();
 
@@ -833,6 +1027,7 @@ fn bench_report() {
                 Some(mut r) => {
                     // 质量位：机械核对（证据齐不齐、引用指不指得到真位置）。
                     r.quality = quality_of(&answer_text(&run_dir), &workspace, spec);
+                    append_json_record(&summary_path, bench_record(name, i + 1, protocol, &r));
                     let (t, g, s) = r.split();
                     println!(
                         "  run {}  协议 {}  质量 {}  墙钟 {}s  轮 {:<3} ttft {}%  gen {}%  tools {}%   \
@@ -1229,4 +1424,252 @@ fn base_override_needs_complete_env_credentials() {
     // SAFETY: 同上。
     unsafe { std::env::set_var("YUSHAN_API_KEY", "sk-test") };
     assert!(base_override_effective(), "base + key ⇒ 生效");
+}
+
+// ─────────────────────────────── 汇总落盘单测 ───────────────────────────────
+
+/// `Reading` → JSON：三个新字段齐全且为数字；`run_reading` 缺失时写 `null`。
+#[test]
+fn bench_summary_json_carries_run_reading_fields() {
+    let reading = Reading {
+        tpr_x100: 151,
+        input_med: 121_344,
+        single_call_rounds: 2,
+        run_reading_seen: true,
+        ..Reading::default()
+    };
+    let value = reading.to_json();
+    assert_eq!(value["tpr_x100"].as_u64(), Some(151));
+    assert_eq!(value["input_med"].as_u64(), Some(121_344));
+    assert_eq!(value["single_call_rounds"].as_u64(), Some(2));
+    assert!(value["tpr_x100"].is_u64(), "tpr_x100 必须是 JSON 数字");
+    assert!(value["input_med"].is_u64(), "input_med 必须是 JSON 数字");
+    assert!(
+        value["single_call_rounds"].is_u64(),
+        "single_call_rounds 必须是 JSON 数字"
+    );
+
+    // 没有 run_reading ⇒ 三个字段为 null（与表格的「-」同义），不伪装成 0。
+    let absent = Reading::default().to_json();
+    for key in ["tpr_x100", "input_med", "single_call_rounds"] {
+        assert!(absent[key].is_null(), "缺失 run_reading 时 {key} 应为 null");
+    }
+}
+
+/// `YUSHAN_BENCH_OUT` 存在且非空 ⇒ 固定路径生效，且跨次写入追加到同一个数组。
+#[test]
+fn bench_summary_path_honors_out_env() {
+    let _guard = env_lock();
+    let _restore = EnvRestore::capture(&[BENCH_OUT_ENV]);
+    let dir = temp_dir("bench-out-env");
+    let fixed = dir.join("fixed-summary.json");
+    let run_dir = dir.join("run");
+    // SAFETY: 持有 env_lock，独占进程环境变量的修改。
+    unsafe { std::env::set_var(BENCH_OUT_ENV, &fixed) };
+
+    assert_eq!(bench_summary_path(&run_dir), fixed, "非空 ⇒ 固定路径");
+
+    let reading = Reading {
+        rounds: 3,
+        tpr_x100: 133,
+        input_med: 900,
+        single_call_rounds: 1,
+        run_reading_seen: true,
+        ..Reading::default()
+    };
+    append_json_record(
+        &bench_summary_path(&run_dir),
+        bench_record("fact/1", 1, Protocol::Chat, &reading),
+    );
+    append_json_record(
+        &bench_summary_path(&run_dir),
+        bench_record("fact/1", 2, Protocol::Chat, &reading),
+    );
+
+    let text = std::fs::read_to_string(&fixed).expect("固定路径应已落盘");
+    let value: Value = serde_json::from_str(&text).expect("合法 JSON");
+    let records = value.as_array().expect("顶层必须是数组");
+    assert_eq!(records.len(), 2, "两次写入必须追加而不是覆盖");
+    assert_eq!(records[0]["name"], "fact/1");
+    assert_eq!(records[0]["repeat"], 1);
+    assert_eq!(records[0]["protocol"], "chat");
+    assert_eq!(records[1]["repeat"], 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 未设置（或空串）⇒ 写本次 run 目录下的 `bench-summary.json`。
+#[test]
+fn bench_summary_defaults_to_run_dir() {
+    let _guard = env_lock();
+    let _restore = EnvRestore::capture(&[BENCH_OUT_ENV]);
+    let dir = temp_dir("bench-out-default");
+    // SAFETY: 持有 env_lock，独占进程环境变量的修改。
+    unsafe { std::env::remove_var(BENCH_OUT_ENV) };
+    assert_eq!(bench_summary_path(&dir), dir.join("bench-summary.json"));
+
+    // 空串视同未设置。
+    // SAFETY: 同上。
+    unsafe { std::env::set_var(BENCH_OUT_ENV, "  ") };
+    assert_eq!(bench_summary_path(&dir), dir.join("bench-summary.json"));
+
+    // 未设置时确实写到 run 目录。
+    let reading = Reading::default();
+    append_json_record(
+        &bench_summary_path(&dir),
+        bench_record("daily/1", 1, Protocol::Chat, &reading),
+    );
+    let value: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("bench-summary.json")).expect("应写到 run 目录"),
+    )
+    .expect("合法 JSON");
+    assert_eq!(value.as_array().unwrap().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 找不到 `run_reading` ⇒ 三个字段回落为 0 / null，且解析不 panic。
+#[test]
+fn parse_debug_without_run_reading_falls_back_without_panic() {
+    let text = r#"{"ev":"run_start","pid":42}
+{"ev":"round_end","ttft_ms":10,"gen_ms":20,"tools_ms":30,"tool_calls":1}
+{"ev":"round_end","ttft_ms":11,"gen_ms":21,"tools_ms":31,"tool_calls":3}
+{"ev":"run_end"}
+"#;
+    let reading = parse_debug_text(text).expect("有 round_end 就应有读数");
+    assert_eq!(reading.rounds, 2);
+    assert_eq!(
+        (
+            reading.tpr_x100,
+            reading.input_med,
+            reading.single_call_rounds
+        ),
+        (0, 0, 0)
+    );
+    assert!(!reading.run_reading_seen);
+    let value = reading.to_json();
+    for key in ["tpr_x100", "input_med", "single_call_rounds"] {
+        assert!(value[key].is_null(), "无 run_reading 时 {key} 应为 null");
+    }
+}
+
+/// 生产 schema：`run_reading` 同时带 `line` 与顶层数字字段；只有 `line` 时
+/// 也必须能反解出 `tpr_x100` / `input_med`（bench 端兜底）。
+///
+/// 变异：`absorb_run_reading` 只读顶层键 ⇒ 第二个用例（只有 `line`）变红，
+/// 回到「有记录却读成假 0」。
+#[test]
+fn parse_debug_absorbs_run_reading_record() {
+    // 形态一：生产端当前的真实 schema —— `line`（人读出口）+ 顶层数字字段。
+    let text = r#"{"ev":"run_start","pid":42}
+{"ev":"round_end","ttft_ms":10,"gen_ms":20,"tools_ms":30,"tool_calls":1}
+{"ev":"round_end","ttft_ms":11,"gen_ms":21,"tools_ms":31,"tool_calls":2}
+{"ev":"run_reading","turn":1,"line":"turn=1 rounds=2 tools=3 tpr_x100=150 ttft_ms=21 gen_ms=41 tools_ms=61 input_med=121344 cache_pct=90","tpr_x100":150,"input_med":121344,"rounds":2,"tools":3,"single_call_rounds":7}
+{"ev":"run_end"}
+"#;
+    let reading = parse_debug_text(text).expect("应有读数");
+    assert_eq!(reading.tpr_x100, 150);
+    assert_eq!(reading.input_med, 121_344);
+    assert_eq!(reading.single_call_rounds, 7, "记录自带的值优先");
+    assert!(reading.run_reading_seen);
+
+    // 形态二：只有 `line`、没有顶层数字键 —— 仍必须从文本反解出正确值。
+    let line_only = r#"{"ev":"run_start","pid":42}
+{"ev":"round_end","ttft_ms":10,"gen_ms":20,"tools_ms":30,"tool_calls":1}
+{"ev":"round_end","ttft_ms":11,"gen_ms":21,"tools_ms":31,"tool_calls":2}
+{"ev":"run_reading","turn":1,"line":"turn=1 rounds=2 tools=3 tpr_x100=150 ttft_ms=21 gen_ms=41 tools_ms=61 input_med=121344 cache_pct=90"}
+{"ev":"run_end"}
+"#;
+    let reading = parse_debug_text(line_only).expect("应有读数");
+    assert_eq!(
+        (reading.tpr_x100, reading.input_med),
+        (150, 121_344),
+        "顶层缺失时必须从 line 反解，不能假 0"
+    );
+    assert_eq!(
+        reading.single_call_rounds, 1,
+        "line 里没有该字段 ⇒ 由 round_end.tool_calls == 1 派生"
+    );
+    assert!(reading.run_reading_seen);
+
+    // 记录在 `run_end` 之后也要吸收（落盘顺序不保证）。
+    let after = r#"{"ev":"run_start","pid":42}
+{"ev":"round_end","ttft_ms":10,"gen_ms":20,"tools_ms":30,"tool_calls":1}
+{"ev":"run_end"}
+{"ev":"run_reading","turn":1,"line":"turn=1 rounds=1 tools=1 tpr_x100=100 ttft_ms=10 gen_ms=20 tools_ms=30 input_med=777 cache_pct=n/a"}
+"#;
+    let reading = parse_debug_text(after).expect("应有读数");
+    assert_eq!((reading.tpr_x100, reading.input_med), (100, 777));
+    assert_eq!(
+        reading.single_call_rounds, 1,
+        "记录没带该字段 ⇒ 由 round_end.tool_calls == 1 派生"
+    );
+}
+
+/// 汇总文件损坏时先备份、再写新数组；**原内容不得被静默清空**。
+///
+/// 变异：把备份分支改回 `Vec::new()` 直接覆盖 ⇒ 备份文件不存在 / 内容断言变红。
+#[test]
+fn append_json_record_backs_up_corrupt_file_instead_of_overwriting() {
+    let dir = temp_dir("bench-corrupt");
+    for (file_name, payload) in [
+        ("broken.json", &b"{not json"[..]),
+        ("not-array.json", &b"{\"keep\":1}"[..]),
+    ] {
+        let path = dir.join(file_name);
+        std::fs::write(&path, payload).unwrap();
+
+        append_json_record(&path, json!({"name": "new"}));
+
+        let backup_prefix = format!("{file_name}.corrupt-");
+        let backups: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&backup_prefix))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "{file_name} 应恰好备份一次：{backups:?}");
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            payload,
+            "备份必须逐字节保留原内容"
+        );
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("新文件合法");
+        assert_eq!(value.as_array().unwrap().len(), 1, "新数组只含本次记录");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// stdout 表格是字节稳定的契约：表头与数据行的精确输出不得漂移。
+#[test]
+fn summary_table_output_is_byte_stable() {
+    assert_eq!(
+        summary_header(),
+        "提示         协议             墙钟s     轮    ttft_ms     gen_ms   tools_ms   质量  attempts  retries   retry_wait   cache"
+    );
+
+    let row = (
+        "fact/1".to_string(),
+        12_300,
+        3,
+        1_200,
+        3_400,
+        800,
+        3,
+        1,
+        500,
+        90,
+        10,
+        Quality::Pass,
+    );
+    assert_eq!(
+        summary_row(&row, Protocol::Responses),
+        "fact/1     responses     12.3     3       1200       3400        800   Q+         3        1          500     90%"
+    );
 }

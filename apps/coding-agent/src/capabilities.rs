@@ -283,8 +283,18 @@ pub fn set_model(
     // 窗口值与**来源**一起报：只有数字，用户无从判断它是厂商目录里的实测值还是兜底
     // 默认值 —— 也无从决定要不要自己写一份 `config.json` 覆盖。值与来源同源
     // （`Config::context_window_with_source` 一次判定出两个值）。
-    let (window, source) = config.context_window_with_source();
-    out.push(format!("Context window: {window} (source: {source})"));
+    //
+    // 声明值（未封顶）与实际喂入值（effective）不等时并列显示并标 `(capped)` ——
+    // 只报 effective 会让用户以为「模型不是 1M 吗」，只报声明值则掩盖主动封顶。
+    let (declared, source) = config.context_window_with_source();
+    let effective = config.effective_context_window();
+    if effective != declared {
+        out.push(format!(
+            "Context window: {effective} / {declared} (capped) (source: {source})"
+        ));
+    } else {
+        out.push(format!("Context window: {declared} (source: {source})"));
+    }
 
     out
 }
@@ -1288,7 +1298,11 @@ mod tests {
 
     /// `/model` 的输出里带**窗口值与来源**；换模型后来源跟着变。
     ///
-    /// 变异：把输出里的来源硬编码成「user override」⇒ 后两条断言（内建表 / 默认值）变红。
+    /// 声明值超过默认上限（200k）时并列显示 effective 与声明值并标 `(capped)`；
+    /// 声明值不超上限时保持单值（既有输出）。
+    ///
+    /// 变异：把输出里的来源硬编码成「user override」⇒ 后两条断言（内建表 / 默认值）变红；
+    /// 只报 effective 而不标 `(capped)` ⇒ 前两条断言变红。
     #[test]
     fn test_set_model_reports_context_window_and_source() {
         let (mut config, dir) = test_config();
@@ -1314,24 +1328,65 @@ mod tests {
         let out = set_model(&mut config, &mut wiring, &state, "deepseek-reasoner", None);
         assert!(
             out.iter()
-                .any(|l| l == "Context window: 258400 (source: user override)"),
-            "窗口值与来源都要报出来：{out:?}"
+                .any(|l| l == "Context window: 200000 / 258400 (capped) (source: user override)"),
+            "窗口值与来源都要报出来，封顶时并列：{out:?}"
         );
 
-        // 换模型 ⇒ 来源跟着变（内建兜底表）。
+        // 换模型 ⇒ 来源跟着变（内建兜底表）；1M 声明值被默认 200k 封顶。
         let out = set_model(&mut config, &mut wiring, &state, "MiniMax-M3", None);
         assert!(
             out.iter()
-                .any(|l| l == "Context window: 1000000 (source: builtin table)"),
+                .any(|l| l == "Context window: 200000 / 1000000 (capped) (source: builtin table)"),
             "换模型后来源要跟着变：{out:?}"
         );
 
-        // 再换到没人报过窗口的模型 ⇒ 兜底默认值。
+        // 再换到没人报过窗口的模型 ⇒ 兜底默认值（同样被 200k 封顶）。
         let out = set_model(&mut config, &mut wiring, &state, "my-local-model", None);
         assert!(
             out.iter()
-                .any(|l| l == "Context window: 1000000 (source: default)"),
+                .any(|l| l == "Context window: 200000 / 1000000 (capped) (source: default)"),
             "未知模型回退默认值：{out:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&cfg_dir);
+    }
+
+    /// 声明值**不超上限**时保持单值 —— 逐字节沿用既有输出（不加 `(capped)`）。
+    ///
+    /// 变异：无条件拼接 `effective / declared (capped)` ⇒ 本用例变红。
+    #[test]
+    fn test_set_model_reports_single_window_when_not_capped() {
+        let (mut config, dir) = test_config();
+        config.api_base = Some("https://api.deepseek.com".into());
+        config.api_key = Some("sk-x".into());
+        config.provider = Some("deepseek".into());
+
+        // 128k 声明值 < 默认 200k 上限 ⇒ effective == declared。
+        let cfg_dir = temp_dir("user_config_uncapped");
+        let cfg_path = cfg_dir.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{
+                "context_window": { "small-model": 128000 }
+            }"#,
+        )
+        .unwrap();
+        config.load_user_config(&cfg_path);
+
+        let (state, state_dir) = test_state();
+        let mut wiring = test_wiring();
+
+        let out = set_model(&mut config, &mut wiring, &state, "small-model", None);
+        assert!(
+            out.iter()
+                .any(|l| l == "Context window: 128000 (source: user override)"),
+            "未封顶时保持单值：{out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("(capped)")),
+            "未封顶不得出现 (capped)：{out:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

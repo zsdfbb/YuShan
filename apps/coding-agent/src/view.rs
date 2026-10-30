@@ -155,7 +155,17 @@ pub fn build_view(
         // R3 的可见性出口：预算安全阀把一部分 skill 从**模型**目录里收起时，
         // 用户仍要在 `/status` 看得见（默认预算下恒为 0）。
         skills_omitted: cfg.skills_omitted,
-        context_window: Some(agent.context_window()),
+        // effective 与 declared **同源取自 `cfg`**：`build_view` 产出的是「下一回合
+        // 将使用的窗口」这一**前瞻**视图。`cfg` 在 `/model` / `/login` 时立即更新，
+        // 而 agent 的窗口要到回合开头（`set_context_window`）才刷新 —— 两者在稳态下
+        // 恒等，只在切换的瞬间分叉，此时 `cfg` 才是正确的那个。若 effective 取
+        // `agent.context_window()`，从 1M（effective 200k）切到 128k 后会显示
+        // `200k / 128k (capped)`：effective 大于 declared 却标 capped，与 `/model`
+        // 自己基于 `effective_context_window()` 的输出直接打架。
+        context_window: Some(cfg.effective_context_window()),
+        // 声明窗口（未封顶）与 effective 并列进快照：两者不等时 `/status` 显示
+        // `effective / declared (capped)`。
+        context_window_declared: Some(cfg.context_window()),
         session_path: wiring.session_path().map(ToOwned::to_owned),
         // 首次运行 = 没有任何 auth 且没有 state.json（欢迎语用）。
         is_first_run: registry.logged_in_providers().is_empty() && !state.exists(),
@@ -295,7 +305,16 @@ mod tests {
         assert_eq!(view.message_count, 0);
         assert!(view.session_path.is_none(), "一次性会话无文件");
         assert!(view.is_first_run);
-        assert_eq!(view.context_window, Some(agent.context_window()));
+        assert_eq!(
+            view.context_window,
+            Some(cfg.effective_context_window()),
+            "effective 窗口与 declared 同源取自 cfg（前瞻视图）"
+        );
+        assert_eq!(
+            view.context_window_declared,
+            Some(cfg.context_window()),
+            "声明窗口必须进快照：与 effective 不等时 /status 显示 (capped)"
+        );
         assert_eq!(
             view.effort,
             Some(ys_core::EffortLevel::High),

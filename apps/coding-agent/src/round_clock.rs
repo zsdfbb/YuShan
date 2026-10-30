@@ -57,6 +57,26 @@ pub(crate) struct RoundObservation {
     pub records: Vec<DebugRecord>,
 }
 
+/// 回合级累加：把每轮的读数与 usage 汇总成一行 `summary_line`。
+///
+/// 口径与逐轮行一致：耗时复用 `close_round` 里同一组 `span_ms`，不另立一套。
+/// `input_tokens` 逐次 `RoundUsage` 追加（有界于上报次数），中位数由
+/// [`RoundClock::summary_line`] 现算。
+#[derive(Default, Clone, Debug)]
+pub(crate) struct TurnTotals {
+    pub rounds: u32,
+    pub tool_calls: u32,
+    pub ttft_ms: u128,
+    pub gen_ms: u128,
+    pub tools_ms: u128,
+    /// 每次 `RoundUsage` 的 `input_tokens`，供中位数使用。
+    pub input_tokens: Vec<u32>,
+    pub cache_hit: u64,
+    pub cache_miss: u64,
+    /// 至少有一条 `RoundUsage` 带缓存读数；缓存百分比的分母只含这类轮。
+    pub cache_reported: bool,
+}
+
 /// 逐轮计时状态机：吃事件、吐可观测行。
 pub(crate) struct RoundClock {
     round: Option<u32>,
@@ -85,6 +105,8 @@ pub(crate) struct RoundClock {
     in_flight: HashMap<ToolCallId, (String, Instant)>,
     /// 本轮**已完成**调用的耗时，按完成顺序（与 `in_flight` 一起在轮末清空）。
     calls: Vec<(String, u128)>,
+    /// 跨轮累加；逐轮状态在 `reset_round` 里清空，这里**不**清空。
+    totals: TurnTotals,
 }
 
 impl Default for RoundClock {
@@ -113,6 +135,7 @@ impl RoundClock {
             args_mode,
             in_flight: HashMap::new(),
             calls: Vec::new(),
+            totals: TurnTotals::default(),
         }
     }
 
@@ -238,6 +261,14 @@ impl RoundClock {
                 round,
                 usage,
             } => {
+                self.totals.input_tokens.push(usage.input_tokens);
+                // 缓存分母只算**上报过读数**的轮：`cache_split` 为 `None` 表示 provider
+                // 没给缓存明细，不能把整段 input 当成未命中。
+                if let Some((hit, miss)) = usage.cache_split() {
+                    self.totals.cache_hit += hit as u64;
+                    self.totals.cache_miss += miss as u64;
+                    self.totals.cache_reported = true;
+                }
                 let mut observation = RoundObservation::default();
                 if debug {
                     let mut fields = Map::new();
@@ -309,6 +340,68 @@ impl RoundClock {
         self.close_round(false).lines
     }
 
+    /// 回合级读数的**数字字段**：定形、整数、顺序固定，供 `run_reading` 记录与
+    /// [`RoundClock::summary_line`] **共用**。
+    ///
+    /// `tpr_x100` 是「每轮工具调用数 ×100」（整数百分比口径）；`input_med` 取
+    /// `input_tokens` 的中位数，偶数个时取中间两个的**较小者**（保持整数、可预测）。
+    ///
+    /// `cache_pct` 不在本表里 —— 它可能是 `n/a`，不是数字；文本出口仍由
+    /// [`RoundClock::summary_line`] 在同一处追加。
+    pub(crate) fn summary_fields(&self, turn: u32) -> Vec<(&'static str, u128)> {
+        let totals = &self.totals;
+        let tpr_x100 = if totals.rounds == 0 {
+            0
+        } else {
+            u128::from(totals.tool_calls) * 100 / u128::from(totals.rounds)
+        };
+
+        let mut inputs = totals.input_tokens.clone();
+        inputs.sort_unstable();
+        let input_med = if inputs.is_empty() {
+            0
+        } else {
+            // 偶数个取中间两个的较小者：`len / 2 - 1`。
+            u128::from(inputs[(inputs.len() - 1) / 2])
+        };
+
+        vec![
+            ("turn", u128::from(turn)),
+            ("rounds", u128::from(totals.rounds)),
+            ("tools", u128::from(totals.tool_calls)),
+            ("tpr_x100", tpr_x100),
+            ("ttft_ms", totals.ttft_ms),
+            ("gen_ms", totals.gen_ms),
+            ("tools_ms", totals.tools_ms),
+            ("input_med", input_med),
+        ]
+    }
+
+    /// 回合级读数：定形、整数、grep 友好，**不含浮点**。
+    ///
+    /// 数字字段全部来自 [`RoundClock::summary_fields`]（同源，避免文本与记录两套口径）；
+    /// `cache_pct` 的分母只含上报过缓存读数的轮；没有读数或分母为 0 时写 `n/a`
+    /// （不伪装成 0% 命中）。
+    pub(crate) fn summary_line(&self, turn: u32) -> String {
+        let mut line = String::new();
+        for (key, value) in self.summary_fields(turn) {
+            line.push_str(&format!("{key}={value} "));
+        }
+        line.push_str(&format!("cache_pct={}", self.cache_pct()));
+        line
+    }
+
+    /// 缓存命中百分比；没有可用的分母时返回 `n/a`。
+    fn cache_pct(&self) -> String {
+        let totals = &self.totals;
+        if totals.cache_reported && totals.cache_hit + totals.cache_miss > 0 {
+            let total = totals.cache_hit + totals.cache_miss;
+            format!("{}", totals.cache_hit * 100 / total)
+        } else {
+            "n/a".to_string()
+        }
+    }
+
     /// 关闭当前轮：文本行与 `round_end` 记录来自同一次状态迁移。
     ///
     /// `with_records = false` 时跳过摘要与记录构造（关闭 debug 的路径）。
@@ -331,12 +424,20 @@ impl RoundClock {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
+        // 三段耗时只在这里算一次：逐轮行、`round_end` 记录与回合累加共用同一口径。
+        let ttft_ms = span_ms(self.started, first_out);
+        let gen_ms = span_ms(first_out, model_end);
+        let tools_ms = span_ms(self.first_tool, self.last_tool);
+        let total_ms = span_ms(self.started, self.last_tool.or(model_end));
+
+        self.totals.rounds += 1;
+        self.totals.tool_calls += self.tool_calls;
+        self.totals.ttft_ms += ttft_ms;
+        self.totals.gen_ms += gen_ms;
+        self.totals.tools_ms += tools_ms;
+
         let mut lines = vec![format!(
-            "round={round} ttft_ms={} gen_ms={} tools_ms={} total_ms={}",
-            span_ms(self.started, first_out),
-            span_ms(first_out, model_end),
-            span_ms(self.first_tool, self.last_tool),
-            span_ms(self.started, self.last_tool.or(model_end)),
+            "round={round} ttft_ms={ttft_ms} gen_ms={gen_ms} tools_ms={tools_ms} total_ms={total_ms}",
         )];
         if !self.calls.is_empty() {
             let parts: Vec<String> = self
@@ -1300,6 +1401,204 @@ mod tests {
         assert!(
             tools_ms as f64 / total_ms as f64 > 0.99,
             "工具阻塞占比 = {tools_ms}/{total_ms}"
+        );
+    }
+
+    // ---- A1 回合级累加与 summary_line ----
+
+    /// 造一条 `RoundUsage`：`hit = None` 表示 provider 未上报缓存明细。
+    fn round_usage(round: u32, input: u32, hit: Option<u32>) -> AgentEvent {
+        AgentEvent::RoundUsage {
+            purpose: RoundPurpose::Turn,
+            round,
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: 0,
+                prompt_cache_hit_tokens: hit,
+                prompt_cache_miss_tokens: None,
+                reasoning_tokens: None,
+            },
+        }
+    }
+
+    /// 两轮事件后：轮数、工具调用数、三段耗时都按 `close_round` 的同一口径累加。
+    ///
+    /// 变异：① `close_round` 不累加 `tool_calls` ⇒ 第二条断言变红；
+    /// ② 累加时用 `span_ms(started, ...)` 另起口径 ⇒ 耗时断言变红。
+    #[test]
+    fn round_clock_accumulates_turn_totals_across_rounds() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+
+        clock.observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        clock.observe(&env_of(text_delta()), t0 + 100 * MS);
+        clock.observe(&env_of(tool_call_id("c1")), t0 + 300 * MS);
+        clock.observe(&env_of(tool_result_id("c1")), t0 + 400 * MS);
+        clock.observe(&env_of(round_usage(1, 100, Some(90))), t0 + 450 * MS);
+        // 开第二轮即关闭第一轮。
+        clock.observe(
+            &env_of(AgentEvent::RoundStarted { round: 2 }),
+            t0 + 500 * MS,
+        );
+        clock.observe(&env_of(text_delta()), t0 + 700 * MS);
+        clock.observe(&env_of(text_delta()), t0 + 900 * MS);
+        clock.observe(&env_of(round_usage(2, 200, Some(180))), t0 + 950 * MS);
+        clock.observe(
+            &env_of(AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 2,
+            }),
+            t0 + 1000 * MS,
+        );
+
+        assert_eq!(clock.totals.rounds, 2);
+        assert_eq!(clock.totals.tool_calls, 1, "两轮合计 1 次调用");
+        assert_eq!(clock.totals.ttft_ms, 300, "第一轮 100 + 第二轮 200");
+        assert_eq!(clock.totals.gen_ms, 400, "第一轮 200 + 第二轮 200");
+        assert_eq!(clock.totals.tools_ms, 100, "只有第一轮有工具段");
+        assert_eq!(clock.totals.input_tokens, vec![100, 200]);
+    }
+
+    /// `summary_line` 逐字定形：十个键固定顺序，值全为整数或 `n/a`。
+    ///
+    /// 变异：把任一字段改成浮点 / 改键名 / 改顺序 ⇒ 本条变红。
+    #[test]
+    fn summary_line_has_a_fixed_integer_shape() {
+        let t0 = Instant::now();
+        let mut clock = RoundClock::default();
+        clock.observe(&env_of(AgentEvent::RoundStarted { round: 1 }), t0);
+        clock.observe(&env_of(text_delta()), t0 + 100 * MS);
+        clock.observe(&env_of(tool_call_id("c1")), t0 + 300 * MS);
+        clock.observe(&env_of(tool_result_id("c1")), t0 + 400 * MS);
+        clock.observe(&env_of(round_usage(1, 100, Some(90))), t0 + 450 * MS);
+        clock.observe(
+            &env_of(AgentEvent::RoundStarted { round: 2 }),
+            t0 + 500 * MS,
+        );
+        clock.observe(&env_of(text_delta()), t0 + 700 * MS);
+        clock.observe(&env_of(text_delta()), t0 + 900 * MS);
+        clock.observe(&env_of(round_usage(2, 200, Some(180))), t0 + 950 * MS);
+        clock.observe(
+            &env_of(AgentEvent::RunFinished {
+                stop_reason: StopReason::Completed,
+                usage: Usage::default(),
+                rounds: 2,
+            }),
+            t0 + 1000 * MS,
+        );
+
+        let line = clock.summary_line(3);
+        assert_eq!(
+            line,
+            "turn=3 rounds=2 tools=1 tpr_x100=50 ttft_ms=300 gen_ms=400 tools_ms=100 \
+             input_med=100 cache_pct=90"
+        );
+
+        // 逐字段拆分：键名与顺序固定，数值只含 ASCII 数字（或 cache_pct 的 `n/a`）。
+        let keys = [
+            "turn",
+            "rounds",
+            "tools",
+            "tpr_x100",
+            "ttft_ms",
+            "gen_ms",
+            "tools_ms",
+            "input_med",
+            "cache_pct",
+        ];
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), keys.len(), "{line}");
+        for (field, key) in fields.iter().zip(keys) {
+            let (name, value) = field.split_once('=').expect("键=值");
+            assert_eq!(name, key, "{line}");
+            if key == "cache_pct" {
+                assert!(
+                    value == "n/a" || value.bytes().all(|b| b.is_ascii_digit()),
+                    "{line}"
+                );
+            } else {
+                assert!(
+                    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+                    "值必须是整数：{line}"
+                );
+            }
+        }
+    }
+
+    /// 缓存分母只算**上报过 usage 的轮**：3 条里 1 条 `None`，分母只含另两条。
+    ///
+    /// 变异：把未上报轮也算进分母（例如用 `input_tokens` 兜底）⇒ `cache_pct` 从
+    /// 65 变成 18，断言变红。
+    #[test]
+    fn summary_line_cache_denominator_only_counts_reported_rounds() {
+        let mut clock = RoundClock::default();
+        clock.observe(&env_of(round_usage(1, 100, Some(80))), Instant::now());
+        // 未上报：input 500 不得进入缓存分母。
+        clock.observe(&env_of(round_usage(2, 500, None)), Instant::now());
+        clock.observe(&env_of(round_usage(3, 100, Some(50))), Instant::now());
+
+        assert_eq!(clock.totals.cache_hit, 130);
+        assert_eq!(clock.totals.cache_miss, 70);
+        let line = clock.summary_line(1);
+        assert!(
+            line.ends_with("input_med=100 cache_pct=65"),
+            "分母只含 2 条上报轮（130 / 200）：{line}"
+        );
+    }
+
+    /// 全部未上报 ⇒ `cache_pct=n/a`，绝不伪装成 0%。
+    ///
+    /// 变异：把 `cache_reported == false` 的分支写成 `0` ⇒ 本条变红。
+    #[test]
+    fn summary_line_cache_pct_is_na_when_nothing_reported() {
+        let mut clock = RoundClock::default();
+        clock.observe(&env_of(round_usage(1, 100, None)), Instant::now());
+        clock.observe(&env_of(round_usage(2, 200, None)), Instant::now());
+
+        assert!(!clock.totals.cache_reported);
+        let line = clock.summary_line(1);
+        assert!(line.ends_with("cache_pct=n/a"), "{line}");
+        assert!(!line.contains("cache_pct=0"), "{line}");
+    }
+
+    /// 零轮：`tpr_x100=0` 且不 panic（不得做除零）。
+    ///
+    /// 变异：去掉 `rounds == 0` 分支 ⇒ 直接除零 panic。
+    #[test]
+    fn summary_line_zero_rounds_does_not_panic() {
+        let clock = RoundClock::default();
+        let line = clock.summary_line(1);
+        assert_eq!(
+            line,
+            "turn=1 rounds=0 tools=0 tpr_x100=0 ttft_ms=0 gen_ms=0 tools_ms=0 input_med=0 \
+             cache_pct=n/a"
+        );
+    }
+
+    /// 中位数：奇数个取正中，偶数个取中间两个的**较小者**。
+    ///
+    /// 变异：偶数个改取较大者 ⇒ `input_med=10` 变 20，断言变红。
+    #[test]
+    fn summary_line_input_median_odd_and_even() {
+        let mut odd = RoundClock::default();
+        for input in [10, 20, 30] {
+            odd.observe(&env_of(round_usage(1, input, None)), Instant::now());
+        }
+        assert!(
+            odd.summary_line(1).contains("input_med=20"),
+            "{}",
+            odd.summary_line(1)
+        );
+
+        let mut even = RoundClock::default();
+        for input in [5, 10, 20, 30] {
+            even.observe(&env_of(round_usage(1, input, None)), Instant::now());
+        }
+        assert!(
+            even.summary_line(1).contains("input_med=10"),
+            "偶数个取中间两个的较小者：{}",
+            even.summary_line(1)
         );
     }
 }

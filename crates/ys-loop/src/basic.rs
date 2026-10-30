@@ -59,6 +59,54 @@ const NARRATION_NUDGE_PROMPT: &str = "You have run several tool calls in a row w
      one short sentence (at most 120 characters) telling the user what you are doing right now. \
      One sentence only — do not explain your reasoning and do not restate what you already found.";
 
+/// A4 批处理提醒：回合内累计工具调用到阈值、且模型当前仍在「一轮一调用」时，主循环把它
+/// 作为一条 `User` 消息补进**下一轮的请求**（不落 session）。
+///
+/// 纯常量、不做数字插值（ADR-0024「同内容恒同字节」）。只陈述代价、**不规定形状**：
+/// 模型每条 `bash` 已平均含 4 个以上 shell 步骤，硬性要求「一条消息发多个调用」会诱导
+/// 它把一条管道拆成多次 `bash`。末尾的 `Keep dependent steps separate.` 是必需句，
+/// 否则会诱导它对有依赖的步骤做无效批处理。
+const BATCH_NUDGE_PROMPT: &str = "Harness hint: this turn has made many tool calls, and most \
+     messages carried only one. Every message is a full model round-trip. If the next lookups \
+     are independent of each other, cover them in one message or one call — `read` accepts \
+     `paths=[...]` and `grep` accepts `paths=[...]`, and independent read-only calls sent \
+     together run in parallel. Keep dependent steps separate.";
+
+/// A6 轮数软提醒：回合内轮数到阈值时补进**下一轮请求**（不落 session、不中断回合）。
+///
+/// 只要求「汇报进展或收敛」，不规定具体动作 —— 到阀的回合可能仍在正常探索，
+/// 提醒的作用是让用户看到当前位置，而不是强行终止。
+const SOFT_ROUND_ADVICE: &str = "Harness hint: this turn has run for many rounds without \
+     converging. If you are still exploring, stop and report: what is done, what is blocked, and \
+     what you need from the user. Do not keep probing without telling the user where things stand.";
+
+/// A4 批处理提醒计数推进。
+///
+/// - 累计本轮工具调用数（**单调，不因某一轮多调用而重置**）。
+/// - 到阈值 **且** 当前 `tpr < 1.5` ⇒ 返回 `true` 并把阈值翻倍。
+/// - `tpr >= 1.5`（模型已经在批处理）⇒ **不触发、也不推进阈值**；下一轮再判。
+///   这正是旧判据的缺陷所在：旧判据按「连续单调用轮」计数，中间夹一轮多调用就清零，
+///   实测只触发 4/10 次且多落在回合末尾。
+fn advance_batch_nudge(
+    calls: usize,
+    rounds: u32,
+    cumulative: &mut usize,
+    threshold: &mut usize,
+) -> bool {
+    *cumulative = cumulative.saturating_add(calls);
+    if *threshold == 0 || *cumulative < *threshold {
+        return false;
+    }
+    // tpr < 1.5  ⇔  cumulative / rounds < 3/2  ⇔  cumulative * 2 < rounds * 3
+    // 用 u64 相乘避免溢出；`rounds == 0` 时视为 tpr 0（会触发），但调用点保证 rounds >= 1。
+    if (*cumulative as u64) * 2 < (rounds as u64) * 3 {
+        *threshold = threshold.saturating_mul(2);
+        true
+    } else {
+        false
+    }
+}
+
 /// 一次工具调用的超时预算：**工具声明值优先** → 否则 `limits.bash_timeout` → 否则 300s。
 ///
 /// 「优先」而非取 min：`bash_timeout` 管的是「shell 命令多久算卡死」，不该成为长任务
@@ -463,6 +511,21 @@ impl AgentLoop for BasicLoop {
         // 若追加进会话，它会像之前的叙述一样被之后**每一轮**重读，反而把想省的成本加回去。
         let mut narration_nudge = false;
 
+        // A4 批处理提醒：本回合**累计**工具调用数（单调，不因某一轮多调用而重置）。
+        //
+        // 到阈值 **且** 当前 `tpr < 1.5` ⇒ 置 `batch_nudge`，并把阈值翻倍；
+        // `tpr >= 1.5` 说明模型已经在批处理，不打扰、也不推进阈值。
+        // 阈值 `0` ⇒ 关闭。
+        let mut batch_nudge_at = ctx.limits.batch_nudge_at_tool_calls;
+        let mut cumulative_tool_calls: usize = 0;
+        let mut batch_nudge = false;
+
+        // A6 轮数软提醒：回合内轮数到阈值后，在**下一轮请求**末尾补一条「汇报或收敛」。
+        // 每回合重置（本变量就是回合局部状态），触发后阈值 ×2（60 → 120 → 240）。
+        // 不产生事件、不落 session、不中断回合；阈值 `0` ⇒ 关闭。
+        let mut soft_round_advice_at = ctx.limits.soft_round_advice_at;
+        let mut soft_round_advice = false;
+
         // 回合级工具输出闸门的**下界锚**：本回合新增消息的起点。必须在 Step 2 append
         // 用户消息**之前**取，否则用户消息会被当成可降级对象。
         let turn_start = ctx.session.messages().len();
@@ -631,13 +694,20 @@ impl AgentLoop for BasicLoop {
             emit(ctx.events, AgentEvent::RoundStarted { round: rounds })
                 .await
                 .map_err(LoopError::Event)?;
+            // A6 轮数软提醒判定：轮数递增之后、请求组装之前。
+            // 触发即把阈值 ×2，下一次要到更晚的轮次；`0` = 关闭。
+            if soft_round_advice_at > 0 && rounds as usize >= soft_round_advice_at {
+                soft_round_advice = true;
+                soft_round_advice_at = soft_round_advice_at.saturating_mul(2);
+            }
             let tools = ctx.registry.specs().to_vec();
-            // 「闷头干活」提醒：**只影响本轮请求**，不落 session（见 `narration_nudge` 声明处）。
+            // 提醒注入：**只影响本轮请求**，不落 session（见 `narration_nudge` 声明处）。
             //
-            // 时机：上一轮的工具调用把 `silent_tool_calls` 推到阀值 ⇒ 本轮开头把一条
-            // `User` 消息补在消息末尾（照 `TRUNCATED_CONTINUE_PROMPT` 的 `User` 先例）。
-            // 注入后阀值翻倍 —— 模型若又沉默这么久，下一轮再来一条；不翻倍的话
-            // 它会**每轮都**挨一条，恰好变成我们想消除的“唠叨”。
+            // 时机：上一轮的工具调用把对应计数推到阀值 ⇒ 本轮开头把一条 `User` 消息
+            // 补在消息末尾（照 `TRUNCATED_CONTINUE_PROMPT` 的 `User` 先例）。
+            //
+            // 优先级固定 `narration > A4 > A6`，**每轮至多一条**；未选中的标志保留到
+            // 下一轮（不清零）—— 同时发三条会浪费 token 且互相稀释。
             let mut request_messages = ctx.session.messages().to_vec();
             if narration_nudge {
                 request_messages.push(Message {
@@ -647,6 +717,22 @@ impl AgentLoop for BasicLoop {
                     }],
                 });
                 narration_nudge = false;
+            } else if batch_nudge {
+                request_messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: BATCH_NUDGE_PROMPT.to_string(),
+                    }],
+                });
+                batch_nudge = false;
+            } else if soft_round_advice {
+                request_messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: SOFT_ROUND_ADVICE.to_string(),
+                    }],
+                });
+                soft_round_advice = false;
             }
             let request = ModelRequest {
                 messages: request_messages,
@@ -1323,6 +1409,19 @@ impl AgentLoop for BasicLoop {
                         silent_tool_calls = 0;
                     }
                 }
+            }
+
+            // A4 批处理提醒计数推进（与 narration 同一处账务，判据独立）。
+            //
+            // 累计本回合工具调用数（单调、不因多调用轮清零）；到阈值且当前 `tpr < 1.5`
+            // 才置标志并把阈值翻倍。下一轮 Step 5 按优先级注入，**不落 session**。
+            if batch_nudge_at > 0 {
+                batch_nudge |= advance_batch_nudge(
+                    tool_calls.len(),
+                    rounds,
+                    &mut cumulative_tool_calls,
+                    &mut batch_nudge_at,
+                );
             }
 
             // Step 11：回合级工具输出总量闸门 —— 超预算时降级**更早**的结果（头部截断 +
@@ -5569,6 +5668,422 @@ mod tests {
             0,
             "阀值 0 必须完全关闭提醒；实际 {:?}",
             model.nudges()
+        );
+    }
+
+    // ==================== A4 单调用 / A6 轮数软提醒 ====================
+
+    /// 一次请求里三条提醒各自是否出现。正常每轮至多一条。
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct ReminderPresence {
+        narration: bool,
+        batch_nudge: bool,
+        soft_round: bool,
+    }
+
+    impl ReminderPresence {
+        fn total(&self) -> usize {
+            self.narration as usize + self.batch_nudge as usize + self.soft_round as usize
+        }
+    }
+
+    fn contains_prompt(message: &Message, prompt: &str) -> bool {
+        message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text == prompt))
+    }
+
+    /// 记录**每次请求带了哪条提醒**的模型；前 `silent_rounds` 轮各发
+    /// `calls_per_round` 个工具调用（不发正文），之后回终稿。
+    struct ReminderProbeModel {
+        silent_rounds: usize,
+        calls_per_round: usize,
+        /// 从第几轮（0 起）开始**同时输出一句正文**。默认 `usize::MAX` = 始终不说话。
+        /// 用于让 narration 只触发一次（说话会把它归零），而 A4 不受影响。
+        speak_from_round: usize,
+        round: AtomicUsize,
+        sampled: Mutex<Vec<ReminderPresence>>,
+    }
+
+    impl ReminderProbeModel {
+        fn new(silent_rounds: usize, calls_per_round: usize) -> Self {
+            Self {
+                silent_rounds,
+                calls_per_round,
+                speak_from_round: usize::MAX,
+                round: AtomicUsize::new(0),
+                sampled: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn speak_from(mut self, round: usize) -> Self {
+            self.speak_from_round = round;
+            self
+        }
+
+        fn sampled(&self) -> Vec<ReminderPresence> {
+            self.sampled.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ReminderProbeModel {
+        fn model_id(&self) -> &str {
+            "reminder-probe"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            self.sampled.lock().unwrap().push(ReminderPresence {
+                narration: request
+                    .messages
+                    .iter()
+                    .any(|m| contains_prompt(m, NARRATION_NUDGE_PROMPT)),
+                batch_nudge: request
+                    .messages
+                    .iter()
+                    .any(|m| contains_prompt(m, BATCH_NUDGE_PROMPT)),
+                soft_round: request
+                    .messages
+                    .iter()
+                    .any(|m| contains_prompt(m, SOFT_ROUND_ADVICE)),
+            });
+
+            let round = self.round.fetch_add(1, Ordering::SeqCst);
+            if round < self.silent_rounds {
+                let mut content: Vec<ContentBlock> = Vec::new();
+                if round >= self.speak_from_round {
+                    content.push(ContentBlock::Text {
+                        text: "checking".into(),
+                    });
+                }
+                content.extend((0..self.calls_per_round).map(|i| ContentBlock::ToolUse {
+                    id: ys_core::ToolCallId(format!("r{round}-{i}")),
+                    name: "noop".into(),
+                    arguments: serde_json::json!({}),
+                }));
+                return Ok(ys_model::ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content,
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                });
+            }
+            Ok(ys_model::ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    async fn run_reminder_turn(
+        model: &ReminderProbeModel,
+        session: &mut MemorySession,
+        limits: RunLimits,
+    ) {
+        let registry = ToolRegistry::build(vec![Box::new(NoopTool) as Box<dyn Tool>]).unwrap();
+        let mut events = CollectingSink::new();
+        let mut ctx = make_ctx(model, &registry, session, &mut events, limits);
+        BasicLoop
+            .run_turn(AgentInput::text("go"), &mut ctx)
+            .await
+            .unwrap();
+    }
+
+    /// A4 文案契约：只陈述代价、不规定形状，且末尾保留 `Keep dependent steps separate.`。
+    ///
+    /// 变异：删掉末尾那句 ⇒ 本用例变红（缺了它，提醒会诱导对有依赖的步骤做无效批处理）。
+    #[test]
+    fn batch_nudge_prompt_contract() {
+        assert!(
+            BATCH_NUDGE_PROMPT.ends_with("Keep dependent steps separate."),
+            "A4 提醒必须以 dependent-steps 约束收尾"
+        );
+        assert!(BATCH_NUDGE_PROMPT.contains("paths=[...]"));
+        assert!(BATCH_NUDGE_PROMPT.starts_with("Harness hint:"));
+        assert!(SOFT_ROUND_ADVICE.starts_with("Harness hint:"));
+    }
+
+    /// A4 计数规则（纯函数）。
+    ///
+    /// 覆盖：未到阈值不触发；到阈值且 `tpr < 1.5` 触发并翻倍；到阈值但
+    /// `tpr >= 1.5` 不触发且阈值不变；累计单调（多调用轮不清零）；阈值 0 永不触发。
+    ///
+    /// 变异：① 把累计改成「本轮调用数」⇒ 单调性断言变红；
+    ///       ② 删掉 `tpr < 1.5` 判据 ⇒ `tpr >= 1.5` 用例变红；
+    ///       ③ 去掉阈值翻倍 ⇒ 翻倍断言变红；
+    ///       ④ 删掉 `*threshold == 0` 早退 ⇒ 阈值 0 用例变红。
+    #[test]
+    fn advance_batch_nudge_rules() {
+        // 未到阈值：累计但不触发，阈值不变。
+        let mut cumulative = 0;
+        let mut threshold = 12;
+        assert!(!advance_batch_nudge(5, 3, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 5);
+        assert_eq!(threshold, 12, "未到阈值不得推进阈值");
+
+        // 到阈值且 tpr < 1.5：触发并翻倍。cumulative = 12, rounds = 12 ⇒ tpr = 1.0。
+        assert!(advance_batch_nudge(7, 12, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 12);
+        assert_eq!(threshold, 24, "12 → 24");
+
+        // 到阈值但 tpr >= 1.5：不触发、阈值不变。
+        // cumulative = 24, rounds = 16 ⇒ tpr = 1.5（边界，`<` 不成立）。
+        let mut cumulative = 22;
+        let mut threshold = 24;
+        assert!(!advance_batch_nudge(2, 16, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 24);
+        assert_eq!(threshold, 24, "已经在批处理时不得推进阈值");
+
+        // 单调性：中间一轮多调用**不清零**累计（旧判据的缺陷回归钉）。
+        let mut cumulative = 0;
+        let mut threshold = 5;
+        assert!(!advance_batch_nudge(3, 1, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 3, "多调用轮也要累计，不得归零");
+        assert!(!advance_batch_nudge(1, 2, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 4);
+        // rounds 3：tpr = 5/3 ≥ 1.5 ⇒ 累计已到阈值也不触发。
+        assert!(!advance_batch_nudge(1, 3, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 5);
+        // rounds 4：tpr = 6/4 = 1.5 ⇒ 仍不触发。
+        assert!(!advance_batch_nudge(1, 4, &mut cumulative, &mut threshold));
+        // rounds 5：tpr = 7/5 = 1.4 < 1.5 ⇒ 触发。
+        assert!(advance_batch_nudge(1, 5, &mut cumulative, &mut threshold));
+        assert_eq!(cumulative, 7, "累计从未被清零");
+        assert_eq!(threshold, 10);
+
+        // 阈值 0 ⇒ 永不触发。
+        let mut cumulative = 0;
+        let mut threshold = 0;
+        assert!(!advance_batch_nudge(
+            100,
+            1,
+            &mut cumulative,
+            &mut threshold
+        ));
+        assert_eq!(threshold, 0);
+    }
+
+    /// A4：累计调用到阈值 ⇒ 下一轮请求末尾多一条 `User` 提醒；提醒不落 session；
+    /// 阈值翻倍 ⇒ 第二次触发需要更多调用。
+    ///
+    /// 每轮 1 个调用、阈值 2：第 2 轮结束累计 2 且 tpr = 1 < 1.5 ⇒ 第 3 轮请求带提醒；
+    /// 阈值翻倍到 4 ⇒ 第 4 轮结束累计 4 才再次触发（第 5 轮请求）。
+    ///
+    /// 变异：① 删除 Step 5 的 A4 注入 ⇒ 永不出现；
+    ///       ② 去掉阈值翻倍 ⇒ 第 4 轮请求也会带提醒，`!sampled[3].batch_nudge` 变红；
+    ///       ③ 把提醒 `append` 进 session ⇒ 长度断言与「会话无提醒」断言同时变红。
+    #[tokio::test]
+    async fn batch_nudge_fires_at_threshold_and_doubles() {
+        let model = ReminderProbeModel::new(10, 1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.batch_nudge_at_tool_calls = 2;
+        run_reminder_turn(&model, &mut session, limits).await;
+
+        let sampled = model.sampled();
+        assert!(sampled.len() >= 5, "用例需要至少 5 轮；实际 {sampled:?}");
+        assert!(!sampled[0].batch_nudge && !sampled[1].batch_nudge);
+        assert!(
+            sampled[2].batch_nudge,
+            "第 2 轮后累计 2 次调用 ⇒ 第 3 轮请求必须带提醒；实际 {sampled:?}"
+        );
+        assert!(!sampled[3].batch_nudge);
+        assert!(
+            sampled[4].batch_nudge,
+            "阈值已翻倍到 4 ⇒ 第 5 轮再次提醒；实际 {sampled:?}"
+        );
+        assert!(sampled.iter().all(|p| p.total() <= 1));
+
+        // 22 = 1 条用户消息 + 11 轮 assistant + 10 条工具结果；提醒不落 session。
+        assert_eq!(
+            session.messages().len(),
+            22,
+            "提醒只应存在于当轮请求，不得写进会话"
+        );
+        assert!(
+            !session
+                .messages()
+                .iter()
+                .any(|m| contains_prompt(m, BATCH_NUDGE_PROMPT)),
+            "A4 提醒不得写进会话"
+        );
+    }
+
+    /// A4：模型本来就在批处理（每轮 2 个调用，tpr = 2 ≥ 1.5）⇒ 即使累计远超阈值也
+    /// **不打扰** —— 此时提醒是错的建议。
+    ///
+    /// 变异：删掉 `tpr < 1.5` 判据 ⇒ 第 2 轮后就会注入提醒，本用例变红。
+    #[tokio::test]
+    async fn batch_nudge_skips_when_model_already_batches() {
+        let model = ReminderProbeModel::new(10, 2);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.batch_nudge_at_tool_calls = 2;
+        run_reminder_turn(&model, &mut session, limits).await;
+
+        assert!(
+            model.sampled().iter().all(|p| !p.batch_nudge),
+            "tpr = 2 ≥ 1.5 ⇒ 模型已在批处理，不得提醒；实际 {:?}",
+            model.sampled()
+        );
+    }
+
+    /// A6：阈值 60 → 120 → 240 各提醒一次；提醒不落 session。
+    ///
+    /// 变异：去掉阈值 ×2 ⇒ 第 60 轮之后每轮都带提醒，第 61 轮断言变红。
+    #[tokio::test]
+    async fn soft_round_advice_doubles_at_60_120_240() {
+        let model = ReminderProbeModel::new(250, 1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(300);
+        limits.soft_round_advice_at = 60;
+        run_reminder_turn(&model, &mut session, limits).await;
+
+        let sampled = model.sampled();
+        assert!(
+            sampled.len() >= 240,
+            "用例需要跑到第 240 轮；实际 {}",
+            sampled.len()
+        );
+        assert!(!sampled[58].soft_round);
+        assert!(sampled[59].soft_round, "第 60 轮必须提醒");
+        assert!(!sampled[118].soft_round);
+        assert!(sampled[119].soft_round, "第 120 轮必须再次提醒");
+        assert!(!sampled[238].soft_round);
+        assert!(sampled[239].soft_round, "第 240 轮必须再次提醒");
+        assert!(sampled.iter().all(|p| p.total() <= 1));
+
+        assert!(
+            !session
+                .messages()
+                .iter()
+                .any(|m| contains_prompt(m, SOFT_ROUND_ADVICE)),
+            "A6 提醒只应存在于当轮请求，不得写进会话"
+        );
+    }
+
+    /// A6：阈值每回合重置 —— 上一回合触发过并翻倍，新回合仍从基础阈值起算。
+    ///
+    /// 变异：把阈值改成跨回合持久（例如塞进 `RuntimeContext` / session）⇒ 第二回合
+    ///       第 2 轮不会提醒，本用例变红。
+    #[tokio::test]
+    async fn soft_round_advice_resets_each_turn() {
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.soft_round_advice_at = 2;
+
+        let first = ReminderProbeModel::new(3, 1);
+        run_reminder_turn(&first, &mut session, limits.clone()).await;
+        assert!(
+            first.sampled()[1].soft_round,
+            "第一回合第 2 轮必须提醒；实际 {:?}",
+            first.sampled()
+        );
+
+        let second = ReminderProbeModel::new(2, 1);
+        run_reminder_turn(&second, &mut session, limits).await;
+        assert!(
+            second.sampled()[1].soft_round,
+            "新回合阈值必须回到 2（不能沿用上一回合翻倍后的值）；实际 {:?}",
+            second.sampled()
+        );
+    }
+
+    /// R5 注入优先级：三条同时置位 ⇒ 本次请求**只有一条**且是 narration；
+    /// A4 / A6 标志顺延到下一轮，顺序稳定为 `narration > A4 > A6`。
+    ///
+    /// A6 阈值取 2：narration / A4 在第 1 轮结束时置位，A6 在第 2 轮开头置位，
+    /// 这样第 2 轮请求才会「三条同时置位」。
+    ///
+    /// 变异：把 `else if` 链改成三个独立 `if` ⇒ 每轮 `total()` 会 > 1，本用例变红。
+    #[tokio::test]
+    async fn nudge_priority_prefers_narration_then_batch_then_soft_round() {
+        // 第 1 轮沉默（narration 触发一次）；之后每轮说一句（narration 归零，
+        // 不再抢优先级），但 A4 只看累计调用数、照常累加。
+        let model = ReminderProbeModel::new(10, 1).speak_from(1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.narration_silence_tool_calls = 1;
+        limits.batch_nudge_at_tool_calls = 1;
+        limits.soft_round_advice_at = 2;
+        run_reminder_turn(&model, &mut session, limits).await;
+
+        let sampled = model.sampled();
+        assert!(sampled.len() >= 4, "用例需要至少 4 轮；实际 {sampled:?}");
+        assert_eq!(sampled[0], ReminderPresence::default());
+        assert_eq!(
+            sampled[1],
+            ReminderPresence {
+                narration: true,
+                batch_nudge: false,
+                soft_round: false,
+            },
+            "三条同时置位时本轮只能发 narration；实际 {sampled:?}"
+        );
+        assert_eq!(
+            sampled[2],
+            ReminderPresence {
+                narration: false,
+                batch_nudge: true,
+                soft_round: false,
+            },
+            "A4 标志必须保留到下一轮；实际 {sampled:?}"
+        );
+        assert_eq!(
+            sampled[3],
+            ReminderPresence {
+                narration: false,
+                batch_nudge: false,
+                soft_round: true,
+            },
+            "A6 标志必须再顺延一轮；实际 {sampled:?}"
+        );
+        assert!(
+            sampled.iter().all(|p| p.total() <= 1),
+            "每轮至多注入一条；实际 {sampled:?}"
+        );
+    }
+
+    /// 阈值 `0` ⇒ A4 永不触发。
+    #[tokio::test]
+    async fn batch_nudge_is_off_at_zero() {
+        let model = ReminderProbeModel::new(10, 1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.batch_nudge_at_tool_calls = 0;
+        run_reminder_turn(&model, &mut session, limits).await;
+        assert!(
+            model.sampled().iter().all(|p| !p.batch_nudge),
+            "阈值 0 必须完全关闭 A4；实际 {:?}",
+            model.sampled()
+        );
+    }
+
+    /// 阈值 `0` ⇒ A6 永不触发。
+    #[tokio::test]
+    async fn soft_round_advice_is_off_at_zero() {
+        let model = ReminderProbeModel::new(10, 1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.soft_round_advice_at = 0;
+        run_reminder_turn(&model, &mut session, limits).await;
+        assert!(
+            model.sampled().iter().all(|p| !p.soft_round),
+            "阈值 0 必须完全关闭 A6；实际 {:?}",
+            model.sampled()
         );
     }
 }

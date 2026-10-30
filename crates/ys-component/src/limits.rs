@@ -21,6 +21,18 @@ pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 4;
 /// 未加此阀时实测出现过**连续 38 条调用不吭声**的段 ≈ 565 s（9.4 分钟）。
 pub const DEFAULT_NARRATION_SILENCE_TOOL_CALLS: usize = 12;
 
+/// 回合内**累计工具调用数**阈值的**应用默认值**（A4）。
+///
+/// 库面默认是 `0`（关闭）⇒ 老调用方逐字节不变；app 侧显式设为本值。
+/// 取 **12**：10–15 轮的任务仍能在中段触发；626 次调用的长会话会在
+/// 12 / 24 / 48 / 96 / 192 / 384 各触发一次（约 6 次，每次一行）。
+pub const DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS: usize = 12;
+
+/// 回合内轮数软提醒阈值的**应用默认值**（A6）。
+///
+/// 库面默认是 `0`（关闭）⇒ 老调用方逐字节不变；app 侧显式设为本值。
+pub const DEFAULT_SOFT_ROUND_ADVICE_AT: usize = 60;
+
 /// 一次 run 的执行限制
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -134,6 +146,27 @@ pub struct RunLimits {
     /// **只对 `ModelError::Provider` 生效**：`Cancelled` 是用户意图，`Sink` /
     /// `Serde` 是本地缺陷 —— 三者重试都无意义。
     pub stream_interrupt_retries: u32,
+    /// 回合内**累计工具调用数**阈值（A4）；到阈值且当前 `tpr < 1.5` 时在**下一轮请求**
+    /// 末尾补一条批处理提醒，阈值触发后 ×2。
+    ///
+    /// # 为何是累计而不是连续
+    ///
+    /// 累计单调、永不重置：旧判据按「连续单调用轮」计数，中间夹一轮多调用就清零，
+    /// 实测只触发 4/10 次且多落在回合末尾（那时提醒改变不了任何东西）。
+    ///
+    /// # 为何要 `tpr < 1.5` 过滤
+    ///
+    /// `tpr`（tools per round）已经 ≥ 1.5 的回合，模型**本来就在批处理**，此时提醒
+    /// 是错的建议。故到阈值但 `tpr >= 1.5` 时**不触发、也不推进阈值**，下一轮再判。
+    ///
+    /// 默认 `0` = 关闭（**核心默认**）⇒ 老调用方逐字节不变。
+    /// app 默认 [`DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS`]。
+    pub batch_nudge_at_tool_calls: usize,
+    /// 回合内轮数软提醒阈值（A6）：到 60 / 120 / 240 … 各提醒一次。
+    ///
+    /// 每回合重置，触发后阈值 ×2；不产生事件、不落 session、不中断回合。
+    /// 默认 `0` = 关闭（**核心默认**）。app 默认 [`DEFAULT_SOFT_ROUND_ADVICE_AT`]。
+    pub soft_round_advice_at: usize,
 }
 
 impl RunLimits {
@@ -169,6 +202,10 @@ impl Default for RunLimits {
             main_disable_thinking: None,
             // 0 = 关闭 ⇒ 既有行为逐字节不变（客户端不重发已开始的流）。
             stream_interrupt_retries: 0,
+            // 0 = 关闭（核心默认）⇒ 老调用方逐字节不变；app 侧显式设 12。
+            batch_nudge_at_tool_calls: 0,
+            // 0 = 关闭（核心默认）⇒ 老调用方逐字节不变；app 侧显式设 60。
+            soft_round_advice_at: 0,
         }
     }
 }
@@ -266,5 +303,21 @@ mod tests {
         };
         assert_eq!(limits.subagent_wait, Duration::from_millis(80));
         assert_eq!(limits.subagent_poll, Duration::from_millis(10));
+    }
+
+    /// A4 / A6 的库面默认必须是 `0`（关闭）—— 这是「老调用方逐字节不变」的承重默认；
+    /// app 侧才引用非零的应用默认常量。
+    ///
+    /// 变异自检：把任一字段的默认改成非零 ⇒ 本用例变红，且未显式配置的老调用方
+    /// 会凭空多出提醒。
+    #[test]
+    fn reminder_thresholds_default_to_zero() {
+        assert_eq!(RunLimits::default().batch_nudge_at_tool_calls, 0);
+        assert_eq!(RunLimits::default().soft_round_advice_at, 0);
+        assert_eq!(RunLimits::new(5).batch_nudge_at_tool_calls, 0);
+        assert_eq!(RunLimits::new(5).soft_round_advice_at, 0);
+        // 应用默认常量供 app 侧引用，不得被核心默认吞掉。
+        assert_eq!(DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS, 12);
+        assert_eq!(DEFAULT_SOFT_ROUND_ADVICE_AT, 60);
     }
 }

@@ -1117,11 +1117,13 @@ fn t5_debug_file_is_complete_and_structured() {
         "round_usage",
         "round_end",
         "turn_end",
+        "run_reading",
     ] {
         assert!(names.contains(&expected), "缺少 {expected} 记录：{names:?}");
     }
     // 允许名单而非「名字不含 delta」：后者会放过任何新造的增量类记录名。
-    const ALLOWED: [&str; 8] = [
+    // `run_reading` 每回合一条、随回合收尾产生，是段记录而非增量事件。
+    const ALLOWED: [&str; 9] = [
         "run_start",
         "turn_start",
         "round_start",
@@ -1129,6 +1131,7 @@ fn t5_debug_file_is_complete_and_structured() {
         "round_usage",
         "round_end",
         "turn_end",
+        "run_reading",
         "run_end",
     ];
     assert!(

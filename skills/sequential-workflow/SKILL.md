@@ -143,6 +143,7 @@ shallow (本波一个批量 subagent) — 其余
 1. 派 subagent 更新 `docs/design-final/`
 2. `bash scripts/archive.sh [ROOT] <slug>` 归档
 3. 确认归档完成（如建过基线 commit，提示用户可 `git reset --soft <base>`）
+   - 本阶段的验证只适用于由本 workflow 驱动的实现任务，不适用于用户临时插入的纯 git 请求
 
 ---
 > **Phase 4 已完成** → 进入 Phase 5
@@ -151,7 +152,7 @@ shallow (本波一个批量 subagent) — 其余
 
 1. `EnterPlanMode`（回到只读模式）
 2. 读所有 review 报告（deep 独立报告 + shallow 批量报告）
-3. 跑全量测试确认通过
+3. 跑全量测试确认通过（只适用于由本 workflow 驱动的实现任务；用户临时插入的纯 git 请求不适用）
 4. 对照 Phase 1 的测试合同逐条确认
 5. 输出状态报告（完成 / 有风险 / 跳过 / 阻塞）
 6. 如有遗漏或失败 → 与用户讨论是否补充

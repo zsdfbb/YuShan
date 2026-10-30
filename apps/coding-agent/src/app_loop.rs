@@ -795,7 +795,7 @@ pub async fn run(
                 let fixed = agent.fixed_prompt_tokens();
                 // 活对话的 system（同理取自 agent）⇒ 摘要请求复用前缀、命中 KV cache。
                 let live_system = agent.system_prompt().map(str::to_string);
-                let window = config.context_window();
+                let window = config.effective_context_window();
 
                 // **开始提示必须先于这次 `await` 落地**：摘要是一次独立模型调用
                 // （实测数十秒），`capabilities::compact` 一进去就 await、中途没有任何
@@ -1337,7 +1337,8 @@ async fn run_turn_once(
     //
     // 放在回合**开头**（而非 login/set_model 各加一处）：命令的实现散在
     // `capabilities`，而窗口由 `config` 派生 —— 一处读取、不可能漂移。
-    ctx.agent.set_context_window(ctx.config.context_window());
+    ctx.agent
+        .set_context_window(ctx.config.effective_context_window());
     // **每回合收紧子 agent 等待上限**（ADR-0055）。
     //
     // 双计时器：app 侧的 budget 到点会推 `Abort` 并打印「budget exhausted」。若
@@ -1565,6 +1566,8 @@ async fn run_turn_once(
     for line in clock.take_lines() {
         logging::log(&line);
     }
+    // 回合级读数：TUI 与 debug 共用这一行；`take_lines` 之后再算 ⇒ 最后一轮已计入。
+    let reading = clock.summary_line(*ctx.turns);
 
     // §4.9 可观测性：每个回合边界经**日志**落一行（对 TUI 不可见，供排障）。
     // `elapsed` / `budget_remaining` 都取**整数秒**便于 grep；`budget_remaining`
@@ -1582,6 +1585,8 @@ async fn run_turn_once(
         remaining,
         turn_cache(&outcome),
     ));
+    // 回合末读数行：TUI 经既有 `Outbound::Output` 展示（不新增协议变体）。
+    send(ctx.out_tx, Outbound::Output(reading.clone())).await?;
 
     // debug 侧的回合收尾（只进文件，绝不影响上面的文本行）。
     // 以 `Cancelled` 收场 ⇒ 补一条 `observed`：`enqueued` 说明 Abort 已投递，
@@ -1606,6 +1611,8 @@ async fn run_turn_once(
             remaining,
             turn_cache(&outcome),
         );
+        // 回合级读数行（与 TUI / stderr 同一文本）：`ev` 开放，直接传 `run_reading`。
+        crate::record_run_reading(sink, ctx.debug_session_id, *ctx.turns, &reading);
         // 回合末的后台命令计数 —— **只进 debug 日志**：不进模型上下文、
         // 不进 transcript（绝不 `Outbound::Output`）。N = 本会话**仍在跑**的
         // 后台命令数。
@@ -2438,14 +2445,20 @@ mod tests {
         model.push_text("again");
         let mut h = spawn_with_mock(model).await;
 
-        // 回合 1：事件（种类顺序固定）→ View。
+        // 回合 1：事件（种类顺序固定）→ 回合末读数 `Output` → View。
         h.requests.send(prompt("one")).await.unwrap();
         let mut msgs = collect_until_view(&mut h).await;
         let view = take_view(&mut msgs);
         assert_eq!(view.turn_count, 1);
+        // 回合末的读数行是唯一插在事件与 View 之间的 `Output`。
+        let reading = msgs.pop().expect("回合末应有读数 Output");
+        match reading {
+            Outbound::Output(text) => assert!(text.starts_with("turn=1 "), "{text}"),
+            other => panic!("回合末读数应是 Output：{other:?}"),
+        }
         assert!(
             msgs.iter().all(|m| matches!(m, Outbound::Event(_))),
-            "回合期间只应有事件（唯一的 View 在末尾）：{msgs:?}"
+            "回合期间只应有事件（读数 Output 与 View 在末尾）：{msgs:?}"
         );
         assert_eq!(
             event_kinds(&msgs),
@@ -3395,9 +3408,15 @@ mod tests {
         h.requests.send(prompt("hello")).await.unwrap();
         let mut msgs = collect_until_view(&mut h).await;
         let _ = take_view(&mut msgs);
+        // 回合末的读数行走 `Outbound::Output`；其余仍只有事件。
+        let reading = msgs.pop().expect("回合末应有读数 Output");
+        assert!(
+            matches!(&reading, Outbound::Output(t) if t.starts_with("turn=1 ")),
+            "回合末读数应是 Output：{reading:?}"
+        );
         assert!(
             msgs.iter().all(|m| matches!(m, Outbound::Event(_))),
-            "Prompt 期间只应有事件：{msgs:?}"
+            "Prompt 期间除读数行外只应有事件：{msgs:?}"
         );
 
         for req in cases {
@@ -3731,6 +3750,9 @@ mod tests {
     /// 断言**刻意双向**：回合 1 的宽窗口下**不**压缩，回合 2 换窄窗口后**必须**压缩
     /// —— 只断言后半截的话，一个「永远压缩」的实现也能蒙混过关。
     ///
+    /// 同时钉住 **`SetModel` 后立刻取到的快照**：effective 与 declared 都必须来自
+    /// 新模型（`cfg`），否则切换瞬间会出现 effective > declared 的 `(capped)`。
+    ///
     /// 变异：删掉 `Request::Prompt` 臂开头的 `agent.set_context_window(...)` →
     /// agent 停在 `RunLimits::default()` 的 128_000 → 回合 2 不压缩 → 本用例变红。
     ///
@@ -3780,7 +3802,28 @@ mod tests {
             .await
             .unwrap();
         let mut msgs = collect_until_view(&mut h).await;
-        let _ = take_view(&mut msgs);
+        let view = take_view(&mut msgs);
+
+        // **快照也必须是新模型的窗口**（`/status` 与 `/model` 同源）。
+        // `SetModel` 只改 `cfg`，agent 的窗口要到下一回合开头才刷新；若快照的
+        // effective 仍取 `agent.context_window()`，这里会是 128_000 / 8_000
+        // —— effective > declared 却标 `(capped)`，与 `/model` 的输出自相矛盾。
+        assert_eq!(
+            view.context_window,
+            Some(8_000),
+            "SetModel 后快照的 effective 窗口必须取自新模型（不得停留在上一回合的 128k）"
+        );
+        assert_eq!(
+            view.context_window_declared,
+            Some(8_000),
+            "声明窗口同样应取自新模型"
+        );
+        assert!(
+            view.context_window.unwrap() <= view.context_window_declared.unwrap(),
+            "effective 不得大于 declared（否则 /status 显示自相矛盾的 capped）：{:?} / {:?}",
+            view.context_window,
+            view.context_window_declared
+        );
 
         // 回合 2：窗口若**每回合**重算 ⇒ 8000（触发点 2880）⇒ 7000 > 2880 ⇒ 必须压缩。
         // 若窗口只在回合 1 设过一次，这里仍是 128_000（触发点 108_800）⇒ 不压缩 → 变红。
@@ -5388,8 +5431,15 @@ mod tests {
         model.push_text("done");
         let mut h = spawn_app_loop_debug(Box::new(model), true, Vec::new()).await;
         h.requests.send(prompt("hi")).await.unwrap();
-        let _ = collect_until_view(&mut h).await;
+        let msgs = collect_until_view(&mut h).await;
         shutdown(h).await;
+
+        // TUI 回合末的读数行走既有 `Outbound::Output`（不新增协议变体）。
+        let output = output_text(&msgs);
+        assert!(
+            output.contains("turn=1 rounds=") && output.contains("tpr_x100="),
+            "TUI 回合末应展示读数行：{output}"
+        );
 
         let files = debug_files(&logs.0);
         assert_eq!(files.len(), 1, "一个会话一个 debug 文件：{files:?}");
@@ -5402,6 +5452,7 @@ mod tests {
             "tool_call",
             "round_end",
             "turn_end",
+            "run_reading",
             "run_end",
         ] {
             assert!(evs.contains(&expected), "缺少 `{expected}` 记录：{evs:?}");
@@ -5415,6 +5466,11 @@ mod tests {
             evs.iter().filter(|ev| **ev == "turn_end").count(),
             1,
             "一个回合恰一条 `turn_end`"
+        );
+        assert_eq!(
+            evs.iter().filter(|ev| **ev == "run_reading").count(),
+            1,
+            "一个回合恰一条 `run_reading`"
         );
 
         // 既有文本行形状不变（逐字节口径由 `round_clock` 的单测钉住）。

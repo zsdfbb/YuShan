@@ -347,6 +347,19 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
              at once. `rg` respects .gitignore; bound the output with `-m`, `-l`, or `| head -n`."
                 .to_string(),
         );
+        // `grep` 的结果有 **16 KiB 硬上限**：这是模型无法从工具描述推断的事实。
+        // 被截断时只能收窄模式 / 路径（`glob` / `path`），加大 `limit` 在字节上限下无效。
+        // 主提示单独给这一条：explore 子 agent 的 `EXPLORE_SEARCH_METHOD` 已有同款，
+        // 但两套提示各自独立发送，子 agent 知道不等于主 agent 知道。
+        //
+        // 门控：只有 `grep` 在场才渲染 —— 文案只引用它，缺了就是指向不存在工具的悬空指令。
+        if tools.contains(&"grep") {
+            guidelines.push(
+                "The `grep` tool caps its result at 16 KiB regardless of `limit`: when it truncates, \
+                 narrow with `glob`, `path`, or a tighter pattern instead of raising `limit`."
+                    .to_string(),
+            );
+        }
         guidelines.push(
             "Reach for read/grep/find/ls when the next step genuinely depends on what you just saw, \
              when you need offset/limit continuation on a single file, or when one targeted lookup is \
@@ -1945,6 +1958,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 主 agent 的提示里也写明 `grep` 的 **16 KiB 硬上限**：这是模型无法从工具描述
+    /// 推断的事实；截断时收窄 `glob` / `path` / 模式，加大 `limit` 在字节上限下无效。
+    ///
+    /// explore 子 agent 的 `EXPLORE_SEARCH_METHOD` 已有同款，但两套提示各自独立发送 ——
+    /// 主 agent 事前不知道，就会「默认 limit 不够 → 加大 limit 重跑」，白烧一轮往返。
+    ///
+    /// 变异：删掉这条 guideline ⇒ 第一条变红；去掉 `tools.contains(&"grep")` 门控
+    /// （改成无条件 push）⇒ 第二条变红。
+    #[test]
+    fn main_prompt_states_grep_byte_cap() {
+        let _guard = env_lock();
+        let _env = no_global_prompt();
+
+        let with_grep = build_system_prompt(
+            Path::new("/tmp"),
+            &[spec("read"), spec("grep")],
+            &no_skills(),
+        );
+        assert!(
+            with_grep.contains("16 KiB"),
+            "`grep` 在场时须写明 16 KiB 上限；prompt = {with_grep}"
+        );
+        assert!(
+            with_grep.contains("instead of raising `limit`"),
+            "须说明截断时收窄而非加大 `limit`；prompt = {with_grep}"
+        );
+
+        let without_grep = build_system_prompt(Path::new("/tmp"), &[spec("read")], &no_skills());
+        assert!(
+            !without_grep.contains("16 KiB"),
+            "`grep` 不在场时不得渲染该 guideline；prompt = {without_grep}"
+        );
+        assert!(
+            !without_grep.contains("instead of raising `limit`"),
+            "`grep` 不在场时不得渲染该 guideline；prompt = {without_grep}"
+        );
+    }
+
     /// 主 agent 的提示主体**逐字节不变**（`mode` 只影响子 agent）。
     ///
     /// 观测手段：把临时 cwd 归一成 `<cwd>` 后取 `build_system_prompt` 的指纹。
@@ -1967,7 +2018,7 @@ mod tests {
         let normalized = body.replace(&dir.display().to_string(), "<cwd>");
         assert_eq!(
             fnv1a64(normalized.as_bytes()),
-            0xb238d36795e45d24u64,
+            0x74d85548c8ce4034u64,
             "主 agent 提示主体漂移：确认是有意改动，再更新此锚点"
         );
 

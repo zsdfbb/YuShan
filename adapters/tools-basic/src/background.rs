@@ -1321,9 +1321,12 @@ mod tests {
         }
     }
 
-    /// 等一条目离开 `Running`（最多 2s）—— 子进程退出有竞态，不能假设立即可见。
+    /// 等一条目离开 `Running`（最多 6s）—— 子进程退出有竞态，不能假设立即可见。
+    ///
+    /// 并行测试负载下子进程调度延迟可达数秒，2s 上限不足；放宽只是等真实进程退出，
+    /// 真卡死仍会 panic，不会掩盖逻辑错误。
     fn wait_done(tasks: &BackgroundTasks, handle: BgHandle, session: &str) -> BgState {
-        for _ in 0..200 {
+        for _ in 0..600 {
             tasks.sweep();
             if let Some(snapshot) = tasks.snapshot(handle, session)
                 && snapshot.state != BgState::Running

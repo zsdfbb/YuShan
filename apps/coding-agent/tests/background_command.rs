@@ -264,7 +264,10 @@ async fn wait_for_output(path: &Path, needle: &str, limit: Duration) -> String {
 
 /// 启动**不等命令结束**就返回句柄。
 ///
-/// 变异：把 `start` 改成等到进程退出再返回 ⇒ 第二条断言（实测耗时 < 3s）变红。
+/// 变异：把 `start` 改成等到进程退出再返回 ⇒ 第二条断言（实测耗时 < 4s）变红。
+///
+/// 阈值必须严格小于被测命令时长（5s），才能证明「没有等命令结束」；
+/// 同时要留出并行测试负载下的调度余量（实测曾到 3.05s），故取 4s。
 #[tokio::test]
 async fn starting_a_background_command_returns_a_handle_before_it_finishes() {
     let fixture = Fixture::new("start");
@@ -274,7 +277,7 @@ async fn starting_a_background_command_returns_a_handle_before_it_finishes() {
 
     assert_eq!(handle, BgHandle(1), "首个句柄应是 bg1");
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_secs(4),
         "启动**不等命令结束**（命令要跑 5s），实测 {elapsed:?}"
     );
     assert!(content.contains("pid:"), "结果里应有 pid：{content}");

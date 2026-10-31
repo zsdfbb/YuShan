@@ -92,7 +92,7 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 | 信道 | 类型 | 方向 | 目的地 / 消费时机 | 容量 |
 |---|---|---|---|---|
 | ① Request | `ys_protocol::Request` | UI → app | app 线程 `recv().await`（**回合边界**） | 64 |
-| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`take`）；模型调用前 / 工具轮询用 `is_aborted` / `has_pending_steer` | 64 |
+| ② Boundary | `ys_protocol::Boundary` | UI → `BasicLoop` | **轮边界**拉取（`take`）；中止靠 `is_aborted` 轮询 | 64 |
 | ③ Outbound | `ys_protocol::Outbound<CodingView>` | app → UI | UI 事件循环 `try_recv` 排空 | 1024 |
 
 **为何 ② 必须独立于 ①**：回合跑动时 app 线程阻塞在 `agent.run_turn()` 里，不可能 `recv` ①；
@@ -186,16 +186,16 @@ impl QueueBoundarySource {
 
 **工具级取消载体**：`ToolContext.cancel: &CancelToken` → `ToolContext.boundary: Option<&dyn BoundarySource>`
 （`ys-component::ToolContext`，构造函数 `ToolContext::new(boundary, cwd, workspace_root)`）。
-`BashTool` 在挂载 `boundary` 时**以 100ms 间隔轮询**两个信号：
+`BashTool` 在挂载 `boundary` 时**以 100ms 间隔轮询** `is_aborted()`：命中 ⇒ 杀**进程组**
+（`sh -c "kill -9 -{pid}"`，不引 libc）并返回中止错误。
 
-- `is_aborted()` 命中 ⇒ 杀**进程组**（`sh -c "kill -9 -{pid}"`，不引 libc）并返回中止错误；
-- `has_pending_steer()` 命中（用户插话）⇒ 同样杀进程组、停止等待，但返回**成功结果**：
-  已捕获的 stdout/stderr 照给，末尾说明「命令因插话提前中止，插话将在本批工具调用结束后
-  进入上下文」。插话**不被工具消费**，仍由轮边界 `take`。
-
-于是「长工具跑多久，插话就等多久」这一延迟被压到**一个轮询周期**（100ms 量级）。
+**用户插话与 `/compact` 不打断正在跑的工具**：它们只在 `BasicLoop` 的轮边界（`take`）生效。
+⇒ 「长工具跑多久，插话就等多久」是**刻意选择**：插话与后台任务都不该杀掉正在做的工作。
 未挂载 `boundary` 时行为与改动前完全一致（有测试钉住）。`timeout` 语义在挂载 `boundary`
 时仍生效。
+
+> `BoundarySource::has_pending_steer()` 仍存在（非破坏性、只看 `Steer` / `Compact`），
+> 但**当前生产代码无消费者** —— 保留供将来的长工具选用。
 
 **UI 侧的两个时刻要分开说**（`App::note_steered`）：提交后立即画用户行 + 紧跟一条系统行
 「已插话：将在当前工具调用结束后生效」。用户行只证明「已送达」，不代表「模型已看到」——
@@ -750,11 +750,9 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
   「子 agent 的命令莫名提前中止」并让孩子那边生成一条语义矛盾的「用户插话了」结果。
 - **子预算**：watchdog（`tokio::spawn(sleep(budget) → 子边界源 push(Abort))`，用 **`AbortOnDropHandle`** 防孤儿任务）；子预算与主 agent 同值 ⇒ 真实天花板是父回合那条 deadline。
 - **超时**：`Tool::timeout()` 的优先级链（工具声明 → `bash_timeout` → 300s）；`subagent` 的外闸 = 子预算 + 60s 宽限，**构造期由 `Config` 注入**（ADR-0029 修正 2）。
-- **插话**：同步 `subagent` 的 `call` 用 `tokio::select!` 同时等 `runner.run(..)` 与「父边界源上的
-  `has_pending_steer()` 轮询」（`STEER_POLL_INTERVAL = 100ms`，与 `tools-basic` 同口径）。命中则
-  **放弃等待** —— drop 掉 `runner` future ⇒ 子回合取消（其内部子进程靠 `kill_on_drop` 收尸）——
-  并返回 `is_error: false` 的结果说清「派发被插话中止、子 agent 未完成」。插话不被消费，
-  仍由父轮的轮边界 `take`。`subagent_async` **不需此机制**（它本来就不阻塞父回合）。
+- **插话**：**不打断子 agent**。同步 `subagent` 的 `call` 直接 `.await` 派发结果；插话排在父边界源上，
+  等父轮的轮边界 `take` 后才进上下文。子 agent 的收场方式是「跑完」，不是「被打断」。
+  `subagent_async` 同理（它本来就不阻塞父回合）。
 
 ### 13.3 结果与产物
 

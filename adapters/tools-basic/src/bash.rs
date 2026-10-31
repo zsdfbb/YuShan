@@ -13,9 +13,6 @@ use crate::proc_group;
 /// 挂载了 `boundary` 时的中止轮询间隔 —— 命令中止的感知延迟上界。
 const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 杀进程组之后等管道排空收束的上限（插话路径要取回已捕获的输出）。
-const PIPE_SETTLE: Duration = Duration::from_secs(2);
-
 /// 内层 deadline 与外层预算之间的**余量** —— 内层必须**严格早于**外层到期。
 ///
 /// 外层预算到点时是把工具 future **drop** 掉（`ys-loop` 的 `tokio::time::timeout`），
@@ -40,8 +37,8 @@ const MIN_DEADLINE: Duration = Duration::from_secs(1);
 ///
 /// **「无 deadline」档位的完成条件**：阶段 A 以「管道读到 EOF」为完成条件
 /// ⇒ 若有孙进程持着写端，工具会**一直阻塞**到孙进程自己退出；
-/// 唯一的打断是 boundary 的**两个信号**：中止（`Abort`）与**用户插话**
-/// （`has_pending_steer()` —— 停手，让轮边界尽快把插话交给模型）。
+/// 唯一的打断是 boundary 的**中止**信号（`Abort`）—— 用户插话与 `/compact`
+/// 都不缩短正在跑的命令。
 /// 该档位的可达性：生产路径两路都必挂 `with_tool_budget` ⇒ **不可达**；
 /// 但「挂 boundary、不挂 `tool_budget`、模型不传 `timeout`」的组合在
 /// **直接调用工具**时可达（正常命令仍能正常返回，见
@@ -87,36 +84,26 @@ fn deadline_secs(deadline: Duration) -> u64 {
     u64::try_from(nanos.div_ceil(1_000_000_000)).unwrap_or(u64::MAX)
 }
 
-/// 等待阶段的结局 —— 「被中止」/「因插话提前收口」/「撞上生效 deadline」/「等待本身失败」。
+/// 等待阶段的结局 —— 「被中止」/「撞上生效 deadline」/「等待本身失败」。
 ///
 /// `TimedOut` 携带**生效时长**：超时文案必须写生效值（模型传的值可能远大于它）。
 enum WaitOutcome {
     /// 边界发出了中止信号。
     Aborted,
-    /// 边界探到了**未消费的用户插话**（`has_pending_steer`）—— 停手，让 `BasicLoop`
-    /// 尽快回到轮边界把插话交给模型。
-    ///
-    /// **不是失败**：已捕获的输出照常回给模型，只是命令未跑完。
-    Steered,
     /// 撞上生效 deadline（携带生效时长）。
     TimedOut(Duration),
     /// 等待本身失败（`wait` 报错）。
     Failed(String),
 }
 
-/// 边界上的两个打断信号。
+/// 边界上的打断信号 —— 只有整回合中止。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Interrupt {
     /// 整回合中止：以 `Cancelled` 收场。
     Abort,
-    /// 用户插话待到轮边界消费：本命令提前收口，但回合继续。
-    Steer,
 }
 
 /// 等到边界发出打断信号，并返回原因。
-///
-/// **先探 `Abort` 再探插话**：中止是更强的信号，两者同在时按中止处理（否则会为了
-/// 「让模型读到插话」而把一个正在收场的回合拖下去）。
 ///
 /// `None` = 没有边界控制 ⇒ **永不完成**（调用方的 `select!` 只会等另外两个分支）。
 async fn wait_interrupt(boundary: Option<&dyn BoundarySource>) -> Interrupt {
@@ -124,9 +111,6 @@ async fn wait_interrupt(boundary: Option<&dyn BoundarySource>) -> Interrupt {
         Some(boundary) => loop {
             if boundary.is_aborted() {
                 return Interrupt::Abort;
-            }
-            if boundary.has_pending_steer() {
-                return Interrupt::Steer;
             }
             tokio::time::sleep(ABORT_POLL_INTERVAL).await;
         },
@@ -415,47 +399,6 @@ async fn terminate(child: &mut tokio::process::Child, pid: Option<u32>) {
     let _ = child.wait().await;
 }
 
-/// 收场（杀进程组）之后取回已捕获的管道内容 —— **有界等待**。
-///
-/// 进程组被杀 ⇒ 写端关闭 ⇒ 两个排空任务必然收束，故通常**立即**返回。
-/// 但「孙进程没随组而死」仍可能发生（杀组失败 / 已被过继走）—— 那种情况下
-/// 不得把整轮拖住，到期即放弃并 `abort` 两个任务（已不需要它们的结果）。
-async fn drain_after_kill(
-    out_task: &mut tokio::task::JoinHandle<Vec<u8>>,
-    err_task: &mut tokio::task::JoinHandle<Vec<u8>>,
-) -> (Vec<u8>, Vec<u8>) {
-    let settle = async {
-        let (out, err) = tokio::join!(&mut *out_task, &mut *err_task);
-        (out.unwrap_or_default(), err.unwrap_or_default())
-    };
-    match tokio::time::timeout(PIPE_SETTLE, settle).await {
-        Ok(pair) => pair,
-        Err(_) => {
-            out_task.abort();
-            err_task.abort();
-            (Vec::new(), Vec::new())
-        }
-    }
-}
-
-/// 因**用户插话**提前收口的结果。
-///
-/// **不是错误**：命令确实跑了（只是没跑完），已捕获的输出原样交还，并在末尾说清
-/// 「为什么停在这里」与「接下来会发生什么」—— 模型据此决定是重跑、接着跑还是先回应用户。
-/// 插话本身仍排在边界队列里，由 `BasicLoop` 在**轮边界**消费，本函数**不碰**队列。
-fn steered_result(stdout: &[u8], stderr: &[u8], note: Option<&str>) -> ToolResult {
-    const STEER_NOTE: &str = "[bash: command stopped early because the user sent a message while \
-         it was running. That message is queued and will enter your context as soon as this batch \
-         of tool calls finishes — read it before deciding what to do next. Output captured before \
-         the stop is above; anything after that point did not run.]";
-    let combined = match note {
-        Some(note) => format!("{note}\n{STEER_NOTE}"),
-        None => STEER_NOTE.to_string(),
-    };
-    // 退出码传 `None`：是我们杀掉的，`code` 不承载语义（见 `render_result` 的既有约定）。
-    render_result(stdout, stderr, None, Some(&combined), None)
-}
-
 #[async_trait::async_trait]
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
@@ -598,7 +541,6 @@ impl Tool for BashTool {
                 result = drain => Ok(result),
                 reason = wait_interrupt(boundary) => Err(match reason {
                     Interrupt::Abort => WaitOutcome::Aborted,
-                    Interrupt::Steer => WaitOutcome::Steered,
                 }),
                 _ = wait_deadline(deadline_at) => Err(WaitOutcome::TimedOut(
                     deadline_at.map(|(_, d)| d).unwrap_or_default(),
@@ -622,7 +564,6 @@ impl Tool for BashTool {
                     },
                     reason = wait_interrupt(boundary) => Err(match reason {
                         Interrupt::Abort => WaitOutcome::Aborted,
-                        Interrupt::Steer => WaitOutcome::Steered,
                     }),
                     _ = wait_deadline(deadline_at) => Err(WaitOutcome::TimedOut(
                         deadline_at.map(|(_, d)| d).unwrap_or_default(),
@@ -696,13 +637,6 @@ impl Tool for BashTool {
                     is_error: false,
                 })
             }
-            // 因**用户插话**提前收口：与中止同样要杀进程组（否则孙进程攥着管道），
-            // 但结局不同 —— 已捕获的输出照样回给模型，回合继续。
-            Err(WaitOutcome::Steered) => {
-                terminate(&mut child, pid).await;
-                let (stdout, stderr) = drain_after_kill(&mut out_task, &mut err_task).await;
-                Ok(steered_result(&stdout, &stderr, note.as_deref()))
-            }
             Err(outcome) => {
                 // 中止 / 超时（未挂后台能力）/ 等待失败：先杀进程组（含孙进程），再杀子进程兜底，最后收尸
                 terminate(&mut child, pid).await;
@@ -711,8 +645,6 @@ impl Tool for BashTool {
                 err_task.abort();
                 Err(match outcome {
                     WaitOutcome::Aborted => ToolError::Execution("aborted by user".into()),
-                    // 上面已单独处理
-                    WaitOutcome::Steered => unreachable!("Steered 已在上一分支处理"),
                     WaitOutcome::TimedOut(deadline) => ToolError::Timeout(format!(
                         "Command timed out after {} seconds",
                         deadline_secs(deadline)
@@ -1710,26 +1642,27 @@ mod tests {
         );
     }
 
-    /// 命令运行**期间**用户插话 → 命令提前收口（杀进程组），但**不是错误**：
-    /// 已捕获的输出照常回给模型，结果里说清「为什么停」与「插话马上到」。
+    /// 命令运行**期间**用户插话 ⇒ 命令**不被杀**、跑到自然结束，插话**仍在队列里**。
     ///
     /// 四条断言各钉一条不变量：
-    /// ① 墙钟远小于命令时长（探针生效，不再傻等 30s）；
-    /// ② 结果是 `Ok` 且带插话中止说明（不得伪装成「跑完了」或报错）；
-    /// ③ 孙进程按 pid 不存在（进程组被杀）；
+    /// ① 命令跑满自身时长（插话不缩短它，只有 `Abort` 能）；
+    /// ② 结果是 `Ok`、`is_error == false`、 stdout 完整（自然结束后才有）；
+    /// ③ 孙进程按 pid 自然退出（不是被我们杀的）；
     /// ④ 插话**仍在队列里**（工具不得偷吃用户的插话 —— 它只该在轮边界被消费）。
     ///
-    /// 变异：删掉 `wait_interrupt` 的 `has_pending_steer` 分支 ⇒ 跑到 `sleep` 结束
-    /// ⇒ ① 爆守卫、④ 虽然仍绿但耗时断言变红。
+    /// 变异：把 `wait_interrupt` 的 `is_aborted()` 换成 `has_pending_steer()`
+    /// ⇒ 200ms 后杀进程组 → ③ 红、且命令未跑满 → ① 红。
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_bash_steer_mid_command_stops_early_without_consuming_steer() {
+    async fn test_bash_steer_mid_command_does_not_stop_it() {
         use ys_protocol::Boundary;
 
         let dir = test_dir();
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let pid_file = dir.join("grandchild.pid");
-        let secs = unique_sleep_secs(&dir);
+        // 短命令：本用例要的不是「提前收口」而是「不被打断」⇒ 等到自然结束就行，
+        // 无需 30s 级的 leftover 防御预算。
+        let secs = 2;
         let marker = format!("sleep {secs}");
         let _guard = LeftoverGuard::new(&pid_file, &marker);
 
@@ -1750,7 +1683,7 @@ mod tests {
         assert!(!boundary.has_pending_steer(), "插话尚未到达");
 
         let tool = BashTool::new(dir.clone());
-        // 先把输出吐出来（验证「已捕获的 stdout 照常返回」），再挂到 `wait` 上。
+        // 先把输出吐出来，再挂到 `wait` 上 —— 插话到达时命令正卡在阶段 B。
         let input = json!({
             "command": format!(
                 "echo started; {} ; wait",
@@ -1761,27 +1694,22 @@ mod tests {
         let started = Instant::now();
         let result = tokio::time::timeout(TOOL_CALL_GUARD, tool.call(input, ctx_with(&boundary)))
             .await
-            .expect("插话应让工具提前收口（不得跑到 sleep 自然结束）");
+            .expect("插话不得影响等待（只有超时/中止能收口）");
         let elapsed = started.elapsed();
 
-        let result = result.expect("插话提前收口不是错误（命令确实跑了，只是没跑完）");
+        let result = result.expect("跑完自然结束不是错误");
         assert!(
-            elapsed < Duration::from_secs(5),
-            "插话应立即收口（远小于 30s 级命令时长），实际耗时 {elapsed:?}"
+            elapsed >= Duration::from_secs(secs),
+            "插话不得缩短正在跑的命令，实际耗时 {elapsed:?}"
         );
-        assert!(
-            result.content.contains("stopped early"),
-            "结果须说清是插话导致的中止：{}",
-            result.content
-        );
+        assert!(!result.is_error, "自然结束不是错误：{}", result.content);
         assert!(
             result.content.contains("started"),
-            "已捕获的 stdout 不得丢：{}",
+            "stdout 必须完整：{}",
             result.content
         );
-        assert!(!result.is_error, "插话中止不是错误");
 
-        // ③ 进程组被杀（按 pid 查进程存在性，不靠文案）
+        // ③ 孙进程自然退出（不是被我们杀的）
         let pid = read_pid(&pid_file).await;
         let gone = wait_until_gone(pid, &marker, Duration::from_secs(3)).await;
         let snapshot = ps_snapshot(pid);
@@ -1790,15 +1718,11 @@ mod tests {
         }
         assert!(
             gone,
-            "插话收口后孙进程仍在运行（{marker}，pid={pid}）—— 进程组没被杀；ps: {snapshot}"
+            "孙进程应在命令结束后退出（{marker}，pid={pid}）；ps: {snapshot}"
         );
 
         // ④ 插话**未被消费**：仍排着，等轮边界
-        assert_eq!(
-            boundary.len(),
-            1,
-            "工具不得消费用户的插话（只能由轮边界 take）"
-        );
+        assert_eq!(boundary.len(), 1, "工具不得消费用户的插话");
         assert!(boundary.has_pending_steer());
         assert_eq!(boundary.take(), Some(steer), "插话原样留在队列里");
 

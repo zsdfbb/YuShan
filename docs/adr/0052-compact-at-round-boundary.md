@@ -65,6 +65,13 @@ Step 4b 的 `fixed < trigger && estimated + fixed > trigger` 与 R5 早退
 
 **3. `has_pending_steer` 包含 `Compact`。**
 
+> ⚠️ **本条已被取代**：工具不再轮询 `has_pending_steer()` —— 用户插话与 `/compact` 都不打断
+> 正在跑的工具与子 agent，只在轮边界 `take` 生效。`QueueBoundarySource::has_pending_steer`
+> 仍包含 `Compact`，但**当前无生产消费者**。原文的动机（避免长工具让 `/compact` 等十几分钟）
+> 被接受为**已知代价**，因为打断正在做的工作代价更高。
+> 当前契约见 `docs/design-final/coding-agent-tui.md` §13.2 与
+> `crates/ys-protocol/src/boundary.rs` 的 trait 文档。
+
 该探针供**长工具**在运行期间轮询，命中即提前收口。若不把 `Compact` 算进去，
 一个跑十几分钟的工具会让 `/compact` 同样等十几分钟 —— 那正是本变体要消除的延迟。
 

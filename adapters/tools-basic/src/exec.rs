@@ -150,12 +150,6 @@ pub enum Stop {
     Cap,
     /// `boundary.is_aborted()` → 我们杀掉了它。
     Aborted,
-    /// 边界探到了**未消费的用户插话**（`has_pending_steer`）→ 我们杀掉了它，
-    /// 让 `BasicLoop` 尽快回到轮边界把插话交给模型。
-    ///
-    /// 与 [`Self::Aborted`] 的区别只在**归因**：中止是整回合收场，插话是回合继续。
-    /// 调用方**不得**把它渲染成「无命中 / 无结果」。
-    Steered,
     /// 超过 `deadline` → 我们杀掉了它。
     TimedOut,
 }
@@ -181,8 +175,9 @@ pub struct Bounded {
 /// - `byte_cap`：stdout 累积上限（字节）。达到即杀子进程、`stop = Cap`（`grep`/`find` 传 1 MiB）。
 /// - `deadline`：从本函数开始跑的**最长时间**（调用方自带兜底 timeout —— 一次性模式
 ///   `-p`/`--json` 的 `boundary` 恒为 `None`，没有别的中止通道）。
-/// - `boundary`：`Some` 时每 [`ABORT_POLL_INTERVAL`] 探一次 `is_aborted()`
-///   与 `has_pending_steer()`（先中止后插话：中止是更强的信号）。
+/// - `boundary`：`Some` 时每 [`ABORT_POLL_INTERVAL`] 探一次 `is_aborted()`。
+///   用户插话（`Boundary::Steer` / `Compact`）**不**打断子进程：它在 `BasicLoop` 的
+///   轮边界被消费，跑着的命令不受影响。
 ///
 /// # 死锁防护（本函数最易错处之一）
 ///
@@ -327,9 +322,6 @@ pub async fn run_bounded(
         }
         if boundary.is_some_and(|b| b.is_aborted()) {
             break Stop::Aborted;
-        }
-        if boundary.is_some_and(|b| b.has_pending_steer()) {
-            break Stop::Steered;
         }
         if started.elapsed() >= deadline {
             break Stop::TimedOut;
@@ -678,35 +670,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Steered`：运行**期间**用户插话 → 被杀、`stop = Steered`，且**插话未被消费**。
+    /// 运行**期间**用户插话 ⇒ 子进程**不被杀**、跑到自然结束（`stop == Eof`），
+    /// 且插话**未被消费**（仍排着，等 `BasicLoop` 在轮边界 `take`）。
     ///
     /// 两条不变量：
-    /// ① 插话能让长时间的子进程提前收口（否则搜索工具会把整轮拖满 60s deadline）；
-    /// ② 工具**不碰队列** —— 插话仍排着，等 `BasicLoop` 在轮边界 `take`。
+    /// ① 插话不缩短正在跑的进程（只 `is_aborted()` 能）；
+    /// ② 工具**不碰队列**。
     ///
-    /// 变异：删掉主循环里的 `has_pending_steer() → break Stop::Steered`
-    /// ⇒ 本用例跑到 deadline 才返回 `TimedOut` → ① 红。
+    /// 变异：把主循环里的 `is_aborted()` 分支改成 `has_pending_steer()`
+    /// ⇒ 进程被杀、`stop` 变 `Aborted` → `stop == Eof` 与
+    /// `code == Some(0)` 两条断言红。
     #[tokio::test]
-    async fn test_run_bounded_steer_mid_run_returns_steered() {
+    async fn test_run_bounded_steer_mid_run_does_not_stop_it() {
         let dir = test_dir("steer");
         std::fs::create_dir_all(&dir).unwrap();
 
         let boundary = Arc::new(QueueBoundarySource::new());
+        let steer = Boundary::Steer(ys_core::Message {
+            role: ys_core::Role::User,
+            content: vec![ys_core::ContentBlock::Text {
+                text: "先别搜了".into(),
+            }],
+        });
         let producer = Arc::clone(&boundary);
+        let steer_for_task = steer.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            producer.push(Boundary::Steer(ys_core::Message {
-                role: ys_core::Role::User,
-                content: vec![ys_core::ContentBlock::Text {
-                    text: "先别搜了".into(),
-                }],
-            }));
+            producer.push(steer_for_task);
         });
         let src: &dyn BoundarySource = &*boundary;
 
         let (result, elapsed) = run_guarded(
-            "sleep",
-            &["30"],
+            "sh",
+            &["-c", "printf started; sleep 1"],
             &dir,
             1024 * 1024,
             Duration::from_secs(10),
@@ -715,17 +711,20 @@ mod tests {
         )
         .await;
 
-        let b = result.expect("因插话被杀不是错误（是我们杀的）");
-        assert_eq!(b.stop, Stop::Steered);
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "插话应在 200ms 后的下一次轮询内收场，实际 {elapsed:?}"
-        );
+        let b = result.expect("插话不影响等待，不该出错");
         assert_eq!(
-            boundary.len(),
-            1,
-            "工具不得消费用户的插话（只能由轮边界 take）"
+            b.stop,
+            Stop::Eof,
+            "插话不得杀子进程（只有中止能），实际 elapsed {elapsed:?}"
         );
+        assert_eq!(b.code, Some(0), "跑到自然结束 ⇒ 退出码承载语义");
+        assert_eq!(b.stdout, b"started", "已捕获的输出照旧");
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "必须跑满命令自身时长，实际 {elapsed:?}"
+        );
+        assert_eq!(boundary.len(), 1, "工具不得消费用户的插话");
+        assert_eq!(boundary.take(), Some(steer), "插话原样留在队列里");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -128,12 +128,12 @@ impl BoundarySource for ChildBoundary {
         self.own.is_aborted() || self.parent.as_ref().is_some_and(|p| p.is_aborted())
     }
 
-    /// **恒 `false`**：子的工具不得因**父的**插话被打断。
+    /// **恒 `false`**：子的工具不因**父的**插话被打断（与父侧工具同口径 —— 插话只在
+    /// 轮边界被消费，从不缩短正在跑的工具）。
     ///
-    /// 插话是给父模型的输入，爹的 `Steer` 在父的轮边界才被消费、且孩子的上下文
+    /// 插话是给父模型的输入，父的 `Steer` 在父的轮边界才被消费、且孩子的上下文
     /// 里根本看不到它 —— 若让它透传，父的插话会以「孩子命令莫名提前中止」的形式
-    /// 表现出来，而这个中止在孩子那边会催生一条「用户插话了」的结果，语义互相矛盾。
-    /// 孩子只该因**中止**（自己那份或父的 `Abort`）而收口。
+    /// 表现出来，语义互相矛盾。孩子只该因**中止**（自己那份或父的 `Abort`）而收口。
     fn has_pending_steer(&self) -> bool {
         false
     }
@@ -1494,70 +1494,6 @@ fn truncate_bytes(s: &str, max: usize) -> String {
     format!("{}\n…[truncated]", &s[..end])
 }
 
-/// 同步派发等待期间探「用户插话」的轮询间隔。
-///
-/// 与 `ys-tools-basic` 的 `ABORT_POLL_INTERVAL` **同口径**（100ms）：那里不能跨 crate
-/// 复用（它是 crate 私有常量），但两处的感知延迟必须一致 —— 否则同一个插话在
-/// `bash` 里 100ms 生效、在 `subagent` 里 300ms 生效。
-const STEER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// 同步派发的两种结局。
-enum Dispatch {
-    /// 子 agent 跑完了。
-    Done(Result<SubagentOutcome, String>),
-    /// 用户插话 ⇒ 放弃等待（drop 掉 runner future = 取消子 agent）。
-    Steered,
-}
-
-/// 跑一次子 agent，并同时监视父边界源上的**用户插话**。
-///
-/// **为什么放弃等待就够**：`runner.run(..)` 的 future 被 drop ⇒ 子 agent 的回合
-/// 随之中止 ⇒ 它自己的 bash 靠 `kill_on_drop` 收尸（与「父回合被中止」同一条路径）。
-/// 插话本身**不在这里消费**：它仍排在边界队列里，由 `BasicLoop` 在轮边界 `take`。
-///
-/// **`boundary` 为 `None`**（`-p` / `--json` 无 steering 生产者）⇒ 退化为单纯等待，
-/// 与「没有探针」逐字等价。
-async fn run_or_steer(
-    runner: &dyn SubagentRunner,
-    prompt: &str,
-    model: Option<&str>,
-    mode: SubagentMode,
-    boundary: Option<&dyn BoundarySource>,
-) -> Dispatch {
-    let wait_steer = async {
-        match boundary {
-            // 先看一眼：插话已到时不白白发起一次派发。
-            Some(src) => loop {
-                if src.has_pending_steer() {
-                    return;
-                }
-                tokio::time::sleep(STEER_POLL_INTERVAL).await;
-            },
-            None => std::future::pending::<()>().await,
-        }
-    };
-    tokio::select! {
-        biased;
-        out = runner.run(prompt, model, mode, boundary) => Dispatch::Done(out),
-        _ = wait_steer => Dispatch::Steered,
-    }
-}
-
-/// 因用户插话放弃等待时的工具结果。
-///
-/// **`is_error: false`**：派发没坏，是用户改了主意 —— 报成失败会让模型去「重试」，
-/// 而用户想要的恰恰是别再跑了。
-fn steered_dispatch_result() -> ToolResult {
-    ToolResult {
-        content: "[subagent: dispatch aborted early because the user sent a message while the \
-                  sub-agent was working. The sub-agent was cancelled and did NOT finish — its \
-                  partial work is not available. That message will enter your context as soon as \
-                  this batch of tool calls finishes; read it before deciding whether to re-dispatch.]"
-            .to_string(),
-        is_error: false,
-    }
-}
-
 /// 解析 `mode` 参数：缺省 / `"general"` ⇒ `General`；`"explore"` ⇒ `Explore`；
 /// 其余任何值（含非字符串）⇒ `InvalidInput`。
 ///
@@ -1627,11 +1563,10 @@ impl Tool for SubagentTool {
         let runner = ctx
             .subagent
             .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
-        let out = match run_or_steer(runner, prompt, model, mode, ctx.boundary).await {
-            Dispatch::Done(out) => out.map_err(ToolError::Execution)?,
-            // 插话：放弃等待（子 agent 已取消），回合继续。
-            Dispatch::Steered => return Ok(steered_dispatch_result()),
-        };
+        let out = runner
+            .run(prompt, model, mode, ctx.boundary)
+            .await
+            .map_err(ToolError::Execution)?;
 
         let mut content = String::new();
         if let Some(d) = &out.diagnostic {
@@ -2060,29 +1995,34 @@ mod tests {
         assert!(matches!(err, ToolError::Execution(_)));
     }
 
-    /// 同步派发时用户插话 ⇒ **放弃等待**（子 agent 被取消），且**不消费插话**。
+    /// 同步派发期间用户插话 ⇒ **不打断**：子 agent 跑完、结果正常返回，插话仍在队列里。
     ///
-    /// 用「永不返回的 runner」作替身：不插话就永远不返回 ⇒ 本用例只能靠探针收场。
-    /// 三条不变量：
-    /// ① 插话后**很快**返回（不把父回合钉到子任务跑完）；
-    /// ② 结果是 `is_error: false` 且如实说明「派发已中止、子 agent 未完成」；
+    /// 用「跑 400ms 才返回的 runner」作替身，并在 100ms 时投 `Steer`：
+    /// ① 工具不提前返回（墙钟 ≥ runner 自身时长）；
+    /// ② 结果就是子 agent 的正常结果（不得被偷换成「派发已中止」类文案）；
     /// ③ 插话**仍在队列里**（工具不得偷吃，只能由轮边界 `take`）。
     ///
-    /// 变异：删掉 `run_or_steer` 里的 `wait_steer` 分支 ⇒ 永不返回 ⇒ 守卫超时变红。
+    /// 变异：把 `call` 改回 `select!` 监视 `has_pending_steer()` ⇒ ① 红。
     #[tokio::test]
-    async fn subagent_tool_steer_abandons_dispatch_without_consuming_steer() {
-        struct HangingRunner;
+    async fn subagent_tool_steer_mid_dispatch_does_not_abandon_it() {
+        struct SlowRunner;
         #[async_trait]
-        impl SubagentRunner for HangingRunner {
+        impl SubagentRunner for SlowRunner {
             async fn run(
                 &self,
-                _prompt: &str,
+                prompt: &str,
                 _model: Option<&str>,
                 _mode: SubagentMode,
                 _boundary: Option<&dyn BoundarySource>,
             ) -> Result<SubagentOutcome, String> {
-                std::future::pending::<()>().await;
-                unreachable!("永不返回")
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Ok(SubagentOutcome {
+                    summary: format!("摘要:{prompt}"),
+                    artifact: None,
+                    stop_reason: StopReason::Completed,
+                    diagnostic: None,
+                    usage: Usage::default(),
+                })
             }
         }
 
@@ -2096,12 +2036,12 @@ mod tests {
         let producer = Arc::clone(&boundary);
         let steer_for_task = steer.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             producer.push(steer_for_task);
         });
 
         let tool = SubagentTool::new(Duration::from_secs(600));
-        let runner = HangingRunner;
+        let runner = SlowRunner;
         let ctx = ToolContext::new(Some(&*boundary), PathBuf::from("."), PathBuf::from("."))
             .with_subagent(&runner);
 
@@ -2111,59 +2051,21 @@ mod tests {
             tool.call(serde_json::json!({"description":"d","prompt":"干活"}), ctx),
         )
         .await
-        .expect("插话必须能放弃等待（否则父回合被子任务钉死）")
-        .expect("放弃等待不是工具错误");
+        .expect("子 agent 应在守卫内跑完")
+        .expect("插话不是工具错误");
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < Duration::from_secs(3),
-            "插话应在一个轮询周期级别内收口，实际 {elapsed:?}"
+            elapsed >= Duration::from_millis(400),
+            "插话不得缩短派发（应跑满 runner 自身时长），实际 {elapsed:?}"
         );
-        assert!(!r.is_error, "插话中途放弃不是失败（否则模型会去重试）");
-        assert!(
-            r.content.contains("aborted early") && r.content.contains("user sent a message"),
-            "结果须说清是插话导致的提前中止：{}",
-            r.content
-        );
-        assert!(
-            r.content.contains("did NOT finish"),
-            "须明确子 agent 未完成（别让模型以为拿到了结果）：{}",
-            r.content
-        );
+        assert!(!r.is_error);
+        assert_eq!(r.content, "摘要:干活", "结果就是子 agent 的正常结果");
 
         // 插话未被消费。
         assert_eq!(boundary.len(), 1, "工具不得消费用户的插话");
         assert!(boundary.has_pending_steer());
-        assert_eq!(boundary.take(), Some(steer));
-    }
-
-    /// 无边界源（`-p` / `--json`）时 `run_or_steer` 退化为单纯等待：正常派发不受影响。
-    #[tokio::test]
-    async fn run_or_steer_without_boundary_is_plain_dispatch() {
-        struct CompletingRunner;
-        #[async_trait]
-        impl SubagentRunner for CompletingRunner {
-            async fn run(
-                &self,
-                prompt: &str,
-                _model: Option<&str>,
-                _mode: SubagentMode,
-                _boundary: Option<&dyn BoundarySource>,
-            ) -> Result<SubagentOutcome, String> {
-                Ok(SubagentOutcome {
-                    summary: format!("摘要:{prompt}"),
-                    artifact: None,
-                    stop_reason: StopReason::Completed,
-                    diagnostic: None,
-                    usage: Usage::default(),
-                })
-            }
-        }
-
-        match run_or_steer(&CompletingRunner, "干活", None, SubagentMode::General, None).await {
-            Dispatch::Done(Ok(out)) => assert_eq!(out.summary, "摘要:干活"),
-            _ => panic!("无边界源时应正常派发并返回结果"),
-        }
+        assert_eq!(boundary.take(), Some(steer), "插话原样留在队列里");
     }
 
     /// `mode` 解析：缺省 / `"general"` ⇒ `General`，`"explore"` ⇒ `Explore`，

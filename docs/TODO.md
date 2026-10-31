@@ -129,11 +129,20 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 | `docs/arch/tool-call-efficiency/` | Q1 范围、Q2 多目标参数面、Q3 布局快照、Q4 验收口径、Q5 措辞归属 | `context.md:199` |
 | `docs/arch/etf-display-tool/` | 报告目录是否可配、ECharts CDN 降级；**`adapters/tools-finance` crate 不存在**（`Cargo.toml` 成员表无此项） | `context.md:99` |
 | `docs/arch/prompt-delivery/notes.md` | 唯一未决项：**产品内置 vs 项目可配** | `notes.md:98`（文档头自标「状态：未决」） |
+| `docs/arch/subagent-budget/` | 🟡 **部分已决**（2026-10-31）：**`General` 不设硬上限**、`General` 软提醒 50 已定；`Explore` 软提醒 10 待定（修「继承 60」但硬上限 16”）的死角。未澄清：低轮次竞速是否正常、不活工具与空心轮的区分依据 | `context.md` 末尾「未澄清问题」 |
 | `docs/arch/input-delivery-latency/` | ⚠️ **部分已解**（2026-10-22）：<br>· ✅ **G2**（F2）已修 —— 「模型正要收尾时到达的插话静默消失」已修，见 `docs/adr/0049-final-answer-boundary-drain.md`；<br>· ✅ **G4**（F4）已解 —— 随 `8a08bd6` 落地；<br>· ⬜ **G1 / G3 / G5 / G6** 未做 —— app 侧 `Delivery` 队列、降级投递的触发机制、`origin` 是否外送、状态机载体；<br>· ⬜ 设计 §7 仍有 **3 项「待用户确认」**（命令与消息谁先 / 回合中命令是否即时拒绝 / 投递状态显示落点） | `review.md` §7 闸门表、`docs/adr/0047-input-delivery-target-and-queue.md`、`docs/adr/0049-final-answer-boundary-drain.md` |
 
 ---
 
 ## D. 其他尾巴
+
+- ✅ **插话不再打断工具与同步 subagent 已落地**（2026-10-31）。
+  决策 `docs/adr/0064-steer-does-not-interrupt.md`，as-built `docs/design-final/steer-does-not-interrupt.md`。
+  工具与子 agent 只响应 `is_aborted()`；`Steer` / `Compact` 仍留在队列里，由 `BasicLoop` 在轮边界
+  `take` 后注入（语义不变，只延后生效）。净减 289 行。
+  **已接受的代价**：`/compact` 也要等长工具跑完（ADR-0052 决策 3 随之作废）。
+  ⬜ **遗留**：`BoundarySource::has_pending_steer()` 现无生产消费者（公共 API，删属破坏性变更）；
+  确认无用后可删 —— 需先核外部实现方。
 
 - ✅ **推理强度的「按调用类型分档」已落地**（2026-10-28，P1–P4）。
   完整探索 `docs/arch/effort-per-call-type/context.md`，设计 `design.md`，

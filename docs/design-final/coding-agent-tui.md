@@ -509,7 +509,7 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 
 | 落点 | 条数 | 覆盖 |
 |---|---|---|
-| `crates/ys-protocol` | 46（其中 `boundary` 18） | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `has_pending_steer`（只看 Steer、不消费、不泄露正文、默认 false）/ `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
+| `crates/ys-protocol` | 52（其中 `boundary` 22） | `Boundary` FIFO / `Abort` 置位即见 / `is_aborted` 非破坏性 / Steer 不置位 / `has_pending_steer`（只看 Steer、不消费、不泄露正文、默认 false）/ `Send+Sync` trait 对象；`Request`/`Outbound`/`Envelope` 序列化 |
 | `crates/ys-tui-coding` | 501（**当前值**） | 三 pane `TestBackend` 渲染、状态行四档宽度、输入区（多行 + 粘贴 + 中文退格）、补全浮层、命令表逐条映射、`resolve_prompt` 决策路径、`FakePrompter`、`/skills` 选择器（回填 / 遮蔽过滤 / 取消）；**本轮 md 渲染 +30**（逐项见 §9.4） |
 | `crates/ys-runtime/tests/run_turn_boundary.rs` | 5 | `run_turn` + `AgentPorts` 带 `BoundarySource` 的轮边界语义（跨 crate，不反向依赖 app） |
 | `apps/coding-agent/src/app_loop.rs` | 2 | Prompt → 事件（turn 从 1）→ View；`NewSession` → Output + 刷新快照；**残留 `Abort` 被空闲期丢弃**（变异测试钉住） |

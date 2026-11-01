@@ -474,7 +474,7 @@ impl KeyGroup {
 ///
 /// **不列 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（见 `events.rs`
 /// 模块头）。**不列 `⌥+↓`**：Terminal.app 发 `ESC[B`，与普通 `↓` 同形。
-static KEYBINDINGS: [KeyBinding; 21] = [
+static KEYBINDINGS: [KeyBinding; 22] = [
     KeyBinding {
         keys: "← / →",
         action: "移动输入光标（Ctrl 或 ⌥ + ←/→ 按词移动；⌥b / ⌥f 同义）",
@@ -591,7 +591,13 @@ static KEYBINDINGS: [KeyBinding; 21] = [
     },
     KeyBinding {
         keys: "左键拖选（Chat 区）",
-        action: "选中对话内容，松手即复制（按不按 ⇧ 都行）",
+        action: "标记对话内容（按不按 ⇧ 都行），松手不复制",
+        group: KeyGroup::Mouse,
+        note: None,
+    },
+    KeyBinding {
+        keys: "右键（Chat 区）",
+        action: "复制已标记的内容到系统剪贴板",
         group: KeyGroup::Mouse,
         note: None,
     },

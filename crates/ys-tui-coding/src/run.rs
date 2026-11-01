@@ -168,6 +168,7 @@ fn is_selection_kind(kind: MouseEventKind) -> bool {
         MouseEventKind::Down(MouseButton::Left)
             | MouseEventKind::Drag(MouseButton::Left)
             | MouseEventKind::Up(MouseButton::Left)
+            | MouseEventKind::Down(MouseButton::Right)
     )
 }
 
@@ -1554,8 +1555,10 @@ mod tests {
         );
     }
 
-    /// **快速拖选必须能复制**：`Down` / `Drag` / `Up` 落在同一批时，`coalesce` 只留
-    /// 最后一个 ⇒ 状态机收到孤立的 `Up`，`is_dragging()` 为假，整次拖选被静默丢弃。
+    /// **快速拖选 + 右键必须能复制**：`Down` / `Drag` / `Up` / 右键落在同一批时，
+    /// `coalesce` 必须把它们全部按序送达 —— 少任何一个环节选区都走不到复制。
+    ///
+    /// 变异：把 `coalesce` 改回「只留最后一个」⇒ 本用例红。
     #[test]
     fn test_fast_drag_in_one_batch_copies() {
         let (req_tx, _req_rx) = mpsc::channel(8);
@@ -1578,7 +1581,8 @@ mod tests {
         let down = mk(MouseEventKind::Down(MouseButton::Left), x, y);
         let drag = mk(MouseEventKind::Drag(MouseButton::Left), x + 10, y + 2);
         let up = mk(MouseEventKind::Up(MouseButton::Left), x + 10, y + 2);
-        let mut rest = vec![drag, up].into_iter();
+        let right = mk(MouseEventKind::Down(MouseButton::Right), x + 10, y + 2);
+        let mut rest = vec![drag, up, right].into_iter();
         let (wheel, mouse, deferred) = coalesce(down, || rest.next());
         let mut written: Vec<String> = Vec::new();
         handle_round(
@@ -1595,7 +1599,7 @@ mod tests {
         );
         assert!(
             !written.is_empty(),
-            "快速拖选（Down/Drag/Up 同批）必须复制，实际未写剪贴板"
+            "快速拖选 + 右键同批时必须复制，实际未写剪贴板"
         );
     }
 

@@ -171,10 +171,10 @@ pub fn handle_event(
 ///
 /// - **滚轮上下**：滚聊天，每事件 [`WHEEL_ROWS`] 视觉行（见模块文档「滚轮」段）；属
 ///   **用户主动**滚动，与批路径共用 [`scroll_wheel_batch`] —— 两条路只有一份位移折算。
-/// - **左键三态**（按下 / 拖动 / 松开）：应用内选区的生命周期（ADR-0051）。
-///   crossterm 把「按住左键移动」一律解析为 `Drag(Left)`（`parse_cb`：`cb & 0b10_0000`
-///   即拖动位），`Moved` 只在**未按键**时产生 —— 故拖选只认三态即可。
-/// - **`⇧` 不影响选区**：带不带 `⇧` 都走同一条应用内选区，两条路都必须能选中并复制。
+/// - **左键三态**（按下 / 拖动 / 松开）：标记选区范围；**松手不复制**。
+/// - **右键**：复制已标记的选区。这是本应用唯一的复制入口 —— 拖选只负责标记，
+///   用户再按右键才真的写剪贴板。
+/// - **`⇧` 不影响选区**：带不带 `⇧` 都走同一条应用内选区，两条路都必须能标记并复制。
 /// - 其余（水平滚动 / 悬停 / 其它键）：不绑任何动作。
 pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
     match m.kind {
@@ -185,6 +185,7 @@ pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
         MouseEventKind::Down(MouseButton::Left) => begin_selection(app, m, width, height),
         MouseEventKind::Drag(MouseButton::Left) => extend_selection(app, m, width, height),
         MouseEventKind::Up(MouseButton::Left) => finish_selection(app, m, width, height),
+        MouseEventKind::Down(MouseButton::Right) => copy_marked_selection(app),
         // 水平滚动没有语义（对话是单列竖排）；悬停不绑（不做 hover）。
         _ => {}
     }
@@ -364,19 +365,27 @@ fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     }
 }
 
-/// 松开左键：两端点重合 ⇒ 不复制；否则提取文本写进 `pending_clipboard`。
+/// 松开左键：把选区从「正在拖」转为「已标记」，**不**复制。
 ///
-/// 无论结局如何都要清选区（高亮消失，文字已在剪贴板）。
+/// 复制改由右键触发（[`copy_marked_selection`]）—— 拖选只负责标记范围，用户再决定
+/// 什么时候真的写剪贴板。两端点重合（按下未拖动）⇒ 清选区。
 fn finish_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     if !app.selection.is_dragging() {
         return;
     }
     extend_selection(app, m, width, height);
-    let (anchor, cursor) = app.selection.bounds();
-    if anchor == cursor {
-        app.selection.clear();
+    app.selection.mark();
+}
+
+/// 右键：把已标记的选区写进剪贴板，并清掉选区（高亮消失，文字已进剪贴板）。
+///
+/// 无选区时右键**什么也不做** —— 不弹菜单、不粘贴。右键在本应用里只有一个语义：
+/// 「复制我刚标记的东西」。
+fn copy_marked_selection(app: &mut App) {
+    if !app.selection.is_active() {
         return;
     }
+    let (anchor, cursor) = app.selection.bounds();
     let outcome = crate::selection::extract(&app.layout.borrow(), anchor, cursor);
     match outcome {
         crate::selection::ExtractOutcome::Copied(text) => app.pending_clipboard = Some(text),
@@ -2461,9 +2470,20 @@ mod tests {
             w,
             h,
         );
-        let copied = a.pending_clipboard.take().expect("松手应复制");
+        // **松手只标记**：高亮保留、剪贴板不动。
+        assert!(a.selection.is_marked(), "松手后应转为已标记");
+        assert!(a.pending_clipboard.is_none(), "松手不得复制");
+
+        // **右键才复制**，且复制后高亮消失。
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), col + 3, row + 2),
+            &mut a,
+            w,
+            h,
+        );
+        let copied = a.pending_clipboard.take().expect("右键应复制");
         assert!(!copied.is_empty(), "复制的文本不得为空");
-        assert!(!a.selection.is_active(), "松手后选区应清");
+        assert!(!a.selection.is_active(), "复制后选区应清");
     }
 
     /// **V7：`⇧` 拖选与裸拖选同效** —— 两者都必须建选区、松手都必须复制。
@@ -2501,11 +2521,20 @@ mod tests {
             let mut ev = mouse(MouseEventKind::Up(MouseButton::Left), col + 20, row + 3);
             ev.modifiers = modifiers;
             handle_mouse(ev, &mut a, w, h);
+            assert!(a.selection.is_marked(), "松手后应转为已标记");
+            assert!(
+                a.pending_clipboard.is_none(),
+                "松手不得复制（modifiers={modifiers:?}）"
+            );
+
+            let mut ev = mouse(MouseEventKind::Down(MouseButton::Right), col + 20, row + 3);
+            ev.modifiers = modifiers;
+            handle_mouse(ev, &mut a, w, h);
             assert!(
                 a.pending_clipboard.is_some(),
-                "松手必须复制（modifiers={modifiers:?}）"
+                "右键必须复制（modifiers={modifiers:?}）"
             );
-            assert!(!a.selection.is_active(), "松手后选区必清");
+            assert!(!a.selection.is_active(), "复制后选区必清");
             assert_eq!(a.scroll_offset, 5, "拖选不得改滚动位置");
             assert!(!a.follow, "拖选脱离跟随");
         }
@@ -2663,6 +2692,17 @@ mod tests {
         handle_mouse(
             mouse(
                 MouseEventKind::Up(MouseButton::Left),
+                inner.x + inner.width - 1,
+                inner.y + inner.height - 1,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        // 松手只标记；超限提示在**右键复制**时才产生。
+        handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
                 inner.x + inner.width - 1,
                 inner.y + inner.height - 1,
             ),

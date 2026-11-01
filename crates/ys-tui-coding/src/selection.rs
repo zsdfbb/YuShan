@@ -45,8 +45,8 @@ use crate::layout::{RowRef, TranscriptLayout, Window};
 
 /// 一次拖选的生命周期。
 ///
-/// **两态**：没有 `Done`。松手复制后立即 [`Selection::clear`] 回 `Idle`（高亮随之消失，
-/// 文字已在剪贴板），故 `Done` 没有观测点。
+/// **三态**：`Idle` → `Dragging` →（松手）`Marked` →（右键）`Idle`。
+/// 松手不复制 —— 只是把范围标下来，等右键才写剪贴板（[`Selection::mark`]）。
 ///
 /// 消费方是 `events.rs` 的鼠标分支与 `draw.rs` 的高亮层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,6 +56,11 @@ pub(crate) enum Phase {
     Idle,
     /// 左键已按下（可能尚未移动 ⇒ 两端点相等，松手不复制）。
     Dragging,
+    /// 左键已松开，选区**保留**为「已标记」状态，等右键复制。
+    ///
+    /// 与 `Dragging` 分开是承重的：高亮在两种状态下都要画，但只有 `Dragging`
+    /// 才接 `Drag` 事件、才跑自动滚动（[`Selection::is_dragging`]）。
+    Marked,
 }
 
 /// 贴边方向：`1` = 上沿（要看**更早**的行，对应 `scroll` 的 `delta > 0`）；
@@ -96,10 +101,17 @@ impl Selection {
 
     /// 是否存在（或正在进行）选区。
     ///
-    /// 当前两态下与 [`Self::is_dragging`] 等价；两个名字都留，是因为调用点语义不同
-    /// （「要不要继续自动滚动」问前者，「要不要画高亮 / 清理」问后者）。
+    /// `Dragging` 与 `Marked` 都算 —— 两者都要画高亮；只有前者接拖拽事件。
     pub(crate) fn is_active(&self) -> bool {
         self.phase != Phase::Idle
+    }
+
+    /// 左键已松开、选区仍标记着（等右键复制）。
+    ///
+    /// 当前只有测试直接问它；生产路径用 [`Self::is_active`]（两者都要画高亮）。
+    #[cfg(test)]
+    pub(crate) fn is_marked(&self) -> bool {
+        self.phase == Phase::Marked
     }
 
     /// 当前贴边方向（`1` 上沿 / `-1` 下沿 / `0` 未贴边）。
@@ -151,6 +163,20 @@ impl Selection {
             self.edge_since = Some(now);
         }
         self.edge = edge;
+    }
+
+    /// 松手：保留选区并转入 `Marked`，**不**改两端点。
+    ///
+    /// 两端点重合（按下未拖动）⇒ 回 `Idle`：空选区没有可复制的，留着高亮只会
+    /// 让下一次点击多一步清理。
+    pub(crate) fn mark(&mut self) {
+        if self.anchor_row == self.cursor_row && self.anchor_x == self.cursor_x {
+            self.clear();
+            return;
+        }
+        self.phase = Phase::Marked;
+        self.edge = 0;
+        self.edge_since = None;
     }
 
     /// 清选区：连字形缓存与矩形缓冲一起回到初始态。

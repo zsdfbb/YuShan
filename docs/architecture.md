@@ -1,6 +1,6 @@
 # YuShan 架构图说
 
-> **最后更新**：2026-10-20（并行工具事件时序、subagent 诊断/转录、debug 默认保留与 TUI 摘要）
+> **最后更新**：2026-11-01（subagent 异步收敛：异步派发、结果自动起回合、`subagent_send`）
 >
 > 用图解释设计。**规范细节**见 `docs/design.md`；**as-built 实现形态**（含实现与设计的分歧）见 `docs/design-final/coding-agent-tui.md`（路线 B，最新；核心信道第一刀见 `docs/design-final/core-channel.md`，其信道/actor 部分已被前者取代）；术语见 `docs/CONTEXT.md`；决策的 why 见 `docs/adr/`。
 >
@@ -274,7 +274,9 @@ emit 全部 `ToolCall`，9b 用 `buffer_unordered(max_parallel_tools.max(1))` �
 立即 emit 对应的 `ToolResult` 并写回原始 index；9c 再按原始 `tool_calls` 顺序组装回喂模型的
 单条 `Role::User` 消息。因此**事件结果按完成顺序出现，模型消息仍按调用顺序配对**；
 TUI 按 `ToolCallId` 回填，不依赖 `ToolResult` 事件顺序。当前声明并发安全的集合是
-`subagent` 与只读工具 `read` / `find` / `ls` / `grep`；`bash` / `write` / `edit` 等保持串行准入。
+只读工具 `read` / `find` / `ls` / `grep` 与 `subagent_async` / `subagent_send`
+（后两个只登记后台任务、只往子的边界源入队，都不跑子 agent、不等待）；
+`bash` / `write` / `edit` / `bash_bg` / `websearch` / `webfetch` 保持串行准入。
 
 **两个边界的区别**（容易混淆）
 
@@ -401,12 +403,13 @@ pub struct QueueBoundarySource { inner: Mutex<Inner { queue: VecDeque<Boundary>,
 - **工具级取消载体**：`ToolContext.boundary: Option<&dyn BoundarySource>`。`BashTool` 挂载时
   以 **100ms** 间隔轮询 `is_aborted()`，命中则杀**进程组**（`sh -c "kill -9 -{pid}"`，**不引 libc**）；
   未挂载时行为与改动前完全一致。
-- **工具表与执行批**：启动期装配 **10 个工具**（基础 9：`read/write/edit/bash/grep/find/ls/websearch/webfetch`
-  + 末位 `subagent`；见 `docs/design-final/coding-agent-tui.md` §13）。`Tool` 另有两个不进 `ToolSpec`
+- **工具表与执行批**：启动期装配 **12 个工具**（基础 9：`read/write/edit/bash/grep/find/ls/websearch/webfetch`
+  + 末位 `bash_bg` / `subagent_async` / `subagent_send`；见 `docs/design-final/coding-agent-tui.md` §13）。`Tool` 另有两个不进 `ToolSpec`
   的默认方法：`timeout()`（per-tool 墙钟上限，优先级 工具声明 → `bash_timeout` → 300s）与
   `is_concurrency_safe()`（默认 `false`）。只有当一批 **每一个**工具都为 `true` 时才并发
   （`buffer_unordered(max_parallel_tools.max(1))`，**完成即发**）；否则保持原串行路径
-  （事件 `C1,R1,C2,R2`）。当前安全集合为 `subagent` + `read` / `find` / `ls` / `grep`。
+  （事件 `C1,R1,C2,R2`）。当前安全集合为只读 4 元 `read` / `find` / `ls` / `grep`
+  加 `subagent_async` / `subagent_send`。
   并行批的模型回喂消息仍在 Step 9c 按原 `tool_calls` 顺序组装。
 
 ---
@@ -759,12 +762,15 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 
 **subagent 失败现场**：子 agent 的本地 `CollectingSink` 捕获本次回合事件，不进入父事件流；
 转录按子会话内容块保留 `Text`、`ToolUse` 参数与 `ToolResult`，工具结果正文优先取事件中的原始
-`ToolResult`（会话可能被 turn budget 降级），仅在事件缺失时回退会话正文。非 `Completed` 结果回给
-父工具的结果首行是 `[diagnostic: ...]`：物理单行、控制字符替换为空格、总计不超过 1024 字节；
-`Cancelled` 带 `cause=parent-turn-cancelled|child-budget|unknown`。只有在子回合已经启动、
-`child.run_turn` 返回 `Err` 的路径才生成 `stop_reason=cancelled cause=unknown` 的诊断并附真实
-错误文本；无模型、派发次数超限、`AgentBuilder` 组装失败等 runner 前置错误直接返回 `Err`，
-由 `SubagentTool` 映射为 `ToolError::Execution`，没有 diagnostic 前缀。转录写失败不 panic，
+`ToolResult`（会话可能被 turn budget 降级），仅在事件缺失时回退会话正文。非 `Completed` 结果的正文以
+`[diagnostic: ...]` 开头：物理单行、控制字符替换为空格、总计不超过 1024 字节；
+`Cancelled` 带 `cause=parent-turn-cancelled|child-budget|unknown`。结果渲染成一条 `Role::Harness`
+消息经 `PendingResults` 送达（不是工具返回值），正文顺序是诊断 → 摘要 → 转录路径。
+子回合已经启动、`child.run_turn` 返回 `Err` 的路径生成 `stop_reason=Failed` 的诊断并附
+真实错误文本（故障不是取消 ⇒ 不带 `cause`）；`AgentBuilder` 组装失败同在子任务内，
+落成 `stop_reason=Failed` + 「子 agent 未启动」的最小转录。无可用模型、派发次数超限等
+发生在 `spawn` **之前**的错误由 `SubagentRunner::spawn` 返回 `Err`，
+`SubagentAsyncTool` 以 `ToolError::Execution` 上报，没有 diagnostic 前缀。转录写失败不 panic，
 错误并入诊断；摘要文本主体按 `MAX_SUMMARY_BYTES` 截断，截断标记与随后保证的 `## Files`
 节可使最终 summary 略超该值。
 

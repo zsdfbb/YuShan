@@ -106,8 +106,8 @@ debug 日志新增一条**段记录** `ev="run_reading"`，每回合一条、随
 - 两者是**兄弟**而非子集：`compaction_usage` 不得并入 `usage`，那会破坏 `RunFinished.usage`
   的逐字节承诺与既有消费者。
 
-**压缩归因不透传事件消费者**：`run_compaction` / `drain_boundary` / `wait_for_subagents`
-三处都加 `&mut Usage` 参数回填（依次 `crates/ys-loop/src/basic.rs:237`、`:176`、`:115`），
+**压缩归因不透传事件消费者**：`run_compaction` / `drain_boundary`
+两处都加 `&mut Usage` 参数回填（依次 `crates/ys-loop/src/basic.rs:237`、`:176`），
 与 `total_usage` **同一 sink 类型、同一套 `Add`**。累计责任在 `ys-loop` 与 app 侧
 `TurnStats`，**不靠** `RoundUsage{purpose}` 的事件消费者（ADR-0061 D6）。
 
@@ -213,8 +213,8 @@ crates/ys-core/src/lib.rs               跨桶同一条 Add 规则用例
 adapters/model-openai-compatible/src/response.rs   ChatUsage 缓存两桶 Option 化；cache_reading()
 adapters/model-openai-compatible/src/lib.rs       Usage 构造改用 cache_reading()；三态单测
 crates/ys-loop/src/result.rs            RunResult +cache_reading +compaction_usage
-crates/ys-loop/src/basic.rs             逐轮累加 cache_reading；run_compaction/drain_boundary/
-                                        wait_for_subagents 加 &mut Usage 回填
+crates/ys-loop/src/basic.rs             逐轮累加 cache_reading；run_compaction/drain_boundary
+                                        加 &mut Usage 回填
 apps/coding-agent/src/status.rs         TurnStats +cache_reported +total_compaction_usage；
                                         record_result / record_with_cache / cache_hit_pct；
                                         Copy → Clone（Usage 只 Clone）

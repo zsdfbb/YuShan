@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -58,9 +58,6 @@ pub const EXPLORE_WALL_CLOCK: Duration = Duration::from_secs(300);
 pub const EXPLORE_FINAL_REPORT_GRACE: Duration = Duration::from_secs(60);
 /// 产物保留期 —— 启动期 sweep 超过此龄的文件（只对 Primary 档）。
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// 派发工具外闸相对**子预算**的宽限：让协作路径（watchdog → 轮边界）先赢，
-/// 外闸只兜「连轮边界都到不了」的挂死（ADR-0029 修正 2）。
-pub const OUTER_GRACE: Duration = Duration::from_secs(60);
 /// 单条诊断的硬上限（含 `[diagnostic:` 前缀与截断标记）。
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 
@@ -116,11 +113,25 @@ pub struct ChildBoundary {
 impl ChildBoundary {
     /// `parent` 必须是 `Arc` —— 边界源要能 coerce 成 `Arc<dyn BoundarySource>`
     /// （默认隐含 `'static`），而借用父的引用做不到（自身会带上父的生命周期）。
+    ///
+    /// 生产路径走 [`new_with_own`](Self::new_with_own)：子那份队列要在 `tokio::spawn`
+    /// 之前建并登记。本构造仅供测试。
+    #[cfg(test)]
     pub fn new(parent: Option<Arc<dyn BoundarySource>>) -> Self {
         Self {
             own: Arc::new(QueueBoundarySource::new()),
             parent,
         }
+    }
+
+    /// 用调用方给的 `own` 构造 —— 让 spawn 侧在 `tokio::spawn` **之前**就能把该队列
+    /// 登记进 [`SubagentHandles`]（否则从拿到句柄到 `execute` 建边界之间有一窗口，
+    /// 父的 `subagent_send` 会落空）。
+    pub fn new_with_own(
+        parent: Option<Arc<dyn BoundarySource>>,
+        own: Arc<QueueBoundarySource>,
+    ) -> Self {
+        Self { own, parent }
     }
 
     /// 自己那份边界源（watchdog 往这里 `push(Abort)`）。
@@ -394,37 +405,114 @@ impl Drop for PendingResultsBinding {
     }
 }
 
-/// 进程级的「仍在跑的子 agent 数」（ADR-0055）。
+/// handle → 子 agent 自己那份边界源（`subagent_send` 的投递目标）。
+///
+/// # 为何用 `Weak`
+///
+/// 子 agent 收尾后它的 `ChildBoundary` 被 drop ⇒ 注册项自动失效（`upgrade()` 失败
+/// 即视为「已收尾」），无需手动注销。用 `Arc` 会把每个子 agent 的边界源钉到进程结束。
+///
+/// # 为何是进程级
+///
+/// 与 [`PendingResults`] / [`LiveSubagents`] 同一条理由：`/resume` 重建 agent，
+/// 但已在后台跑着的子 agent 不随之重建 ⇒ 注册表必须与工具持有的是**同一份**。
+#[derive(Default)]
+pub struct SubagentHandles {
+    inner: Mutex<HashMap<String, Weak<QueueBoundarySource>>>,
+}
+
+impl SubagentHandles {
+    /// 登记一个句柄的投递目标。
+    ///
+    /// 必须在子 agent 的 `tokio::spawn` **之前**调用：父侧 `spawn` 返回句柄后可以立刻
+    /// `send`，晚注册会让那条消息落空。
+    pub fn register(&self, handle: impl Into<String>, own: Arc<QueueBoundarySource>) {
+        self.lock().insert(handle.into(), Arc::downgrade(&own));
+    }
+
+    /// 投递一条消息给**仍在跑**的子 agent（它在子的下一个轮边界被看到）。
+    ///
+    /// 角色用 [`Role::User`] 而非 `Harness`：`transcript_body` 会把角色名打进子转录，
+    /// `Harness` 会让子转录出现「父 harness 说过话」的误导。
+    ///
+    /// fail-closed：handle 不存在 / 已收尾 ⇒ `Err`，正文列出当前有效的 handle 列表。
+    pub fn send(&self, handle: &str, message: &str) -> Result<(), String> {
+        // 先取目标、放锁，再 `push`：持锁调外部代码是坏习惯（`push` 会唤醒等待者）。
+        let own = {
+            let mut inner = self.lock();
+            let own = inner.get(handle).and_then(Weak::upgrade);
+            if own.is_none() {
+                // 顺手清理已失效项，让错误正文里的列表就是当下真在跑的那批。
+                inner.retain(|_, weak| weak.strong_count() > 0);
+            }
+            own
+        };
+        match own {
+            Some(own) => {
+                own.push(Boundary::Steer(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: message.to_string(),
+                    }],
+                }));
+                Ok(())
+            }
+            None => Err(format!(
+                "没有在跑的子 agent 叫 `{handle}`（可能已收尾或句柄写错）。{}",
+                self.describe_live()
+            )),
+        }
+    }
+
+    /// 当前**仍在跑**的 handle（升序）—— 已收尾的条目顺手清理掉。
+    pub fn live_handles(&self) -> Vec<String> {
+        let mut inner = self.lock();
+        inner.retain(|_, weak| weak.strong_count() > 0);
+        let mut handles: Vec<String> = inner.keys().cloned().collect();
+        handles.sort();
+        handles
+    }
+
+    /// 错误正文里的「有效 handle」一句话（锁内不留悬垂引用）。
+    fn describe_live(&self) -> String {
+        let live = self.live_handles();
+        if live.is_empty() {
+            "当前没有在跑的子 agent".to_string()
+        } else {
+            format!("当前有效的 handle：{}", live.join(", "))
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Weak<QueueBoundarySource>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// 进程级的「仍在跑的子 agent 数」。
 ///
 /// # 为何必须是进程级
 ///
 /// `AppSubagentRunner` **每回合新建**（`app_loop` 的 `make_runner`）⇒ 上一回合派发、
-/// 本回合仍在跑的子 agent 不在它的视野里。若判据读 runner 自己的计数器，它会恒为 `0`
-/// ⇒ 父回合立刻收场，「等子 agent 回来」静默失效。
+/// 本回合仍在跑的子 agent 不在它的视野里。
 ///
 /// 故本结构与 [`PendingResults`] 并列：以 `Arc` 经 `SubagentSetup` 跨 `/resume` 重建共享。
 ///
 /// # 为何用 RAII 守卫而不是手工加减
 ///
 /// `ChildTask::execute` 有四条退出路径（组装失败 / `Ok` / `Err` / future 被 drop）。
-/// 手工 `fetch_sub` 必漏一条，而漏减会让父回合钉死在等待里 —— 这是正确性问题，
+/// 手工 `fetch_sub` 必漏一条，而漏减会让读数长期偏高 —— 这是正确性问题，
 /// 不是防御性编程。守卫进 `ChildTask`，`Drop` 结构上保证回归。
 #[derive(Default)]
 pub struct LiveSubagents {
     running: AtomicUsize,
-    /// 计数变化时唤醒等待方。
-    ///
-    /// 用 `notify_waiters`（**不存 permit**）而非 `notify_one`：等待循环是
-    /// 「唤醒 + `subagent_poll` tick」双源 ⇒ 漏一次唤醒的代价只是一个 tick；
-    /// 而 permit 会跨回合残留，让下一回合凭空立即醒来。
-    settled: tokio::sync::Notify,
 }
 
 impl LiveSubagents {
-    /// 登记一个在跑的子 agent；返回的守卫 drop 时自减并唤醒等待方。
+    /// 登记一个在跑的子 agent；返回的守卫 drop 时自减。
     ///
-    /// **必须在 `tokio::spawn` 之前调用**（但要在模型 / 额度解析成功之后）——
-    /// 否则「已 spawn 但未计数」的窗口里父回合可能收场。
+    /// **必须在 `tokio::spawn` 之前调用**（但要在模型 / 额度解析成功之后）。
     pub fn enter(self: &Arc<Self>) -> LiveGuard {
         self.running.fetch_add(1, Ordering::SeqCst);
         LiveGuard {
@@ -432,18 +520,14 @@ impl LiveSubagents {
         }
     }
 
-    /// 仍在跑的数量。父回合的**唯一收场判据**（`BasicLoop` Step 9c）。
+    /// 仍在跑的数量（测试断言用）。
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.running.load(Ordering::SeqCst)
     }
-
-    /// 等到「计数发生变化」—— **不分方向**，调用方必须复核 [`count`](Self::count)。
-    pub async fn settled_notified(&self) {
-        self.settled.notified().await
-    }
 }
 
-/// [`LiveSubagents::enter`] 的 RAII 守卫 —— drop 时自减并唤醒。
+/// [`LiveSubagents::enter`] 的 RAII 守卫 —— drop 时自减。
 pub struct LiveGuard {
     live: Arc<LiveSubagents>,
 }
@@ -452,16 +536,13 @@ impl Drop for LiveGuard {
     fn drop(&mut self) {
         // `fetch_sub` 的结果不作判断：`SeqCst` 下计数不会穿透 0（enter/drop 严格配对）。
         self.live.running.fetch_sub(1, Ordering::SeqCst);
-        // 必须唤醒：判据从「>0」变成「==0」的那一刻，父回合才允许收场。
-        self.live.settled.notify_waiters();
     }
 }
 
-/// **ADR-0055 承重不变量**：`LiveGuard` 必须把计数减回去。
+/// **承重不变量**：`LiveGuard` 必须把计数减回去。
 ///
-/// 父回合的收场判据是 `running() == 0` ⇒ 任何让计数停在 >0 的路径都会把父回合
-/// 钉死在等待里直到 `subagent_wait` 上限。`ChildTask::execute` 有四条退出路径
-/// （组装失败 / `Ok` / `Err` / future 被 drop），靠 `Drop` 才能全部覆盖。
+/// `ChildTask::execute` 有四条退出路径（组装失败 / `Ok` / `Err` / future 被 drop），
+/// 靠 `Drop` 才能全部覆盖；漏一条会让读数停在 >0。
 ///
 /// 变异：删掉 `LiveGuard::drop` 里的 `fetch_sub` ⇒ 归零断言变红。
 #[test]
@@ -789,7 +870,7 @@ pub struct AppSubagentRunner<'a> {
     /// 按名构造模型用（`model` 参数）；`None` = 未接线 ⇒ 指定模型名一律 fail-closed。
     config: Option<&'a crate::config::Config>,
     /// 按「模型名 + 构建时档位」缓存实例（跨派发复用连接池 + TLS）；缓存持
-    /// `Arc<dyn Model>`，因为 `SubagentRunner::run` 需要 `&dyn Model`，`Box`
+    /// `Arc<dyn Model>`，因为子 agent 的执行要 `&dyn Model` 且实例需跨调用复用，`Box`
     /// 拿不出稳定引用。
     model_cache: SubagentModelCache,
     child_prompt: String,
@@ -802,6 +883,11 @@ pub struct AppSubagentRunner<'a> {
     dir: Arc<SubagentsDir>,
     max_dispatches: u32,
     dispatched: AtomicU32,
+    /// 当前回合号（与 `results` / `live` 同一条共享路径）。
+    ///
+    /// 句柄 `sa{turn}.{n}` 的回合段由它给出 ⇒ 跨回合不重复，`subagent_send`
+    /// 按句柄寻址时不会指向上一个回合的同名任务。写入方是回合开头（`app_loop`）。
+    turn: Arc<AtomicU32>,
     totals: Arc<UsageTotals>,
     /// 父回合的边界源（共享所有权）—— 子 agent 的 `ChildBoundary` 要透传它的
     /// 中止状态。
@@ -817,6 +903,11 @@ pub struct AppSubagentRunner<'a> {
     results: Arc<PendingResults>,
     /// 进程级的「仍在跑」计数（ADR-0055）—— 父回合的收场判据经它读出。
     live: Arc<LiveSubagents>,
+    /// handle → 子 agent 自己那份边界源（`subagent_send` 的投递目标）。
+    ///
+    /// 与 `results` / `live` 同一条共享路径：已在后台跑着的子 agent 不随 `/resume`
+    /// 重建，它们的 handle 必须汇入**同一份**注册表。
+    handles: Arc<SubagentHandles>,
 }
 
 impl<'a> AppSubagentRunner<'a> {
@@ -860,11 +951,31 @@ impl<'a> AppSubagentRunner<'a> {
             dir,
             max_dispatches: DEFAULT_MAX_DISPATCHES_PER_TURN,
             dispatched: AtomicU32::new(0),
+            turn: Arc::new(AtomicU32::new(0)),
             totals,
             parent_boundary,
             results,
             live,
+            handles: Arc::new(SubagentHandles::default()),
         }
+    }
+
+    /// 绑定句柄注册表（`make_runner` 从 [`SubagentSetup`] 转递）。
+    ///
+    /// 与构造分开是为了不改 [`new`](Self::new) 的签名：它的调用点大多是测试，
+    /// 不关心注册表。
+    pub fn with_handles(mut self, handles: Arc<SubagentHandles>) -> Self {
+        self.handles = handles;
+        self
+    }
+
+    /// 绑定回合号（`make_runner` 从 [`SubagentSetup`] 转递）。
+    ///
+    /// 与构造分开是为了不改 [`new`](Self::new) 的签名：它的调用点大多是测试，
+    /// 不关心回合号。
+    pub fn with_turn(mut self, turn: Arc<AtomicU32>) -> Self {
+        self.turn = turn;
+        self
     }
 }
 
@@ -890,11 +1001,21 @@ pub struct SubagentSetup {
     /// **已在后台跑着的子 agent 并不随之重建** —— 它们完成时写的那份表必须与
     /// 重建后的新表是**同一个**，否则结果又落进无人读的旧表。
     results: Arc<PendingResults>,
-    /// 进程级的「仍在跑」计数（ADR-0055）。
+    /// 进程级的「仍在跑」计数。
     ///
     /// 与 `results` 同一条理由共享所有权：已在后台跑着的子 agent 不随 `/resume` 重建，
-    /// 它们的计数必须汇入**同一份**计数器，否则新回合读到的 `0` 会让父回合提前收场。
+    /// 它们的计数必须汇入**同一份**计数器（供诊断与 UI 读数，不参与回合推进）。
     live: Arc<LiveSubagents>,
+    /// 当前回合号 —— 句柄 `sa{turn}.{n}` 的回合段。
+    ///
+    /// 与 `results` / `live` 同样跨重建共享：写入方在回合开头，读方是每回合新建的
+    /// [`AppSubagentRunner`]（经 [`make_runner`](Self::make_runner) 转递）。
+    turn: Arc<AtomicU32>,
+    /// handle → 子 agent 自己那份边界源（`subagent_send` 的投递目标）。
+    ///
+    /// 与 `results` / `live` 同一条理由共享所有权：已在后台跑着的子 agent 不随
+    /// `/resume` 重建，它们的 handle 必须汇入**同一份**注册表。
+    handles: Arc<SubagentHandles>,
 }
 
 impl SubagentSetup {
@@ -941,7 +1062,31 @@ impl SubagentSetup {
             model_cache: Arc::new(Mutex::new(HashMap::new())),
             results,
             live,
+            turn: Arc::new(AtomicU32::new(0)),
+            handles: Arc::new(SubagentHandles::default()),
         }
+    }
+
+    /// 句柄 `sa{turn}.{n}` 的回合段由此读出 —— 回合号指向**当前**回合（与 `results` /
+    /// `live` 同一份 `Arc` 共享路径：`make_runner` 把同一个 `Arc` 转递给 runner）。
+    pub fn set_turn(&self, turn: u32) {
+        self.turn.store(turn, Ordering::Relaxed);
+    }
+
+    /// 绑定回合号（写入方在回合开头写一次；本结构只持有 `Arc`，不写）。
+    #[allow(dead_code)] // 装配点在 app 层，本 crate 内目前只有测试调用它
+    pub fn with_turn(mut self, turn: Arc<AtomicU32>) -> Self {
+        self.turn = turn;
+        self
+    }
+
+    /// 绑定句柄注册表（装配端在构造后调用）。
+    ///
+    /// 保留 [`shared`](Self::shared) 的原签名，是为了让未接线的调用方（测试 / 恢复路径）
+    /// 零改动；未注入时每个 setup 自带一份空表（`send` 一律 fail-closed）。
+    pub fn with_handles(mut self, handles: Arc<SubagentHandles>) -> Self {
+        self.handles = handles;
+        self
     }
 
     /// 显式给出探索模式的系统提示（装配端在构造后调用）。
@@ -951,11 +1096,6 @@ impl SubagentSetup {
     pub fn with_explore_prompt(mut self, explore_prompt: String) -> Self {
         self.explore_prompt = explore_prompt;
         self
-    }
-
-    /// 派发工具的外闸（子预算 + 宽限，构造期注入）。
-    pub fn outer_timeout(&self) -> Duration {
-        self.child_budget + OUTER_GRACE
     }
 
     /// 绑定**本回合**的结果落点 —— 守卫 drop 时解绑。
@@ -998,6 +1138,8 @@ impl SubagentSetup {
             self.results.clone(),
             self.live.clone(),
         )
+        .with_turn(self.turn.clone())
+        .with_handles(self.handles.clone())
     }
 
     /// 结果投递表（供 app 循环在**回合之间**等它落地）。
@@ -1006,48 +1148,7 @@ impl SubagentSetup {
     }
 }
 
-#[async_trait]
 impl SubagentRunner for AppSubagentRunner<'_> {
-    async fn run(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        mode: SubagentMode,
-        boundary: Option<&dyn BoundarySource>,
-    ) -> Result<SubagentOutcome, String> {
-        // `boundary` 参数保留在 trait 签名里（`ToolContext` 的通用挂载点），但
-        // 本实现用 `self.parent_boundary`（生产路径上两者是同一个 `Arc`）——
-        // 它要跟着 `ChildTask` 进后台，故从构造期注入的那份取。
-        let _ = boundary;
-
-        // fail-closed：未支持按名构造模型时**绝不静默回退到父模型**。
-        let resolved = self.resolve_model(model)?;
-        self.take_dispatch_slot()?;
-        let child_limits = self.child_limits_for(model, mode);
-
-        // 执行交给 owned 的 `ChildTask` —— 同步 `run` 与异步 `spawn` **共用同一份**
-        // 执行逻辑（否则两条路径的行为会漂移：结果打包、诊断、usage 上卷全在手写两份）。
-        //
-        // 同步路径也占额：模型自己就在等这一发，但父回合的收场判据必须看到它
-        // （否则「在等的子 agent」不计入 `running()` ⇒ 判据偏乐观）。
-        Ok(self
-            .child_task(resolved, child_limits, self.live.enter(), mode)
-            .execute(prompt.to_string())
-            .await)
-    }
-
-    /// 进程级：仍在跑的子 agent 数。
-    ///
-    /// **读 `self.live` 而非自己的计数器** —— 后者只记「本回合派了几次」
-    /// （`dispatched`，每回合从 0 重来），拿它当判据会漏掉上一回合遗留的子 agent。
-    fn running(&self) -> usize {
-        self.live.count()
-    }
-
-    fn settled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(self.live.settled_notified())
-    }
-
     /// **后台派发**：回合内解析模型 + 查额度（两者都要读 `config`，不能带进后台），
     /// 之后把 owned 的 `ChildTask` 交给 `tokio::spawn`。
     ///
@@ -1079,12 +1180,20 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         let child_limits = self.child_limits_for(model, mode);
         let results = self.results.clone();
 
-        // 句柄 = 本回合第 N 次派发（`take_dispatch_slot` 已自增 ⇒ 直接取当前值）。
-        // 只用于让模型 / UI 区分是哪个后台任务，**不需要全局唯一**。
-        let handle = format!("sa{}", self.dispatched.load(Ordering::Relaxed));
+        // 句柄 = `sa{turn}.{n}`：`take_dispatch_slot` 已自增 ⇒ `n` 直接取当前值。
+        // 形如 `sa12.3`，**全局唯一**（回合段 + 回合内序号）—— `subagent_send`
+        // 按句柄寻址，跨回合同名会让它发错目标。
+        let handle = subagent_handle(
+            self.turn.load(Ordering::Relaxed),
+            self.dispatched.load(Ordering::Relaxed),
+        );
+        // 子 agent 自己那份边界源在**这里**建：必须在 `tokio::spawn` **之前**登记，
+        // 否则从拿到句柄到 `execute` 建边界之间有一窗口，父的 `subagent_send` 会落空。
+        let own = Arc::new(QueueBoundarySource::new());
+        self.handles.register(handle.clone(), own.clone());
         // **先占额、再 spawn**：`ChildTask` 持有守卫 ⇒ `execute` 的每条退出路径
         // （组装失败 / Ok / Err / future 被 drop）都由 `Drop` 回归。
-        let task = self.child_task(resolved, child_limits, self.live.enter(), mode);
+        let task = self.child_task(resolved, child_limits, self.live.enter(), mode, own);
         let prompt = prompt.to_string();
         let handle_for_task = handle.clone();
 
@@ -1098,6 +1207,21 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         });
         Ok(handle)
     }
+
+    /// 向**仍在跑**的后台子 agent 投递一条消息（它在子的下一个轮边界被看到）。
+    ///
+    /// 转给 [`SubagentHandles`]：投不出去（handle 未知 / 已收尾）一律 `Err`，
+    /// 不静默吞。
+    fn send(&self, handle: &str, message: &str) -> Result<(), String> {
+        self.handles.send(handle, message)
+    }
+}
+
+/// 句柄格式化：`sa{turn}.{n}`（回合号 + 回合内第几次派发）。
+///
+/// 抽成自由函数是为了让「句柄形状」有一处唯一定义，且可脱离模型单测。
+fn subagent_handle(turn: u32, n: u32) -> String {
+    format!("sa{turn}.{n}")
 }
 
 /// 把一次派发的结果包成投递用的 `Message`。
@@ -1115,8 +1239,7 @@ fn outcome_message(out: &SubagentOutcome) -> Message {
 
 /// 把一次派发的结果渲染成**纯文本**（供 `Boundary::Deferred` 的消息正文）。
 ///
-/// 与工具结果那份（`SubagentTool::call` 里的拼装）内容是同一套：
-/// 诊断前缀 → 摘要 → 转录指针。抽成函数是为了两条路径**不漂移**。
+/// 诊断前缀 → 摘要 → 转录指针，顺序即契约（`PendingResults` 的读者是模型）。
 fn render_outcome_text(out: &SubagentOutcome) -> String {
     let mut content = String::new();
     if let Some(d) = &out.diagnostic {
@@ -1144,7 +1267,8 @@ impl AppSubagentRunner<'_> {
     /// 而 `config` 是借用、不可 `'static`）⇒ 收成的 `ChildTask` 只含 owned 字段。
     /// 解析要用的模型（`model` 参数 → 缓存 / 构造；`None` → 父模型）。
     ///
-    /// 抽出来是因为 `run` 与 `spawn` **都要**它，而 fail-closed 纪律不能写两遍。
+    /// 抽出来是因为模型 / 额度的解析要在回合内做，而 `ChildTask` 只收 owned 字段；
+    /// fail-closed 纪律只有这一处。
     fn resolve_model(&self, model: Option<&str>) -> Result<Arc<dyn Model>, String> {
         let owned: Option<Arc<dyn Model>> = match model {
             None => None,
@@ -1182,7 +1306,7 @@ impl AppSubagentRunner<'_> {
         }
     }
 
-    /// 占用一个**本回合**派发额度（同步与后台派发**共用**同一个计数器）。
+    /// 占用一个**本回合**派发额度。
     fn take_dispatch_slot(&self) -> Result<(), String> {
         let n = self.dispatched.fetch_add(1, Ordering::Relaxed);
         if n >= self.max_dispatches {
@@ -1226,6 +1350,7 @@ impl AppSubagentRunner<'_> {
         child_limits: RunLimits,
         guard: LiveGuard,
         mode: SubagentMode,
+        own: Arc<QueueBoundarySource>,
     ) -> ChildTask {
         ChildTask {
             model,
@@ -1243,6 +1368,7 @@ impl AppSubagentRunner<'_> {
             dir: self.dir.clone(),
             totals: self.totals.clone(),
             parent_boundary: self.parent_boundary.clone(),
+            own,
             _live: guard,
         }
     }
@@ -1266,6 +1392,9 @@ struct ChildTask {
     dir: Arc<SubagentsDir>,
     totals: Arc<UsageTotals>,
     parent_boundary: Option<Arc<dyn BoundarySource>>,
+    /// 子 agent 自己那份边界源 —— **由 spawn 侧建并登记**（`subagent_send` 投递到它），
+    /// 这里只持有，`execute` 用它构造 `ChildBoundary`。
+    own: Arc<QueueBoundarySource>,
     /// 本子 agent 的「在跑」额度（ADR-0055）。
     ///
     /// 字段名带下划线：**不读取，只为了持有** —— `execute` 返回与 future 被 drop
@@ -1293,7 +1422,7 @@ impl ChildTask {
     ///
     /// **永远返回 `Ok`**：子 agent「跑完了但没跑好」走 `stop_reason` + `diagnostic`
     /// （ADR-0001 错误结果通道），只有「建不起来」（工具表装配失败）才是 `Err` 语义 ——
-    /// 那种情形在这里折成 `Cancelled` + 诊断文本，与既有 `run` 的 `Err` 分支同形。
+    /// 那种情形在这里折成 `Cancelled` + 诊断文本，而不是 `Err`。
     async fn execute(self, prompt: String) -> SubagentOutcome {
         let started = Instant::now();
         let parent_cancelled_probe = self.parent_boundary.clone();
@@ -1336,7 +1465,7 @@ impl ChildTask {
             }
         };
 
-        let child_boundary = ChildBoundary::new(self.parent_boundary.clone());
+        let child_boundary = ChildBoundary::new_with_own(self.parent_boundary.clone(), self.own);
         // 自己那份边界源（watchdog 往这里 `push(Abort)`）。先取出 `Arc` 副本 ——
         // `child_boundary` 本身要 move 进 `Arc`（供 `AgentPorts` 持有）。
         let child_own = child_boundary.own();
@@ -1810,92 +1939,12 @@ fn parse_subagent_mode(input: &Value) -> Result<SubagentMode, ToolError> {
     }
 }
 
-/// 派发工具：schema `{description, prompt, [model], [mode]}`，把调用转给 `ToolContext.subagent`。
-pub struct SubagentTool {
-    /// 外闸 = 子预算 + 宽限（ADO-0029 修正 2）。
-    outer_timeout: Duration,
-}
-
-impl SubagentTool {
-    pub fn new(outer_timeout: Duration) -> Self {
-        Self { outer_timeout }
-    }
-}
-
-#[async_trait]
-impl Tool for SubagentTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            "subagent",
-            "Delegate a self-contained task to an isolated sub-agent and get back a summary plus a transcript path",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "description": {"type": "string", "description": "3-5 word label for the user (shown in the tool line)"},
-                    "prompt": {"type": "string", "description": "Complete self-contained task; the sub-agent does NOT see this conversation"},
-                    "model": {"type": "string", "description": "Optional model override"},
-                    "mode": {"type": "string", "enum": ["general", "explore"],
-                             "description": "Set to `explore` for a read-only investigation agent that returns findings with exact `path:line` citations and cannot write. It has a hard budget of about 16 rounds and 300s; when either runs out it is told to stop and report what it has. Use it when you have SEVERAL INDEPENDENT exploration questions that would each take many rounds — send them in ONE message so they run in parallel. For one or two small lookups, search directly: spawning an agent costs more than the lookup. Ask each agent ONE cohesive question and state what a complete answer looks like — open-ended audits make it explore without end, and a task with many sub-questions will spend its whole budget without finishing any of them."}
-                },
-                "required": ["description", "prompt"]
-            }),
-        )
-    }
-
-    fn timeout(&self) -> Option<Duration> {
-        Some(self.outer_timeout)
-    }
-
-    /// 派发工具与同批的其他 `subagent` 调用并发执行（同一批 **每一个** 都声明
-    /// `true` 才走并行；混合批次自动退回串行）。子 agent 各有独立的会话 / 事件出口 /
-    /// 边界源，「写目标不相交」由 guideline 约束（本仓无沙箱）。
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
-
-    async fn call(&self, input: Value, ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        let prompt = input
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("`prompt` 必填".into()))?;
-        let model = input.get("model").and_then(|v| v.as_str());
-        let mode = parse_subagent_mode(&input)?;
-        let runner = ctx
-            .subagent
-            .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
-        let out = runner
-            .run(prompt, model, mode, ctx.boundary)
-            .await
-            .map_err(ToolError::Execution)?;
-
-        let mut content = String::new();
-        if let Some(d) = &out.diagnostic {
-            content.push_str(d);
-        }
-        if !out.summary.is_empty() {
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&out.summary);
-        }
-        if let Some(a) = &out.artifact {
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&format!("[full transcript: {a}]"));
-        }
-        Ok(ToolResult {
-            content,
-            is_error: out.stop_reason != StopReason::Completed,
-        })
-    }
-}
-
 /// **后台**派发工具：立刻返回句柄，子 agent 在后台跑；**结果会自动注入会话**。
 ///
-/// 存在的理由（实测，会话 `1792579023_125340094`）：同步派发把父回合钉死 ——
+/// 存在的理由（实测，会话 `1792579023_125340094`）：派发一旦占住父回合 ——
 /// 14 次派发累计阻塞 **3,605 s**，最长一次 **965 s**；而 turn 16 的三次派发
 /// 分在**三轮**里（965 / 511 / 355 s）⇒ 串行 1,831 s，同一批只需 965 s。
+/// 后台派发让父回合在这些时间里可以继续干活。
 ///
 /// **不需要 poll**：完成时结果作为 `Boundary::Deferred` 注入，`BasicLoop` 在下一个
 /// 轮边界 append 进会话 ⇒ 模型不必记句柄、也不可能「忘记取」。
@@ -1920,9 +1969,8 @@ impl Tool for SubagentAsyncTool {
             "subagent_async",
             "Start a sub-agent in the background and get a handle back immediately; it keeps \
              working while you do other things, and its result is delivered to you \
-             automatically when it finishes — you do NOT need to poll. Prefer this over \
-             `subagent` when you want to dispatch several sub-tasks at once, or when you want \
-             to keep answering the user while the sub-agent works",
+             automatically when it finishes — you do NOT need to poll. Use it to run several \
+             sub-tasks at once, or to keep answering the user while the sub-agent works",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1959,9 +2007,70 @@ impl Tool for SubagentAsyncTool {
             content: format!(
                 "Started sub-agent in the background.\nhandle: {handle}\n\
                  Its result will be delivered to you automatically when it finishes — do NOT \
-                 poll for it. Keep working on your own part now. It is cancelled if this turn \
-                 ends before it finishes."
+                 poll for it. Keep working on your own part now: it keeps running after this \
+                 turn ends, and its result arrives to you as a new turn."
             ),
+            is_error: false,
+        })
+    }
+}
+
+/// **向仍在跑的后台子 agent 发一条消息**（`subagent_async` 的配套工具）。
+///
+/// 投递进该子 agent **自己那份**边界源，它在子的下一个轮边界被取到（`ChildBoundary::take`）
+/// ⇒ `BasicLoop` append 进子的会话并 `continue`。工具只入队、不等待，故可并发。
+pub struct SubagentSendTool;
+
+impl SubagentSendTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SubagentSendTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for SubagentSendTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            "subagent_send",
+            // 与提示词里的 guideline / snippet **逐字同一份**（只此一份定义）。
+            crate::prompt::SUBAGENT_SEND_DESCRIPTION,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "Handle printed by subagent_async (e.g. sa3.2)"},
+                    "message": {"type": "string", "description": "What to tell it"}
+                },
+                "required": ["handle", "message"]
+            }),
+        )
+    }
+
+    /// 只往子的边界源 push 一条消息（不跑子 agent、不等待）⇒ 与 `subagent_async` 同理可并发。
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+
+    async fn call(&self, input: Value, ctx: ToolContext<'_>) -> Result<ToolResult, ToolError> {
+        let handle = input
+            .get("handle")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("`handle` 必填".into()))?;
+        let message = input
+            .get("message")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("`message` 必填".into()))?;
+        let runner = ctx
+            .subagent
+            .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
+        runner.send(handle, message).map_err(ToolError::Execution)?;
+        Ok(ToolResult {
+            content: format!("Message queued for {handle}."),
             is_error: false,
         })
     }
@@ -1972,6 +2081,50 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use ys_core::Role;
+
+    /// 句柄形如 `sa{turn}.{n}`：回合段来自共享的回合号 ⇒ 不同回合的同序号派发不撞名；
+    /// 回合内序号递增。
+    #[test]
+    fn subagent_handle_carries_turn_and_sequence() {
+        assert_eq!(subagent_handle(1, 1), "sa1.1");
+        assert_eq!(subagent_handle(2, 1), "sa2.1");
+        assert_ne!(
+            subagent_handle(1, 1),
+            subagent_handle(2, 1),
+            "不同回合的第一个派发不得同名"
+        );
+        assert_eq!(subagent_handle(1, 2), "sa1.2", "回合内序号递增");
+    }
+
+    /// 回合号经 `with_turn` → `make_runner` 转递：runner 拿到的是 setup 里那**同一份**
+    /// 原子（回合开头的写入方对两份都可见）。
+    #[test]
+    fn make_runner_inherits_turn_from_setup() {
+        let base = unique_subagent_test_dir("runner_turn");
+        let turn = Arc::new(AtomicU32::new(0));
+        let setup = SubagentSetup::shared(
+            "child prompt".to_string(),
+            RunLimits::new(3),
+            Duration::from_secs(30),
+            base.clone(),
+            WebConfig::offline(ys_tools_web::FetchedDir::Temp(base.join("fetched"))),
+            Arc::new(SubagentsDir::at(base.join("artifacts"), false)),
+            Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
+        )
+        .with_turn(turn.clone());
+
+        let runner = setup.make_runner(None, None, Arc::new(UsageTotals::default()), None);
+        assert_eq!(runner.turn.load(Ordering::Relaxed), 0);
+        turn.store(2, Ordering::Relaxed);
+        assert_eq!(
+            runner.turn.load(Ordering::Relaxed),
+            2,
+            "runner 与 setup 必须共享同一份回合号"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn child_boundary_takes_own_and_probes_parent() {
@@ -1987,6 +2140,95 @@ mod tests {
         assert_eq!(cb.take(), Some(Boundary::Abort));
         // 父队列不被子消费（父仍能自己 take）。
         assert_eq!(parent.take(), Some(Boundary::Abort));
+    }
+
+    /// `subagent_send` 的通路：注册后按 handle 投递，子在**自己那份**队列里以 `Steer`
+    /// 取到它，且角色是 `User`（`Harness` 会让子转录误称「父 harness 说过话」）。
+    ///
+    /// 变异：投给父的边界源 ⇒ `own.take()` 空、父队列非空 ⇒ 变红。
+    #[test]
+    fn subagent_send_queues_steer_into_the_child_queue() {
+        let handles = SubagentHandles::default();
+        let own = Arc::new(QueueBoundarySource::new());
+        let parent = Arc::new(QueueBoundarySource::new());
+        handles.register("sa1.1", own.clone());
+
+        handles
+            .send("sa1.1", "收敛")
+            .expect("在跑的 handle 应投递成功");
+
+        assert!(
+            parent.take().is_none(),
+            "消息只能进子自己的队列，绝不进父队列"
+        );
+        match own.take() {
+            Some(Boundary::Steer(msg)) => {
+                assert_eq!(msg.role, Role::User, "投给子 agent 的是用户角色");
+                assert_eq!(msg.content.len(), 1, "只投一条文本块");
+                assert!(
+                    matches!(&msg.content[0], ContentBlock::Text { text } if text == "收敛"),
+                    "正文必须逐字送达；content = {:?}",
+                    msg.content
+                );
+            }
+            other => panic!("应取到 Steer，得到 {other:?}"),
+        }
+    }
+
+    /// fail-closed：handle 不存在 / 子已收尾 ⇒ `Err`，正文列出当前有效的 handle；
+    /// 失效条目在查询时被清理。
+    ///
+    /// 变异：把 `send` 的 `None` 分支改成 `Ok(())` ⇒ 两条 `unwrap_err` 都变红。
+    #[test]
+    fn subagent_send_fails_closed_when_handle_is_unknown_or_finished() {
+        let handles = SubagentHandles::default();
+        let own = Arc::new(QueueBoundarySource::new());
+        let other = Arc::new(QueueBoundarySource::new());
+        handles.register("sa1.2", own.clone());
+        handles.register("sa1.1", other.clone());
+        assert_eq!(
+            handles.live_handles(),
+            vec!["sa1.1".to_string(), "sa1.2".to_string()],
+            "live_handles 升序"
+        );
+
+        // ① 句柄写错：错误正文必须给出**当前有效**的 handle，不能只说「失败」。
+        let err = handles
+            .send("sa9.9", "收敛")
+            .expect_err("未知 handle 必须 Err");
+        assert!(
+            err.contains("sa1.1") && err.contains("sa1.2"),
+            "错误正文必须列出有效 handle；err = {err}"
+        );
+
+        // ② 子 agent 收尾（`ChildBoundary` 被 drop）⇒ 同一 handle 也失效。
+        drop(own);
+        let err = handles
+            .send("sa1.2", "收敛")
+            .expect_err("已收尾的子 agent 必须 Err");
+        assert!(
+            err.contains("当前没有在跑的子 agent") || err.contains("当前有效的 handle"),
+            "错误正文必须给出当下的 handle 列表；err = {err}"
+        );
+        // 句柄名本身会出现在「没有在跑的子 agent 叫 X」那句里，只看列表部分。
+        let live_part = err.split('。').nth(1).unwrap_or_default();
+        assert!(
+            !live_part.contains("sa1.2") && live_part.contains("sa1.1"),
+            "已收尾的 handle 不得出现在有效列表里、在跑的必须出现；err = {err}"
+        );
+        assert_eq!(
+            handles.live_handles(),
+            vec!["sa1.1".to_string()],
+            "失效条目应被清理"
+        );
+        drop(other);
+        let err = handles
+            .send("sa1.1", "收敛")
+            .expect_err("全部收尾后必须 Err");
+        assert!(
+            err.contains("当前没有在跑的子 agent"),
+            "空表时错误正文说明没有在跑的子 agent；err = {err}"
+        );
     }
 
     /// 构造一条纯文本 `User` 消息（投递表的操作对象）。
@@ -2263,142 +2505,6 @@ mod tests {
         );
     }
 
-    /// 工具把 runner 的 outcome 组装成 `ToolResult`；非 `Completed` ⇒ `is_error`。
-    #[tokio::test]
-    async fn subagent_tool_maps_outcome_to_result() {
-        struct FakeRunner(StopReason);
-        #[async_trait]
-        impl SubagentRunner for FakeRunner {
-            async fn run(
-                &self,
-                prompt: &str,
-                _model: Option<&str>,
-                _mode: SubagentMode,
-                _boundary: Option<&dyn BoundarySource>,
-            ) -> Result<SubagentOutcome, String> {
-                Ok(SubagentOutcome {
-                    summary: format!("摘要:{prompt}"),
-                    artifact: Some("/tmp/t.md".into()),
-                    stop_reason: self.0.clone(),
-                    diagnostic: (self.0 != StopReason::Completed)
-                        .then(|| "[diagnostic: stop_reason=max-rounds elapsed_ms=1]".into()),
-                    usage: Usage::default(),
-                })
-            }
-        }
-
-        let tool = SubagentTool::new(Duration::from_secs(60));
-        let runner = FakeRunner(StopReason::Completed);
-        let ctx =
-            ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_subagent(&runner);
-        let r = tool
-            .call(serde_json::json!({"description":"d","prompt":"干活"}), ctx)
-            .await
-            .unwrap();
-        assert!(!r.is_error);
-        assert!(r.content.contains("摘要:干活"));
-        assert!(r.content.contains("[full transcript: /tmp/t.md]"));
-
-        let runner2 = FakeRunner(StopReason::MaxRounds);
-        let ctx2 =
-            ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_subagent(&runner2);
-        let r2 = tool
-            .call(serde_json::json!({"description":"d","prompt":"干活"}), ctx2)
-            .await
-            .unwrap();
-        assert!(r2.is_error, "非 Completed ⇒ is_error（父回合不失败）");
-        assert!(
-            r2.content.starts_with("[diagnostic:"),
-            "诊断必须是正文首行：{}",
-            r2.content
-        );
-        let diagnostic_at = r2.content.find("[diagnostic:").unwrap();
-        let summary_at = r2.content.find("摘要:干活").unwrap();
-        let path_at = r2.content.find("[full transcript:").unwrap();
-        assert!(diagnostic_at < summary_at && summary_at < path_at);
-
-        // 未挂载 ⇒ Execution 错误。
-        let bare = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."));
-        let err = tool
-            .call(serde_json::json!({"description":"d","prompt":"x"}), bare)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
-    }
-
-    /// 同步派发期间用户插话 ⇒ **不打断**：子 agent 跑完、结果正常返回，插话仍在队列里。
-    ///
-    /// 用「跑 400ms 才返回的 runner」作替身，并在 100ms 时投 `Steer`：
-    /// ① 工具不提前返回（墙钟 ≥ runner 自身时长）；
-    /// ② 结果就是子 agent 的正常结果（不得被偷换成「派发已中止」类文案）；
-    /// ③ 插话**仍在队列里**（工具不得偷吃，只能由轮边界 `take`）。
-    ///
-    /// 变异：把 `call` 改回 `select!` 监视 `has_pending_steer()` ⇒ ① 红。
-    #[tokio::test]
-    async fn subagent_tool_steer_mid_dispatch_does_not_abandon_it() {
-        struct SlowRunner;
-        #[async_trait]
-        impl SubagentRunner for SlowRunner {
-            async fn run(
-                &self,
-                prompt: &str,
-                _model: Option<&str>,
-                _mode: SubagentMode,
-                _boundary: Option<&dyn BoundarySource>,
-            ) -> Result<SubagentOutcome, String> {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                Ok(SubagentOutcome {
-                    summary: format!("摘要:{prompt}"),
-                    artifact: None,
-                    stop_reason: StopReason::Completed,
-                    diagnostic: None,
-                    usage: Usage::default(),
-                })
-            }
-        }
-
-        let boundary = Arc::new(QueueBoundarySource::new());
-        let steer = Boundary::Steer(Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "先停，我要改需求".into(),
-            }],
-        });
-        let producer = Arc::clone(&boundary);
-        let steer_for_task = steer.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            producer.push(steer_for_task);
-        });
-
-        let tool = SubagentTool::new(Duration::from_secs(600));
-        let runner = SlowRunner;
-        let ctx = ToolContext::new(Some(&*boundary), PathBuf::from("."), PathBuf::from("."))
-            .with_subagent(&runner);
-
-        let started = Instant::now();
-        let r = tokio::time::timeout(
-            Duration::from_secs(5),
-            tool.call(serde_json::json!({"description":"d","prompt":"干活"}), ctx),
-        )
-        .await
-        .expect("子 agent 应在守卫内跑完")
-        .expect("插话不是工具错误");
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed >= Duration::from_millis(400),
-            "插话不得缩短派发（应跑满 runner 自身时长），实际 {elapsed:?}"
-        );
-        assert!(!r.is_error);
-        assert_eq!(r.content, "摘要:干活", "结果就是子 agent 的正常结果");
-
-        // 插话未被消费。
-        assert_eq!(boundary.len(), 1, "工具不得消费用户的插话");
-        assert!(boundary.has_pending_steer());
-        assert_eq!(boundary.take(), Some(steer), "插话原样留在队列里");
-    }
-
     /// `mode` 解析：缺省 / `"general"` ⇒ `General`，`"explore"` ⇒ `Explore`，
     /// 其余值（含非字符串）⇒ `InvalidInput`。
     ///
@@ -2430,50 +2536,28 @@ mod tests {
         ));
     }
 
-    /// 两个派发工具的 `mode` 描述都必须交代**何时**该用 `explore`（多个独立、多轮），
+    /// 派发工具的 `mode` 描述必须交代**何时**该用 `explore`（多个独立、多轮），
     /// 以及小查找**不该**派发 —— 否则模型只会看到「只读、带引用」，把它当廉价查找工具。
     ///
     /// 变异：删掉 `SEVERAL INDEPENDENT exploration questions` 或 `search directly`
     /// ⇒ 对应断言变红。
     #[test]
     fn subagent_mode_description_states_when_to_explore() {
-        let tools: [Box<dyn Tool>; 2] = [
-            Box::new(SubagentTool::new(Duration::from_secs(60))),
-            Box::new(SubagentAsyncTool::new()),
-        ];
-        for tool in tools {
-            let spec = tool.spec();
-            let description = spec.parameters["properties"]["mode"]["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{} 的 mode 描述必须是字符串", spec.name));
-            assert!(
-                description.contains("SEVERAL INDEPENDENT exploration questions"),
-                "{} 的 mode 描述须交代触发条件；description = {description}",
-                spec.name
-            );
-            assert!(
-                description.contains("search directly"),
-                "{} 的 mode 描述须交代小查找自己搜；description = {description}",
-                spec.name
-            );
-        }
-    }
-
-    /// 工具调用层同样 fail-closed：拼错的 `mode` 在挂载 runner 之前就被拒绝。
-    ///
-    /// 变异：`SubagentTool::call` 忽略 `parse_subagent_mode` 的 `Err` ⇒ 本用例变红。
-    #[tokio::test]
-    async fn subagent_tool_rejects_bogus_mode() {
-        let tool = SubagentTool::new(Duration::from_secs(60));
-        let bare = ToolContext::new(None, PathBuf::from("."), PathBuf::from("."));
-        let err = tool
-            .call(
-                serde_json::json!({"description": "d", "prompt": "x", "mode": "bogus"}),
-                bare,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::InvalidInput(_)));
+        let tool = SubagentAsyncTool::new();
+        let spec = tool.spec();
+        let description = spec.parameters["properties"]["mode"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} 的 mode 描述必须是字符串", spec.name));
+        assert!(
+            description.contains("SEVERAL INDEPENDENT exploration questions"),
+            "{} 的 mode 描述须交代触发条件；description = {description}",
+            spec.name
+        );
+        assert!(
+            description.contains("search directly"),
+            "{} 的 mode 描述须交代小查找自己搜；description = {description}",
+            spec.name
+        );
     }
 
     /// 探索子表恰 7 元且**不含** `write` / `edit`；通用子表仍 9 元。
@@ -2520,7 +2604,7 @@ mod tests {
     /// 模式在**真实子执行路径**上生效：`execute` 按 mode 选提示与工具表。
     ///
     /// 只测 `child_tools` 不够 —— 若 `ChildTask` 不把 `mode` 带进去，选择函数再对也没用。
-    /// 这里从 `runner.run` 进去，读模型实际收到的 `system` / `tools`。
+    /// 这里从 `ChildTask::execute` 的真实路径进去，读模型实际收到的 `system` / `tools`。
     ///
     /// 变异 1：`execute` 恒用 `self.child_prompt` ⇒ 第二条 system 断言变红。
     /// 变异 2：`child_task` 丢掉 `mode`（恒 `General`）⇒ 第二条 tools 断言变红。
@@ -2548,12 +2632,10 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
 
-        runner
-            .run("g", None, SubagentMode::General, None)
+        run_child(&runner, "g", None, SubagentMode::General)
             .await
             .unwrap();
-        runner
-            .run("e", None, SubagentMode::Explore, None)
+        run_child(&runner, "e", None, SubagentMode::Explore)
             .await
             .unwrap();
 
@@ -2580,13 +2662,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn subagent_tool_requires_prompt_and_declares_timeout() {
-        let tool = SubagentTool::new(Duration::from_secs(123));
-        assert_eq!(tool.timeout(), Some(Duration::from_secs(123)));
-        assert_eq!(tool.spec().name, "subagent");
     }
 
     /// 端到端：`AppSubagentRunner` 用一个 `MockModel` 跑一个真子 agent（独立会话），
@@ -2656,8 +2731,7 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
 
-        let out = runner
-            .run("查 X", None, SubagentMode::General, None)
+        let out = run_child(&runner, "查 X", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -2686,8 +2760,7 @@ mod tests {
         assert_eq!(up_cache, Some((9, 2)), "上卷的 (hit, miss) 逐次累加");
 
         // fail-closed：指定 model 名 ⇒ Err（不静默回退）。
-        let err = runner
-            .run("x", Some("other-model"), SubagentMode::General, None)
+        let err = run_child(&runner, "x", Some("other-model"), SubagentMode::General)
             .await
             .unwrap_err();
         assert!(err.contains("fail-closed"));
@@ -2730,13 +2803,11 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
         for _ in 0..DEFAULT_MAX_DISPATCHES_PER_TURN {
-            runner
-                .run("t", None, SubagentMode::General, None)
+            run_child(&runner, "t", None, SubagentMode::General)
                 .await
                 .unwrap();
         }
-        let err = runner
-            .run("t", None, SubagentMode::General, None)
+        let err = run_child(&runner, "t", None, SubagentMode::General)
             .await
             .unwrap_err();
         assert!(err.contains("上限"), "超限应响亮报错: {err}");
@@ -2831,8 +2902,7 @@ mod tests {
                 Arc::new(PendingResults::default()),
                 Arc::new(LiveSubagents::default()),
             );
-            runner
-                .run("x", Some("shared-name"), SubagentMode::General, None)
+            run_child(&runner, "x", Some("shared-name"), SubagentMode::General)
                 .await
                 .unwrap()
         };
@@ -2861,8 +2931,7 @@ mod tests {
                 Arc::new(PendingResults::default()),
                 Arc::new(LiveSubagents::default()),
             );
-            runner
-                .run("x", Some("shared-name"), SubagentMode::General, None)
+            run_child(&runner, "x", Some("shared-name"), SubagentMode::General)
                 .await
                 .unwrap()
         };
@@ -3059,8 +3128,7 @@ mod tests {
             Arc::new(PendingResults::default()),
             Arc::new(LiveSubagents::default()),
         );
-        let out = runner
-            .run("查 X", None, SubagentMode::General, None)
+        let out = run_child(&runner, "查 X", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -3215,8 +3283,7 @@ mod tests {
         let model = ys_model::MockModel::new("m");
         model.push_text("写失败也要留 journal");
         let runner = test_runner(model, &base, dir, RunLimits::new(2));
-        let out = runner
-            .run("写失败", None, SubagentMode::General, None)
+        let out = run_child(&runner, "写失败", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.artifact, None, "转录必须写失败");
@@ -3464,7 +3531,7 @@ mod tests {
     ///
     /// 为何必须走真实路径：`failed_is_not_reported_as_cancellation` 直接构造
     /// `StopReason::Failed`，**抓不到**「`Err` 分支写回 `Cancelled`」这个变异
-    /// （实测过：那次变异让它全绿）。本用例从 `runner.run` 进去，必经 `Err` 分支。
+    /// （实测过：那次变异让它全绿）。本用例直接驱动 `ChildTask::execute`，必经 `Err` 分支。
     ///
     /// 变异：把 `Err` 分支的 `StopReason::Failed` 改回 `Cancelled`
     /// （并把 `cause` 改回 `Some(CancelCause::Unknown)`）⇒ 本用例变红。
@@ -3521,8 +3588,7 @@ mod tests {
             Arc::new(LiveSubagents::default()),
         );
 
-        let out = runner
-            .run("查 X", None, SubagentMode::General, None)
+        let out = run_child(&runner, "查 X", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(
@@ -3581,8 +3647,7 @@ mod tests {
         // `new` 无条件开启重试 ⇒ 直接用它验证产品路径。
         let runner = test_runner(model, &base, dir, RunLimits::new(3));
 
-        let out = runner
-            .run("查 X", None, SubagentMode::General, None)
+        let out = run_child(&runner, "查 X", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(
@@ -3618,8 +3683,7 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(3));
 
-        let out = runner
-            .run("查 X", None, SubagentMode::General, None)
+        let out = run_child(&runner, "查 X", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(
@@ -3852,7 +3916,7 @@ mod tests {
         test_runner_with_parent(model, base, dir, limits, child_budget, None)
     }
 
-    /// 父边界源**经构造期注入**（而非只经 `run` 的参数）——
+    /// 父边界源**经构造期注入**（而非只经 `spawn` 的参数）——
     /// 与生产路径一致：app 层把**同一份 `Arc`** 同时给 `make_runner` 与
     /// `AgentPorts`，子 agent 的 `ChildBoundary` 才能透传父的中止状态。
     fn test_runner_with_parent(
@@ -3893,6 +3957,33 @@ mod tests {
             Arc::new(PendingResults::default()),
             Arc::new(LiveSubagents::default()),
         )
+    }
+
+    /// 直接驱动子 agent 的完整执行路径：解析模型 → 占额度 → 收成 `ChildTask` → `execute`。
+    ///
+    /// 与 `spawn` 走的是同一条 `ChildTask::execute`；差别只在**不** spawn、不等结果经
+    /// 投递表回来 —— 测试要的是「子 agent 跑出了什么」这个返回值本身。
+    ///
+    /// `Err` = 启动失败（按名构造模型失败 / 本回合额度用尽），与 `spawn` 同口径。
+    async fn run_child(
+        runner: &AppSubagentRunner<'_>,
+        prompt: &str,
+        model: Option<&str>,
+        mode: SubagentMode,
+    ) -> Result<SubagentOutcome, String> {
+        let resolved = runner.resolve_model(model)?;
+        runner.take_dispatch_slot()?;
+        let child_limits = runner.child_limits_for(model, mode);
+        Ok(runner
+            .child_task(
+                resolved,
+                child_limits,
+                runner.live.enter(),
+                mode,
+                Arc::new(QueueBoundarySource::new()),
+            )
+            .execute(prompt.to_string())
+            .await)
     }
 
     /// **A5 回归钉（D3）**：父级封顶必须对子 agent 生效。
@@ -4079,6 +4170,7 @@ mod tests {
             limits.clone(),
             runner.live.enter(),
             SubagentMode::Explore,
+            Arc::new(QueueBoundarySource::new()),
         );
         assert_eq!(
             explore.child_budget, EXPLORE_WALL_CLOCK,
@@ -4089,6 +4181,7 @@ mod tests {
             limits.clone(),
             runner.live.enter(),
             SubagentMode::General,
+            Arc::new(QueueBoundarySource::new()),
         );
         assert_eq!(
             general.child_budget, parent_budget,
@@ -4109,6 +4202,7 @@ mod tests {
             limits,
             tighter.live.enter(),
             SubagentMode::Explore,
+            Arc::new(QueueBoundarySource::new()),
         );
         assert_eq!(
             explore_tight.child_budget, tight_budget,
@@ -4127,7 +4221,7 @@ mod tests {
     ///  3. 正文含子 agent 的摘要（不是空消息）。
     ///
     /// 变异：① 删掉 `sink.push(...)` ⇒ 第 2 点变红；
-    ///       ② 把 `spawn` 改成 `run().await` ⇒ 第 1 点变红。
+    ///       ② 把 `spawn` 改成阻塞等 `execute` ⇒ 第 1 点变红。
     #[tokio::test]
     async fn spawn_pushes_deferred_result_without_polling() {
         use std::sync::Arc as StdArc;
@@ -4172,7 +4266,10 @@ mod tests {
             "spawn 必须立刻返回（实际 {:?}）",
             started.elapsed()
         );
-        assert_eq!(handle, "sa1", "首个句柄应为 sa1");
+        assert_eq!(
+            handle, "sa0.1",
+            "首个句柄应为 sa0.1（本 runner 未绑回合 ⇒ turn=0）"
+        );
 
         // ② 等后台任务把结果推进边界源（轮询 `take`，最多 5 秒）。
         let mut got = None;
@@ -4186,7 +4283,7 @@ mod tests {
         let Some(Boundary::Deferred { handle, message }) = got else {
             panic!("完成后必须自动推进一条 Boundary::Deferred（不需要 poll）");
         };
-        assert_eq!(handle, "sa1", "Deferred 必须带产出它的句柄");
+        assert_eq!(handle, "sa0.1", "Deferred 必须带产出它的句柄");
 
         // ③ 正文含子 agent 的摘要。
         let text: String = message
@@ -4217,8 +4314,7 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(4));
 
-        let out = runner
-            .run("读文件", None, SubagentMode::General, None)
+        let out = run_child(&runner, "读文件", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -4273,8 +4369,7 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner_arc(model.clone(), &base, dir, limits);
 
-        let out = runner
-            .run("预算回归", None, SubagentMode::General, None)
+        let out = run_child(&runner, "预算回归", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -4317,8 +4412,7 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(5));
 
-        let out = runner
-            .run("重复 id", None, SubagentMode::General, None)
+        let out = run_child(&runner, "重复 id", None, SubagentMode::General)
             .await
             .unwrap();
         let body = std::fs::read_to_string(out.artifact.expect("应写转录")).unwrap();
@@ -4355,8 +4449,7 @@ mod tests {
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));
         let runner = test_runner(model, &base, dir, RunLimits::new(2));
 
-        let out = runner
-            .run("失败", None, SubagentMode::General, None)
+        let out = run_child(&runner, "失败", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(
@@ -4403,8 +4496,7 @@ mod tests {
             RunLimits::new(2),
         );
 
-        let out = runner
-            .run("写失败", None, SubagentMode::General, None)
+        let out = run_child(&runner, "写失败", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Completed);
@@ -4444,8 +4536,7 @@ mod tests {
             Some(parent.clone()),
         );
 
-        let out = runner
-            .run("取消", None, SubagentMode::General, Some(parent.as_ref()))
+        let out = run_child(&runner, "取消", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
@@ -4474,8 +4565,7 @@ mod tests {
             Duration::from_millis(5),
         );
 
-        let out = runner
-            .run("子预算", None, SubagentMode::General, None)
+        let out = run_child(&runner, "子预算", None, SubagentMode::General)
             .await
             .unwrap();
         assert_eq!(out.stop_reason, StopReason::Cancelled);
@@ -4514,7 +4604,7 @@ mod tests {
             parent.push(Boundary::Abort);
         };
         let (out, ()) = tokio::join!(
-            runner.run("父取消", None, SubagentMode::General, Some(parent.as_ref())),
+            run_child(&runner, "父取消", None, SubagentMode::General),
             cancel_parent
         );
         let out = out.unwrap();

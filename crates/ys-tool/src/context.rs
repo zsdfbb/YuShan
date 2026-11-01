@@ -91,20 +91,12 @@ mod tests {
     }
 
     /// 极简假派发器 —— 只为证明挂载点可用，不做真实派发。
+    ///
+    /// `spawn` 有默认实现 ⇒ 本结构体不需要任何方法体，"能藏在 `&dyn SubagentRunner`
+    /// 后面"本身就是 object-safe 的编译期断言。
     struct FakeRunner;
 
-    #[async_trait]
-    impl SubagentRunner for FakeRunner {
-        async fn run(
-            &self,
-            _prompt: &str,
-            _model: Option<&str>,
-            _mode: crate::subagent::SubagentMode,
-            _boundary: Option<&dyn ys_protocol::BoundarySource>,
-        ) -> Result<crate::subagent::SubagentOutcome, String> {
-            unimplemented!()
-        }
-    }
+    impl SubagentRunner for FakeRunner {}
 
     #[test]
     fn test_new_has_no_summarizer_by_default() {

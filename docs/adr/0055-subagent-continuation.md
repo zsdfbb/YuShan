@@ -8,7 +8,10 @@
 
 ## Status
 
-accepted（2026-10-25；设计见 [`subagent-continuation/design.md`](../arch/subagent-continuation/design.md)）
+**Status**: `superseded by [ADR-0065](0065-subagent-send-and-auto-turn.md)`
+
+本决策的「父回合等待子 agent」已被 ADR-0065 取代（父回合不再等待，子结果自动起新回合），
+正文保留以记录当时的取舍理由。
 
 ## 背景
 

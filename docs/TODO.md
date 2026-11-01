@@ -38,7 +38,28 @@ P0 已落地；P1、P2 是**设计文档自己排的阶段**，标注见
 `docs/design-plans/completed/2026-10-09-subagent-landing.md:74` —— 需真实凭证跑一次派发，把读数写回
 `docs/arch/subagent-rebaseline/design.md` §6.4。标记 `MANUAL_ACK_REQUIRED`。
 
-> 该计划的刀 0–6 **已落地**（`SubagentRunner` 全仓 28 处命中，`toolset.rs:592` 的父表 10 元断言存在）。
+> 该计划的刀 0–6 **已落地**（`SubagentRunner` 全仓 28 处命中，`toolset.rs:624` 的父表 12 元断言存在）。
+
+### A2b. ADR-0054 —— 只落了决策 ⑤（且 ⑥ 部分落地）
+
+`docs/adr/0054-subagent-progress-board.md`（proposed）共 9 条决策，**只落了决策 ⑤**（句柄全局唯一
+`sa{turn}.{n}`，2026-11-01 随 ADR-0065 一起落地）；决策 ⑥ 的「增量落盘」有一个**形态不同**的既存实现。
+其余仍未做。
+
+| 决策 | 缺什么 | 状态依据 |
+|---|---|---|
+| ① 进程级状态板 | `SubagentBoard`（与 `PendingResults` 并置） | 全仓源码 grep `SubagentBoard` **零命中** |
+| ⑤ 句柄全局唯一 | 句柄改 `sa{turn}.{n}` + 寻址用的注册表 | ✅ **已落**：`subagent_handle`（`apps/coding-agent/src/subagent.rs:1258`）与 `SubagentHandles`（`:420`） |
+| ② 四态状态机（完成 ≠ 送达） | 无状态机 | 无 `SubagentState` 类类型 |
+| ③ `ProgressTap` 采集点 | 包装 `EventSink` 的采集层 | 全仓源码 grep `ProgressTap` **零命中** |
+| ④ `AgentEvent::SubagentProgress` 通道 | 事件变体 | 全仓源码 grep `SubagentProgress` **零命中** |
+| ⑥ 路径先分配 + 按轮 append | `SubagentsDir::allocate() -> Artifact` / `append_round` | ⚠️ **部分落地但形态不同**：增量落盘已有 —— `JournalingSink` 把结构性事件逐行写 `<pid>_<seq>.live.jsonl`（`apps/coding-agent/src/subagent.rs:822-853`，落盘路径 `:702`），收尾时 `finish_transcript` 删掉 journal（`:688-690`）。**缺的是**：路径未在 `spawn` 前分配（`seq` 在 `execute` 内取，`:1521`）、无 `Artifact`/`append_round` 那两个类型、路径未进状态板（板本身未做） |
+| ⑦ 只读工具 `subagent_status` | 工具本体 | 全仓源码 grep `subagent_status` **零命中**（父表 12 元里没有它）；当前观察子 agent 只能读子会话与转录文件 |
+| ⑧ TUI 状态行 | 状态行 + 三种转换行 | 无对应 `TranscriptLine` 产出 |
+| ⑨ 模型侧结构化头 | 头 + 两条 guideline | 无 |
+
+> 可观察性的现实路径：**子 agent 自己的 session / 转录文件**（ADR-0054 背景里定的载体）。
+> 缺的是「不读文件也能看到」的推送式状态，不是「完全不可观察」。
 
 ### A3. 子 agent 只读角色（多角色定义）
 
@@ -49,7 +70,7 @@ ADR-0022（accepted）`:132-133` 同文）。
 
 | 缺什么 | 状态依据（核实于 `39f4f95`） |
 |---|---|
-| 多角色定义（frontmatter / 配置） | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（2026-10-30 重核）。**但「角色概念」本身已部分落地**：`SubagentMode { General, Explore }` 已是公开类型（`crates/ys-tool/src/subagent.rs:18`），`Explore` 由工具表过滤实现（`apps/coding-agent/src/subagent.rs:1060` `child_tools` 按名字去掉 `write` / `edit`）。缺的是**第三个角色**与**配置驱动**，不是「只读」这件事 |
+| 多角色定义（frontmatter / 配置） | 全仓源码 grep `AgentDefinition` / `agent_role` **零命中**（2026-10-30 重核）。**但「角色概念」本身已部分落地**：`SubagentMode { General, Explore }` 已是公开类型（`crates/ys-tool/src/subagent.rs:18`），`Explore` 由工具表过滤实现（`apps/coding-agent/src/subagent.rs:1443` `child_tools` 按名字去掉 `write` / `edit`）。缺的是**第三个角色**与**配置驱动**，不是「只读」这件事 |
 | ~~「只读开关」零命中~~ | 旧依据 `toolset.rs:517` / `prompt.rs:782` **已失效**（2026-10-30 重核：前者现在是 `only_read_only_tools_are_concurrency_safe` 的文档注释、后者是 `tool_list_is_derived_from_specs_order_verbatim`；现存的 `read_only` 用例是 `prompt.rs:997`）。该依据曾把 explore 的落地读成「零命中」，误判过一项状态 |
 | `build_tools` 无法按角色换表 | 签名零策略参数（`apps/coding-agent/src/toolset.rs:88`）；生产路径全仓**仅两处**构建工具表：装配期 `apps/coding-agent/src/assembly.rs:143`（子表）与派发期 `apps/coding-agent/src/subagent.rs:980`（每次派发重建） |
 
@@ -86,14 +107,14 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 `Boundary` 仍无 `NextTurn` 一格，app 侧无跨回合队列 ⇒ 系统发起的 follow-up 无处可去。
 `grep follow_up / FollowUp` 仍为 **0**。
 
-> ⚠️ **ADR-0055（2026-10-25）改变了这里的结论边界**：子 agent 的结果现在**不再需要**
-> 「再起一个回合」—— 父回合会在收场前等子 agent，把结果作为**同一回合的下一轮**的输入
-> （`crates/ys-loop/src/basic.rs` 的 `wait_for_subagents`）。
+> ⚠️ **ADR-0055 的等待链已拆除（ADR-0065，2026-11-01）**：子 agent 的结果现在**不靠**「父回合在收场前等」
+> 送达 —— 子结果走与 `bash_bg` 同构的通道（`PendingResults` 投递表 + `Wake::SubagentReturned`）
+> ⇒ **结果回来时自动起一个新回合**交给模型（`apps/coding-agent/src/app_loop.rs:413-445`）。
 >
-> ⇒ 本条缺的「协议格 + 队列」仍是真的，但它的**第一个假想消费者已不存在**：
-> ADR-0055 明确否决了「系统再起回合」这条路（四条硬代价，见该 ADR 的 Considered Options）。
-> 将来若真要做 follow-up（如 `todo` 的推动），需重新论证「为什么不能在回合内等」，
-> 而不能直接引用本段的「协议已备」。as-built 见 `docs/design-final/subagent-continuation.md`。
+> ⇒ 本条缺的「协议格 + 队列」仍是真的，但它的**第一个假想消费者**已经由**另一条路**满足了：
+> 自动起回合用的是 `Role::Harness` 的占位输入（`app_loop.rs:1429`），不是 `Boundary` 的新变体。
+> 将来若真要做 follow-up（如 `todo` 的推动），可以照这条通路加，
+> 但**先论证「为什么不能沿用自动回合」**。as-built 见 `docs/design-final/subagent-async.md`。
 
 **根因的解法已定（2026-10-22，ADR-0047）**：
 投递去向做成协议一等公民（`DeliveryTarget` / `Delivery`，`ys-protocol` 新文件），
@@ -112,7 +133,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 设计与变更清单：`docs/arch/input-delivery-latency/design.md` §6。
 
 **未落地但已在别处补上的**：ADR-0021 的前置条件「prefix 指纹测试」已由 subagent 刀 0 于
-`apps/coding-agent/src/toolset.rs:592` 一带补齐，**不再计入**。
+`apps/coding-agent/src/toolset.rs:624`（`prefix_fingerprint_is_anchored_and_stable`）一带补齐，**不再计入**。
 
 ---
 
@@ -135,6 +156,22 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 ---
 
 ## D. 其他尾巴
+
+- ✅ **子 agent 异步收敛已落地**（2026-11-01）。删除同步 `subagent` 工具、拆除父回合等待链、
+  子结果自动起回合、新增 `subagent_send`、句柄改 `sa{turn}.{n}`。
+  决策 `docs/adr/0065-subagent-send-and-auto-turn.md`，as-built `docs/design-final/subagent-async.md`，
+  设计 `docs/design-plans/2026-11-01-subagent-async-convergence.md`。
+  ⬜ **已知边界（不在本轮修）**：
+  1. **消息最大延迟 = 当前工具跑完** —— `subagent_send` 的 `Steer` 只在子的轮边界被消费，
+     子 agent 正卡在一次长工具调用里时消息要等那次调用返回（与 ADR-0064 同一口径）。
+  2. **广播语义未做** —— `handle` 是单个字符串，一次只投一个子 agent，没有「发给所有在跑的」。
+  3. **`PendingResults` 是进程级、会话无关** —— 别的会话遗留的结果会投给当前会话。
+  4. **`-p` / `--json` 不自动起回合** —— 单回合模式结束后才完成的结果留表即失效
+     （`apps/coding-agent/src/main.rs:1952-1957`）。
+  5. **`LiveSubagents` 降为纯计数** —— 等待链拆除后无控制流消费者，`count()` 现为 `#[cfg(test)]`
+     （`apps/coding-agent/src/subagent.rs:524-525`）。删不删属设计决策，未定。
+  6. **`docs/design-final/subagent-continuation.md` 的 `path:line` 已全部失效** —— 该文已标
+     「已被取代」，指针未重算。
 
 - ✅ **插话不再打断工具与同步 subagent 已落地**（2026-10-31）。
   决策 `docs/adr/0064-steer-does-not-interrupt.md`，as-built `docs/design-final/steer-does-not-interrupt.md`。
@@ -184,7 +221,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   子 agent 的 `CollectingSink` / `MemorySession` / 转录字符串**全量留内存**
   （`crates/ys-event/src/collecting.rs:8`、`crates/ys-session/src/memory.rs:8`、`subagent.rs:1246`）。
   ⬜ **待办**：R2（`bash` 有界收集，照 `exec.rs:218` 的 `run_bounded` 语义）无契约变更，可直接做；
-  R1（子 agent 并发闸）改 ADR-0022 决策 15 / ADR-0055 的语义边界 ⇒ **须先走 `arch-design`**。
+  R1（子 agent 并发闸）改 ADR-0022 决策 15 的语义边界 ⇒ **须先走 `arch-design`**。
   ⚠️ 主因归属**尚未确认**：本机读不到 cgroup / `dmesg`，需用户侧提供「Termux 是否打出 `signal 9`」
   与进程数峰值（报告 §5）。**确认前不要把 R1 当已定方案落地**。
 

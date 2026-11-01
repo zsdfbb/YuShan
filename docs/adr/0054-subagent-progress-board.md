@@ -9,20 +9,33 @@ append）；⑦ 可选只读工具 `subagent_status`，**无 wait 语义**。
 
 ## Status
 
-**proposed（设计已定，代码未落）**（2026-10-25；设计见
+**proposed（部分落地：决策 ⑤ 已由
+[ADR-0065](0065-subagent-send-and-auto-turn.md) 落地，其余未做）**（2026-10-25；设计见
 [`subagent-progress/design.md`](../arch/subagent-progress/design.md)，
 现状基线见 [`context.md`](../arch/subagent-progress/context.md)）
+
+> **落地状态**：决策 ⑤（句柄全局唯一）**已落地** —— 句柄现为 `sa{turn}.{n}`
+> （`apps/coding-agent/src/subagent.rs` 的 `subagent_handle`），见 ADR-0065 决策 5。
+> 其余决策（`SubagentBoard` / `ProgressTap` / `AgentEvent::SubagentProgress` / 四态状态机 /
+> 决策 ⑥ 增量落盘 / 决策 ⑦ `subagent_status` 工具）**仍未实现**，全仓无
+> `SubagentBoard` / `ProgressTap` / `SubagentProgress` 命中 ⇒ 本文其余部分仍是目标形态，不是 as-built。
 
 > ⚠️ **本 ADR 描述的是目标形态，不是 as-built。** 本轮的落地范围只包含
 > [ADR-0055](0055-subagent-continuation.md)（父回合等得起）所必需的那一部分：
 > `LiveSubagents`（进程级在跑计数 + RAII 守卫）。全文其余部分 —— 状态板
 > `SubagentBoard` / `ProgressTap` / `AgentEvent::SubagentProgress` /
-> `subagent_status` 工具 / 增量落盘 / 全局句柄 —— **代码零行**。
+> `subagent_status` 工具 / 增量落盘 / 全局句柄 —— 除全局句柄（决策 ⑤，ADR-0065 已落）外
+> **代码零行**。
 >
 > 全仓 grep `SubagentBoard` / `ProgressTap` / `SubagentProgress` **均无命中**。
 > 施工前先看 [`subagent-continuation/review.md`](../arch/subagent-continuation/review.md)
 > 与 [`design.md`](../arch/subagent-continuation/design.md) §7（它们解释了为什么降级到
 > P1/P2）。
+>
+> 另：上文「本轮落地范围只包含 ADR-0055 所必需的那一部分」一句的**前提已变** ——
+> ADR-0055 的等待链已被 ADR-0065 拆除，`LiveSubagents` 保留为纯在跑计数（不再有
+> `settled` / `Notify`）；`subagent_send` 的句柄注册表 `SubagentHandles` 是决策 ⑤ 落地时
+> 新增的现成基座（handle → 在跑子 agent 的边界源）。
 
 ## 背景
 

@@ -47,9 +47,6 @@ struct RawUserConfig {
     /// 一次用户请求（含复核回合）的 wall-clock 预算，单位**秒**。
     #[serde(default)]
     max_turn_duration_secs: Option<serde_json::Value>,
-    /// 收场前等待在跑子 agent 的上限，单位**秒**（ADR-0055）。
-    #[serde(default)]
-    subagent_wait_secs: Option<serde_json::Value>,
     /// 有效上下文窗口上限（token）。`0` = 不封顶。
     #[serde(default)]
     context_cap_tokens: Option<serde_json::Value>,
@@ -155,11 +152,6 @@ struct UserConfig {
     max_rounds: Option<u32>,
     /// wall-clock 预算秒数覆盖（仅正整数）。`None` = 未给 ⇒ 回落 48h。
     max_turn_duration_secs: Option<u64>,
-    /// 收场前等待在跑子 agent 的上限秒数（仅正整数）。`None` = 未给 ⇒ 回落 30min。
-    ///
-    /// 与 `max_turn_duration_secs` **不是同一个东西**：后者是「一个请求能占多少墙钟」，
-    /// 本值是「模型已经答完、子 agent 还在跑时，父回合愿意为它再挂多久」。
-    subagent_wait_secs: Option<u64>,
     /// 有效窗口上限覆盖（`0` = 不封顶）。`None` = 未给 ⇒ 默认
     /// [`DEFAULT_CONTEXT_CAP_TOKENS`]。
     context_cap_tokens: Option<usize>,
@@ -423,18 +415,6 @@ impl Config {
         std::time::Duration::from_secs(self.user_config.max_turn_duration_secs.unwrap_or(172_800))
     }
 
-    /// 收场前等待在跑子 agent 的上限（`config.json` 的 `subagent_wait_secs`，ADR-0055）。
-    ///
-    /// 缺省 **30 min**：与 [`max_turn_duration`](Self::max_turn_duration) **刻意分离** ——
-    /// 后者是「一个请求能占多少墙钟」（48h，长程任务需要），本值是「模型已经答完、
-    /// 但子 agent 还在跑时，父回合愿意为它再挂多久」。实测最长一次派发 965 s，
-    /// 30 min 留约 2 倍余量。
-    ///
-    /// 调用方仍须再取 `min(本值, 回合剩余预算)` —— 见 `TurnCtx::deadline_remaining`。
-    pub fn subagent_wait(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.user_config.subagent_wait_secs.unwrap_or(30 * 60))
-    }
-
     /// 配置层推理强度（provider 的 `reasoning_effort`）。缺省 `high`。
     ///
     /// 这是 `/effort` 覆盖之前的值；请求实际发送的是
@@ -676,7 +656,6 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
     user.max_rounds = sanitize_uint("max_rounds", raw.max_rounds, 1u32);
     user.max_turn_duration_secs =
         sanitize_uint("max_turn_duration_secs", raw.max_turn_duration_secs, 1u64);
-    user.subagent_wait_secs = sanitize_uint("subagent_wait_secs", raw.subagent_wait_secs, 1u64);
 
     // 三项都允许 0：`context_cap_tokens = 0` 表示不封顶，两个提醒阈值 0 表示关闭，
     // 都是显式语义而非「非法值」。故下限传 0，不沿用上面「0 立即到顶」的判据。

@@ -74,7 +74,7 @@ pub fn build_system_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogue
         // 子表没有 ⇒ 逐字保留（对子 agent 而言那句是真话）。
         Some(skill_section(
             &catalogue.lines,
-            tools.iter().any(|t| t.name == "subagent"),
+            tools.iter().any(|t| t.name == "subagent_async"),
         ))
     } else {
         None
@@ -164,7 +164,7 @@ pub fn build_explore_prompt(cwd: &Path, tools: &[ToolSpec], catalogue: &Catalogu
     let skills_block = if tools.iter().any(|t| t.name == "read") && !catalogue.lines.is_empty() {
         Some(skill_section(
             &catalogue.lines,
-            tools.iter().any(|t| t.name == "subagent"),
+            tools.iter().any(|t| t.name == "subagent_async"),
         ))
     } else {
         None
@@ -221,7 +221,7 @@ pub fn has_custom_prompt(cwd: &Path) -> bool {
 ///    在本 runtime 静默失效；不做符号映射（那是把上游知识写死），改为声明边界。
 fn skill_section(lines: &str, has_subagent: bool) -> String {
     let capability = if has_subagent {
-        "This runtime CAN delegate tasks to subagents via the `subagent` tool; it has no plan mode — ignore instructions that ask for plan mode."
+        "This runtime CAN delegate tasks to subagents via the `subagent_async` tool; it has no plan mode — ignore instructions that ask for plan mode."
     } else {
         "This runtime has no subagents and no plan mode — ignore instructions that ask for them."
     };
@@ -237,6 +237,11 @@ fn skill_section(lines: &str, has_subagent: bool) -> String {
          </available_skills>"
     )
 }
+
+/// `subagent_send` 的 description —— `SubagentSendTool::spec()` 与 `tool_snippet` 的**同一份字串**
+/// （工具 schema 与系统提示的工具清单不得说两样话）。
+pub(crate) const SUBAGENT_SEND_DESCRIPTION: &str =
+    "Send a message to a sub-agent that is still running; it sees it on its next round";
 
 /// 工具的一句话描述，按 **name** 查表。
 ///
@@ -266,10 +271,13 @@ fn tool_snippet(name: &str) -> &'static str {
         "webfetch" => {
             "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
         }
-        // 派发工具（ADR-0022 决策 18 定的名字，装配端 `spec().name` 是契约）。
-        "subagent" => {
-            "Delegate a self-contained task to an isolated sub-agent and get back a summary plus a transcript path"
+        // 派发工具（装配端 `spec().name` 是契约）。
+        "subagent_async" => {
+            "Start a sub-agent in the background and get a handle immediately; its result arrives automatically when it finishes"
         }
+        // 配套的 `subagent_send`：发给**仍在跑**的子 agent，子在下一个轮边界看到。
+        // 与 `SubagentSendTool::spec()` 的 description 共用 [`SUBAGENT_SEND_DESCRIPTION`]。
+        "subagent_send" => SUBAGENT_SEND_DESCRIPTION,
         _ => "Custom tool",
     }
 }
@@ -447,7 +455,7 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
     // 「不要 poll」是**显式禁令**：本运行时没有查询后台状态的工具，模型能做的只有等通知。
     // ② 禁 `sleep` 假装在等 —— `sleep 30` 是真的睡满 30s。
     //
-    // 守卫形态与既有 `websearch` / `webfetch` / `subagent` 的「在场才出现」同形，**只看
+    // 守卫形态与既有 `websearch` / `webfetch` / 派发工具的「在场才出现」同形，**只看
     // `bash_bg`**：两条文案都只引用它，缺了它就是指向不存在工具的悬空指令。
     // 附带效果：子表不含 bg 工具 ⇒ 子 agent 天然看不到这两条。
     if tools.contains(&"bash_bg") {
@@ -464,14 +472,27 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
                 .to_string(),
         );
     }
-    // 异步派发：**结果自动送达，不要 poll**。只在工具在场时出现（子表没有它）。
+    // 派发：**结果自动送达、不要 poll**，且**父回合不等它**。只在工具在场时出现（子表没有它）。
     if tools.contains(&"subagent_async") {
+        // 并发槽位数读 `ys-component` 的**单一真值常量**（ADR-0022 决策 14 的双轨：
+        // 常量是唯一真值，`RunLimits.max_parallel_tools` 与这里都取它）。
+        guidelines.push(format!(
+            "At most {} subagents run in parallel in one turn; extra calls queue. Dispatch only \
+             as many independent sub-tasks as you actually have.",
+            ys_component::DEFAULT_MAX_PARALLEL_TOOLS
+        ));
+        // 送达时机是**机制事实**：后台任务与父回合脱钩 —— 父回合正常收场，结果到达时
+        // harness 自动起**新回合**。措辞必须交代这一点，否则模型会原地等，或以为
+        // 「回合结束 = 结果没了」。
+        //
+        // 两条纪律（不得谎报「还在跑」/ 不得重派同一件活）仍然成立：结果未到时
+        // 模型**看不到**子 agent 是否跑着，只能等。
         guidelines.push(
-            "Use subagent_async instead of subagent when you want to dispatch several sub-tasks \
-             or keep answering the user while a sub-agent works: it returns a handle immediately \
-             and the result is delivered to you automatically when it finishes — do NOT poll for \
-             it. Keep doing your own part after dispatching. If you finish your own part first, \
-             the turn keeps running until the sub-agent reports back, so never claim it is still \
+            "Use subagent_async to keep big, self-contained investigations out of this context: it \
+             returns a handle immediately, the sub-agent does NOT see this conversation, so \
+             `prompt` must be fully self-contained, and its result is delivered to you \
+             automatically when it finishes — do NOT poll for it. Finish your own part and let \
+             the turn end; the result arrives as a new turn. Never claim a sub-agent is still \
              running and never re-dispatch the same work"
                 .to_string(),
         );
@@ -481,33 +502,14 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
              doing next, then continue"
                 .to_string(),
         );
-    }
-    if tools.contains(&"subagent") {
-        // 防失控 + 防重复劳动（来源：Anthropic 多 agent 博客的量化经验，见
-        // `docs/arch/subagent/research.md` §2.9）。措辞要点：
-        // 规模规则、任务描述四要素、依赖与写入范围、失败诊断、成本提醒。
-        // 并发槽位数读 `ys-component` 的**单一真值常量**（ADR-0022 决策 14 的双轨：
-        // 常量是唯一真值，`RunLimits.max_parallel_tools` 与这里都取它）。
-        guidelines.push(format!(
-            "At most {} subagents run in parallel in one turn; extra calls queue. Dispatch only \
-             as many independent sub-tasks as you actually have.",
-            ys_component::DEFAULT_MAX_PARALLEL_TOOLS
-        ));
-        guidelines.push(
-            "Use subagent to keep big, self-contained investigations out of this context: the \
-             sub-agent does NOT see this conversation, so `prompt` must be fully self-contained"
-                .to_string(),
-        );
-        // **成批派发是机制事实，不是风格建议**：同一条消息里的多个 `subagent` 调用进同一个
-        // 并行段（`is_concurrency_safe == true`，`BasicLoop` Step 9 的 `Segment::Parallel`）
-        // ⇒ 真并发；而**一轮一个**会一个跑完才轮到下一个 ⇒ 串行 N 倍。
+        // **成批派发是机制事实，不是风格建议**：同一条消息里的多个 `subagent_async` 调用进
+        // 同一个并行段（`is_concurrency_safe == true`，`BasicLoop` Step 9 的
+        // `Segment::Parallel`）⇒ 真并发；而**一轮一个**会一个跑完才轮到下一个 ⇒ 串行 N 倍。
         // 实测（会话 `1792579023_125340094` turn 16）：3 个派发分在 3 轮里，
         // 串行 1,831 s；同一批只需 965 s。
-        //
-        // 这条**替换**了原先只讲「规模」的那句 —— 前缀成本按字节计，不新增条目。
         guidelines.push(
             "Scale the dispatch: one subagent is enough for a simple lookup. For genuinely \
-             independent sub-tasks, send ALL the `subagent` calls in ONE message — a single \
+             independent sub-tasks, send ALL the `subagent_async` calls in ONE message — a single \
              batch runs concurrently, whereas one call per round runs them one after another \
              (N times slower)"
                 .to_string(),
@@ -517,10 +519,11 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
              use, and explicit boundaries — vague prompts make the sub-agents repeat each other's work"
                 .to_string(),
         );
+        // 依赖不得靠「等一下」解决：派发是即时的，所以有依赖就**先不派**。
         guidelines.push(
             "Before dispatching multiple subagents, check their dependencies and write scopes. If \
-             a task consumes another task's output or verifies its changes, wait for the \
-             prerequisite to finish. Run tasks in parallel only when their outputs are \
+             a task consumes another task's output or verifies its changes, dispatch it only after \
+             the prerequisite's result arrives. Run tasks in parallel only when their outputs are \
              independent and their write scopes do not overlap; serialize them when the scope is \
              unclear"
                 .to_string(),
@@ -540,9 +543,27 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
         // 成批派发才是收益点 —— 同批调用进 `Segment::Parallel`。
         guidelines.push(
             "Delegate exploration only when you have several independent questions that each need \
-             many rounds: send them in ONE message as `subagent` with `mode=\"explore\"` so they run \
-             in parallel, then trust their `path:line` findings. For one or two small lookups, search \
-             directly — an agent's cold start costs more than the lookup itself."
+             many rounds: send them in ONE message as `subagent_async` with `mode=\"explore\"` so \
+             they run in parallel, then trust their `path:line` findings. For one or two small \
+             lookups, search directly — an agent's cold start costs more than the lookup itself."
+                .to_string(),
+        );
+    }
+
+    // 纠偏：**只对仍在跑的子 agent**有意义，故单独守卫 `subagent_send`（子表没有它）。
+    // 四条都是现行为的事实，不是风格建议：
+    // ① 地址就是 `subagent_async` 打出的那个 handle —— 模型没有别处可查；
+    // ② 送达点是子的**下一个轮边界**（`ChildBoundary::take`）⇒ 必须说「不是立即生效、
+    //    正在跑的工具不会被打断」，否则模型会以为发完就改了方向；
+    // ③ 语意不限（工具只把文本入队），但它是「改已有任务」而不是「再开一件活」——
+    //    后者要新派发（新 handle、新上下文）。
+    if tools.contains(&"subagent_send") {
+        guidelines.push(
+            "Use subagent_send to steer a sub-agent that is still running: tell it to converge, add \
+             a constraint, or change direction, addressing it with the handle subagent_async \
+             returned (e.g. `sa3.2`). Your message reaches it at its next round boundary, not \
+             immediately, and does not interrupt the tool it is running. Any wording is fine, but \
+             it never replaces dispatching new work"
                 .to_string(),
         );
     }
@@ -846,6 +867,18 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 派发工具的 snippet **逐字**钉死（它只出现在父表的真实工具表里，不在基础 9 元中，
+    /// 故上一用例的全表循环覆盖不到它）。
+    ///
+    /// 变异：把它改成兜底文案或别的措辞 ⇒ 本用例变红。
+    #[test]
+    fn subagent_snippet_is_verbatim() {
+        assert_eq!(
+            tool_snippet("subagent_async"),
+            "Start a sub-agent in the background and get a handle immediately; its result arrives automatically when it finishes"
+        );
     }
 
     /// `grep` / `find` / `ls` / `websearch` / `webfetch` 的 snippet **逐字**钉死
@@ -1439,7 +1472,7 @@ mod tests {
         let dir = unique_dir("cap_line");
         let cat = one_skill("arch-design", "多方案架构设计");
 
-        let parent = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
+        let parent = build_system_prompt(&dir, &[spec("read"), spec("subagent_async")], &cat);
         assert!(
             parent.contains("CAN delegate tasks to subagents"),
             "父提示应声明可派发；prompt = {parent}"
@@ -1457,29 +1490,34 @@ mod tests {
         );
         // **异步派发**的指引只在 `subagent_async` 在场时出现（子表没有它）。
         //
-        // 承重的三句：① 结果**自动送达、不要 poll**；② 模型先做完自己那部分时，
-        //    回合**不会**结束 —— 它会继续跑到子 agent 回报（ADR-0055：父回合等得起）；
-        //    ③ 不得谎报状态：既不必声称还在跑，也不要重派。
+        // 承重的三句：① 结果**自动送达、不要 poll**；② 父回合**不等**它 —— 先做完自己那部分
+        //    就正常收场，结果到达时自动起新回合；③ 不得谎报状态：既不得声称还在跑，
+        //    也不要重派。
         //
-        // 变异：删掉「do NOT poll for it」/「the turn keeps running until the sub-agent
-        // reports back」/「say in one line what it found」⇒ 变红。
-        let with_async = build_system_prompt(
-            &dir,
-            &[spec("read"), spec("subagent"), spec("subagent_async")],
-            &cat,
-        );
+        // 变异：删掉「do NOT poll for it」/「the result arrives as a new turn」
+        // （或把它改回「the turn keeps running until the sub-agent reports back」）
+        // /「Never claim a sub-agent is still running」/「never re-dispatch the same work」
+        // /「say in one line what it found」⇒ 变红。
+        let with_async = build_system_prompt(&dir, &[spec("read"), spec("subagent_async")], &cat);
         assert!(
             with_async.contains("do NOT poll for it"),
             "必须说明「结果自动送达、不要 poll」；prompt = {with_async}"
         );
         assert!(
-            with_async.contains("the turn keeps running until the sub-agent reports back"),
-            "必须说明「父回合会等到子 agent 回报」—— 这是 ADR-0055 的行为契约；\
-             prompt = {with_async}"
+            with_async.contains("the result arrives as a new turn"),
+            "必须说明「父回合不等待，结果到达时自动起新回合」；prompt = {with_async}"
         );
         assert!(
-            with_async.contains("never claim it is still running"),
+            !with_async.contains("the turn keeps running until the sub-agent reports back"),
+            "父回合不再等子 agent 回报；prompt = {with_async}"
+        );
+        assert!(
+            with_async.contains("Never claim a sub-agent is still running"),
             "必须禁止未核实就声称「还在跑」；prompt = {with_async}"
+        );
+        assert!(
+            with_async.contains("never re-dispatch the same work"),
+            "必须禁止重派同一件活；prompt = {with_async}"
         );
         // 用户明确要求的「回复后立即汇报并继续」—— 汇报是义务，不是风格。
         assert!(
@@ -1492,7 +1530,7 @@ mod tests {
             !with_async.contains("delivered at the start of your next turn"),
             "不得再承诺需要用户开口的「下一回合送达」；prompt = {with_async}"
         );
-        let without = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
+        let without = build_system_prompt(&dir, &[spec("read")], &cat);
         assert!(
             !without.contains("do NOT poll for it"),
             "`subagent_async` 不在场时不该出现它的指引；prompt = {without}"
@@ -1503,8 +1541,8 @@ mod tests {
         //
         // 实测依据（turn 16）：3 个派发分 3 轮 ⇒ 1,831 s；同批只需 965 s。
         //
-        // 变异：把「send ALL the `subagent` calls in ONE message」删掉，只留「scale」
-        // 语义 ⇒ 变红。
+        // 变异：把「send ALL the `subagent_async` calls in ONE message」删掉，只留
+        // 「scale」语义 ⇒ 变红。
         assert!(
             parent.contains("in ONE message")
                 && parent.contains("one call per round runs them one after another"),
@@ -1514,7 +1552,7 @@ mod tests {
         let child = build_system_prompt(&dir, &[spec("read")], &cat);
         assert!(
             child.contains("no subagents"),
-            "子提示（无 subagent 工具）应逐字保留那句；prompt = {child}"
+            "子提示（无派发工具）应逐字保留那句；prompt = {child}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1538,7 +1576,7 @@ mod tests {
         let _env = no_global_prompt();
         let dir = unique_dir("subagent_dispatch_parent");
         let cat = one_skill("arch-design", "多方案架构设计");
-        let prompt = build_system_prompt(&dir, &[spec("read"), spec("subagent")], &cat);
+        let prompt = build_system_prompt(&dir, &[spec("read"), spec("subagent_async")], &cat);
         let block = subagent_guideline_block(&prompt);
 
         assert!(
@@ -1548,8 +1586,9 @@ mod tests {
             "须要求派发前检查依赖与写入范围；block = {block}"
         );
         assert!(
-            block.contains("wait for the prerequisite to finish"),
-            "消费输出或验证修改的任务须等待前置完成；block = {block}"
+            block.contains("dispatch it only after")
+                && block.contains("the prerequisite's result arrives"),
+            "有依赖的任务须等前置结果到达后再派；block = {block}"
         );
         assert!(
             block.contains("outputs are independent and their write scopes do not overlap"),
@@ -1593,7 +1632,7 @@ mod tests {
 
     /// 后台命令两条 guideline **只在 `bash_bg` 在场时**出现。
     ///
-    /// 守卫形态与既有 `websearch` / `webfetch` / `subagent` 的「在场才出现」同形。
+    /// 守卫形态与既有 `websearch` / `webfetch` / `subagent_async` 的「在场才出现」同形。
     /// **只看 `bash_bg`**：两条文案都只引用它（结果由 harness 送达，模型无需也不得轮询）；
     /// 缺了它，两条都是指向不存在工具的悬空指令。
     ///
@@ -1687,7 +1726,7 @@ mod tests {
 
     /// 子 agent 的工具表（基础 9 元）**不含 bg 工具** ⇒ 天然看不到这两条 guideline。
     ///
-    /// 这与 `subagent` 那组的「在场才出现」同形：子表少一项，父表多一项，
+    /// 这与派发工具那组的「在场才出现」同形：子表少一项，父表多一项，
     /// 提示词各说各话，互不越界。
     #[test]
     fn background_command_guidelines_absent_from_child_prompt() {
@@ -1736,7 +1775,7 @@ mod tests {
 
         for phrase in [
             "Before dispatching multiple subagents",
-            "wait for the prerequisite to finish",
+            "the prerequisite's result arrives",
             "write scopes do not overlap",
             "serialize them when the scope is unclear",
             "read its diagnostic first",
@@ -1750,11 +1789,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 派发探索的**触发条件**只在父表有 `subagent` 时渲染，且必须写明
+    /// 派发探索的**触发条件**只在父表有 `subagent_async` 时渲染，且必须写明
     /// 「多个独立问题 + 一条消息成批 + 小查找自己搜」。
     ///
     /// 变异：① 删掉 `mode=\"explore\"` 或 `in ONE message` ⇒ 正向断言变红；
-    /// ② 去掉 `tools.contains(&"subagent")` 门控 ⇒ 反向断言变红。
+    /// ② 去掉 `tools.contains(&"subagent_async")` 门控 ⇒ 反向断言变红。
     #[test]
     fn delegate_exploration_guideline_gated_on_subagent() {
         let _guard = env_lock();
@@ -1762,13 +1801,13 @@ mod tests {
 
         let parent = build_system_prompt(
             Path::new("/tmp"),
-            &[spec("read"), spec("grep"), spec("subagent")],
+            &[spec("read"), spec("grep"), spec("subagent_async")],
             &no_skills(),
         );
         assert!(
             parent
                 .contains("Delegate exploration only when you have several independent questions"),
-            "父表有 subagent 时应渲染派发探索指引；prompt = {parent}"
+            "父表有 subagent_async 时应渲染派发探索指引；prompt = {parent}"
         );
         assert!(
             parent.contains("mode=\"explore\""),
@@ -1790,7 +1829,7 @@ mod tests {
         );
         assert!(
             !child.contains("Delegate exploration only when"),
-            "无 subagent 时不得渲染派发探索指引；prompt = {child}"
+            "无派发工具时不得渲染派发探索指引；prompt = {child}"
         );
     }
 

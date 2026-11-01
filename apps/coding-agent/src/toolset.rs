@@ -609,17 +609,17 @@ mod tests {
     ///
     /// - `fp_tools`：**只**覆盖基础 9 元（子 agent 的工具表）。它守的是子表自身的
     ///   字节稳定性，对追加段完全无感。
-    /// - `fp_parent`：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent` / `subagent_async`）
+    /// - `fp_parent`：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）
     ///   共 **12 元**，与 `assembly.rs` 的生产父表同形。追加段工具的 schema 漂移
-    ///   在 `fp_tools` 那里是**静默的**（本会话已实际发生过一次：给 `subagent` 加
+    ///   在 `fp_tools` 那里是**静默的**（本会话已实际发生过一次：给派发工具加
     ///   `mode` 参数后 `fp_tools` 纹丝不动），故必须由父表锚补上。
     ///
     /// # 变异
     ///
     /// 变异：把 [`build_tools`] 里 `grep`/`find` 互换 ⇒ 顺序断言与两个指纹都变红。
     /// 变异：改任一**基础**工具的 description ⇒ `fp_tools` 与 `fp_parent` 都变红。
-    /// 变异：改 `subagent` 的 description ⇒ `fp_parent` 变红、`fp_tools` 不变
-    /// （这正是父表锚存在的理由）。
+    /// 变异：改 `subagent_async` / `subagent_send` 的 description ⇒ `fp_parent` 变红、
+    /// `fp_tools` 不变（这正是父表锚存在的理由）。
     #[test]
     fn prefix_fingerprint_is_anchored_and_stable() {
         let _guard = env_lock();
@@ -634,29 +634,40 @@ mod tests {
         let json = serde_json::to_string(&specs).unwrap();
         let fp_tools = fnv1a64(json.as_bytes());
 
-        // **父表锚点**：父表 = 这 9 元 + `bash_bg` + `subagent` + `subagent_async` ⇒ **12 元**
-        // （与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的**字节前缀 + 追加项**
-        // （子表命中父的前缀缓存）。
+        // **父表锚点**：父表 = 这 9 元 + `bash_bg` + `subagent_async` + `subagent_send`
+        // ⇒ **12 元**（与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的
+        // **字节前缀 + 追加项**（子表命中父的前缀缓存）。
         //
         // 三个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
         // 真看到的那份 schema。
         let mut parent_specs = specs.clone();
         parent_specs.push(bash_bg_spec(&dir));
-        parent_specs.push(crate::subagent::SubagentTool::new(Duration::from_secs(60)).spec());
         parent_specs.push(crate::subagent::SubagentAsyncTool::new().spec());
+        parent_specs.push(crate::subagent::SubagentSendTool::new().spec());
         assert_eq!(
             parent_specs.len(),
             12,
-            "父表应为 12 元（9 基础 + bash_bg + subagent + subagent_async）"
+            "父表应为 12 元（9 基础 + bash_bg + subagent_async + subagent_send）"
+        );
+        // 合同：父表**不得**含已删除的同步 `subagent` 工具 —— 子 agent 只能靠
+        // `subagent_async` 派发（`subagent_send` 只对**已在跑**的子 agent 插话，
+        // 没有 handle 时 fail-closed，无法替代派发）。
+        //
+        // 这里的 `"subagent"` 是 `==` 的**精确相等**比较（不是 `contains` 子串匹配），
+        // 故不会误伤 `subagent_async` / `subagent_send`。改动成 `contains` 会让本断言
+        // 在两处永远为真 —— 那才是真正的误伤方向，别做。
+        assert!(
+            !parent_specs.iter().any(|s| s.name == "subagent"),
+            "同步 `subagent` 工具已删除，父表不得含它（子 agent 靠 `subagent_async` 派发）"
         );
         assert_eq!(
             parent_specs[parent_specs.len() - 3..]
                 .iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<&str>>(),
-            vec!["bash_bg", "subagent", "subagent_async"],
-            "追加段顺序即契约：后台工具在派发工具**之前**、`subagent_async` 在 `subagent` \
-             **之后**（与 assembly.rs 尾断言逐项一致，否则子表不再是父的字节前缀）"
+            vec!["bash_bg", "subagent_async", "subagent_send"],
+            "追加段顺序即契约：后台工具在派发工具**之前**（与 assembly.rs 尾断言逐项一致，\
+             否则子表不再是父的字节前缀）"
         );
         let parent_json = serde_json::to_string(&parent_specs).unwrap();
         assert!(
@@ -704,14 +715,13 @@ mod tests {
             fp_tools, 0xc3a96ba4de69115au64,
             "工具表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
-        // 父表指纹锚：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent` / `subagent_async`）。
+        // 父表指纹锚：覆盖基础 9 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）。
         // `fp_tools` 只覆盖子表，追加段工具的 schema 漂移在它那里是静默的 —— 这里补上。
         //
-        // 2026-10-30 漂移：`subagent` / `subagent_async` 的 `mode` 描述写明「约 16 轮 / 300s」
-        // 硬预算（旧描述不提预算，模型无从据此控制问题粒度）。`fp_tools` 未变 ——
-        // 那两项在追加段，不在基础 9 元表里。
+        // 最近一次漂移：追加段新增 `subagent_send`。`fp_tools` 未变 ——
+        // 那项在追加段，不在基础 9 元表里。
         assert_eq!(
-            fp_parent, 0x76e0bbd866bc74b8u64,
+            fp_parent, 0x4ff39b05aba679efu64,
             "父表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
 

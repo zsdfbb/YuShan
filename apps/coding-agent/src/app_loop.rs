@@ -282,12 +282,14 @@ pub type AppLoopError = Box<dyn std::error::Error + Send + Sync>;
 enum Wake {
     Request(Option<Request>),
     Models(Option<crate::provider::ModelCache>),
-    /// 有子 agent 的结果落地到跨回合投递表（ADR-0055）。
+    /// 有子 agent 的结果落地到跨回合投递表（ADR-0065）。
     ///
     /// 无此分支时，一轮「回合已结束、子 agent 稍后才回来」的结果会**静默滞留**到用户
-    /// 下次敲字（表没有回合外读者）。这里只负责**告知**，不自动起回合 —— 自动起回合
-    /// 等于在用户没开口时替他花一次模型调用，且合成消息会落盘、`/resume` 回放会把
-    /// 它画成「用户说过的话」。
+    /// 下次敲字（表没有回合外读者）。结果是一种输入 ⇒ 这里**自动起一轮**把它交给模型
+    /// 处理，与 [`Wake::BackgroundReturned`] 同构。
+    ///
+    /// 起回合前先 [`PendingResults::has_pending`] 复核：唤醒只说「可能有」（permit 还
+    /// 可能跨回合残留），空则什么都不做。
     SubagentReturned,
     /// 有后台命令**跑完了**（进了终态、结果留在投递表里）。
     ///
@@ -296,8 +298,9 @@ enum Wake {
     /// [`BackgroundTasks::has_pending`](ys_tools_basic::BackgroundTasks::has_pending)
     /// 复核：唤醒只说「可能有」（清扫是进程级、会话级过滤在这一侧），空则什么都不做。
     ///
-    /// 与 [`Wake::SubagentReturned`] **有意不对称**：子 agent 的结果仍是「只告知」，
-    /// 它的注入时机走子 agent 自己的语义（父回合等待 / 跨回合投递表），不额外起回合。
+    /// 与 [`Wake::SubagentReturned`] 同构（两者都是「后台工作的结果回来了 ⇒ 起一轮交给
+    /// 模型」），差别只在复核判据：本条按会话过滤（清扫是进程级的），子 agent 的结果
+    /// 不分会话。
     ///
     /// **不会热循环**：`sweep` 的 `notify` 只在**新终态**时发（`newly_terminal > 0`），
     /// 而本回合把 `Pending` 一次取完（`take_completions`） ⇒ 醒来时表里已空。
@@ -408,41 +411,58 @@ pub async fn run(
                 return Ok(());
             }
             Wake::SubagentReturned => {
-                // 只报「有结果回来了」，不取走、不注入 —— 投递仍归下一回合开头的补投
-                // （`take_pending_results`），否则会重复送达。
-                if let Some(s) = subagent.as_ref()
-                    && s.pending_results().has_pending()
-                {
-                    send_or_flush(
-                        &out_tx,
-                        Outbound::Output(
-                            "↓ 后台子 agent 已返回；它的结果会在你的下一次发言时进入上下文"
-                                .to_string(),
-                        ),
-                        &mut debug,
-                        &stats,
-                        run_rounds,
-                    )
-                    .await?;
-                    let view = build_view(
-                        &config,
-                        &agent,
-                        &wiring,
-                        &config.registry,
-                        &state_store,
-                        &stats,
-                        session_started,
-                        theme,
-                    );
-                    send_or_flush(
-                        &out_tx,
-                        Outbound::View(view),
-                        &mut debug,
-                        &stats,
-                        run_rounds,
-                    )
-                    .await?;
+                // 复核必须留：唤醒只说「可能有」（permit 可能跨回合残留），也可能结果
+                // 已被某个回合的补投取走 ⇒ 空则什么都不做。`has_pending` **只读不取**：
+                // 真正取走结果的是本回合开头的补投（`take_pending_results`），双取会重复送达。
+                let has_pending = subagent
+                    .as_ref()
+                    .is_some_and(|s| s.pending_results().has_pending());
+                if !has_pending {
+                    continue;
                 }
+                // 占位输入**不是**用户说的话 ⇒ `Role::Harness`。真正的内容是随后经
+                // `Boundary::Deferred` 注入的那几条子 agent 结果。
+                let message = subagent_placeholder();
+                run_turn_chain(
+                    &mut agent,
+                    &mut wiring,
+                    &config,
+                    &mut turns,
+                    &mut stats,
+                    thinking_visible,
+                    &mut run_rounds,
+                    &out_tx,
+                    &mut sink_rx,
+                    &mut boundary_rx,
+                    subagent.as_ref(),
+                    debug.as_mut(),
+                    &debug_session_id,
+                    &worktree,
+                    message,
+                    // 占位消息不是用户说的话 ⇒ 不贡献标题素材。
+                    None,
+                )
+                .await?;
+                // 回合收场后刷新视图（本臂 `continue`，走不到循环尾部那次刷新）——
+                // 否则状态行会停在自动回合**之前**的读数上。
+                let view = build_view(
+                    &config,
+                    &agent,
+                    &wiring,
+                    &config.registry,
+                    &state_store,
+                    &stats,
+                    session_started,
+                    theme,
+                );
+                send_or_flush(
+                    &out_tx,
+                    Outbound::View(view),
+                    &mut debug,
+                    &stats,
+                    run_rounds,
+                )
+                .await?;
                 continue;
             }
             Wake::BackgroundReturned => {
@@ -1126,17 +1146,6 @@ struct TurnCtx<'a> {
     debug_session_id: &'a str,
 }
 
-impl TurnCtx<'_> {
-    /// 距本请求 wall-clock 截止点还剩多久（已过则 `ZERO`）。
-    ///
-    /// 供 [`Agent::set_subagent_wait`] 收紧等待上限用 —— 两个计时器必须相融，
-    /// 否则「子 agent 等待」会把回合拖到 budget 到点，用户看到的是「预算耗尽」。
-    fn deadline_remaining(&self) -> std::time::Duration {
-        self.deadline
-            .saturating_duration_since(std::time::Instant::now())
-    }
-}
-
 /// 一个回合的结局：`Ok` 是本回合的 `RunResult`，`Err` 是模型 / 工具失败
 /// （`BasicLoop` 已在返回前发 `RunFailed`）。二者都属**本回合**；它不与
 /// [`AppLoopError`]（「UI 侧已收摊」）混为一谈 —— 后者才终止整个 app 循环。
@@ -1281,9 +1290,9 @@ async fn send_or_flush(
 
 /// 跑**一条回合链**（目前总是一回合：ADR-0041 撤回了完工复核）。
 ///
-/// 两个调用点共用它：`Request::Prompt`（用户发言）与 `Wake::BackgroundReturned`
-/// （后台结果自动起回合）。回合本身的推进/记账/写穿 meta 只有一份实现，否则两处
-/// 必然漂移。
+/// 两个调用点共用它：`Request::Prompt`（用户发言）、`Wake::BackgroundReturned` 与
+/// `Wake::SubagentReturned`（后台结果自动起回合）。回合本身的推进/记账/写穿 meta 只有
+/// 一份实现，否则两处必然漂移。
 ///
 /// **wall-clock 预算在此算一次**：`deadline` 覆盖整条链，时长只来自
 /// `config.max_turn_duration()`。
@@ -1413,6 +1422,19 @@ fn background_placeholder() -> Message {
     }
 }
 
+/// 子 agent 结果自动起回合时的占位输入。
+///
+/// 与 [`background_placeholder`] 同一条理由：它**不是用户说的话** ⇒ `Role::Harness`。
+/// 真正的内容是随后经 `Boundary::Deferred` 注入的那几条派发结果。
+fn subagent_placeholder() -> Message {
+    Message {
+        role: Role::Harness,
+        content: vec![ContentBlock::Text {
+            text: "[harness] 子 agent 结果已送入上下文，请据此继续。".to_string(),
+        }],
+    }
+}
+
 /// 逐轮计时状态机 —— 定义在 [`crate::round_clock`]（两条入口共用同一套口径）。
 use crate::round_clock::{RoundClock, turn_cache, turn_line};
 
@@ -1458,6 +1480,11 @@ async fn run_turn_once(
 
     // 回合号从 1 起（`begin_turn` 把它带进 `Envelope.turn`）。
     *ctx.turns += 1;
+    // 同一编号写进子 agent 的共享回合号：句柄 `sa{turn}.{n}` 的回合段取自它，
+    // 跨回合不重复 ⇒ `subagent_send` 不会寻到上一个回合的同序号任务。
+    if let Some(s) = ctx.subagent {
+        s.set_turn(*ctx.turns);
+    }
     // `turn_start` 必须在回合开跑前取输入规模（`input` 随后被移动进 `run_turn`）。
     if let Some(sink) = ctx.debug.as_deref_mut() {
         crate::record_turn_start(
@@ -1479,22 +1506,6 @@ async fn run_turn_once(
     // `capabilities`，而窗口由 `config` 派生 —— 一处读取、不可能漂移。
     ctx.agent
         .set_context_window(ctx.config.effective_context_window());
-    // **每回合收紧子 agent 等待上限**（ADR-0055）。
-    //
-    // 双计时器：app 侧的 budget 到点会推 `Abort` 并打印「budget exhausted」。若
-    // `subagent_wait` 比剩余 deadline 更长，用户会看到「预算耗尽」而回合其实只是在
-    // 正常等待子 agent。故每回合取一次 min —— 与上面的 context window 同一个理由：
-    // 都在回合**开头**一处派生，不可能漂移。
-    //
-    // **必须取 min，而不是直接赋值**：装配期（`resolve_limits` / 测试）可能已经设过
-    // 一个更紧的值，直接覆盖会把它静默抬回 `config` 默认值。`min` 同时满足两件事：
-    // ① 不越过父 budget；② 不放松调用方显式要的紧上限。
-    let wait = ctx
-        .config
-        .subagent_wait()
-        .min(ctx.deadline_remaining())
-        .min(ctx.agent.subagent_wait());
-    ctx.agent.set_subagent_wait(wait);
     // 本回合**实际跑过的轮数**，从事件流累计（见 [`count_round`] 的理由）——
     // 成功与失败两条路径都从这里取，不依赖 `RunResult` 是否存在。
     let mut observed_rounds: u32 = 0;
@@ -4364,80 +4375,6 @@ mod tests {
         );
     }
 
-    /// **`max_rounds` = `u32::MAX` ⇒ 不被核心默认 10 截断**（ADR-0027 决策 1）。
-    ///
-    /// **接线**：`app_loop` 每回合构造 `AppSubagentRunner` 并经 `AgentPorts` 注入 ⇒
-    /// 模型发一个 `subagent` 工具调用时，它真的在环里跑通（子 agent 产出 → 结果回喂父模型）。
-    ///
-    /// 这是唯一覆盖「注入那几行」的用例：`subagent` 单元测试直接调 runner，跳过了
-    /// `TurnCtx.subagent → make_runner → AgentPorts::with_subagent` 这条链。
-    #[tokio::test]
-    async fn subagent_runner_is_injected_each_turn() {
-        let model = ys_model::MockModel::new("m");
-        // 父第 1 轮：发一个 `subagent` 调用。
-        model.push_tool_call(
-            "subagent",
-            serde_json::json!({"description": "查 X", "prompt": "查 X"}),
-        );
-        // 子 agent 的唯一一次模型调用，吃掉下一条响应。
-        model.push_text("CHILD-OUTPUT");
-        // 父第 2 轮（看到工具结果后）收尾。
-        model.push_text("parent done");
-
-        let mut h = spawn_app_loop_full(
-            Box::new(model),
-            false,
-            Vec::new(),
-            |_, _| {},
-            |b| {
-                b.tools(vec![Box::new(crate::subagent::SubagentTool::new(
-                    std::time::Duration::from_secs(30),
-                ))])
-            },
-            |tmp| {
-                Some(crate::subagent::SubagentSetup::shared(
-                    "你是子 agent".to_string(),
-                    ys_component::RunLimits::new(3),
-                    std::time::Duration::from_secs(30),
-                    tmp.to_path_buf(),
-                    WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
-                    // 产物目录注入临时路径 —— 不写进用户的 `~/.yushan/subagents/`。
-                    Arc::new(crate::subagent::SubagentsDir::at(
-                        tmp.join("subagents"),
-                        false,
-                    )),
-                    Arc::new(crate::subagent::PendingResults::default()),
-                    Arc::new(crate::subagent::LiveSubagents::default()),
-                ))
-            },
-            None,
-            false,
-            false,
-            false,
-        )
-        .await;
-
-        h.requests.send(prompt("hi")).await.unwrap();
-        let mut msgs = collect_until_view(&mut h).await;
-        let _ = take_view(&mut msgs);
-
-        let contents: Vec<String> = events_of(&msgs)
-            .into_iter()
-            .filter_map(|env| match &env.event {
-                AgentEvent::ToolResult { result, .. } => Some(result.content.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            contents.iter().any(|c| c.contains("CHILD-OUTPUT")),
-            "子 agent 的产出必须作为工具结果回喂（注入链未接通？）：{contents:?}"
-        );
-        assert!(
-            contents.iter().any(|c| c.contains("## Files")),
-            "runner 必须保证产物节存在：{contents:?}"
-        );
-    }
-
     /// 子 agent 在**回合内**完成时，结果必须在**本回合**就送达（不能白等一个回合）。
     ///
     /// 这条钉的是「落点绑定」这一半：投递表是进程级的，若本回合没绑定落点，
@@ -4565,21 +4502,10 @@ mod tests {
     /// **契约已变（ADR-0055）**：本用例现在钉的是「**结果一旦在表里，就不会丢**」
     /// 这条兼底保证 —— 而不是第一版设想的「回合结束后完成」那条时序。
     ///
-    /// # 为什么原时序已不可达
-    ///
-    /// 本用例的子 agent 睡 300ms，而父模型第 2 轮就给出了最终答复。按 ADR-0055 之前的
-    /// 行为，回合会在那里收场 ⇒ 结果只能等到用户下一次输入（本用例的第二回合）。
-    /// **现在父回合会等**：Step 9c 发现 `running() > 0` 就进等待，结果一到就 `continue`
-    /// ⇒ 300ms 的延迟完全落在**同一个回合**内。
-    ///
     /// 因此本用例现在验证的事实是：
     /// ① 子 agent **没有被取消**（`tokio::spawn` 分离任务，回合结束不等于它死）；
-    /// ② 即使走跨回合路径，结果也**不会丢**（投递表 + 回合开头补投 —— 这条兼底是
-    ///    超时收场之后唯一能接住结果的地方，见 `parent_waits_for_slow_subagent` 的反面）；
+    /// ② 即使走跨回合路径，结果也**不会丢**（投递表 + 回合开头补投）；
     /// ③ 第二回合的请求里能看到它。
-    ///
-    /// **与 `parent_waits_for_slow_subagent_within_the_same_turn` 的分工**：那个用例钉
-    /// 「同一回合内送达」；本用例钉「兼底不漏」。两者一个管主路径、一个管兜底。
     ///
     /// 生产证据（会话 `1792840206_799154000`，修复前的故障）：turn 11 于 20:13:36 派发
     /// 3 个 `subagent_async`，回合 20:14:28 结束；子 agent 分别于 20:16:59 / 20:20:47
@@ -4685,6 +4611,10 @@ mod tests {
         // 等子 agent 真正跑完（300ms 睡眠 + 余量）—— 此后它的结果必须已在
         // 某个**跨回合**的落点上，而不是随回合 1 的边界源一起销毁。
         tokio::time::sleep(Duration::from_millis(700)).await;
+        // 结果落地会**自动起一个回合**（`Wake::SubagentReturned`）—— 先把那一回合的
+        // 收尾 `View` 收掉，否则它会被误当成下面那个回合的收尾。
+        let mut auto = collect_until_view(&mut h).await;
+        let _ = take_view(&mut auto);
 
         // 回合 2：模型必须能在请求里看到子 agent 的产出。
         h.requests.send(prompt("结果呢")).await.unwrap();
@@ -4712,274 +4642,6 @@ mod tests {
              第二回合请求里没有 {CHILD_OUTPUT}；消息数 = {}",
             turn2.messages.len()
         );
-    }
-
-    /// **ADR-0055 的兜底路径**：等满上限收场后，子 agent 才回来 —— 结果落在跨回合
-    /// 投递表里，空闲态必须**主动告知**用户（而不是静默躺着等下次输入）。
-    ///
-    /// 这条分支（`Wake::SubagentReturned`）只在「超时收场」这条罕见路径上走到：
-    /// 正常情况下父回合会一直等到结果（见同组的上一个用例）。但它是**唯一**能让
-    /// 「模型已答完、子 agent 随后回来」被看见的路径 —— 没有它，用户会觉得子 agent
-    /// 人间蒸发。
-    ///
-    /// 时序要点：`subagent_wait` 必须**小于**子 agent 的睡眠，否则父回合会等到结果，
-    /// 走不到空闲分支。
-    ///
-    /// 变异：删掉 `app_loop` 里 `Wake::SubagentReturned` 那个臂 ⇒ 本用例收不到
-    /// 「已返回」那行 `Output`（超时失败）。
-    #[tokio::test]
-    async fn late_subagent_result_is_announced_while_idle() {
-        const CHILD_PROMPT: &str = "你是子 agent";
-        const CHILD_OUTPUT: &str = "CHILD-VERY-LATE";
-
-        struct Inner {
-            parent_calls: AtomicU32,
-        }
-        struct VerySlowChildModel(Arc<Inner>);
-
-        #[async_trait::async_trait]
-        impl Model for VerySlowChildModel {
-            fn model_id(&self) -> &str {
-                "very-slow-child"
-            }
-
-            async fn complete(
-                &self,
-                request: ModelRequest,
-                _sink: &mut dyn ModelEventSink,
-            ) -> Result<ModelResponse, ModelError> {
-                if request.system.as_deref() == Some(CHILD_PROMPT) {
-                    // **比等待上限慢得多**：父回合必然先超时收场。
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    return Ok(text_response(CHILD_OUTPUT));
-                }
-                let n = self.0.parent_calls.fetch_add(1, Ordering::Relaxed);
-                if n == 0 {
-                    Ok(ModelResponse {
-                        message: Message {
-                            role: Role::Assistant,
-                            content: vec![ContentBlock::ToolUse {
-                                id: ToolCallId("call-1".into()),
-                                name: "subagent_async".into(),
-                                arguments: serde_json::json!({
-                                    "description": "极慢活",
-                                    "prompt": "干极慢活",
-                                }),
-                            }],
-                        },
-                        usage: Usage::default(),
-                        finish_reason: FinishReason::ToolCalls,
-                    })
-                } else {
-                    Ok(text_response("parent done"))
-                }
-            }
-        }
-
-        let inner = Arc::new(Inner {
-            parent_calls: AtomicU32::new(0),
-        });
-        let mut h = spawn_app_loop_full(
-            Box::new(VerySlowChildModel(Arc::clone(&inner))),
-            false,
-            Vec::new(),
-            |_, _| {},
-            |b| {
-                // 等待上限压到 50ms ⇒ 父回合必然在子 agent（400ms）之前收场。
-                let mut limits = ys_component::RunLimits::new(6);
-                limits.subagent_wait = Duration::from_millis(50);
-                limits.subagent_poll = Duration::from_millis(5);
-                b.tools(vec![Box::new(crate::subagent::SubagentAsyncTool::new())])
-                    .limits(limits)
-            },
-            |tmp| {
-                Some(crate::subagent::SubagentSetup::shared(
-                    CHILD_PROMPT.to_string(),
-                    ys_component::RunLimits::new(3),
-                    Duration::from_secs(30),
-                    tmp.to_path_buf(),
-                    WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
-                    Arc::new(crate::subagent::SubagentsDir::at(
-                        tmp.join("subagents"),
-                        false,
-                    )),
-                    Arc::new(crate::subagent::PendingResults::default()),
-                    Arc::new(crate::subagent::LiveSubagents::default()),
-                ))
-            },
-            None,
-            false,
-            false,
-            false,
-        )
-        .await;
-
-        // 回合 1：父收场（等满 50ms 仍未回来）。
-        h.requests.send(prompt("hi")).await.unwrap();
-        let mut msgs = collect_until_view(&mut h).await;
-        let _ = take_view(&mut msgs);
-        // 此刻结果还不该到：它睡 400ms。
-        assert!(
-            !msgs.iter().any(|m| matches!(
-                m,
-                Outbound::Output(t) if t.contains("后台子 agent 已返回")
-            )),
-            "子 agent 还没回来，不得提前告知：{msgs:?}"
-        );
-
-        // **不发任何请求** —— 空闲态必须自己收到唤醒并告知。
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let announced = loop {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(
-                !left.is_zero(),
-                "空闲态必须主动告知「子 agent 已返回」，实际 5s 内没有任何 Output"
-            );
-            let m = tokio::time::timeout(left, h.outbound.recv())
-                .await
-                .expect("等待 Outbound 超时")
-                .expect("app 循环不应提前收摊");
-            if matches!(&m, Outbound::Output(t) if t.contains("后台子 agent 已返回")) {
-                break true;
-            }
-        };
-        assert!(
-            announced,
-            "必须告知用户结果已在表里、将在下次发言时进入上下文"
-        );
-        // 父模型只在第 1 轮派发、第 2 轮收工后就被超时收场 ⇒ 不得有第 3 轮。
-        assert_eq!(
-            inner.parent_calls.load(Ordering::Relaxed),
-            2,
-            "等待上限必须生效（若为 3 说明父回合等到了结果，走的是主路径而非兜底路径）"
-        );
-    }
-
-    /// **ADR-0055 端到端**：子 agent 慢于父模型的最终答复时，父回合**不许收场** ——
-    /// 它要等结果回来、当成下一轮的输入，模型于是能在**同一个回合**里汇报并继续。
-    ///
-    /// 与 `async_subagent_result_survives_turn_boundary` 的区别：那个用例描述的是
-    /// **修复前**的行为（结果只能等到用户下一个请求）。本用例固定**修复后**的契约 ——
-    /// 同一个 `Request::Prompt` 之内结果就已进会话。
-    ///
-    /// 变异：把 Step 9c 的 `has_running_subagents` 判断去掉 ⇒ 结果只能在第二回合看到，
-    /// 本用例的「同一回合内」断言变红。
-    #[tokio::test]
-    async fn parent_waits_for_slow_subagent_within_the_same_turn() {
-        const CHILD_PROMPT: &str = "你是子 agent";
-        const CHILD_OUTPUT: &str = "CHILD-SLOW-OUTPUT";
-
-        struct Inner {
-            parent_calls: AtomicU32,
-            requests: Mutex<Vec<ModelRequest>>,
-        }
-        struct SlowChildModel(Arc<Inner>);
-
-        #[async_trait::async_trait]
-        impl Model for SlowChildModel {
-            fn model_id(&self) -> &str {
-                "slow-child"
-            }
-
-            async fn complete(
-                &self,
-                request: ModelRequest,
-                _sink: &mut dyn ModelEventSink,
-            ) -> Result<ModelResponse, ModelError> {
-                if request.system.as_deref() == Some(CHILD_PROMPT) {
-                    // 比父的最终答复慢：父第 2 轮就答完了，子还在跑。
-                    tokio::time::sleep(Duration::from_millis(120)).await;
-                    return Ok(text_response(CHILD_OUTPUT));
-                }
-                self.0.requests.lock().unwrap().push(request);
-                let n = self.0.parent_calls.fetch_add(1, Ordering::Relaxed);
-                if n == 0 {
-                    Ok(ModelResponse {
-                        message: Message {
-                            role: Role::Assistant,
-                            content: vec![ContentBlock::ToolUse {
-                                id: ToolCallId("call-1".into()),
-                                name: "subagent_async".into(),
-                                arguments: serde_json::json!({
-                                    "description": "慢活",
-                                    "prompt": "干慢活",
-                                }),
-                            }],
-                        },
-                        usage: Usage::default(),
-                        finish_reason: FinishReason::ToolCalls,
-                    })
-                } else {
-                    // 父以为自己完事了 —— 但子还在跑，回合不该就此结束。
-                    Ok(text_response("parent thinks it is done"))
-                }
-            }
-        }
-
-        let inner = Arc::new(Inner {
-            parent_calls: AtomicU32::new(0),
-            requests: Mutex::new(Vec::new()),
-        });
-        let mut h = spawn_app_loop_full(
-            Box::new(SlowChildModel(Arc::clone(&inner))),
-            false,
-            Vec::new(),
-            |_, _| {},
-            |b| {
-                // 等待上限压到 5s：测试不该依赖 30min 的默认值。
-                // （`RunLimits` 是 `#[non_exhaustive]` ⇒ 只能先建后改。）
-                let mut limits = ys_component::RunLimits::new(6);
-                limits.subagent_wait = Duration::from_secs(5);
-                limits.subagent_poll = Duration::from_millis(10);
-                b.tools(vec![Box::new(crate::subagent::SubagentAsyncTool::new())])
-                    .limits(limits)
-            },
-            |tmp| {
-                Some(crate::subagent::SubagentSetup::shared(
-                    CHILD_PROMPT.to_string(),
-                    ys_component::RunLimits::new(3),
-                    Duration::from_secs(30),
-                    tmp.to_path_buf(),
-                    WebConfig::offline(FetchedDir::Temp(tmp.join("fetched"))),
-                    Arc::new(crate::subagent::SubagentsDir::at(
-                        tmp.join("subagents"),
-                        false,
-                    )),
-                    Arc::new(crate::subagent::PendingResults::default()),
-                    Arc::new(crate::subagent::LiveSubagents::default()),
-                ))
-            },
-            None,
-            false,
-            false,
-            false,
-        )
-        .await;
-
-        // **只发一个请求** —— 全程不靠用户第二次输入。
-        h.requests.send(prompt("hi")).await.unwrap();
-        let mut msgs = collect_until_view(&mut h).await;
-        let _ = take_view(&mut msgs);
-
-        // ① 父模型被多叫了一轮：第 2 轮以为自己完事，等到结果后第 3 轮继续。
-        let requests = inner.requests.lock().unwrap().clone();
-        assert!(
-            requests.len() >= 3,
-            "父回合必须等到结果并多跑一轮（派发 / 收尾 / 汇报），实际 {} 轮",
-            requests.len()
-        );
-        // ② **同一个回合内**，最后的请求里已有子 agent 的产出。
-        let last = requests.last().unwrap();
-        assert!(
-            has_text(last, CHILD_OUTPUT),
-            "子 agent 的结果必须在**同一回合**内进入 ModelRequest（ADR-0055 的承重契约）"
-        );
-        // ③ 经 `DeferredResult` 事件送达（不是伪装成用户消息）。
-        let deferred = events_of(&msgs)
-            .iter()
-            .filter(|e| matches!(e.event, AgentEvent::DeferredResult { .. }))
-            .count();
-        assert_eq!(deferred, 1, "应恰好一条 DeferredResult 事件");
     }
 
     /// 生产侧 `resolve_limits`（`main.rs`）把 `config.max_rounds()`（app 默认

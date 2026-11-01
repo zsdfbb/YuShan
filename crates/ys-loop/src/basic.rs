@@ -163,86 +163,6 @@ enum BoundaryDrain {
     Aborted,
 }
 
-/// 收场前等待子 agent 的结局（ADR-0055）。
-enum SubagentWait {
-    /// 有结果/插话到达 ⇒ 调用方应 `continue` 跑下一轮。
-    Arrived,
-    /// 全部子 agent 都已收尾（可能全部失败 / 被取消）⇒ 可收场。
-    Settled,
-    /// 等满 [`RunLimits::subagent_wait`] 仍有人在跑 ⇒ 收场（结果稍后经投递表在
-    /// 用户下次输入时补投，**不静默** —— app 侧会告知）。
-    TimedOut,
-    /// 命中 `Abort` ⇒ 调用方以 `Cancelled` 收场。
-    Aborted,
-}
-
-/// 收场前等还在跑的子 agent 回来（ADR-0055）。
-///
-/// # 为什么在循环内等，而不是让 app 层再起一个回合
-///
-/// 只有循环内能把结果变成**同一回合的下一轮**的输入 ⇒ 上下文连续，模型知道刚才
-/// 在做哪一步。出了 `run_turn` 就只能新起回合，而那会换掉 `RuntimeContext`
-/// （模型看不到刚才派发的句柄与转录路径），且只在 app 那一条入口生效。
-///
-/// # 为什么不需要单独的 abort 分支
-///
-/// `Abort` 入队即置 `is_aborted`（`QueueBoundarySource::push`）。本函数返回后调用方
-/// 必然 `continue` ⇒ 下一轮开头就是 **Step 3 探针** ⇒ `Cancelled` 收场。
-/// 故取消延迟的上界 = 一个 [`RunLimits::subagent_poll`]，而不是 crates 那个上限。
-///
-/// # 两个唤醒源
-///
-/// - `settled()`：计数变化时**即时**醒（主路径）；
-/// - `subagent_poll` 定时兜底：因为「结果已 push 进边界源」这件事**没有唤醒源**
-///   （`QueueBoundarySource::push` 是同步的，不通知任何人），而 abort 也需要一个
-///   返回的时机。
-async fn wait_for_subagents(
-    ctx: &mut RuntimeContext<'_>,
-    rounds: u32,
-    compaction: &mut Usage,
-) -> Result<SubagentWait, LoopError> {
-    let started = std::time::Instant::now();
-    loop {
-        // ① 结果/插话可能已经到了 —— 复用**同一条** drain，不另写注入逻辑。
-        match drain_boundary(ctx, rounds, compaction).await? {
-            BoundaryDrain::Consumed => return Ok(SubagentWait::Arrived),
-            BoundaryDrain::Aborted => return Ok(SubagentWait::Aborted),
-            BoundaryDrain::Empty => {}
-        }
-        // ② 都收尾了 ⇒ 收场（可能全部失败 / 被取消）。
-        if !has_running_subagents(ctx) {
-            return Ok(SubagentWait::Settled);
-        }
-        // ③ 到上限。
-        if started.elapsed() >= ctx.limits.subagent_wait {
-            return Ok(SubagentWait::TimedOut);
-        }
-        // ④ 等一拍。
-        //
-        // 剩余时间夹到 poll 粒度：否则 `subagent_wait` 比 `subagent_poll` 还小时
-        // 会先多睡一个 poll 才复核上限（多睡的量与配置无关，是可观测的偏差）。
-        let poll = ctx
-            .limits
-            .subagent_poll
-            .min(ctx.limits.subagent_wait.saturating_sub(started.elapsed()));
-        let tick = tokio::time::sleep(poll.max(Duration::from_millis(1)));
-        match ctx.subagent {
-            Some(runner) => {
-                tokio::select! {
-                    _ = runner.settled() => {}
-                    _ = tick => {}
-                }
-            }
-            None => tick.await,
-        }
-    }
-}
-
-/// 是否还有在跑的子 agent（无派发能力 ⇒ 恒 `false`）。
-fn has_running_subagents(ctx: &RuntimeContext<'_>) -> bool {
-    ctx.subagent.is_some_and(|runner| runner.running() > 0)
-}
-
 /// 轮边界：拉取中途插话（steering）、后台结果（deferred）、手动压缩请求与中止
 /// （abort），保持入队顺序。
 ///
@@ -1212,41 +1132,7 @@ impl AgentLoop for BasicLoop {
                 //
                 // 取到插话就**继续本轮循环**：模型下一轮就能看到它，用户不必等整个回合结束。
                 match drain_boundary(ctx, rounds, &mut compaction_usage).await? {
-                    BoundaryDrain::Empty => {
-                        // 【ADR-0055】还有子 agent 在跑 ⇒ **不许收场**。
-                        //
-                        // 不回这个分支，模型会“安恬地做完”并结束回合，而子 agent 的
-                        // 结果只能进跨回合投递表、等用户下次敲字 —— 提示词里那句
-                        // “结果会在下一回合送到” 在这条路径上是假的。
-                        if has_running_subagents(ctx) {
-                            match wait_for_subagents(ctx, rounds, &mut compaction_usage).await? {
-                                // 有结果/插话到了 ⇒ 把它作为同一回合的下一轮输入。
-                                SubagentWait::Arrived => continue,
-                                SubagentWait::Aborted => {
-                                    emit(
-                                        ctx.events,
-                                        AgentEvent::RunFinished {
-                                            stop_reason: StopReason::Cancelled,
-                                            usage: total_usage.clone(),
-                                            rounds,
-                                        },
-                                    )
-                                    .await
-                                    .map_err(LoopError::Event)?;
-                                    return Ok(RunResult {
-                                        stop_reason: StopReason::Cancelled,
-                                        usage: total_usage,
-                                        cache_reading,
-                                        compaction_usage: compaction_usage.clone(),
-                                        rounds,
-                                        final_message: None,
-                                    });
-                                }
-                                // 都收尾了 / 到上限 ⇒ 落到下面的正常收场。
-                                SubagentWait::Settled | SubagentWait::TimedOut => {}
-                            }
-                        }
-                    }
+                    BoundaryDrain::Empty => {}
                     // 有插话/后台结果 ⇒ 继续本轮，让模型接着看得到它。
                     BoundaryDrain::Consumed => continue,
                     BoundaryDrain::Aborted => {
@@ -2576,18 +2462,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_runner_reaches_tool_context() {
         struct ProbeRunner;
-        #[async_trait::async_trait]
-        impl ys_tool::SubagentRunner for ProbeRunner {
-            async fn run(
-                &self,
-                _prompt: &str,
-                _model: Option<&str>,
-                _mode: ys_tool::SubagentMode,
-                _boundary: Option<&dyn ys_protocol::BoundarySource>,
-            ) -> Result<ys_tool::SubagentOutcome, String> {
-                unimplemented!("probe 不应被调用")
-            }
-        }
+        impl ys_tool::SubagentRunner for ProbeRunner {}
 
         struct SeenTool(Arc<AtomicUsize>);
         #[async_trait::async_trait]
@@ -5213,228 +5088,47 @@ mod tests {
         }
     }
 
-    // ── ADR-0055：收场前等待子 agent ─────────────────────────────────────────
-
-    /// 可控的假 runner：`running` 由测试手推，`settled` 在收场时唤醒等待方。
-    #[derive(Default)]
-    struct FakeSubagentRunner {
-        running: AtomicUsize,
-        settled: tokio::sync::Notify,
-    }
-
-    impl FakeSubagentRunner {
-        fn finish(&self) {
-            self.running.fetch_sub(1, Ordering::SeqCst);
-            self.settled.notify_waiters();
-        }
-    }
-
-    #[async_trait]
-    impl ys_tool::SubagentRunner for FakeSubagentRunner {
-        async fn run(
-            &self,
-            _prompt: &str,
-            _model: Option<&str>,
-            _mode: ys_tool::SubagentMode,
-            _boundary: Option<&dyn ys_protocol::BoundarySource>,
-        ) -> Result<ys_tool::SubagentOutcome, String> {
-            Err("not used".into())
-        }
-
-        fn running(&self) -> usize {
-            self.running.load(Ordering::SeqCst)
-        }
-
-        fn settled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-            Box::pin(self.settled.notified())
-        }
-    }
-
-    /// 只答一次、立刻给出最终答复的模型（`calls` 计模型调用次数）。
-    struct FinalAnswerModel {
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl Model for FinalAnswerModel {
-        fn model_id(&self) -> &str {
-            "final-answer"
-        }
-
-        async fn complete(
-            &self,
-            _request: ModelRequest,
-            _sink: &mut dyn ModelEventSink,
-        ) -> Result<ModelResponse, ModelError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ModelResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: "answer".into(),
-                    }],
-                },
-                usage: Usage::default(),
-                finish_reason: FinishReason::Stop,
-            })
-        }
-    }
-
-    /// **ADR-0055 承重用例**：子 agent 还在跑 ⇒ 父回合**不许收场**；它回来后
-    /// 结果进会话、模型多跑一轮。
+    /// 模型给出最终答复即**立即收场**（`StopReason::Completed`）。
     ///
-    /// 故障形态（修复前）：模型给出最终答复即收场，子 agent 的结果只能进跨回合
-    /// 投递表、等用户下次敲字 ⇒ 提示词里「结果会在下一回合送到」是假话。
+    /// 收场路径上没有任何等待点：仍在跑的子 agent 不拖住父回合 —— 它的结果经实现方的
+    /// 投递表在后续回合送达。
     ///
-    /// 变异：把 Step 9c 的 `if has_running_subagents(ctx)` 整段删掉 ⇒ 模型只被调
-    /// 一次、`rounds == 1`、会话里没有结果 ⇒ 三条断言同时变红。
-    #[tokio::test]
-    async fn final_answer_waits_for_running_subagents() {
-        const RESULT: &str = "SUBAGENT-RESULT-MARKER";
-        let registry = ToolRegistry::build(vec![]).unwrap();
-        let model = FinalAnswerModel {
-            calls: AtomicUsize::new(0),
-        };
-        let runner = Arc::new(FakeSubagentRunner::default());
-        runner.running.store(1, Ordering::SeqCst);
-
-        // 子 agent 在「父回合进入等待」之后的某个时刻交付结果。
-        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
-        {
-            let runner = runner.clone();
-            let boundary = boundary.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                boundary.push(Boundary::Deferred {
-                    handle: "sa1".into(),
-                    message: Message {
-                        role: Role::User,
-                        content: vec![ContentBlock::Text {
-                            text: RESULT.to_string(),
-                        }],
-                    },
-                });
-                // 先交付、再收尾：两件事都可能唤醒等待方。
-                runner.finish();
-            });
-        }
-
-        let mut session = MemorySession::new();
-        let mut events = CollectingSink::new();
-        let result = {
-            let mut limits = RunLimits::new(5);
-            limits.subagent_wait = Duration::from_secs(5);
-            limits.subagent_poll = Duration::from_millis(10);
-            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
-            ctx.boundary = Some(boundary.clone());
-            ctx.subagent = Some(runner.as_ref() as &dyn ys_tool::SubagentRunner);
-            BasicLoop
-                .run_turn(AgentInput::text("go"), &mut ctx)
-                .await
-                .unwrap()
-        };
-
-        assert_eq!(
-            model.calls.load(Ordering::SeqCst),
-            2,
-            "父回合必须等到结果并多跑一轮模型（不能答完就收场）"
-        );
-        assert_eq!(result.rounds, 2, "等待后继续的那一轮必须计入 rounds");
-        assert!(
-            session
-                .messages()
-                .iter()
-                .any(|m| content_has_text(m, RESULT)),
-            "子 agent 的结果必须进了会话（这就是「主 agent 收到了通知」）：{:?}",
-            session.messages()
-        );
-        assert!(
-            events.events().iter().any(|e| matches!(
-                e,
-                AgentEvent::DeferredResult { handle, .. } if handle == "sa1"
-            )),
-            "结果注入必须发 DeferredResult 事件（UI 靠它落一行）"
-        );
-    }
-
-    /// 没有子 agent 在跑 ⇒ **立刻收场**，不白等一个 poll 周期。
-    ///
-    /// 变异：把 `has_running_subagents` 改成恒 `true` ⇒ 本用例墙钟断言变红
-    /// （会睡满 `subagent_wait`）。
+    /// 变异：在 `BoundaryDrain::Empty` 的收场分支里插入任何 `await` ⇒ 墙钟断言变红。
     #[tokio::test]
     async fn final_answer_returns_immediately_without_running_subagents() {
         let registry = ToolRegistry::build(vec![]).unwrap();
-        let model = FinalAnswerModel {
-            calls: AtomicUsize::new(0),
+        let model = CountingModel {
+            calls: Mutex::new(0),
         };
-        let runner = Arc::new(FakeSubagentRunner::default()); // running == 0
         let mut session = MemorySession::new();
         let mut events = CollectingSink::new();
 
         let started = std::time::Instant::now();
         let result = {
-            let mut limits = RunLimits::new(5);
-            limits.subagent_wait = Duration::from_secs(30);
-            limits.subagent_poll = Duration::from_millis(200);
-            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
-            ctx.subagent = Some(runner.as_ref() as &dyn ys_tool::SubagentRunner);
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
             BasicLoop
                 .run_turn(AgentInput::text("go"), &mut ctx)
                 .await
                 .unwrap()
         };
-
-        assert_eq!(result.rounds, 1, "没有子在跑 ⇒ 一轮就收场");
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "不得白等一个 poll 周期（实际 {:?}）",
-            started.elapsed()
-        );
-    }
-
-    /// 等满上限仍有人在跑 ⇒ 如实收场（不是死循环，也不是 panic）。
-    ///
-    /// 变异：把 `started.elapsed() >= subagent_wait` 的判断挪到循环**外** ⇒
-    /// 本用例会一直等到 `subagent_wait` 之后才返回（断言墙钟上界变红），
-    /// 或在 `running` 永不为 0 时永久挂起。
-    #[tokio::test]
-    async fn wait_times_out_and_closes_the_turn() {
-        let registry = ToolRegistry::build(vec![]).unwrap();
-        let model = FinalAnswerModel {
-            calls: AtomicUsize::new(0),
-        };
-        let runner = Arc::new(FakeSubagentRunner::default());
-        runner.running.store(1, Ordering::SeqCst); // 永不 finish
-        let mut session = MemorySession::new();
-        let mut events = CollectingSink::new();
-
-        let started = std::time::Instant::now();
-        let result = {
-            let mut limits = RunLimits::new(5);
-            limits.subagent_wait = Duration::from_millis(80);
-            limits.subagent_poll = Duration::from_millis(10);
-            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
-            ctx.subagent = Some(runner.as_ref() as &dyn ys_tool::SubagentRunner);
-            BasicLoop
-                .run_turn(AgentInput::text("go"), &mut ctx)
-                .await
-                .unwrap()
-        };
-
         let elapsed = started.elapsed();
-        assert_eq!(result.rounds, 1, "等不到就如实收场，不额外跑模型");
+
+        assert_eq!(result.rounds, 1, "最终答复 ⇒ 一轮就收场");
         assert_eq!(
             result.stop_reason,
             StopReason::Completed,
-            "模型确实答完了 —— 终止原因不得被等待污染"
+            "收场原因不得被任何收场前动作污染"
         );
+        assert_eq!(*model.calls.lock().unwrap(), 1, "模型只被调用一次");
         assert!(
-            elapsed >= Duration::from_millis(80),
-            "必须真的等到了上限（实际 {elapsed:?}）"
-        );
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "上限必须生效，不能无限等（实际 {elapsed:?}）"
+            elapsed < Duration::from_millis(200),
+            "收场不得白等（实际 {elapsed:?}）"
         );
     }
 
@@ -6711,6 +6405,173 @@ mod tests {
         assert_eq!(
             deadline_reached(&limits, 1, Duration::from_secs(15)),
             Some(FinalReportCause::WallClock)
+        );
+    }
+
+    // ==================== 子 agent 被插话后仍能收尾 ====================
+
+    /// 模拟 `subagent_send` 的投递：**第 1 轮**模型调用期间，往子自己那份边界源
+    /// 推一条 `Boundary::Steer`（正文按 `subagent_send` 的实际投递形）—— 消息角色是
+    /// `Role::User`，即「父 agent 转来的一句话」，不是子自己说的话。
+    ///
+    /// 逐次记下每个 `ModelRequest.messages`：插话是否**进了同一次请求**只能靠请求快照
+    /// 判定 —— 只看会话里有没有它，无法区分「本轮就看到」与「本轮之后才 append」。
+    struct SteerMidRunModel {
+        boundary: Arc<ys_protocol::QueueBoundarySource>,
+        steer_text: String,
+        calls: AtomicUsize,
+        requests: Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl Model for SteerMidRunModel {
+        fn model_id(&self) -> &str {
+            "steer-mid-run"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.requests.lock().unwrap().push(request.messages.clone());
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // 子 agent 正在第 1 轮里跑工具：此刻父 agent 投来一句话。
+                self.boundary.push(Boundary::Steer(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: self.steer_text.clone(),
+                    }],
+                }));
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ys_core::ToolCallId("mid-run-0".into()),
+                            name: "noop".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                })
+            } else {
+                Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "final answer".into(),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::Stop,
+                })
+            }
+        }
+    }
+
+    /// 子 agent 被 `subagent_send` 插话后**仍能跑完并以 `Completed` 收尾**。
+    ///
+    /// 钉住三件事：
+    /// ① 插话正文出现在**下一轮**的 `ModelRequest.messages` 里（子确实看到了它，
+    ///    而不是「append 进会话但本轮请求没带上」）；
+    /// ② `stop_reason == Completed` 且带 `final_message`（插话没把回合搞成
+    ///    `Cancelled` / `MaxRounds` / `NoOutput`）；
+    /// ③ `run_turn` 返回 `Ok`（不出现 `LoopError`）。
+    ///
+    /// 变异：① 把轮边界的 `drain_boundary` 整段删掉 ⇒ 插话既不进会话也不进请求，
+    ///          ①「第 2 次请求含插话」与「会话含插话」同时变红；
+    ///       ② 把 `Boundary::Steer` 分支改成按中止处理（提前返回 `Cancelled`）⇒
+    ///          ②「`Completed`」与 `rounds == 2` 两条同时变红。
+    #[tokio::test]
+    async fn steer_mid_run_still_finishes_completed() {
+        const MARKER: &str = "SUBAGENT-SEND-STEER";
+        let registry = ToolRegistry::build(vec![Box::new(NoopTool) as Box<dyn Tool>]).unwrap();
+        let boundary = Arc::new(ys_protocol::QueueBoundarySource::new());
+        let model = SteerMidRunModel {
+            boundary: boundary.clone(),
+            steer_text: MARKER.to_string(),
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        };
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+
+        let outcome = {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            )
+            .with_boundary(boundary.clone());
+            BasicLoop.run_turn(AgentInput::text("go"), &mut ctx).await
+        };
+
+        // ③ 不出现 LoopError。
+        let result = match outcome {
+            Ok(result) => result,
+            Err(err) => panic!("插话不得让子 agent 的回合以 LoopError 收场：{err:?}"),
+        };
+
+        let requests = model.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "工具轮 + 收尾轮 ⇒ 恰两次模型请求；实际 {}",
+            requests.len()
+        );
+        assert!(
+            !requests[0].iter().any(|m| content_has_text(m, MARKER)),
+            "投递发生在第 1 次请求之后，故第 1 次请求里不可能有它：{:?}",
+            requests[0]
+        );
+        // ① 子确实看到了插话：正文进了**下一次**模型请求。
+        assert!(
+            requests[1].iter().any(|m| content_has_text(m, MARKER)),
+            "插话必须出现在第 2 次模型请求的 messages 里（否则等于没送达）：{:?}",
+            requests[1]
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .rev()
+                .any(|m| m.role == Role::User && content_has_text(m, MARKER)),
+            "插话以 `Role::User` 身份进请求（`subagent_send` 的投递角色）：{:?}",
+            requests[1]
+        );
+        assert!(
+            session
+                .messages()
+                .iter()
+                .any(|m| content_has_text(m, MARKER)),
+            "插话必须落进子会话（下一轮才会被重读）：{:?}",
+            session.messages()
+        );
+        // ② 插话没有把子 agent 搞崩：照常收尾。
+        assert_eq!(
+            result.stop_reason,
+            StopReason::Completed,
+            "被插话的子 agent 必须以 `Completed` 收尾"
+        );
+        assert_eq!(result.rounds, 2, "插话只延长一轮，不得额外空转");
+        assert!(
+            result
+                .final_message
+                .as_ref()
+                .is_some_and(|m| content_has_text(m, "final answer")),
+            "收尾必须带上模型给的最终答复：{:?}",
+            result.final_message
+        );
+        assert!(
+            events.events().iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessage { message } if content_has_text(message, MARKER)
+            )),
+            "插话必须发出 UserMessage 事件（父/UI 靠它把消息标为已生效）：{:?}",
+            events.events()
         );
     }
 }

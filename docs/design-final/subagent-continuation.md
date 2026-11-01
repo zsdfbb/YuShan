@@ -1,5 +1,14 @@
 # Subagent 回复后继续推进 — As-built
 
+> **状态：已被取代（ADR-0065）**。本文描述的「父回合等待子 agent」机制已从代码中移除
+> （`wait_for_subagents` / `SubagentWait` / `RunLimits::subagent_wait` / `Config::subagent_wait_secs`
+> 均已删）；现状见 `docs/design-final/subagent-async.md`，决策见
+> `docs/adr/0065-subagent-send-and-auto-turn.md`。本文保留以说明当时的实现形态 ——
+> **不要拿本文当现行行为的依据**，下文所有 `path:line` 指针已随拆除失效。
+> 同一轮改造还让 `Wake::SubagentReturned` **自动起一个新回合**（与 `bash_bg` 的结果回收同构）、
+> 并新增 `subagent_send` 给仍在跑的子 agent 插话 ⇒ 本文「结果留到下一回合开头补投」
+> （作为唯一路径）与「等到了就在同一回合下一轮继续」两类描述**均不再成立**。
+
 > 性质：**实际建成记录**。设计见 `docs/arch/subagent-continuation/design.md`（rev2），
 > 决策见 `docs/adr/0055-subagent-continuation.md`，质量分析见
 > `docs/arch/subagent-continuation/review.md`。

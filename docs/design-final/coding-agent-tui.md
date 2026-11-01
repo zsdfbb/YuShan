@@ -736,8 +736,8 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 
 ### 13.1 装配（启动期一次，之后冻结）
 
-- **父工具表 = 基础 9 元 + `bash_bg` + `bash_poll` + `SubagentTool` 追加末位**（`apps/coding-agent/src/assembly.rs` 的 `AgentFactory::build()`：基础 9 元之后依次 `push` 两个后台工具，最后 `push` 派发工具）。末位保证**子 tools JSON 是父的字节前缀** ⇒ 命中 prompt cache。
-- **子工具表 = 基础 9 元**（无 `subagent`）⇒ 派发**结构上不可能递归**（`registry.get("subagent")` 未命中 ⇒ 走 `tool not found`）。
+- **父工具表 = 基础 9 元 + `bash_bg` / `subagent_async` / `subagent_send` 追加末位**（`apps/coding-agent/src/assembly.rs` 的 `AgentFactory::build()`：基础 9 元之后依次 `push`，顺序即契约）。末位保证**子 tools JSON 是父的字节前缀** ⇒ 命中 prompt cache。
+- **子工具表 = 基础 9 元**（无 `subagent_async` / `subagent_send`）⇒ 派发**结构上不可能递归**（`registry.get("subagent_async")` 未命中 ⇒ 走 `tool not found`）。
 - **两份系统提示**：父（12 工具，能力边界声明改为「CAN delegate tasks to subagents」）、子（9 工具，逐字保留「no subagents」）。由 `prompt::build_system_prompt` 按**工具表派生**，不是常量。
 - **子 `RunLimits`**：与主 agent 同源（同一份 `Config`），但 `fixed_prompt_tokens` 填**子表**的真值（否则子会话系统性晚触发压缩）。
 
@@ -749,40 +749,39 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
   `has_pending_steer()` **恒 `false`**（不透传）—— 插话是给父模型的输入，若透传，父的插话会表现为
   「子 agent 的命令莫名提前中止」并让孩子那边生成一条语义矛盾的「用户插话了」结果。
 - **子预算**：watchdog（`tokio::spawn(sleep(budget) → 子边界源 push(Abort))`，用 **`AbortOnDropHandle`** 防孤儿任务）；子预算与主 agent 同值 ⇒ 真实天花板是父回合那条 deadline。
-- **超时**：`Tool::timeout()` 的优先级链（工具声明 → `bash_timeout` → 300s）；`subagent` 的外闸 = 子预算 + 60s 宽限，**构造期由 `Config` 注入**（ADR-0029 修正 2）。
-- **插话**：**不打断子 agent**。同步 `subagent` 的 `call` 直接 `.await` 派发结果；插话排在父边界源上，
-  等父轮的轮边界 `take` 后才进上下文。子 agent 的收场方式是「跑完」，不是「被打断」。
-  `subagent_async` 同理（它本来就不阻塞父回合）。
+- **超时**：`Tool::timeout()` 的优先级链（工具声明 → `bash_timeout` → 300s）；`subagent_async` / `subagent_send` 都不声明 `timeout()` ⇒ 走 300s 默认值（它们只登记任务 / 入队，立刻返回）。
+- **插话**：**不打断子 agent**。`subagent_send` 只把消息推进子 agent 自己那份边界源（`Boundary::Steer`），子在下一个轮边界 append 进自己的会话并 `continue`；那一刻子可能正卡在一次长工具调用里，消息要等那次调用返回才被看到。工具本身入队即返回，不等子 agent。
 
 ### 13.3 结果与产物
 
 - **回传**：摘要文本主体按 `MAX_SUMMARY_BYTES = 8 KiB` 做 UTF-8 安全截断；截断标记与随后由 runner 保证的 `## Files` 节不在这 8 KiB 预算内，因此最终 `summary` 可略超 8 KiB。完整转录落 `~/.yushan/subagents/`（`YUSHAN_SUBAGENTS_DIR` 覆盖口；Primary 档启动期 sweep 7 天）。
 - **完整转录**：按子会话内容块保留 `Text`、`ToolUse` 的 id/name/参数 JSON、`ToolResult` 的 id/is_error/正文。工具结果正文优先取 `CollectingSink` 中的原始 `ToolResult` 事件，只有事件缺失时才回退会话正文（turn budget 可能已把较早结果改写为降级文本）。末尾记录 `stop_reason`、取消来源、`elapsed_ms` 与诊断。
-- **失败**：子撞 `max_rounds` / 被取消 ⇒ `Ok` + 非 `Completed` 的 `stop_reason` + `diagnostic` ⇒ 父侧 `ToolResult{is_error}`，**父回合不失败**。`SubagentTool` 的结果正文顺序为诊断 → 摘要 → 转录路径（无诊断时摘要在前）。诊断固定以 `[diagnostic: ` 开头，控制字符替换为空格，整条最多 1024 字节并在 UTF-8 边界截断；`Cancelled` 带 `cause=parent-turn-cancelled|child-budget|unknown`，父取消优先于子预算。转录写失败不 panic，错误并入诊断；摘要保留。
-- **Runner 错误分界**：只有子回合已经启动、`child.run_turn` 返回 `Err` 时，runner 才构造 `SubagentOutcome{stop_reason: Cancelled}` 并生成 `stop_reason=cancelled cause=unknown` 诊断。无可用模型、派发次数超限、`AgentBuilder` 组装失败等发生在子回合之前的错误直接从 `AppSubagentRunner::run` 返回 `Err`；`SubagentTool` 将其映射为 `ToolError::Execution`，不生成 diagnostic 前缀。
+- **失败**：子撞 `max_rounds` / 被取消 ⇒ `SubagentOutcome` 带非 `Completed` 的 `stop_reason` + `diagnostic`，渲染成一条 `Role::Harness` 消息交给投递表，**父回合不失败**。`render_outcome_text`（`apps/coding-agent/src/subagent.rs`）的正文顺序为诊断 → 摘要 → 转录路径（无诊断时摘要在前）。诊断固定以 `[diagnostic: ` 开头，控制字符替换为空格，整条最多 1024 字节并在 UTF-8 边界截断；`Cancelled` 带 `cause=parent-turn-cancelled|child-budget|unknown`，父取消优先于子预算。转录写失败不 panic，错误并入诊断；摘要保留。
+- **错误分界**：发生在子回合**之前**的错误走 `SubagentRunner::spawn` 的 `Err` —— 模型名解析失败、派发次数超限（`take_dispatch_slot`）。`SubagentAsyncTool::call` 把它映射成 `ToolError::Execution`（本回合未挂载 subagent 能力同样落这一档），**没有** diagnostic 前缀。子回合一旦启动，`ChildTask::execute` 恒返回 `SubagentOutcome`（**不返回 `Err`**）：`child.run_turn` 返回 `Err` 落成 `stop_reason=Failed` 的诊断（故障不是取消 ⇒ 不带 `cause`），`AgentBuilder` 组装失败同为 `Failed` + 诊断。
 - **`model` 参数**：按名构造（`Config::build_model_for`）+ `Arc<dyn Model>` 缓存（复用连接池/TLS）；构造失败 **fail-closed**，绝不静默回退父模型。
 - **usage 上卷**：子 usage 累加进 `Arc<UsageTotals>`，回合末 drain 并追加进 `RunResult.usage` ⇒ `TurnStats` / meta / 退出码看到真实总消耗。
 
 ### 13.3b 异步派发（`subagent_async`）的投递
 
-- **派发即返回**：`SubagentAsyncTool` 只登记后台任务（`tokio::spawn`），立刻回句柄 `sa{N}`；取消机制**不适用**（它本来就不阻塞父回合）。
+- **派发即返回**：`SubagentAsyncTool` 只登记后台任务（`tokio::spawn`），立刻回句柄 `sa{turn}.{n}`；取消机制**不适用**（它本来就不阻塞父回合）。句柄带回合段是为 `subagent_send` 寻址 —— 只写回合内序号会重到上一个回合的同序号任务。
 - **任务是真的分离**：`spawn` 的 `JoinHandle` 被丢弃、没有 abort 路径 ⇒ 父回合结束后子 agent **继续运行**（实测转录在回合结束后 2~6 分钟才落盘）。「回合结束即取消」从来不是实现行为。
 - **结果跨回合送达**：完成结果交给 `PendingResults`（**进程级**、`Arc` 跨工作区重建共享）——
   - 本回合**已绑定**落点（`SubagentSetup::bind_results`，守卫活到回合块末）⇒ 直接 `push` 成 `Boundary::Deferred`，`BasicLoop` 在轮边界 append 并 emit `DeferredResult`；
-  - **未绑定**（回合已结束）⇒ 留表（上限 `MAX_PENDING_RESULTS = 32`，超限淘汰最旧并留日志），由**下一回合开头**一次性补投。
+  - **未绑定**（回合已结束）⇒ 留表（上限 `MAX_PENDING_RESULTS = 32`，超限淘汰最旧并留日志）并唤醒 app 循环 ⇒ `Wake::SubagentReturned` 臂**自动起一个新回合**，该回合开头一次性补投（§20.6；自动回合只在 TUI 的 app 循环存在，`-p` / `--json` 单回合模式无后续回合）。
 - **补投不限流**：派发数量已被 `DEFAULT_MAX_DISPATCHES_PER_TURN` 封顶，且每条结果都在等一个明确答复 —— 限流只会让模型继续误以为「还没回来」。
 - **提示词据此约束模型行为**：`subagent_async` 在场时的 guideline 明确「结束回合不丢结果，下一回合开头送达」，并禁止未核实就声称「还在跑」。
 
 ### 13.4 并行批（Step 9）
 
 - 准入：批次 `len > 1` **且每一个**工具都 `is_concurrency_safe()` ⇒ 走 `futures_util::stream::iter(..).buffer_unordered(max_parallel_tools.max(1))`（单任务内并发、完成即交出一个结果、不需 `'static`）；否则**原串行路径**。`max_parallel_tools = 0` 钳为 1。
-- 事件顺序：并行批先按原始调用顺序 emit 全部 `ToolCall`；执行阶段每个工具完成时立即 emit 对应 `ToolResult`，因此结果事件按完成顺序出现。结果同时写回原始 index，Step 9c 仍按原 `tool_calls` 顺序组装单条回喂消息。**串行批保持逐个 `C1,R1,C2,R2`**。默认 `is_concurrency_safe() == false` 是准入守卫；当前声明为 `true` 的集合是 `subagent` 与 `read` / `find` / `ls` / `grep`。
+- 事件顺序：并行批先按原始调用顺序 emit 全部 `ToolCall`；执行阶段每个工具完成时立即 emit 对应 `ToolResult`，因此结果事件按完成顺序出现。结果同时写回原始 index，Step 9c 仍按原 `tool_calls` 顺序组装单条回喂消息。**串行批保持逐个 `C1,R1,C2,R2`**。默认 `is_concurrency_safe() == false` 是准入守卫；当前声明为 `true` 的集合是 `read` / `grep` / `find` / `ls` 与 `subagent_async` / `subagent_send`（`apps/coding-agent/src/toolset.rs` 的 `only_read_only_tools_are_concurrency_safe` 钉的是 `build_tools` 那 4 个只读工具；后两个在 `subagent.rs` 里各自声明，由 `main` 追加进父表）。`bash_bg` 虽然只登记后台任务，但它启动会 spawn 进程，仍声明 `false`。
 
 ### 13.5 已知缺口（承接 §10/§12 的口径）
 
 - 子 agent 内部活动在**任何输出通道都不可见**（`--json` 亦然），只有落盘完整转录可查 —— ADR-0022 决策 2 的少数派偏离。
 - 并行子 agent 的**写冲突无人管**（本仓无 branch/worktree、无沙箱），只能靠 guideline「写目标不相交」。
 - 每回合派发总量上限（`DEFAULT_MAX_DISPATCHES_PER_TURN = 16`）是**仅剩的代码级成本防线**：`max_rounds` 默认已放宽到 `u32::MAX`，且子取同一份 `Config`（子自身无独立上界）。
+- **`-p` / `--json` 单回合模式没有 `Wake::SubagentReturned` 自动回合**：结果照常落表、落点照常绑，但回合结束后才完成的结果无后续回合补投（进程随即退出）。区间与原因见 `docs/design-final/subagent-async.md` §6.3。
 - ⚠️ **`--json` 的 `RunFinished.usage` 不含子 agent usage**：子 usage 是在 app 侧、回合**结束后**追加进 `RunResult.usage` 的（`merge` 点在 `app_loop::run_turn_once` / `main::run_single_turn`），而 `RunFinished` 由 `BasicLoop` 在回合内发出 ⇒ **事件流里的 usage 只算父**。TUI 的状态行（`TurnStats`）与 `-p` 的 meta 走的是合并后的 `RunResult.usage`，**是正确总数**。⇒ 脚本消费者若要精确总成本，需自行减去或改用 meta；这是「循环拥有 `RunFinished`」这一结构的直接代价，记在此处。
 
 ---
@@ -1549,19 +1548,18 @@ Chat / Input / Status 三块。`ui_with` 已切出 `chunks[]`，故高亮层**�
 
 ### 19.1 父/子工具表元素数
 
-- **父表 = 11 元**：基础 9 元（`apps/coding-agent/src/toolset.rs:88` 的 `build_tools`）+
-  `bash_bg` + `SubagentTool` **追加末位**（`apps/coding-agent/src/assembly.rs`
-  的 `AgentFactory::build()`）；`bash_bg` 排在 `subagent` **之前** —— 顺序即契约。
-  （`bash_poll` 已删除，见 §20。）
-- **子表 = 9 元**（不含 `bash_bg` / `subagent`）⇒ 派发**结构上**不可能递归，
+- **父表 = 12 元**：基础 9 元（`apps/coding-agent/src/toolset.rs` 的 `build_tools`）+
+  `bash_bg` / `subagent_async` / `subagent_send` **追加末位**（`apps/coding-agent/src/assembly.rs`
+  的 `AgentFactory::build()`）；追加段顺序即契约。
+- **子表 = 9 元**（不含 `bash_bg` / `subagent_async` / `subagent_send`）⇒ 派发**结构上**不可能递归，
   子 agent 天然没有后台能力。
 - 前缀性质：子表 JSON 是父表 JSON 的**字节前缀**（父表 = 子表去掉末尾 `]` +
-  追加段 `,{bash_bg…},{subagent…}]`）⇒ 命中 prompt cache。
+  追加段 `,{bash_bg…},{subagent_async…},{subagent_send…}]`）⇒ 命中 prompt cache。
   真实装配产物的字节级断言在 `apps/coding-agent/src/assembly.rs` 的
   `real_parent_table_keeps_the_child_table_as_its_byte_prefix`（元素数 + 前缀 + 追加段逐字节）
-  与 `real_parent_table_ends_with_the_subagent_tool`（末位）。
-  `apps/coding-agent/src/toolset.rs` 那条顺序用例**自拼**父表 ⇒ 不描述真实父表。
-- **装配条件**：后台上下文未注入时父表少两项；生产装配路径恒注入 ⇒ 父表恒为 12 元。
+  与 `real_parent_table_ends_with_the_subagent_tools`（末位）。
+  `apps/coding-agent/src/toolset.rs` 的 `prefix_fingerprint_is_anchored_and_stable` 断言的是 12 元 + 追加段顺序 + 不含 `subagent`。
+- **装配条件**：后台上下文未注入时父表少一项（`bash_bg`）；生产装配路径恒注入 ⇒ 父表恒为 12 元。
 
 ### 19.2 六个清理点
 
@@ -1627,26 +1625,26 @@ Chat / Input / Status 三块。`ui_with` 已切出 `chunks[]`，故高亮层**�
     只跑一个回合，后台任务来不及送达 ⇒ 不同步拉就整个停在 ④。拉取失败
     **静默降级**到 ④（拉目录只为把窗口估准，不为选模型）。
 
-### 19.4 两个新工具的形态
+### 19.4 后台工具的形态
 
-`bash_bg` / `bash_poll` **已注册**（`apps/coding-agent/src/assembly.rs` 的
-`AgentFactory::build()`，排在 `subagent` **之前**）。契约位有两处：
+`bash_bg` **已注册**（`apps/coding-agent/src/assembly.rs` 的
+`AgentFactory::build()`，排在 `subagent_async` / `subagent_send` **之前**）。契约位有两处：
 
 - 提示词侧：工具说明与两条 guideline 已按名字备好
-  （`apps/coding-agent/src/prompt.rs:170`、`:173`、`:306`），沿用既有工具的
-  **「在场才出现」**守卫形态 ⇒ 子表不含这两个工具 ⇒ 子 agent 天然看不到那两条 guideline。
+  （`apps/coding-agent/src/prompt.rs` 的 `bash_bg` 片段与 guideline），沿用既有工具的
+  **「在场才出现」**守卫形态 ⇒ 子表不含这个工具 ⇒ 子 agent 天然看不到那两条 guideline。
 - debug 侧：命令串指纹已把 `bash_bg` 计入命令类工具
   （`apps/coding-agent/src/debug_log.rs:1088`）。
 
 形态要点：
 
-- `bash_bg` 启动后台命令并**立即**返回句柄；`bash_poll` 查状态 + **只给上次轮询之后的增量输出**。
+- `bash_bg` 启动后台命令并**立即**返回句柄，结果由完成通知送达（不靠模型轮询）。
 - 落盘 `<bg_root>/<session_id>/bg<N>.log`；`bg_root` = `$YUSHAN_BG_DIR`
   （**须绝对路径**，与 `YUSHAN_FETCHED_DIR` 同规矩）或 `<temp_dir>/yushan-bg`。
 - 句柄 `BgHandle(u32)` 进程内**单调递增、永不复用**；条目带 `session` 字段，poll 时核对
   ⇒ 跨会话的旧句柄命中不到本会话的条目。
-- 两个工具**均非** `is_concurrency_safe`（`bash_poll` 会推进注册表里的交付偏移）。
-- 触发只取显式（`bash_bg`），回收只取显式轮询（`bash_poll`）；**不做**通知注入。
+- `bash_bg` **非** `is_concurrency_safe`（它启动会 spawn 进程，有副作用）。
+- 触发只取显式（`bash_bg`），回收由 sweeper **主动投递**（§20.1）；**不做**模型轮询。
 
 ### 19.5 交付语义（三条，缺一不可）
 
@@ -1726,8 +1724,8 @@ beta
 
 `Boundary::Deferred` 与 `DeferredResult` 是既有机制，异步 subagent 早就在用同一条路径。
 
-**父表 = 11 元**：基础 9 元 + `bash_bg` + `SubagentTool`（`bash_poll` 已删）。
-子表仍是 9 元 ⇒ 子 agent 无后台能力。
+**父表 = 12 元**：基础 9 元 + `bash_bg` / `subagent_async` / `subagent_send`（追加段顺序即契约）。
+子表仍是 9 元 ⇒ 子 agent 无后台能力、也无派发能力。
 
 ### 20.2 三个部件
 
@@ -1793,15 +1791,20 @@ beta
 只能等用户下次发言才送达。取一次就取空则不成立：「醒来时表里已空」正是不会热循环的理由。
 取出的条目先落 `InFlight`，投递失败才回 `Pending`，而那只等下一次新终态唤醒。
 
-**子 agent 结果不自动起回合**（`Wake::SubagentReturned` 只告知）—— 这是**有意的不对称**：
-子 agent 的注入时机走它自己的语义（父回合等待 / 未绑定则留表、下一回合开头补投，§13.3b），
-它的完成不构成「工作内容已经变了」。
+**子 agent 结果同构地自动起回合**：`Wake::SubagentReturned` 与 `Wake::BackgroundReturned`
+走同一条回路 —— 复核（`PendingResults::has_pending`，只读不取；permit 可能残留）⇒ 用一条
+`subagent_placeholder()`（`Role::Harness`）当输入起一个回合 ⇒ 回合开头
+`take_pending_results` 取空并逐条 `push` 成 `Boundary::Deferred`。两条都满足同一个前提：
+**完成本身就是「工作内容已经变了」** —— 后台命令跑完、子 agent 跑完，都是模型必须接手的输入，
+不需要用户再开口。两边的不对称只剩在**唤醒源与容量**上（进程级注册表 vs 进程级投递表，
+`BgLimits::max_entries` vs `MAX_PENDING_RESULTS = 32`），不在回合是否起。
 
 ### 20.7 已知缺口
 
 - 「锁内不读输出文件」只有人工审查，缺自动化探针（渲染是外挂 `fn` 指针，黑盒）。
-- 自动回合的占位消息在 TUI 上画一行 `↓ [harness] 后台命令结果已送入上下文…`，
-  紧跟其后才是真正有内容的结果行。它是「回合开始」的标记（点亮 Working），但零信息量。
+- 自动回合的占位消息在 TUI 上画一行 `↓ [harness] 后台命令结果已送入上下文…`（子 agent 的自动
+  回合同理，正文是「子 agent 结果已送入上下文，请据此继续。」），紧跟其后才是真正有内容的结果行。
+  它是「回合开始」的标记（点亮 Working），但零信息量。
 - 压缩的切点若落在 `Harness` 消息上（保留段首条恰为 `Harness`）：`compact.rs:266` 的判断是
   `to_keep[0].role == Role::User` ⇒ 不命中，摘要独立成一条 `Role::User` 前言，紧接其后就是
   那条 `Harness`；两者线上都映射成 `"user"`（§20.8）⇒ 线上出现连续两条 user，局部交替被破坏。
@@ -1817,7 +1820,7 @@ beta
 | 产出点 | 位置 |
 |---|---|
 | 后台命令的完成结果 | `adapters/tools-basic/src/bg_output.rs:128` `render_completion`（末段构造 `Message { role: Role::Harness, .. }`） |
-| 子 agent 的派发结果 | `apps/coding-agent/src/subagent.rs:1107` `outcome_message` |
+| 子 agent 的派发结果 | `apps/coding-agent/src/subagent.rs:1266` `outcome_message` → `render_outcome_text`（诊断 → 摘要 → 转录指针） |
 
 两者都只装**单个** `ContentBlock::Text` —— 这条内容形态是下面「6 处 `==` 保持原样」的依据。
 

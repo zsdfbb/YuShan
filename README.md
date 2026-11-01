@@ -143,9 +143,9 @@ $ ./target/release/ys-coding-agent -p "这个项目是做什么的"
 
 **干活**
 - 12 个工具：9 个基础（`read` `write` `edit` `bash` `grep` `find` `ls` `websearch` `webfetch`）
-  + `bash_bg` + `subagent` + `subagent_async`（后三者追加在末位，顺序即契约）
+  + `bash_bg` + `subagent_async` + `subagent_send`（后三者追加在末位，顺序即契约）
 - 搜索后端可配多个（SearXNG / DeepSeek / Tavily / Bocha / Firecrawl），配了哪个用哪个
-- **子 agent**：派一个出去干子任务，父回合会等它回来接着干，不会半路把活丢了
+- **子 agent**：派一个出去干子任务，父回合不等它、继续干自己的，结果回来时自动起一轮接着处理
 - **Skill**：把 `SKILL.md` 丢进 `.yushan/skills`，模型需要时才读正文——不占上下文
 - **git worktree**：一个需求一棵树，`worktree create / attach / list / remove`
 

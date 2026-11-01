@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -73,18 +74,21 @@ fn poll_interval(dragging_with_edge: bool) -> Duration {
     }
 }
 
-/// 一批连续到达的鼠标事件：**滚轮事件全留**（折叠成净量），其余只留**最后一个**；
-/// 碰到的首个非鼠标事件**推迟**返回。
+/// 一批连续到达的鼠标事件：**滚轮事件全留**（折叠成净量），**拖选三态保序全留**
+/// （连续 `Drag` 只留最后一个），碰到的首个非鼠标事件**推迟**返回。
 ///
-/// 触控板一次滑动会爆发 8–30 个事件（ADR-0050 决策 2）⇒ 分两种处理：
+/// 触控板一次滑动会爆发 8–30 个事件（ADR-0050 决策 2）⇒ 滚轮全部**保留**并折叠成
+/// **净滚动量**（[`events::fold_wheel`]）。只取最后一个会让「一次滑动」只滚一行 ——
+/// 与 ADR-0050 决策 2 的「按行累加才跟手」相反。批内只施加一次净位移（一次
+/// `layout.sync`），位移与逐事件累加等价（夹取单调）。
 ///
-/// - **滚轮**：全部**保留**并折叠成**净滚动量**（[`events::fold_wheel`]）。
-///   只取最后一个会让「一次滑动」只滚一行 —— 与 ADR-0050 决策 2 的
-///   「按行累加才跟手」相反。批内只施加一次净位移（一次 `layout.sync`），
-///   位移与逐事件累加等价（夹取单调）。
-/// - **拖选 / 点击**：只留**最后一个**。这些事件的**坐标**是承重的
-///   （选区端点取自最后那个坐标），中间态没有意义；且逐个走一遍 `draw`
-///   （每次约 150 µs）就是可见的卡顿（ADR-0051 设计 §2.5）。
+/// **非滚轮鼠标事件必须保序全留**：`Down` / `Drag` / `Up` 是一条状态机的三段
+/// （`Selection::begin` → `extend` → `finish`），只留最后一个等于把状态机喂成孤立的
+/// `Up` —— `is_dragging()` 为假，整次拖选被静默丢弃（快速拖选必然同批）。
+///
+/// **连续的 `Drag` 只留最后一个**：中间态坐标没有意义（选区端点取自最后一个坐标），
+/// 而每个 `Drag` 都会走一次 `sync_scroll_state`（一次 `layout.sync`）—— 30 个中间态
+/// 就是 30 次无用重算。
 ///
 /// 合并不丢事件：非鼠标事件一律原样返回，由调用方在本轮消费。
 ///
@@ -93,13 +97,13 @@ fn poll_interval(dragging_with_edge: bool) -> Duration {
 /// 到上限即**停止继续读** —— 剩余事件仍留在终端队列里，下一轮循环自然消费；
 /// 批语义不变，只是把一批拆成几轮（真实突发只有 8–30 个，远达不到上限）。
 ///
-/// 返回 `(滚轮事件批次, 最后一个非滚轮鼠标事件, 被推迟的非鼠标事件)`。
+/// 返回 `(滚轮事件批次, 保序的非滚轮鼠标事件, 被推迟的非鼠标事件)`。
 fn coalesce(
     first: Event,
     next: impl FnMut() -> Option<Event>,
-) -> (Vec<Event>, Option<Event>, Option<Event>) {
+) -> (Vec<Event>, Vec<Event>, Option<Event>) {
     let mut wheel: Vec<Event> = Vec::new();
-    let mut other_mouse: Option<Event> = None;
+    let mut mouse: Vec<Event> = Vec::new();
     let mut deferred: Option<Event> = None;
 
     let events = std::iter::once(first).chain(std::iter::from_fn(next));
@@ -111,7 +115,23 @@ fn coalesce(
                     break;
                 }
             }
-            Event::Mouse(_) => other_mouse = Some(event),
+            Event::Mouse(m) => {
+                // 只留 `handle_mouse` 真正处理的三态（`Down` / `Drag` / `Up`）。
+                // 其余（`Moved` / 水平滚动）在那边是 `_ => {}`，而 `EnableMouseCapture`
+                // 开了 `?1003h`（任意移动上报）⇒ 指针一动就持续产生 `Moved`，
+                // 全留会让本批无界增长，且每个事件都是一次空转。
+                if !is_selection_kind(m.kind) {
+                    continue;
+                }
+                // 连续 `Drag` 只留最后一个：中间态坐标没有意义（端点取自最后一个），
+                // 而每个 `Drag` 都要跑一次 `layout.sync`。
+                if matches!(m.kind, MouseEventKind::Drag(_))
+                    && matches!(mouse.last(), Some(Event::Mouse(p)) if matches!(p.kind, MouseEventKind::Drag(_)))
+                {
+                    mouse.pop();
+                }
+                mouse.push(Event::Mouse(m));
+            }
             // 遇到非鼠标事件就停：**不 read 丢掉**，原样交给调用方。
             other => {
                 deferred = Some(other);
@@ -119,7 +139,7 @@ fn coalesce(
             }
         }
     }
-    (wheel, other_mouse, deferred)
+    (wheel, mouse, deferred)
 }
 
 /// 单批滚轮事件的上限 —— 内存护栏，不是业务参数。
@@ -136,6 +156,18 @@ fn is_wheel(kind: crossterm::event::MouseEventKind) -> bool {
     matches!(
         kind,
         crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown
+    )
+}
+
+/// 该鼠标事件是不是**选区状态机的一段**（左键三态）。
+///
+/// 与 [`is_wheel`] 互补：滚轮走批内累加，三态走保序状态机，其余一律不进批次。
+fn is_selection_kind(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
     )
 }
 
@@ -255,7 +287,7 @@ fn setup_terminal() -> Result<Term, TuiError> {
 fn handle_round(
     app: &mut App,
     wheel: &[Event],
-    mouse: Option<Event>,
+    mouse: Vec<Event>,
     deferred: Option<Event>,
     requests: &Sender<Request>,
     boundaries: &Sender<Boundary>,
@@ -278,8 +310,10 @@ fn handle_round(
         );
         events::scroll_wheel_batch(app, width, height, delta);
     }
-    if let Some(m) = mouse {
-        events::handle_event(m, app, requests, boundaries, width, height);
+    // **鼠标事件逐条按序交给状态机**：`Down` / `Drag` / `Up` 是同一条状态机的三段，
+    // 缺任何一段都会让选区静默失效（快速拖选时三者必同批）。
+    for event in mouse {
+        events::handle_event(event, app, requests, boundaries, width, height);
     }
     if let Some(other) = deferred {
         events::handle_event(other, app, requests, boundaries, width, height);
@@ -1355,7 +1389,7 @@ mod tests {
         .into_iter();
         let (wheel, other, deferred) = coalesce(first, || rest.next());
         assert_eq!(wheel.len(), 4, "4 个滚轮事件全要保留");
-        assert!(other.is_none(), "无其它鼠标事件");
+        assert!(other.is_empty(), "无其它鼠标事件");
         assert!(deferred.is_none(), "无非鼠标事件");
     }
 
@@ -1381,20 +1415,43 @@ mod tests {
             MAX_WHEEL_BATCH - 1,
             "到上限即停止读取（首个事件来自 first，其余来自 next）"
         );
-        assert!(other.is_none());
+        assert!(other.is_empty());
         assert!(deferred.is_none());
     }
 
-    /// **拖选类事件只留最后一个**（坐标是承重的：选区端点取自最后那个坐标）。
+    /// **拖选三态保序全留，连续 `Drag` 只留最后一个**。
     ///
-    /// 变异：把 `coalesce` 的非滚轮分支改成「也全留」⇒ 本用例红。
+    /// 坐标是承重的（选区端点取自最后那个 `Drag`），但 `Down` / `Up` 不能被 `Drag`
+    /// 覆盖 —— 它们是状态机的起止段。
+    ///
+    /// 变异：把非滚轮分支改回「整批只留最后一个」⇒ `Down` 被吞，`test_fast_drag_in_one_batch_copies` 红。
     #[test]
-    fn test_coalesce_keeps_only_last_drag_event() {
+    fn test_coalesce_keeps_drag_sequence_in_order() {
         let first = mouse_event(MouseEventKind::Down(MouseButton::Left));
-        let mut queue = vec![mouse_event(MouseEventKind::Drag(MouseButton::Left))].into_iter();
+        let mut queue = vec![
+            mouse_event(MouseEventKind::Drag(MouseButton::Left)),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left)),
+            mouse_event(MouseEventKind::Up(MouseButton::Left)),
+        ]
+        .into_iter();
         let (wheel, other, deferred) = coalesce(first, || queue.next());
         assert!(wheel.is_empty(), "拖选不是滚轮");
-        assert_eq!(other.map(|e| matches!(e, Event::Mouse(m) if m.kind == MouseEventKind::Drag(MouseButton::Left))), Some(true), "留最后一个 Drag");
+        let kinds: Vec<_> = other
+            .iter()
+            .map(|e| match e {
+                Event::Mouse(m) => m.kind,
+                _ => panic!("只应有鼠标事件"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ],
+            "Down / Drag / Up 必须保序全留，连续 Drag 折叠成一个"
+        );
         assert!(deferred.is_none());
     }
 
@@ -1411,7 +1468,7 @@ mod tests {
         let (wheel, other, deferred) =
             coalesce(mouse_event(MouseEventKind::ScrollUp), || pending.take());
         assert_eq!(wheel.len(), 1, "滚轮仍保留");
-        assert!(other.is_none());
+        assert!(other.is_empty());
         assert!(deferred.is_some(), "非鼠标事件必须推迟返回，不得丢");
     }
 
@@ -1463,6 +1520,84 @@ mod tests {
         assert!(!app.follow, "向上滚即脱离跟随");
     }
 
+    /// **`Moved` 不进批次**：`?1003h` 下指针一动就产生 `Moved`，全留会让批次无界增长。
+    ///
+    /// 变异：删掉 `coalesce` 里的 `is_selection_kind` 判断 ⇒ 1000 个 `Moved` 全进 `mouse`，红。
+    #[test]
+    fn test_moved_events_do_not_grow_the_batch() {
+        let mut rest = std::iter::repeat_with(|| mouse_event(MouseEventKind::Moved)).take(1000);
+        let (_wheel, other, _deferred) =
+            coalesce(mouse_event(MouseEventKind::Down(MouseButton::Left)), || {
+                rest.next()
+            });
+        assert_eq!(other.len(), 1, "只有按下事件进批次，悬停一律丢弃");
+    }
+
+    /// **悬停事件不得吃掉按下事件**：`EnableMouseCapture` 开了 1003（任意移动上报），
+    /// 指针移动会产生 `Moved`。若 `coalesce` 把它当作「最后一个非滚轮事件」，同批里的
+    /// `Down` 就被覆盖 ⇒ 选区状态机从未 `begin`，拖拽全程无效。
+    #[test]
+    fn test_moved_does_not_swallow_press() {
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left));
+        let moved = mouse_event(MouseEventKind::Moved);
+        let mut rest = vec![moved].into_iter();
+        let (_wheel, other, _deferred) = coalesce(down, || rest.next());
+        let kept = match other.first() {
+            Some(Event::Mouse(m)) => m.kind,
+            _ => panic!("必须留下一个鼠标事件"),
+        };
+        assert_eq!(
+            kept,
+            MouseEventKind::Down(MouseButton::Left),
+            "悬停事件不得覆盖按下事件"
+        );
+    }
+
+    /// **快速拖选必须能复制**：`Down` / `Drag` / `Up` 落在同一批时，`coalesce` 只留
+    /// 最后一个 ⇒ 状态机收到孤立的 `Up`，`is_dragging()` 为假，整次拖选被静默丢弃。
+    #[test]
+    fn test_fast_drag_in_one_batch_copies() {
+        let (req_tx, _req_rx) = mpsc::channel(8);
+        let (bnd_tx, _bnd_rx) = mpsc::channel(8);
+        let mut app = App::new(CodingView::for_test());
+        for i in 0..40 {
+            app.transcript
+                .push(TranscriptLine::User(format!("msg-{i}")));
+        }
+        let inner = crate::draw::chat_inner_rect(&app, 120, 40).expect("应有内区");
+        let (x, y) = (inner.x + 2, inner.y + 1);
+        let mk = |kind, col, row| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let down = mk(MouseEventKind::Down(MouseButton::Left), x, y);
+        let drag = mk(MouseEventKind::Drag(MouseButton::Left), x + 10, y + 2);
+        let up = mk(MouseEventKind::Up(MouseButton::Left), x + 10, y + 2);
+        let mut rest = vec![drag, up].into_iter();
+        let (wheel, mouse, deferred) = coalesce(down, || rest.next());
+        let mut written: Vec<String> = Vec::new();
+        handle_round(
+            &mut app,
+            &wheel,
+            mouse,
+            deferred,
+            &req_tx,
+            &bnd_tx,
+            120,
+            40,
+            &mut |t: &str| written.push(t.to_string()),
+            &mut || None,
+        );
+        assert!(
+            !written.is_empty(),
+            "快速拖选（Down/Drag/Up 同批）必须复制，实际未写剪贴板"
+        );
+    }
+
     /// [`events::WHEEL_ROWS`] 的转写（`isize` → `usize`，断言用）。
     fn ys_tui_coding_wheel_rows() -> usize {
         crate::events::WHEEL_ROWS as usize
@@ -1503,7 +1638,7 @@ mod tests {
         handle_round(
             &mut app,
             &[],
-            None,
+            Vec::new(),
             Some(key),
             &req_tx,
             &bnd_tx,
@@ -1530,7 +1665,7 @@ mod tests {
         handle_round(
             &mut app,
             &[],
-            None,
+            Vec::new(),
             None,
             &req_tx,
             &bnd_tx,
@@ -1559,7 +1694,7 @@ mod tests {
         handle_round(
             &mut app,
             &[],
-            None,
+            Vec::new(),
             Some(key),
             &req_tx,
             &bnd_tx,
@@ -1577,7 +1712,7 @@ mod tests {
         handle_round(
             &mut app,
             &[],
-            None,
+            Vec::new(),
             None,
             &req_tx,
             &bnd_tx,
@@ -1605,7 +1740,7 @@ mod tests {
         handle_round(
             &mut app,
             &[],
-            None,
+            Vec::new(),
             None,
             &req_tx,
             &bnd_tx,
@@ -1623,7 +1758,7 @@ mod tests {
         handle_round(
             &mut app,
             &[],
-            None,
+            Vec::new(),
             None,
             &req_tx,
             &bnd_tx,

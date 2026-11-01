@@ -15,6 +15,24 @@ pub enum RoundPurpose {
     Compaction,
 }
 
+/// harness 在**本轮请求**里补进去的那条提醒属于哪一种（[`AgentEvent::AdviceInjected`] 的判别位）。
+///
+/// 四条提醒共享同一形态（一条 `User` 消息追加在消息末尾）、同一优先级策略（每轮至多一条），
+/// 差别只在**触发条件**与**措辞**。分开记的理由是事后归因：只看「发过提醒」无法回答
+/// 「是哪条策略在起作用」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdviceKind {
+    /// 「闷头干活」提醒：连续若干次工具调用而没有正文输出。
+    Narration,
+    /// A4 批处理提醒：回合内累计工具调用数到阈值，且模型仍在一轮一调用。
+    Batch,
+    /// A6 轮数软提醒：回合内轮数到阈值。
+    SoftRound,
+    /// 收卷轮指令：轮数或墙钟预算到点，要求模型停止取数、交最终答复。
+    FinalReport,
+}
+
 /// agent run 期间发出的 runtime 级事件。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +145,30 @@ pub enum AgentEvent {
     ResponseTruncated {
         /// 被作废、**未执行**的工具调用数（0 = 纯文本被截断）。
         dropped_tool_calls: usize,
+    },
+    /// harness 往**本轮请求**里注入了一条提醒。
+    ///
+    /// 提醒只影响本轮请求、**不落 session**（见 `basic.rs` 的提醒注入处）：会话要能被
+    /// `--resume` 读回，里面不能有「harness 让模型收敛」这类内部消息。故本事件是提醒
+    /// 存在过的**唯一旁路证据** —— 没有它，事后无法判断「提醒到底发过没有」。
+    ///
+    /// **非终局**：终局事件仍只有 `RunFinished` / `RunFailed`。
+    AdviceInjected {
+        kind: AdviceKind,
+        /// 注入发生在第几轮，与 `RoundStarted.round` / `RunFinished.rounds` **同口径**
+        /// （从 `1` 起）。
+        round: u32,
+        /// 触发时用的阈值，`Option` 表达「这条策略没有阈值」而非「阈值未知」。
+        ///
+        /// - [`AdviceKind::SoftRound`] / [`AdviceKind::Batch`]：填**本次触发那一刻**的阈值
+        ///   （如 50 / 100 / 200）。触发即把阈值 ×2 ⇒ 必须记翻倍**前**的值，否则同一策略的
+        ///   连续几次提醒会记成翻倍后的数字，事后读起来像「阈值一直是 50 却报了 100」。
+        /// - [`AdviceKind::Narration`]：填 `narration_silence_tool_calls` —— 触发判据是
+        ///   「连续无正文的工具调用计数 `>=` 它」。到阀后计数**清零**（不是 ×2），阈值本身
+        ///   不变，故每次报的都是同一个值。
+        /// - [`AdviceKind::FinalReport`]：`None` —— 它是**无条件**注入（预算已到点），
+        ///   归因看随后的 `RunFinished.stop_reason`，不需要阈值。
+        threshold: Option<usize>,
     },
 }
 

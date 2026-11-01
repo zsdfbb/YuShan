@@ -7,7 +7,10 @@
 //! 每回合派发总量上限、`model` 名解析失败 fail-closed、产物目录 sweep + 环境变量覆盖口。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,8 +18,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::Value;
 use ys_component::RunLimits;
-use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId, Usage};
-use ys_event::{AgentEvent, CollectingSink};
+use ys_core::{ContentBlock, EventError, Message, Role, StopReason, ToolCallId, Usage};
+use ys_event::{AdviceKind, AgentEvent, CollectingSink, EventSink};
 use ys_loop::AgentInput;
 use ys_model::Model;
 use ys_protocol::{Boundary, BoundarySource, QueueBoundarySource};
@@ -60,6 +63,21 @@ pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const OUTER_GRACE: Duration = Duration::from_secs(60);
 /// 单条诊断的硬上限（含 `[diagnostic:` 前缀与截断标记）。
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+
+/// journal 单文件上限。触顶后停写并留一条标记行，不轮转、不新建文件。
+/// 取值参照 `debug_log::DEFAULT_FILE_LIMIT_BYTES`（64 MiB），但 journal 是临时现场
+/// 而非长期档案，故取更小的 8 MiB。
+const JOURNAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// journal 里 `ToolResult` 正文的上限。崩溃现场的价值在于「跑到哪、调了什么」，
+/// 不在于完整工具输出。
+const JOURNAL_MAX_TOOL_RESULT_BYTES: u64 = 4 * 1024;
+
+/// 触顶后写入的标记行（每次派发至多一条）。
+const JOURNAL_TRUNCATED_MARKER: &str = "{\"truncated\":true}\n";
+
+/// 打开 journal 时遇到 `AlreadyExists` 的重试次数（换 `seq` 重试，仍失败则降级）。
+const JOURNAL_OPEN_ATTEMPTS: u32 = 3;
 const DIAGNOSTIC_PREFIX: &str = "[diagnostic: ";
 
 /// 跨回合最多滞留多少条**未投出**的后台结果。
@@ -573,13 +591,188 @@ impl SubagentsDir {
     }
 
     /// 写一份子转录，返回绝对路径。文件名含进程 id + 进程内原子序号（并行安全）。
-    fn write_transcript(&self, body: &str) -> std::io::Result<PathBuf> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    fn write_transcript(&self, body: &str, seq: u64) -> std::io::Result<PathBuf> {
         std::fs::create_dir_all(&self.path)?;
-        let path = self.path.join(format!("{}_{}.md", std::process::id(), seq));
+        let path = self.transcript_path(seq);
         std::fs::write(&path, body)?;
         Ok(std::fs::canonicalize(&path).unwrap_or(path))
+    }
+
+    /// 正常收尾：写 markdown 转录，成功后删掉旁路 journal。
+    ///
+    /// 转录写失败时**保留** journal —— 那时它是这次派发的唯一**残留**记录。
+    /// 它的价值边界是「跑到哪、调了什么」：`ToolResult` 正文已按
+    /// [`JOURNAL_MAX_TOOL_RESULT_BYTES`] 截断，总量也受 [`JOURNAL_MAX_BYTES`] 封顶，
+    /// 故它不是完整转录。
+    fn finish_transcript(&self, body: &str, seq: u64) -> std::io::Result<PathBuf> {
+        let path = self.write_transcript(body, seq)?;
+        let _ = std::fs::remove_file(self.journal_path(seq));
+        Ok(path)
+    }
+
+    /// 终态转录路径：`<dir>/<pid>_<seq>.md`。
+    fn transcript_path(&self, seq: u64) -> PathBuf {
+        self.path.join(format!("{}_{}.md", std::process::id(), seq))
+    }
+
+    /// 旁路 journal 路径：`<dir>/<pid>_<seq>.live.jsonl`。
+    ///
+    /// 与终态转录共用同一个 `seq` ⇒ 崩溃残留的 journal 与它的 `.md` 天然配对。
+    fn journal_path(&self, seq: u64) -> PathBuf {
+        self.path
+            .join(format!("{}_{}.live.jsonl", std::process::id(), seq))
+    }
+}
+
+/// 一次派发的产物序号：进程 id + 进程内原子序号（并行安全）。
+///
+/// journal 与最终 `.md` 共用同一份序号，故两者天然配对。
+fn next_seq() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 子 agent 的事件出口：内存收集 + 旁路 journal。
+///
+/// journal 只服务排障：进程被 kill、或卡在长派发里时，`<pid>_<seq>.live.jsonl`
+/// 留下已发生的事件。正常收尾写完 markdown 转录后删除；残留文件由
+/// [`SubagentsDir::sweep_old`] 按保留期清理（它不按扩展名过滤）。
+struct JournalingSink {
+    inner: CollectingSink,
+    /// `None` ⇒ journal 打不开，本 sink 静默降级为纯内存收集。
+    journal: Option<std::fs::File>,
+    /// journal 与最终 `.md` 共用的序号（调用方经 [`Self::seq`] 取，保证两者配对）。
+    seq: u64,
+    /// 已成功写入 journal 的正文字节数（不含 `{"truncated":true}` 标记行 ——
+    /// 写标记行时不累加）。
+    written: u64,
+    /// `true` ⇒ 已触顶并写过标记行，此后不再写任何行。
+    truncated: bool,
+    /// 本 sink 的单文件上限。生产恒为 [`JOURNAL_MAX_BYTES`]；测试注入更小值。
+    max_bytes: u64,
+}
+
+impl JournalingSink {
+    /// 打开 journal 文件，并**独占**采用一个 `seq`。
+    ///
+    /// `create_new` 是必需的：`seq` 每进程从 0 起、OS 会复用 pid，而
+    /// [`SubagentsDir::sweep_old`] 保留 7 天 —— 允许追加会让新进程写进上一次崩溃的
+    /// 现场，伪造因果。碰撞时换 `seq` 重试 [`JOURNAL_OPEN_ATTEMPTS`] 次，仍失败则
+    /// 降级为纯内存（journal 打不开不得让派发失败）；降级时保留首个候选 `seq`。
+    fn new(dir: &SubagentsDir, first_seq: u64) -> Self {
+        Self::with_limit(dir, first_seq, JOURNAL_MAX_BYTES)
+    }
+
+    /// 同 [`Self::new`]，但用显式上限（测试注入小上限用）。
+    fn with_limit(dir: &SubagentsDir, first_seq: u64, max_bytes: u64) -> Self {
+        if let Some(parent) = dir.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::create_dir_all(&dir.path);
+
+        let mut seq = first_seq;
+        let mut journal = None;
+        for attempt in 0..JOURNAL_OPEN_ATTEMPTS {
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(dir.journal_path(seq))
+            {
+                Ok(file) => {
+                    journal = Some(file);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 只有还有重试机会才换号；最后一次换号也无意义。
+                    if attempt + 1 < JOURNAL_OPEN_ATTEMPTS {
+                        seq = next_seq();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        Self {
+            inner: CollectingSink::new(),
+            journal,
+            seq,
+            written: 0,
+            truncated: false,
+            max_bytes,
+        }
+    }
+
+    /// 本 sink 最终采用的序号。journal 与 `.md` 必须用它，两者才天然配对。
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// 已收集的事件（与 journal 无关，journal 只是旁路副本）。
+    fn events(&self) -> &[AgentEvent] {
+        self.inner.events()
+    }
+
+    /// journal 是否真的写过字节。降级（打不开）或零事件时都不算 —— 诊断只在有现场时
+    /// 给路径，否则如实说不可用。
+    fn has_journal_bytes(&self) -> bool {
+        self.journal.is_some() && self.written > 0
+    }
+
+    /// 追加一行到 journal。超过 [`Self::max_bytes`] 时停写并留**一次**标记行。
+    fn append_line(&mut self, line: &str) {
+        let Some(journal) = self.journal.as_mut() else {
+            return;
+        };
+        if self.truncated {
+            return;
+        }
+        let len = line.len() as u64;
+        if self.written + len > self.max_bytes {
+            // 标记行很短，允许它把文件略微顶过上限。
+            self.truncated = true;
+            let _ = journal.write_all(JOURNAL_TRUNCATED_MARKER.as_bytes());
+            return;
+        }
+        if journal.write_all(line.as_bytes()).is_ok() {
+            self.written += len;
+        }
+    }
+}
+
+impl EventSink for JournalingSink {
+    /// **只**进内存、**不**写盘：这是模型流式回调的同步快路径，每 token 一次，
+    /// 写盘会毁掉流式。
+    ///
+    /// 前提：当前只有流式增量走这条快路径（`basic.rs:501/505`）；若将来有结构性事件
+    /// 改走 `try_emit`，这里会静默漏 journal —— 届时须在此按 `matches!` 分流。
+    fn try_emit(&mut self, event: AgentEvent) -> Result<(), AgentEvent> {
+        self.inner.try_emit(event)
+    }
+
+    /// 先落 journal 一行 JSON，再转给 inner。写盘是同步 `write_all`（单次 append
+    /// 系统调用）—— 这条路径的事件频率是「每工具 / 每轮一次」，不是每 token 一次。
+    ///
+    /// 写盘失败静默忽略：journal 是排障旁路，它的 IO 失败不得拖垮派发。
+    fn emit<'a>(
+        &'a mut self,
+        event: AgentEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventError>> + Send + 'a>> {
+        // 流式增量是每 token 一次的高频事件，journal 只记结构性事件 ⇒ 直接透传。
+        if matches!(
+            event,
+            AgentEvent::ModelTextDelta { .. } | AgentEvent::ModelThinkingDelta { .. }
+        ) {
+            return Box::pin(async move { self.inner.emit(event).await });
+        }
+        if self.journal.is_some()
+            && let Some(line) = journal_json_line(&event)
+        {
+            self.append_line(&line);
+        }
+        Box::pin(async move { self.inner.emit(event).await })
+    }
+
+    fn begin_turn(&mut self, turn: u32) {
+        self.inner.begin_turn(turn);
     }
 }
 
@@ -1120,10 +1313,13 @@ impl ChildTask {
                 let diagnostic = run_diagnostic(&stop_reason, cause, 0, &details);
                 let artifact = self
                     .dir
-                    .write_transcript(&format!(
-                        "# 子 agent 未启动\n\n{}\n",
-                        diagnostic.as_deref().unwrap_or("(无诊断)")
-                    ))
+                    .write_transcript(
+                        &format!(
+                            "# 子 agent 未启动\n\n{}\n",
+                            diagnostic.as_deref().unwrap_or("(无诊断)")
+                        ),
+                        next_seq(),
+                    )
                     .ok();
                 return SubagentOutcome {
                     summary: String::new(),
@@ -1152,7 +1348,10 @@ impl ChildTask {
         let _watchdog_guard = tokio_util::task::AbortOnDropHandle::new(handle);
 
         let mut session = MemorySession::new();
-        let mut sink = CollectingSink::new();
+        // 产物序号先分配：journal 与最终 `.md` 必须共用同一份（崩溃残留可配对）。
+        // `JournalingSink::new` 在 journal 路径碰撞时会换号，最终号码以 `sink.seq()` 为准。
+        let seq = next_seq();
+        let mut sink = JournalingSink::new(&self.dir, seq);
         let result = child
             .run_turn(
                 AgentInput::text(format!("{prompt}{CHILD_TASK_SUFFIX}")),
@@ -1166,6 +1365,12 @@ impl ChildTask {
             .await;
         let elapsed_ms = trusted_elapsed_ms(started);
         let raw_tool_results = collect_raw_tool_results(sink.events());
+        // journal 与 `.md` 共用 sink 最终采用的序号（§见 `JournalingSink::new`）。
+        let seq = sink.seq();
+        // 转录写失败时 journal 会被保留，诊断里得带上它的位置；但它可能从未落过盘
+        // （打开失败降级为纯内存 / 零事件），故同时取一份「有字节」快照。
+        let journal_path = self.dir.journal_path(seq);
+        let journal_has_bytes = sink.has_journal_bytes();
 
         match result {
             Ok(run) => {
@@ -1182,15 +1387,17 @@ impl ChildTask {
                 let body = transcript_body(
                     &session,
                     &raw_tool_results,
+                    sink.events(),
                     &stop_reason,
                     cause,
                     elapsed_ms,
                     run_diagnostic(&stop_reason, cause, elapsed_ms, &details).as_deref(),
                 );
-                let artifact = match self.dir.write_transcript(&body) {
+                let artifact = match self.dir.finish_transcript(&body, seq) {
                     Ok(path) => Some(path),
                     Err(error) => {
                         details.push(format!("transcript write failed: {error}"));
+                        push_journal_location(&mut details, &journal_path, journal_has_bytes);
                         None
                     }
                 };
@@ -1217,15 +1424,17 @@ impl ChildTask {
                 let body = transcript_body(
                     &session,
                     &raw_tool_results,
+                    sink.events(),
                     &stop_reason,
                     cause,
                     elapsed_ms,
                     run_diagnostic(&stop_reason, cause, elapsed_ms, &details).as_deref(),
                 );
-                let artifact = match self.dir.write_transcript(&body) {
+                let artifact = match self.dir.finish_transcript(&body, seq) {
                     Ok(path) => Some(path),
                     Err(error) => {
                         details.push(format!("transcript write failed: {error}"));
+                        push_journal_location(&mut details, &journal_path, journal_has_bytes);
                         None
                     }
                 };
@@ -1241,6 +1450,18 @@ impl ChildTask {
         }
     }
 }
+/// 转录写失败时的一条诊断细节：journal 真有字节才给路径，否则如实说不可用。
+///
+/// 降级（journal 打不开）或零事件的派发从未创建过该文件 —— 给出路径会让排障者去
+/// 找一个不存在的现场。
+fn push_journal_location(details: &mut Vec<String>, journal_path: &Path, has_bytes: bool) {
+    if has_bytes {
+        details.push(format!("journal kept at {}", journal_path.display()));
+    } else {
+        details.push("journal unavailable".to_string());
+    }
+}
+
 fn trusted_elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
@@ -1425,6 +1646,7 @@ fn text_of(m: &ys_core::Message) -> String {
 fn transcript_body(
     session: &MemorySession,
     raw_tool_results: &HashMap<ToolCallId, String>,
+    events: &[AgentEvent],
     stop_reason: &StopReason,
     cause: Option<CancelCause>,
     elapsed_ms: u64,
@@ -1470,6 +1692,7 @@ fn transcript_body(
         }
         out.push('\n');
     }
+    write_advice_section(&mut out, events);
     out.push_str("## Run\n");
     out.push_str(&format!("stop_reason={}\n", stop_reason_label(stop_reason)));
     if let Some(cause) = cause {
@@ -1482,6 +1705,44 @@ fn transcript_body(
     out
 }
 
+/// 在 `## Run` 之前写 harness 提醒节。
+///
+/// 提醒只进本轮请求的局部 `request_messages`、不落 session，所以转录里**只能**
+/// 从事件流看到它们。没有提醒时**整节不输出** —— 既有转录逐字节不变。
+fn write_advice_section(out: &mut String, events: &[AgentEvent]) {
+    let mut header_written = false;
+    for event in events {
+        let AgentEvent::AdviceInjected {
+            kind,
+            round,
+            threshold,
+        } = event
+        else {
+            continue;
+        };
+        if !header_written {
+            out.push_str("## Advice\n");
+            header_written = true;
+        }
+        out.push_str(&format!("round={round} kind={}", advice_kind_label(kind)));
+        if let Some(threshold) = threshold {
+            out.push_str(&format!(" threshold={threshold}"));
+        }
+        out.push('\n');
+    }
+}
+
+/// 提醒类别的转录形态：小写 snake_case（`narration` / `batch` / `soft_round` /
+/// `final_report`），与 `AdviceKind` 的 serde 形态一致。
+fn advice_kind_label(kind: &AdviceKind) -> &'static str {
+    match kind {
+        AdviceKind::Narration => "narration",
+        AdviceKind::Batch => "batch",
+        AdviceKind::SoftRound => "soft_round",
+        AdviceKind::FinalReport => "final_report",
+    }
+}
+
 /// 按**字符边界**截断到 ≤ `max` 字节（UTF-8 安全）。
 fn truncate_bytes(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -1492,6 +1753,40 @@ fn truncate_bytes(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}\n…[truncated]", &s[..end])
+}
+
+/// 把一条事件序列化成 journal 的一行（含结尾换行）。
+///
+/// `ToolResult` 的正文按 [`JOURNAL_MAX_TOOL_RESULT_BYTES`] 截断（字符边界安全）并标注
+/// 丢弃的字节数 —— 崩溃现场的价值在「跑到哪、调了什么」，不在完整工具输出。截断只发生
+/// 在序列化副本上，内存里的事件保持完整。
+fn journal_json_line(event: &AgentEvent) -> Option<String> {
+    let mut line = match event {
+        AgentEvent::ToolResult { id, result } => {
+            let mut result = result.clone();
+            let max = JOURNAL_MAX_TOOL_RESULT_BYTES as usize;
+            if result.content.len() > max {
+                let full = result.content.len();
+                let mut end = max;
+                while end > 0 && !result.content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let dropped = full - end;
+                result.content.truncate(end);
+                result
+                    .content
+                    .push_str(&format!("…[truncated {dropped} bytes]"));
+            }
+            serde_json::to_string(&AgentEvent::ToolResult {
+                id: id.clone(),
+                result,
+            })
+            .ok()?
+        }
+        other => serde_json::to_string(other).ok()?,
+    };
+    line.push('\n');
+    Some(line)
 }
 
 /// 解析 `mode` 参数：缺省 / `"general"` ⇒ `General`；`"explore"` ⇒ `Explore`；
@@ -2559,12 +2854,458 @@ mod tests {
     fn transcript_body_renders_roles() {
         let s = MemorySession::new();
         // 空会话 → 空正文（不 panic）。
-        let body = transcript_body(&s, &HashMap::new(), &StopReason::Completed, None, 0, None);
+        let body = transcript_body(
+            &s,
+            &HashMap::new(),
+            &[],
+            &StopReason::Completed,
+            None,
+            0,
+            None,
+        );
         assert!(
             body.starts_with("## Run\nstop_reason=completed\nelapsed_ms=0\n"),
             "{body}"
         );
         let _ = Role::User;
+    }
+
+    /// `## Advice` 节：有提醒时才出现，无提醒时整节缺席（保持既有转录不变）。
+    ///
+    /// 变异：把 `write_advice_section` 改成无条件写标题 ⇒ 第二条断言变红；
+    /// 把 `threshold` 打印成恒定 `None` ⇒ 第一条变红。
+    #[test]
+    fn transcript_renders_advice_section() {
+        let s = MemorySession::new();
+        let events = vec![
+            AgentEvent::RoundStarted { round: 50 },
+            AgentEvent::AdviceInjected {
+                kind: AdviceKind::SoftRound,
+                round: 50,
+                threshold: Some(50),
+            },
+            AgentEvent::AdviceInjected {
+                kind: AdviceKind::Narration,
+                round: 51,
+                threshold: None,
+            },
+        ];
+        let body = transcript_body(
+            &s,
+            &HashMap::new(),
+            &events,
+            &StopReason::Completed,
+            None,
+            0,
+            None,
+        );
+        assert!(body.contains("## Advice\n"), "有提醒必须有这一节：{body}");
+        assert!(
+            body.contains("round=50 kind=soft_round threshold=50\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("round=51 kind=narration\n"),
+            "无阈值的提醒不得写出 threshold：{body}"
+        );
+        // 节在 `## Run` **之前**。
+        let advice_at = body.find("## Advice").unwrap();
+        let run_at = body.find("## Run").unwrap();
+        assert!(
+            advice_at < run_at,
+            "`## Advice` 必须在 `## Run` 之前：{body}"
+        );
+
+        // 无提醒 ⇒ 整节不出现，且正文与既有一致。
+        let plain = vec![AgentEvent::RoundStarted { round: 1 }];
+        let without = transcript_body(
+            &s,
+            &HashMap::new(),
+            &plain,
+            &StopReason::Completed,
+            None,
+            0,
+            None,
+        );
+        assert!(
+            !without.contains("## Advice"),
+            "无提醒时整节不得出现：{without}"
+        );
+        assert!(without.starts_with("## Run\n"), "{without}");
+    }
+
+    /// journal 只在**异步** `emit` 落盘；`try_emit` 是流式快路径，绝不写盘。
+    ///
+    /// 变异：让 `try_emit` 也写盘 ⇒ 第一段断言变红。
+    #[tokio::test]
+    async fn journaling_sink_writes_on_emit_only() {
+        static COUNTER: AtomicU64 = AtomicU64::new(10);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("yushan_journal_{}_{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = SubagentsDir::at(base.join("subagents"), false);
+        let seq = next_seq();
+        let journal = dir.journal_path(seq);
+
+        let mut sink = JournalingSink::new(&dir, seq);
+        for i in 0..3 {
+            sink.try_emit(AgentEvent::ModelTextDelta {
+                text: format!("t{i}"),
+            })
+            .unwrap();
+        }
+        assert_eq!(sink.events().len(), 3, "try_emit 仍必须进内存");
+        let early = std::fs::read_to_string(&journal).unwrap_or_default();
+        assert!(
+            early.is_empty(),
+            "try_emit 是流式快路径，不得写盘；实际 {early:?}"
+        );
+
+        for i in 0..2 {
+            sink.emit(AgentEvent::RoundStarted {
+                round: i as u32 + 1,
+            })
+            .await
+            .unwrap();
+        }
+        let text = std::fs::read_to_string(&journal).expect("emit 必须落盘");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "每事件一行 JSON：{text}");
+        let first: AgentEvent = serde_json::from_str(lines[0]).expect("journal 行是事件 JSON");
+        assert!(
+            matches!(first, AgentEvent::RoundStarted { round: 1 }),
+            "{first:?}"
+        );
+        assert!(
+            matches!(first, AgentEvent::RoundStarted { .. }),
+            "journal 只含 emit 过的事件"
+        );
+        assert_eq!(sink.events().len(), 5, "emit 也必须进内存");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 正常走完一次派发 ⇒ `.md` 存在、`.live.jsonl` 已删。
+    ///
+    /// 变异：把 `finish_transcript` 里的 `remove_file` 去掉 ⇒ 变红。
+    #[tokio::test]
+    async fn journal_removed_after_transcript_written() {
+        use ys_model::MockModel;
+        use ys_tools_web::FetchedDir;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(20);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "yushan_journal_finish_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let model = MockModel::new("m");
+        model.push_text("子 agent 的结论");
+        let subagents = base.join("subagents");
+        let dir = Arc::new(SubagentsDir::at(subagents.clone(), false));
+        let runner = AppSubagentRunner::new(
+            Some(Arc::new(model)),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            String::new(),
+            "explore prompt".to_string(),
+            RunLimits::new(2),
+            Duration::from_secs(30),
+            base.clone(),
+            WebConfig::offline(FetchedDir::Temp(base.join("fetched"))),
+            dir,
+            Arc::new(UsageTotals::default()),
+            None,
+            Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
+        );
+        let out = runner
+            .run("查 X", None, SubagentMode::General, None)
+            .await
+            .unwrap();
+        assert_eq!(out.stop_reason, StopReason::Completed);
+
+        let artifact = out.artifact.expect("应落盘转录");
+        assert!(Path::new(&artifact).exists(), "转录应存在: {artifact}");
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(&subagents)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".live.jsonl"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "正常收尾必须删掉 journal，残留: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// journal 里的超长 `ToolResult` 正文截到 4 KiB，且按**字符边界**截断。
+    ///
+    /// 变异：① 去掉 `truncate_journal_tool_result` 调用 ⇒ 正文长度断言变红；
+    ///       ② 把边界回退（`is_char_boundary` 循环）删掉 ⇒ 用多字节字符时 `&s[..max]`
+    ///          切在字符中间，截断处出现替换符 / 长度断言变红。
+    #[tokio::test]
+    async fn journal_truncates_large_tool_results() {
+        let base = unique_subagent_test_dir("journal_truncate");
+        let dir = SubagentsDir::at(base.join("subagents"), false);
+        let seq = next_seq();
+        let journal = dir.journal_path(seq);
+        let mut sink = JournalingSink::new(&dir, seq);
+
+        // 「测」占 3 字节，总长刻意让 4 KiB 边界落在字符中间。
+        let content = "测".repeat(3000);
+        let full_len = content.len();
+        sink.emit(AgentEvent::ToolResult {
+            id: ToolCallId("c1".into()),
+            result: ToolResult {
+                content,
+                is_error: false,
+            },
+        })
+        .await
+        .unwrap();
+
+        let text = std::fs::read_to_string(&journal).expect("journal 应落盘");
+        let line: AgentEvent = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let AgentEvent::ToolResult { result, .. } = line else {
+            panic!("应是 ToolResult");
+        };
+        assert!(result.content.len() < full_len, "正文必须被截断");
+        let body = result
+            .content
+            .split("…[truncated")
+            .next()
+            .expect("有截断标记就有正文");
+        assert!(
+            body.len() <= JOURNAL_MAX_TOOL_RESULT_BYTES as usize,
+            "截断后正文（不含标记）不得超过上限：{}",
+            body.len()
+        );
+        assert!(
+            !body.is_empty() && body.chars().all(|c| c == '测'),
+            "截断必须落在字符边界"
+        );
+        assert!(
+            result.content.contains("…[truncated") && result.content.contains("bytes]"),
+            "必须带丢弃字节数标记：{}",
+            &result.content[result.content.len().saturating_sub(40)..]
+        );
+        // 内存里的副本保持完整（journal 截断只影响落盘）。
+        let in_memory = sink.events();
+        let AgentEvent::ToolResult { result, .. } = &in_memory[0] else {
+            panic!("应是 ToolResult");
+        };
+        assert_eq!(result.content.len(), full_len, "body 截断不得影响内存副本");
+
+        // 流式增量不进盘（防御性：即使将来它们走 `emit`）。
+        let before = std::fs::read_to_string(&journal).unwrap().len();
+        sink.emit(AgentEvent::ModelTextDelta { text: "tok".into() })
+            .await
+            .unwrap();
+        sink.emit(AgentEvent::ModelThinkingDelta {
+            text: "think".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap().len(),
+            before,
+            "流式增量必须跳过 journal"
+        );
+        assert_eq!(sink.events().len(), 3, "跳过写盘但仍要进内存");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 触顶后停写，只留**一条** `{"truncated":true}` 标记行，文件不得远超上限。
+    ///
+    /// 变异：① 去掉 `append_line` 的上限判断 ⇒ 文件远超上限；
+    ///       ② 把 `truncated` 标志去掉（只判一次）⇒ 末尾出现多条标记行。
+    #[tokio::test]
+    async fn journal_stops_at_size_limit() {
+        let base = unique_subagent_test_dir("journal_limit");
+        let dir = SubagentsDir::at(base.join("subagents"), false);
+        let seq = next_seq();
+        let journal = dir.journal_path(seq);
+        const LIMIT: u64 = 512;
+        let mut sink = JournalingSink::with_limit(&dir, seq, LIMIT);
+
+        for round in 1..=200u32 {
+            sink.emit(AgentEvent::RoundStarted { round }).await.unwrap();
+        }
+
+        let text = std::fs::read_to_string(&journal).expect("journal 应落盘");
+        assert!(
+            (text.len() as u64) <= LIMIT + JOURNAL_TRUNCATED_MARKER.len() as u64,
+            "不得超过上限太多：{} 字节，上限 {LIMIT}",
+            text.len()
+        );
+        assert!(text.ends_with(JOURNAL_TRUNCATED_MARKER), "末尾必须有标记行");
+        assert_eq!(
+            text.matches(JOURNAL_TRUNCATED_MARKER.trim_end()).count(),
+            1,
+            "标记行只能写一次：{text}"
+        );
+        assert_eq!(sink.events().len(), 200, "触顶只停写盘，内存照收");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 两个场景：
+    /// - ① journal 根本没开成（降级纯内存）⇒ 诊断必须说 `journal unavailable`，不得给假线索；
+    /// - ② journal 真有字节、`.md` 写不成 ⇒ journal 留存且内容完整。
+    ///
+    /// `push_journal_location` 的 `has_bytes=true` 分支由
+    /// `journal_location_reported_only_when_bytes_exist` 单独覆盖 —— 场景 ② 走的是
+    /// 直接调用，不产生诊断。
+    ///
+    /// 变异：① 诊断无条件 push `journal kept at <path>` ⇒ ① 的 `journal unavailable` 与
+    ///       「不含 `.live.jsonl`」两断言变红；
+    ///       ② `finish_transcript` 在写失败时也 `remove_file` ⇒ ② 的 `.live.jsonl` 残留断言变红。
+    #[tokio::test]
+    async fn journal_kept_when_transcript_write_fails() {
+        // ① 派发路径：`.md` 写不进去（目录位置被普通文件占住）⇒ journal 也开不成，
+        //    诊断必须如实说不可用。
+        let base = unique_subagent_test_dir("journal_kept");
+        let blocker = base.join("not-a-directory");
+        std::fs::write(&blocker, "file blocks create_dir_all").unwrap();
+        let dir = Arc::new(SubagentsDir::at(blocker.join("subagents"), false));
+        let model = ys_model::MockModel::new("m");
+        model.push_text("写失败也要留 journal");
+        let runner = test_runner(model, &base, dir, RunLimits::new(2));
+        let out = runner
+            .run("写失败", None, SubagentMode::General, None)
+            .await
+            .unwrap();
+        assert_eq!(out.artifact, None, "转录必须写失败");
+        let diagnostic = out.diagnostic.expect("写失败必须有诊断");
+        assert!(
+            diagnostic.contains("transcript write failed"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("journal unavailable"),
+            "journal 没开成时必须如实说不可用：{diagnostic}"
+        );
+        // 这个场景里 journal 根本没开成 ⇒ 诊断必须如实说不可用，不能给出一个空路径。
+        assert!(
+            !diagnostic.contains(".live.jsonl"),
+            "不得给出一个不存在的现场路径：{diagnostic}"
+        );
+
+        // ② 直接路径：journal 能开、`.md` 写不成（同名位置被目录占位）⇒ journal 不被删。
+        let base2 = unique_subagent_test_dir("journal_kept2");
+        let dir2 = SubagentsDir::at(base2.join("subagents"), false);
+        std::fs::create_dir_all(&dir2.path).unwrap();
+        let seq = next_seq();
+        let mut sink = JournalingSink::new(&dir2, seq);
+        sink.emit(AgentEvent::RoundStarted { round: 1 })
+            .await
+            .unwrap();
+        let journal = dir2.journal_path(sink.seq());
+        assert!(journal.exists(), "emit 之后 journal 必须存在");
+        // 目录占住 `.md` 的位置 ⇒ `std::fs::write` 失败。
+        std::fs::create_dir_all(dir2.transcript_path(sink.seq())).unwrap();
+        assert!(
+            dir2.finish_transcript("body", sink.seq()).is_err(),
+            "`.md` 位置被目录占住时必须报错"
+        );
+        assert!(
+            journal.exists(),
+            "转录写失败时不得删 journal：{}",
+            journal.display()
+        );
+        assert!(
+            std::fs::read_to_string(&journal)
+                .unwrap()
+                .contains("RoundStarted"),
+            "journal 内容必须完整保留"
+        );
+
+        drop(sink);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    /// `push_journal_location` 的另一支：journal 真有字节时，诊断必须给出可用的路径。
+    ///
+    /// 与 `journal_kept_when_transcript_write_fails` 的场景 ① 合起来覆盖两个分支 ——
+    /// 那一支断言「没现场就不给路径」，这一支断言「有现场就必须给」。
+    ///
+    /// 变异：删掉 `push_journal_location` 的 `if has_bytes` 判断、永远 push
+    /// `journal unavailable` ⇒ 本用例红。
+    #[test]
+    fn journal_location_reported_only_when_bytes_exist() {
+        let path = std::path::Path::new("/tmp/example_journal.live.jsonl");
+        let shown = path.display().to_string();
+
+        // 有字节 ⇒ 必须给路径，排障者要能顺着它找到现场。
+        let mut kept = Vec::new();
+        push_journal_location(&mut kept, path, true);
+        assert_eq!(kept.len(), 1, "一次调用只追加一条细节：{kept:?}");
+        assert!(
+            kept[0].contains("journal kept at"),
+            "journal 有字节时必须给出路径：{kept:?}"
+        );
+        assert!(
+            kept[0].contains(&shown),
+            "诊断必须带上真实路径 {shown}：{kept:?}"
+        );
+
+        // 没字节 ⇒ 如实说不可用，且不得漏出路径。
+        let mut gone = Vec::new();
+        push_journal_location(&mut gone, path, false);
+        assert_eq!(gone.len(), 1, "一次调用只追加一条细节：{gone:?}");
+        assert!(
+            gone[0].contains("journal unavailable"),
+            "journal 没字节时必须如实说不可用：{gone:?}"
+        );
+        assert!(
+            !gone[0].contains(&shown),
+            "不得给出一个不存在的现场路径 {shown}：{gone:?}"
+        );
+        assert!(
+            !gone[0].contains("journal kept at"),
+            "没现场时不得说已留存：{gone:?}"
+        );
+    }
+
+    /// `create_new` 防 pid 复用：目标 journal 已存在时换号，绝不追加。
+    ///
+    /// 变异：把 `create_new(true)` 换回 `create(true).append(true)` ⇒ 文件被追加变大，
+    /// `seq()` 也不变，两段断言同时变红。
+    #[tokio::test]
+    async fn journal_never_appends_to_existing_file() {
+        let base = unique_subagent_test_dir("journal_create_new");
+        let dir = SubagentsDir::at(base.join("subagents"), false);
+        std::fs::create_dir_all(&dir.path).unwrap();
+
+        // 预置上一次崩溃的现场。
+        let seq = next_seq();
+        let squatted = dir.journal_path(seq);
+        std::fs::write(&squatted, "{\"old\":\"crash scene\"}\n").unwrap();
+
+        let mut sink = JournalingSink::new(&dir, seq);
+        assert_ne!(sink.seq(), seq, "碰撞必须换号");
+        let adopted = dir.journal_path(sink.seq());
+        assert_ne!(adopted, squatted);
+
+        sink.emit(AgentEvent::RoundStarted { round: 1 })
+            .await
+            .unwrap();
+        let old = std::fs::read_to_string(&squatted).unwrap();
+        assert_eq!(old, "{\"old\":\"crash scene\"}\n", "旧现场不得被追加");
+        let fresh = std::fs::read_to_string(&adopted).expect("新 journal 应落盘");
+        assert!(fresh.contains("RoundStarted"), "新文件装新事件：{fresh}");
+        assert!(!fresh.contains("crash scene"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2905,7 +3646,7 @@ mod tests {
         session.append(degraded).await.unwrap();
         let mut raw = HashMap::new();
         raw.insert(id.clone(), original);
-        let body = transcript_body(&session, &raw, &StopReason::Completed, None, 9, None);
+        let body = transcript_body(&session, &raw, &[], &StopReason::Completed, None, 9, None);
         assert!(body.contains("[tool_result id=call-big is_error=true]"));
         assert!(
             body.contains("ORIGINAL_TOOL_RESULT_MARKER"),

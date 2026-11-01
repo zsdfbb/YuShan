@@ -9,7 +9,7 @@ use ys_component::RuntimeContext;
 use ys_core::{
     ContentBlock, Message, Role, StopReason, ThinkingOverride, ToolResult as CoreToolResult, Usage,
 };
-use ys_event::{AgentEvent, RoundPurpose, emit};
+use ys_event::{AdviceKind, AgentEvent, RoundPurpose, emit};
 use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
 use ys_protocol::Boundary;
 use ys_tool::{Tool, ToolContext, ToolError, ToolRegistry};
@@ -563,12 +563,17 @@ impl AgentLoop for BasicLoop {
         let mut batch_nudge_at = ctx.limits.batch_nudge_at_tool_calls;
         let mut cumulative_tool_calls: usize = 0;
         let mut batch_nudge = false;
+        // 置 `batch_nudge` 时用的阈值。阈值在触发当下就被 `advance_batch_nudge` 翻倍，
+        // 故必须当场存下旧值供 `AdviceInjected.threshold` 上报（翻倍后的值不属本次触发）。
+        let mut batch_nudge_threshold: Option<usize> = None;
 
         // A6 轮数软提醒：回合内轮数到阈值后，在**下一轮请求**末尾补一条「汇报或收敛」。
         // 每回合重置（本变量就是回合局部状态），触发后阈值 ×2（60 → 120 → 240）。
         // 不产生事件、不落 session、不中断回合；阈值 `0` ⇒ 关闭。
         let mut soft_round_advice_at = ctx.limits.soft_round_advice_at;
         let mut soft_round_advice = false;
+        // 置 `soft_round_advice` 时用的阈值（翻倍前的值），供 `AdviceInjected.threshold` 用。
+        let mut soft_round_advice_threshold: Option<usize> = None;
 
         // 回合级工具输出闸门的**下界锚**：本回合新增消息的起点。必须在 Step 2 append
         // 用户消息**之前**取，否则用户消息会被当成可降级对象。
@@ -763,8 +768,10 @@ impl AgentLoop for BasicLoop {
                 .map_err(LoopError::Event)?;
             // A6 轮数软提醒判定：轮数递增之后、请求组装之前。
             // 触发即把阈值 ×2，下一次要到更晚的轮次；`0` = 关闭。
+            // 阈值先存后翻：`AdviceInjected.threshold` 要报的是**本次触发时**的值。
             if soft_round_advice_at > 0 && rounds as usize >= soft_round_advice_at {
                 soft_round_advice = true;
+                soft_round_advice_threshold = Some(soft_round_advice_at);
                 soft_round_advice_at = soft_round_advice_at.saturating_mul(2);
             }
             let tools = ctx.registry.specs().to_vec();
@@ -799,6 +806,17 @@ impl AgentLoop for BasicLoop {
                         ),
                     }],
                 });
+                emit(
+                    ctx.events,
+                    AgentEvent::AdviceInjected {
+                        kind: AdviceKind::FinalReport,
+                        round: rounds,
+                        // 收卷轮是无条件注入（预算已到点），归因看终局的 `stop_reason`。
+                        threshold: None,
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 narration_nudge = false;
                 batch_nudge = false;
                 soft_round_advice = false;
@@ -809,6 +827,20 @@ impl AgentLoop for BasicLoop {
                         text: NARRATION_NUDGE_PROMPT.to_string(),
                     }],
                 });
+                emit(
+                    ctx.events,
+                    AgentEvent::AdviceInjected {
+                        kind: AdviceKind::Narration,
+                        round: rounds,
+                        // 这里就是 `narration_silence_tool_calls` 本身的值 —— 触发判据是
+                        // 「连续无正文的工具调用计数 `>=` 它」。narration 到阀后把计数**清零**
+                        // （不是翻倍），故 `silence_threshold` 全程不变，直接读它即本次触发值，
+                        // 无需像 `SoftRound` / `Batch` 那样先存一份旧值。
+                        threshold: Some(silence_threshold),
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 narration_nudge = false;
             } else if batch_nudge {
                 request_messages.push(Message {
@@ -817,6 +849,16 @@ impl AgentLoop for BasicLoop {
                         text: BATCH_NUDGE_PROMPT.to_string(),
                     }],
                 });
+                emit(
+                    ctx.events,
+                    AgentEvent::AdviceInjected {
+                        kind: AdviceKind::Batch,
+                        round: rounds,
+                        threshold: batch_nudge_threshold,
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 batch_nudge = false;
             } else if soft_round_advice {
                 request_messages.push(Message {
@@ -825,6 +867,16 @@ impl AgentLoop for BasicLoop {
                         text: SOFT_ROUND_ADVICE.to_string(),
                     }],
                 });
+                emit(
+                    ctx.events,
+                    AgentEvent::AdviceInjected {
+                        kind: AdviceKind::SoftRound,
+                        round: rounds,
+                        threshold: soft_round_advice_threshold,
+                    },
+                )
+                .await
+                .map_err(LoopError::Event)?;
                 soft_round_advice = false;
             }
             let request = ModelRequest {
@@ -1509,12 +1561,18 @@ impl AgentLoop for BasicLoop {
             // 累计本回合工具调用数（单调、不因多调用轮清零）；到阈值且当前 `tpr < 1.5`
             // 才置标志并把阈值翻倍。下一轮 Step 5 按优先级注入，**不落 session**。
             if batch_nudge_at > 0 {
-                batch_nudge |= advance_batch_nudge(
+                let triggering_at = batch_nudge_at;
+                let fired = advance_batch_nudge(
                     tool_calls.len(),
                     rounds,
                     &mut cumulative_tool_calls,
                     &mut batch_nudge_at,
                 );
+                if fired {
+                    // `batch_nudge_at` 已在上面被翻倍 ⇒ 这里存的是触发时用的旧值。
+                    batch_nudge_threshold = Some(triggering_at);
+                }
+                batch_nudge |= fired;
             }
 
             // Step 11：回合级工具输出总量闸门 —— 超预算时降级**更早**的结果（头部截断 +
@@ -5895,6 +5953,207 @@ mod tests {
             .run_turn(AgentInput::text("go"), &mut ctx)
             .await
             .unwrap();
+    }
+
+    /// 同 [`run_reminder_turn`]，但把 event sink 交回给调用方供断言。
+    async fn run_reminder_turn_collecting(
+        model: &ReminderProbeModel,
+        session: &mut MemorySession,
+        limits: RunLimits,
+    ) -> Vec<AgentEvent> {
+        let registry = ToolRegistry::build(vec![Box::new(NoopTool) as Box<dyn Tool>]).unwrap();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(model, &registry, session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        events.events().to_vec()
+    }
+
+    /// 取出所有 `AdviceInjected` 的 `(kind, round, threshold)`。
+    fn advice_events(events: &[AgentEvent]) -> Vec<(AdviceKind, u32, Option<usize>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::AdviceInjected {
+                    kind,
+                    round,
+                    threshold,
+                } => Some((*kind, *round, *threshold)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `AdviceInjected` 上报的是**触发时用过的阈值**，不是翻倍后的值。
+    ///
+    /// 阈值从 2 起：第 2 轮触发（报 2）并翻倍到 4，第 4 轮再触发（报 4）并翻倍到 8。
+    ///
+    /// 变异：把 `soft_round_advice_threshold` 的赋值挪到 `*= 2` **之后**
+    /// （或直接上报 `soft_round_advice_at`）⇒ 两条 threshold 断言变红。
+    #[tokio::test]
+    async fn advice_injected_carries_triggering_threshold() {
+        let model = ReminderProbeModel::new(6, 1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.soft_round_advice_at = 2;
+        let events = run_reminder_turn_collecting(&model, &mut session, limits).await;
+
+        let soft: Vec<_> = advice_events(&events)
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == AdviceKind::SoftRound)
+            .collect();
+        assert!(
+            soft.len() >= 2,
+            "阀值 2 且跑 6 轮 ⇒ 至少两次 A6 提醒；实际 {soft:?}"
+        );
+        assert_eq!(
+            soft[0],
+            (AdviceKind::SoftRound, 2, Some(2)),
+            "第一次必须报触发时用的 2（翻倍后是 4）；实际 {soft:?}"
+        );
+        assert_eq!(
+            soft[1],
+            (AdviceKind::SoftRound, 4, Some(4)),
+            "第二次必须报触发时用的 4（翻倍后是 8）；实际 {soft:?}"
+        );
+    }
+
+    /// 收卷轮的 `AdviceInjected { kind: FinalReport }` 必须带**当轮**轮次，与
+    /// `RunFinished.rounds` 一致 —— 收卷轮在 Step 4 判定、`rounds += 1` 在 Step 5，
+    /// 若在 Step 4 直接 emit，这里会少 1。
+    ///
+    /// 变异：把 `FinalReport` 的 emit 移到 `rounds += 1` 之前 ⇒ 本用例红。
+    #[tokio::test]
+    async fn final_report_advice_carries_current_round() {
+        let model = FinalReportProbeModel::new(usize::MAX);
+        let mut limits = RunLimits::new(2);
+        limits.final_report_prompt = Some(FINAL_REPORT_SENTINEL.to_string());
+        let (_, events) = run_final_report(&model, limits).await;
+
+        let advice = advice_events(events.events());
+        let final_report: Vec<_> = advice
+            .iter()
+            .filter(|(kind, _, _)| *kind == AdviceKind::FinalReport)
+            .collect();
+        assert_eq!(
+            final_report.len(),
+            1,
+            "收卷轮只注入一次提醒；实际 {advice:?}"
+        );
+
+        let finished = events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RunFinished { rounds, .. } => Some(*rounds),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1, "回合必须恰好收场一次；实际 {finished:?}");
+        let finished_rounds = finished[0];
+
+        let (_, advice_round, threshold) = *final_report[0];
+        assert_eq!(
+            advice_round, finished_rounds,
+            "FinalReport 的 round 必须与 RunFinished.rounds 一致（Step 4 emit 会少 1）"
+        );
+        assert_eq!(
+            threshold, None,
+            "收卷轮是无条件注入，不带阈值归因；实际 {advice:?}"
+        );
+    }
+
+    /// narration 上报的 `threshold` 就是配置的 `narration_silence_tool_calls`，**不是 `None`**。
+    ///
+    /// 阀值 2、每轮 1 个调用且始终不说话 ⇒ 第 2/4/6… 轮结束后到阀，触发即计数清零。
+    /// 计数清零而非翻倍 ⇒ 每次触发报的都是同一个 2（与 `SoftRound` / `Batch` 的翻倍语义不同）。
+    ///
+    /// 变异：把 `threshold` 改回 `None` ⇒ 本用例红。
+    #[tokio::test]
+    async fn narration_advice_reports_silence_threshold() {
+        let model = ReminderProbeModel::new(6, 1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.narration_silence_tool_calls = 2;
+        // 其余两条提醒关掉，让 narration 是唯一来源（优先级上它也抢在 A4 / A6 之前）。
+        limits.batch_nudge_at_tool_calls = 0;
+        limits.soft_round_advice_at = 0;
+        let events = run_reminder_turn_collecting(&model, &mut session, limits).await;
+
+        let narration: Vec<_> = advice_events(&events)
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == AdviceKind::Narration)
+            .collect();
+        assert!(
+            !narration.is_empty(),
+            "阀值 2、跑 6 轮静默 ⇒ narration 必须触发过；实际事件 {:?}",
+            advice_events(&events)
+        );
+        for (kind, round, threshold) in &narration {
+            assert_eq!(
+                (*kind, *threshold),
+                (AdviceKind::Narration, Some(2)),
+                "第 {round} 轮的 narration 必须报配置的阀值 2（计数清零而非翻倍，故恒为 2）；\
+                 实际 {narration:?}"
+            );
+        }
+    }
+
+    /// 提醒**不落 session** —— 它只活在本轮请求里。
+    ///
+    /// 承重不变量（`basic.rs` 提醒注入处注释）：会话要能被 `--resume` 读回，里面不能有
+    /// 「harness 让模型收敛」这类内部消息；否则它会像叙述一样被之后每一轮重读，
+    /// 把本想省的成本加回去。
+    ///
+    /// 三条提醒全部开启。`speak_from(1)` 让 narration 只触发一次 —— 模型一旦开始说话，
+    /// 它的「连续无正文」计数就归零，否则它每轮都会抢到优先级（`narration > A4 > A6`），
+    /// A4 / A6 永远轮不上。
+    ///
+    /// 变异：把任一提醒改成 `session.append(...)` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn advice_not_persisted_to_session() {
+        let model = ReminderProbeModel::new(6, 1).speak_from(1);
+        let mut session = MemorySession::new();
+        let mut limits = RunLimits::new(20);
+        limits.narration_silence_tool_calls = 1;
+        limits.batch_nudge_at_tool_calls = 2;
+        limits.soft_round_advice_at = 2;
+        let events = run_reminder_turn_collecting(&model, &mut session, limits).await;
+
+        let kinds: Vec<AdviceKind> = advice_events(&events)
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        assert!(
+            kinds.contains(&AdviceKind::Narration),
+            "narration 必须发过事件；实际 {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&AdviceKind::Batch),
+            "A4 必须发过事件；实际 {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&AdviceKind::SoftRound),
+            "A6 必须发过事件；实际 {kinds:?}"
+        );
+
+        for prompt in [
+            NARRATION_NUDGE_PROMPT,
+            BATCH_NUDGE_PROMPT,
+            SOFT_ROUND_ADVICE,
+        ] {
+            assert!(
+                !session
+                    .messages()
+                    .iter()
+                    .any(|m| contains_prompt(m, prompt)),
+                "提醒不得写进会话：{prompt}"
+            );
+        }
     }
 
     /// A4 文案契约：只陈述代价、不规定形状，且末尾保留 `Keep dependent steps separate.`。

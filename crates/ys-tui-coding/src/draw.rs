@@ -35,7 +35,6 @@ use ys_core::StopReason;
 use crate::app::App;
 use crate::completion::CompletionState;
 use crate::input::InputBuffer;
-use crate::selection::Highlight;
 use crate::theme::Palette;
 use crate::transcript::TranscriptLine;
 
@@ -163,12 +162,6 @@ fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
     app.input.wrap_width = Some(input_inner_width(area.width));
 
     draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
-    // 选区高亮**独立一行**：它需要 `&mut app`（写字形缓存），不能塞进 `draw_transcript`。
-    // 内区几何在**整屏** `area` 上算好再传下去 —— 高亮层不得再从 `chunks[0]` 推一遍：
-    // 那是二次切分，会把内区多扣掉「Input 高度 + 状态行」。
-    if let Some(inner) = chat_inner(app, area) {
-        draw_selection(frame, inner, scroll.top_row, app);
-    }
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app, palette);
 
@@ -241,9 +234,10 @@ pub(crate) fn chat_viewport(app: &App, width: u16, height: u16) -> (u16, u16) {
     }
 }
 
-/// Chat 内区的**屏幕绝对坐标**（含 `x` / `y`）—— 鼠标坐标转内区相对坐标用。
+/// Chat 内区的**屏幕绝对坐标**（含 `x` / `y`）。
 ///
 /// 与 [`chat_viewport`] 同源（同一个 `chat_inner`），故不可能漂移。
+#[cfg(test)]
 pub(crate) fn chat_inner_rect(app: &App, width: u16, height: u16) -> Option<Rect> {
     chat_inner(app, Rect::new(0, 0, width, height))
 }
@@ -304,31 +298,6 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, pal
     frame.render_widget(para, area);
 }
 
-/// 选区高亮层：在 `draw_transcript` **之后**、`draw_input` **之前**独立调用。
-///
-/// `inner` 是 Chat 内区的**屏幕绝对几何**，由调用方经 [`chat_inner`]（唯一来源）在整屏
-/// `area` 上算好传入。本函数**不得**再对传入区做一次布局切分 —— 重新切分会把内区多扣掉
-/// Input 高度与状态行，高亮与字形网格随之短掉那几行（贴着 Input 的下沿选不中、也读不到字形）。
-///
-/// 取 `&mut App`：写 `app.selection.grid` 需要可变访问，而 `draw_transcript` 拿的是
-/// `&App`。分开写就不必给 `GlyphGrid` 再包一层 `RefCell`。
-fn draw_selection(frame: &mut Frame, inner: Rect, top_row: usize, app: &mut App) {
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    if app.selection.is_active() {
-        let layout = app.layout.borrow();
-        app.selection.ensure_grid(&layout, inner, top_row);
-        drop(layout);
-        let rects = app.selection.rects(top_row, inner);
-        frame.render_widget(Highlight { rects }, inner);
-    } else {
-        // 无选区也要走一次：让 `ensure_grid` 把一屏字形释放掉（设计 §2.3 第 9 条）。
-        let layout = app.layout.borrow();
-        app.selection.ensure_grid(&layout, inner, top_row);
-    }
-}
-
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(" Input ");
     let inner = block.inner(area);
@@ -354,8 +323,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         area,
     );
 
-    // 选区反显：与 Chat 选区同口径（`Modifier::REVERSED`，见 `selection.rs::Highlight`）。
-    // 颜色刻意不猜 —— 主题里没有「选区色」这一个槽，反显对任何前景色都可见。
+    // 输入框选区反显：颜色刻意不猜 —— 主题里没有「选区色」这一个槽，
+    // 反显对任何前景色都可见。
     let x0 = inner.x;
     for (x, y) in sel_cells {
         let cell = &mut frame.buffer_mut()[(x0 + x, inner.y + y)];
@@ -4025,98 +3994,6 @@ mod tests {
         );
     }
 
-    /// **高亮落在正确格**：开启选区后渲一帧，`REVERSED` 的格应恰好落在 `chat_inner_rect`
-    /// 内的选区矩形上；且连续两帧后 `rebuild_count` 不再增长（稳态零重建）。
-    #[test]
-    fn selection_highlights_correct_cells_and_goes_steady() {
-        let (w, h) = (80u16, 24u16);
-        let mut app = app_with(CodingView::for_test());
-        for line in ["alpha", "bravo"] {
-            app.transcript
-                .push(TranscriptLine::Assistant(line.to_string()));
-        }
-        let inner = chat_inner_rect(&app, w, h).expect("应有内区");
-        // 先同步一帧，拿到真实 `top_row`。
-        let scroll = app.sync_scroll_state(w, h, Instant::now());
-
-        // 内容不足一屏 ⇒ `top_row == 0`，故全局行 0 就是内区第 0 行（`alpha`）。
-        // 造一个落在该行、列 0..=4 的选区。
-        assert_eq!(scroll.top_row, 0, "前置：内容不足一屏 ⇒ 视窗顶即第 0 行");
-        app.selection.begin(0, 0, Instant::now());
-        app.selection.extend(0, 4, 0, Instant::now());
-
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-
-        let y = inner.y;
-        for x in 0..w {
-            let reversed = buf[(x, y)].modifier.contains(Modifier::REVERSED);
-            let should = (0..=4).contains(&x);
-            assert_eq!(
-                reversed, should,
-                "({x},{y}) 高亮与选区不符（内区 x 从 {} 起）",
-                inner.x
-            );
-        }
-
-        // 稳态：同一选区再渲一帧，不得重建字形缓存。
-        let before = app.selection.grid.rebuild_count_snapshot();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
-        assert_eq!(
-            app.selection.grid.rebuild_count_snapshot(),
-            before,
-            "稳态帧不得重建字形缓存"
-        );
-    }
-
-    /// **内区每一行都能被选中**（回归：高亮层曾比真实渲染少 4 行）。
-    ///
-    /// `draw_selection` 曾收到 `Layout::vertical(..).split(area)[0]` 这个**已切好的
-    /// Chat 分块**，而 `chat_inner` 期望的是**整屏** `area` —— 它会再切一次，于是内区被
-    /// 多扣掉「Input 高度 + 状态行」（单行输入框下 = 4 行）。后果是高亮矩形底边与字形网格
-    /// 高度都比真实 Chat 内区短 4 行：贴 Input 的那四行拖过也不变色（字也读不到）。
-    ///
-    /// 提取本身不受影响（`extract` 自己重渲一份字形），所以这是**看得见与看不见**的差异：
-    /// 用户以为没选中，实际剪贴板里有。
-    ///
-    /// 变异：把 `ui_with` 里的 `chat_inner(app, area)` 换回 `chat_inner(app, chunks[0])`
-    /// ⇒ 本用例变红。
-    #[test]
-    fn selection_covers_every_row_of_chat_inner() {
-        let (w, h) = (80u16, 24u16);
-        let mut app = app_with(CodingView::for_test());
-        // 内容刚好铺满内区：`top_row == 0`，屏幕行号与全局行号一一对应。
-        let inner = chat_inner_rect(&app, w, h).expect("应有内区");
-        for i in 0..inner.height {
-            app.transcript
-                .push(TranscriptLine::System(format!("L{i:02}")));
-        }
-        let scroll = app.sync_scroll_state(w, h, Instant::now());
-        assert_eq!(scroll.top_row, 0, "前置：内容恰好一屏 ⇒ 视窗顶即第 0 行");
-
-        // 从内区首行拖到内区**最后一行**。
-        app.selection.begin(0, 0, Instant::now());
-        app.selection
-            .extend((inner.height - 1) as usize, w - 1, 0, Instant::now());
-
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| ui(f, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-
-        // 全域选中 ⇒ 内区**每一行**的每一格都必须反显（任何一行漏掉都意味着高度算短了）。
-        for y in inner.y..inner.bottom() {
-            for x in [0u16, w / 2, w - 1] {
-                assert!(
-                    buf[(x, y)].modifier.contains(Modifier::REVERSED),
-                    "内区 ({x},{y}) 应被高亮（内区 {inner:?}）"
-                );
-            }
-        }
-    }
-
     /// 输入框选区高亮必须落在**它自己的字上**（与 Chat 选区同一口径：`REVERSED`）。
     ///
     /// 变异：把 `input_selection_cells` 的 `pos_of` 换成「按 char 数当列」⇒ CJK 下
@@ -4194,70 +4071,5 @@ mod tests {
             Some(W as usize - 2),
             "内区宽 = 总宽 − 边框"
         );
-    }
-
-    /// **画面级回归**：回合中点一下聊天区，后续输出必须仍然跟得上。
-    ///
-    /// 字段级断言（`events.rs::v6b_bare_click_does_not_stop_following`）只能证明
-    /// `follow` 没被误改；这条直接看屏 —— 用户报的症状就是「新输出不展示」。
-    ///
-    /// 为什么必须“回合中”点：`begin_local_turn` 会把 `follow` 置回真，掩盖提交前的冻结。
-    /// 而在回合进行中点一下（换焦点、误触）过去会永久冻结视窗：
-    /// `sync_scroll_state` 的增量补偿把 `scroll_offset` 与内容同步加 Δ ⇒ `top_row` 不变。
-    ///
-    /// 每步之后的渲染不是多余的：流式渲染缓存有 100 ms 节流窗口，不推帧就不会重算折行，
-    /// 也就看不到「内容长了但行数没变」这个假象。
-    #[test]
-    fn bare_click_mid_turn_keeps_new_output_visible() {
-        let (w, h) = (80u16, 24u16);
-        let mut app = app_with(CodingView::for_test());
-        let feed = |app: &mut App, tag: &str, n: usize| {
-            for i in 0..n {
-                app.apply_event(ys_protocol::Envelope::new(
-                    ys_protocol::Source::agent(),
-                    1,
-                    ys_event::AgentEvent::ModelTextDelta {
-                        text: format!("{tag} {i}\n\n"),
-                    },
-                ));
-                // 推帧把内容推过渲染节流窗口（否则整段被合批、总行数不动）。
-                std::thread::sleep(Duration::from_millis(110));
-                let _ = rows_of(app, w, h);
-            }
-        };
-        app.begin_local_turn("q1".into());
-        feed(&mut app, "head", 5);
-
-        // 回合仍在进行中，用户在聊天区单击（不拖动）。
-        let inner = chat_inner_rect(&app, w, h).expect("应有内区");
-        let (col, row) = (inner.x + 3, inner.y + 1);
-        let click = |app: &mut App, kind| {
-            crate::events::handle_mouse(
-                crossterm::event::MouseEvent {
-                    kind,
-                    column: col,
-                    row,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                },
-                app,
-                w,
-                h,
-            )
-        };
-        click(
-            &mut app,
-            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        );
-        click(
-            &mut app,
-            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        );
-        assert!(app.follow, "单击不得脱离跟随");
-
-        feed(&mut app, "tail", 40);
-
-        let rows = rows_of(&mut app, w, h);
-        let tail: Vec<&String> = rows.iter().filter(|r| r.contains("tail 39")).collect();
-        assert_eq!(tail.len(), 1, "回合中单击之后，最新输出必须仍在屏上");
     }
 }

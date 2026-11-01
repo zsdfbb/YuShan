@@ -307,7 +307,7 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 
 **键位归属**：`Up/Down` 归**输入历史**（readline 语义：`Up` 拿更旧一条、`Down` 往新并在越过最新时还原草稿），
 聊天滚动让给 `PageUp/PageDown`（逐页）、`Ctrl+Up/Ctrl+Down`（跳到最早 / 最新）与
-**滚轮 / 触控板上下**（逐行，[ADR-0050](../../adr/0050-tui-mouse-wheel-scroll.md)）；
+**滚轮 / 触控板上下**（由终端处理）；
 水平方向归输入（`Left/Right/Delete/Home`）；
 `Ctrl`·`⌥` + 左右（或 `⌥b` / `⌥f`）让输入光标**按词**移动，`Home` / `End` 到**输入当前行的行首 / 行尾**
 （`Ctrl-E` 与 `End` 同义；`Ctrl-A` 已让给**全选**，[ADR-0059](../../adr/0059-ctrl-a-select-all-and-ctrl-v-paste.md)）。
@@ -1147,8 +1147,8 @@ App::set_theme(kind)                       // 唯一入口
 ratatui 显式认它作断点（`ratatui-core` 的 `Grapheme::is_whitespace`：`symbol == ZWSP || …`），且宽 0：
 
 - **不占列** ⇒ 折行位置之外的一切宽度计算不受影响；
-- **不写入 `Buffer`**（实测「含 ZWSP 的单元格数 = 0」）⇒ 屏幕上看不见，复制选区也拿不到，
-  `selection.rs` **无需改动**。
+- **不写入 `Buffer`**（实测「含 ZWSP 的单元格数 = 0」）⇒ 屏幕上看不见，终端原生拖选
+  复制时也拿不到。
 
 **落点两处**（不是逐变体各插一遍）：
 
@@ -1362,7 +1362,7 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 | `↑` | 输入框**按视觉行上移**（软换行也算一行）→ 到首行才取会话内历史 → 历史空则逐视觉行滚动 | 
 | `↓` | 输入框**按视觉行下移** → 到底才回落：浏览态内取历史下一条（越过最新即还原草稿并退出浏览态），否则逐视觉行滚动 |
 | `PageUp` / `PageDown` | 翻页，步长 = **视窗高度 − 1**（聊天滚动的主入口） |
-| 滚轮 / 触控板上下 | 逐 **3 视觉行**滚动聊天（与输入历史**无关**）；脱离底部即停止跟随 |
+| 滚轮 / 触控板上下 | **由终端处理**（滚终端 scrollback，或被译成 `↑`/`↓`）；对话滚动用 `PageUp` / `PageDown` |
 | `Home` / `End` | 输入**当前行**的行首 / 行尾（`Ctrl-E` 与 `End` 同义；`Ctrl-A` **不是**行首，见下） |
 | `Ctrl-End` / `Ctrl-Down` | 跳到最新消息 |
 | `Ctrl-Home` / `Ctrl-Up` | 跳到最早消息 |
@@ -1375,8 +1375,8 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 | `Enter` / `Shift`·`Alt+Enter` / `Ctrl+J` | 提交 / 换行 / 换行（终端无关的换行键） |
 | `Tab` | 补全浮层（`/` 开头时） |
 | `Esc` | 取消回合（或命令在飞）→ 否则清空输入 |
-| 左键拖选（Chat） | 应用内选区标记（不复制）；`⇧`+拖选同效 |
-| 右键（Chat） | 复制已标记的内容到系统剪贴板 |
+| 左键拖选 | **终端原生选区**（应用不接管鼠标）—— 高亮与剪贴板都由终端管 |
+| 右键 | **终端原生菜单**（复制 / 粘贴由终端提供） |
 
 **`↑↓` 与历史的走廊规则变了**（ADR-0057 决策 4）：软换行让 `↑` 在长草稿里成了编辑操作，
 「无条件先问历史」会把草稿整段换掉。现在输入框有得动就先动它，到边界才回落。
@@ -1401,17 +1401,23 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
 
-**滚轮归应用**（ADR-0050）：`run::setup_terminal` 开 `EnableMouseCapture`，
-`events::handle_mouse` 只认 `ScrollUp` / `ScrollDown`（其余鼠标事件忽略）；
-**每事件 3 视觉行**（`events::WHEEL_ROWS`，单事件与批路径共用 `WheelDelta::rows()` 折算）。
-不开捕获时终端把滚轮译成 `↑` / `↓` ⇒ 滑触控板翻的是**输入历史**而不是对话。
-捕获期间终端原生拖选失效的代价，已由**应用内选区 + 右键复制**（ADR-0051）消掉 ——
-裸左键拖选与 `⇧`+拖选**同效**：都标记选区，右键都写系统剪贴板。
+**鼠标归终端**：`run::setup_terminal` **不开** `EnableMouseCapture`，应用不接收任何
+鼠标事件（`events::handle_event` 把 `Event::Mouse` 落到 `_ => {}`）。于是：
 
-**macOS 的两个坑**（键盘侧入口为何不够）：系统级快捷键占用了 `Ctrl+↑` / `Ctrl+↓`
+- **拖选 = 终端原生选区**，右键 = 终端原生菜单，两者在 xterm.js / VTE / iTerm2 / tmux /
+  SSH 上各自成立 —— 应用不需要逐个适配，也没有「终端截获了事件、应用收不到」的缺口。
+- **滚轮 = 终端的滚轮**：它滚终端 scrollback，或被终端译成 `↑` / `↓` 字节（后者会让触控板
+  翻出输入历史）。**对话滚动因此走键盘**：`PageUp` / `PageDown`、`Ctrl+↑` / `Ctrl+↓`、
+  `Home` / `End`。
+- 复制长回复另有 `/copy`（OSC 52 + 本机工具），不必依赖拖选。
+
+实测确认（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1002h` / `?1003h` / `?1006h`
+**均为 0 次**，只有 `?1049h`（alt-screen）/ `?2004h`（括号粘贴）/ `?7l`（关换行）。
+
+**macOS 的两个坑**（键盘侧入口为何重要）：系统级快捷键占用了 `Ctrl+↑` / `Ctrl+↓`
 （Mission Control / App Exposé，字节到不了终端，需在「系统设置 → 键盘 → 键盘快捷键 →
 Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp / PageDown**
-（须 `fn+↑` / `fn+↓`）。这也是滚轮进应用的直接理由。
+（须 `fn+↑` / `fn+↓`）。
 
 **键位表是结构化数据，不是一段字符串**（ADR-0057 决策 6）：真源是
 `commands::all_keybindings()`（`KeyBinding { keys, action, group, note }`），两个出口
@@ -1448,9 +1454,9 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
   「可能没跟上」，不是「算错」。
 - 逐行 `line_count` 有分配开销（每条目只在内容变化时算一次）。
 - 真实终端的「翻页跟手」观感仍是 `MANUAL_ACK` 项（见 §10）。
-- **鼠标捕获期间终端原生拖选失效** ⇒ 已由应用内选区补上（ADR-0051：裸左键拖选 =
-  应用内选区标记 + 右键复制）。选区自身的代价见 §18.7。
-- **模态浮层不吃滚轮**：浮层自读事件、`_ => {}` 掉鼠标 —— 浮层内容尚不滚动（见 `docs/TODO.md` §C）。
+- **滚轮不滚对话**：鼠标归终端 ⇒ 滚轮滚终端 scrollback（或被译成 `↑`/`↓`）。对话滚动
+  走 `PageUp` / `PageDown` / `Ctrl+↑` / `Ctrl+↓` / `Home` / `End`。详见 §18.7。
+- **模态浮层不滚动**：浮层内容尚不滚动（见 `docs/TODO.md` §C）。
 - **`Ctrl+V` 在 SSH / 容器里无反应**：远端没有本机剪贴板工具（读取只走工具，不发 OSC 52 读）。
   那时用终端自己的粘贴键（`Ctrl+Shift+V` / `⌘V`）。工具缺失时`Ctrl+V`会走完整条候选链（逐个
   `ENOENT`），延迟以毫秒计但确实在按键路径上 —— 不做能力缓存，否则用户装了工具也没反应。
@@ -1459,93 +1465,40 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
 - **`xsel` 复制后不退出**：X11 selection 的拥有者必须是个活进程 ⇒ 下一个 `xsel` 接管时它才退。
   这不是泄漏，但 `ps` 里会看到它。
 
-### 18.7 文本选区与右键复制 — as-built
+### 18.7 文本选区与复制 — as-built
 
-鼠标左键拖选 Chat 区 ⇒ 应用内反显高亮；**松手只标记、不复制**，再按**右键**才把
-**屏幕字形**写进系统剪贴板。消掉了「复制内容要靠终端给不给修饰键」这一跳终端差异
-（ADR-0051）。
+**应用不接管鼠标**：`run::setup_terminal` 不开 `EnableMouseCapture`，
+`events::handle_event` 把 `Event::Mouse` 落到 `_ => {}`。拖选、右键、滚轮全部归终端。
 
-**为什么不是松手即复制**：`⇧`+拖选在多数终端里被终端自己截获（VS Code 的 xterm.js
-`shouldForceSelection` 非 Mac 分支就是 `event.shiftKey`；VTE 在鼠标追踪模式下遇到
-`GDK_SHIFT_MASK` 也直接 `start_selecting`）—— 应用收不到事件，无法触发应用内复制。
-拆成「标记」与「复制」两步后，两条路径都是同一个结局：标记看得见，复制由用户显式
-触发，不依赖修饰键。
+- **拖选 = 终端原生选区**：高亮由终端画，剪贴板由终端写。`⇧`+拖选与裸拖选在本应用里
+  完全等价 —— 两条路都是终端的，应用不介入。
+- **右键 = 终端原生菜单**：复制 / 粘贴由终端提供。
+- **复制长回复用 `/copy`**：OSC 52 + 本机工具双发（见上节「复制出口」），不依赖拖选。
 
-**出口（ADR-0057 已改）**：不再只发 OSC 52，而是**本机工具 + OSC 52 双发**（见上节
-「复制出口」）。原实现只发 OSC 52，而 VS Code 的 xterm.js 不实现它 —— 那正是主要使用场景，
-于是「复制成功」在这类终端上一直是幻觉。
+**为什么这么选（通用性）**：选区与剪贴板在各终端上的实现差异极大，且总会有终端把事件
+截获在自己手里 —— VS Code 的 xterm.js `shouldForceSelection` 非 Mac 分支就是
+`event.shiftKey`（`⇧`+拖选被终端截获）；VTE 在鼠标追踪模式下遇到 `GDK_SHIFT_MASK`
+直接 `start_selecting`，裸右键也弹终端自己的菜单。应用内自建选区必须逐个适配这些终端，
+且永远存在「应用收不到事件」的缺口。交还给终端则各处一致，包括 SSH 与容器。
 
-**输入框也有选区了**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+A` 全选、
-`Shift+方向` 扩选、有选区时 `Ctrl+C` 复制、`Ctrl+V` 粘贴替换、编辑键替换整段。高亮走同一口径
-（`Modifier::REVERSED`）且与 `draw::wrap_input` **共用折行结果** —— 另算一份就会错位。
-
-**模块划分**（唯一新文件 `crates/ys-tui-coding/src/selection.rs`）：
-
-| 项 | 职责 |
-|---|---|
-| `Selection` | 状态机：`anchor_*` / `cursor_*` / `edge` / `edge_since` + `rects` 复用缓冲 |
-| `GlyphGrid` | 视窗字形缓存：`slots: Buffer` + `order: Vec<u16>` 槽环 + `cont` 续格位图 |
-| `extract` | 按 `EXTRACT_CHUNK_ROWS` 分块重渲 → 逐行**按内容裁剪** → 读回 |
-| `Highlight` | 只改 `Modifier::REVERSED` 样式，**不动 symbol**、**不用 `Clear`** |
-| `drag_tick` | 贴边自动滚动（自由函数，六步顺序不可换） |
-
-**坐标模型**：`anchor_row` / `cursor_row` 是 `TranscriptLayout` 的**全局视觉行号**
-（按下时 = `top_row` + 内区相对 y），`x` 是内区相对屏幕列。因此选区能**超过一屏**，
-且 `anchor_row` 是逻辑坐标、不随滚动改变。**自动滚动只改 `cursor_row`。**
-
-**内区几何只有一个来源**：`chat_inner(app, area)` 期望的是**整屏** `area`，它内部自己切
-Chat / Input / Status 三块。`ui_with` 已切出 `chunks[]`，故高亮层**必须**接收
-`chat_inner(app, area)` 的结果而非 `chunks[0]` —— 把已切好的 Chat 分块再喂给 `chat_inner`
-会二次切分，内区被多扣掉「Input 高度 + 状态行」，高亮与 `GlyphGrid` 随之短掉那几行
-（贴 Input 的几行拖过不变色）。守卫：`draw::tests::selection_covers_every_row_of_chat_inner`。
-
-**提取不受上面那条影响**：`extract` 另建一份 `GlyphGrid` 按 `layout` 重渲，读的是布局而非
-视窗缓存 —— 故几何算短时「剪贴板里有、屏幕上看不见」，而不是复制缺内容。
-
-**九条缓存失效**（设计 §2.3 的落地）：键 = `layout_rev`（`structural_rev`）+ `win_rev`
-（`rev_alloc`，内容代次）+ `inner` Rect + `base_row`。仅 `base_row` 变 ⇒ `shift(k)`
-槽环旋转；其余 ⇒ 全量 `rebuild`；`Idle` ⇒ `release()`（保容量、还内存）。
-
-> ⚠️ **`win_rev` 用的是 `rev_alloc` 而不是 `revision_range`**：后者把「窗口首条目内偏移」
-> 折进了哈希，而滚动本身就会改这个偏移 —— 拿它做键的话「纯滚动」永远被判成内容变化，
-> 槽环永远不会生效。代价是窗口**外**条目重渲也会打一次全量重建（正确性优先）。
-
-**复制出口**（ADR-0057 决策 1）：`write_clipboard` = **本机工具 + OSC 52 双发**。
-本机工具按序试 `wl-copy`（仅 Wayland）→ `xsel --clipboard --input` → `xclip -selection clipboard` →
-`pbcopy` → `wl-copy` → `clip.exe`，命中即返回，文本写进子进程 stdin 后**立即关 stdin**
-（`xsel` 靠 EOF 判断粘完，但它写完不自己退 —— X11 selection 的拥有者必须是个活进程，
-故不 wait、不 kill）。OSC 52 仍然发：那是 SSH / 容器 / tmux 里**唯一**可用的通路。
-两条都失败时静默（写入无应答可等，探测做不到），用户退路是 `/copy`。
-
-**复制上限** `COPY_MAX_BYTES = 256 KiB`：超限**不复制**、不静默截断，transcript 回一行提示。
-**自动滚动**：`DRAG_TICK = 16ms` 可变 poll 周期 + `step = clamp(1 + held_ms/40, 1, 8)`，
-200 拍实测选区增量 ≈ **366 µs**（固定 UI 开销另计）。
-
-**`⇧` 语义**：拖选的 `⇧` **不改变任何行为** —— 与裸拖选走同一条应用内选区与同一条
-剪贴板通路。原则是「带不带 `⇧` 都必须能选中并复制」；`⇧` 在鼠标上原本的用途是
-让终端强制原生选择，而终端在鼠标捕获期间收不到这些事件，故不再给终端留这个缺口。
-
-**已知代价**：
+**代价**：
 
 | 项 | 代价 |
 |---|---|
-| 选区不跨**用户滚动** / **resize** 存活 | 有意（决策 5/6）；松手后 resize 无害 |
-| 流式拖选时缓存重建 ≤ 10 次/秒 | 受 `RENDER_THROTTLE` 天然限流 |
-| 字形存两份（`layout` + `GlyphGrid`） | 视窗期 ≈ 120 KB；`Idle` 时释放 |
-| 双击选词 / 三击选行 | 未做（`SelectionMode` 不建） |
-| `⇧` 在捕获期间不切换为原生选择 | 有意：两条路径都必须能选中并复制，`⇧` 不再分支 |
-| 真实终端手感 | `MANUAL_ACK`；客观替代闸门是 3 个 `#[ignore]` 基准 |
+| 滚轮不滚对话 | 它滚终端 scrollback（或被译成 `↑`/`↓`）；对话滚动改走 `PageUp` / `PageDown`、`Ctrl+↑`/`Ctrl+↓`、`Home`/`End` |
+| 应用不知道用户在选什么 | 无法做「选中即复制」「选区联动」这类功能 |
+| 无双击选词 / 三击选行（应用层） | 由终端决定，多数终端本身提供 |
 
-**实现的四处明确化**（与 `docs/arch/tui-text-selection/design.md` 的差异）：
+**输入框选区保留**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+A` 全选、`Shift+方向` 扩选、
+有选区时 `Ctrl+C` 复制、`Ctrl+V` 粘贴替换、编辑键替换整段。这是**输入框自己的状态**，
+与 Chat 区的鼠标选区无关 —— 它由键盘驱动，不经过鼠标事件。高亮走 `Modifier::REVERSED`
+且与 `draw::wrap_input` **共用折行结果**（另算一份就会错位）。
 
-1. `Phase` **两态**（`Idle` / `Dragging`）：`Done` 无观测点（松手即 `clear()`）。
-2. `TranscriptLayout.rev` 拆成 `structural_rev`（结构）+ `rev_alloc`（内容代次）。
-3. `window_rows()` 落地为 `window_with_rows() -> (Window, Vec<RowRef>)`：`window()` 传
-   `None` 保持零分配，二者共用 `window_impl` 一次遍历。
-4. `drag_tick` 是**自由函数**（避 `app.selection` 与 `&mut app` 的借用冲突），
-   且**只动 `cursor_*`**、不动 `anchor_*`。
+**实测确认**（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1002h` / `?1003h` / `?1006h`
+**均为 0 次**，与 Claude Code 一致；只有 `?1049h` / `?2004h` / `?7l`。
+守卫：`run::tests::restore_sequence_contains_terminal_state_restore` 断言恢复序列里
+**不出现**鼠标模式序列（不该关一个从未开启的捕获）。
 
-**变异测试**：`python3 scripts/selection-mutation.py`（8 处注入，全部可被抓到）。
 
 ## 19. 后台命令执行（execution-efficiency）— as-built
 

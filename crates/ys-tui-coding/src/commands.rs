@@ -441,7 +441,7 @@ pub enum KeyGroup {
     Scroll,
     /// 剪贴板。
     Clipboard,
-    /// 鼠标。
+    /// 鼠标（归终端，只列终端原生行为）。
     Mouse,
 }
 
@@ -462,7 +462,7 @@ impl KeyGroup {
             Self::Submit => "提交与退出",
             Self::Scroll => "滚动与跳转",
             Self::Clipboard => "剪贴板",
-            Self::Mouse => "鼠标",
+            Self::Mouse => "鼠标（归终端）",
         }
     }
 }
@@ -474,7 +474,7 @@ impl KeyGroup {
 ///
 /// **不列 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（见 `events.rs`
 /// 模块头）。**不列 `⌥+↓`**：Terminal.app 发 `ESC[B`，与普通 `↓` 同形。
-static KEYBINDINGS: [KeyBinding; 22] = [
+static KEYBINDINGS: [KeyBinding; 21] = [
     KeyBinding {
         keys: "← / →",
         action: "移动输入光标（Ctrl 或 ⌥ + ←/→ 按词移动；⌥b / ⌥f 同义）",
@@ -578,26 +578,20 @@ static KEYBINDINGS: [KeyBinding; 22] = [
         note: None,
     },
     KeyBinding {
-        keys: "滚轮 / 触控板",
-        action: "逐 3 视觉行滚动对话（不影响输入历史）",
-        group: KeyGroup::Scroll,
-        note: None,
-    },
-    KeyBinding {
         keys: "Ctrl+C",
         action: "复制输入框选区",
         group: KeyGroup::Clipboard,
         note: None,
     },
     KeyBinding {
-        keys: "左键拖选（Chat 区）",
-        action: "标记对话内容（按不按 ⇧ 都行），松手不复制",
+        keys: "左键拖选",
+        action: "终端原生选区（应用不接管鼠标，任何终端行为一致）",
         group: KeyGroup::Mouse,
         note: None,
     },
     KeyBinding {
-        keys: "右键（Chat 区）",
-        action: "复制已标记的内容到系统剪贴板",
+        keys: "右键",
+        action: "终端原生菜单（复制 / 粘贴由终端提供）",
         group: KeyGroup::Mouse,
         note: None,
     },
@@ -675,7 +669,7 @@ pub fn keybind_text() -> String {
 const KEY_HELP_BRIEF: &str = "键位（完整表：/keybind）：
   ↑ ↓                输入框内先按视觉行移光标；到首/末行才取历史 / 滚动对话
   PageUp / PageDown  翻页；Ctrl+↑ / Ctrl+Home 最早，Ctrl+↓ / Ctrl+End 最新
-  滚轮 / 触控板上下   逐段滚动对话（不影响输入历史）
+  滚轮               由终端处理（滚 scrollback）；对话滚动用 PageUp / PageDown
   Home / End         输入行首 / 行尾（Ctrl+E 也是行尾）
   Ctrl+A             全选输入框（随后 Backspace 清空）
   Ctrl+V             粘贴系统剪贴板（读不到时用终端的 Ctrl+Shift+V）
@@ -860,9 +854,9 @@ pub fn status_text(view: &CodingView) -> String {
 ///
 /// 返回 `None` = 没有可复制的回复。
 ///
-/// **文本去往终端剪贴板**（OSC 52，由 `run.rs` 发序列）—— 不走「写进对话区让用户
-/// 手动选中」：`run.rs` 常开 `EnableMouseCapture`（ADR-0050 滚轮接管鼠标），
-/// 终端原生拖选因此失效，「可手动选中」是一个走不通的指路。
+/// **文本去往终端剪贴板**（OSC 52，由 `run.rs` 发序列），同时本机若装了
+/// `wl-copy` / `xclip` / `xsel` 也一并写 —— 用户既可以自己拖选（终端原生选区），
+/// 也可以直接用 `/copy` 一步到位。
 pub fn copy_text(app: &App) -> Option<&str> {
     app.transcript.iter().rev().find_map(|line| match line {
         TranscriptLine::Assistant(s) if !s.trim().is_empty() => Some(s.as_str()),
@@ -1645,7 +1639,6 @@ mod tests {
             "Ctrl+↑",
             "Ctrl+Home",
             "Ctrl+End",
-            "滚轮",
             "Home",
             "Ctrl+A",
             "Ctrl+V",
@@ -1802,13 +1795,8 @@ mod tests {
     // `/copy` 走终端剪贴板（OSC 52）—— 不再依赖用户手动选中
     // -----------------------------------------------------------------------
 
-    /// **回归测试（Bug：`/copy` 无法获取内容）**。
-    ///
-    /// 原实现把正文写进 `System` 行并提示"可手动选中"，但 `run.rs` 常开
-    /// `EnableMouseCapture`（ADR-0050 为滚轮接管鼠标）⇒ 终端原生拖选失效
-    /// ⇒ 提示所指的那条路**物理上走不通**，`/copy` 在任何终端上都不可能成功。
-    ///
-    /// 修复后：正文交给 `pending_clipboard`，由 `run.rs` 用 OSC 52 写进终端剪贴板。
+    /// 正文交给 `pending_clipboard`，由 `run.rs` 用 OSC 52 写进终端剪贴板，
+    /// 并提示已进剪贴板 —— 不把正文倾倒进 transcript。
     #[test]
     fn test_copy_hands_text_to_clipboard_instead_of_manual_selection() {
         let mut a = app();
@@ -1830,7 +1818,7 @@ mod tests {
         assert!(s.contains("剪贴板"), "确认行须说明已进剪贴板：{s}");
         assert!(
             !s.contains("手动选中"),
-            "不得再让用户手动选中（鼠标捕获下走不通）：{s}"
+            "正文已进剪贴板，不该再让用户手动选中：{s}"
         );
         assert!(
             !s.contains("正文二"),

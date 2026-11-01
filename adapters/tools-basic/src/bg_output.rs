@@ -183,8 +183,9 @@ pub fn render_completion(c: &BgCompletion) -> Message {
         )),
     }
 
+    // 这是 harness 产生的输入（后台命令完成的结果），用户没说过 ⇒ `Harness`。
     Message {
-        role: Role::User,
+        role: Role::Harness,
         content: vec![ContentBlock::Text {
             text: lines.join("\n"),
         }],
@@ -430,7 +431,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **非零退码**：退码同样写在首行 —— 完成项是 `User` 消息，**没有 `is_error` 位**
+    /// **完成结果的角色是 `Harness`**：这是 harness 注入的输入，用户没说过。
+    ///
+    /// `/resume` 回放时事件流已不存在 ⇒ 只能靠角色把它与用户真说的话区分开。
+    ///
+    /// 变异：角色写回 `Role::User` ⇒ 本用例变红。
+    #[test]
+    fn a_completion_message_is_marked_as_harness_not_user() {
+        let (completion, path) = completion_with_output(BgState::Exited(Some(0)), Some(b"done\n"));
+
+        let message = render_completion(&completion);
+        assert_eq!(
+            message.role,
+            Role::Harness,
+            "后台命令完成的结果是 harness 输入，不得落成用户消息"
+        );
+        assert_ne!(message.role, Role::User);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **非零退码**：退码同样写在首行 —— 完成项是 `Harness` 消息，**没有 `is_error` 位**
     /// ⇒ 「失败」只能由措辞携带。
     ///
     /// 变异：首行固定写 `exit 0` ⇒ 本用例变红。

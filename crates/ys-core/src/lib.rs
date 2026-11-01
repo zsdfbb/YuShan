@@ -33,6 +33,23 @@ mod tests {
         assert_eq!(msg, back);
     }
 
+    /// `Role::Harness` 的落盘形态是**对外契约**（`/resume` 按它认来源）
+    /// ⇒ 序列化字符串必须钉死，且必须与 `User` 区分得开。
+    ///
+    /// 变异：变体改名 / 把它合并回 `User`（同一变体或 `#[serde(alias)]`）
+    /// ⇒ 字面量断言与「与 User 不同」断言同时变红。
+    #[test]
+    fn test_role_harness_serde_roundtrip() {
+        let json = serde_json::to_string(&Role::Harness).unwrap();
+        assert_eq!(json, "\"Harness\"", "序列化字符串是对外契约，不得改名");
+        let back: Role = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Role::Harness);
+
+        let user_json = serde_json::to_string(&Role::User).unwrap();
+        assert_ne!(json, user_json, "Harness 必须能与 User 区分");
+        assert_ne!(back, Role::User, "反序列化回来不得落到 User");
+    }
+
     #[test]
     fn test_tool_call_serde_roundtrip() {
         let call = ToolCall {

@@ -450,6 +450,16 @@ pub struct BackgroundTasks {
     deferred: Mutex<SinkSlot>,
     /// 完成正文的渲染回调（未装载 ⇒ 清扫不投递，回 `Pending`）。
     renderer: Mutex<Option<CompletionRenderer>>,
+    /// 「有新完成项落地」的一次性唤醒 —— **让回合外的完成也能被看见**。
+    ///
+    /// 回合结束后落点即解绑，完成项只能停回 `Pending`；而表在回合外没有读者
+    /// （唯一的补投入口是回合开头的 `take_completions`）⇒ 不加唤醒，用户会以为
+    /// 「命令还在跑」而它其实早就跑完了。
+    ///
+    /// **只在 `Running` / `Killed` 首次推进到终态时播报**：每 tick 无条件播报会让
+    /// 空闲态每 100ms 醒一次（忙转），而「可能有了」不等于「一定有」⇒ 消费端仍须
+    /// 用 [`BackgroundTasks::has_pending`] 复核。
+    wake: tokio::sync::Notify,
 }
 
 /// 投递落点格。
@@ -474,7 +484,29 @@ impl BackgroundTasks {
                 generation: 0,
             }),
             renderer: Mutex::new(None),
+            wake: tokio::sync::Notify::new(),
         }
+    }
+
+    /// 某会话是否还有「已终态但尚未投出」的完成项。
+    ///
+    /// 唤醒只是「**可能**有了」的信号（`notify_waiters` 不区分事件类型，也可能来自
+    /// 别的写入方）⇒ 醒来后必须复核，不能假定一定非空。
+    pub fn has_pending(&self, session: &str) -> bool {
+        let inner = self.lock();
+        inner.entries.iter().any(|entry| {
+            entry.session == session
+                && entry.state != BgState::Running
+                && entry.delivery == Delivery::Pending
+        })
+    }
+
+    /// 等到「可能有新的完成项待投」。
+    ///
+    /// 只报「可能有」，不报具体是什么 —— 消费端一律先用
+    /// [`has_pending`](Self::has_pending) 复核，空则无动作。
+    pub async fn notified(&self) {
+        self.wake.notified().await;
     }
 
     /// 装载完成正文的渲染回调 —— 只需装一次（进程级）。
@@ -738,17 +770,21 @@ impl BackgroundTasks {
     /// `start` / `snapshot` / `take_completions` 的必经之路。
     pub fn sweep(&self) {
         // ── 段 1（持锁）：状态推进 + 认领，**不做 IO、不 fork** ──
-        let (to_kill, claimed) = {
+        let (to_kill, claimed, newly_terminal) = {
             let mut inner = self.lock();
             Self::repair_inflight(&mut inner);
             // 输出上限闸门**先标记后收尸**，顺序不可颠倒
             // （收尸 ⇒ pid 可被复用 ⇒ `kill -9 -<pid>` 会打到无关的进程组）。
+            // 段 1 内所有状态写入都在同一把锁里 ⇒ 在跑数的减少量恰好是「本次推进
+            // 到终态的条目数」：认领不改 `state`，淘汰只删已在终态的条目。
+            let running = Self::running_count(&inner);
             let mut to_kill = self.enforce_output_cap(&mut inner);
             to_kill.extend(self.reap(&mut inner));
+            let newly_terminal = running - Self::running_count(&inner);
             // 认领候选 —— **任何会话**的（清扫是进程级的）：
             // 未绑定落点 / 不属当前会话的结果会停回 `Pending` 等下一回合补投。
             let claimed = Self::claim_completions(&mut inner, None);
-            (to_kill, claimed)
+            (to_kill, claimed, newly_terminal)
         };
 
         // ── 段 2（无锁）：重活 ──
@@ -756,12 +792,35 @@ impl BackgroundTasks {
         self.deliver(claimed);
 
         // ── 段 3（持锁）：淘汰超额的完成项（只碰 `Pending` / `Delivered`）──
-        let mut inner = self.lock();
-        while Self::pending_completions(&inner) > self.limits.max_entries {
-            if !Self::evict_oldest_completed(&mut inner) {
-                break;
+        {
+            let mut inner = self.lock();
+            while Self::pending_completions(&inner) > self.limits.max_entries {
+                if !Self::evict_oldest_completed(&mut inner) {
+                    break;
+                }
             }
         }
+
+        // 唤醒在**锁外**：`notify` 会调外部代码（唤醒等待者），不应持锁。
+        // 只在「本次有新完成」时播报 ⇒ 空闲态不会每 tick 醒一次（忙转）。
+        // 时段 3 之后：该投的已投出（`Delivered`）⇒ 消费端复核 `has_pending` 看到的
+        // 正是「真的还没投出」的那些。
+        if newly_terminal > 0 {
+            // `notify_one`（存 permit）而不是 `notify_waiters`：消费端大部分时间不挂在
+            // `notified()` 上（回合进行中 / 正在处理别的请求），而 `notify_waiters`
+            // **不存 permit** ⇒ 完成项正好落在那段间隙里，唤醒就落空，那行提示要等到
+            // 下一次（可能不来的）完成或用户输入。代价是一次可被复核吸收的假醒。
+            self.wake.notify_one();
+        }
+    }
+
+    /// 表中仍在跑（`Running`）的条目数。
+    fn running_count(inner: &Inner) -> usize {
+        inner
+            .entries
+            .iter()
+            .filter(|entry| entry.state == BgState::Running)
+            .count()
     }
 
     /// 取「已终态且 `Pending`」的完成项（**当前回合**）—— 内部置 `InFlight`。
@@ -890,11 +949,21 @@ impl BackgroundTasks {
     /// 与 `sweep` 的 `reap` 互补：那条路径靠 `try_wait` 观察，这条靠 watcher 主动告知。
     /// 已终态的条目不重复改写（可能已被 `Killed`）。
     pub fn mark_finished(&self, handle: BgHandle, exit_code: Option<i32>) {
-        let mut inner = self.lock();
-        if let Some(entry) = inner.entries.iter_mut().find(|e| e.handle == handle)
-            && entry.state == BgState::Running
-        {
-            entry.state = BgState::Exited(exit_code);
+        let advanced = {
+            let mut inner = self.lock();
+            match inner.entries.iter_mut().find(|e| e.handle == handle) {
+                Some(entry) if entry.state == BgState::Running => {
+                    entry.state = BgState::Exited(exit_code);
+                    true
+                }
+                _ => false,
+            }
+        };
+        // 这条路径同样是一次「新完成」（只是由 watcher 告知，不靠 `sweep` 的收尸）
+        // ⇒ 同样要播报，否则过继的条目在空闲态永远等不到告知。
+        // 唤醒在**锁外**（见 [`Self::sweep`]）。
+        if advanced {
+            self.wake.notify_one();
         }
     }
 
@@ -1985,6 +2054,83 @@ mod tests {
         assert!(matches!(error, BgError::InvalidSession(_)), "got {error:?}");
         assert_eq!(tasks.entry_count(), 0);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `has_pending` 只认「已终态 **且** 未投递」；`notify` 只在**有新完成**时播报。
+    ///
+    /// 变异：把 `sweep` 里的 `if newly_terminal > 0` 去掉（每 tick 无条件播报）
+    /// ⇒ 空闲态将每 100ms 醒来一次 —— 本用例的「无新完成时不得返回」会变红。
+    ///
+    /// 变异：把 `has_pending` 的状态条件去掉（只按 `Pending` 算）⇒ 第三条断言变红
+    /// （还在跑的命令不得算「待投」）。
+    #[tokio::test]
+    async fn notify_only_on_new_completion() {
+        let dir = test_dir("bg_notify");
+        let tasks = Arc::new(BackgroundTasks::new(dir.clone(), BgLimits::default()));
+        let cwd = std::env::temp_dir();
+
+        // 还在跑：既不是待投，也不会播报。
+        let _running = tasks.start("s", "sleep 0.4", &cwd, None).unwrap();
+        assert!(
+            !tasks.has_pending("s"),
+            "还在跑的命令不算待投（`has_pending` 必须同时看进程状态）"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), tasks.notified())
+                .await
+                .is_err(),
+            "没有新完成时不得播报（否则空闲态每 tick 醒一次）"
+        );
+        assert!(
+            !tasks.has_pending("other"),
+            "别的会话（以及不存在的会话）不得算待投"
+        );
+
+        // 等它自己跑完，再由**清扫**推进到终态 —— 这就是生产侧的那条路径。
+        let mut announced = false;
+        for _ in 0..200 {
+            tasks.sweep();
+            if tokio::time::timeout(Duration::from_millis(20), tasks.notified())
+                .await
+                .is_ok()
+            {
+                assert!(
+                    tasks.has_pending("s"),
+                    "播报时必须真的有新完成 —— 无条件播报会让空闲态每 tick 醒一次"
+                );
+                announced = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(announced, "命令跑完后清扫必须播报一次唤醒");
+        assert!(tasks.has_pending("s"), "已终态且未投递 ⇒ 必须算待投");
+        assert!(!tasks.has_pending("other"), "会话过滤不得失效");
+
+        // 投出之后不再是待投（此时也不再有新完成 ⇒ 不再播报）。
+        tasks.set_completion_renderer(|candidate| Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: candidate.handle.label(),
+            }],
+        });
+        let sink = Arc::new(QueueBoundarySource::new());
+        let _binding = tasks.bind_deferred(Arc::clone(&sink));
+        tasks.sweep();
+        assert!(sink.take().is_some(), "绑定后应投出那条完成项");
+        assert!(!tasks.has_pending("s"), "已投出的不得再算待投");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), tasks.notified())
+                .await
+                .is_err(),
+            "已投出、且没有新完成 ⇒ 不得再播报"
+        );
+
+        // 清理：确认没有遗留进程（`running` 早已跑完）。
+        tasks.kill_all("s");
+        tasks.sweep();
+        assert!(tasks.running_handles("s").is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

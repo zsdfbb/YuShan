@@ -82,12 +82,6 @@ use crate::wiring::Wiring;
 /// 共享 sweeper 的 tick 间隔 —— 100ms。
 const BG_SWEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// 每个回合开头最多补投多少条**已完成的**后台结果。
-///
-/// 超出部分留在注册表里（仍为 `Pending`）⇒ 后续回合继续补投。
-/// 一次灌完会把回合开头变成噪音，而且模型也处理不了十条并发的结果。
-const BG_CATCHUP_PER_TURN: usize = 2;
-
 /// 共享 sweeper 的进程级条目 —— (注册表的弱引用, sweeper 任务句柄)。
 type BgSweeperEntry = (Weak<BackgroundTasks>, tokio::task::JoinHandle<()>);
 
@@ -145,6 +139,17 @@ fn ensure_background_sweeper(tasks: Arc<BackgroundTasks>) {
 /// 当前会话 id（后台注册表的会话键）—— `None` = 本接线器不带后台能力。
 fn background_session_id(wiring: &Wiring) -> Option<String> {
     wiring.backgrounds().map(|context| context.session_id())
+}
+
+/// 把「可选的唤醒源」变成一条 `select!` 分支：无源 ⇒ `None`。
+///
+/// 用 `Some(..) = …` 模式形式接住结果：模式不匹配时 tokio **禁用**该分支（本次
+/// `select!` 不再轮询它）⇒ 未挂该能力时既不会忙转，也不会被它抢先返回。
+async fn optional_wake<F: std::future::Future>(source: Option<F>) -> Option<F::Output> {
+    match source {
+        Some(source) => Some(source.await),
+        None => None,
+    }
 }
 
 /// 杀掉某会话的全部后台命令进程组（**按会话过滤**）。
@@ -284,6 +289,20 @@ enum Wake {
     /// 等于在用户没开口时替他花一次模型调用，且合成消息会落盘、`/resume` 回放会把
     /// 它画成「用户说过的话」。
     SubagentReturned,
+    /// 有后台命令**跑完了**（进了终态、结果留在投递表里）。
+    ///
+    /// 这里**自动起一轮**把结果交给模型处理：后台命令的返回是一种输入，而命令本身
+    /// 就是工作内容 —— 跑完就该继续，不该搁置到用户下次开口。起回合前先
+    /// [`BackgroundTasks::has_pending`](ys_tools_basic::BackgroundTasks::has_pending)
+    /// 复核：唤醒只说「可能有」（清扫是进程级、会话级过滤在这一侧），空则什么都不做。
+    ///
+    /// 与 [`Wake::SubagentReturned`] **有意不对称**：子 agent 的结果仍是「只告知」，
+    /// 它的注入时机走子 agent 自己的语义（父回合等待 / 跨回合投递表），不额外起回合。
+    ///
+    /// **不会热循环**：`sweep` 的 `notify` 只在**新终态**时发（`newly_terminal > 0`），
+    /// 而本回合把 `Pending` 一次取完（`take_completions`） ⇒ 醒来时表里已空。
+    /// 取出的条目先落 `InFlight`，投递失败才回 `Pending`，而那要等下一次新终态唤醒。
+    BackgroundReturned,
 }
 
 /// 跑 app 侧循环，直到 UI 侧把所有发送端 drop 掉（= 正常收摊）。
@@ -365,25 +384,20 @@ pub async fn run(
         // 目录到手 ⇒ 并入 registry、刷新一次视图：`/model` 候选此刻才拿到这两家的
         // 模型名（渲染路径依旧一次 HTTP 都不发，写与读同在这个线程）。
         let wake = {
-            // 「子 agent 结果落地」这条分支只在挂了派发能力时存在。
-            // `Some(..) = …` 模式形式：`subagent` 为 `None` 时该分支被 tokio **禁用**，
+            // 「子 agent 结果落地」与「后台命令跑完」这两条分支只在挂了对应能力时存在。
+            // 一律用 `Some(..) = …` 模式形式：源为 `None` 时该分支被 tokio **禁用**，
             // 不会忙转。
             let pending = subagent.as_ref().map(|s| s.pending_results().notified());
-            match (models_rx.as_mut(), pending) {
-                (Some(rx), Some(returned)) => tokio::select! {
-                    req = request_rx.recv() => Wake::Request(req),
-                    cache = rx.recv() => Wake::Models(cache),
-                    _ = returned => Wake::SubagentReturned,
-                },
-                (Some(rx), None) => tokio::select! {
-                    req = request_rx.recv() => Wake::Request(req),
-                    cache = rx.recv() => Wake::Models(cache),
-                },
-                (None, Some(returned)) => tokio::select! {
-                    req = request_rx.recv() => Wake::Request(req),
-                    _ = returned => Wake::SubagentReturned,
-                },
-                (None, None) => Wake::Request(request_rx.recv().await),
+            let background = wiring
+                .backgrounds()
+                .map(|context| context.tasks().notified());
+            tokio::select! {
+                req = request_rx.recv() => Wake::Request(req),
+                Some(cache) = optional_wake(models_rx.as_mut().map(|rx| rx.recv())) => {
+                    Wake::Models(cache)
+                }
+                Some(()) = optional_wake(pending) => Wake::SubagentReturned,
+                Some(()) = optional_wake(background) => Wake::BackgroundReturned,
             }
         };
         let req = match wake {
@@ -431,6 +445,63 @@ pub async fn run(
                 }
                 continue;
             }
+            Wake::BackgroundReturned => {
+                // 会话 id 在**唤醒时**从共享槽读（`/new` / `/resume` 会换槽）⇒ 只看
+                // 本会话的完成项。复核必须留：唤醒只说「可能有」（清扫是进程级的），
+                // 也可能来自别的会话，或结果已被某个回合的补投取走
+                // （`InFlight` / `Delivered` 都不算 `Pending`）⇒ 空则什么都不做。
+                let has_pending = wiring.backgrounds().is_some_and(|context| {
+                    should_start_background_turn(context.tasks(), &context.session_id())
+                });
+                if !has_pending {
+                    continue;
+                }
+                // 占位输入**不是**用户说的话 ⇒ `Role::Harness`：`BasicLoop` 照它 append
+                // 进会话（与任何回合的输入同一条路径），TUI 据 `Role` 画 System 行。
+                // 真正的内容是随后经 `Boundary::Deferred` 注入的那几条结果。
+                let message = background_placeholder();
+                run_turn_chain(
+                    &mut agent,
+                    &mut wiring,
+                    &config,
+                    &mut turns,
+                    &mut stats,
+                    thinking_visible,
+                    &mut run_rounds,
+                    &out_tx,
+                    &mut sink_rx,
+                    &mut boundary_rx,
+                    subagent.as_ref(),
+                    debug.as_mut(),
+                    &debug_session_id,
+                    &worktree,
+                    message,
+                    // 占位消息不是用户说的话 ⇒ 不贡献标题素材。
+                    None,
+                )
+                .await?;
+                // 回合收场的快照刷新与其它请求同规（本臂 `continue`，走不到循环尾部
+                // 的那次刷新）—— 否则状态行会停在自动回合**之前**的读数上。
+                let view = build_view(
+                    &config,
+                    &agent,
+                    &wiring,
+                    &config.registry,
+                    &state_store,
+                    &stats,
+                    session_started,
+                    theme,
+                );
+                send_or_flush(
+                    &out_tx,
+                    Outbound::View(view),
+                    &mut debug,
+                    &stats,
+                    run_rounds,
+                )
+                .await?;
+                continue;
+            }
             Wake::Models(cache) => {
                 models_rx = None; // 目录只投一次；此后不再参与 `select!`
                 if let Some(cache) = cache {
@@ -476,90 +547,25 @@ pub async fn run(
                 // **只作用于用户原文** —— 复核消息由 `should_review` 直接产出、不再展开。
                 let message = expand_skill_invocation(message, &config.skills);
 
-                // 一个 `Request::Prompt` **恰好跑一个回合**（ADR-0041 撤回了完工复核）。
-                //
-                // **wall-clock 预算在此算一次**：`deadline` 覆盖整个 `pending` 循环
-                // —— 主回合与复核回合共享同一个截止点，时长只来自
-                // `config.max_turn_duration()`。
-                let request_started = Instant::now();
-                let deadline = request_started + config.max_turn_duration();
-                // 本请求一份子 usage 累加器（跨主回合 + 复核回合）。
-                let subagent_totals = Arc::new(crate::subagent::UsageTotals::default());
-                let mut ctx = TurnCtx {
-                    agent: &mut agent,
-                    wiring: &mut wiring,
-                    config: &config,
-                    turns: &mut turns,
-                    stats: &mut stats,
+                run_turn_chain(
+                    &mut agent,
+                    &mut wiring,
+                    &config,
+                    &mut turns,
+                    &mut stats,
                     thinking_visible,
-                    deadline,
-                    request_started,
-                    cumulative_rounds: 0,
-                    run_rounds: &mut run_rounds,
-                    out_tx: &out_tx,
-                    sink_rx: &mut sink_rx,
-                    boundary_rx: &mut boundary_rx,
-                    subagent: subagent.as_ref(),
-                    subagent_totals,
-                    debug: debug.as_mut(),
-                    debug_session_id: &debug_session_id,
-                };
-                // **一个 `Request::Prompt` 恰好跑一个回合** —— 没有完工复核
-                // （ADR-0041 撤回 ADR-0027 决策 2）。
-                // 外层 `Err` = UI 已收摊（出站失败）：先收尾 debug 再退出；
-                // 内层 `TurnOutcome` 的 `Err` 只是本回合模型/工具失败，app 继续。
-                match run_turn_once(&mut ctx, AgentInput::new(message)).await {
-                    Ok(outcome) => match outcome {
-                        Ok(result) => {
-                            ctx.stats.record_result(&result);
-                            // **执行口径**的时长累加：与上面的 usage 同一位置 ⇒
-                            // 「token 统计」与「时长统计」覆盖同一批回合。
-                            // 失败回合也计入（模型跑过了就是占用了墙钟）⇒ 见下。
-                            ctx.stats.record_elapsed(ctx.request_started.elapsed());
-                            // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
-                            let model = ctx.wiring.model_id().map(str::to_string);
-                            // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
-                            let ws = worktree.get();
-                            if let Err(e) = crate::finalize_turn_meta(
-                                ctx.wiring,
-                                raw_user_text.as_deref(),
-                                ctx.config.provider.as_deref(),
-                                model.as_deref(),
-                                Some(ctx.thinking_visible),
-                                // TUI 模式：档位随回合末写穿会话 meta。
-                                Some(ctx.config.effort),
-                                ws.as_ref().map(|b| b.path.as_path()),
-                                ctx.stats,
-                            )
-                            .await
-                            {
-                                logging::log(&format!("failed to persist session meta: {e}"));
-                            }
-                        }
-                        // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
-                        // Error 行，这里不再往 transcript 重复刷一条，只落日志。
-                        // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
-                        // **但时长要计入**：模型跑过了就是占用了墙钟 ⇒
-                        // 执行口径必须包含失败回合，否则「跑失败的时长」凭空消失。
-                        Err(e) => {
-                            ctx.stats.record_elapsed(ctx.request_started.elapsed());
-                            logging::log(&format!("turn {} failed: {e}", ctx.turns));
-                        }
-                    },
-                    Err(e) => {
-                        let rounds = *ctx.run_rounds;
-                        let usage = ctx.stats.cumulative_usage();
-                        if let Some(sink) = ctx.debug.as_deref_mut() {
-                            sink.flush_run(crate::debug_log::RunEndMeta {
-                                stop_reason: "RunFailed",
-                                rounds,
-                                exit_code: 1,
-                                usage: Some(&usage),
-                            });
-                        }
-                        return Err(e);
-                    }
-                }
+                    &mut run_rounds,
+                    &out_tx,
+                    &mut sink_rx,
+                    &mut boundary_rx,
+                    subagent.as_ref(),
+                    debug.as_mut(),
+                    &debug_session_id,
+                    &worktree,
+                    message,
+                    raw_user_text,
+                )
+                .await?;
             }
 
             Request::SetThinking { visible } => {
@@ -1273,6 +1279,140 @@ async fn send_or_flush(
     }
 }
 
+/// 跑**一条回合链**（目前总是一回合：ADR-0041 撤回了完工复核）。
+///
+/// 两个调用点共用它：`Request::Prompt`（用户发言）与 `Wake::BackgroundReturned`
+/// （后台结果自动起回合）。回合本身的推进/记账/写穿 meta 只有一份实现，否则两处
+/// 必然漂移。
+///
+/// **wall-clock 预算在此算一次**：`deadline` 覆盖整条链，时长只来自
+/// `config.max_turn_duration()`。
+///
+/// **`raw_user_text` 由调用方传入**：标题素材必须取**用户原文**（`/name` 展开前的
+/// 那一行，C3）—— 展开后是 `<skill …>` 信封，不能当标题。harness 占位消息没有
+/// 原文 ⇒ 传 `None`。
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_chain(
+    agent: &mut Agent,
+    wiring: &mut Wiring,
+    config: &Config,
+    turns: &mut u32,
+    stats: &mut TurnStats,
+    thinking_visible: bool,
+    run_rounds: &mut u32,
+    out_tx: &mpsc::Sender<Outbound<CodingView>>,
+    sink_rx: &mut mpsc::Receiver<Envelope>,
+    boundary_rx: &mut mpsc::Receiver<Boundary>,
+    subagent: Option<&crate::subagent::SubagentSetup>,
+    debug: Option<&mut DebugSink>,
+    debug_session_id: &str,
+    worktree: &WorktreeHandle,
+    message: Message,
+    raw_user_text: Option<String>,
+) -> Result<(), AppLoopError> {
+    let request_started = Instant::now();
+    let deadline = request_started + config.max_turn_duration();
+    let subagent_totals = Arc::new(crate::subagent::UsageTotals::default());
+    let mut ctx = TurnCtx {
+        agent,
+        wiring,
+        config,
+        turns,
+        stats,
+        thinking_visible,
+        deadline,
+        request_started,
+        cumulative_rounds: 0,
+        run_rounds,
+        out_tx,
+        sink_rx,
+        boundary_rx,
+        subagent,
+        subagent_totals,
+        debug,
+        debug_session_id,
+    };
+    // 外层 `Err` = UI 已收摊（出站失败）：先收尾 debug 再退出；
+    // 内层 `TurnOutcome` 的 `Err` 只是本回合模型/工具失败，app 继续。
+    match run_turn_once(&mut ctx, AgentInput::new(message)).await {
+        Ok(outcome) => match outcome {
+            Ok(result) => {
+                ctx.stats.record_result(&result);
+                // **执行口径**的时长累加：与上面的 usage 同一位置 ⇒
+                // 「token 统计」与「时长统计」覆盖同一批回合。
+                // 失败回合也计入（模型跑过了就是占用了墙钟）⇒ 见下。
+                ctx.stats.record_elapsed(ctx.request_started.elapsed());
+                // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
+                let model = ctx.wiring.model_id().map(str::to_string);
+                // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
+                let ws = worktree.get();
+                if let Err(e) = crate::finalize_turn_meta(
+                    ctx.wiring,
+                    raw_user_text.as_deref(),
+                    ctx.config.provider.as_deref(),
+                    model.as_deref(),
+                    Some(ctx.thinking_visible),
+                    // TUI 模式：档位随回合末写穿会话 meta。
+                    Some(ctx.config.effort),
+                    ws.as_ref().map(|b| b.path.as_path()),
+                    ctx.stats,
+                )
+                .await
+                {
+                    logging::log(&format!("failed to persist session meta: {e}"));
+                }
+            }
+            // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
+            // Error 行，这里不再往 transcript 重复刷一条，只落日志。
+            // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
+            // **但时长要计入**：模型跑过了就是占用了墙钟 ⇒
+            // 执行口径必须包含失败回合，否则「跑失败的时长」凭空消失。
+            Err(e) => {
+                ctx.stats.record_elapsed(ctx.request_started.elapsed());
+                logging::log(&format!("turn {} failed: {e}", ctx.turns));
+            }
+        },
+        Err(e) => {
+            let rounds = *ctx.run_rounds;
+            let usage = ctx.stats.cumulative_usage();
+            if let Some(sink) = ctx.debug.as_deref_mut() {
+                sink.flush_run(crate::debug_log::RunEndMeta {
+                    stop_reason: "RunFailed",
+                    rounds,
+                    exit_code: 1,
+                    usage: Some(&usage),
+                });
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// 后台结果唤醒的**复核判据**：本会话是否真的有已终态、尚未投出的结果。
+///
+/// 唤醒只说「**可能**有了」（清扫是进程级的，`notify` 也不携带会话信息）⇒ 起回合前
+/// 必须复核。空 ⇒ 不起回合、不发文案（既省一次模型调用，也不制造噪音）。
+fn should_start_background_turn(tasks: &BackgroundTasks, session: &str) -> bool {
+    tasks.has_pending(session)
+}
+
+/// 后台结果自动起回合时的占位输入。
+///
+/// 它**不是用户说的话** ⇒ `Role::Harness`。`BasicLoop` 会照它 append 进会话
+/// （与任何回合的输入同一条路径），TUI 据 `Role` 画出 System 行而非用户行。
+///
+/// 正文说清「这只是占位」：真正的内容是随后经 `Boundary::Deferred` 注入的那些结果，
+/// 模型看到的是那几条，不是这一行。
+fn background_placeholder() -> Message {
+    Message {
+        role: Role::Harness,
+        content: vec![ContentBlock::Text {
+            text: "[harness] 后台命令结果已送入上下文，请据此继续。".to_string(),
+        }],
+    }
+}
+
 /// 逐轮计时状态机 —— 定义在 [`crate::round_clock`]（两条入口共用同一套口径）。
 use crate::round_clock::{RoundClock, turn_cache, turn_line};
 
@@ -1391,19 +1531,18 @@ async fn run_turn_once(
         let _bg_binding = background
             .as_ref()
             .map(|(tasks, _)| tasks.bind_deferred(boundary.clone()));
-        // 上一回合（或落点未绑的那一瞬）攺下的完成项：**一次性补投**。
-        // 每回合最多补投 [`BG_CATCHUP_PER_TURN`] 条 —— 其余留在表里（仍为 `Pending`），
-        // 于后续回合继续补投：一次灌十条会把回合开头变成噪音。
+        // 上一回合（或落点未绑的那一瞬）攺下的完成项：**一次取完**。
+        //
+        // 起一个回合已经付了模型调用，欠下的结果一次带完比「为剩下几条再起几轮」
+        // 便宜；限流还会让「限流外的条目停在 `Pending`、而唤醒只在**新终态**时发」
+        // 变成死角（再也没人唤醒它们）。上界由 `BgLimits::max_entries`（默认 8）与
+        // 单条正文截断（`MAX_BYTES` = 50 KiB）给出，不需要额外的每回合限流。
         //
         // 取出的条目已被认领（`InFlight`）⇒ **每条都必须落状态**，否则它会卡到
         // 下一 tick 的修复才重投。渲染总是给出正文（输出读不出时是「不可读」形态），
         // 故这里不存「空正文」分支：空正文会让模型以为「命令没有输出」。
         if let Some((tasks, session)) = background.as_ref() {
-            for candidate in tasks
-                .take_completions(session)
-                .into_iter()
-                .take(BG_CATCHUP_PER_TURN)
-            {
+            for candidate in tasks.take_completions(session) {
                 boundary.push(Boundary::Deferred {
                     handle: candidate.handle.label(),
                     message: render_completion(&candidate),
@@ -1651,6 +1790,12 @@ async fn run_turn_once(
 ///   `None` ⇒ 原样返回（宁可发一条普通消息，也不塞半截指令）。
 /// - **不缓存**正文：skill 目录可写（agent 会往里写文件），缓存会给出陈旧指令。
 fn expand_skill_invocation(message: Message, skills: &[crate::skills::SkillEntry]) -> Message {
+    // skill 调用是**用户输入**的概念：只有 `Role::User` 才展开。harness 注入的输入
+    // （后台命令结果等）与用户原文可以长得一样，但它不是用户在敲命令 —— 展开会
+    // 顺带把角色重建成 `User`（见下面的 `Message { role: Role::User, .. }`）。
+    if message.role != Role::User {
+        return message;
+    }
     let Some(text) = first_text(&message) else {
         return message;
     };
@@ -1978,6 +2123,8 @@ mod tests {
                 tmp.join("bg-root"),
                 ys_tools_basic::BgLimits::default(),
             ));
+            // 完成正文的渲染回调：生产侧由 `main` 装载，未装载则清扫不投递。
+            tasks.set_completion_renderer(ys_tools_basic::render_completion);
             let slot = ys_tools_basic::SessionSlot::new("pending");
             wiring.attach_backgrounds(crate::wiring::BackgroundContext::new(
                 Arc::clone(&tasks),
@@ -2277,11 +2424,108 @@ mod tests {
     }
 
     fn has_text(request: &ModelRequest, needle: &str) -> bool {
-        request.messages.iter().any(|m| {
-            m.content
+        request.messages.iter().any(|m| has_text_in(m, needle))
+    }
+
+    /// 单条消息里是否有包含 `needle` 的文本块。
+    fn has_text_in(message: &Message, needle: &str) -> bool {
+        message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
+    }
+
+    /// 记录每次模型调用的请求 —— 供「后台结果是否自动起了回合」取证。
+    #[derive(Default)]
+    struct CallLog {
+        calls: AtomicU32,
+        requests: Mutex<Vec<ModelRequest>>,
+    }
+
+    impl CallLog {
+        fn count(&self) -> u32 {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn requests(&self) -> Vec<ModelRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// 每次调用都立刻收工的模型：回合数=1，便于精确断言「是否多起了回合」。
+    struct CountingModel(Arc<CallLog>);
+
+    #[async_trait::async_trait]
+    impl Model for CountingModel {
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.0.calls.fetch_add(1, Ordering::Relaxed);
+            self.0.requests.lock().unwrap().push(request);
+            Ok(text_response("ok"))
+        }
+    }
+
+    /// 把本回合收到的 `DeferredResult` 按回合号归组。
+    fn deferred_by_turn(
+        msgs: &[Outbound<CodingView>],
+        into: &mut std::collections::BTreeMap<u32, String>,
+    ) {
+        for m in msgs {
+            let Outbound::Event(env) = m else { continue };
+            let AgentEvent::DeferredResult { message, .. } = &env.event else {
+                continue;
+            };
+            let text: String = message
+                .content
                 .iter()
-                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle)))
-        })
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            into.entry(env.turn).or_default().push_str(&text);
+        }
+    }
+
+    /// 等「**某一个回合**里集齐了 `needles` 全部结果」，返回该回合号与该回合的正文。
+    ///
+    /// 后台结果只能经 `Boundary::Deferred` 进上下文（同一条路径 append + 进本轮
+    /// `ModelRequest`）⇒ 按回合归组就能判定「一次取完」，无需给模型塞探针。
+    async fn wait_for_one_turn_with(
+        h: &mut Harness,
+        already: Vec<Outbound<CodingView>>,
+        needles: &[&str],
+        limit: Duration,
+    ) -> (u32, String) {
+        let mut by_turn = std::collections::BTreeMap::new();
+        deferred_by_turn(&already, &mut by_turn);
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if let Some((&turn, text)) = by_turn
+                .iter()
+                .find(|(_, text)| needles.iter().all(|n| text.contains(n)))
+            {
+                return (turn, text.clone());
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "后台结果没有在**同一个回合**里集齐（每回合限流未拆除？已有：{by_turn:?}）"
+            );
+            let m = tokio::time::timeout(left, h.outbound.recv())
+                .await
+                .expect("等待 Outbound 超时")
+                .expect("app 循环不应提前收摊");
+            deferred_by_turn(&[m], &mut by_turn);
+        }
     }
 
     fn text_response(text: &str) -> ModelResponse {
@@ -3998,6 +4242,45 @@ mod tests {
         };
         let msg = user_message("/model-only");
         assert_eq!(expand_skill_invocation(msg.clone(), &[model_only]), msg);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`Role::Harness` 的消息不展开**：正文即使长得完全像 skill 调用（`/foo`），也
+    /// 必须**原样返回**、角色不得被改写成 `User`。
+    ///
+    /// skill 调用是**用户输入**的概念；harness 注入的输入（后台命令结果 / 占位消息）
+    /// 不是用户在敲命令。展开路径会重建 `Message { role: Role::User, .. }` ⇒ 若不过滤
+    /// 角色，后台结果会被当成用户发言（落盘 / 回放 / 统计全部说错来源）。
+    ///
+    /// 变异：删掉 `expand_skill_invocation` 开头的 `if message.role != Role::User`
+    /// ⇒ 本用例变红（正文被换成信封、角色变 `User`）。
+    #[test]
+    fn harness_role_is_not_rewritten_by_skill_expansion() {
+        let root = temp_dir_for("expand_harness");
+        let dir = root.join("foo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: 演示\n---\n正文\n").unwrap();
+        let (skills, _) = crate::skills::scan(std::slice::from_ref(&root));
+        assert_eq!(skills.len(), 1, "测试前提：恰好扫到一条 skill");
+        // 同一个调用形式用 `User` 是会展开的 —— 否则下面的断言就分不出「角色门控」
+        // 与「这个调用本来就没命中」。
+        let as_user = user_message("/foo");
+        assert_ne!(
+            expand_skill_invocation(as_user.clone(), &skills),
+            as_user,
+            "测试前提：`/foo` 在 `Role::User` 下确实会被展开"
+        );
+
+        let harness = Message {
+            role: Role::Harness,
+            content: vec![ContentBlock::Text {
+                text: "/foo".to_string(),
+            }],
+        };
+        let out = expand_skill_invocation(harness.clone(), &skills);
+        assert_eq!(out, harness, "harness 输入必须逐字节原样返回");
+        assert_eq!(out.role, Role::Harness, "角色不得被改写成 `User`");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5743,11 +6026,16 @@ mod tests {
                 .snapshot(handle, session)
                 .expect("刚启动的条目应有快照")
                 .pid;
+            self.track_session(session);
+            self.pids.push(pid);
+            (handle, pid)
+        }
+
+        /// 把一条**外部**启动的会话也纳入收尾（不经本结构体的 `start*` 起命令时用）。
+        fn track_session(&mut self, session: &str) {
             if !self.sessions.iter().any(|known| known == session) {
                 self.sessions.push(session.to_string());
             }
-            self.pids.push(pid);
-            (handle, pid)
         }
     }
 
@@ -6027,6 +6315,230 @@ mod tests {
             reaped,
             "已退出的后台命令应被共享 sweeper 收尸（否则它一直占着 pid）"
         );
+    }
+
+    /// **后台结果在空闲态自动起一轮**，并把结果带进上下文。
+    ///
+    /// 走真实链路：`echo` 命令自己退出 ⇒ 共享 sweeper 的 `sweep` 推入终态 ⇒ 锁外
+    /// `notify` ⇒ app 循环的 `Wake::BackgroundReturned` 臂 ⇒ 复核通过 ⇒ 起一个回合。
+    ///
+    /// 三重断言（缺一都不足以钉住行为）：
+    /// ① 模型**多了一次调用**（回合真起了，而用户只提交了那一条请求）；
+    /// ② 该回合里确有命令的完成结果（`DeferredResult`，正文来自真实工具输出）；
+    /// ③ 占位消息的角色是 `Harness`，不是 `User`（它是 harness 输入，不是用户发言）。
+    ///
+    /// 变异：把该臂改回「只发一行 `Output` 提示、`continue`」⇒ ① 变红；
+    /// 去掉 `expand_skill_invocation` 的角色门控 ⇒ ③ 变红。
+    #[tokio::test]
+    async fn late_background_result_starts_a_turn_while_idle() {
+        const MARKER: &str = "BG-ONE-SHOT-MARKER";
+
+        let logs = TempDir::new("bg_wake_logs");
+        let _env = BgEnv::set(&logs.0);
+        let calls = Arc::new(CallLog::default());
+        let mut h =
+            spawn_app_loop_backgrounds(Box::new(CountingModel(Arc::clone(&calls))), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        // marker 只进**工具输出**（渲染成 `Deferred` 正文）；占位消息里没有它。
+        let (_handle, _pid) = cleanup.start_with(&session, &format!("echo {MARKER} >&2"));
+
+        // 回合 1：本用例唯一的一条用户请求。
+        h.requests.send(prompt("起个后台命令")).await.unwrap();
+        let first = collect_until_view(&mut h).await;
+        assert_eq!(calls.count(), 1, "前提：第 1 个回合恰好一次模型调用");
+
+        // **不再发任何请求** —— 空闲态必须自己起一轮。
+        let (background_turn, text) =
+            wait_for_one_turn_with(&mut h, first, &[MARKER], Duration::from_secs(10)).await;
+        assert!(
+            background_turn >= 2,
+            "完成结果必须落进**自动起的那个回合**（第 1 回合只是起命令）：{background_turn}"
+        );
+        assert!(text.contains(MARKER), "结果正文必须带上命令输出：{text}");
+
+        assert!(
+            calls.count() >= 2,
+            "空闲态必须再起一个回合（模型调用数应从 1 增至 ≥2），实际 {}",
+            calls.count()
+        );
+        let last = calls.requests().pop().expect("应有模型调用记录");
+        assert!(
+            has_text(&last, MARKER),
+            "自动起的回合必须已把命令结果注入模型上下文：{last:?}"
+        );
+        assert!(
+            last.messages
+                .iter()
+                .any(|m| m.role == Role::Harness && has_text_in(m, "[harness]")),
+            "占位输入必须是 `Role::Harness`（harness 产生的输入，非用户发言）：{last:?}"
+        );
+        assert!(
+            !last
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && has_text_in(m, "[harness]")),
+            "占位输入不得落成用户消息（`expand_skill_invocation` 不得改角色）：{last:?}"
+        );
+    }
+
+    /// **一次取完**：三条命令的结果必须落进**同一个**回合的上下文。
+    ///
+    /// 钉的是原缺陷：限流 2 条时「第三条留在 `Pending`、而唤醒只在**新终态**时发」
+    /// 会变成死角 —— 再也没人唤醒它，用户得再发言两次才收得全。
+    ///
+    /// 三条命令都是 `sleep 0.2; echo …`：退出时刻相差几毫秒 ⇒ 同一个 100ms tick 里
+    /// 一起进终态 ⇒ 一次唤醒、一个回合。任何「每回合 2 条」的限流都会让第三条永远
+    /// 留在表里（此后不再有新终态，也就不会再有唤醒）。
+    ///
+    /// 变异：把 `take_completions(..)` 接回 `.take(2)` ⇒ 第三个标记不在该回合的
+    /// `ModelRequest` 里、且 `has_pending` 仍为真 ⇒ 两条断言都变红。
+    #[tokio::test]
+    async fn all_pending_background_results_arrive_in_one_turn() {
+        const MARKERS: [&str; 3] = ["BG-SWEEP-ALPHA", "BG-SWEEP-BETA", "BG-SWEEP-GAMMA"];
+
+        let logs = TempDir::new("bg_sweep_logs");
+        let _env = BgEnv::set(&logs.0);
+        let calls = Arc::new(CallLog::default());
+        let mut h =
+            spawn_app_loop_backgrounds(Box::new(CountingModel(Arc::clone(&calls))), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let mut cleanup = BgCleanup::new(&tasks);
+        for marker in MARKERS {
+            let _ = cleanup.start_with(&session, &format!("sleep 0.2; echo {marker} >&2"));
+        }
+
+        // **不发任何请求** —— 唤醒必须自己起一轮，并在**同一个回合**里取完三条。
+        let first = collect_until_view(&mut h).await;
+        assert!(!first.is_empty(), "自动回合必须产生出站消息");
+
+        let request = calls.requests().pop().expect("应有模型调用记录");
+        let missing: Vec<&str> = MARKERS
+            .iter()
+            .copied()
+            .filter(|m| !has_text(&request, m))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "同一个回合必须把三条结果全部带进上下文，缺 {missing:?}：{request:?}"
+        );
+        assert!(
+            !tasks.has_pending(&session),
+            "取完之后不得再有 `Pending`（否则没人会再唤醒它）"
+        );
+    }
+
+    /// **`Wake::BackgroundReturned` 的复核**（端到端）：唤醒来自**别的会话**时不起回合。
+    ///
+    /// 唤醒是进程级的「可能有」：`sweep` 扫**所有**会话、`notify` 不携带会话信息 ⇒
+    /// 别的会话的命令跑完也会叫醒本会话的循环。此时本会话没有待投结果 ⇒ 唤醒臂必须
+    /// 原地 `continue`：既不发文案，也不花一次模型调用。
+    //
+    /// 构造走真实链路：给**另一个会话**起一条即刻退出的命令（`true`）⇒
+    /// 共享 sweeper 下一拍看到 `newly_terminal > 0` ⇒ `notify` ⇒
+    /// `Wake::BackgroundReturned` 臂 ⇒ 复核（本会话无 `Pending`）⇒ `continue`。
+    /// 全程不发任何 `Request`：空闲态唯一可能的模型调用只能来自唤醒臂。
+    ///
+    /// 两条断言缺一不可：① 前提是别的会话**确实**有待投结果（否则本用例会因为
+    /// 「根本没有唤醒」而假绿）；② 核心是模型调用数为 0。
+    ///
+    /// 变异：把唤醒臂的 `if !has_pending { continue }` 换成无条件起回合 ⇒ ② 变红
+    /// （模型被调用一次）。只断言判据函数时该变异全绿 ⇒ 判据语义另由
+    /// `background_turn_predicate_only_starts_for_own_pending` 单独钉住。
+    #[tokio::test]
+    async fn no_turn_starts_when_the_pending_set_is_empty() {
+        const OTHER: &str = "other-session";
+
+        let logs = TempDir::new("bg_empty_logs");
+        let _env = BgEnv::set(&logs.0);
+        let calls = Arc::new(CallLog::default());
+        let h = spawn_app_loop_backgrounds(Box::new(CountingModel(Arc::clone(&calls))), true).await;
+        let (tasks, slot) = h
+            .backgrounds
+            .as_ref()
+            .expect("本用例挂了后台上下文")
+            .clone();
+        let session = slot.get();
+        let cwd = h.temp_path("bg-cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut cleanup = BgCleanup::new(&tasks);
+        // 本会话在起跑时是干净的 ⇒ 「零调用」断言的唯一输入只会来自下面那条别的会话的命令。
+        assert!(
+            !tasks.has_pending(&session),
+            "前提：起跑时本会话没有待投结果"
+        );
+
+        // 属于**别的会话**的命令：直接经注册表起（不经 `cleanup.start_with` —— 那会用
+        // 本会话 id），但要纳入收尾，免得用例失败时留下进程。
+        cleanup.track_session(OTHER);
+        let _handle = tasks
+            .start(OTHER, "true", &cwd, None)
+            .expect("起一条即刻退出的命令");
+
+        // 等**两个** sweep tick（100ms 一拍）：第一拍让它进终态并播报唤醒，第二拍
+        // 兜住「唤醒之后又顺手起了回合」的迟到调用。全程不发 `Request`。
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert!(
+            tasks.has_pending(OTHER),
+            "前提：别的会话确实有待投结果（否则本用例会因为根本没有唤醒而假绿）"
+        );
+        assert_eq!(
+            calls.count(),
+            0,
+            "唤醒来自别的会话 ⇒ 本会话不得起回合（模型调用数必须为 0）"
+        );
+    }
+
+    /// **复核判据的语义**：只按**本会话**的 `Pending` 起回合。
+    ///
+    /// 唤醒臂用的是 [`should_start_background_turn`] ⇒ 这里钉住它的三种情形：空表、
+    /// 别的会话有完成项、本会话有完成项（唯一起回合的那一种）。
+    ///
+    /// 变异：把复核改成「无条件起回合」⇒ 前两种情形都会返回 `true` ⇒ 变红。
+    ///
+    /// 用 `#[tokio::test]`：`start` 走 tokio 的子进程 ⇒ 与其它后台用例同规地留在
+    /// runtime 内。
+    #[tokio::test]
+    async fn background_turn_predicate_only_starts_for_own_pending() {
+        let root = temp_dir_for("bg_empty");
+        let tasks = Arc::new(BackgroundTasks::new(
+            root.clone(),
+            ys_tools_basic::BgLimits::default(),
+        ));
+
+        // 空表：没有待投结果 ⇒ 不得起回合。
+        assert!(
+            !should_start_background_turn(&tasks, "s1"),
+            "空表必须否决起回合"
+        );
+
+        // 别的会话有完成项、本会话没有 ⇒ 同样不得起回合（复核只按会话过滤）。
+        let handle = tasks
+            .start("other", "true", &root, None)
+            .expect("起一条即刻退出的命令");
+        tasks.mark_finished(handle, Some(0));
+        assert!(tasks.has_pending("other"), "前提：别的会话确实有待投结果");
+        assert!(
+            !should_start_background_turn(&tasks, "s1"),
+            "只按**本会话**复核 ⇒ 别的会话的结果不得起本会话的回合"
+        );
+        assert!(
+            should_start_background_turn(&tasks, "other"),
+            "本会话有待投结果 ⇒ 必须起回合"
+        );
+        tasks.kill_all("other");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **回合末的后台计数只进 debug 日志**：不进模型上下文、不进 transcript。

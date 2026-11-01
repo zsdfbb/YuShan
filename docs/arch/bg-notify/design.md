@@ -408,3 +408,22 @@ main.rs: 构造 backgrounds 的条件从「无条件」改为
 - [ADR-0049](../../adr/0049-final-answer-boundary-drain.md) — `Boundary` 消费语义
 - `crates/ys-protocol/src/boundary.rs:23` — `Boundary::Deferred` 既有定义
 - `apps/coding-agent/src/subagent.rs` — 异步 subagent「不需要 poll」先例
+
+## 实现期修正（后续需求）
+
+> 以下几处与本文前面各节不一致：以本小节为准，前面各节保留为当时的决策记录。
+
+- **补投不限流。** §6 的 R10 以「补投可能一次灌入多条 × 50 KiB」为由限制每回合补 2 条，
+  §7 相应有一条「补投上限 2 条」的断言。该限流与「只在有新终态时唤醒」（§2.4 的
+  `newly_terminal > 0`）**不能共存**：5 条命令全跑完时只播报一次唤醒、只补 2 条，剩 3 条仍 `Pending`
+  却不再产生新终态 ⇒ 再没有任何唤醒去认领它们，只能等用户再次发言。
+  当前形态：**回合外完成 ⇒ 自动起一轮**（`app_loop` 的 `Wake::BackgroundReturned` 臂，
+  先由 `should_start_background_turn` 复核本会话确有 `Pending`），回合开头用
+  `take_completions` **一次取完**。上界由两处既有闸门给出：`BgLimits::max_entries`
+  （默认 8，只对未投出的完成项计数）与单条正文截断（`ys_tool::MAX_BYTES` = 50 KiB）。
+  起一个回合已付一次模型调用 ⇒ 欠下的结果一次带完比「为剩下几条再起几轮」便宜。
+- **结果消息的角色是 `Role::Harness`。** 后台命令的完成结果
+  （`bg_output::render_completion`）与子 agent 的派发结果（`subagent::outcome_message`）都由
+  harness 产生、用户没说过。角色若为 `Role::User`，`/resume` 回放会把它画成用户发言：
+  回放时 `DeferredResult` 事件不存在，`replay_lines` 只看角色。线上仍映射成 `"user"`。
+  完整说明见 [`docs/design-final/coding-agent-tui.md`](../../design-final/coding-agent-tui.md) §20.8。

@@ -1091,20 +1091,25 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         tokio::spawn(async move {
             let outcome = task.execute(prompt).await;
             // 渲染成一条消息交给投递表：本回合还活着 ⇒ 直接进边界源；
-            // 已结束 ⇒ 留表，下一回合开头补投。角色用 `User` 沿压缩摘要的先例
-            // （ADR-0017 决策 12：系统注入走 `User`）—— **区分来源靠事件类型**
-            // （`DeferredResult`），不是靠角色。
-            results.deliver(
-                handle_for_task,
-                Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text {
-                        text: render_outcome_text(&outcome),
-                    }],
-                },
-            );
+            // 已结束 ⇒ 留表，下一回合开头补投。角色用 `Harness` ⇒ 落盘与
+            // `/resume` 回放都认得出「这不是用户说的话」（回放时事件流已不存在，
+            // 事件类型不再能区分来源，只能靠角色）。
+            results.deliver(handle_for_task, outcome_message(&outcome));
         });
         Ok(handle)
+    }
+}
+
+/// 把一次派发的结果包成投递用的 `Message`。
+///
+/// 角色是 [`Role::Harness`]：这条输入由 harness 产生、用户没说过 —— 区分来源
+/// 只能靠它（投递表的 `DeferredResult` 事件在 `/resume` 回放时已不存在）。
+fn outcome_message(out: &SubagentOutcome) -> Message {
+    Message {
+        role: Role::Harness,
+        content: vec![ContentBlock::Text {
+            text: render_outcome_text(out),
+        }],
     }
 }
 
@@ -2044,6 +2049,37 @@ mod tests {
         );
         assert!(second.take().is_some(), "结果应进最新的落点");
         assert!(first.take().is_none(), "旧落点不该拿到结果");
+    }
+
+    /// **子 agent 结果的角色是 `Harness`**：harness 派发的输入，用户没说过。
+    ///
+    /// `/resume` 回放时 `DeferredResult` 事件已不存在 ⇒ 区分来源只能靠角色。
+    ///
+    /// 变异：`outcome_message` 把角色写回 `Role::User` ⇒ 本用例变红。
+    #[test]
+    fn subagent_outcome_message_is_marked_as_harness_not_user() {
+        let outcome = SubagentOutcome {
+            summary: "子 agent 的结论".to_string(),
+            artifact: Some("/tmp/transcript.md".to_string()),
+            stop_reason: StopReason::Completed,
+            diagnostic: None,
+            usage: Usage::default(),
+        };
+
+        let message = outcome_message(&outcome);
+        assert_eq!(
+            message.role,
+            Role::Harness,
+            "子 agent 的结果是 harness 输入，不得落成用户消息"
+        );
+        assert_ne!(message.role, Role::User);
+        // 正文仍然来自 `render_outcome_text`（摘要 + 产物指针不漂移）。
+        assert_eq!(
+            message.content,
+            vec![ContentBlock::Text {
+                text: render_outcome_text(&outcome)
+            }]
+        );
     }
 
     #[test]

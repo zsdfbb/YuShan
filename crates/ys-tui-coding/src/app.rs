@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use ys_core::{ContentBlock, Message, StopReason, ToolCallId};
+use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId};
 use ys_event::AgentEvent;
 use ys_protocol::{Envelope, Outbound, Request, SessionSummary};
 
@@ -325,6 +325,21 @@ impl App {
     pub fn apply_event(&mut self, env: Envelope) {
         match env.event {
             AgentEvent::UserMessage { message } => {
+                // ⓘ harness 自己发起的输入（后台命令完成结果 / 子 agent 结果）：用户没说过，
+                //    故画成 System 行，且**不参与**回显抑制 —— `suppress_user_echo` 只为用户
+                //    提交的那条回声服务，让它在这里消耗会把真正的用户回声计数搞错，
+                //    那条回声就会被画第二遍。
+                if message.role == Role::Harness {
+                    self.transcript.push(harness_line(&message));
+                    // 它标志着**一个回合的开始**（后台结果自动起的回合），故与下面
+                    // 「回合刚落幕时到达」的分支同待遇：点亮 Working。
+                    self.is_turning = true;
+                    self.abort_requested = false;
+                    self.turn_started_at = Some(Instant::now());
+                    self.current_round = None;
+                    self.note_appended_below();
+                    return;
+                }
                 // ① 既有回显抑制：提交时已本地 push 过那条 User 行，这条事件就是它的
                 //    回声 —— 递减计数并跳过，别重复画。
                 if self.suppress_user_echo > 0 {
@@ -732,6 +747,24 @@ pub(crate) fn message_text(message: &Message) -> String {
     parts.join("\n")
 }
 
+/// 把一条 `Role::Harness` 消息渲染成一行 System 摘要。
+///
+/// **实时路径与 `/resume` 回放路径共用本函数** —— 同一段历史在两条路径上必须画成
+/// 同一行，否则「刚跑完看到的」和「重开会话看到的」会不一样。
+///
+/// 只取**首个非空行**：后台命令的完成消息带命令输出、子 agent 的结果带长摘要，
+/// 整段塞进 transcript 会把它刷满；模型看的是会话里的完整正文，用户看的是
+/// 「哪件事回来了」。
+pub(crate) fn harness_line(message: &Message) -> TranscriptLine {
+    let text = message_text(message);
+    let head = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("(empty)")
+        .trim();
+    TranscriptLine::System(format!("↓ {head}"))
+}
+
 /// 测试辅助：构造一条用户文本消息。
 #[cfg(test)]
 pub(crate) fn user_message(text: &str) -> Message {
@@ -747,7 +780,7 @@ mod tests {
     use std::collections::HashSet;
 
     use ratatui::style::Color;
-    use ys_core::{Role, StopReason, ToolCall, ToolResult, Usage};
+    use ys_core::{StopReason, ToolCall, ToolResult, Usage};
     use ys_protocol::Source;
 
     fn app() -> App {
@@ -846,6 +879,105 @@ mod tests {
 
     fn env(event: AgentEvent) -> Envelope {
         Envelope::new(Source::agent(), 1, event)
+    }
+
+    /// 测试辅助：构造一条 `Role::Harness` 文本消息（后台命令 / 子 agent 的结果）。
+    fn harness_message(text: &str) -> Message {
+        Message {
+            role: Role::Harness,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// `Role::Harness` 的 `UserMessage` **一律**画成 System 行（不是用户行），且标志着
+    /// 一个回合的开始 —— 无论此刻是否在回合中。
+    ///
+    /// 变异：把 `Role::Harness` 并进 `Role::User` 分支 ⇒ 回合内那一步画成用户行；
+    /// 把 `harness_line` 的 `↓ ` 前缀去掉 ⇒ 前缀断言变红；不点亮 Working ⇒ `is_turning` 断言红。
+    #[test]
+    fn harness_user_message_renders_system_line_not_user() {
+        let mut a = app();
+        let message = harness_message("后台命令完成：cargo test\n第二行输出，不追进 transcript");
+
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: message.clone(),
+        }));
+        match a.transcript.last().expect("应有新行") {
+            TranscriptLine::System(s) => {
+                assert_eq!(s, "↓ 后台命令完成：cargo test", "带 ↓ 前缀 + 只取首行");
+            }
+            other => panic!("应是 System 行，得到 {other:?}"),
+        }
+        assert!(
+            !a.transcript
+                .iter()
+                .any(|l| matches!(l, TranscriptLine::User(_))),
+            "不得出现用户行：{:?}",
+            a.transcript
+        );
+        assert!(a.is_turning, "harness 消息标志一个回合开始 ⇒ 点亮 Working");
+
+        // 回合进行中：不得被归进 steering 的用户行分支。
+        let mut b = app();
+        b.begin_local_turn("first".into());
+        let before = b.transcript.len();
+        b.apply_event(env(AgentEvent::UserMessage { message }));
+        assert_eq!(b.transcript.len(), before + 1, "回合内也得产出一行");
+        match b.transcript.last().expect("应有新行") {
+            TranscriptLine::System(s) => assert!(s.starts_with("↓ "), "got {s}"),
+            other => panic!("应是 System 行，得到 {other:?}"),
+        }
+    }
+
+    /// **`Harness` 不参与回显抑制**：它是个回合的开始，不是用户提交的回声。
+    ///
+    /// 若 `Harness` 判断排在 `suppress_user_echo` 之后，这条会白白吃掉一次抑制额度
+    /// 且不产出任何行，于是紧接着的用户回声被画**第二遍**。
+    ///
+    /// 变异：把 `Harness` 判断移到 `suppress_user_echo` 判断之后 ⇒ 本用例变红。
+    #[test]
+    fn harness_message_does_not_consume_echo_suppression() {
+        let mut a = app();
+        a.begin_local_turn("你好".into());
+        assert_eq!(a.suppress_user_echo, 1);
+        let before = a.transcript.len();
+
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: harness_message("子 agent 结果回来了"),
+        }));
+        assert_eq!(a.transcript.len(), before + 1, "Harness 必须照常渲染");
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptLine::System(_))),
+            "应是 System 行：{:?}",
+            a.transcript
+        );
+        assert_eq!(a.suppress_user_echo, 1, "Harness 不得消耗抑制额度");
+
+        // 紧随其后的用户回声仍被抑制 —— 额度还在。
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: user_message("你好"),
+        }));
+        assert_eq!(a.transcript.len(), before + 1, "用户回声被抑制，不重复画");
+        assert_eq!(a.suppress_user_echo, 0);
+    }
+
+    /// **两条路径一致**：同一条 `Harness` 消息，`apply_event` 的尾行与 `replay_lines`
+    /// 的唯一一行必须**相等** —— 钉住「共用 `harness_line`」这个设计意图。
+    ///
+    /// 变异：任一侧改回自己拼字符串（前缀 / 取行规则差一点）⇒ 本用例变红。
+    #[test]
+    fn live_and_replay_render_harness_identically() {
+        let message = harness_message("\n  \n  后台命令 sa7 完成  \n第二行\n");
+
+        let mut a = app();
+        a.apply_event(env(AgentEvent::UserMessage {
+            message: message.clone(),
+        }));
+        let live = a.transcript.last().expect("应有新行").clone();
+
+        let replayed = replay_lines(&[message]);
+        assert_eq!(replayed.len(), 1, "回放恰好一行：{replayed:?}");
+        assert_eq!(live, replayed[0], "两条路径必须画成同一行");
     }
 
     /// 指定回合号的信封 —— 用于构造跨回合的序列（回声关联凭 `Envelope.turn`）。

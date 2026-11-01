@@ -135,6 +135,7 @@ fn normalize_ws(s: &str) -> String {
 ///
 /// **不产出的行**：`Summary` / `System`（回合摘要、命令输出**不持久化**，历史里没有它们）；
 /// `Thinking` 亦然 —— [`ContentBlock`] 没有 thinking 变体（思考内容不落盘）。
+/// `Role::Harness` **产出**一行（与 live 路径共用 [`crate::app::harness_line`]）。
 ///
 /// 配对按 `ToolCallId` 做**全局**预扫描（回填在第二遍），故不要求 `ToolResult` 紧跟其
 /// `ToolUse`（真实历史里工具结果在**下一条** User 消息里）。重复 id 时结果落到**最后**一条
@@ -173,10 +174,17 @@ pub fn replay_lines(messages: &[Message]) -> Vec<TranscriptLine> {
                     lines.push(TranscriptLine::User(text));
                 }
             }
+            // `Harness`：harness 注入的输入（后台命令结果 / 子 agent 结果），用户没说过。
+            // 与实时路径共用 `harness_line` ⇒ 两条路径同一段历史画成同一行。
+            Role::Harness => {
+                lines.push(crate::app::harness_line(message));
+                // 跳过后面的 `ToolUse` 扫描：`Harness` 消息只装文本（与 `Role::System` 同形）。
+                continue;
+            }
             // `Role::System`（系统提示等）不属 transcript，不产出行。
             Role::System => continue,
         }
-        // `ToolUse` 两角色都处理（User 消息正常不含工具调用，含了也不丢信息）。
+        // `ToolUse` 两角色（`Assistant` / `User`）都处理（User 消息正常不含工具调用，含了也不丢信息）。
         // 其余变体在此同样**有意忽略**（白名单见上方 `filter_map` 的注释）。
         for block in &message.content {
             if let ContentBlock::ToolUse {
@@ -674,6 +682,30 @@ mod tests {
         assert_ne!(
             replay, a.transcript,
             "P1-1 分叉 ③：live(合并) ≠ replay(分条)"
+        );
+    }
+
+    /// **回放路径：`Role::Harness` 画成一行 `System`，绝不是用户发言**。
+    ///
+    /// 变异：把 `Role::Harness` 并进 `Role::User` 分支（或其他非 `continue` 分支）⇒ 本用例红
+    /// （出现 `User(_)` 或行数不为 1）。
+    #[test]
+    fn replay_harness_message_makes_one_system_line() {
+        let lines = replay_lines(&[Message {
+            role: Role::Harness,
+            content: vec![ContentBlock::Text {
+                text: "后台命令完成：git status\nsecond line".into(),
+            }],
+        }]);
+
+        assert_eq!(lines.len(), 1, "恰好一行：{lines:?}");
+        match &lines[0] {
+            TranscriptLine::System(s) => assert_eq!(s, "↓ 后台命令完成：git status"),
+            other => panic!("应是 System 行，得到 {other:?}"),
+        }
+        assert!(
+            !lines.iter().any(|l| matches!(l, TranscriptLine::User(_))),
+            "不得出现用户行：{lines:?}"
         );
     }
 }

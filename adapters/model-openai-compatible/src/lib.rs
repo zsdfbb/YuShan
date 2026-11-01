@@ -1224,7 +1224,8 @@ pub fn translate_request(
     // Session 消息
     for msg in &request.messages {
         let role = match msg.role {
-            Role::User => "user",
+            // `Harness` 在线上没有对应角色，按 `user` 发送；本地靠 `Role` 区分来源。
+            Role::User | Role::Harness => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
         };
@@ -1492,6 +1493,51 @@ mod tests {
             .arguments;
         let parsed: serde_json::Value = serde_json::from_str(serialized).unwrap();
         assert_eq!(parsed, serde_json::json!({"path": "a.rs"}));
+    }
+
+    /// **`Harness` 出站仍是 `user`**：本地用 `Role` 区分来源，线上语义不变。
+    ///
+    /// 变异：把 `Role::Harness` 从 `"user"` 分支里拆出（映射成 `"harness"` /
+    /// 合并到 `"system"`）⇒ 断言变红。
+    #[test]
+    fn translate_request_maps_harness_role_to_user() {
+        let config = OpenAICompatibleConfig {
+            api_base: "http://localhost".into(),
+            api_key: "test".into(),
+            model: "test".into(),
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            disable_thinking: false,
+            compat: ProviderCompat::standard(),
+        };
+
+        let request = ModelRequest {
+            messages: vec![ys_core::Message {
+                role: Role::Harness,
+                content: vec![ContentBlock::Text {
+                    text: "[bg1] cargo build — finished (exit 0) in 2.0s".into(),
+                }],
+            }],
+            tools: vec![],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            boundary: None,
+            thinking: None,
+        };
+
+        let chat_req = translate_request(&request, &config).unwrap();
+        assert_eq!(chat_req.messages.len(), 1);
+        assert_eq!(
+            chat_req.messages[0].role, "user",
+            "Harness 在线上没有对应角色，必须按 user 发送"
+        );
+        assert_eq!(
+            chat_req.messages[0].content.as_deref(),
+            Some("[bg1] cargo build — finished (exit 0) in 2.0s"),
+            "正文不得因角色映射而变"
+        );
     }
 
     #[test]

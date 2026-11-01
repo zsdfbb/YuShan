@@ -770,7 +770,7 @@ N11 卡顿观感、Chat 去边框后的整体观感、库对「4 空格缩进式
 - **结果跨回合送达**：完成结果交给 `PendingResults`（**进程级**、`Arc` 跨工作区重建共享）——
   - 本回合**已绑定**落点（`SubagentSetup::bind_results`，守卫活到回合块末）⇒ 直接 `push` 成 `Boundary::Deferred`，`BasicLoop` 在轮边界 append 并 emit `DeferredResult`；
   - **未绑定**（回合已结束）⇒ 留表（上限 `MAX_PENDING_RESULTS = 32`，超限淘汰最旧并留日志），由**下一回合开头**一次性补投。
-- **补投不限流**（与后台命令的 `BG_CATCHUP_PER_TURN = 2` 不同）：派发数量已被 `DEFAULT_MAX_DISPATCHES_PER_TURN` 封顶，且每条结果都在等一个明确答复 —— 限流只会让模型继续误以为「还没回来」。
+- **补投不限流**：派发数量已被 `DEFAULT_MAX_DISPATCHES_PER_TURN` 封顶，且每条结果都在等一个明确答复 —— 限流只会让模型继续误以为「还没回来」。
 - **提示词据此约束模型行为**：`subagent_async` 在场时的 guideline 明确「结束回合不丢结果，下一回合开头送达」，并禁止未核实就声称「还在跑」。
 
 ### 13.4 并行批（Step 9）
@@ -1715,10 +1715,16 @@ beta
 
 ### 20.1 形态
 
-后台命令结束时，由既有的 100ms sweeper 把结果 `push` 成 `Boundary::Deferred`；
-`BasicLoop` 在下一个轮边界 append 进会话并 emit `AgentEvent::DeferredResult`
-⇒ 模型**不需要轮询**。`Boundary::Deferred` 与 `DeferredResult` 是既有机制，
-异步 subagent 早就在用同一条路径。
+后台命令完成时由 100ms sweeper（`BG_SWEEPER_INTERVAL`，进程级 1 个 tokio 任务）投递：
+把结果推成 `Boundary::Deferred`，`BasicLoop` 在下一个轮边界 append 进会话并 emit
+`AgentEvent::DeferredResult` ⇒ 模型**不需要轮询**。
+
+**回合内完成** ⇒ 走上面那条路，在本回合的下一个轮边界进上下文。
+**回合外完成**（回合已收场、边界源已销毁）⇒ 结果留表并唤醒 `app_loop`，
+**自动起一轮**把它送进上下文（§20.6）—— 后台命令的返回是一种输入，命令本身
+就是工作内容，跑完就该继续，不等用户再开口。
+
+`Boundary::Deferred` 与 `DeferredResult` 是既有机制，异步 subagent 早就在用同一条路径。
 
 **父表 = 11 元**：基础 9 元 + `bash_bg` + `SubagentTool`（`bash_poll` 已删）。
 子表仍是 9 元 ⇒ 子 agent 无后台能力。
@@ -1763,13 +1769,124 @@ beta
 `-p` / `--json` 模式**不挂**后台能力（`main.rs` 的 `Mode::Interactive` 判断）
 ⇒ 超时走原路径（杀进程组 + `ToolError::Timeout`）。
 
-### 20.6 跨回合补投
+### 20.6 跨回合补投与自动起回合
 
-回合先结束时完成项留在注册表（`Pending`），下一回合开头由 `app_loop` 补投，
-**每回合最多 2 条**（`BG_CATCHUP_PER_TURN`）；超出部分继续留表。
+回合先结束时完成项留在注册表（`Pending`）。`sweep` 在新终态出现时 `notify_one`
+⇒ `app_loop` 的 `Wake::BackgroundReturned` 臂先**复核**本会话是否真有已终态、尚未投出的
+结果（`should_start_background_turn` ⇒ `BackgroundTasks::has_pending`；唤醒是进程级的，
+也可能来自别的会话，或已被某个回合取走），空则 `continue`、什么都不发。
+
+复核通过 ⇒ 用一条 `background_placeholder()`（`Role::Harness`，见 §20.8）当输入起一个回合，
+走 `run_turn_chain` —— 与 `Request::Prompt` **共用同一条回合链**（`TurnCtx` /
+`run_turn_once` / 记账 / 写穿 meta / 失败处理），两处不会漂移。
+
+回合开头把本会话的 `Pending` **一次取完**（`take_completions`），逐条 `push` 成
+`Boundary::Deferred` 并立即 `finish_delivery(.., true)`：认领过的条目必须落状态，
+否则它会卡到下一 tick 的修复才重投。
+
+**不限流**：起一个回合已经付了一次模型调用，欠下的结果一次带完比「为剩下几条再起几轮」
+便宜。上界不靠每回合条数，而靠两处既有闸门 —— `BgLimits::max_entries`（默认 8，只对
+**未投出的完成项**计数，§20.4）与单条正文截断（`ys_tool::MAX_BYTES` = 50 KiB，§19.6/§19.7）。
+
+**限流与「只在有新终态时唤醒」不能共存**：唤醒是边沿信号（`newly_terminal > 0`），
+而限流把超出部分留在 `Pending` —— 那些条目不再产生新终态，也就再没有唤醒去认领它们，
+只能等用户下次发言才送达。取一次就取空则不成立：「醒来时表里已空」正是不会热循环的理由。
+取出的条目先落 `InFlight`，投递失败才回 `Pending`，而那只等下一次新终态唤醒。
+
+**子 agent 结果不自动起回合**（`Wake::SubagentReturned` 只告知）—— 这是**有意的不对称**：
+子 agent 的注入时机走它自己的语义（父回合等待 / 未绑定则留表、下一回合开头补投，§13.3b），
+它的完成不构成「工作内容已经变了」。
 
 ### 20.7 已知缺口
 
 - 「锁内不读输出文件」只有人工审查，缺自动化探针（渲染是外挂 `fn` 指针，黑盒）。
-- `BG_CATCHUP_PER_TURN` 的限流逻辑在回合循环体内，未抽成可测函数。
+- 自动回合的占位消息在 TUI 上画一行 `↓ [harness] 后台命令结果已送入上下文…`，
+  紧跟其后才是真正有内容的结果行。它是「回合开始」的标记（点亮 Working），但零信息量。
+- 压缩的切点若落在 `Harness` 消息上（保留段首条恰为 `Harness`）：`compact.rs:266` 的判断是
+  `to_keep[0].role == Role::User` ⇒ 不命中，摘要独立成一条 `Role::User` 前言，紧接其后就是
+  那条 `Harness`；两者线上都映射成 `"user"`（§20.8）⇒ 线上出现连续两条 user，局部交替被破坏。
+  当前只是理论面（需要切点恰好落在这里），未加防护。
 - `kill_group` 仍是同步 fork（已挪到锁外，但未异步化）。
+
+### 20.8 结果的来源可辨识（`Role::Harness`）
+
+**`Role` 四个变体**（`crates/ys-core/src/message.rs:5`）：`User` / `Assistant` / `System` / `Harness`。
+
+**`Harness` 的语义**：harness 产生、**用户没说过**的输入。当前两个产出点：
+
+| 产出点 | 位置 |
+|---|---|
+| 后台命令的完成结果 | `adapters/tools-basic/src/bg_output.rs:128` `render_completion`（末段构造 `Message { role: Role::Harness, .. }`） |
+| 子 agent 的派发结果 | `apps/coding-agent/src/subagent.rs:1107` `outcome_message` |
+
+两者都只装**单个** `ContentBlock::Text` —— 这条内容形态是下面「6 处 `==` 保持原样」的依据。
+
+**线上仍是 `user`**：`adapters/model-openai-compatible/src/lib.rs:1228` 把
+`Role::User | Role::Harness` 一起映射成 `"user"`。`Harness` 在 wire 协议上没有对应角色，
+区分**只在本地**（落盘 / 回放 / 统计）。
+
+**落盘是 `"Harness"`**：`Role` 直接 `serde` 派生，序列化字符串就是变体名；它是**对外契约**
+（`/resume` 按它认来源，`crates/ys-core/src/lib.rs` 的 `test_role_harness_serde_roundtrip`
+把字面量钉死）。
+
+#### 为什么角色必须可辨识
+
+实时路径还能靠 `AgentEvent::DeferredResult` 区分来源，`/resume` 回放时事件流不存在、
+`replay_lines` 只看 `Role`。角色若为 `Role::User`，`Role::User => TranscriptLine::User` 会把
+子 agent 的结果与后台命令的输出在重开的会话里画成「用户说过的话」。
+
+故 `transcript.rs:179` 把 `Role::Harness` 单列一支，产出一行 `TranscriptLine::System`
+并 `continue`（跳过其后的 `ToolUse` 扫描 —— 它们只装文本）。`Role::User` 分支不变。
+
+#### TUI 两条路径共用 `harness_line`
+
+`crates/ys-tui-coding/src/app.rs:758` 的 `harness_line` 是**唯一渲染点**，两条路径都调它：
+
+- 实时：`apply_event` 的 `UserMessage` 臂，`app.rs:332` 的 `if message.role == Role::Harness`；
+- 回放：`replay_lines`，`transcript.rs:179`。
+
+同一段历史在两条路径上必须画成同一行，否则「刚跑完看到的」与「重开会话看到的」会不一致。
+渲染只取**首个非空行**并加 `↓ ` 前缀：后台命令的完成消息带整段输出、子 agent 的结果带长摘要，
+整段塞进 transcript 会刷满；模型看的是会话里的完整正文，用户看的是「哪件事回来了」。
+
+**`Harness` 分支必须在 `suppress_user_echo` 判断之前**（`app.rs:332` 早于同一臂里
+`if self.suppress_user_echo > 0` 的递减）。放在之后的话：这条 `Harness` 不产出用户行、
+却会消耗一次抑制额度 ⇒ 紧接着那条真正的用户回声因计数已耗尽而被画**第二遍**。
+`suppress_user_echo` 只为「用户提交、本地已 push、回声待抵达」的那条服务，`Harness` 不属于它。
+
+`Harness` 还标志着**一个回合的开始**（自动起的那一轮）⇒ 同一分支点亮 Working
+（`is_turning = true`、重置 `abort_requested` / `turn_started_at` / `current_round`）。
+
+#### 6 处 `==` / `!=` 有意保持原样
+
+| 位置 | 判断 | `Harness` 被跳过是正确的，因为 |
+|---|---|---|
+| `apps/coding-agent/src/sessions.rs:183` | `message.role != Role::User` ⇒ `None` | 标题素材只取用户原文；占位消息不是用户说的话 |
+| `apps/coding-agent/src/app_loop.rs:1796` | `message.role != Role::User` ⇒ 不展开 | 见下「角色门控」 |
+| `crates/ys-session/src/jsonl.rs:214` | `messages[index].role != Role::Assistant` | 会话修复只给 `Assistant` 的悬空 `ToolUse` 合成结果 |
+| `crates/ys-session/src/jsonl.rs:252` | `message.role == Role::User` ⇒ 结果组 | `Harness` 消息里没有 `ContentBlock::ToolResult`（只装 `Text`）⇒ 它们不是结果组 |
+| `crates/ys-loop/src/compact.rs:266` | `to_keep[0].role == Role::User` ⇒ 摘要并入 | 见 §20.7 第三条 |
+| `crates/ys-loop/src/compact.rs:514` | `m.role == Role::Assistant`（测试断言） | `Harness` 不是模型产出，不该参与「零伪造」比对 |
+
+`Harness` 不是 `User` —— 这些判断跳过它正是它们的语义。**依赖内容形态的那几条**
+（`jsonl.rs:252` 与 `expand_skill_invocation`）之所以安全，是因为两个产出点都只装单个
+`Text` 块，**不可能**含 `ToolUse` / `ToolResult` ⇒ 会话修复跳过它们不会留下悬空工具调用。
+
+#### `expand_skill_invocation` 的角色门控
+
+`app_loop.rs:1796` 的 `if message.role != Role::User { return message; }`：展开时会**重建**一条
+`Message { role: Role::User, .. }`（同一函数末尾）⇒ 对 `Harness` 展开会把角色改写掉、这条结果
+回放时又变回用户发言。故门控放在函数第一步（早于 `first_text`）。
+
+#### 自动回合的占位输入
+
+`app_loop.rs:1407` 的 `background_placeholder()` 就是 `Role::Harness`：
+
+```text
+[harness] 后台命令结果已送入上下文，请据此继续。
+```
+
+`BasicLoop` 照它 append 进会话（与任何回合的输入同一条路径），真正的内容是随后经
+`Boundary::Deferred` 注入的那几条结果。它不贡献标题素材（`run_turn_chain` 的
+`raw_user_text` 传 `None`），但它会落盘、会在回放里画成一行 —— 那是「回合开始」的标记，
+不是用户输入。

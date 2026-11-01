@@ -591,7 +591,7 @@ static KEYBINDINGS: [KeyBinding; 21] = [
     },
     KeyBinding {
         keys: "左键拖选（Chat 区）",
-        action: "选中对话内容，松手即复制；⇧+拖选 = 用终端原生选择",
+        action: "选中对话内容，松手即复制（按不按 ⇧ 都行）",
         group: KeyGroup::Mouse,
         note: None,
     },

@@ -117,10 +117,12 @@
 //! 因此本模块**接管鼠标**（`run.rs` 开 `EnableMouseCapture`，退出序列关掉），让滚轮
 //! 在应用内成为独立语义：**滚轮 = 滚聊天**，与输入历史完全无关。代价与边界：
 //!
-//! - **终端原生选择失效**：手机模式与绝大多数终端在鼠标捕获期间不响应拖选，用户要
-//!   `⇧`+拖选（iTerm2 / Terminal.app / WezTerm 都支持强制原生选择）或走 `/copy`。
-//! - **只处理滚动**：`Down` / `Up`（键按下）、`Moved`（悬停）一律忽略 —— 不绑点击，
-//!   也就不会与拖选抢事件。
+//! - **终端原生选择失效**：手机模式与绝大多数终端在鼠标捕获期间不响应拖选。**这不再是
+//!   退路缺失** —— 本模块自己接管了拖选（ADR-0051），裸拖与 `⇧`+拖**都**选中并复制，
+//!   走同一条应用内选区与同一条剪贴板通路（`app.pending_clipboard` → OSC 52）。
+//!   `⇧` 不改变任何行为：它在鼠标上的含义是「让终端强制原生选择」，而终端在捕获期间
+//!   收不到这些事件，本应用也不再给终端留这个缺口。
+//! - **只处理滚动与拖选**：`Moved`（悬停）忽略 —— 不绑悬停，也就不会与拖选抢事件。
 //! - **左右滚动忽略**：聊天是单列竖排，水平分量没有语义。
 //! - **步长 = [`WHEEL_ROWS`] 视觉行 / 事件**（既不是 1 行，也不是 `PageUp` 的一页）：
 //!   `ScrollUp` / `ScrollDown` 是离散的「滚一格」事件，触控板一次滑动只爆发 8–30 个
@@ -170,13 +172,11 @@ pub fn handle_event(
 /// - **滚轮上下**：滚聊天，每事件 [`WHEEL_ROWS`] 视觉行（见模块文档「滚轮」段）；属
 ///   **用户主动**滚动，与批路径共用 [`scroll_wheel_batch`] —— 两条路只有一份位移折算。
 /// - **左键三态**（按下 / 拖动 / 松开）：应用内选区的生命周期（ADR-0051）。
-/// - **`⇧` 按住**：直接返回，把原生选择让回终端（决策 1）。
+///   crossterm 把「按住左键移动」一律解析为 `Drag(Left)`（`parse_cb`：`cb & 0b10_0000`
+///   即拖动位），`Moved` 只在**未按键**时产生 —— 故拖选只认三态即可。
+/// - **`⇧` 不影响选区**：带不带 `⇧` 都走同一条应用内选区，两条路都必须能选中并复制。
 /// - 其余（水平滚动 / 悬停 / 其它键）：不绑任何动作。
 pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
-    // **最先**判修饰键：`⇧` 是「让回终端原生选择」的开关，必须在任何状态变更之前。
-    if m.modifiers.contains(KeyModifiers::SHIFT) {
-        return;
-    }
     match m.kind {
         MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),
         MouseEventKind::ScrollDown => {
@@ -256,16 +256,13 @@ impl WheelDelta {
 ///
 /// 批内的滚轮事件**只累加方向**（不带坐标）—— 滚轮与选区无关（坐标无意义）。
 ///
-/// **`⇧` 按住的事件不计入**：`⇧` 是「让回终端原生选择」的开关
-/// （[`handle_mouse`] 里逐事件判定），按住时滚轮不得改变视窗。
+/// **修饰键不参与**：`⇧` / `⌥` 按住时滚轮照常滚 —— 修饰键在鼠标上只表达「终端原生
+/// 选择的快捷键」，而本应用已接管选区（[`handle_mouse`]），不再把选择让回终端。
 ///
 /// 变异：把「同向累加」改成「只取最后一个」⇒ 一次滑动只滚一行的用例红。
 pub fn fold_wheel(events: &[MouseEvent]) -> WheelDelta {
     let mut delta = WheelDelta::default();
     for m in events {
-        if m.modifiers.contains(KeyModifiers::SHIFT) {
-            continue;
-        }
         match m.kind {
             MouseEventKind::ScrollUp => delta.push(true),
             MouseEventKind::ScrollDown => delta.push(false),
@@ -2244,9 +2241,9 @@ mod tests {
         assert!(a.follow, "净量 0 ⇒ 仍贴底跟随");
     }
 
-    /// **`⇧` 按住的滚轮不计入**（`⇧` = 让回终端原生选择，ADR-0051 决策 1）。
+    /// **`⇧` 不影响滚轮**：修饰键不再把事件让回终端，`⇧`+滚轮与裸滚轮等价。
     ///
-    /// 变异：把 `fold_wheel` 里的 `⇧` 过滤删掉 ⇒ 本用例红。
+    /// 变异：把 `fold_wheel` 里的 `⇧` 过滤加回去 ⇒ 本用例红。
     #[test]
     fn test_wheel_batch_ignores_shift_held_events() {
         let mut a = app_scrollable();
@@ -2259,11 +2256,15 @@ mod tests {
         };
         let batch = vec![shifted; 5];
         let delta = fold_wheel(&batch);
-        assert_eq!(delta.net(), 0, "`⇧` 按住的事件不计入");
-        assert_eq!(delta.rows(), 0, "净量为 0 个事件 ⇒ 0 视觉行");
+        assert_eq!(delta.net(), 5, "`⇧` 不再过滤，5 个事件全部计入");
+        assert_eq!(delta.rows(), 5 * WHEEL_ROWS, "净量 5 个事件");
 
         scroll_wheel_batch(&mut a, 120, 40, delta);
-        assert_eq!(a.scroll_offset, 0, "`⇧`+滚轮不得改变视窗");
+        assert_eq!(
+            a.scroll_offset,
+            5 * WHEEL_ROWS as usize,
+            "`⇧`+滚轮与裸滚轮同效"
+        );
     }
 
     /// 水平滚动 / 按键 / 悬停 / 拖动一律**不动视窗**（不绑点击才能保留终端原生拖选）。
@@ -2465,28 +2466,48 @@ mod tests {
         assert!(!a.selection.is_active(), "松手后选区应清");
     }
 
-    /// **V7：`⇧` 按住 ⇒ 全程无副作用**（让回终端原生选择）。
+    /// **V7：`⇧` 拖选与裸拖选同效** —— 两者都必须建选区、松手都必须复制。
+    ///
+    /// 变异：把 `handle_mouse` 开头的 `⇧` 提前返回加回去 ⇒ 本用例红。
     #[test]
-    fn v7_shift_has_no_side_effects() {
+    fn v7_shift_selects_and_copies_like_plain_drag() {
         let (w, h) = (120u16, 40u16);
-        let mut a = app_scrollable();
-        a.follow = false;
-        a.scroll_offset = 5;
-        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
-        let (col, row) = (inner.x + 2, inner.y + 1);
 
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Drag(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
-            let mut ev = mouse(kind, col, row);
-            ev.modifiers = KeyModifiers::SHIFT;
+        // 裸拖选与 `⇧` 拖选走完全相同的三态，应得到相同结局。
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let mut a = app_scrollable();
+            a.follow = false;
+            a.scroll_offset = 5;
+            let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+            let (col, row) = (inner.x + 2, inner.y + 1);
+
+            let mut ev = mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+            ev.modifiers = modifiers;
             handle_mouse(ev, &mut a, w, h);
-            assert_eq!(a.scroll_offset, 5, "⇧ 不得改滚动位置");
-            assert!(!a.follow, "⇧ 不得恢复跟随");
-            assert!(a.pending_clipboard.is_none(), "⇧ 不得复制");
-            assert!(!a.selection.is_active(), "⇧ 不得建选区");
+            assert!(
+                a.selection.is_active(),
+                "按下必须建选区（modifiers={modifiers:?}）"
+            );
+
+            let mut ev = mouse(MouseEventKind::Drag(MouseButton::Left), col + 20, row + 3);
+            ev.modifiers = modifiers;
+            handle_mouse(ev, &mut a, w, h);
+            let (anchor, cursor) = a.selection.bounds();
+            assert_ne!(
+                anchor, cursor,
+                "拖动必须扩展选区（modifiers={modifiers:?}）"
+            );
+
+            let mut ev = mouse(MouseEventKind::Up(MouseButton::Left), col + 20, row + 3);
+            ev.modifiers = modifiers;
+            handle_mouse(ev, &mut a, w, h);
+            assert!(
+                a.pending_clipboard.is_some(),
+                "松手必须复制（modifiers={modifiers:?}）"
+            );
+            assert!(!a.selection.is_active(), "松手后选区必清");
+            assert_eq!(a.scroll_offset, 5, "拖选不得改滚动位置");
+            assert!(!a.follow, "拖选脱离跟随");
         }
     }
 

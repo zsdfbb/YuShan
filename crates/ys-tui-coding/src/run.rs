@@ -237,7 +237,8 @@ fn setup_terminal() -> Result<Term, TuiError> {
     let mut out = std::io::stdout();
     // 鼠标捕获：**只为滚轮**（`events::handle_mouse`）。开着它终端就不再拿滚轮
     // 自己滚 scrollback / 发 `↑↓`，滚轮因此归聊天而不是输入历史（见 `events.rs`
-    // 模块文档「滚轮」段）。代价：终端原生拖选失效，用户须 `⇧`+拖选。
+    // 模块文档「滚轮」段）。代价：终端原生拖选失效 —— 由应用内选区接住
+    // （ADR-0051）：裸拖与 `⇧`+拖都选中并复制，不再依赖终端原生选择。
     if let Err(e) = execute!(
         out,
         EnterAlternateScreen,

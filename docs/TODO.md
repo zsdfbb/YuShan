@@ -132,6 +132,13 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 
 设计与变更清单：`docs/arch/input-delivery-latency/design.md` §6。
 
+> **外部参考**：`docs/arch/superagent-reference/design.md` §4 —— 本条**就是**那个参考的
+> 核心结论：缺的不是「投递通道」而是「**系统推一回合**」那一格。原有的判断
+> （宜照 ADR-0051 `Boundary::Deferred` 的形状做）只对「结果回到会话」成立，
+> 对「工作还没完、再推一次」不成立 —— 后者需要一格与 `Deferred` 语义不同的东西：
+> `Deferred` 是「产出物到达」，而这一格的语义是「推进」。
+> 设计要点（约束而非方案）见该文 §4.3，不得绕过 `Abort` 那一条尤要注意。
+
 **未落地但已在别处补上的**：ADR-0021 的前置条件「prefix 指纹测试」已由 subagent 刀 0 于
 `apps/coding-agent/src/toolset.rs:624`（`prefix_fingerprint_is_anchored_and_stable`）一带补齐，**不再计入**。
 
@@ -166,8 +173,11 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
      子 agent 正卡在一次长工具调用里时消息要等那次调用返回（与 ADR-0064 同一口径）。
   2. **广播语义未做** —— `handle` 是单个字符串，一次只投一个子 agent，没有「发给所有在跑的」。
   3. **`PendingResults` 是进程级、会话无关** —— 别的会话遗留的结果会投给当前会话。
+     外部参考（`docs/arch/superagent-reference/design.md` §2.2）：同构问题按
+     「送达 / 读到 / 处理」三段可判事实拆开，未投递的结果**退回上游并永不过期**。
   4. **`-p` / `--json` 不自动起回合** —— 单回合模式结束后才完成的结果留表即失效
-     （`apps/coding-agent/src/main.rs:1952-1957`）。
+     （`apps/coding-agent/src/main.rs:2027` 的绑定点与 `:2029-2030` 的注释）。
+     同上 §2.2：对价是「先落盘再投递」。
   5. **`LiveSubagents` 降为纯计数** —— 等待链拆除后无控制流消费者，`count()` 现为 `#[cfg(test)]`
      （`apps/coding-agent/src/subagent.rs:524-525`）。删不删属设计决策，未定。
   6. **`docs/design-final/subagent-continuation.md` 的 `path:line` 已全部失效** —— 该文已标
@@ -222,6 +232,8 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   （`crates/ys-event/src/collecting.rs:8`、`crates/ys-session/src/memory.rs:8`、`subagent.rs:1246`）。
   ⬜ **待办**：R2（`bash` 有界收集，照 `exec.rs:218` 的 `run_bounded` 语义）无契约变更，可直接做；
   R1（子 agent 并发闸）改 ADR-0022 决策 15 的语义边界 ⇒ **须先走 `arch-design`**。
+  外部参考（`docs/arch/superagent-reference/notes.md` §1「槽满 ≠ 失败」）：做闸时要区分**准入拒绝与运行失败**
+  （槽满不得计进健康统计），且**人发起的操作不被同一道闸挡住**。
   ⚠️ 主因归属**尚未确认**：本机读不到 cgroup / `dmesg`，需用户侧提供「Termux 是否打出 `signal 9`」
   与进程数峰值（报告 §5）。**确认前不要把 R1 当已定方案落地**。
 

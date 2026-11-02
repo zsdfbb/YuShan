@@ -92,6 +92,14 @@ const MIN_HEIGHT: u16 = 5;
 /// 筛选无命中时占位的那行（有候选但都不匹配）。中文全角括号，与既有提示同风格。
 const NO_MATCH: &str = "（无匹配）";
 
+/// 状态行首段在**无回合在跑**时的文案（等待用户输入）。
+///
+/// 与回合进行中的 `⏳ Working…` 构成互斥的一对：首段位置恒有「现在是什么状态」，
+/// 且两种形态都不可被剥 —— 那是状态行唯一无法从别处读到的信息。
+///
+/// 用 `⏸`（U+23F8，窄字符）而非 `▶`：暂停态是「轮到你」，不是「可以开始」。
+const IDLE_MARKER: &str = "⏸ Ready";
+
 /// 筛选框为空时的占位文案 —— **可筛选这件事在这里告诉用户**，不进标题。
 ///
 /// 标题里塞「输入筛选」会把整框撑到 60+ 列（原有标题约 40 列），窄终端下反而被裁掉；
@@ -708,21 +716,26 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
-/// 状态行文案：**从尾部剥**（时长 → 轮数 → tokens → model）。
+/// 状态行文案：**从尾部剥**（时长 → 轮数 → tokens → model → 首段状态）。
 ///
-/// `model` 最不可剥，故任何宽度下都至少显示它。
+/// **首段恒为状态标记**，两种形态互斥：回合进行中是 `⏳ Working…`（`working_text()`
+/// 按 300ms 节拍前进），暂停（等待输入）时是 `⏸ Ready`。`model` 紧随其后，**任何状态下
+/// 都显示** —— 运行中看不到「在跑哪个模型」是纯粹的损失，而「它在推进」已由首段标记与
+/// 进度段承担，不需要用 model 段去换。
 ///
-/// **回合进行中**首段换成 `⏳ Working…`，其后紧跟两个**进度段**（本回合轮号、已用秒数）
-/// —— 它们在剥除顺序里排在 tokens/轮数/时长**之前**，故「它在推进」这条信息在窄终端下
-/// 也保得住。回合结束后不再显示：那时轮号与耗时的权威形态是 transcript 里的 `Summary` 行。
+/// **回合进行中**在 model 之后紧跟两个**进度段**（本回合轮号、本回合已用秒数），它们在剥除
+/// 顺序里排在 tokens/轮数/会话时长**之前**，故「它在推进」这条信息在窄终端下也保得住。
+/// 回合结束后不再显示：那时轮号与耗时的权威形态是 transcript 里的 `Summary` 行。
+///
+/// 最不可剥的是首段标记（连 model 都放不下时只剩它），因为「正在跑 / 等待输入」是
+/// 状态行唯一不可从别处读到的信息。
 fn status_text(app: &App, width: usize) -> String {
-    let model = if app.is_turning {
+    let mut segs = vec![if app.is_turning {
         format!("⏳ {}", app.working_text())
     } else {
-        app.view.model_label()
-    };
-
-    let mut segs = vec![model];
+        IDLE_MARKER.to_string()
+    }];
+    segs.push(app.view.model_label());
     // 「下方有新内容」提示：脱离底部时才有 —— 排在 model 之后、其余段之前，
     // 于是窄终端下先被剥掉的是 tokens / 轮数 / 时长，提示与 model 都留得住。
     if app.new_content_below {
@@ -732,7 +745,9 @@ fn status_text(app: &App, width: usize) -> String {
         if let Some(round) = app.current_round {
             segs.push(format!("第 {round} 轮"));
         }
-        segs.push(format!("{:.0}s", app.turn_elapsed_secs()));
+        // 标 `本回合`：下方还有一段未标的总时长（会话存活），两个裸数字并排时
+        // 分隔符两侧都是 `Ns`，看不出谁是谁。
+        segs.push(format!("本回合 {:.0}s", app.turn_elapsed_secs()));
     }
     // token 段：**只要有任何读数就显示** ——「总量为 0」不是隐藏条件，
     // 否则全程不上报 usage 的会话永远看不到用量。
@@ -776,7 +791,7 @@ fn status_text(app: &App, width: usize) -> String {
             return candidate;
         }
     }
-    segs[0].clone() // 连 model 都放不下：原样交给终端裁
+    segs[0].clone() // 连首段都放不下：原样交给终端裁
 }
 
 /// transcript → 完整的、带样式的文本（**不做 wrap** —— 交给 `Paragraph`）。
@@ -2559,7 +2574,7 @@ mod tests {
             !input_pane.contains("Working"),
             "输入区不再重复 Working：{input_pane}"
         );
-        // 状态行（最底）也把 model 段换成 Working（⏳ 是宽字符，占两格）
+        // 状态行（最底）首段是 Working（⏳ 是宽字符，占两格），model 紧随其后
         assert!(
             rows[39].contains("Working.."),
             "状态行也应显示 Working：{}",
@@ -2567,8 +2582,8 @@ mod tests {
         );
         assert!(rows[39].contains('⏳'), "带 ⏳ 前缀：{}", rows[39]);
         assert!(
-            !rows[39].contains("deepseek-chat"),
-            "turn 中 model 段被替换：{}",
+            rows[39].contains("deepseek-chat"),
+            "turn 中 model 紧随首段、不被替换：{}",
             rows[39]
         );
         assert_eq!(
@@ -2586,11 +2601,7 @@ mod tests {
         assert!(!joined.contains("Working"), "{joined}");
     }
 
-    /// 组合边界：**turn 中 + 极窄**。状态行只剩 `⏳ Working.` 一段，
-    /// 且**不得**泄漏 model 名（turn 中 model 段已被 Working 段替换）。
-    ///
-    /// 与 [`test_idle_does_not_render_working`] 形成对照：同一份 view、同一宽度下，
-    /// idle 走的是 model 段，不会出现 Working。
+    /// 组合边界：**turn 中 + 极窄**。首段 `⏳ Working.` 独占一行，model 与其余段全被剥掉。
     #[test]
     fn test_turning_status_at_extreme_narrow_keeps_working_marker() {
         let view = || CodingView {
@@ -2604,33 +2615,43 @@ mod tests {
         app.is_turning = true;
         app.working_dot = 0; // Working.
 
-        // 宽屏：Working 段在最前，model 名不出现
+        // 宽屏：Working 在最前，model 紧随其后（运行中也要看得见在跑哪个模型）
         let full = status_text(&app, 120);
         assert!(full.starts_with("⏳ Working."), "{full}");
-        assert!(
-            !full.contains("deepseek-chat"),
-            "turn 中替换 model 段：{full}"
-        );
+        assert!(full.contains("deepseek-chat"), "model 不被替换：{full}");
 
-        // 极窄：宽度恰好只够 `⏳ Working.`（之后的 tokens/轮数/时长全被剥掉）
+        // 极窄：宽度恰好只够 `⏳ Working.`（model 及其后全部剥掉）
         let narrow_w = display_width("⏳ Working.");
         let narrow = status_text(&app, narrow_w);
         assert_eq!(narrow, "⏳ Working.", "极窄只剩 Working 段");
         assert!(!narrow.contains("deepseek-chat"), "不泄漏 model：{narrow}");
         assert!(!narrow.contains("1.2k"), "tokens 段已剥掉：{narrow}");
         assert!(!narrow.contains("轮"), "轮数段已剥掉：{narrow}");
+    }
 
-        // 对照：idle 在同一宽度下不含 Working
-        let idle = app_with(view());
-        let idle_txt = status_text(&idle, narrow_w);
-        assert!(
-            !idle_txt.contains("Working"),
-            "idle 不显示 Working：{idle_txt}"
-        );
-        assert!(
-            idle_txt.contains("deepseek-chat"),
-            "idle 显示 model：{idle_txt}"
-        );
+    /// 暂停态：首段是 `⏸ Ready`，同样在任何宽度下都保得住；极窄时 model 先被剥。
+    ///
+    /// 与 [`test_turning_status_at_extreme_narrow_keeps_working_marker`] 对照：同一份 view、
+    /// 同一形状的断言，只有首段标记不同。
+    ///
+    /// 变异：把首段状态段删掉（退回「model 打头」）⇒ 首两条断言变红。
+    #[test]
+    fn test_idle_status_at_extreme_narrow_keeps_ready_marker() {
+        let view = || CodingView {
+            total_input_tokens: 1_200,
+            total_output_tokens: 345,
+            turn_count: 2,
+            ..CodingView::for_test()
+        };
+        let app = app_with(view());
+
+        let full = status_text(&app, 120);
+        assert!(full.starts_with("⏸ Ready"), "{full}");
+        assert!(full.contains("deepseek-chat"), "model 紧随状态段：{full}");
+        assert!(!full.contains("Working"), "暂停态不显示 Working：{full}");
+
+        let narrow_w = display_width(IDLE_MARKER);
+        assert_eq!(status_text(&app, narrow_w), IDLE_MARKER, "极窄只剩状态段");
     }
 
     #[test]
@@ -2648,23 +2669,30 @@ mod tests {
         assert!(full.contains("2 轮"), "{full}");
         assert!(full.contains('s'), "含时长：{full}");
 
-        let mid = status_text(&app, display_width("deepseek-chat · ↑1.2k ↓345 · 2 轮"));
-        assert_eq!(mid, "deepseek-chat · ↑1.2k ↓345 · 2 轮", "中屏去时长");
+        let mid = status_text(
+            &app,
+            display_width("⏸ Ready · deepseek-chat · ↑1.2k ↓345 · 2 轮"),
+        );
+        assert_eq!(
+            mid, "⏸ Ready · deepseek-chat · ↑1.2k ↓345 · 2 轮",
+            "中屏去会话时长"
+        );
 
-        let narrow = status_text(&app, display_width("deepseek-chat · ↑1.2k ↓345"));
-        assert_eq!(narrow, "deepseek-chat · ↑1.2k ↓345");
+        let narrow = status_text(&app, display_width("⏸ Ready · deepseek-chat · ↑1.2k ↓345"));
+        assert_eq!(narrow, "⏸ Ready · deepseek-chat · ↑1.2k ↓345");
 
         let tiny = status_text(&app, 1);
-        assert_eq!(tiny, "deepseek-chat", "极窄只剩 model");
+        assert_eq!(tiny, IDLE_MARKER, "极窄只剩状态段");
     }
 
-    /// 回合进行中：`⏳ Working…` 之后补两个**进度段**（本回合轮号、已用秒数）。
+    /// 回合进行中：`⏳ Working…` 与 model 之后补两个**进度段**（本回合轮号、本回合已用秒数）。
     ///
     /// 这是回合内唯一的进度刻度 —— 在此之前，一个跑 26 轮、六分钟的回合在界面上
     /// 只有一个不动的动画。
     ///
-    /// 变异：① 把进度段从 `segs` 里去掉 ⇒ 前两条断言变红；② 把进度段插到 `segs` **末尾**
-    /// ⇒ 剥段断言变红（窄屏会把轮号连同时长一起剥掉，而这正是最该留下的信息）。
+    /// 变异：① 把进度段从 `segs` 里去掉 ⇒ 「要报轮号」断言变红；② 把进度段插到 `segs`
+    /// **末尾** ⇒ 剥段断言变红（窄屏会把轮号连同时长一起剥掉，而这正是最该留下的信息）；
+    /// ③ 删掉秒数段的 `本回合` 标签 ⇒ 末条断言变红。
     #[test]
     fn test_status_shows_round_and_elapsed_during_turn() {
         let mut app = app_with(CodingView::for_test());
@@ -2675,13 +2703,17 @@ mod tests {
         assert!(full.contains("Working"), "回合中首段是 Working：{full}");
         assert!(full.contains("第 3 轮"), "回合中要报轮号：{full}");
         assert!(
-            !full.contains("deepseek-chat"),
-            "回合中不显示 model（被 Working 段替换）：{full}"
+            full.contains("deepseek-chat"),
+            "回合中 model 仍可见（不再被 Working 替换）：{full}"
+        );
+        assert!(
+            full.contains("本回合 0s"),
+            "回合内的秒数要带标签，否则与会话总时长混淆：{full}"
         );
 
-        // 剥除顺序：秒数先于轮号被剥掉 ⇒ 宽度只够 [Working.. · 第 3 轮] 时，
+        // 剥除顺序：秒数先于轮号被剥掉 ⇒ 宽度只够 [Working.. · model · 第 3 轮] 时，
         // 「跑到第几轮」这条信息保得住。
-        let prefix = format!("⏳ {} · 第 3 轮", app.working_text());
+        let prefix = format!("⏳ {} · deepseek-chat · 第 3 轮", app.working_text());
         assert_eq!(
             status_text(&app, display_width(&prefix)),
             prefix,
@@ -2767,7 +2799,10 @@ mod tests {
             model: None,
             ..CodingView::for_test()
         });
-        assert_eq!(status_text(&app, 1), "(no model)");
+        assert!(
+            status_text(&app, 200).contains("(no model)"),
+            "无模型时状态行的 model 段写 (no model)"
+        );
     }
 
     #[test]

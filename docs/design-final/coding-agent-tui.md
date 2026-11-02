@@ -293,8 +293,13 @@ provider 把思考内联在 `delta.content` 的 `<think>`/`<thinking>`/`<reasoni
 会产出 1 个空行，TUI 侧 `md::render("")` 产出 0 行，用产出行数会让两边在空 assistant 之后
 给出不同留白。
 
-**状态行**：`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**（时长 → 轮数 → tokens → model）；
-turn 中把 model 段换成 `⏳ Working·`（300ms 节拍前进，宽字符占两格）。四档宽度各有测试。
+**状态行**：首段恒为状态标记（回合中 `⏳ Working·`，暂停态 `⏸ Ready`），其后
+`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**（时长 → 轮数 → tokens → model → 状态标记）；
+回合中在 model 之后再插两个进度段（`第 N 轮`、`本回合 Ns`），它们在剥除顺序里排在
+tokens 之前。`⏳` 是宽字符、`⏸` 是窄字符。四档宽度各有测试。
+
+> **model 段不因回合进行而被替换**：运行中看不到「在跑哪个模型」是纯损失，而「它在推进」
+> 已由首段标记与进度段承担（见 `draw::status_text`）。
 
 **输入区**：多行（`Enter` 提交；`Shift`/`Alt` + Enter 换行，另加 **`Ctrl-J` 普适兜底** ——
 `Shift+Enter` 依赖终端的 Kitty 键盘增强协议，Termux 等不支持的终端下它与 `Enter` 发出**同一个

@@ -841,8 +841,9 @@ flowchart TB
 - **回合摘要**：`Summary` 输出 `{symbol} {stop-label} · N rounds · X.Ys`。五种已知
   `StopReason` 使用 `completed` / `max rounds` / `cancelled` / `truncated` / `no output`，
   未来变体由通配分支显示 `unknown`；TUI 与退出 scrollback 共用这一格式。
-- **状态行**：`model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**；turn 中把 model 段换成
-  `⏳ Working·`（300ms 节拍前进）。
+- **状态行**：首段恒为状态标记（回合中 `⏳ Working·` 按 300ms 节拍前进，暂停态 `⏸ Ready`），
+  其后 `model · ↑↓tokens · N 轮 · 时长`，窄屏**从尾部剥**；回合中在 model 之后再插
+  `第 N 轮` / `本回合 Ns` 两个进度段。
 - **输入区**：多行（`Shift/Alt+Enter` 换行、`Enter` 提交）；启用 bracketed paste（`Event::Paste`
   原样 `insert_str`）；`InputBuffer.cursor` 是 **char 索引**，退格走字节边界求区间再 `replace_range`
   —— 修掉了旧 `ui/events.rs:131` 的 `cursor - 1` 落在多字节字符中间导致的**中文退格 panic**。

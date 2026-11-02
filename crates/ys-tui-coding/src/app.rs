@@ -134,6 +134,12 @@ pub struct App {
     /// 它存在的唯一理由：一个回合可以跑几十轮、每轮数秒，而 `rounds` 此前只在
     /// **回合结束**的摘要里出现 ⇒ 回合进行中界面只能显示一个不动的动画。
     pub current_round: Option<u32>,
+    /// 覆盖状态行的「现在时间」（`HH:MM`）。
+    ///
+    /// `None` = 渲染时读真实钟点（生产路径）：事件循环空闲也会每 `POLL_INTERVAL`
+    /// 重绘一次，故钟点自行行走，无需额外节拍。`Some` 只给测试用 —— 否则断言得
+    /// 依赖「跑测试时几点」与机器时区。
+    pub clock_now: Option<String>,
     /// assistant 渲染产物缓存 + 流式节流状态（设计 §2.5）。
     ///
     /// `RefCell`：`layout.rs` 的条目渲染走 `&App`，而缓存需要可变访问；
@@ -206,6 +212,7 @@ impl App {
             turn_started_at: None,
             working_dot: 0,
             current_round: None,
+            clock_now: None,
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             layout: std::cell::RefCell::new(crate::layout::TranscriptLayout::default()),
             selection: crate::selection::Selection::default(),

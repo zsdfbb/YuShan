@@ -17,6 +17,14 @@
 //! `startup_outbound_sequence_puts_replay_before_hint` 进程内单测钉住。
 //! 这样不写不稳定的 pty 测试，也不为凑覆盖率放松断言。
 //!
+//! # 关于 `session: <id>`（ADR-0067）
+//!
+//! 退出提示行**只在面向人的终端里打**（`stdout` 是 TTY）。本文件的子进程用管道捕获
+//! 输出，故 stderr **永远不含** `session:` —— 这不是缺陷，是契约。I3 的等价断言改为
+//! 直接看落盘事实：会话文件只有一个、且就是目标 id、新消息 append 进去了。
+//! `session_exit_line` 自身的 TTY 门控由 `src/main.rs` 的
+//! `exit_line_is_silent_when_stderr_is_not_human_facing` 钉住。
+//!
 //! # 子进程 env 隔离
 //!
 //! 全部经 `Command` 的 **per-child** `.env()` / `.env_remove()` / `.current_dir()` 注入，
@@ -360,10 +368,11 @@ fn resume_continues_target_session_and_replays_history() {
         "-p 的 stdout 恰为模型文本（不得混入 `session:` 等）：{stdout:?}\nstderr:\n{stderr}"
     );
 
-    // N5：退出提示的 id == **目标**会话文件 stem。
+    // N5（ADR-0067 后的等价形态）：子进程 stdout 是管道 ⇒ 退出提示行按契约静默，
+    // 故 I3 直接钉**落盘事实**：唯一会话文件就是目标 id、新消息与历史都在里面。
     assert!(
-        stderr.contains(&format!("session: {id}")),
-        "stderr 应以 `session: <目标 id>` 提示（I3）：\n{stderr}"
+        !stderr.contains(&format!("session: {id}")),
+        "非 TTY 的 stderr 不得打 `session:`（管道调用只要结果）：\n{stderr}"
     );
 
     // N12（等价证据）：恢复的历史确实被加载并进入本轮发给模型的请求。

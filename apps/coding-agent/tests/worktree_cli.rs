@@ -192,6 +192,23 @@ fn streams(out: &Output) -> (String, String) {
     )
 }
 
+/// 会话目录下的 `*.jsonl` 文件，按路径排序（文件名即会话 id）。
+///
+/// 非 TTY 下不再有 `session: <id>` 提示行（ADR-0067），故需要会话 id 的用例
+/// 直接从这里取证。
+fn session_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .collect();
+    out.sort();
+    out
+}
+
 fn debug_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -313,9 +330,11 @@ fn n1_create_makes_worktree_and_branch() {
         stdout.is_empty(),
         "create 的输出属于诊断，应全走 stderr；stdout:\n{stdout:?}"
     );
+    // 纯建树分支（TUI 起不来）**仍然**打告知行：它就是「未启动 TUI」这条降级说明的
+    // 一部分，不适用 ADR-0067 的「管道下静默」—— 此处本就没有会话，也没有结果流。
     assert!(
         stderr.contains("worktree: feat"),
-        "stderr 应含 `worktree: feat`：\n{stderr}"
+        "非终端纯建树仍应告知树名：\n{stderr}"
     );
     assert!(
         stderr.contains("未启动 TUI"),
@@ -827,11 +846,11 @@ fn serve_sse_once(
     stream.flush()
 }
 
-/// **N9**：worktree 会话跑 `-p` ⇒ stderr **同时**含 `session: <id>` 与 `worktree: feat`；
-/// 非 worktree 会话 ⇒ 只有 `session:`、**没有** `worktree:`。
+/// **N9**：`-p` 的 stderr **不含** `session:` / `worktree:` 收尾行（ADR-0067：管道调用
+/// 只要结果）；而落盘侧的会话 meta **正确记录了工作树**。
 ///
 /// 用回环 SSE mock 跑通成功回合（`persist_single_turn` 才会执行），故**无需真实凭证**。
-/// 变异靶子：删掉 `persist_single_turn` 里的 `worktree` 分支 ⇒ 第一段断言红。
+/// 变异靶子：删掉 `persist_single_turn` 里的 `worktree` 分支 ⇒ 第二段断言红。
 #[test]
 fn n9_exit_lines_report_worktree_only_when_attached() {
     let server = SseServer::start();
@@ -859,15 +878,21 @@ fn n9_exit_lines_report_worktree_only_when_attached() {
         "stdout 应为模型文本；stdout:\n{stdout:?}"
     );
     assert!(
-        stderr.contains("session: "),
-        "stderr 应含 `session: <id>`：\n{stderr}"
-    );
-    assert!(
-        stderr.contains("worktree: feat"),
-        "worktree 会话的 stderr 应含 `worktree: feat`：\n{stderr}"
+        !stderr.contains("session: ") && !stderr.contains("worktree: "),
+        "非 TTY 不得打收尾行：\n{stderr}"
     );
 
-    // 非 worktree 会话：`-p` 直跑 ⇒ 只有 `session:`。
+    // 落盘事实：唯一会话文件的 meta 记录了 attach 的树。
+    let sessions = session_files(&sb.sessions);
+    assert_eq!(sessions.len(), 1, "成功回合应落一个会话文件：{sessions:?}");
+    let content = std::fs::read_to_string(&sessions[0]).unwrap();
+    let first = content.lines().next().expect("首行应存在");
+    assert!(
+        first.contains("\"workspace\"") && first.contains("feat"),
+        "attach 会话的 meta 应记录树：\n{first}"
+    );
+
+    // 非 worktree 会话：`-p` 直跑 ⇒ meta 不带 workspace。
     let mut cmd = command(&sb, &sb.repo);
     cmd.args(["-p", "hi"])
         .env("YUSHAN_API_BASE", &api_base)
@@ -881,12 +906,21 @@ fn n9_exit_lines_report_worktree_only_when_attached() {
         "成功回合应 exit(0)；stderr:\n{plain_err}"
     );
     assert!(
-        plain_err.contains("session: "),
-        "stderr 应含 `session: <id>`：\n{plain_err}"
+        !plain_err.contains("session: ") && !plain_err.contains("worktree: "),
+        "非 TTY 不得打收尾行：\n{plain_err}"
     );
+    let sessions = session_files(&sb.sessions);
+    assert_eq!(sessions.len(), 2, "两个回合各一个会话文件：{sessions:?}");
+    let plain = sessions
+        .iter()
+        .find(|p| !std::fs::read_to_string(p).unwrap().contains("feat"))
+        .expect("应有一个未 attach 的会话文件");
+    let first = std::fs::read_to_string(plain).unwrap();
+    let first = first.lines().next().unwrap();
+    // 键**恒存在**，只是值为 `null`（「未绑定树」与「没这个字段」在 meta 里同义）。
     assert!(
-        !plain_err.contains("worktree: "),
-        "非 worktree 会话**不得**打 `worktree:` 行：\n{plain_err}"
+        first.contains("\"workspace\":null"),
+        "非 worktree 会话的 meta 应显式无 workspace：\n{first}"
     );
 }
 
@@ -970,9 +1004,13 @@ fn attach_and_run(sb: &Sandbox, name: &str, api_base: &str) -> (String, PathBuf)
         Some(0),
         "attach -p 成功回合应 exit(0)；stderr:\n{stderr}"
     );
-    let id = line_after(&stderr, "session: ")
-        .expect("成功回合应打 `session: <id>`")
-        .trim()
+    // 会话文件从落盘目录取：非 TTY 下不再有 `session: <id>` 提示行（ADR-0067）。
+    let sessions = session_files(&sb.sessions);
+    assert_eq!(sessions.len(), 1, "成功回合应落一个会话文件：{sessions:?}");
+    let id = sessions[0]
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("会话文件名即 id")
         .to_string();
     (id, tree)
 }
@@ -1020,8 +1058,8 @@ fn u3_resume_restores_recorded_worktree() {
         "应告知恢复到工作树：\n{stderr}"
     );
     assert!(
-        stderr.contains("worktree: feat"),
-        "恢复后退出行应报告当前工作树：\n{stderr}"
+        !stderr.contains("worktree: feat"),
+        "非 TTY 不得打退出行（ADR-0067），恢复事实由下面的 meta 与 cwd 取证：\n{stderr}"
     );
 }
 
@@ -1092,9 +1130,17 @@ fn u3_explicit_attach_wins_over_recorded_worktree() {
         stderr.contains("已按显式指定的工作树使用"),
         "显式指定与记录不同时应说明：\n{stderr}"
     );
+    // 显式指定优先于 meta 记录：落盘事实是 meta 已改写为 `bug`（退出行在非 TTY 静默）。
+    let sessions = session_files(&sb.sessions);
+    let content = std::fs::read_to_string(&sessions[0]).unwrap();
+    let first = content.lines().next().expect("首行应存在");
     assert!(
-        stderr.contains("worktree: bug"),
-        "退出行应报告显式 attach 的树（显式者优先）：\n{stderr}"
+        first.contains("bug") && !first.contains("feat"),
+        "显式 attach 的树应胜出并写进 meta：\n{first}"
+    );
+    assert!(
+        !stderr.contains("worktree: "),
+        "非 TTY 不得打退出行：\n{stderr}"
     );
 }
 
@@ -1305,19 +1351,20 @@ fn create_launches_session_in_the_new_tree() {
         stdout.contains("hi"),
         "stdout 应为模型文本；stdout:\n{stdout:?}"
     );
-    // 建树告知走启动期提示（`-p` 下即 stderr），不再是「下一步：attach」。
+    // 建树告知**不进 stderr**（ADR-0067：非 TTY 不吐面向人的告知行），
+    // 但树本身确实建在受管目录下。
+    let tree = canonical(&sb.trees.join("Develop").join("YuShan").join("feat"));
+    assert!(tree.is_dir(), "树应已建出：{tree:?}");
     assert!(
-        stderr.contains("worktree: feat"),
-        "应告知建出的树名：\n{stderr}"
+        !stderr.contains("worktree: feat") && !stderr.contains("路径："),
+        "非 TTY 不得打建树告知：\n{stderr}"
     );
-    assert!(stderr.contains("路径："), "应告知建出的树路径：\n{stderr}");
     assert!(
         !stderr.contains("下一步："),
         "create 已直接启动，不该再提示 attach：\n{stderr}"
     );
 
     // 系统提示首段的 cwd 就是新树 ⇒ 回合确实跑在树里。
-    let tree = canonical(&sb.trees.join("Develop").join("YuShan").join("feat"));
     let bodies = server.bodies();
     assert!(!bodies.is_empty(), "mock 应至少收到一个请求");
     let cwd_line = format!("Current working directory: {}", tree.display());
@@ -1328,13 +1375,11 @@ fn create_launches_session_in_the_new_tree() {
         bodies.join("\n---\n")
     );
 
-    // meta 同样记录了新树（退出后 `--resume` 回到同一棵树）。
-    let id = line_after(&stderr, "session: ")
-        .expect("成功回合应打 `session: <id>`")
-        .trim()
-        .to_string();
-    let meta_path = sb.sessions.join(format!("{id}.jsonl"));
-    let content = std::fs::read_to_string(&meta_path).expect("会话文件应存在");
+    // meta 同样记录了新树（退出后 `--resume` 回到同一棵树）。\n    // 会话文件从落盘目录取：非 TTY 下不再有 `session: <id>` 提示行。
+    let sessions = session_files(&sb.sessions);
+    assert_eq!(sessions.len(), 1, "成功回合应落一个会话文件：{sessions:?}");
+    let meta_path = &sessions[0];
+    let content = std::fs::read_to_string(meta_path).expect("会话文件应存在");
     let first = content.lines().next().expect("首行应存在");
     assert!(
         first.contains(tree.to_str().unwrap()),

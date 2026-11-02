@@ -34,6 +34,7 @@
 mod app;
 mod breakpoints;
 mod cache;
+mod clock;
 mod commands;
 mod completion;
 mod draw;

@@ -704,9 +704,25 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 |---|---|---|
 | **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
-| **退出时** | `session: <id>`（TUI 退出**摘要写回主屏之后**写 stderr；`-p` / `--json` 收尾） | **stderr** |
+| **退出时** | `session: <id>`（TUI 退出**摘要写回主屏之后**写 stderr；`-p` / `--json` 收尾） | **stderr**，但**仅当 stdout 是终端** |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
-| **debug 运行期间（默认开启）** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
+| **debug 运行期间（默认开启）** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage / 回合读数） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
+
+**异常是唯一的例外**：一次性模式（`-p` / `--json`）的 stderr 正常路径**完全为空**；
+只在消费侧出错时写一行错误（回合错误优先传播，且不覆盖消费侧那一行）。
+
+**收尾提示与可发现性提示都在 TTY 门控下**（ADR-0067）：`session: <id>` / `worktree: <name>` /
+`Resume with --resume` 只在 **stdout 是终端**时打 —— 被程序调用时（管道 / 脚本 / `$(...)`）
+调用方要的是结果与退出码，会话 id 可以从会话目录或自身日志里取。
+`stdin` 不参与判定（`echo q | yushan -p …` 仍然是人）。
+**例外**：纯建树分支（`worktree create` 起不了 TUI，无会话也无结果流）照旧打告知行。
+
+**运行读数不上人读出口**（ADR-0067）：每回合的 `turn=… rounds=… tpr_x100=…` 这类
+定形行**只**落 debug（`ev="run_reading"`）与 bench（`bench-summary.json`）。
+`-p` / `--json` 的调用方要的是结果，TUI 用户要的是对话 —— 三模式都不打印它。
+TUI 展示的是**现在几点**（状态行尾段 `HH:MM`，本地时区）与**会话开了多久**
+（`Ns / NmMs / NhMm`）；`/status` 另给 `duration`（存活）与 `executed`（Σ 回合实际
+占用）两个口径。
 
 **退出时**是第三类时机：TUI 已退 alt-screen（`restore_terminal` 已把**一行退出摘要**写回 stdout），此刻写 stderr
 的字节落在主屏、不会被冲掉，也不污染 `-p` 的模型文本 / `--json` 的逐行 `Envelope`。内容由

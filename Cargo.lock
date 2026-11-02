@@ -2525,6 +2525,7 @@ name = "ys-tui-coding"
 version = "0.0.1"
 dependencies = [
  "crossterm",
+ "libc",
  "ratatui",
  "serde_json",
  "tokio",

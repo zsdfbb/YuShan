@@ -633,9 +633,11 @@ fn print_success_persists_meta_and_reports_session_to_stderr() {
 
     let path = sole_jsonl(&roots.sessions_dir);
     let id = path.file_stem().unwrap().to_str().unwrap();
+    // ADR-0067：收尾提示行只在面向人的终端打；子进程 stdout 是管道 ⇒ 静默。
+    // 会话文件的存在性由 `sole_jsonl` 自己钉住（落盘目录里恰一个 jsonl）。
     assert!(
-        stderr.contains(&format!("session: {id}")),
-        "stderr 应以 `session: <id>` 提示落盘文件（设计 §9）；stderr:\n{stderr}"
+        !stderr.contains(&format!("session: {id}")),
+        "非 TTY 的 stderr 不得打 `session:`；stderr:\n{stderr}"
     );
 
     let meta = read_meta_line(&path);
@@ -713,9 +715,11 @@ fn json_success_keeps_stdout_pure_json_and_persists_meta() {
 
     let path = sole_jsonl(&roots.sessions_dir);
     let id = path.file_stem().unwrap().to_str().unwrap();
+    // ADR-0067：收尾提示行只在面向人的终端打；子进程 stdout 是管道 ⇒ 静默。
+    // 会话文件的存在性由 `sole_jsonl` 自己钉住（落盘目录里恰一个 jsonl）。
     assert!(
-        stderr.contains(&format!("session: {id}")),
-        "stderr 应以 `session: <id>` 提示落盘文件（设计 §9）；stderr:\n{stderr}"
+        !stderr.contains(&format!("session: {id}")),
+        "非 TTY 的 stderr 不得打 `session:`；stderr:\n{stderr}"
     );
 
     let meta = read_meta_line(&path);

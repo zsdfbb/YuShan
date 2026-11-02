@@ -781,7 +781,7 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
-/// 状态行文案：**从尾部剥**（时长 → 轮数 → tokens → model → 首段状态）。
+/// 状态行文案：**从尾部剥**（本地钟点 → 时长 → 轮数 → tokens → model → 首段状态）。
 ///
 /// **首段恒为状态标记**，两种形态互斥：回合进行中是 `⏳ Working…`（`working_text()`
 /// 按 300ms 节拍前进），暂停（等待输入）时是 `⏸ Ready`。`model` 紧随其后，**任何状态下
@@ -791,6 +791,10 @@ fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
 /// **回合进行中**在 model 之后紧跟两个**进度段**（本回合轮号、本回合已用秒数），它们在剥除
 /// 顺序里排在 tokens/轮数/会话时长**之前**，故「它在推进」这条信息在窄终端下也保得住。
 /// 回合结束后不再显示：那时轮号与耗时的权威形态是 transcript 里的 `Summary` 行。
+///
+/// **现在时间与时长在尾段**（`HH:MM` + `session_duration_str`）：「现在几点」是背景信息，
+/// 窄屏下该先让位给「在跑什么、跑了几轮」。运行读数（`rounds` / `ttft` / token 明细）
+/// **不进状态行** —— 它们只在 `/status` 与 debug 记录里，状态行只管对话进度。
 ///
 /// 最不可剥的是首段标记（连 model 都放不下时只剩它），因为「正在跑 / 等待输入」是
 /// 状态行唯一不可从别处读到的信息。
@@ -854,6 +858,11 @@ fn status_text(app: &App, width: usize) -> String {
         segs.push(format!("{} 轮", app.view.turn_count));
     }
     segs.push(app.view.session_duration_str());
+    // 钟点放**最后**：它是背景信息，窄屏下先被剥。
+    segs.push(match &app.clock_now {
+        Some(fixed) => fixed.clone(),
+        None => crate::clock::now_hhmm(),
+    });
 
     // 取「能放下的最长前缀」= 逐段从尾部剥
     for k in (1..=segs.len()).rev() {
@@ -1612,7 +1621,10 @@ mod tests {
     use ys_core::ToolCallId;
 
     fn app_with(view: CodingView) -> App {
-        App::new(view)
+        let mut app = App::new(view);
+        // 状态行未端有钟点段：固定成已知值，剥段断言就不依赖「跑测试时机器的时区与时刻」。
+        app.clock_now = Some("12:00".to_string());
+        app
     }
 
     // ── CJK 断点（`breakpoints.rs` 的渲染层守卫） ──────────────────────────
@@ -2850,6 +2862,9 @@ mod tests {
         assert_eq!(status_text(&app, narrow_w), IDLE_MARKER, "极窄只剩状态段");
     }
 
+    /// 剥除顺序：**钟点 → 会话时长 → 轮数 → tokens → model → 首段状态**。
+    ///
+    /// 变异：把钟点段插到 `segs` 开头或中段 ⇒ 首两条断言变红（窄屏会先丢“在跑什么”）。
     #[test]
     fn test_status_narrowing_drops_from_tail() {
         let view = CodingView {
@@ -2859,11 +2874,19 @@ mod tests {
             ..CodingView::for_test()
         };
         let app = app_with(view);
-        let full = status_text(&app, 120);
+        let full = status_text(&app, 160);
         assert!(full.contains("deepseek-chat"), "{full}");
         assert!(full.contains("↑1.2k ↓345"), "{full}");
         assert!(full.contains("2 轮"), "{full}");
-        assert!(full.contains('s'), "含时长：{full}");
+        assert!(full.ends_with("12:00"), "钟点在未端：{full}");
+
+        // 宽度恰好不含钟点 ⇒ 只剩到会话时长。
+        let without_clock = "⏸ Ready · deepseek-chat · ↑1.2k ↓345 · 2 轮 · 0s";
+        assert_eq!(
+            status_text(&app, display_width(without_clock)),
+            without_clock,
+            "钟点最先被剥"
+        );
 
         let mid = status_text(
             &app,
@@ -2871,7 +2894,7 @@ mod tests {
         );
         assert_eq!(
             mid, "⏸ Ready · deepseek-chat · ↑1.2k ↓345 · 2 轮",
-            "中屏去会话时长"
+            "中屏再去会话时长"
         );
 
         let narrow = status_text(&app, display_width("⏸ Ready · deepseek-chat · ↑1.2k ↓345"));
@@ -2879,6 +2902,25 @@ mod tests {
 
         let tiny = status_text(&app, 1);
         assert_eq!(tiny, IDLE_MARKER, "极窄只剩状态段");
+    }
+
+    /// 状态行未端**一定有**钟点段（`HH:MM`），且它跟在会话时长之后：
+    /// 「现在几点」与「开了多久」是两个数，不得只留一个。
+    ///
+    /// 变异：删掉钟点段 ⇒ 末段断言变红；把它提到时长之前 ⇒ 顺序断言变红。
+    #[test]
+    fn test_status_shows_clock_after_session_duration() {
+        let app = app_with(CodingView::for_test());
+        let full = status_text(&app, 160);
+        let segs: Vec<&str> = full.split(" · ").collect();
+        assert_eq!(segs.last().copied(), Some("12:00"), "末段是钟点：{full}");
+        assert_eq!(segs[segs.len() - 2], "0s", "钟点紧跟会话时长：{full}");
+
+        let narrow = status_text(&app, display_width("⏸ Ready · deepseek-chat · 0s"));
+        assert!(
+            !narrow.contains("12:00") && narrow.ends_with("0s"),
+            "窄屏先剥钟点，时长留下：{narrow}"
+        );
     }
 
     /// 复制提示进状态行，并**排在夹在首段之后、model 之前**：

@@ -1040,12 +1040,16 @@ pub(crate) fn record_boundary(
 
 /// [`consume_events`] 的产物：事件流累计轮数 + 回合级读数行。
 ///
-/// 读数行由**消费者侧**的 [`RoundClock`] 汇总（口径与 TUI 入口一致）；调用方负责
-/// 把它写到 stderr（`-p` / `--json`）—— **绝不写 stdout**，那是对外事件流的契约。
+/// 读数行由**消费者侧**的 [`RoundClock`] 汇总（口径与 TUI 入口一致）。它**只是内部
+/// 记录**：`-p` / `--json` 的 stdout 承载结果、stderr 只在有异常时说话，故读数行既不
+/// 进 stdout 也不进 stderr，只经 `record_run_reading_fields` 落 debug JSONL（供 bench
+/// 与事后分析）。`dead_code`：`-p` / `--json` 的唯一出口是 debug，关掉 debug 时无人读。
 struct ConsumeOutcome {
     rounds: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
     reading: String,
     /// 与 `reading` 同源的数字字段（见 [`RoundClock::summary_fields`]）。
+    #[cfg_attr(not(test), allow(dead_code))]
     reading_fields: Vec<(&'static str, u128)>,
 }
 
@@ -1057,7 +1061,7 @@ struct ConsumeOutcome {
 /// 每个事件 `on_event` 写出后 `flush()`（保证 `-p` 增量实时可见）。
 ///
 /// `turn` 是**回合号**（`-p` / `--json` 恒为 1，取自 `begin_turn(1)` 的同一取值），
-/// 只用于读数行的 `turn=` 字段。
+/// 只用于读数行的 `turn=` 字段（该行只进 debug，见 [`ConsumeOutcome`]）。
 async fn consume_events<W, F>(
     mut rx: mpsc::Receiver<Envelope>,
     mut w: W,
@@ -1289,6 +1293,9 @@ fn startup_hints(
 /// 默认新会话、但会话目录非空时，把一行 `Resume with --resume` 可发现性提示追加进
 /// 既有启动期提示（设计 §9）。
 ///
+/// **只在面向人的终端里加**（[`stderr_is_human_facing`]）：它是「你可能想恢复既有会话」的
+/// 建议，对脚本而言只是噪音。
+///
 /// **绝不覆盖**已有提示：`triggered` 为假时原样返回 `hint`；为真时多行拼接、
 /// 原有提示在前（与 [`startup_hints`] 的「一行一事」同规）。
 fn with_resume_hint(hint: Option<String>, triggered: bool) -> Option<String> {
@@ -1349,6 +1356,20 @@ fn worktree_created_note(entry: &worktree::Entry) -> String {
 /// （CI / 脚本 / 管道）**不**启动 TUI，由调用方降级为纯建树语义。
 fn tui_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// 收尾提示（`session: <id>` / `worktree: <name>`）该不该落 stderr。
+///
+/// 口径是「**stdout / stdin 是不是终端**」，不是「哪个模式」：
+///
+/// - 终端里的人（`-p` 亲自跑也算）需要这两行 —— 拿 `session: <id>` 去 `--resume`、
+///   确认刚才落在哪棵树。
+/// - 被程序调用时（管道 / 脚本 / `$(...)`）它们只是要过滤的噪音：调用方要的是
+///   结果与退出码，会话 id 可以从会话目录或自身日志里取。
+///
+/// 与 [`tui_available`] 不同，它**不要求 stdin**（`echo q | yushan -p ...` 仍然是人）。
+fn stderr_is_human_facing() -> bool {
+    io::stdout().is_terminal()
 }
 
 /// 把打开会话时产生的一次性修复摘要追加到启动期提示末尾。
@@ -1467,10 +1488,22 @@ fn session_id_of(path: &Path) -> Option<String> {
 /// 都没跑过的会话压根没有文件，打出的 id 连 `--resume` 都找不到（`sessions::resolve`
 /// 会报「找不到会话」），那是误导而不是提示。
 ///
+/// **只在面向人的终端里打**（[`stderr_is_human_facing`]）：管道调用方要的是结果，
+/// 会话 id 属于可以事后从会话目录取的信息。
+///
 /// 三模式共用同一条：`-p` / `--json` 收尾与 TUI 退出后（`run_interactive`）都经此，
 /// 措辞因此不可能漂移。三处都写 **stderr**（stdout 属数据流：`-p` 是模型文本、
 /// `--json` 是逐行 `Envelope`、TUI 是退出回放的 transcript）。
 fn session_exit_line(path: Option<&Path>) -> Option<String> {
+    exit_line_for(path, stderr_is_human_facing())
+}
+
+/// [`session_exit_line`] 的可测内核：把「有没有文件」与「要不要吐给人」分开，
+/// 故两条闸都能在不依赖真实终端的前提下铉住。
+fn exit_line_for(path: Option<&Path>, human_facing: bool) -> Option<String> {
+    if !human_facing {
+        return None;
+    }
     let path = path.filter(|p| p.is_file())?;
     Some(format!("session: {}", session_id_of(path)?))
 }
@@ -1904,7 +1937,7 @@ async fn persist_single_turn(
     if let Some(line) = session_exit_line(wiring.session_path()) {
         eprintln!("{line}");
     }
-    if let Some(b) = binding {
+    if let Some(b) = binding.filter(|_| stderr_is_human_facing()) {
         eprintln!("{}", worktree_exit_line(&b.name));
     }
     Ok(())
@@ -2130,27 +2163,31 @@ fn report_channel_stats(handle: &ChannelStatsHandle, force: bool) {
     }
 }
 
-/// 一次性模式的收尾顺序：先把已汇总的读数行写到 `stderr`，再传播错误。
+/// 消费侧异常时 stderr 的**首段**。测试以它判定「报的是消费异常而非回合错误」。
+const EVENT_STREAM_BROKEN: &str = "event stream broken";
+
+/// 一次性模式的收尾：合并回合结果与消费结果，必要时向 stderr 报**消费**异常，再传播错误。
 ///
-/// 读数行必须在 `run_result` 的 `?` **之前**落盘：回合失败时 `run_result` 为
-/// `Err` 会提前返回，但消费侧已排空、读数已算出，仍应让用户看到（设计
-/// `design.md`「终局事件后写 stderr」）。
+/// 读数行**不写 stderr**：`-p` / `--json` 的调用方要的是结果，不是运行读数 ——
+/// 它只落 debug JSONL（见 [`ConsumeOutcome`]）。正常路径因此完全零噪音，stderr
+/// 只在真出异常时说话。
+///
+/// 消费异常**先于**回合结果汇报：回合失败时 `run_result` 会提前返回，若先传播回合
+/// 错误，消费侧的真实异常就被它挡住了。
 ///
 /// 错误优先级：回合错误先于消费错误（模型错误是用户真正要看的）。
-/// 消费失败时没有读数可写 —— 不编造行，只传播错误。
 fn finish_after_reading<ER, EC, T>(
     stderr: &mut impl Write,
     run_result: Result<RunResult, ER>,
     consume_result: Result<T, EC>,
-    reading: Option<&str>,
 ) -> Result<(RunResult, T), Box<dyn std::error::Error>>
 where
     ER: std::error::Error + 'static,
     EC: std::error::Error + 'static,
 {
-    if let Some(line) = reading {
+    if let Some(err) = consume_result.as_ref().err() {
         // 与 `eprintln!` 一致：stderr 写失败不改变退出语义。
-        let _ = writeln!(stderr, "{line}");
+        let _ = writeln!(stderr, "{EVENT_STREAM_BROKEN}: {err}");
     }
     let result = run_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     let consumed = consume_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -2240,11 +2277,9 @@ async fn run_print_mode(
 
     // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
     report_channel_stats(stats, force_stats);
-    // 读数行走 **stderr**：stdout 承载模型增量流，必须保持干净。
-    // 回合失败时 `run_result` 为 `Err`，但读数已算出 —— 先写读数再传播（回合错误优先）。
-    let reading_line = reading.as_ref().map(|(line, _)| line.as_str());
+    // 读数行**只进 debug**（上面已写）；stdout 承载模型增量流、stderr 只在异常时说话。
     let (result, (printed_any, consumed)) =
-        finish_after_reading(&mut io::stderr(), run_result, consume_result, reading_line)?;
+        finish_after_reading(&mut io::stderr(), run_result, consume_result)?;
     *observed_rounds = consumed.rounds;
 
     if printed_any {
@@ -2335,11 +2370,8 @@ async fn run_json_mode(
     }
 
     report_channel_stats(stats, force_stats);
-    // 读数行走 **stderr**：stdout 是逐行 `Envelope` 流，必须保持干净。
-    // 回合失败时 `run_result` 为 `Err`，但读数已算出 —— 先写读数再传播（回合错误优先）。
-    let reading_line = reading.as_ref().map(|(line, _)| line.as_str());
-    let (result, consumed) =
-        finish_after_reading(&mut io::stderr(), run_result, consume_result, reading_line)?;
+    // 读数行**只进 debug**（上面已写）；stdout 是逐行 `Envelope` 流、stderr 只在异常时说话。
+    let (result, consumed) = finish_after_reading(&mut io::stderr(), run_result, consume_result)?;
     *observed_rounds = consumed.rounds;
     Ok(result)
 }
@@ -2672,7 +2704,7 @@ fn run_interactive(
         eprintln!("{line}");
     }
     // `worktree:` 行取自**运行期可变**的工作区绑定快照（`/resume` 可能已切树）。
-    if let Some(b) = worktree.get() {
+    if let Some(b) = worktree.get().filter(|_| stderr_is_human_facing()) {
         eprintln!("{}", worktree_exit_line(&b.name));
     }
 
@@ -2875,6 +2907,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut worktree_path: Option<PathBuf> = None;
     // 建树成功的告知行。**不进 stderr**（TUI 起屏前写 stderr 会在退出 alt-screen 后变成
     // 主屏残渣，设计 §5），改为并入启动期提示：TUI 进 transcript、`-p`/`--json` 进 stderr。
+    // 非面向人的终端（管道）下整行不提（ADR-0067）。
     let mut worktree_note: Option<String> = None;
     // 是否**显式**指定了工作树（`create` 或 `attach`，含 attach 的失败降级）。
     // 显式者优先于 meta 记录：只要用户点名了工作树，就不再套用 meta 里的记录
@@ -2893,7 +2926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     worktree_path = Some(entry.path.clone());
                     worktree_name = Some(entry.name.clone());
                     config.cwd = entry.path.clone();
-                    worktree_note = Some(worktree_created_note(&entry));
+                    worktree_note = stderr_is_human_facing().then(|| worktree_created_note(&entry));
 
                     // **起不了 TUI 就不起**：交互式模式要求 stdin/stdout 是终端（`enable_raw_mode`
                     // 在管道 stdio 下必失败）。非终端环境（CI / 脚本 / 管道）保持纯建树语义
@@ -3241,9 +3274,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 启动期可发现性：默认新会话且目录非空时，提示存在可恢复会话。
+    // 只在面向人的终端里提（ADR-0067）：管道调用只要结果。
     let hint = with_resume_hint(
         hint,
-        matches!(args.resume, Resume::New) && sessions_dir_has_entries(&sessions_dir),
+        stderr_is_human_facing()
+            && matches!(args.resume, Resume::New)
+            && sessions_dir_has_entries(&sessions_dir),
     );
 
     // 建树告知（`create` 路径）并入同一条启动期提示：名字 / 路径 / 分支未合并。
@@ -4906,8 +4942,8 @@ mod tests {
         );
     }
 
-    /// `-p` / `--json` 的读数行由消费者侧汇总：stdout 保持干净，读数只经返回值
-    /// 交给调用方写 stderr。
+    /// `-p` / `--json` 的读数行由消费者侧汇总，但**不出现**在任何输出通道上：
+    /// stdout 承载结果、stderr 只在异常时说话，读数只落 debug。
     ///
     /// 变异：把读数行也写进 `w` ⇒ stdout 断言变红；`turn` 不取自入参 ⇒ 首段变红。
     #[tokio::test]
@@ -4926,12 +4962,7 @@ mod tests {
 
         assert!(
             consumed.reading.starts_with("turn=7 rounds=1 "),
-            "读数行必须带调用方给的回合号：{}",
-            consumed.reading
-        );
-        assert!(
-            consumed.reading.contains("tpr_x100="),
-            "读数行必须是 summary_line 的定形输出：{}",
+            "读数行仍要按调用方给的回合号汇总（供 debug 记录）：{}",
             consumed.reading
         );
         let stdout = String::from_utf8(out).unwrap();
@@ -4941,18 +4972,16 @@ mod tests {
         );
     }
 
-    /// 回合失败（模型错误）时，收尾仍要把已算出的读数行写到 stderr。
+    /// 回合失败时 stderr **不写读数行**：一次性模式的调用方要的是结果与错误，
+    /// 不是运行读数；读数只落 debug（`run_reading`）。
     ///
-    /// 生产调用点 [`finish_after_reading`] 在传播 `run_result` 的 `Err` **之前**
-    /// 写读数；此处用真实失败回合（`MockModel::push_error` ⇒ `RunFailed` +
-    /// `run_single_turn` 返回 `Err`）驱动，再以 `Vec<u8>` 代 stderr 断言：
-    /// - 读数行确实出现；
-    /// - stdout 仍干净（错误回合无文本增量 ⇒ 空）；
-    /// - 返回 `Err` ⇒ 调用方走非零退出路径，且暴露的是回合错误。
+    /// 本用例驱动真实失败回合（`MockModel::push_error` ⇒ `RunFailed` +
+    /// `run_single_turn` 返回 `Err`），再以 `Vec<u8>` 代 stderr 断言：stderr 为空、
+    /// 暴露的是回合错误（调用方据此非零退出）。
     ///
-    /// 变异：把读数行移到 `result?` 之后 ⇒ 本用例 stderr 为空、断言变红。
+    /// 变异：把读数行写回 stderr ⇒ stderr 断言变红。
     #[tokio::test]
-    async fn failed_turn_still_writes_reading_line_to_stderr() {
+    async fn failed_turn_writes_no_reading_line_to_stderr() {
         let model = MockModel::new("m");
         model.push_error("provider boom");
 
@@ -4991,15 +5020,14 @@ mod tests {
         .expect("失败回合也应在超时内收场");
 
         assert!(run_result.is_err(), "模型错误应使回合失败");
-        let (printed_any, consumed) = consume_result
+        let (printed_any, _consumed) = consume_result
             .as_ref()
             .expect("RunFailed 是终局事件，消费应成功");
         assert!(!*printed_any, "错误回合没有文本增量");
-        assert!(stdout.is_empty(), "stdout 必须干净（读数只进 stderr）");
-        let reading = consumed.reading.clone();
+        assert!(stdout.is_empty(), "stdout 必须干净（读数只进 debug）");
 
         let mut stderr: Vec<u8> = Vec::new();
-        let outcome = finish_after_reading(&mut stderr, run_result, consume_result, Some(&reading));
+        let outcome = finish_after_reading(&mut stderr, run_result, consume_result);
 
         let err = outcome
             .err()
@@ -5008,28 +5036,24 @@ mod tests {
             err.to_string().contains("provider boom"),
             "暴露的应是回合错误：{err}"
         );
-        let stderr = String::from_utf8(stderr).unwrap();
         assert!(
-            stderr.contains(&reading),
-            "回合失败时 stderr 仍须含读数行：{stderr:?}（读数 {reading:?}）"
-        );
-        assert_eq!(
-            stderr.trim_end().lines().count(),
-            1,
-            "stderr 恰为一行读数：{stderr:?}"
+            stderr.is_empty(),
+            "一次性模式的 stderr 不得承载读数行：{:?}",
+            String::from_utf8(stderr).unwrap()
         );
     }
 
-    /// 收尾的错误优先级与「无读数不编造行」：
-    /// 消费失败时没有读数 ⇒ stderr 保持干净；回合与消费都失败 ⇒ 暴露回合错误。
+    /// 收尾的错误优先级与「消费异常要留一条」：
+    /// 回合与消费都失败 ⇒ 暴露回合错误，但消费异常仍先落一行 stderr。
+    ///
+    /// 变异：把消费异常那一行移到 `result?` 之后 ⇒ stderr 变空、断言变红。
     #[test]
-    fn finish_after_reading_skips_missing_reading_and_prefers_turn_error() {
+    fn finish_after_reading_reports_consume_breakage_and_prefers_turn_error() {
         let mut stderr: Vec<u8> = Vec::new();
         let err = finish_after_reading(
             &mut stderr,
             Err::<RunResult, _>(io::Error::other("turn boom")),
             Err::<(), _>(io::Error::other("consume boom")),
-            None,
         )
         .err()
         .expect("两个错误都必须传播");
@@ -5037,10 +5061,40 @@ mod tests {
             err.to_string().contains("turn boom"),
             "回合错误优先于消费错误：{err}"
         );
+        let stderr = String::from_utf8(stderr).unwrap();
         assert!(
-            stderr.is_empty(),
-            "消费失败没有读数可写，不得编造行：{stderr:?}"
+            stderr.contains(EVENT_STREAM_BROKEN) && stderr.contains("consume boom"),
+            "消费异常仍须留一行 stderr：{stderr:?}"
         );
+        assert_eq!(
+            stderr.trim_end().lines().count(),
+            1,
+            "恰为一行，且不含读数：{stderr:?}"
+        );
+    }
+
+    /// 回合成功且消费成功 ⇒ stderr 完全干净（正常路径零噪音）。
+    ///
+    /// 变异：无条件写一行 ⇒ 断言变红。
+    #[test]
+    fn finish_after_reading_stays_silent_on_success() {
+        let ok_run = RunResult {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
+            rounds: 1,
+            final_message: None,
+        };
+        let mut stderr: Vec<u8> = Vec::new();
+        let out = finish_after_reading(
+            &mut stderr,
+            Ok::<_, io::Error>(ok_run),
+            Ok::<_, io::Error>(7_u8),
+        );
+        let (_, consumed) = out.expect("两边都成功时必须返回结果");
+        assert_eq!(consumed, 7, "消费结果原样带出");
+        assert!(stderr.is_empty(), "成功路径 stderr 必须为空");
     }
 
     /// debug 开启时 `run_reading` 必须落一条记录（`ev` 是开放的 `&'static str`）。
@@ -5506,12 +5560,12 @@ mod tests {
     fn session_exit_line_requires_persisted_file() {
         let dir = unique_tmp_dir("session_exit_line");
         let path = dir.join("2026-10-10-abc.jsonl");
-        assert_eq!(session_exit_line(Some(&path)), None, "未落盘不得打 id");
-        assert_eq!(session_exit_line(None), None, "一次性会话无文件");
+        assert_eq!(exit_line_for(Some(&path), true), None, "未落盘不得打 id");
+        assert_eq!(exit_line_for(None, true), None, "一次性会话无文件");
 
         std::fs::write(&path, "{}\n").unwrap();
         assert_eq!(
-            session_exit_line(Some(&path)).as_deref(),
+            exit_line_for(Some(&path), true).as_deref(),
             Some("session: 2026-10-10-abc"),
             "id 取文件 stem"
         );
@@ -5519,7 +5573,29 @@ mod tests {
         // 目录（而非文件）同名时不算落盘：`is_file` 而非 `exists`。
         let as_dir = dir.join("2026-10-10-dir.jsonl");
         std::fs::create_dir_all(&as_dir).unwrap();
-        assert_eq!(session_exit_line(Some(&as_dir)), None);
+        assert_eq!(exit_line_for(Some(&as_dir), true), None);
+    }
+
+    /// **非面向人的终端不吐收尾提示**（[`exit_line_for`] 的 `human_facing = false`）：
+    /// 被程序调用时（管道 / 脚本）`-p` 的 stderr 必须全空，即便会话文件已落盘。
+    ///
+    /// 变异：把 `human_facing` 闸去掉（恒 `true`）⇒ 首条断言变红。
+    #[test]
+    fn exit_line_is_silent_when_stderr_is_not_human_facing() {
+        let dir = unique_tmp_dir("exit_line_tty");
+        let path = dir.join("2026-10-10-tty.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        assert_eq!(
+            exit_line_for(Some(&path), false),
+            None,
+            "管道调用不得收到 `session: <id>`"
+        );
+        assert_eq!(
+            exit_line_for(Some(&path), true).as_deref(),
+            Some("session: 2026-10-10-tty"),
+            "终端里仍要给人看"
+        );
     }
 
     /// 自定义 prompt 提示：**两个条件同时成立**才出（有自定义 SYSTEM.md 且发现了 skill）。

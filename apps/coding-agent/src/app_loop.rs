@@ -1716,7 +1716,8 @@ async fn run_turn_once(
     for line in clock.take_lines() {
         logging::log(&line);
     }
-    // 回合级读数：TUI 与 debug 共用这一行；`take_lines` 之后再算 ⇒ 最后一轮已计入。
+    // 回合级读数：**只进 debug / 日志**（供 bench 与事后分析）；
+    // 不占 transcript —— TUI 用户要的是对话，读数在状态栏与 `/status` 里。
     let reading = clock.summary_line(*ctx.turns);
 
     // §4.9 可观测性：每个回合边界经**日志**落一行（对 TUI 不可见，供排障）。
@@ -1735,8 +1736,7 @@ async fn run_turn_once(
         remaining,
         turn_cache(&outcome),
     ));
-    // 回合末读数行：TUI 经既有 `Outbound::Output` 展示（不新增协议变体）。
-    send(ctx.out_tx, Outbound::Output(reading.clone())).await?;
+    // 回合末读数行**不经 `Outbound::Output`**：transcript 只装对话与命令输出。
 
     // debug 侧的回合收尾（只进文件，绝不影响上面的文本行）。
     // 以 `Cancelled` 收场 ⇒ 补一条 `observed`：`enqueued` 说明 Abort 已投递，
@@ -1761,7 +1761,7 @@ async fn run_turn_once(
             remaining,
             turn_cache(&outcome),
         );
-        // 回合级读数行（与 TUI / stderr 同一文本）：`ev` 开放，直接传 `run_reading`。
+        // 回合级读数行只落 debug（不进 transcript / stderr）。
         crate::record_run_reading(sink, ctx.debug_session_id, *ctx.turns, &reading);
         // 回合末的后台命令计数 —— **只进 debug 日志**：不进模型上下文、
         // 不进 transcript（绝不 `Outbound::Output`）。N = 本会话**仍在跑**的
@@ -2700,20 +2700,18 @@ mod tests {
         model.push_text("again");
         let mut h = spawn_with_mock(model).await;
 
-        // 回合 1：事件（种类顺序固定）→ 回合末读数 `Output` → View。
+        // 回合 1：事件（种类顺序固定）→ View。读数**不经出站**（只落 debug）。
         h.requests.send(prompt("one")).await.unwrap();
         let mut msgs = collect_until_view(&mut h).await;
         let view = take_view(&mut msgs);
         assert_eq!(view.turn_count, 1);
-        // 回合末的读数行是唯一插在事件与 View 之间的 `Output`。
-        let reading = msgs.pop().expect("回合末应有读数 Output");
-        match reading {
-            Outbound::Output(text) => assert!(text.starts_with("turn=1 "), "{text}"),
-            other => panic!("回合末读数应是 Output：{other:?}"),
-        }
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Outbound::Output(_))),
+            "回合结束时不得再有读数 `Output`（读数只落 debug）：{msgs:?}"
+        );
         assert!(
             msgs.iter().all(|m| matches!(m, Outbound::Event(_))),
-            "回合期间只应有事件（读数 Output 与 View 在末尾）：{msgs:?}"
+            "回合期间只应有事件与末尾 View：{msgs:?}"
         );
         assert_eq!(
             event_kinds(&msgs),
@@ -3663,15 +3661,14 @@ mod tests {
         h.requests.send(prompt("hello")).await.unwrap();
         let mut msgs = collect_until_view(&mut h).await;
         let _ = take_view(&mut msgs);
-        // 回合末的读数行走 `Outbound::Output`；其余仍只有事件。
-        let reading = msgs.pop().expect("回合末应有读数 Output");
+        // 回合末不再有读数 `Output`；其余仍只有事件。
         assert!(
-            matches!(&reading, Outbound::Output(t) if t.starts_with("turn=1 ")),
-            "回合末读数应是 Output：{reading:?}"
+            !msgs.iter().any(|m| matches!(m, Outbound::Output(_))),
+            "回合结束时不得再有读数 `Output`：{msgs:?}"
         );
         assert!(
             msgs.iter().all(|m| matches!(m, Outbound::Event(_))),
-            "Prompt 期间除读数行外只应有事件：{msgs:?}"
+            "Prompt 期间只应有事件：{msgs:?}"
         );
 
         for req in cases {
@@ -5379,11 +5376,11 @@ mod tests {
         let msgs = collect_until_view(&mut h).await;
         shutdown(h).await;
 
-        // TUI 回合末的读数行走既有 `Outbound::Output`（不新增协议变体）。
+        // 读数**不进 transcript**：TUI 用户看不到 `turn=…` 这一类运行读数。
         let output = output_text(&msgs);
         assert!(
-            output.contains("turn=1 rounds=") && output.contains("tpr_x100="),
-            "TUI 回合末应展示读数行：{output}"
+            !output.contains("turn=1 rounds=") && !output.contains("tpr_x100="),
+            "TUI transcript 不得出现读数行：{output}"
         );
 
         let files = debug_files(&logs.0);

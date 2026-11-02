@@ -66,10 +66,13 @@ skills/sequential-workflow/SKILL.md    Phase 4/5 验证范围限定
 
 | 出口 | 机制 |
 |---|---|
-| `-p` / `--json` | 终局事件后写 **stderr**：`finish_after_reading`（`main.rs:2111-2128`）**先**写读数行，**再**传播 `run_result` / `consume_result` 的 `Err` ⇒ 失败回合仍输出读数；错误优先级为**回合错误先于消费错误**。调用点 `main.rs:2217` / `:2312`。stdout 保持干净。 |
-| TUI | `app_loop.rs:1570` 算 `summary_line(*ctx.turns)`，`:1589` 经**既有** `Outbound::Output` 展示 —— **未新增协议变体**。 |
-| debug | `ev="run_reading"`：`record_run_reading` / `record_run_reading_fields`（`main.rs:926` / `:936`）写 `line` **加**顶层结构化字段 `turn / rounds / tools / tpr_x100 / ttft_ms / gen_ms / tools_ms / input_med`。TUI 路径只拿到文本，故从 `line` 反解数字字段（`:951-982`），键顺序与 `summary_fields` 一致。 |
+| `-p` / `--json` | **不出任何读数行**（ADR-0067）：stdout 只承载结果，stderr 只在异常时说话 —— `finish_after_reading`（`main.rs:2141`）仅当消费侧 `Err` 时写一行 `<错误>`；回合错误仍优先于消费错误传播。读数只落 debug。 |
+| TUI | **不进 transcript**。状态行尾段给 locale 钟点 `HH:MM` + 会话时长（`draw.rs` 的 `status_text`）；`/status` 给 `duration` / `executed` 两个口径。 |
+| debug | `ev="run_reading"`：`record_run_reading` / `record_run_reading_fields`（`main.rs:965` / `:975`）写 `line` **加**顶层结构化字段 `turn / rounds / tools / tpr_x100 / ttft_ms / gen_ms / tools_ms / input_med`。TUI 路径只拿到文本，故从 `line` 反解数字字段（`:993-1019`），键顺序与 `summary_fields` 一致。 |
 | bench | `apps/coding-agent/tests/e2e_bench.rs` 每条结果追加一条到 `bench-summary.json`；`YUSHAN_BENCH_OUT` 非空时改指固定路径（`:547-552`）。文件存在但不是合法 JSON 数组时**改名备份**为 `<name>.corrupt-<pid>-<序号>`（`:579-634`），不静默清空历史基准。 |
+
+**读数行现在只有 debug + bench 两个消费者**：它度量的是「本回合花了多少」，属于运行
+内部记录；用户看的是对话本身与「现在几点 / 跑了多久」。
 
 **既有轮级文本行逐字节不变**：`observe` 与 `observe_debug` 共享同一状态机，测试
 `observe_and_observe_debug_emit_identical_lines` 钉住两条路径的文本行一致；bench 的 stdout 表格
@@ -342,7 +345,7 @@ rounds as usize >= soft_round_advice_at` ⇒ 置标志并 `saturating_mul(2)`（
 | **D5** | `main.rs:4434/4440` 是启动日志 | 那是**测试断言**；真实启动出口是 debug `run_start` 的 `limits` 字段（`main.rs:850-858`）。 |
 | **R-bench** | bench 读 `run_reading` 顶层键 | 生产一度只写 `line` ⇒ bench 会读成**假 0**。现生产**同时**写顶层数字字段，bench 顶层缺失时再从 `line` 反解。 |
 | **R-corrupt** | `bench-summary.json` 损坏时新建数组 | 原实现会把非法 JSON **静默当空数组覆盖**（丢掉付费历史基准）。现先改名备份，备份失败则跳过写入。 |
-| **R-fail-turn** | 读数行在终局事件后写 | 若 `run_result` 先 `?` 传播，**失败回合的读数会丢失**。现 `finish_after_reading` **先**写读数行再传播错误。 |
+| **R-fail-turn** | 读数行在终局事件后写 | 若 `run_result` 先 `?` 传播，**失败回合的读数会丢失**。现读数**只**落 debug（终局事件后立即写），与错误传播路线解耦；消费侧异常仍先于回合错误报一行 stderr。 |
 
 ## 测试与验证
 

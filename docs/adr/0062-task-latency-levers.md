@@ -7,6 +7,8 @@
 
 proposed（2026-10-29）；A3 / A4 于 2026-10-30 按实测返工（见「实测后的修订」）。
 设计见 `docs/arch/task-latency-optimization/design.md`。
+**出口已收窄**（2026-11-02，ADR-0067）：读数行只落 debug / bench，`-p` / `--json`
+与 TUI transcript 都不打印，TUI 状态行改为 locale 钟点 + 会话时长。
 
 ## 背景
 

@@ -266,14 +266,14 @@ MUTANTS: list[Mutant] = [
         edits=[
             (
                 "crates/ys-loop/src/basic.rs",
-                """                    if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
-                        outcomes[i] = Some(CoreToolResult {
-                            content: "tool not executed: turn cancelled".to_string(),
-                            is_error: true,
-                        });
-                        continue;
-                    }""",
-                """                    // MUTATION: abort 探针被去掉""",
+                """                        if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
+                            outcomes[i] = Some(CoreToolResult {
+                                content: "tool not executed: turn cancelled".to_string(),
+                                is_error: true,
+                            });
+                            continue;
+                        }""",
+            """                        // MUTATION: abort 探针被去掉""",
             )
         ],
     ),
@@ -338,6 +338,7 @@ pub struct ModelRequest {""",
             system: self.system.clone(),
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            thinking: self.thinking.clone(),
             boundary: self
                 .boundary
                 .as_ref()

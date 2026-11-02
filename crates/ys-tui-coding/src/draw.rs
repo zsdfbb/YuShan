@@ -25,10 +25,11 @@
 use std::time::Instant;
 
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap};
 
 use ys_core::StopReason;
 
@@ -299,11 +300,46 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, pal
     let block = chat_block();
     let inner = block.inner(area);
     let (lines, skip_rows) = window_lines(app, top_row, inner.height as usize, palette);
-    let para = Paragraph::new(Text::from(lines))
-        .block(block)
+    if inner.is_empty() {
+        frame.render_widget(block, area);
+        return;
+    }
+
+    // **不用 `Paragraph::scroll`**：`render_paragraph` 跳过前 N 行时走
+    // `for _ in 0..scroll.y { next_line() }`，而 `WordWrapper` 的 `pending_word` /
+    // `pending_whitespace` 是**跨行状态**。跳行结束后这些残留会让首行可用宽度的
+    // 起算点偏移，折行位置随之左移 —— 屏幕上就是「一段文字整体往左错了几列」。
+    // 带 CJK 断点时中文变成可断的小词，残留才有东西可积，故错行显著变多。
+    //
+    // 改为把窗口首行**上半截也真画出来**，再从缓冲区取下半截：多画的行数与
+    // `skip_rows` 同阶（≤ 视窗高度），且与整段渲染逐行相同（不依赖跳行状态）。
+    let rows_needed = skip_rows + inner.height as usize;
+    let mut scratch = Buffer::empty(Rect::new(0, 0, inner.width, rows_needed as u16));
+    // 先刷主题底色：`Buffer::empty` 的格子是 `Cell::EMPTY`（无背景），
+    // 直接搬过去会把内区的主题底色抹成终端默认。
+    scratch.set_style(scratch.area, Style::default().bg(palette.bg));
+    Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .scroll((skip_rows.min(u16::MAX as usize) as u16, 0));
-    frame.render_widget(para, area);
+        .render(scratch.area, &mut scratch);
+
+    // 只搬下半截：`scratch` 的第 `skip_rows` 行对应屏幕内区第 0 行。
+    //
+    // `Buffer::empty` 的格子 symbol 是空串（`Cell::EMPTY`），而 `Paragraph` 只覆盖
+    // 新内容占的格子 —— 行尾没画到的格子仍是空串。直接拷进去会把这些格子也“搬空”，
+    // 屏幕上的效果是旧字符残留。故空 symbol 归一成空格。
+    let buf = frame.buffer_mut();
+    for y in 0..inner.height {
+        for x in 0..inner.width {
+            let mut cell = scratch[(x, skip_rows as u16 + y)].clone();
+            if cell.symbol().is_empty() {
+                cell.set_symbol(" ");
+            }
+            buf[(inner.x + x, inner.y + y)] = cell;
+        }
+    }
+
+    // 外框最后画：它只盖边框与内边距，不碰内区正文。
+    frame.render_widget(block, area);
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
@@ -1868,6 +1904,131 @@ mod tests {
             .chunks(width)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect()
+    }
+
+    /// 把 `Text` 整幅画到 `height` 高（不 scroll），返回逐行字符串。
+    fn render_rows(text: Text<'static>, width: u16, height: usize) -> Vec<String> {
+        let backend = TestBackend::new(width, height.max(1).min(u16::MAX as usize) as u16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), f.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// 每行**实际占用列数**（末个非空白格的位置 + 其宽度）。
+    ///
+    /// 这是用户能直接看见的量：折行位置错位 ⇒ 某些行短一截、下一行多几个字。
+    /// 与该行具体是什么字无关，故不受文案变化影响。
+    fn row_used_widths(rows: &[String]) -> Vec<usize> {
+        rows.iter()
+            .map(|r| {
+                let mut last = 0;
+                for (i, ch) in r.chars().enumerate() {
+                    if ch.is_whitespace() {
+                        continue;
+                    }
+                    last = i + if (ch as u32) >= 0x1100 { 2 } else { 1 };
+                }
+                last
+            })
+            .collect()
+    }
+
+    /// **回归：折行必须填满，且滚动不得让它错位**（按「每行占用列数」比对）。
+    ///
+    /// 用户可见的症状是「一行只有几个字、下一行很多」。成因有两个，都钉住：
+    ///
+    /// 1. **行太短**：CJK 之间没有断点 ⇒ 整串中文是一个「词」，放不下就整体下移。
+    ///    `md::render` 插 ZWSP 后每个中文都可断，行必然填满。
+    /// 2. **行错位**：`Paragraph::scroll` 跳行时连续调 `next_line()`，`WordWrapper`
+    ///    的 `pending_word` / `pending_whitespace` 是跨 `Line` 状态，残留让折行整体
+    ///    移动 ⇒ 同一份内容在不同滚动位置上切出**不同的行宽分布**。
+    ///
+    /// 参考取「单个条目单独渲染」的整段：它含且只含这一个条目的行，段落边界清楚。
+    ///
+    /// 变异 ①：`md::render` 去掉 `insert_cjk_breakpoints` ⇒ 短行 ⇒ 红。
+    /// 变异 ②：`draw_transcript` 改回 `.scroll((skip_rows, 0))` ⇒ 行宽分布漂移 ⇒ 红。
+    #[test]
+    fn wrapped_rows_stay_full_and_stable_across_scroll() {
+        // 长中英混排、段内无空格 —— 断点缺失时首行只剩几个字的典型形态。
+        let body = "这个函数的实现位于 crates/ys-tool/src/lib.rs 里，它是 Tool trait 上的默认方法，\
+                    返回 false 表示该工具不具备并发安全性，需要串行执行才能保证正确性。\
+                    另外它还会在参数校验失败时提前返回，调用方必须检查返回值。";
+        for (w, h) in [(80u16, 24u16), (100, 24)] {
+            let chat = chat_block().inner(chat_area(
+                &app_with(CodingView::for_test()),
+                Rect::new(0, 0, w, h),
+            ));
+            let inner_w = chat.width.max(1);
+            let inner_h = chat.height as usize;
+
+            let mut app = app_with(CodingView::for_test());
+            app.transcript
+                .push(TranscriptLine::User("读一下这个工具".into()));
+            app.transcript.push(TranscriptLine::Assistant(body.into()));
+            app.transcript.push(TranscriptLine::Assistant(body.into()));
+
+            // 参考：整幅画到自然高度（不 scroll）。
+            let text = build_text(&app, inner_w as usize, Instant::now());
+            let total = Paragraph::new(text.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner_w);
+            let full = render_rows(text, inner_w, total);
+            let full_widths = row_used_widths(&full);
+
+            // ① 折出来的行必须填满九成宽。
+            //
+            // 「折出来的行」判据：本行满宽 ⇒ 它被填满了，无需检查；本行不满但**后面
+            // 还有内容**才是症状。后者用「同一文本单独作为仅一条 assistant 渲染」来
+            // 定位：那种情形下整段就是这一段，除末行外全部必须满宽。
+            let solo = {
+                let mut a = app_with(CodingView::for_test());
+                a.transcript.push(TranscriptLine::Assistant(body.into()));
+                let t = build_text(&a, inner_w as usize, Instant::now());
+                let n = Paragraph::new(t.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(inner_w);
+                render_rows(t, inner_w, n)
+            };
+            let solo_widths = row_used_widths(&solo);
+            for (k, used) in solo_widths.iter().enumerate().take(solo_widths.len() - 1) {
+                assert!(
+                    used * 10 >= inner_w as usize * 9,
+                    "w={w} 单条正文第 {k} 行只有 {used} 列 / {inner_w} 列，\
+                     折行未填满（CJK 断点缺失的症状）：{:?}",
+                    solo[k]
+                );
+            }
+
+            // ② 每个滚动位置：视窗的行宽分布 == 整段对应区间。
+            let max_scroll = total.saturating_sub(inner_h);
+            for top in 0..=max_scroll {
+                app.follow = false;
+                app.scroll_offset = max_scroll - top;
+                let got = chat_inner_rows(&rows_of(&mut app, w, h), &app, w, h);
+                let got_widths = row_used_widths(&got);
+                let mut want: Vec<usize> = full_widths
+                    .iter()
+                    .skip(top)
+                    .take(inner_h)
+                    .cloned()
+                    .collect();
+                // 内容不足一屏时，视窗下方是空白行。
+                want.resize(inner_h, 0);
+                assert_eq!(
+                    got_widths, want,
+                    "w={w} h={h} top={top}：行宽分布漂移 ⇒ 滚动后文字错位。\
+                     视窗 {got_widths:?} vs 整段 {want:?}"
+                );
+            }
+        }
     }
 
     #[test]

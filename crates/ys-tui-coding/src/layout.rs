@@ -740,6 +740,9 @@ mod tests {
                     .collect::<String>()
             })
             .unwrap_or_default();
+        // 比对前剔除断点：`md::render` 给正文插了 U+200B，它会把中文子串切开。
+        // 这条测的是「流式结束后文本完整」，断点位置不在断言范围内。
+        let rendered = crate::breakpoints::strip_breakpoints(&rendered);
         assert!(
             rendered.contains(full),
             "流式结束后末条必须完整；实际渲染 = {rendered:?}（源 = {full:?}）"
@@ -937,19 +940,30 @@ mod tests {
         buffer_rows(terminal.backend().buffer())
     }
 
-    /// 单个 `Line` 的**第 `off` 个视觉行**（1 行高的缓冲区）—— 解码 [`RowRef`] 的参考路径。
+    /// 单个 `Line` 的**第 `off` 个视觉行** —— 解码 [`RowRef`] 的参考路径。
+    ///
+    /// 画到 `off + 1` 行高再取末行，**不用 `Paragraph::scroll`**：`render_paragraph`
+    /// 跳行时连续调 `next_line()`，而 `WordWrapper` 的 `pending_word` /
+    /// `pending_whitespace` 是跨 `Line` 状态，跳行结束后的残留会让折行位置偏移 ——
+    /// 解出来的行与「实画」不同（生产渲染也因此不再用 `scroll`）。
+    ///
+    /// 用 `TestBackend` 而不是 `Buffer::empty`：后者格子 `symbol` 为空，`Paragraph`
+    /// 只覆盖新内容占的格，行首旧格会残留，与「整段渲染」的参考缓冲区口径不一致。
     fn rendered_row(line: &Line<'static>, width: u16, off: usize) -> String {
-        let backend = TestBackend::new(width.max(1), 1);
+        let height = (off + 1).min(u16::MAX as usize) as u16;
+        let backend = TestBackend::new(width.max(1), height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                let para = Paragraph::new(Text::from(vec![line.clone()]))
-                    .wrap(Wrap { trim: false })
-                    .scroll((off.min(u16::MAX as usize) as u16, 0));
+                let para =
+                    Paragraph::new(Text::from(vec![line.clone()])).wrap(Wrap { trim: false });
                 f.render_widget(para, f.area());
             })
             .unwrap();
-        buffer_rows(terminal.backend().buffer()).concat()
+        buffer_rows(terminal.backend().buffer())
+            .get(off)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn buffer_rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {

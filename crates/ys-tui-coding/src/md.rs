@@ -7,6 +7,7 @@
 //!
 //! `tui_markdown::` 路径只准出现在 `md.rs` / `styles.rs`（R6 缓解）。
 
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use tui_markdown::Options;
 
@@ -83,7 +84,42 @@ pub(crate) fn render(src: &str, width: usize, styles: AssistantStyles) -> Vec<Li
     {
         return raw_plain_lines(src);
     }
+
+    // CJK 断点（设计 §2.11）：CJK 字素之间没有空格，`Paragraph` 的 `WordWrapper`
+    // 只在空白处断行 ⇒ 一整串中文被当作**一个词**，放不进当前行就整体移到下一行，
+    // 首行只剰它与行尾之间的空白。插 U+200B（宽 0 的断点）后才能逐字填充。
+    //
+    // 位置在**表格守卫之后**：守卫量 `Line::width()`（ZWSP 宽 0，不影响），
+    // 但要保 raw 回退的产物仍是未插断点的源文本。
+    let code = styles.palette().code;
     lines
+        .into_iter()
+        .map(|line| insert_cjk_breakpoints(line, code))
+        .collect()
+}
+
+/// 逐 span 插 CJK 断点，保留 span 样式与行级样式 / 对齐。
+///
+/// 逐 span 而不是拼成整串再插：拼接会抹掉每个 span 各自的样式。
+/// **代码行不插**（行级前景 == `palette().code`，库用它标记围栏码）：代码要可复制、
+/// 可粘贴执行，而 ZWSP 是零宽的不可见字符，静默进入源码会变成难查的编译错误。
+fn insert_cjk_breakpoints(line: Line<'static>, code: Color) -> Line<'static> {
+    if line.style.fg == Some(code) {
+        return line;
+    }
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            Span::styled(
+                crate::breakpoints::with_cjk_breakpoints(&span.content).into_owned(),
+                span.style,
+            )
+        })
+        .collect();
+    let mut owned = Line::from(spans).style(line.style);
+    owned.alignment = line.alignment;
+    owned
 }
 
 /// 退化路径：按 `\n` 原样切行得**无样式、不折行**纯文本。
@@ -246,9 +282,105 @@ Term
         );
     }
 
+    // ── CJK 断点（`render` 出口的 ZWSP 插入） ─────────────────────────────
+
+    /// 渲染一段正文并按 `width` 折行，返回每行的显示宽度。
+    fn wrapped_row_widths(lines: Vec<Line<'static>>, width: u16) -> Vec<usize> {
+        use ratatui::text::Text;
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let height = Paragraph::new(Text::from(lines.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .min(u16::MAX as usize) as u16;
+        let mut buf =
+            ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, height));
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .render(buf.area, &mut buf);
+        buf.content()
+            .chunks(width as usize)
+            .map(|row| {
+                let mut last = 0;
+                for (i, cell) in row.iter().enumerate() {
+                    if cell.symbol().trim().is_empty() {
+                        continue;
+                    }
+                    last = i + Span::raw(cell.symbol()).width();
+                }
+                last
+            })
+            .collect()
+    }
+
+    /// **CJK 断点让首行填满**：一整段无空格中文必须逐字填到行尾，
+    /// 而不是把整串当成一个词推到下一行（那样首行只剩前缀几个字）。
+    ///
+    /// 变异：去掉 `render` 出口的 `insert_cjk_breakpoints` ⇒ 首行只有 `width` 的一半
+    /// 以下 ⇒ 红。
+    #[test]
+    fn cjk_breaks_fill_the_first_row() {
+        // 全角中文、无任何空格：`WordWrapper` 找不到断点，整串是一个「词」。
+        let src = "这个函数的实现位于工具库里它是默认方法返回假表示该工具不具备并发安全性，\
+                   因此调用方需要串行执行才能在多个任务之间保持正确性并避免数据竞争带来的隐蔽缺陷";
+        for width in [40u16, 60, 80] {
+            let rows = wrapped_row_widths(r(src, width as usize), width);
+            assert!(
+                rows.len() >= 2,
+                "w={width}：该文本应折成多行（实际 {rows:?}）"
+            );
+            let first = rows[0];
+            assert!(
+                first * 10 >= width as usize * 9,
+                "w={width}：首行应填满（≥90%），实际 {first} 列 / {width} 列，全部行宽 {rows:?}"
+            );
+        }
+    }
+
+    /// **代码行不插断点**：代码要能原样复制、粘贴执行，而 ZWSP 是零宽不可见字符，
+    /// 混进源码会变成难查的编译错误。
+    ///
+    /// 变异：`insert_cjk_breakpoints` 去掉「行级前景 == `palette().code` 就返回原样」
+    /// 这一条 ⇒ 代码块里的中文注释被插断点 ⇒ 红。
+    #[test]
+    fn cjk_breaks_skip_code() {
+        let src = "```rust\nfn f() { // 中文注释\n}\n```\n";
+        let lines = r(src, 120);
+        let code_lines: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| l.style.fg == Some(base_palette().code))
+            .collect();
+        assert!(!code_lines.is_empty(), "前置：应识别出代码行");
+        for l in code_lines {
+            let raw: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !raw.contains('\u{200B}'),
+                "代码行不得含 ZWSP（否则复制出去会带上不可见字符）：{raw:?}"
+            );
+        }
+        // 正文里的中文仍应插断点（否则本条就退化成「全局不插」而误绿）。
+        let prose = r("这是一段中文正文，含 `inline` 代码。", 120);
+        let prose_raw: String = prose
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            prose_raw.contains('\u{200B}'),
+            "正文应仍插 ZWSP：{prose_raw:?}"
+        );
+    }
+
     /// 一行里所有 span 内容的拼接（用于内容级断言）。
+    ///
+    /// **剔除 ZWSP**：`render` 给正文插了 U+200B 断点，它会把中文子串切开。
+    /// 内容级断言关心「文字与顺序」，不关心断点位置 —— 断点自测。
     fn flat(line: &Line<'static>) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
+        crate::breakpoints::strip_breakpoints(
+            &line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+        )
     }
 
     /// 整个产物的纯文本（行间以 `\n` 连接）。
@@ -280,11 +412,15 @@ Term
         out
     }
 
+    /// 存在**内容等于 `content`** 且满足 `pred` 的 span。
+    ///
+    /// 比较前剔除断点：`render` 给正文插了 U+200B，中文 span 会被切成多段，
+    /// 直接比原文不再命中。
     fn has_span(lines: &[Line<'static>], content: &str, pred: impl Fn(&Span) -> bool) -> bool {
         lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content.as_ref() == content && pred(s))
+            l.spans.iter().any(|s| {
+                crate::breakpoints::strip_breakpoints(s.content.as_ref()) == content && pred(s)
+            })
         })
     }
 

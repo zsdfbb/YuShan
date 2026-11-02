@@ -1130,7 +1130,7 @@ App::set_theme(kind)                       // 唯一入口
    `table_header` / `table_cell` / `definition_term` / `definition_description` 取 `fg`，表头与术语的
    层次只靠 `BOLD`，不引第二套前景色。
 
-### 14.10 CJK 断点（非 assistant 变体的折行）— as-built
+### 14.10 CJK 断点（正文与其余变体的折行）— as-built
 
 **问题**：ratatui 的 `Paragraph` **只在空白处断行**（`ratatui-widgets` 的 `WordWrapper`：
 `word_found = non_whitespace_previous && is_whitespace`）。中文没有词间空格 ⇒ 一整串 CJK 被当成
@@ -1144,9 +1144,19 @@ App::set_theme(kind)                       // 唯一入口
 | `Thinking` | 3 | 只剩 `⌁ ` |
 | `Error` | 6 | 只剩 `Error: ` |
 | `Tool` | 10 | 只剩 `⏺ bash` |
-| `Assistant` | 满宽 | **正常** |
+| `Assistant` | 不尽满（真实数据 28% 短首行） | 见下，同样受影响 |
 
-`Assistant` 正常的原因正是答案：它经 `md::render`（`tui_markdown`），那一步已在渲染期生成断点。
+**`Assistant` 与其余变体一律受影响**：`tui_markdown` 不生成任何 ZWSP（对
+`tui-markdown-*/src/` 搜 `200b` / `ZWSP` 无命中），故 `md::render` 的产物与
+`push_non_assistant` 的产物在这一点上相同 —— 都要过本模块的断点插入。
+
+用户可见的症状正是「工具行之后的 assistant 文本折成两行，一行只有几个字、第二行很多」。
+300 条真实 assistant 文本实测（宽 80、只统计需要折行的 126 条）：
+
+| | 短首行 | 平均首行填充 |
+|---|---|---|
+| 无断点 | 35 / 126 | 67.4% |
+| 有断点 | 17 / 126 | **86.1%** |
 
 **机制**（`crates/ys-tui-coding/src/breakpoints.rs`）：在**相邻 CJK 之间**插入 U+200B（ZWSP）。
 ratatui 显式认它作断点（`ratatui-core` 的 `Grapheme::is_whitespace`：`symbol == ZWSP || …`），且宽 0：
@@ -1155,13 +1165,18 @@ ratatui 显式认它作断点（`ratatui-core` 的 `Grapheme::is_whitespace`：`
 - **不写入 `Buffer`**（实测「含 ZWSP 的单元格数 = 0」）⇒ 屏幕上看不见，终端原生拖选
   复制时也拿不到。
 
-**落点两处**（不是逐变体各插一遍）：
+**落点三处**（不是逐变体各插一遍）：
 
 1. `push_transcript_line` 的**单一出口**：`push_non_assistant` 产出的行统一过 `add_cjk_breakpoints`
    —— 覆盖 `User` / `Thinking` / `Error` / `System`。新增变体自动被覆盖。
 2. `Tool` 分支**自己折行**（`wrap_limited`）⇒ 断点必须在折行**之前**插入，否则 `wrap_words`
    看不到可断位置。同时 `wrap_words` 改认「空格**或** ZWSP」作分词符（`split_at_breaks`）——
    只认空格时，`bash <长中文>` 会把 `bash ` 单独留在首行。
+3. `md::render` 的**出口**：整份 `Vec<Line>` 逐行过 `insert_cjk_breakpoints`。
+
+**代码行不插断点**：零宽字符会跟着复制出去，变成难查的编译错误。判据是**行级**样式
+`line.style.fg == Some(palette.code)` —— 行级而非 span 级，因为 `md.rs` 的补色逻辑已把
+span 级 `fg` 覆写成 `palette.fg`，那样判据对代码行与正文同样成立，区分不出来。
 
 **为何不在 `push_non_assistant` 内部逐变体加**：该函数被测试对照路径（`transcript_plain_lines`）复用，
 而那里会把行再交给 `wrap_plain` 按列硬折 —— 不需要也不该看到零宽字符。
@@ -1173,7 +1188,11 @@ ratatui 显式认它作断点（`ratatui-core` 的 `Grapheme::is_whitespace`：`
 **不覆盖 emoji**：判据取 Unicode 区段而非「宽度 == 2」—— 在 ZWJ 连接的表情序列中间插断点会把
 一个组合表情切断，那是破坏而不是断行。
 
+**代价：断点会放大 §18.2 的 scroll 跳行错位**。带 ZWSP 时每个中文都成了可断小词，`WordWrapper`
+的跨行残留才有东西可积。300 条真实文本实测（逐行与整段渲染比对，宽 80）：带断点 29 条不一致，
+去掉断点 10 条。故 §18.2 的「不用 `Paragraph::scroll`」是这套断点方案成立的前提之一，两者不可分割。
 ---
+
 
 ## 15. debug 结构化执行日志（默认开启）— as-built
 
@@ -1336,7 +1355,30 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
     **不自写折行** —— CJK 列宽口径必须与渲染一致）。
 - `starts`（每条目块起始行号）+ `gaps`（前置留白行数）+ `total_rows` = 全局行号空间。
 - `window(top_row, height)`：二分定位条目与行内偏移 ⇒ 取出覆盖视窗的行 +
-  「首行内部要跳过几行」（`Paragraph::scroll` 的纵向分量）。
+  「首行内部要跳过几行」（`skip_rows`，即窗口首行在它所在条目的折行结果里的行号）。
+  **`skip_rows` 不做成 `Paragraph::scroll` 的纵向分量**，见下。
+
+**为何不用 `Paragraph::scroll` 跳行**：`render_paragraph` 跳过前 N 行时走
+`for _ in 0..scroll.y { next_line() }`，而 `WordWrapper` 的 `pending_word` /
+`pending_whitespace` 是**跨 `Line` 状态** ⇒ 跳过的行数影响后续每一行的折行位置。
+`draw_transcript` 改为把窗口首行的**上半截也真画出来**，再从缓冲区取下半截：
+
+- 画到 `skip_rows + inner.height` 高（多画的行数与 `skip_rows` 同阶，≤ 视窗高度）；
+- 取 `scratch[(x, skip_rows + y)]` 搬到屏幕内区 —— 与整段渲染同源，不依赖跳行状态。
+
+两个必要的配套处理：
+
+- `scratch` 先铺主题底色（`set_style(area, bg(palette.bg))`）—— `Buffer::empty` 的格子是
+  `Cell::EMPTY`（无背景），直接搬会抹掉内区底色。
+- 搬迁时把**空 symbol 归一成空格** —— `Buffer::empty` 的 symbol 是空串，而 `Paragraph`
+  只覆盖新内容占的格子，行尾没画到的格子仍是空串。直接拷会把旧字符留在屏上。
+
+**这个错位在带 CJK 断点时更明显**：断点让每个中文都成了可断小词，残留才有东西可积。
+300 条真实 assistant 文本实测（宽 80、逐行与整段渲染比对）：带断点 29 条不一致，
+去掉断点 10 条（宽 100 则是 27 / 2）。故它与 §14.10 的断点方案不可分割。
+
+**可见程度**：宽 80 下字会挪位（上一行末字被并到本行开头），但若两字同宽，**每行总列数不变**
+—— 盯列宽的测试抛不到它。用户直接看见的「一行只有几个字」是 §14.10 的断点缺失所致。
 
 **承重不变量**：「整段折行 == 逐行折行之和」（N4）。视窗切片依赖它 ——
 `draw.rs` 的 `test_windowed_render_matches_full_render`（视窗渲染与整段渲染**逐行相同**）是守卫。

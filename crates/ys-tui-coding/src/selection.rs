@@ -24,7 +24,19 @@
 //! 决定，自己按 `unicode-width` 复算会与之漂移 —— 漂移的表现是「复制的文字多一个空格
 //! 或少一个字」，而高亮看起来完全正常。
 //!
-//! ## 3. 槽环的等价性前提
+//! ## 3. 松手即复制，右键只是「再复制一次」
+//!
+//! 复制不挂在右键上，因为右键**不一定到得了应用**：VS Code 的终端把 `contextmenu`
+//! 截在 DOM 层弹自己的菜单（`terminal.integrated.rightClickBehavior`），应用发出什么都
+//! 改变不了它。挂右键就等于「在这类终端里永远复制不了」。故松手（`Up(Left)`）当场写
+//! 剪贴板；右键保留为**补救**入口 —— 高亮还在时再按一次可以重写（含跨终端的上报形态
+//! 差异：`Down(Right)` / `Up(Right)` / `Drag(Right)` 都算）。
+//!
+//! 复制**不清**选区 —— 用户要看得见刚拷走的是哪一段。清除只由左键点击、用户主动滚动、
+//! resize、回放替换触发。于是 `Phase::Marked` 同时是「高亮的依据」与「右键可补救的依据」，
+//! 不需要额外的子状态。
+//!
+//! ## 4. 槽环的等价性前提
 //!
 //! 字形缓存用「槽环」表示滚动：`order` 把屏幕行映射到槽位，滚动 k 行 = `order` 旋转 k
 //! 位 + 只重建换进来的那 k 行，不搬 cell。该做法成立的**唯一前提**是
@@ -45,8 +57,8 @@ use crate::layout::{RowRef, TranscriptLayout, Window};
 
 /// 一次拖选的生命周期。
 ///
-/// **三态**：`Idle` → `Dragging` →（松手）`Marked` →（右键）`Idle`。
-/// 松手不复制 —— 只是把范围标下来，等右键才写剪贴板（[`Selection::mark`]）。
+/// **三态**：`Idle` → `Dragging` →（松手）`Marked` →（左键点击 / 滚动）`Idle`。
+/// 松手**当场复制**（[`Selection::mark`] 的调用方负责），右键可再拷一次。
 ///
 /// 消费方是 `events.rs` 的鼠标分支与 `draw.rs` 的高亮层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,6 +72,8 @@ pub(crate) enum Phase {
     ///
     /// 与 `Dragging` 分开是承重的：高亮在两种状态下都要画，但只有 `Dragging`
     /// 才接 `Drag` 事件、才跑自动滚动（[`Selection::is_dragging`]）。
+    ///
+    /// 复制后**仍是**本状态 —— 高亮照画，右键也仍能再拷一次。
     Marked,
 }
 
@@ -106,9 +120,7 @@ impl Selection {
         self.phase != Phase::Idle
     }
 
-    /// 左键已松开、选区仍标记着（等右键复制）。
-    ///
-    /// 当前只有测试直接问它；生产路径用 [`Self::is_active`]（两者都要画高亮）。
+    /// 左键已松开、选区仍标记着（右键可再拷一次）。
     #[cfg(test)]
     pub(crate) fn is_marked(&self) -> bool {
         self.phase == Phase::Marked

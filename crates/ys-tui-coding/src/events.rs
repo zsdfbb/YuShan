@@ -108,19 +108,23 @@
 //! **补全浮层打开时上下归浮层**（设计 §2.4）—— 焦点在浮层上，历史的上下让位；
 //! 浮层因其他键关闭时那一下会**交还给正常处理**，历史的上下随即生效。
 //!
-//! # 鼠标：只接管滚轮
+//! # 鼠标：拖选 + 松手即复制 + 滚轮
 //!
-//! 本应用**只读滚轮**，其余鼠标事件一律不绑：
+//! 三条都归应用（ADR-0066）：
 //!
 //! - **滚轮 = 滚聊天**，每事件 [`WHEEL_ROWS`] 视觉行。终端把滚轮译成 `↑` / `↓` 时它
 //!   会落到输入历史上（翻出的是上一条提交的文本，不是对话）—— 故必须由应用自己
 //!   解释（ADR-0050）。
-//! - **拖选 / 右键 / 悬停一律不处理**：应用**不建自己的选区**，选区与剪贴板由终端
-//!   提供。于是 `run.rs` 只开 `?1000h` + `?1006h`（按键与滚轮上报 + SGR 编码），
-//!   **不开** `?1002h` / `?1003h`（拖拽 / 任意移动上报）—— 后者对滚轮无用，却会让
-//!   指针一动就持续产生 `Moved` 事件。
-//! - **代价**：鼠标追踪期间终端的裸拖选与右键菜单不生效（事件送到应用后被忽略），
-//!   需要复制时用终端的「强制原生选择」逃生门（多数终端是 `⇧`+拖选），或 `/copy`。
+//! - **拖选 = 应用内选区**：`Down(Left)` / `Drag(Left)` / `Up(Left)` 三态，**松手即复制**
+//!   （高亮保留）。故 `run.rs` 开 `?1000h` + `?1002h` + `?1006h`（按键 / 拖拽上报 +
+//!   SGR 编码），**不开** `?1003h`（任意移动上报：对拖选无用，却让指针一动就持续
+//!   产生 `Moved` 事件）。
+//! - **复制不挂在右键上**：右键**不一定到得了应用** —— VS Code 的终端在 DOM 层截掉
+//!   `contextmenu` 弹自己的菜单，应用发什么都改变不了它。挂右键就等于在那类终端里
+//!   永远复制不了。右键保留为**补救**入口：高亮还在时再按一次可重写剪贴板。
+//! - **代价**：鼠标追踪期间终端自己的拖选与右键菜单不生效。不要靠 `⇧` 退回终端 ——
+//!   多数终端会在按住 `⇧` 时抢走手势（xterm.js 的 `shouldForceSelection`），于是
+//!   选区归终端、应用看不到它（实测现象：「高亮两套、右键无反应」）。
 //! - **水平滚动 / `Moved` 忽略**：对话是单列竖排，无水平语义；不绑悬停。
 //! - **模态浮层不吃滚轮**：浮层自己读事件（`run.rs` 的 `Prompter` 实现），它 `_ => {}`
 //!   掉鼠标 —— 浮层内容不滚动（见 `docs/TODO.md` §C）。
@@ -160,12 +164,12 @@ pub fn handle_event(
     }
 }
 
-/// 鼠标事件 —— 拖选 / 右键复制 / 滚轮。
+/// 鼠标事件 —— 拖选 / 松手复制 / 滚轮。
 ///
 /// 三态：
 ///
-/// - `Down(Left)` / `Drag(Left)` / `Up(Left)` —— 应用内选区（锚点 → 拖动 → 标记）；
-/// - `Down(Right)` —— 把已标记的选区写进剪贴板；
+/// - `Down(Left)` / `Drag(Left)` / `Up(Left)` —— 应用内选区（锚点 → 拖动 → **复制**）；
+/// - **右键的任一位** —— 高亮还在时再拷一次（[`refine_gesture`]）；
 /// - 滚轮 —— 滚聊天，每事件 [`WHEEL_ROWS`] 视觉行；属**用户主动**滚动，故与批路径
 ///   共用 [`scroll_wheel_batch`] —— 位移折算只有一份。
 ///
@@ -173,7 +177,14 @@ pub fn handle_event(
 ///
 /// **拖选依赖终端上报 `Drag`** —— 即 `?1002h`，见 `run::MOUSE_MODE_ON`。不开它时
 /// 本函数只会收到 `Down` / `Up`，选区会停在按下点（看起来就是「拖选失效」）。
+///
+/// **修饰键不参与**：`⇧` / `⌥` 按住时拖选与右键照常工作。`⇧` 交给终端做原生选区是
+/// 更坏的取舍：终端自己做完选择后，本应用看不到那个手势，右键既不知道有选区、
+/// 也收不到自己的按下 —— 表现就是「高亮两套、右键拷不了」。
 pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
+    if refine_gesture(m.kind, app) {
+        return;
+    }
     match m.kind {
         MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),
         MouseEventKind::ScrollDown => {
@@ -182,10 +193,41 @@ pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
         MouseEventKind::Down(MouseButton::Left) => begin_selection(app, m, width, height),
         MouseEventKind::Drag(MouseButton::Left) => extend_selection(app, m, width, height),
         MouseEventKind::Up(MouseButton::Left) => finish_selection(app, m, width, height),
-        MouseEventKind::Down(MouseButton::Right) => copy_marked_selection(app),
         // 水平滚动没有语义（对话是单列竖排）；悬停不绑（不做 hover）。
+        // 右键已在上面的 `finish_gesture` 里处理 —— 它只认右键的两位（见下）。
         _ => {}
     }
+}
+
+/// 高亮还在 ⇒ 右键的**任一位**（按下 / 松开 / 拖动）再拷一次，返 `true` 表示
+/// **本事件已消费**。
+///
+/// 复制本身已在松手时完成（[`finish_selection`]）—— 本函数是**补救**入口：剪贴板被
+/// 别的程序抢占、或用户想再确认一次时用。因此它**不需要**「未复制过」这类资格：
+/// 有高亮就允许重写。
+///
+/// 三个位全认是因为终端上报形态不统一：只发 `Down(Right)`、只发 `Up(Right)`、两者都
+/// 不发（把右键留给原生菜单）、或都不少。**`Drag(Right)` 也算** —— SGR 编码里
+/// 「松开」没有专属按键位，它就是「右键 + 移动位」（`btn=34`）：按住右键移动两格
+/// 再松手，应用收到的就是一个 `Drag(Right)`。
+///
+/// **左键不是复制键** —— 它的语义是「清掉旧选区 + 开始新选区」，由 `begin_selection`
+/// 自己处理。**滚轮不算**：它的语义是「滚动」，由 [`scroll_wheel_batch`] 清选区。
+///
+/// 复制**不清选区**：高亮留着，用户才看得见刚拷走的是哪一段；清除交给左键点击、
+/// 用户主动滚动、resize。
+fn refine_gesture(kind: MouseEventKind, app: &mut App) -> bool {
+    let is_right = matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Right)
+            | MouseEventKind::Up(MouseButton::Right)
+            | MouseEventKind::Drag(MouseButton::Right)
+    );
+    if !is_right || !app.selection.is_active() {
+        return false;
+    }
+    copy_marked_selection(app);
+    true
 }
 
 /// 一个滚轮事件滚动的**视觉行数**。
@@ -287,11 +329,16 @@ pub(crate) fn scroll_wheel_batch(app: &mut App, width: u16, height: u16, delta: 
     scroll(app, width, height, net);
 }
 
-/// 左键按下：在内区内那么建选区，在内区外则不开始。
+/// 左键按下：**先清旧选区**，在内区内那么建新锚点。
 ///
-/// 按下点在内区外时钳制语义没有意义（用户意图不是选 Chat），故直接忽略 ——
+/// 左键是**清除键**：不论旧选区是「已标记待拷」还是「已复制、高亮仍在」，一次左键
+/// 按下就把它清掉（用户看到的「点击一下高亮消失」）。内区外按下同样清 —— 点到边框或
+/// 输入框就是「我不选了」。
+///
+/// 按下点在内区外时钳制语义没有意义（用户意图不是选 Chat），故不建选区 ——
 /// 与 `Drag` / `Up` 的「窗外钳制」有意不同。
 fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
+    app.selection.clear();
     let Some(inner) = crate::draw::chat_inner_rect(app, width, height) else {
         return;
     };
@@ -351,22 +398,26 @@ fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     }
 }
 
-/// 松开左键：把选区从「正在拖」转为「已标记」，**不**复制。
+/// 松开左键：先把选区转为「已标记」，**随即复制**。
 ///
-/// 复制改由右键触发（[`copy_marked_selection`]）—— 拖选只负责标记范围，用户再决定
-/// 什么时候真的写剪贴板。两端点重合（按下未拖动）⇒ 清选区。
+/// 复制由松手触发而不是右键（见模块文档）：右键在 VS Code 等终端里被 DOM 拦走，
+/// 挂右键就等于那类终端永远复制不了。两端点重合（按下未拖动）⇒ `mark()` 直接清选区，
+/// 此时 `is_active()` 为假，[`copy_marked_selection`] 自然什么都不做。
 fn finish_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     if !app.selection.is_dragging() {
         return;
     }
     extend_selection(app, m, width, height);
     app.selection.mark();
+    copy_marked_selection(app);
 }
 
-/// 右键：把已标记的选区写进剪贴板，并清掉选区（高亮消失，文字已进剪贴板）。
+/// 把选区写进剪贴板，**保留**选区（高亮不消失，用户看得见刚拷走哪段）。
 ///
-/// 无选区时右键**什么也不做** —— 不弹菜单、不粘贴。右键在本应用里只有一个语义：
-/// 「复制我刚标记的东西」。
+/// 两个调用方：松手（主路径）与右键（补救）。高亮要等到左键点击、用户主动滚动或
+/// resize 才清。
+///
+/// 无选区时什么也不做 —— 不弹菜单、不粘贴。
 fn copy_marked_selection(app: &mut App) {
     if !app.selection.is_active() {
         return;
@@ -374,7 +425,13 @@ fn copy_marked_selection(app: &mut App) {
     let (anchor, cursor) = app.selection.bounds();
     let outcome = crate::selection::extract(&app.layout.borrow(), anchor, cursor);
     match outcome {
-        crate::selection::ExtractOutcome::Copied(text) => app.pending_clipboard = Some(text),
+        crate::selection::ExtractOutcome::Copied(text) => {
+            // 文案带字数：高亮不清时，这是用户**唯一**能看到「真的拷了东西」的地方，
+            // 且字数能让他判断这一段是不是自己想要的。
+            let chars = text.chars().count();
+            app.note_status(format!("已复制 {chars} 字"));
+            app.pending_clipboard = Some(text);
+        }
         crate::selection::ExtractOutcome::TooLarge(bytes) => {
             app.transcript.push(TranscriptLine::System(format!(
                 "选区 {} KB，超过复制上限 256 KB；请分段选择或用 /copy",
@@ -383,7 +440,6 @@ fn copy_marked_selection(app: &mut App) {
         }
         crate::selection::ExtractOutcome::Empty => {}
     }
-    app.selection.clear();
 }
 
 /// 处理一次按键（`KeyEventKind::Release` / `Repeat` 之外的都忽略）。
@@ -1639,7 +1695,7 @@ mod tests {
         assert_eq!(a.scroll_offset, before, "净量为零 ⇒ 位移不变");
     }
 
-    /// 其余鼠标事件**一律不滚动**：拖选与右键由终端提供（应用不建选区）。
+    /// 其余鼠标事件**一律不滚动**：水平方向无意义、悬停未绑。
     ///
     /// 变异：把 `handle_mouse` 的 `_ => {}` 改成滚动 ⇒ 本用例红。
     #[test]
@@ -1691,6 +1747,24 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    /// 走完整手势：按下 → 拖到目标点 → 松手（松手**即复制**）。
+    fn drag_select(a: &mut App, w: u16, h: u16, from: (u16, u16), to: (u16, u16)) {
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let (col, row) = if kind == MouseEventKind::Down(MouseButton::Left) {
+                from
+            } else {
+                to
+            };
+            handle_mouse(mouse_at(kind, col, row), a, w, h);
+        }
+        assert!(a.selection.is_marked(), "前置：松手后应转为已标记");
+        assert!(a.pending_clipboard.is_some(), "前置：松手即复制");
     }
 
     #[test]
@@ -3268,7 +3342,7 @@ mod tests {
         assert!(!a.follow, "拖动已开始 ⇒ 必须冻结视窗");
     }
 
-    /// **`Down` → `Drag` → `Up` ⇒ 复制**。
+    /// **`Down` → `Drag` → `Up` ⇒ 复制**（松手就是复制，不等右键）。
     #[test]
     fn drag_then_release_copies_text() {
         let (w, h) = (120u16, 40u16);
@@ -3289,6 +3363,7 @@ mod tests {
             h,
         );
         assert!(a.selection.is_active(), "拖动期选区应存在");
+        assert!(a.pending_clipboard.is_none(), "拖动中不得复制");
 
         handle_mouse(
             mouse_at(MouseEventKind::Up(MouseButton::Left), col + 3, row + 2),
@@ -3296,20 +3371,103 @@ mod tests {
             w,
             h,
         );
-        // **松手只标记**：高亮保留、剪贴板不动。
+        // **松手即复制**：剪贴板拿到文字，高亮**留着**（用户看得见刚拷走哪段）。
+        let copied = a.pending_clipboard.take().expect("松手就必须复制");
+        assert!(!copied.is_empty(), "复制的文本不得为空");
         assert!(a.selection.is_marked(), "松手后应转为已标记");
-        assert!(a.pending_clipboard.is_none(), "松手不得复制");
+        assert!(a.selection.is_active(), "复制后高亮必须保留");
 
-        // **右键才复制**，且复制后高亮消失。
+        // **复制必须留下可见痕迹**：高亮不清时，状态行是用户唯一能确认「真的拷了」的地方。
+        // 变异：把 `note_status` 去掉 ⇒ 本段红。
+        let (note, _) = a.status_note.clone().expect("复制后必须挂一条状态行提示");
+        assert!(note.contains("已复制"), "提示应说明复制完成：{note}");
+        assert!(
+            note.contains(&copied.chars().count().to_string()),
+            "提示应带字数（用户据此判断选段对不对）：{note}"
+        );
+
+        // **右键是补救入口**：高亮还在时再按一次可重写剪贴板（如被别的程序抢占）。
+        // 变异：把 `refine_gesture` 里 `is_active()` 改成 `is_dragging()` ⇒ 本段红。
         handle_mouse(
             mouse_at(MouseEventKind::Down(MouseButton::Right), col + 3, row + 2),
             &mut a,
             w,
             h,
         );
-        let copied = a.pending_clipboard.take().expect("右键应复制");
-        assert!(!copied.is_empty(), "复制的文本不得为空");
-        assert!(!a.selection.is_active(), "复制后选区应清");
+        assert!(a.pending_clipboard.is_some(), "高亮还在 ⇒ 右键可再拷一次");
+        assert!(a.selection.is_active(), "右键不得清高亮");
+        a.pending_clipboard.take();
+
+        // **左键点击才清**高亮。
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), col, row + 1),
+            &mut a,
+            w,
+            h,
+        );
+        // 单击（未拖动）松手 ⇒ 回 Idle，高亮消失。
+        handle_mouse(
+            mouse_at(MouseEventKind::Up(MouseButton::Left), col, row + 1),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(!a.selection.is_active(), "左键点击后高亮应清");
+        assert!(a.pending_clipboard.is_none(), "清高亮不得再复制");
+    }
+
+    /// **复制提示只活在状态行，不得入 transcript**。
+    ///
+    /// transcript 是对话内容：往里面推一行会把 Chat 区往下推一行，而此刻用户正盯着
+    /// 刚选中的那几行看。
+    #[test]
+    fn copy_note_never_pushes_transcript() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let before = a.transcript.len();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        drag_select(&mut a, w, h, (col, row), (col + 3, row + 2));
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Right), col + 3, row + 2),
+            &mut a,
+            w,
+            h,
+        );
+
+        assert!(a.status_note.is_some(), "前置：应有提示");
+        assert_eq!(a.transcript.len(), before, "复制提示不得进 transcript");
+    }
+
+    /// **到期的提示会被清掉**（否则一句「已复制」会永久占着状态行）。
+    ///
+    /// 变异：`expire_status_note` 去掉清空那句 ⇒ 本用例红。
+    #[test]
+    fn expired_status_note_is_cleared() {
+        let mut a = app();
+        a.note_status("已复制 3 字");
+        assert!(a.status_note.is_some(), "前置：刚挂上应存在");
+
+        a.expire_status_note();
+        assert!(a.status_note.is_some(), "未到期不得清");
+
+        // 手改到期时刻到过去 —— 不 sleep，避免拖慢测试。
+        if let Some((_, until)) = a.status_note.as_mut() {
+            *until = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        a.expire_status_note();
+        assert!(a.status_note.is_none(), "到期必须清掉");
+    }
+
+    /// 连按两次复制只留**最后一条**提示，不排队。
+    #[test]
+    fn second_copy_note_replaces_the_first() {
+        let mut a = app();
+        a.note_status("已复制 3 字");
+        a.note_status("已复制 9 字");
+        let (note, _) = a.status_note.clone().expect("应有一条提示");
+        assert_eq!(note, "已复制 9 字", "后来的覆盖前面的");
     }
 
     /// **V7：`⇧` 拖选与裸拖选同效** —— 两者都必须建选区、松手都必须复制。
@@ -3349,18 +3507,13 @@ mod tests {
             handle_mouse(ev, &mut a, w, h);
             assert!(a.selection.is_marked(), "松手后应转为已标记");
             assert!(
-                a.pending_clipboard.is_none(),
-                "松手不得复制（modifiers={modifiers:?}）"
-            );
-
-            let mut ev = mouse_at(MouseEventKind::Down(MouseButton::Right), col + 20, row + 3);
-            ev.modifiers = modifiers;
-            handle_mouse(ev, &mut a, w, h);
-            assert!(
                 a.pending_clipboard.is_some(),
-                "右键必须复制（modifiers={modifiers:?}）"
+                "松手即复制（modifiers={modifiers:?}）"
             );
-            assert!(!a.selection.is_active(), "复制后选区必清");
+            assert!(
+                a.selection.is_active(),
+                "复制后高亮保留（modifiers={modifiers:?}）"
+            );
             assert_eq!(a.scroll_offset, 5, "拖选不得改滚动位置");
             assert!(!a.follow, "拖选脱离跟随");
         }
@@ -3419,6 +3572,132 @@ mod tests {
             h,
         );
         assert!(!a.selection.is_active(), "边框上按下不得建选区");
+    }
+
+    /// **`Drag(Right)` 也算一次右键** —— SGR 编码里「右键 + 按住移动」与「右键松开」同为
+    /// `button=34`：按住右键移动几格再松手，应用收到的就是一个 `Drag(Right)`。
+    ///
+    /// 变异：把 `Drag(MouseButton::Right)` 从 `refine_gesture` 的集合里删掉 ⇒ 本用例红。
+    #[test]
+    fn right_drag_also_recopies_marked_selection() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        drag_select(&mut a, w, h, (col, row), (col + 3, row + 4));
+        a.pending_clipboard.take();
+
+        handle_mouse(
+            mouse_at(MouseEventKind::Drag(MouseButton::Right), col + 4, row + 4),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(
+            a.pending_clipboard.is_some(),
+            "按住右键移动（= 松开）也必须再拷一次"
+        );
+        assert!(a.selection.is_active(), "右键后高亮保留");
+    }
+
+    /// **右键的任一位都能再拷** —— 终端上报形态不统一：只发 `Up(Right)`、只发
+    /// `Down(Right)`、两者都给。缺一位的终端不得变成「按了没反应」。
+    ///
+    /// 变异：把 `refine_gesture` 改回「只认 `Down(Right)`」⇒ 本用例红。
+    #[test]
+    fn right_release_alone_recopies_marked_selection() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        drag_select(&mut a, w, h, (col, row), (col + 3, row + 4));
+        a.pending_clipboard.take();
+
+        // 只发 `Up(Right)`（该终端不发 `Down(Right)`）。
+        handle_mouse(
+            mouse_at(MouseEventKind::Up(MouseButton::Right), col + 3, row + 4),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.pending_clipboard.is_some(), "右键松开也必须再拷一次");
+        assert!(a.selection.is_active(), "右键后高亮保留");
+    }
+
+    /// **左键按下清掉旧选区的高亮**，并开始新选区（不复制旧选区）。
+    ///
+    /// 变异：`begin_selection` 去掉 `selection.clear()` ⇒ 第二段断言红；
+    /// 把左键当复制键 ⇒ 第一段断言红（成了「点一下就复制」）。
+    #[test]
+    fn left_down_clears_finished_selection_without_copying() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        drag_select(&mut a, w, h, (col, row), (col + 3, row + 4));
+        a.pending_clipboard.take();
+
+        // 左键按下：不许再复制旧选区，且开始新选区。
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), col, row + 2),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(a.pending_clipboard.is_none(), "左键不是复制键");
+        assert!(a.selection.is_dragging(), "左键按下应开始新选区");
+        assert_eq!(a.selection.bounds().0, a.selection.bounds().1);
+    }
+
+    /// 左键落在 **Chat 内区之外**也要清掉旧选区的高亮。
+    ///
+    /// 内区外的按下不建新选区（意图不是选 Chat），所以它只能靠显式的 `clear()` ——
+    /// 内区内的按下会被 `Selection::begin` 覆盖，测不出区别。
+    ///
+    /// 变异：`begin_selection` 去掉开头那句 `selection.clear()` ⇒ 本用例红。
+    #[test]
+    fn left_down_outside_inner_clears_finished_selection() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        drag_select(&mut a, w, h, (col, row), (col + 3, row + 4));
+        a.pending_clipboard.take();
+        assert!(a.selection.is_active(), "前置：高亮仍在");
+
+        // 点到 Chat 内区右上角之外（y = 0 是边框行）—— 不建选区，但必须清高亮。
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 0),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(
+            !a.selection.is_active(),
+            "内区外的左键也必须清掉已复制的高亮"
+        );
+    }
+
+    /// 滚轮**不是**复制触发：它清选区（用户主动滚动），不得把旧选区写进剪贴板。
+    ///
+    /// 变异：把 `ScrollUp` / `ScrollDown` 也算进 `refine_gesture` 的按键集合 ⇒ 本用例红。
+    #[test]
+    fn wheel_after_mark_clears_without_copying() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        let inner = crate::draw::chat_inner_rect(&a, w, h).expect("正常尺寸应有内区");
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        drag_select(&mut a, w, h, (col, row), (col + 3, row + 4));
+        a.pending_clipboard.take();
+        assert!(a.selection.is_active(), "前置：拖选已标记");
+        handle_mouse(mouse_at(MouseEventKind::ScrollUp, col, row), &mut a, w, h);
+        assert!(a.pending_clipboard.is_none(), "滚动不得触发复制");
+        assert!(!a.selection.is_active(), "滚动应清选区");
     }
 
     /// **V9：resize 清选区**（变异注入 #6 的锚点）。

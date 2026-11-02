@@ -6,7 +6,10 @@
     python3 scripts/selection-mutation.py --list     # 只列清单
     python3 scripts/selection-mutation.py 1 3        # 只跑指定编号
 
-前提：工作区**干净**（脚本用 `git checkout --` 还原，未提交改动会被一起回滚）。
+前提：无。工作区可以带未提交改动 —— 还原靠启动时的**进程内快照**，不用 `git checkout`。
+
+> 为什么不用 `git checkout --`：它还原到 **HEAD**，会把工作区里尚未提交的改动
+> （往往就是你要验的那批新代码）一起抹掉。快照还原的是「脚本启动那一刻的文件内容」。
 
 ## 注入 #3 的形态为什么不是文档里那个
 
@@ -25,6 +28,9 @@ import sys
 
 SEL = pathlib.Path("crates/ys-tui-coding/src/selection.rs")
 EV = pathlib.Path("crates/ys-tui-coding/src/events.rs")
+
+# 启动时的原文快照：`restore()` 写回它（不用 `git checkout`，见模块文档）。
+SNAPSHOT: dict[pathlib.Path, str] = {}
 
 SEL_TESTS = ["cargo", "test", "-p", "ys-tui-coding", "--lib", "selection::"]
 EV_TESTS = ["cargo", "test", "-p", "ys-tui-coding", "--lib", "events::"]
@@ -118,11 +124,61 @@ MUTATIONS = [
         "highlight_translates_relative_rects_by_area_origin",
         SEL_TESTS,
     ),
+    (
+        9,
+        "松手不复制（回到「等右键才拷」）",
+        EV,
+        "    app.selection.mark();\n    copy_marked_selection(app);\n",
+        "    app.selection.mark();\n",
+        "drag_then_release_copies_text",
+        EV_TESTS,
+    ),
+    (
+        10,
+        "松手清高亮（复制成功与否只能猜）",
+        SEL,
+        "        self.phase = Phase::Marked;\n        self.edge = 0;",
+        "        self.phase = Phase::Marked;\n        self.clear();\n        self.edge = 0;",
+        "drag_then_release_copies_text",
+        EV_TESTS,
+    ),
+    (
+        11,
+        "左键不清旧选区（旧高亮只能靠 resize 消失）",
+        EV,
+        "fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {\n"
+        "    app.selection.clear();",
+        "fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {\n"
+        "    // MUTANT: 不清理旧选区",
+        "left_down_outside_inner_clears_finished_selection",
+        EV_TESTS,
+    ),
+    (
+        12,
+        "右键补救只认 `Down`（缺该位的终端按了没反应）",
+        EV,
+        "        MouseEventKind::Down(MouseButton::Right)\n"
+        "            | MouseEventKind::Up(MouseButton::Right)\n"
+        "            | MouseEventKind::Drag(MouseButton::Right)",
+        "        MouseEventKind::Down(MouseButton::Right)",
+        "right_release_alone_recopies_marked_selection",
+        EV_TESTS,
+    ),
+    (
+        13,
+        "复制不挂状态行提示（高亮不消失 ⇒ 用户无法区分成功与被抢）",
+        EV,
+        '            app.note_status(format!("已复制 {chars} 字"));',
+        "            // MUTANT: 不挂提示",
+        "drag_then_release_copies_text",
+        EV_TESTS,
+    ),
 ]
 
 
 def restore():
-    subprocess.run(["git", "checkout", "--", str(SEL), str(EV)], check=True)
+    for path, text in SNAPSHOT.items():
+        path.write_text(text)
 
 
 def main():
@@ -136,12 +192,9 @@ def main():
     only = {int(a) for a in args if a.isdigit()}
     todo = [m for m in MUTATIONS if not only or m[0] in only]
 
-    dirty = subprocess.run(
-        ["git", "diff", "--quiet", "--", str(SEL), str(EV)]
-    ).returncode
-    if dirty != 0:
-        print("前置失败：selection.rs / events.rs 有未提交改动，拒绝变异", file=sys.stderr)
-        return 1
+    # 快照必须在**任何注入之前**取：`restore()` 写回的就是这份内容。
+    SNAPSHOT[SEL] = SEL.read_text()
+    SNAPSHOT[EV] = EV.read_text()
 
     print("基线：跑一次全绿", flush=True)
     base_code, base_red, base_compiled = run_tests(SEL_TESTS)

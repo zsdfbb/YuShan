@@ -800,6 +800,12 @@ fn status_text(app: &App, width: usize) -> String {
     } else {
         IDLE_MARKER.to_string()
     }];
+    // 短暂提示（如「已复制 N 字」）排在**首段之后**：
+    // 1. 窄终端剥尾时它会先掉 —— 宁可看不到提示，不可看不到「正在跑 / 等输入」；
+    // 2. 它比 model / tokens 更紧急，所以领先于那些常驻段。
+    if let Some((note, _)) = &app.status_note {
+        segs.push(format!("✓ {note}"));
+    }
     segs.push(app.view.model_label());
     // 「下方有新内容」提示：脱离底部时才有 —— 排在 model 之后、其余段之前，
     // 于是窄终端下先被剥掉的是 tokens / 轮数 / 时长，提示与 model 都留得住。
@@ -2873,6 +2879,40 @@ mod tests {
 
         let tiny = status_text(&app, 1);
         assert_eq!(tiny, IDLE_MARKER, "极窄只剩状态段");
+    }
+
+    /// 复制提示进状态行，并**排在夹在首段之后、model 之前**：
+    /// 窄屏剥尾时先丢提示，不能先丢「正在跑 / 等输入」。
+    ///
+    /// 变异：把提示段挪到 `segs` 末尾 ⇒ 窄屏断言变红。
+    #[test]
+    fn status_shows_copy_note_right_after_first_segment() {
+        let mut app = app_with(CodingView::for_test());
+        app.note_status("已复制 12 字");
+
+        let full = status_text(&app, 120);
+        assert!(
+            full.starts_with(&format!("{IDLE_MARKER} · ✓ 已复制 12 字")),
+            "{full}"
+        );
+        assert!(full.contains("deepseek-chat"), "model 仍在提示之后：{full}");
+
+        // 宽度只够「首段 + 提示」时，提示留得住、model 被剥掉。
+        let note_only_w = display_width(&format!("{IDLE_MARKER} · ✓ 已复制 12 字"));
+        let narrow = status_text(&app, note_only_w);
+        assert_eq!(narrow, format!("{IDLE_MARKER} · ✓ 已复制 12 字"));
+
+        // 再窄一列：提示被剥，首段留下 ——「等输入」永远不可被剥。
+        let ultra = status_text(&app, note_only_w - 2);
+        assert_eq!(ultra, IDLE_MARKER, "窄屏先丢提示，不丢状态段");
+    }
+
+    /// 没有提示时状态行**不**凭空多一段（不得出现空的 `✓ `）。
+    #[test]
+    fn status_without_note_has_no_marker() {
+        let app = app_with(CodingView::for_test());
+        let text = status_text(&app, 120);
+        assert!(!text.contains('✓'), "无提示时不得画勾：{text}");
     }
 
     /// 回合进行中：`⏳ Working…` 与 model 之后补两个**进度段**（本回合轮号、本回合已用秒数）。

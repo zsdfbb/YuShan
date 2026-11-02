@@ -1340,8 +1340,9 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 `follow = false` 同理只在**用户真的在阅读历史**时发生：滚动（`↑` / `PageUp` / 滚轮 /
 `Ctrl+Home`）。
 
-**应用不建自己的选区**：`Down` / `Drag` / `Up` 一律不处理，鼠标拖选、右键菜单与
-指针移动类事件都不参与视窗状态（见 §18.7）。
+**应用内的选区不参与视窗状态**：`Down` / `Drag` / `Up` 只写 `App::selection`，
+而它不读也不写 `scroll_offset` / `follow`（见 §18.7）。拖选期间冻结视窗是例外：
+那由 `extend_selection` 在「指针真的离开了按下点」时置 `follow = false`。
 
 反过来，**回合中插话提交也必须恢复跟随**（ADR-0058）：用户敲了回车就期望看到自己那条与
 模型的回应，不恢复的话会被永久留在旧位置。
@@ -1421,8 +1422,8 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 | `Enter` / `Shift`·`Alt+Enter` / `Ctrl+J` | 提交 / 换行 / 换行（终端无关的换行键） |
 | `Tab` | 补全浮层（`/` 开头时） |
 | `Esc` | 取消回合（或命令在飞）→ 否则清空输入 |
-| 左键拖选 | **终端原生选区**（应用不建自己的选区）—— 高亮与剪贴板都由终端管 |
-| 右键 | **终端原生菜单**（复制 / 粘贴由终端提供） |
+| 左键拖选 | **应用内选区**（高亮用 `Modifier::REVERSED`）；**松手即复制** |
+| 右键 | **再拷一次**（补救：主路径是松手）；**不清高亮**，再点一下左键才消失 |
 
 **`↑↓` 与历史的走廊规则变了**（ADR-0057 决策 4）：软换行让 `↑` 在长草稿里成了编辑操作，
 「无条件先问历史」会把草稿整段换掉。现在输入框有得动就先动它，到边界才回落。
@@ -1447,22 +1448,35 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
 
-**接管鼠标：拖选 + 右键复制 + 滚轮**：`run::setup_terminal` 开 **`?1000h` +
+**接管鼠标：拖选 + 松手复制 + 滚轮**：`run::setup_terminal` 开 **`?1000h` +
 `?1002h` + `?1006h`**（按键 / 滚轮 + 拖拽上报 + SGR 编码），**不开** `?1003h`
-（任意移动上报）。`events::handle_event` 把 `Event::Mouse` 交给 `handle_mouse`，它认四态：`ScrollUp` / `ScrollDown`、左键三态（`Down` / `Drag` / `Up`）、
-`Down(Right)`。于是：
+（任意移动上报）。`events::handle_event` 把 `Event::Mouse` 交给 `handle_mouse`，它认
+滚轮两向、左键三态（`Down` / `Drag` / `Up`），以及**右键补救**（`refine_gesture`）。
+于是：
 
 - **滚轮 = 滚聊天**：每事件 `WHEEL_ROWS`（3）视觉行；`run.rs` 先排空紧跟的一串滚轮事件
   折叠成净量（`events::fold_wheel`）再一次施加 ⇒ 触控板一次滑动按事件累加、只做一次
   `layout.sync`。批上限 `MAX_WHEEL_BATCH`（4096）保证排空循环有界。
-- **拖选 = 应用内选区**：`Down(Left)` 建锚点、`Drag(Left)` 扩展、`Up(Left)` 只转为
-  「已标记」；**右键**才写入剪贴板。高亮层由 `draw::draw_selection` 画
-  （`Modifier::REVERSED`）。上限 256 KB，超限不截断、只回一行提示。
+- **拖选 = 应用内选区**：`Down(Left)` 建锚点、`Drag(Left)` 扩展、`Up(Left)` 转「已标记」
+  **并当场写入剪贴板**。高亮层由 `draw::draw_selection` 画（`Modifier::REVERSED`）。
+  上限 256 KB，超限不截断、只回一行提示。
+- **复制不挂在右键上**：右键**不一定到得了应用** —— VS Code 的终端在 DOM 层截掉
+  `contextmenu` 弹自己的菜单（`terminal.integrated.rightClickBehavior`），应用发什么
+  都改变不了它。挂右键就等于在那类终端里永远复制不了。右键保留为**补救**入口：高亮
+  还在时任一位都能重写剪贴板（各终端上报形态不同：`Down` / `Up` / `Drag(Right)` 都算）。
+- **复制后高亮保留**：`Selection::mark()` 不清选区——高亮留到下次左键点击、用户主动
+  滚动或 resize。左键**不是**复制键：它的语义是「清掉旧选区 + 开始新选区」。滚轮
+  **不算**复制触发（它的语义是滚动，清选区不复制）。
+- **`⇧` 不参与鼠标语义**：应用对 `m.modifiers` 一概不看。按住 `⇧` 时终端可能自己
+  接管「强制原生选区」（xterm.js 的 `shouldForceSelection` 在非 mac 平台就看 `shiftKey`），
+  此时事件**根本不到应用** —— 应用侧无论如何改都看不见那个手势。这也是为什么
+  「高亮两套、右键拷不了」只能靠「别按 ⇧」解决，而不是靠应用内分支。
 - **`?1002h` 不可省**：不开它终端**根本不产生 `Drag` 事件**，拖选会停在按下点。
   另 `?1003h` 有意不开 —— 它对拖选无用，却让指针一动就产生 `Moved` 风暴。
 
-选区清理是契约（`Event::Resize` / `PageUp`·`PageDown` / 滚轮 / 跳首跳尾 / 回放替换 / 复制后
-/ 两端点重合的 `Up`），而 `drag_tick` 的**自动滚动不得清**（否则拖到边缘即自我取消）。
+选区清理是契约（`Event::Resize` / `PageUp`·`PageDown` / 滚轮 / 跳首跳尾 / 回放替换 /
+左键按下 / 两端点重合的 `Up`），而 `drag_tick` 的**自动滚动不得清**（否则拖到边缘即自我取消）；
+**松手复制也不清**（高亮留到下一次左键点击）。
 决策与废弃沿革见 [ADR-0066](../adr/0066-restore-in-app-text-selection.md)。
 
 实测确认（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1002h` / `?1006h` 各 **1 次**，
@@ -1510,8 +1524,8 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
 - 真实终端的「翻页跟手」观感仍是 `MANUAL_ACK` 项（见 §10）。
 - **滚轮滚对话**：应用接管滚轮（`?1000h` + `?1006h`），每事件 3 视觉行、同一次滑动
   按事件累加。`PageUp` / `PageDown` / `Ctrl+↑` / `Ctrl+↓` 仍可用。详见 §18.7。
-- **裸拖选 / 右键菜单需要终端的逃生门**：鼠标追踪期间它们不归终端，复制用 `⇧`+拖选
-  或 `/copy`。
+- **裸拖选 / 右键菜单需要终端的逃生门**：鼠标追踪期间它们不归终端，复制用拖选（松手
+  即复制）或 `/copy`。
 - **模态浮层不滚动**：浮层内容尚不滚动（见 `docs/TODO.md` §C）。
 - **`Ctrl+V` 在 SSH / 容器里无反应**：远端没有本机剪贴板工具（读取只走工具，不发 OSC 52 读）。
   那时用终端自己的粘贴键（`Ctrl+Shift+V` / `⌘V`）。工具缺失时`Ctrl+V`会走完整条候选链（逐个
@@ -1521,27 +1535,32 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
 - **`xsel` 复制后不退出**：X11 selection 的拥有者必须是个活进程 ⇒ 下一个 `xsel` 接管时它才退。
   这不是泄漏，但 `ps` 里会看到它。
 
-### 18.7 鼠标：拖选 + 右键复制 + 滚轮 — as-built
+### 18.7 鼠标：拖选 + 松手复制 + 滚轮 — as-built
 
-**接管四态**：`run::setup_terminal` 开 `?1000h` + `?1002h` + `?1006h`（见
+**接管鼠标**：`run::setup_terminal` 开 `?1000h` + `?1002h` + `?1006h`（见
 `EnableMouseReporting`），**不开** `?1003h`。`events::handle_event` 把 `Event::Mouse` 交给
-`events::handle_mouse`，它认 `ScrollUp` / `ScrollDown`、左键 `Down` / `Drag` / `Up`、
-与 `Down(Right)`。
+`events::handle_mouse`，它认 `ScrollUp` / `ScrollDown`、左键 `Down` / `Drag` / `Up`，
+以及**右键补救**（`events::refine_gesture`）。
 
 - **滚轮 = 滚聊天**：`WHEEL_ROWS` = 3 视觉行 / 事件。`run::coalesce_wheel` 把紧跟的
   一串滚轮事件排空（上限 `MAX_WHEEL_BATCH` = 4096），`events::fold_wheel` 折叠成净量，
   `events::scroll_wheel_batch` 一次施加 ⇒ 触控板一次滑动按事件累加、只做一次
   `layout.sync`。净量为 0（方向抵消）⇒ 不动视窗。
 - **拖选 = 应用内选区**：`Down(Left)` 在 Chat 内区建锚点（外区不开始）；`Drag(Left)` 扩展；
-  `Up(Left)` 只转为「已标记」，**不复制**；**`Down(Right)`** 才写入剪贴板并清高亮。
+  `Up(Left)` 转「已标记」**并当场复制**（`events::finish_selection` → `copy_marked_selection`）。
+  复制**保留**高亮（`Selection::mark` 不动 `phase` 以外的状态），左键按下才清。
   提取与高亮在 `selection.rs`（`GlyphGrid` / `extract` / `Highlight`），高亮由
   `draw::draw_selection` 画在内容层之上。上限 256 KB，超限**不截断**、只回一行提示。
+- **右键是补救，不是主路径**：VS Code 的终端在 DOM 层截掉 `contextmenu` 弹自己的菜单，
+  应用发什么都改变不了它 —— 挂右键就等于在那类终端里永远复制不了。故 `refine_gesture`
+  只做「有高亮就再写一次剪贴板」，三个位（`Down` / `Up` / `Drag(Right)`）全认，因为
+  各终端上报形态不统一。
 - **指针离开按下点那一刻才冻结视窗**：单击不得停止 tail-follow（否则点一下就丢跟随），
   真拖动必须冻结（否则视窗跟随下内容一边跑一边选）。`drag_tick` 负责拖到边缘时自动滚动，
   它**不得**清选区，也不得夺回 follow。
 - **选区清理是契约**：`Event::Resize`（wrap 行数全变 ⇒ 行号空间作废）、`PageUp` /
-  `PageDown` / 滚轮（主动滚动）、跳首跳尾、`reset_for_replay`、复制后、两端点重合的 `Up`。
-  多一处少一处都会出真 bug。
+  `PageDown` / 滚轮（主动滚动）、跳首跳尾、`reset_for_replay`、左键按下、两端点重合的 `Up`。
+  **松手复制不清** —— 复制后高亮仍在，再点一下左键才消失。多一处少一处都会出真 bug。
 - **为什么要鼠标捕获**：不开它，终端把滚轮译成 `↑` / `↓` 字节丢给 stdin，`events.rs` 只能
   把它当按键 ⇒ 从输入历史里翻出上一条提交的文本（ADR-0050）。
 - **为什么 `?1002h` 不可省而 `?1003h` 不开**：`?1002h` 是「按住拖动时上报」—— 不开它终端

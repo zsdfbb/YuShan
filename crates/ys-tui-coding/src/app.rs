@@ -22,6 +22,12 @@ use crate::view::CodingView;
 /// Working 动画的点数（1..=3）。
 const WORKING_DOTS: u8 = 3;
 
+/// 状态行短暂提示的存活时长（如「已复制 N 字」）。
+///
+/// 2 s：足够看到又不足以残留 —— 用户下一步往往是去别处粘贴，回来时提示就该没了。
+/// 上界受 `run.rs` 的 tick 频率约束：提示到期后最多再显示一个 tick 周期。
+pub(crate) const STATUS_NOTE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub struct App {
     pub view: CodingView,
     pub transcript: Vec<TranscriptLine>,
@@ -61,6 +67,14 @@ pub struct App {
     /// 不走「写进对话区让用户手动选中」：`/copy` 的用途就是**一步到位**，
     /// 而拖选本身已由终端原生提供。
     pub pending_clipboard: Option<String>,
+    /// 状态行上的**短暂提示**（如「已复制 N 字」）：`(文案, 到期时刻)`。
+    ///
+    /// 复制刻意**不清高亮**（用户要看得见刚拷走哪段），于是屏幕上没有任何变化 ——
+    /// 没有这一行，成功与「右键被吞」在用户眼里无法区分。
+    ///
+    /// **不写 transcript**：复制不是对话内容，不该推动 Chat 区布局（那会把
+    /// 用户刚选中的那几行顶走）。过期由 `run.rs` 的每轮 tick 判定并清掉。
+    pub status_note: Option<(String, Instant)>,
     /// 请求**读**系统剪贴板并插入输入框（`Ctrl+V`）—— **由 `run.rs` 消费**。
     ///
     /// 与 [`Self::pending_clipboard`] 同一条纪律，方向相反：读剪贴板要起子进程，
@@ -180,6 +194,7 @@ impl App {
             completion: None,
             pending_prompt: None,
             pending_clipboard: None,
+            status_note: None,
             pending_paste: false,
             pending_sessions: None,
             command_in_flight: false,
@@ -561,6 +576,28 @@ impl App {
     /// 推进 Working 动画相位。
     pub fn tick_working(&mut self) {
         self.working_dot = (self.working_dot + 1) % WORKING_DOTS;
+    }
+
+    /// 在状态行上挂一条短暂提示（如「已复制 N 字」）。
+    ///
+    /// 同一时刻只有**一条** —— 连按两次复制时后来的覆盖前面的，而不是排队：
+    /// 状态行只有一行，排队只会让提示比操作晚几秒才出现。
+    pub fn note_status(&mut self, text: impl Into<String>) {
+        self.status_note = Some((text.into(), Instant::now() + crate::app::STATUS_NOTE_TTL));
+    }
+
+    /// 清掉已到期的状态行提示。
+    ///
+    /// **由 `run.rs` 的每轮 tick 调**，不在 `draw.rs` 里判：渲染必须是时间的纯函数，
+    /// 否则同一帧在不同时刻画出不同内容，逐帧断言无从写起。
+    pub fn expire_status_note(&mut self) {
+        if self
+            .status_note
+            .as_ref()
+            .is_some_and(|(_, until)| Instant::now() >= *until)
+        {
+            self.status_note = None;
+        }
     }
 
     /// Working 文案：`Working` + 1..=3 个点（状态行用）。

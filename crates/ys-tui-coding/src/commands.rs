@@ -591,15 +591,15 @@ static KEYBINDINGS: [KeyBinding; 22] = [
     },
     KeyBinding {
         keys: "左键拖选",
-        action: "终端原生选区（应用不建自己的选区）",
+        action: "选中对话文字，**松手即复制**；高亮保留，再点一下左键才清",
         group: KeyGroup::Mouse,
-        note: Some("鼠标捕获期间需用终端的逃生门：多数终端为 ⇧+拖选"),
+        note: Some("⇧ 不参与：按住 ⇧ 时终端可能自己接管选区，此时应用收不到事件"),
     },
     KeyBinding {
         keys: "右键",
-        action: "终端原生菜单（复制 / 粘贴由终端提供）",
+        action: "高亮还在时再拷一次（补救：主路径是松手）",
         group: KeyGroup::Mouse,
-        note: None,
+        note: Some("VS Code 等终端会在应用看到右键之前弹自己的菜单；故复制不挂在它上面"),
     },
     KeyBinding {
         keys: "/copy",
@@ -861,7 +861,7 @@ pub fn status_text(view: &CodingView) -> String {
 /// 返回 `None` = 没有可复制的回复。
 ///
 /// **文本去往终端剪贴板**（OSC 52，由 `run.rs` 发序列），同时本机若装了
-/// `wl-copy` / `xclip` / `xsel` 也一并写 —— 用户既可以自己拖选（终端原生选区），
+/// `wl-copy` / `xclip` / `xsel` 也一并写 —— 用户既可以自己拖选（松手即复制），
 /// 也可以直接用 `/copy` 一步到位。
 pub fn copy_text(app: &App) -> Option<&str> {
     app.transcript.iter().rev().find_map(|line| match line {

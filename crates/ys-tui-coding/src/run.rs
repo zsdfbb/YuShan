@@ -413,6 +413,11 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
         }
 
         // 3) Working 动画节拍（只在 turn 中有意义）
+        //
+        // 状态行提示的过期也挂在这里：它是屏幕上**唯一**的时间驱动文字（除 Working
+        // 动画），且两者共用同一个判定周期。不在 turn 中也必须跑 —— `已复制` 几乎
+        // 总是发生在空闲时。
+        app.expire_status_note();
         if app.is_turning && last_tick.elapsed() >= TICK_INTERVAL {
             app.tick_working();
             last_tick = Instant::now();
@@ -994,7 +999,7 @@ fn run_reader(program: &str, args: &[&str]) -> Option<String> {
 /// 两条路**都走**，不去探测终端支不支持 OSC 52：
 ///
 /// 1. **终端原生工具**（`xsel` / `xclip` / `pbcopy` / `wl-copy` / `clip.exe`）—— 命中即
-///    真的进了系统剪贴板，`⇧`+拖选之外的任何粘贴入口都能用（包括在别的 app 里粘贴）。
+///    真的进了系统剪贴板，任何粘贴入口都能用（包括在别的 app 里粘贴）。
 /// 2. **OSC 52** —— 兜住 SSH / 无 X 的环境，且终端若把它落到自己的剪贴板就同样可用。
 ///
 /// 为什么不二选一：两者**互不排斥**，而失败都是静默的（终端可以忽略 OSC 52；没有工具的
@@ -1809,8 +1814,8 @@ mod tests {
         assert!(seq.contains("\x1b[?1049l"), "须退出 alt-screen：{seq:?}");
         assert!(seq.contains("\x1b[?7h"), "须开启换行：{seq:?}");
         assert!(seq.contains("\x1b[?2004l"), "须关闭括号粘贴：{seq:?}");
-        // 本应用**只接管滚轮**，但捕获确实是开过的（`?1000h`）⇒ 退出时必须关掉，
-        // 否则滚轮会继续被应用吞掉、终端再也收不到。
+        // 鼠标捕获确实是开过的（`?1000h` / `?1002h`）⇒ 退出时必须关掉，
+        // 否则滚轮与拖选会继续被应用吞掉、终端再也收不到。
         assert!(
             seq.contains("\x1b[?1000l") && seq.contains("\x1b[?1006l"),
             "须关闭鼠标捕获（否则泄漏进 shell）：{seq:?}"

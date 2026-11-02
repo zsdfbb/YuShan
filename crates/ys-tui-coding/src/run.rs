@@ -1821,16 +1821,23 @@ mod tests {
         );
     }
 
-    /// 初始化序列**只开滚轮上报**（`?1000h` + `?1006h`），不开拖拽 / 移动上报
-    /// （`?1002h` / `?1003h`）—— 后者对滚轮无用，且会让指针一动就持续产生 `Moved`。
+    /// 初始化序列必须包含鼠标三模式：`?1000h`（按下 / 滚轮）、`?1002h`（按住拖动）、
+    /// `?1006h`（SGR 编码）；不得包含 `?1003h`（任意移动上报）。
     ///
-    /// 变异：把 `setup_sequence` 里的 `EnableWheelReporting` 换成 crossterm 的
-    /// `EnableMouseCapture` ⇒ 红；整段删掉鼠标模式 ⇒ 红（滚轮会落回输入历史）。
+    /// `?1002h` 是拖选的**必要条件** —— 不开它终端不产生 `Drag`，选区会停在按下点。
+    /// 缺它时滚轮仍然可用，因此本断言是拖选唯一的写层防线。
+    ///
+    /// 变异：把 `setup_sequence` 里的 `EnableMouseReporting` 换成 crossterm 的
+    /// `EnableMouseCapture` ⇒ 红；整段删掉鼠标模式 ⇒ 红（滚轮会落回输入历史）；
+    /// 去掉 `?1002h` ⇒ 红。
     #[test]
     fn setup_sequence_enables_drag_and_wheel() {
         let seq = setup_sequence();
         assert!(seq.contains("\x1b[?1000h"), "须开按键/滚轮上报：{seq:?}");
-        assert!(seq.contains("\x1b[?1006h"), "须用 SGR 编码（列号 + 按键号）：{seq:?}");
+        assert!(
+            seq.contains("\x1b[?1006h"),
+            "须用 SGR 编码（列号 + 按键号）：{seq:?}"
+        );
         assert!(
             seq.contains("\x1b[?1002h"),
             "须开按下拖动上报 —— 否则 `Drag` 不产生，拖选停在按下点：{seq:?}"
@@ -1843,10 +1850,10 @@ mod tests {
         assert!(seq.contains("\x1b[?2004h"), "须开括号粘贴：{seq:?}");
     }
 
-    /// `EnableWheelReporting` 命令自身只写两个序列（与 [`setup_sequence`] 同源）。
+    /// `EnableMouseReporting` 命令自身只写三个序列（与 [`setup_sequence`] 同源）。
     #[test]
     fn wheel_reporting_command_is_minimal() {
-        // 三条缺一不可：`?1000h` 给按下/滚轮，`?1002h` 给拖动（写拖选的命根子），
+        // 三条缺一不可：`?1000h` 给按下/滚轮，`?1002h` 给拖动（拖选的命根子），
         // `?1006h` 给 SGR 列号与按键号。`?1003h` 有意不开（任意移动上报）。
         assert_eq!(MOUSE_MODE_ON, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
     }

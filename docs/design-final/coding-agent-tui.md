@@ -1447,22 +1447,26 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
 
-**只接管滚轮**：`run::setup_terminal` 开 **`?1000h` + `?1006h`**（按键与滚轮上报 +
-SGR 编码），**不开** `?1002h` / `?1003h`（拖拽 / 任意移动上报）。`events::handle_event`
-把 `Event::Mouse` 交给 `handle_mouse`，其中**只认 `ScrollUp` / `ScrollDown`**，其余一律
-忽略。于是：
+**接管鼠标：拖选 + 右键复制 + 滚轮**：`run::setup_terminal` 开 **`?1000h` +
+`?1002h` + `?1006h`**（按键 / 滚轮 + 拖拽上报 + SGR 编码），**不开** `?1003h`
+（任意移动上报）。`events::handle_event` 把 `Event::Mouse` 交给 `handle_mouse`，它认四态：`ScrollUp` / `ScrollDown`、左键三态（`Down` / `Drag` / `Up`）、
+`Down(Right)`。于是：
 
 - **滚轮 = 滚聊天**：每事件 `WHEEL_ROWS`（3）视觉行；`run.rs` 先排空紧跟的一串滚轮事件
   折叠成净量（`events::fold_wheel`）再一次施加 ⇒ 触控板一次滑动按事件累加、只做一次
   `layout.sync`。批上限 `MAX_WHEEL_BATCH`（4096）保证排空循环有界。
-- **不开拖拽上报**：指针移动不产生 `Moved` 事件；拖选与右键**不归应用**。
-  **代价**：鼠标追踪期间终端的裸拖选与右键菜单不生效，复制需用终端的「强制原生选择」
-  逃生门（多数终端是 `⇧`+拖选），或 `/copy`。
-- **为什么不建应用内选区**：选区与剪贴板在各终端（xterm.js / VTE / iTerm2 / tmux / SSH）
-  上实现差异极大，自建选区必须逐个适配，且永远有终端截获事件；交还给终端则各处一致。
+- **拖选 = 应用内选区**：`Down(Left)` 建锚点、`Drag(Left)` 扩展、`Up(Left)` 只转为
+  「已标记」；**右键**才写入剪贴板。高亮层由 `draw::draw_selection` 画
+  （`Modifier::REVERSED`）。上限 256 KB，超限不截断、只回一行提示。
+- **`?1002h` 不可省**：不开它终端**根本不产生 `Drag` 事件**，拖选会停在按下点。
+  另 `?1003h` 有意不开 —— 它对拖选无用，却让指针一动就产生 `Moved` 风暴。
 
-实测确认（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1006h` 各 **1 次**，
-`?1002h` / `?1003h` / `?1015h` **均为 0 次**；退出序列含 `?1000l` / `?1006l`（不泄漏进 shell）。
+选区清理是契约（`Event::Resize` / `PageUp`·`PageDown` / 滚轮 / 跳首跳尾 / 回放替换 / 复制后
+/ 两端点重合的 `Up`），而 `drag_tick` 的**自动滚动不得清**（否则拖到边缘即自我取消）。
+决策与废弃沿革见 [ADR-0066](../adr/0066-restore-in-app-text-selection.md)。
+
+实测确认（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1002h` / `?1006h` 各 **1 次**，
+`?1003h` / `?1015h` **均为 0 次**；退出序列含 `?1000l` / `?1006l`（不泄漏进 shell）。
 
 **macOS 的两个坑**（键盘侧入口为何重要）：系统级快捷键占用了 `Ctrl+↑` / `Ctrl+↓`
 （Mission Control / App Exposé，字节到不了终端，需在「系统设置 → 键盘 → 键盘快捷键 →
@@ -1517,37 +1521,67 @@ Mission Control」里取消勾选）；MacBook 内置键盘**没有独立 PageUp
 - **`xsel` 复制后不退出**：X11 selection 的拥有者必须是个活进程 ⇒ 下一个 `xsel` 接管时它才退。
   这不是泄漏，但 `ps` 里会看到它。
 
-### 18.7 鼠标：只接管滚轮 — as-built
+### 18.7 鼠标：拖选 + 右键复制 + 滚轮 — as-built
 
-**只接管滚轮**：`run::setup_terminal` 开 `?1000h` + `?1006h`，**不开** `?1002h` /
-`?1003h`（见 `EnableWheelReporting`）；`events::handle_event` 把 `Event::Mouse` 交给
-`events::handle_mouse`，后者只认 `ScrollUp` / `ScrollDown`。
+**接管四态**：`run::setup_terminal` 开 `?1000h` + `?1002h` + `?1006h`（见
+`EnableMouseReporting`），**不开** `?1003h`。`events::handle_event` 把 `Event::Mouse` 交给
+`events::handle_mouse`，它认 `ScrollUp` / `ScrollDown`、左键 `Down` / `Drag` / `Up`、
+与 `Down(Right)`。
 
 - **滚轮 = 滚聊天**：`WHEEL_ROWS` = 3 视觉行 / 事件。`run::coalesce_wheel` 把紧跟的
   一串滚轮事件排空（上限 `MAX_WHEEL_BATCH` = 4096），`events::fold_wheel` 折叠成净量，
   `events::scroll_wheel_batch` 一次施加 ⇒ 触控板一次滑动按事件累加、只做一次
   `layout.sync`。净量为 0（方向抵消）⇒ 不动视窗。
-- **拖选 / 右键 / 悬停一律不处理**：应用**不建自己的选区**，高亮与剪贴板归终端。
-  **代价**：鼠标追踪期间终端的裸拖选与右键菜单不生效，复制需用终端的「强制原生选择」
-  逃生门（多数终端是 `⇧`+拖选），或 `/copy`。
+- **拖选 = 应用内选区**：`Down(Left)` 在 Chat 内区建锚点（外区不开始）；`Drag(Left)` 扩展；
+  `Up(Left)` 只转为「已标记」，**不复制**；**`Down(Right)`** 才写入剪贴板并清高亮。
+  提取与高亮在 `selection.rs`（`GlyphGrid` / `extract` / `Highlight`），高亮由
+  `draw::draw_selection` 画在内容层之上。上限 256 KB，超限**不截断**、只回一行提示。
+- **指针离开按下点那一刻才冻结视窗**：单击不得停止 tail-follow（否则点一下就丢跟随），
+  真拖动必须冻结（否则视窗跟随下内容一边跑一边选）。`drag_tick` 负责拖到边缘时自动滚动，
+  它**不得**清选区，也不得夺回 follow。
+- **选区清理是契约**：`Event::Resize`（wrap 行数全变 ⇒ 行号空间作废）、`PageUp` /
+  `PageDown` / 滚轮（主动滚动）、跳首跳尾、`reset_for_replay`、复制后、两端点重合的 `Up`。
+  多一处少一处都会出真 bug。
 - **为什么要鼠标捕获**：不开它，终端把滚轮译成 `↑` / `↓` 字节丢给 stdin，`events.rs` 只能
   把它当按键 ⇒ 从输入历史里翻出上一条提交的文本（ADR-0050）。
-- **为什么只开 `?1000h`**：crossterm 的 `EnableMouseCapture` 连带开 `?1002h`（按下拖动）与
-  `?1003h`（任意移动）—— 对滚轮毫无用处，却让指针一动就持续产生 `Moved` 事件。
+- **为什么 `?1002h` 不可省而 `?1003h` 不开**：`?1002h` 是「按住拖动时上报」—— 不开它终端
+  **根本不产生 `Drag` 事件**，拖选会停在按下点。`?1003h` 是「任意移动上报」，对拖选无用，
+  开了只会让指针一动就持续产生 `Moved`。
 - **关闭**：`restore_sequence` 走 crossterm 的 `DisableMouseCapture`（反序关 1006 / 1003 /
-  1002 / 1000），对「只开过两个」的情形是无害的超集。
+  1002 / 1000），对「只开过三个」的情形是无害的超集。
 
 **输入框选区保留**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+A` 全选、`Shift+方向` 扩选、
 有选区时 `Ctrl+C` 复制、`Ctrl+V` 粘贴替换、编辑键替换整段。这是**输入框自己的状态**，
 与 Chat 区的鼠标选区无关 —— 它由键盘驱动，不经过鼠标事件。高亮走 `Modifier::REVERSED`
 且与 `draw::wrap_input` **共用折行结果**（另算一份就会错位）。
 
-**实测确认**（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1006h` **各 1 次**，
-`?1002h` / `?1003h` / `?1015h` 均为 **0 次**。
-守卫：`run::tests::setup_sequence_enables_wheel_only`（初始化只开滚轮）、
+**实测确认**（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1002h` / `?1006h` **各 1 次**，
+`?1003h` / `?1015h` 均为 **0 次**。
+守卫：`run::tests::setup_sequence_enables_drag_and_wheel`（必须含 `?1002h`、不得含 `?1003h`）、
+`run::tests::wheel_reporting_command_is_minimal`（逐字节相等）、
 `run::tests::restore_sequence_contains_terminal_state_restore`（退出必须关掉捕获）、
 `events::tests::test_wheel_scrolls_chat_and_never_input_history`（滚轮不碰输入历史）、
-`events::tests::test_other_mouse_events_are_ignored`（其余鼠标事件不滚动）。
+`events::tests::drag_then_release_copies_text` / `v6_click_without_drag_does_not_copy` /
+`v6b_bare_click_does_not_stop_following` / `v6c_real_drag_freezes_view`（三态）、
+`events::tests::v9_resize_clears_selection` / `user_scroll_clears_selection`（清理契约）、
+`events::tests::v10_oversized_selection_reports_instead_of_copying`（超限不截断）、
+`selection::tests::v8_drag_tick_never_restores_follow`（自动滚动不夺回跟随）。
+
+> 决策与废弃沿革见 [ADR-0066](../adr/0066-restore-in-app-text-selection.md)。
+> **改这块代码前先读它**：上一轮的「只接管滚轮」把「不得含 `?1002h`」写成了断言，
+> 体系每项测试全绿、拖选仍然完全失效。
+
+**输入框选区保留**（ADR-0057）：`InputBuffer::anchor`，`Ctrl+A` 全选、`Shift+方向` 扩选、
+有选区时 `Ctrl+C` 复制、`Ctrl+V` 粘贴替换、编辑键替换整段。这是**输入框自己的状态**，
+与 Chat 区的鼠标选区无关 —— 它由键盘驱动，不经过鼠标事件。高亮走 `Modifier::REVERSED`
+且与 `draw::wrap_input` **共用折行结果**（另算一份就会错位）。
+
+**实测确认**（PTY 抓原始字节）：初始化序列中 `?1000h` / `?1002h` / `?1006h` **各 1 次**，
+`?1003h` / `?1015h` 均为 **0 次**。
+守卫：`run::tests::setup_sequence_enables_drag_and_wheel`（初始化必须含 `?1002h`、不得含 `?1003h`）、
+`run::tests::restore_sequence_contains_terminal_state_restore`（退出必须关掉捕获）、
+`events::tests::test_wheel_scrolls_chat_and_never_input_history`（滚轮不碰输入历史）、
+`events::tests::test_other_mouse_events_are_ignored`（中间键 / 未知列不影响视窗）。
 
 
 ## 19. 后台命令执行（execution-efficiency）— as-built

@@ -305,11 +305,8 @@ fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     let rel_x = m.column - inner.x;
     let rel_y = (m.row - inner.y) as usize;
     // `top_row` 从 `sync_scroll_state` 取：`compute_max_scroll` **不回**它。
-    let top_row = app
-        .sync_scroll_state(width, height, Instant::now())
-        .top_row;
-    app.selection
-        .begin(top_row + rel_y, rel_x, Instant::now());
+    let top_row = app.sync_scroll_state(width, height, Instant::now()).top_row;
+    app.selection.begin(top_row + rel_y, rel_x, Instant::now());
     // **不在这里脱离跟随**：按下只是记下锚点，一次「点一下」（无拖动）不该冻结视窗。
     // 真正冻结视窗的是 [`extend_selection`] 里「指针确实离开了按下点」那一刻。
 }
@@ -336,9 +333,7 @@ fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     } else {
         0
     };
-    let top_row = app
-        .sync_scroll_state(width, height, Instant::now())
-        .top_row;
+    let top_row = app.sync_scroll_state(width, height, Instant::now()).top_row;
     app.selection.extend(
         top_row + (row - inner.y) as usize,
         col - inner.x,
@@ -3175,7 +3170,6 @@ mod tests {
     // T18：左键三态迁移（ADR-0051）
     // -----------------------------------------------------------------------
 
-
     /// **V6：按下未拖动即松开 ⇒ 不复制**（防误触覆盖剪贴板）。
     #[test]
     fn v6_click_without_drag_does_not_copy() {
@@ -3550,6 +3544,4 @@ mod tests {
         };
         assert!(text.contains("256"), "提示应说明上限：{text}");
     }
-
-
 }

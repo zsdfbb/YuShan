@@ -525,6 +525,45 @@ fn channel_capacity() -> usize {
     clamped
 }
 
+/// runtime worker 线程数上限。
+///
+/// **负载形态**：模型流、子进程、文件 IO 全走 async（`reqwest` 流 / `tokio::process` /
+/// `tokio::fs`），worker 几乎全程在**等 IO** 而非算。故 worker 数不随核数放大 ——
+/// tokio 默认 `available_parallelism`，在 32 核机器上是 32 个线程，每个线程一份栈 +
+/// 一份 glibc arena，实测多花约 1 MB RSS，而并发能力一点没多出来。
+///
+/// **8 的依据**：同批并发工具上限 [`ys_component::DEFAULT_MAX_PARALLEL_TOOLS`] 为 4，
+/// 取它的一倍覆盖「并行批 + 在跑的子 agent」同时活跃的情形。**下限不得低于 4** ——
+/// 工具主路径虽是 async，但 `bash` 落盘 / `debug_log` 等仍有零星同步 IO，worker 少于
+/// 并行批上限会让它们互相排队。
+const MAX_WORKER_THREADS: usize = 8;
+
+/// `YUSHAN_WORKER_THREADS` 的变量名 —— 单一定义处（用例与 [`worker_threads`] 共用）。
+const WORKER_THREADS_ENV: &str = "YUSHAN_WORKER_THREADS";
+
+/// runtime 实际 worker 数：`min(可用核数, MAX_WORKER_THREADS)`，可经
+/// `YUSHAN_WORKER_THREADS` 覆盖（取值被 clamp 到 `[1, MAX_WORKER_THREADS]`）。
+///
+/// 覆盖**不能放大**：上限是内存账，不是正确性护栏；真要更多并发就调高
+/// `MAX_WORKER_THREADS` 常量（那要连同内存预算一起复核）。
+fn worker_threads() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let requested = std::env::var(WORKER_THREADS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| available.min(MAX_WORKER_THREADS));
+    let clamped = requested.clamp(1, MAX_WORKER_THREADS);
+    if clamped != requested {
+        eprintln!(
+            "warning: {WORKER_THREADS_ENV}={requested} 超出 [1, {MAX_WORKER_THREADS}]，已 clamp 到 {clamped}"
+        );
+    }
+    clamped
+}
+
 /// 把信封序列化为一行 JSON 写入（供 `--json` 模式）。输出后换行。
 ///
 /// 直接 `to_writer`（不经过中间 `String`），最后补一个 `\n` —— 一行一个信封。
@@ -2993,6 +3032,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/v1/models`。手工建（而非 `#[tokio::main]`）的理由不变 —— TUI 模式的 UI 循环
     // **必须在没有 runtime 上下文的线程上跑**（它用 `blocking_send`）。
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
         .enable_all()
         .build()?;
 
@@ -4122,6 +4162,39 @@ mod tests {
             clamp_capacity(DEFAULT_CHANNEL_CAPACITY),
             DEFAULT_CHANNEL_CAPACITY
         );
+    }
+
+    /// worker 线程数：默认取 `min(核数, 上限)`，env 可覆盖但被 clamp 到 `[1, 上限]`。
+    ///
+    /// 变异：去掉 `.clamp(1, MAX_WORKER_THREADS)` ⇒ 「放大请求」与「0」两段变红。
+    ///
+    /// **为什么这是必测项**：worker 数是**内存账**（每线程一份栈 + 一份 arena），
+    /// 写错的后果是「32 核机器默默多花 1 MB 且无人发现」—— 没有任何行为会报错。
+    #[test]
+    fn worker_threads_defaults_to_available_and_clamps_override() {
+        let _guard = crate::test_env::env_lock();
+        let _env = crate::test_env::EnvRestore::capture(&[WORKER_THREADS_ENV]);
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        // 未设 env ⇒ `min(核数, 上限)`。
+        unsafe { std::env::remove_var(WORKER_THREADS_ENV) };
+        assert_eq!(worker_threads(), available.min(MAX_WORKER_THREADS));
+
+        // 未超上限的显式值原样采用（本机核数很多时也要能压到 4）。
+        unsafe { std::env::set_var(WORKER_THREADS_ENV, "4") };
+        assert_eq!(worker_threads(), 4);
+
+        // 超过上限 ⇒ clamp（**不得**放大）。
+        unsafe { std::env::set_var(WORKER_THREADS_ENV, "64") };
+        assert_eq!(worker_threads(), MAX_WORKER_THREADS);
+
+        // 0 / 非数字 ⇒ 回落默认，而不是 panic 或起 0 个线程（`Builder` 会 assert）。
+        unsafe { std::env::set_var(WORKER_THREADS_ENV, "0") };
+        assert_eq!(worker_threads(), available.min(MAX_WORKER_THREADS));
+        unsafe { std::env::set_var(WORKER_THREADS_ENV, "not-a-number") };
+        assert_eq!(worker_threads(), available.min(MAX_WORKER_THREADS));
     }
 
     /// 12. **-p 按序增量拼接（Task 14 核心不变量）**：多个 `ModelTextDelta` 必须**按序、

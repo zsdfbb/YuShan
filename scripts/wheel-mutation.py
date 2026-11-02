@@ -107,16 +107,16 @@ MUTATIONS = [
     (
         "M10 初始化用 crossterm 的全量鼠标捕获（连带开拖拽/移动上报）",
         RU,
-        "        EnableBracketedPaste,\n        EnableWheelReporting\n    );",
+        "        EnableBracketedPaste,\n        EnableMouseReporting\n    );",
         "        EnableBracketedPaste,\n        crossterm::event::EnableMouseCapture\n    );",
-        "setup_sequence_enables_wheel_only",
+        "setup_sequence_enables_drag_and_wheel",
     ),
     (
         "M11 初始化根本不开鼠标模式（滚轮落回输入历史）",
         RU,
-        "        EnableBracketedPaste,\n        EnableWheelReporting\n    );",
+        "        EnableBracketedPaste,\n        EnableMouseReporting\n    );",
         "        EnableBracketedPaste\n    );",
-        "setup_sequence_enables_wheel_only",
+        "setup_sequence_enables_drag_and_wheel",
     ),
 ]
 

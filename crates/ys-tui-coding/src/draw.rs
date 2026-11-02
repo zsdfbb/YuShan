@@ -36,6 +36,7 @@ use ys_core::StopReason;
 use crate::app::App;
 use crate::completion::CompletionState;
 use crate::input::InputBuffer;
+use crate::selection::Highlight;
 use crate::theme::Palette;
 use crate::transcript::TranscriptLine;
 
@@ -171,6 +172,12 @@ fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
     app.input.wrap_width = Some(input_inner_width(area.width));
 
     draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
+    // 选区高亮**独立一层**：它需要 `&mut app`（写字形缓存），不能塞进 `draw_transcript`。
+    // 内区几何在**整屏** `area` 上算好再传下去 —— 高亮层不得再从 `chunks[0]` 推一遍：
+    // 那是二次切分，会把内区多扣掉「Input 高度 + 状态行」。
+    if let Some(inner) = chat_inner(app, area) {
+        draw_selection(frame, inner, scroll.top_row, app);
+    }
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app, palette);
 
@@ -246,9 +253,31 @@ pub(crate) fn chat_viewport(app: &App, width: u16, height: u16) -> (u16, u16) {
 /// Chat 内区的**屏幕绝对坐标**（含 `x` / `y`）。
 ///
 /// 与 [`chat_viewport`] 同源（同一个 `chat_inner`），故不可能漂移。
-#[cfg(test)]
+///
+/// 消费方是 `events.rs` 的鼠标分支（把屏幕坐标换成本区相对坐标）与单测。
 pub(crate) fn chat_inner_rect(app: &App, width: u16, height: u16) -> Option<Rect> {
     chat_inner(app, Rect::new(0, 0, width, height))
+}
+
+/// 选区反显层。
+///
+/// 无选区时也要走一次：让 `Selection::ensure_grid` 把一屏字形释放掉 —— 否则字形缓存
+/// 会一直挂着最后一次选区期间渲的那份。
+///
+/// 取 `&mut App`：写 `app.selection.grid` 需要可变访问，而 `draw_transcript` 拿的是
+/// `&App`（缓存走 `RefCell`，这里是普通字段）。
+fn draw_selection(frame: &mut Frame, inner: Rect, top_row: usize, app: &mut App) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let layout = app.layout.borrow();
+    app.selection.ensure_grid(&layout, inner, top_row);
+    if !app.selection.is_active() {
+        return;
+    }
+    let rects = app.selection.rects(top_row, inner);
+    drop(layout);
+    frame.render_widget(Highlight { rects }, inner);
 }
 
 /// 允许的最大 `scroll_offset`（**视觉行**，0 = 贴底）。

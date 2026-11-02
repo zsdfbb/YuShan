@@ -56,12 +56,26 @@ use crate::prompter::{PromptError, PromptOutcome, Prompter, resolve_prompt, reso
 use crate::theme::ThemeKind;
 use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
-use crate::{draw, events};
+use crate::{draw, events, selection};
 
 /// 等输入的时长上限（空闲重绘节拍）。
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// 拖选贴边时的轮询周期 —— 自动滚动要跟手，故比空闲节拍短。
+const DRAG_TICK: Duration = Duration::from_millis(16);
 /// Working 动画节拍。
 const TICK_INTERVAL: Duration = Duration::from_millis(300);
+
+/// 本轮的等输入时长：拖到内区边缘时用 [`DRAG_TICK`]（16 ms），否则用 [`POLL_INTERVAL`]。
+///
+/// 贴边自动滚动靠「没事件时也能醒过来」推动，故周期必须短于空闲节拍；否则按住不动
+/// 时视窗每 50 ms 才爬一次，跟不上手。
+fn poll_interval(dragging_with_edge: bool) -> Duration {
+    if dragging_with_edge {
+        DRAG_TICK
+    } else {
+        POLL_INTERVAL
+    }
+}
 
 /// TUI 初始化 / 渲染过程中的 IO 失败。
 #[derive(Debug)]
@@ -127,20 +141,26 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 /// 终端初始化的**鼠标模式部分**（其余命令不在这里）。
 ///
 /// 抽成独立常量是为了让它可测：`setup_terminal` 本身会改真实 termios，单测跑不了。
-const MOUSE_MODE_ON: &str = "\x1b[?1000h\x1b[?1006h";
-
-/// 只上报**滚轮**的鼠标模式：`?1000h`（按键按下 / 松开 + 滚轮）+ `?1006h`（SGR 编码）。
 ///
-/// 不用 crossterm 的 `EnableMouseCapture`：它连带开 `?1002h`（按下拖动上报）与
-/// `?1003h`（任意移动上报）—— 二者对滚轮毫无用处，却让指针一动就持续产生 `Moved`
-/// 事件。只开 `?1000h` ⇒ 终端只在**按键与滚轮**时上报，滚轮得以在应用内成为独立
-/// 语义，而没有移动事件风暴（ADR-0064）。
+/// 三条缺一不可：
+///
+/// - `?1000h` —— 按键按下 / 松开 + 滚轮。**拖选的起点**（`Down`）只能由它来；
+/// - `?1002h` —— 按住并拖动时的移动上报。**没有它 `Drag` 根本不会产生**，
+///   拖选会在松手前停在按下点（应用内选区失效）；
+/// - `?1006h` —— SGR 编码，给出列号与按键号。缺它只能拿到 `?1000h` 的 CGPM
+///   坐标（上限 223 列），且分不清左/右键。
+///
+/// 不开 `?1003h`（任意移动上报）：它对拖选无用，却让指针一动就持续产生 `Moved`
+/// 事件。
+const MOUSE_MODE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+
+/// 应用内接管鼠标：拖选 + 右键复制 + 滚轮。
 ///
 /// 关闭走 crossterm 的 [`DisableMouseCapture`]：它按相反顺序关掉 1006 / 1003 / 1002 /
-/// 1000 / 1015，对「只开过两个」的情形是无害的超集。
-struct EnableWheelReporting;
+/// 1000 / 1015，对「只开过三条」的情形是无害的超集。
+struct EnableMouseReporting;
 
-impl crossterm::Command for EnableWheelReporting {
+impl crossterm::Command for EnableMouseReporting {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
         f.write_str(MOUSE_MODE_ON)
     }
@@ -156,7 +176,7 @@ impl crossterm::Command for EnableWheelReporting {
     }
 }
 
-/// 终端初始化的字节序列：进 alt-screen / 关换行 / 开括号粘贴 / **只开滚轮上报**。
+/// 终端初始化的字节序列：进 alt-screen / 关换行 / 开括号粘贴 / **接管鼠标**。
 ///
 /// 抽成自由函数与 [`restore_sequence`] 对称：`setup_terminal` 会改真实 termios，
 /// 单测跑不了；序列本身却是可断言的。
@@ -167,7 +187,7 @@ fn setup_sequence() -> String {
         EnterAlternateScreen,
         DisableLineWrap,
         EnableBracketedPaste,
-        EnableWheelReporting
+        EnableMouseReporting
     );
     String::from_utf8_lossy(&init).into_owned()
 }
@@ -175,13 +195,11 @@ fn setup_sequence() -> String {
 fn setup_terminal() -> Result<Term, TuiError> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
-    // **只开滚轮上报**（见 [`setup_sequence`]）：滚轮由应用解释成「滚聊天」，
-    // 否则终端把它译成 `↑` / `↓` 字节，滑动触控板翻出来的是**输入历史**而不是对话
-    // （ADR-0064）。
-    //
-    // 代价：鼠标追踪期间终端的裸拖选与右键菜单不生效（事件被送到应用后忽略）——
-    // 需要复制时用终端自己的「强制原生选择」逃生门（多数终端是 `⇧`+拖选）。
-    // 应用**不建自己的选区**：选区与剪贴板由各终端管，行为一致。
+    // **接管鼠标**（见 [`setup_sequence`]）：滚轮由应用解释成「滚聊天」，
+    // 拖选由应用自己做选区、右键复制。交给终端的话两个后果都不理想：滚轮要么滚
+    // 终端的 scrollback（alt-screen 里没有对话内容 ⇒ 滚了没反应），要么被译成
+    // `↑` / `↓` 字节落到**输入历史**上；而多数终端在鼠标追踪开启后并不提供可靠的
+    // 原生拖选逃生门（不同终端的强制选择修饰键各异，甚至有终端一个都没有）。
     if let Err(e) = write!(out, "{}", setup_sequence()) {
         // 半途失败别把终端留在 raw mode
         let _ = disable_raw_mode();
@@ -329,8 +347,10 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             );
         }
 
-        // 2) 等输入，最多 poll 周期
-        if crossterm::event::poll(POLL_INTERVAL)? {
+        // 2) 等输入，最多 poll 周期。拖选贴边时缩短周期 —— 自动滚动靠它驱动。
+        if crossterm::event::poll(poll_interval(
+            app.selection.is_dragging() && app.selection.edge() != 0,
+        ))? {
             let event = crossterm::event::read()?;
             // 滚轮：终端把触控板一次滑动合批成多个事件，**批内累加**才跟手
             // （ADR-0050 决策 2）。其余事件直接交给 `handle_round`。
@@ -398,7 +418,10 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             last_tick = Instant::now();
         }
 
-        // 滚动位置按当前尺寸重新夹紧（窗口缩放后 wrap 行数会变）。
+        // 滚动位置按当前尺寸重新夹紧（窗口缩放后 wrap 行数会变）——
+        // 必须在 `compute_max_scroll` **之前**跑自动滚动：它会重算 `top_row`，
+        // 而 `drag_tick` 的 `cursor_row` 依赖新的 `top_row`。
+        selection::drag_tick(app, size.width, size.height, Instant::now());
         app.compute_max_scroll(size.width, size.height);
 
         if app.should_quit {
@@ -1804,13 +1827,17 @@ mod tests {
     /// 变异：把 `setup_sequence` 里的 `EnableWheelReporting` 换成 crossterm 的
     /// `EnableMouseCapture` ⇒ 红；整段删掉鼠标模式 ⇒ 红（滚轮会落回输入历史）。
     #[test]
-    fn setup_sequence_enables_wheel_only() {
+    fn setup_sequence_enables_drag_and_wheel() {
         let seq = setup_sequence();
         assert!(seq.contains("\x1b[?1000h"), "须开按键/滚轮上报：{seq:?}");
-        assert!(seq.contains("\x1b[?1006h"), "须用 SGR 编码：{seq:?}");
+        assert!(seq.contains("\x1b[?1006h"), "须用 SGR 编码（列号 + 按键号）：{seq:?}");
         assert!(
-            !seq.contains("\x1b[?1002h") && !seq.contains("\x1b[?1003h"),
-            "不开拖拽 / 移动上报：{seq:?}"
+            seq.contains("\x1b[?1002h"),
+            "须开按下拖动上报 —— 否则 `Drag` 不产生，拖选停在按下点：{seq:?}"
+        );
+        assert!(
+            !seq.contains("\x1b[?1003h"),
+            "不开任意移动上报 —— 指针一动就产生 `Moved` 风暴：{seq:?}"
         );
         assert!(seq.contains("\x1b[?1049h"), "须进 alt-screen：{seq:?}");
         assert!(seq.contains("\x1b[?2004h"), "须开括号粘贴：{seq:?}");
@@ -1819,7 +1846,9 @@ mod tests {
     /// `EnableWheelReporting` 命令自身只写两个序列（与 [`setup_sequence`] 同源）。
     #[test]
     fn wheel_reporting_command_is_minimal() {
-        assert_eq!(MOUSE_MODE_ON, "\x1b[?1000h\x1b[?1006h");
+        // 三条缺一不可：`?1000h` 给按下/滚轮，`?1002h` 给拖动（写拖选的命根子），
+        // `?1006h` 给 SGR 列号与按键号。`?1003h` 有意不开（任意移动上报）。
+        assert_eq!(MOUSE_MODE_ON, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
     }
     // -----------------------------------------------------------------------
     // C11：主题浮层的预览 / 还原 / 确认三态

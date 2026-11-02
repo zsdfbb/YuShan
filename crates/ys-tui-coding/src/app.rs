@@ -130,6 +130,16 @@ pub struct App {
     ///
     /// `RefCell`：`layout` 走 `&App`（帧路径与事件路径共用），内部需要可变访问。
     pub(crate) layout: std::cell::RefCell<crate::layout::TranscriptLayout>,
+    /// 当前拖选状态。
+    ///
+    /// **帧路径不得清它** —— 拖动期间每帧都会走 [`App::sync_scroll_state`]，在那里清会让
+    /// 拖动自我取消。清理点只有三个：用户主动跳转（[`App::jump_to_end`] /
+    /// [`App::jump_to_start`]）、回放替换 transcript（[`App::reset_for_replay`]）、
+    /// 以及由 `events.rs` 自己负责的 resize 与松手后收尾。
+    ///
+    /// 类型是 `pub(crate)`（`draw.rs` 的高亮层与 `events.rs` 的鼠标分支都要直接访问），
+    /// 故字段同用 `pub(crate)` —— 与 [`Self::layout`] / [`Self::md_cache`] 一贯。
+    pub(crate) selection: crate::selection::Selection,
     /// `ToolCallId` → transcript 下标 —— 工具结果据此回填到对应的 Tool 行。
     pub(crate) tool_index: HashMap<ToolCallId, usize>,
     /// 本地回显抑制计数：提交时已本地 push 的那条 `UserMessage`，
@@ -183,6 +193,7 @@ impl App {
             current_round: None,
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             layout: std::cell::RefCell::new(crate::layout::TranscriptLayout::default()),
+            selection: crate::selection::Selection::default(),
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
             pending_echo_texts: VecDeque::new(),
@@ -290,6 +301,8 @@ impl App {
         self.tool_index.clear();
         self.suppress_user_echo = 0;
         self.pending_echo_texts.clear();
+        // 回放整体替换 transcript ⇒ 全局视觉行号空间作废，旧选区的行号已无意义。
+        self.selection.clear();
         self.follow = true;
         self.scroll_offset = 0;
     }
@@ -633,6 +646,8 @@ impl App {
 
     /// 跳到**最新内容**（末尾）—— 恢复贴底跟随，并清掉「有新内容」提示。
     pub fn jump_to_end(&mut self) {
+        // 跳转会改 `scroll_offset` ⇒ 旧选区的全局行号已对不上屏幕内容。
+        self.selection.clear();
         self.scroll_offset = 0;
         self.follow = true;
         self.new_content_below = false;
@@ -640,6 +655,7 @@ impl App {
 
     /// 跳到**最早内容**（顶部）—— 脱离跟随。
     pub fn jump_to_start(&mut self, max_scroll: usize) {
+        self.selection.clear();
         self.scroll_offset = max_scroll;
         self.follow = false;
     }

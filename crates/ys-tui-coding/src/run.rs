@@ -34,8 +34,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -123,23 +124,65 @@ pub fn run(
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+/// 终端初始化的**鼠标模式部分**（其余命令不在这里）。
+///
+/// 抽成独立常量是为了让它可测：`setup_terminal` 本身会改真实 termios，单测跑不了。
+const MOUSE_MODE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+
+/// 只上报**滚轮**的鼠标模式：`?1000h`（按键按下 / 松开 + 滚轮）+ `?1006h`（SGR 编码）。
+///
+/// 不用 crossterm 的 `EnableMouseCapture`：它连带开 `?1002h`（按下拖动上报）与
+/// `?1003h`（任意移动上报）—— 二者对滚轮毫无用处，却让指针一动就持续产生 `Moved`
+/// 事件。只开 `?1000h` ⇒ 终端只在**按键与滚轮**时上报，滚轮得以在应用内成为独立
+/// 语义，而没有移动事件风暴（ADR-0064）。
+///
+/// 关闭走 crossterm 的 [`DisableMouseCapture`]：它按相反顺序关掉 1006 / 1003 / 1002 /
+/// 1000 / 1015，对「只开过两个」的情形是无害的超集。
+struct EnableWheelReporting;
+
+impl crossterm::Command for EnableWheelReporting {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(MOUSE_MODE_ON)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+/// 终端初始化的字节序列：进 alt-screen / 关换行 / 开括号粘贴 / **只开滚轮上报**。
+///
+/// 抽成自由函数与 [`restore_sequence`] 对称：`setup_terminal` 会改真实 termios，
+/// 单测跑不了；序列本身却是可断言的。
+fn setup_sequence() -> String {
+    let mut init: Vec<u8> = Vec::new();
+    let _ = crossterm::queue!(
+        init,
+        EnterAlternateScreen,
+        DisableLineWrap,
+        EnableBracketedPaste,
+        EnableWheelReporting
+    );
+    String::from_utf8_lossy(&init).into_owned()
+}
+
 fn setup_terminal() -> Result<Term, TuiError> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
-    // **不开鼠标捕获**：鼠标完全交还终端。
+    // **只开滚轮上报**（见 [`setup_sequence`]）：滚轮由应用解释成「滚聊天」，
+    // 否则终端把它译成 `↑` / `↓` 字节，滑动触控板翻出来的是**输入历史**而不是对话
+    // （ADR-0064）。
     //
-    // 拖选、右键复制、滚轮都归终端 —— 于是它们在任何终端上都一致（VS Code 的
-    // xterm.js、VTE、iTerm2、tmux、SSH 容器都自己处理，应用不需要适配）。
-    //
-    // 代价：**滚轮不再滚聊天**（它会滚终端 scrollback 或发 `↑↓`）。聊天滚动走键盘：
-    // `PageUp` / `PageDown`（一页）、`Ctrl+↑` / `Ctrl+↓`（逐行）、`Home` / `End`（两端）。
-    // 这也意味着本应用不实现应用内选区：选区与剪贴板都由终端管。
-    if let Err(e) = execute!(
-        out,
-        EnterAlternateScreen,
-        DisableLineWrap,
-        EnableBracketedPaste
-    ) {
+    // 代价：鼠标追踪期间终端的裸拖选与右键菜单不生效（事件被送到应用后忽略）——
+    // 需要复制时用终端自己的「强制原生选择」逃生门（多数终端是 `⇧`+拖选）。
+    // 应用**不建自己的选区**：选区与剪贴板由各终端管，行为一致。
+    if let Err(e) = write!(out, "{}", setup_sequence()) {
         // 半途失败别把终端留在 raw mode
         let _ = disable_raw_mode();
         return Err(e.into());
@@ -200,6 +243,50 @@ fn handle_round(
     }
 }
 
+/// 一批连续到达的滚轮事件折叠成的净量上限 —— 内存护栏，不是业务参数。
+///
+/// 真实突发是 8–30 个（ADR-0050 决策 2），取 4096 留出两个数量级的余量；它唯一的
+/// 职责是让排空循环在任何事件源下都**有界**（一个永不枯竭的事件源否则能把 `Vec`
+/// 吃到 OOM）。到上限即停止读取，剩余事件留在终端队列里由下一轮消费。
+const MAX_WHEEL_BATCH: usize = 4096;
+
+/// 排空紧跟 `first` 的一串滚轮事件，返回**批次**与被推迟的首个非滚轮事件。
+///
+/// 触控板一次滑动会爆发 8–30 个事件（ADR-0050 决策 2：「按行累加才跟手」）。
+/// 保留**全部**事件而不只留最后一个 —— 归约成净量在 [`events::fold_wheel`]，
+/// 步长折算在 [`events::WheelDelta::rows`]：两处代码只有一份。
+///
+/// 碰到的首个非滚轮事件**不丢**：原样返回，由调用方本轮消费。
+///
+/// 批大小由 [`MAX_WHEEL_BATCH`] 夹住 ⇒ 排空循环在任何事件源下都有界。
+fn coalesce_wheel(
+    first: MouseEvent,
+    next: impl FnMut() -> Option<Event>,
+) -> (Vec<MouseEvent>, Option<Event>) {
+    let mut batch = vec![first];
+    let mut deferred = None;
+
+    let mut next = next;
+    while batch.len() < MAX_WHEEL_BATCH {
+        match next() {
+            Some(Event::Mouse(m))
+                if matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) =>
+            {
+                batch.push(m);
+            }
+            Some(other) => {
+                deferred = Some(other);
+                break;
+            }
+            None => break,
+        }
+    }
+    (batch, deferred)
+}
+
 fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -245,16 +332,52 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
         // 2) 等输入，最多 poll 周期
         if crossterm::event::poll(POLL_INTERVAL)? {
             let event = crossterm::event::read()?;
-            handle_round(
-                app,
-                event,
-                requests,
-                boundaries,
-                size.width,
-                size.height,
-                &mut write_clipboard,
-                &mut read_system_clipboard,
-            );
+            // 滚轮：终端把触控板一次滑动合批成多个事件，**批内累加**才跟手
+            // （ADR-0050 决策 2）。其余事件直接交给 `handle_round`。
+            match event {
+                Event::Mouse(m)
+                    if matches!(
+                        m.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let (batch, deferred) = coalesce_wheel(m, || {
+                        if !crossterm::event::poll(Duration::ZERO).ok()? {
+                            return None;
+                        }
+                        crossterm::event::read().ok()
+                    });
+                    // 批内只施加**一次**净位移 ⇒ 一次 `layout.sync`；与逐事件累加等价。
+                    events::scroll_wheel_batch(
+                        app,
+                        size.width,
+                        size.height,
+                        events::fold_wheel(&batch),
+                    );
+                    if let Some(other) = deferred {
+                        handle_round(
+                            app,
+                            other,
+                            requests,
+                            boundaries,
+                            size.width,
+                            size.height,
+                            &mut write_clipboard,
+                            &mut read_system_clipboard,
+                        );
+                    }
+                }
+                other => handle_round(
+                    app,
+                    other,
+                    requests,
+                    boundaries,
+                    size.width,
+                    size.height,
+                    &mut write_clipboard,
+                    &mut read_system_clipboard,
+                ),
+            }
             // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
             // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
             if let Some(kind) = app.pending_prompt.take() {
@@ -949,6 +1072,7 @@ fn restore_sequence() -> String {
         EnableLineWrap,
         LeaveAlternateScreen,
         DisableBracketedPaste,
+        DisableMouseCapture,
         PopKeyboardEnhancementFlags
     );
     String::from_utf8_lossy(&restore).into_owned()
@@ -1662,10 +1786,11 @@ mod tests {
         assert!(seq.contains("\x1b[?1049l"), "须退出 alt-screen：{seq:?}");
         assert!(seq.contains("\x1b[?7h"), "须开启换行：{seq:?}");
         assert!(seq.contains("\x1b[?2004l"), "须关闭括号粘贴：{seq:?}");
-        // 本应用**不开启**鼠标捕获（鼠标归终端），故恢复序列里也不该出现鼠标模式序列。
+        // 本应用**只接管滚轮**，但捕获确实是开过的（`?1000h`）⇒ 退出时必须关掉，
+        // 否则滚轮会继续被应用吞掉、终端再也收不到。
         assert!(
-            !seq.contains("\x1b[?1000l") && !seq.contains("\x1b[?1006l"),
-            "不该关一个从未开启的鼠标捕获：{seq:?}"
+            seq.contains("\x1b[?1000l") && seq.contains("\x1b[?1006l"),
+            "须关闭鼠标捕获（否则泄漏进 shell）：{seq:?}"
         );
         assert!(
             seq.contains("\x1b[<1u"),
@@ -1673,6 +1798,29 @@ mod tests {
         );
     }
 
+    /// 初始化序列**只开滚轮上报**（`?1000h` + `?1006h`），不开拖拽 / 移动上报
+    /// （`?1002h` / `?1003h`）—— 后者对滚轮无用，且会让指针一动就持续产生 `Moved`。
+    ///
+    /// 变异：把 `setup_sequence` 里的 `EnableWheelReporting` 换成 crossterm 的
+    /// `EnableMouseCapture` ⇒ 红；整段删掉鼠标模式 ⇒ 红（滚轮会落回输入历史）。
+    #[test]
+    fn setup_sequence_enables_wheel_only() {
+        let seq = setup_sequence();
+        assert!(seq.contains("\x1b[?1000h"), "须开按键/滚轮上报：{seq:?}");
+        assert!(seq.contains("\x1b[?1006h"), "须用 SGR 编码：{seq:?}");
+        assert!(
+            !seq.contains("\x1b[?1002h") && !seq.contains("\x1b[?1003h"),
+            "不开拖拽 / 移动上报：{seq:?}"
+        );
+        assert!(seq.contains("\x1b[?1049h"), "须进 alt-screen：{seq:?}");
+        assert!(seq.contains("\x1b[?2004h"), "须开括号粘贴：{seq:?}");
+    }
+
+    /// `EnableWheelReporting` 命令自身只写两个序列（与 [`setup_sequence`] 同源）。
+    #[test]
+    fn wheel_reporting_command_is_minimal() {
+        assert_eq!(MOUSE_MODE_ON, "\x1b[?1000h\x1b[?1006h");
+    }
     // -----------------------------------------------------------------------
     // C11：主题浮层的预览 / 还原 / 确认三态
     // -----------------------------------------------------------------------

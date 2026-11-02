@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""滚轮接管（ADR-0050）的变异测试：注入 bug，期望对应用例变红。
+"""滚轮接管（ADR-0050 / ADR-0064）的变异测试：注入 bug，期望对应用例变红。
 
-用法：python3 tmp/mutation-wheel.py
-前提：events.rs / run.rs 与 HEAD 一致（脚本用 `git checkout --` 还原）。
+用法：python3 scripts/wheel-mutation.py
+```bash
+python3 scripts/wheel-mutation.py
+```
+
+不需要干净工作区：脚本在启动时**快照**两份源码，每处注入后从快照还原。
 """
 
 import pathlib
@@ -45,14 +49,17 @@ MUTATIONS = [
         "M2 滚轮步长改成一页",
         EV,
         "        MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),",
-        "        MouseEventKind::ScrollUp => {\n            scroll_clearing_selection(app, width, height, page_rows(app, width, height))\n        }",
+        "        MouseEventKind::ScrollUp => {\n"
+        "            scroll(app, width, height, page_rows(app, width, height))\n"
+        "        }",
         "test_wheel_scrolls_chat_and_never_input_history",
     ),
     (
         "M3 其余鼠标事件也滚动（抢终端拖选）",
         EV,
-        "        // 水平滚动没有语义（对话是单列竖排）；悬停不绑（不做 hover）。\n        _ => {}",
-        "        _ => scroll_clearing_selection(app, width, height, 1),",
+        "        _ => {}\n    }\n}\n\n/// 一个滚轮事件滚动的**视觉行数**。",
+        "        _ => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),\n"
+        "    }\n}\n\n/// 一个滚轮事件滚动的**视觉行数**。",
         "test_other_mouse_events_are_ignored",
     ),
     (
@@ -81,22 +88,50 @@ MUTATIONS = [
         EV,
         "        self.net().saturating_mul(WHEEL_ROWS)",
         "        self.net()",
-        "test_wheel_batch_accumulates_one_swipe_many_rows",
+        "test_fold_wheel_accumulates_and_cancels",
+    ),
+    (
+        "M8 批次只取最后一个（一次滑动只滚一行）",
+        EV,
+        "            MouseEventKind::ScrollUp => delta.push(true),",
+        "            MouseEventKind::ScrollUp => delta = WheelDelta::one(true),",
+        "test_fold_wheel_accumulates_and_cancels",
+    ),
+    (
+        "M9 净量为零的一批改成滚一格（方向抵消时视窗抖动）",
+        EV,
+        "    let net = delta.rows();\n    if net == 0 {\n        return;\n    }",
+        "    let mut net = delta.rows();\n    if net == 0 {\n        net = WHEEL_ROWS;\n    }",
+        "test_null_wheel_batch_leaves_offset_untouched",
+    ),
+    (
+        "M10 初始化用 crossterm 的全量鼠标捕获（连带开拖拽/移动上报）",
+        RU,
+        "        EnableBracketedPaste,\n        EnableWheelReporting\n    );",
+        "        EnableBracketedPaste,\n        crossterm::event::EnableMouseCapture\n    );",
+        "setup_sequence_enables_wheel_only",
+    ),
+    (
+        "M11 初始化根本不开鼠标模式（滚轮落回输入历史）",
+        RU,
+        "        EnableBracketedPaste,\n        EnableWheelReporting\n    );",
+        "        EnableBracketedPaste\n    );",
+        "setup_sequence_enables_wheel_only",
     ),
 ]
 
 
+SNAPSHOT: dict[pathlib.Path, str] = {}
+
+
 def restore():
-    subprocess.run(["git", "checkout", "--", str(EV), str(RU)], check=True)
+    for path, text in SNAPSHOT.items():
+        path.write_text(text)
 
 
 def main():
-    dirty = subprocess.run(
-        ["git", "diff", "--quiet", "--", str(EV), str(RU)]
-    ).returncode
-    if dirty != 0:
-        print("前置失败：events.rs / run.rs 有未提交改动，拒绝变异", file=sys.stderr)
-        return 1
+    SNAPSHOT[EV] = EV.read_text()
+    SNAPSHOT[RU] = RU.read_text()
 
     print("基线：跑一次全绿", flush=True)
     code, red, compiled, _ = run_tests()

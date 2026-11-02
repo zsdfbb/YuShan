@@ -225,8 +225,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
   ⚠️ 主因归属**尚未确认**：本机读不到 cgroup / `dmesg`，需用户侧提供「Termux 是否打出 `signal 9`」
   与进程数峰值（报告 §5）。**确认前不要把 R1 当已定方案落地**。
 
-- **TUI 鼠标**（[ADR-0050](adr/0050-tui-mouse-wheel-scroll.md) 滚轮 +
-  [ADR-0051](adr/0051-tui-text-selection.md) 拖选）：
+- **TUI 鼠标**（[ADR-0050](adr/0050-tui-mouse-wheel-scroll.md) 滚轮；拖选 / 右键归终端）：
   - ⬜ **模态浮层里的滚轮**：浮层自己读事件（`crates/ys-tui-coding/src/run.rs` 的
     `Prompter` 实现），`select_modal` 的 `match` 末尾 `_ => {}` 掉鼠标（`run.rs:613`）
     ⇒ 会话列表 / 模型列表超过一屏时**无法滚动**，

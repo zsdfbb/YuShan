@@ -474,7 +474,7 @@ impl KeyGroup {
 ///
 /// **不列 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（见 `events.rs`
 /// 模块头）。**不列 `⌥+↓`**：Terminal.app 发 `ESC[B`，与普通 `↓` 同形。
-static KEYBINDINGS: [KeyBinding; 21] = [
+static KEYBINDINGS: [KeyBinding; 22] = [
     KeyBinding {
         keys: "← / →",
         action: "移动输入光标（Ctrl 或 ⌥ + ←/→ 按词移动；⌥b / ⌥f 同义）",
@@ -584,10 +584,16 @@ static KEYBINDINGS: [KeyBinding; 21] = [
         note: None,
     },
     KeyBinding {
-        keys: "左键拖选",
-        action: "终端原生选区（应用不接管鼠标，任何终端行为一致）",
-        group: KeyGroup::Mouse,
+        keys: "滚轮 / 触控板上下",
+        action: "滚动对话（3 视觉行 / 事件，同一次滑动按事件累加）",
+        group: KeyGroup::Scroll,
         note: None,
+    },
+    KeyBinding {
+        keys: "左键拖选",
+        action: "终端原生选区（应用不建自己的选区）",
+        group: KeyGroup::Mouse,
+        note: Some("鼠标捕获期间需用终端的逃生门：多数终端为 ⇧+拖选"),
     },
     KeyBinding {
         keys: "右键",
@@ -669,7 +675,7 @@ pub fn keybind_text() -> String {
 const KEY_HELP_BRIEF: &str = "键位（完整表：/keybind）：
   ↑ ↓                输入框内先按视觉行移光标；到首/末行才取历史 / 滚动对话
   PageUp / PageDown  翻页；Ctrl+↑ / Ctrl+Home 最早，Ctrl+↓ / Ctrl+End 最新
-  滚轮               由终端处理（滚 scrollback）；对话滚动用 PageUp / PageDown
+  滚轮               滚动对话（应用接管滚轮；一次滑动按事件累加）
   Home / End         输入行首 / 行尾（Ctrl+E 也是行尾）
   Ctrl+A             全选输入框（随后 Backspace 清空）
   Ctrl+V             粘贴系统剪贴板（读不到时用终端的 Ctrl+Shift+V）

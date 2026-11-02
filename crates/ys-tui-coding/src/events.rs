@@ -108,26 +108,26 @@
 //! **补全浮层打开时上下归浮层**（设计 §2.4）—— 焦点在浮层上，历史的上下让位；
 //! 浮层因其他键关闭时那一下会**交还给正常处理**，历史的上下随即生效。
 //!
-//! # 鼠标归终端
+//! # 鼠标：只接管滚轮
 //!
-//! 本应用**不开鼠标捕获**（`run.rs` 的 `setup_terminal`），鼠标事件根本不进入应用：
+//! 本应用**只读滚轮**，其余鼠标事件一律不绑：
 //!
-//! - **拖选 = 终端原生选区**。终端自己画高亮、自己写剪贴板（`⇧`+拖选在部分终端里
-//!   是「强制原生选择」的逃生门，在本应用里它和裸拖完全等价 —— 两条路都是终端的）。
-//! - **右键 = 终端原生菜单**（复制 / 粘贴由终端提供）。
-//! - **滚轮 = 终端的滚轮**：它滚终端自己的 scrollback，或被终端译成 `↑` / `↓` 字节。
-//!   于是「滚轮翻出输入历史」在某些终端上仍会发生 —— 这是把鼠标交还给终端后的
-//!   既定取舍，**聊天滚动因此走键盘**：`PageUp` / `PageDown`（一页）、`Ctrl+↑` /
-//!   `Ctrl+↓`（逐行）、`Home` / `End`（两端）。键位表见模块顶部。
-//!
-//! 这样选的理由是**通用性**：选区与剪贴板在各终端（xterm.js / VTE / iTerm2 / tmux /
-//! SSH）上的实现差异极大，应用内自建选区必须逐个适配，且永远有终端截获事件
-//! （例如 VTE 在鼠标追踪模式下把 `⇧`+拖选和裸右键留给自己）。交还给终端则各处一致。
-//!
-//! 应用**不处理任何鼠标事件**：`Event::Mouse` 走 `_ => {}`。复制长回复用 `/copy`
-//! （写系统剪贴板），见 `commands::copy_text`。
+//! - **滚轮 = 滚聊天**，每事件 [`WHEEL_ROWS`] 视觉行。终端把滚轮译成 `↑` / `↓` 时它
+//!   会落到输入历史上（翻出的是上一条提交的文本，不是对话）—— 故必须由应用自己
+//!   解释（ADR-0050）。
+//! - **拖选 / 右键 / 悬停一律不处理**：应用**不建自己的选区**，选区与剪贴板由终端
+//!   提供。于是 `run.rs` 只开 `?1000h` + `?1006h`（按键与滚轮上报 + SGR 编码），
+//!   **不开** `?1002h` / `?1003h`（拖拽 / 任意移动上报）—— 后者对滚轮无用，却会让
+//!   指针一动就持续产生 `Moved` 事件。
+//! - **代价**：鼠标追踪期间终端的裸拖选与右键菜单不生效（事件送到应用后被忽略），
+//!   需要复制时用终端的「强制原生选择」逃生门（多数终端是 `⇧`+拖选），或 `/copy`。
+//! - **水平滚动 / `Moved` 忽略**：对话是单列竖排，无水平语义；不绑悬停。
+//! - **模态浮层不吃滚轮**：浮层自己读事件（`run.rs` 的 `Prompter` 实现），它 `_ => {}`
+//!   掉鼠标 —— 浮层内容不滚动（见 `docs/TODO.md` §C）。
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use tokio::sync::mpsc::Sender;
 use ys_core::Message;
 use ys_protocol::{Boundary, Request};
@@ -149,10 +149,124 @@ pub fn handle_event(
         Event::Key(key) => handle_key(key, app, requests, boundaries, width, height),
         // bracketed paste：多行粘贴**不得**被当多次提交
         Event::Paste(text) => app.input.insert_str(&text),
-        // 鼠标归终端（见模块文档「鼠标归终端」）：应用不收鼠标事件。
+        // 滚轮：**滚聊天**，与 `↑↓` 的历史语义无关（见模块文档）。
+        // 拖选 / 右键由终端处理，根本不进这里。
+        Event::Mouse(m) => handle_mouse(m, app, width, height),
         // 宽度变由绘制按当前尺寸重排，无需清状态。
         _ => {}
     }
+}
+
+/// 鼠标事件 —— **只认滚轮**（上下）。
+///
+/// 滚轮滚聊天，每事件 [`WHEEL_ROWS`] 视觉行；属**用户主动**滚动，故与批路径共用
+/// [`scroll_wheel_batch`] —— 位移折算只有一份。其余（左键 / 右键 / 水平滚动 /
+/// 悬停）不绑任何动作：拖选与右键菜单由终端提供，应用不接收它们。
+pub fn handle_mouse(m: MouseEvent, app: &mut App, width: u16, height: u16) {
+    match m.kind {
+        MouseEventKind::ScrollUp => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),
+        MouseEventKind::ScrollDown => {
+            scroll_wheel_batch(app, width, height, WheelDelta::one(false))
+        }
+        _ => {}
+    }
+}
+
+/// 一个滚轮事件滚动的**视觉行数**。
+///
+/// 触控板一次滑动爆发 8–30 个事件（ADR-0050 决策 2），故单事件位移决定整次滑动的
+/// 幅度：取 1 行 ⇒ 整次滑动不到一屏（用户观感「滑不动」）；取一页 ⇒ 一次轻滑就飞过
+/// 整屏。3 行是两头之间的取值 —— 40 行终端上约 1/10 屏 / 事件。
+///
+/// 与 `PageUp` / `PageDown`（视窗高度 − 1）互不影响；`↑` / `↓` 的逐行滚动也不经过
+/// 这个常量（它们是键盘的逐行语义）。
+pub const WHEEL_ROWS: isize = 3;
+
+/// 一批滚轮事件折叠成的**净滚动量**（视觉行）。
+///
+/// 触控板一次滑动会爆发 8–30 个 `ScrollUp` / `ScrollDown`（ADR-0050 决策 2：
+/// 「触控板一次滑动会被终端合批成多个事件；按行累加才跟手」）。故批内**不能**
+/// 只取最后一个（那样一次滑动只滚一行），而是**同向累加**。
+///
+/// `ScrollUp` 为正、`ScrollDown` 为负；两者抵消后即为净位移。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WheelDelta {
+    /// 净向上滚动的行数（正）。
+    pub up: usize,
+    /// 净向下滚动的行数（正）。
+    pub down: usize,
+}
+
+impl WheelDelta {
+    /// 单方向**一格**（一次 `ScrollUp` / `ScrollDown` 折算来的滚动量）。
+    ///
+    /// 单事件路径（[`handle_mouse`]）与批路径因此共用同一份折算逻辑，
+    /// 不会出现「批路径滚 3 行、单事件滚 1 行」这种只在一处生效的偏差。
+    pub fn one(up: bool) -> Self {
+        let mut delta = Self::default();
+        delta.push(up);
+        delta
+    }
+
+    /// 记一次滚轮事件的方向。
+    pub fn push(&mut self, up: bool) {
+        if up {
+            self.up = self.up.saturating_add(1);
+        } else {
+            self.down = self.down.saturating_add(1);
+        }
+    }
+
+    /// 净滚动量（**事件数**）：正 = 向上（远离底部），负 = 向下（回到贴底）。
+    ///
+    /// 同向抵消后取净值 —— 一次滑动里方向来回抖（触控板常见）时，
+    /// 净位移才是用户真正想要的位移。
+    pub fn net(self) -> isize {
+        self.up as isize - self.down as isize
+    }
+
+    /// 折算成**视觉行**的净位移 —— 正 = 向上（远离底部）。
+    ///
+    /// 这里是 [`WHEEL_ROWS`] 的**唯一**乘算点：`net()` 只数事件，换算集中在 `rows()`，
+    /// 单事件路径与批路径都读它。
+    pub fn rows(self) -> isize {
+        self.net().saturating_mul(WHEEL_ROWS)
+    }
+}
+
+/// 把一批滚轮事件折叠成一个**净滚动量**。
+///
+/// 批内的滚轮事件**只累加方向**（不带坐标）—— 滚轮与坐标无关。
+///
+/// **修饰键不参与**：`⇧` / `⌥` 按住时滚轮照常滚。
+///
+/// 变异：把「同向累加」改成「只取最后一个」⇒ 一次滑动只滚一行的用例红。
+pub fn fold_wheel(events: &[MouseEvent]) -> WheelDelta {
+    let mut delta = WheelDelta::default();
+    for m in events {
+        match m.kind {
+            MouseEventKind::ScrollUp => delta.push(true),
+            MouseEventKind::ScrollDown => delta.push(false),
+            _ => {}
+        }
+    }
+    delta
+}
+
+/// 一批滚轮事件的滚动入口：按**净量 × [`WHEEL_ROWS`]** 滚一次。
+///
+/// **为什么批内只滚一次**：`scroll` 内部要 `compute_max_scroll` ⇒ 走
+/// `layout.sync`（O(条目数)）。批内逐事件调 `scroll` 就是 8–30 次全量同步。
+/// 净量一次性施加 ⇒ **一次同步**，且位移与逐事件累加**完全等价**（夹取是单调的）。
+///
+/// 净量为 0（方向来回抵消）⇒ **不动视窗**。单事件路径也走本函数
+/// （[`WheelDelta::one`]）—— 位移折算只有一份。
+pub(crate) fn scroll_wheel_batch(app: &mut App, width: u16, height: u16, delta: WheelDelta) {
+    let net = delta.rows();
+    if net == 0 {
+        return;
+    }
+    scroll(app, width, height, net);
 }
 
 /// 处理一次按键（`KeyEventKind::Release` / `Repeat` 之外的都忽略）。
@@ -619,6 +733,7 @@ mod tests {
     use crate::draw::input_height;
     use crate::transcript::TranscriptLine;
     use crate::view::{CodingView, SkillEntry};
+    use crossterm::event::MouseButton;
     use tokio::sync::mpsc;
     use ys_core::{ContentBlock, EffortLevel, Role};
     use ys_protocol::Outbound;
@@ -1329,6 +1444,126 @@ mod tests {
             40,
         );
         assert!(a.should_quit);
+    }
+
+    /// **滚轮滚的是聊天，不是输入历史** —— 这正是接管滚轮的理由（ADR-0050）。
+    ///
+    /// 关键前提：`history` **非空**（否则 `ScrollUp` 与「`↑` 回落滚动」看起来一样，
+    /// 反而抓不到「滚轮误入历史」这个 bug）。
+    ///
+    /// 变异：
+    /// - 把 `handle_mouse` 的 `ScrollUp` 改成 `app.history.prev(..)` ⇒ 输入框断言红；
+    /// - 把步长改成 `page_rows(..)` ⇒ 精确的 +1 / -1 断言红；
+    /// - 把 `ScrollDown` 也接到历史 ⇒ 贴底断言红。
+    #[test]
+    fn test_wheel_scrolls_chat_and_never_input_history() {
+        let mut a = app_scrollable();
+        a.history.record("旧的一次提交");
+        assert_eq!(a.scroll_offset, 0);
+
+        // 向上滑：一事件 = [`WHEEL_ROWS`] 视觉行，输入框与历史浏览态都不动。
+        handle_mouse(mouse(MouseEventKind::ScrollUp), &mut a, 120, 40);
+        assert_eq!(
+            a.scroll_offset, WHEEL_ROWS as usize,
+            "滚轮步长 = WHEEL_ROWS 视觉行"
+        );
+        assert!(!a.follow, "向上滑即脱离跟随");
+        assert!(a.input.text.is_empty(), "滚轮不得把历史填进输入框");
+        assert!(!a.history.is_browsing(), "滚轮不进入历史浏览态");
+
+        // 再向上：按事件数线性累加，幅度仍远小于一页。
+        handle_mouse(mouse(MouseEventKind::ScrollUp), &mut a, 120, 40);
+        assert_eq!(a.scroll_offset, (WHEEL_ROWS * 2) as usize);
+
+        // 向下：回到贴底即恢复跟随。
+        for _ in 0..2 {
+            handle_mouse(mouse(MouseEventKind::ScrollDown), &mut a, 120, 40);
+        }
+        assert_eq!(a.scroll_offset, 0, "向下滑回到贴底");
+        assert!(a.follow, "贴底即恢复跟随");
+        assert!(a.input.text.is_empty(), "向下滑也不碰输入框");
+    }
+
+    /// 一批滚轮事件**同向累加**、反向抵消 —— 一次触控板滑动不能只滚一行。
+    ///
+    /// 变异：把 `fold_wheel` 改成「只取最后一个」/ 把同向累加改成覆盖 ⇒ 红。
+    #[test]
+    fn test_fold_wheel_accumulates_and_cancels() {
+        let up = mouse(MouseEventKind::ScrollUp);
+        let down = mouse(MouseEventKind::ScrollDown);
+
+        assert_eq!(fold_wheel(&[up, up, up]).net(), 3, "同向全累加");
+        assert_eq!(fold_wheel(&[up, down]).net(), 0, "一上一下抵消");
+        assert_eq!(fold_wheel(&[up, down, up, up]).net(), 2);
+        // 步长折算集中在 `rows()`：一次事件 = `WHEEL_ROWS` 行。
+        assert_eq!(fold_wheel(&[up, up]).rows(), WHEEL_ROWS * 2);
+        assert_eq!(fold_wheel(&[up, down]).rows(), 0, "净量为零 ⇒ 不动视窗");
+    }
+
+    /// **净量为零的一批不动视窗**（方向来回抵消时不该“闪一下”）。
+    #[test]
+    fn test_null_wheel_batch_leaves_offset_untouched() {
+        let mut a = app_scrollable();
+        scroll_wheel_batch(&mut a, 120, 40, WheelDelta::one(true));
+        let before = a.scroll_offset;
+        assert!(before > 0);
+
+        let delta = fold_wheel(&[
+            mouse(MouseEventKind::ScrollUp),
+            mouse(MouseEventKind::ScrollDown),
+        ]);
+        scroll_wheel_batch(&mut a, 120, 40, delta);
+        assert_eq!(a.scroll_offset, before, "净量为零 ⇒ 位移不变");
+    }
+
+    /// 其余鼠标事件**一律不滚动**：拖选与右键由终端提供（应用不建选区）。
+    ///
+    /// 变异：把 `handle_mouse` 的 `_ => {}` 改成滚动 ⇒ 本用例红。
+    #[test]
+    fn test_other_mouse_events_are_ignored() {
+        let mut a = app_scrollable();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+            MouseEventKind::Moved,
+        ] {
+            handle_mouse(mouse(kind), &mut a, 120, 40);
+        }
+        assert_eq!(
+            a.scroll_offset, 0,
+            "非滚轮事件不得滚动（scroll_offset 须为 0）"
+        );
+        assert!(a.follow);
+    }
+
+    /// `handle_event` 把 `Event::Mouse` 路由到滚轮处理（不是丢在 `_ => {}` 里）。
+    #[test]
+    fn test_handle_event_routes_mouse_to_scroll() {
+        let ch = channels();
+        let mut a = app_scrollable();
+        handle_event(
+            Event::Mouse(mouse(MouseEventKind::ScrollUp)),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert_eq!(a.scroll_offset, WHEEL_ROWS as usize);
+    }
+
+    /// 造一个滚轮事件（坐标对滚轮无意义，取任意值）。
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     #[test]

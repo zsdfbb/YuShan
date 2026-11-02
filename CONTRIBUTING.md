@@ -246,12 +246,36 @@ ADR: docs/adr/0057-input-selection-and-system-clipboard.md
 
 ### 提交前自查
 
+**先装一次钩子**（git 不从仓库自动加载钩子，clone 后必须手动跑一次）：
+
 ```console
-$ ./scripts/cargo-build.sh                    # 能编译
-$ ./scripts/par-test.sh                       # 全绿（不是 cargo test --workspace）
+$ ./scripts/install-hooks.sh          # core.hooksPath = scripts/git-hooks
+$ ./scripts/install-hooks.sh --status # 确认已装
+```
+
+装好后 `git push` 会自动跑 `./scripts/verify.sh --tests-only`（约 10–12s）。**只跑测试，
+不跑变异测试** —— 后者每个变异体都要重编，全套数分钟，作为 pre-push 太慢；
+慢的钩子会被 `--no-verify` 绕过，那时连测试都拦不住。
+
+手动自查（钩子只覆盖推送，且测试跑的是**工作区**而非待推送的提交）：
+
+```console
+$ ./scripts/verify.sh                         # 完整门：测试 + 4 个变异脚本
+$ ./scripts/verify.sh --tests-only            # 只跑测试（与钩子相同）
 $ cargo clippy --all-targets && cargo fmt     # 无告警、格式干净
 $ bash scripts/doc-consistency.sh             # 文档对账（改过文档时）
 ```
+
+**完整门 `./scripts/verify.sh` 仍是发版 / 改关键逻辑前必须跑过一次的** —— 钩子只挡住
+「测试失败」，挡不住「测试恰好把 bug 写成了契约」。上一轮拖选就是这么失效的：
+测试全绿、功能全坏，只有变异测试能发现。
+
+跳过钩子：`git push --no-verify`（工作区有无关改动、急发版等场景）。
+
+> 钩子与 [ADR-0014](docs/adr/0014-follow-up-without-hook-system.md) /
+> [ADR-0021](docs/adr/0021-plugin-seam-without-hook-system.md) **无关**：那两条说的是
+> 运行时**Agent 不建通用 hook 系统**（`AgentEvent` vs Hook 的边界），与本处的 git 钩子
+> 是两回事。
 
 ## 改动的文档要求
 

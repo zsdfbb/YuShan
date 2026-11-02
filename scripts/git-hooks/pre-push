@@ -1,0 +1,48 @@
+#!/bin/sh
+# pre-push 门：推送前跑**测试**，不跑变异测试。
+#
+# # 为什么只跑测试
+#
+# 变异测试注入 bug ⇒ 每个变异体都要重编 + 重跑，全套约数分钟。作为 pre-push 太慢，
+# 慢的钩子会被 `--no-verify` 绕过，那时它连测试都拦不住。故本钩子只做
+# `./scripts/verify.sh --tests-only`（约 10–12s），完整门留给 `./scripts/verify.sh`。
+#
+# # 安装
+#
+#   ./scripts/install-hooks.sh
+#
+# git 不从仓库里自动加载钩子（`.git/hooks` 是本地目录），必须显式安装。
+#
+# # 跳过
+#
+#   git push --no-verify
+#
+# # 为什么检查工作区
+#
+# 测试跑的是**工作区**代码，不是待推送的提交。有未暂存 / 未提交的改动时，
+# 「测试通过」不代表「推上去的代码通过了」。此时警告并继续 —— 硬失败会误伤
+# 「先推一版，改动还在后续提交里」的正常节奏。
+set -u
+
+cd "$(git rev-parse --show-toplevel || exit 0)" || exit 0
+
+if [ ! -x ./scripts/verify.sh ]; then
+    printf 'pre-push: 找不到可执行的 ./scripts/verify.sh，跳过\n' >&2
+    exit 0
+fi
+
+if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+    printf 'pre-push: ⚠ 工作区有未提交改动 —— 本次测试覆盖的是工作区，不完全是待推送的提交\n' >&2
+fi
+
+printf 'pre-push: 跑测试（约 10–12s；跳过用 git push --no-verify）\n' >&2
+
+if ./scripts/verify.sh --tests-only; then
+    exit 0
+fi
+
+printf '\npre-push: ✗ 测试未通过，推送已中止\n' >&2
+printf 'pre-push:   - 确认测试真的覆盖了本提交：./scripts/verify.sh --tests-only\n' >&2
+printf 'pre-push:   - 完整门（含变异测试）：./scripts/verify.sh\n' >&2
+printf 'pre-push:   - 确需跳过：git push --no-verify\n' >&2
+exit 1

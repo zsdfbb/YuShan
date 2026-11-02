@@ -183,8 +183,10 @@ docs/        设计、决策记录、现状文档
 ## 开发
 
 ```console
+$ ./scripts/install-hooks.sh   # 装 pre-push 钩子（clone 后跑一次；推送前自动跑测试）
 $ ./scripts/cargo-build.sh     # 构建（别直接用 cargo build，有增量垃圾清理）
 $ ./scripts/par-test.sh        # 跑全部测试，约 7 秒
+$ ./scripts/verify.sh          # 完整门：测试 + 变异测试（发版 / 改关键逻辑前）
 $ cargo clippy --all-targets && cargo fmt
 ```
 

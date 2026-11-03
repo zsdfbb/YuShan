@@ -142,6 +142,20 @@ pub struct App {
     /// 它存在的唯一理由：一个回合可以跑几十轮、每轮数秒，而 `rounds` 此前只在
     /// **回合结束**的摘要里出现 ⇒ 回合进行中界面只能显示一个不动的动画。
     pub current_round: Option<u32>,
+    /// 本轮正文（`TranscriptLine::Assistant`）落在 transcript 的哪一槽。
+    ///
+    /// 正文增量按**轮边界**归并，不按「末尾同类型」归并：provider 可能在正文**中途**插入
+    /// `reasoning_content` 增量（思考态与正文态在同一轮内来回切换），若按末尾类型判断，
+    /// 后半截正文会新起一条 —— 一条消息被画成两段，两段各自从新行开始排版，视觉上就是
+    /// 「一段话被切成两行、后一行不满宽」。
+    ///
+    /// 归并键取轮边界（而不是「最后一条 `Assistant`」）：一条 assistant 消息恰好对应一轮
+    /// 里文本增量的总和，这与回放路径 [`crate::transcript::replay_lines`] 的「一条 assistant
+    /// 消息 → 一条 `Assistant` 行」同口径 —— 实时与 `/resume` 必须画成同一个样子。
+    ///
+    /// 生命周期与轮对齐：`RoundStarted`、`ToolCall`、回合结算、丢弃重放、整体替换 transcript
+    /// 都把它清成 `None`。跨轮复用会让下一轮的正文接进上一轮那一条里。
+    pub(crate) live_text_slot: Option<usize>,
     /// 覆盖状态行的「现在时间」（`HH:MM`）。
     ///
     /// `None` = 渲染时读真实钟点（生产路径）：事件循环空闲也会每 `POLL_INTERVAL`
@@ -220,6 +234,7 @@ impl App {
             turn_started_at: None,
             working_dot: 0,
             current_round: None,
+            live_text_slot: None,
             clock_now: None,
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             layout: std::cell::RefCell::new(crate::layout::TranscriptLayout::default()),
@@ -332,6 +347,7 @@ impl App {
         self.layout.borrow_mut().reset();
         self.last_total_rows = None;
         self.tool_index.clear();
+        self.live_text_slot = None;
         self.suppress_user_echo = 0;
         self.pending_echo_texts.clear();
         // 回放整体替换 transcript ⇒ 全局视觉行号空间作废，旧选区的行号已无意义。
@@ -420,7 +436,11 @@ impl App {
             }
             // 轮开始：回合进行中唯一的「进度刻度」。**不产生任何显示行** —— 只更新
             // 状态行用的轮号（`draw.rs` 的 `status_text` 在回合中显示它）。
-            AgentEvent::RoundStarted { round } => self.current_round = Some(round),
+            AgentEvent::RoundStarted { round } => {
+                // 新一轮 ⇒ 下一条正文属于新的一条消息，不得接进上一轮那一条。
+                self.live_text_slot = None;
+                self.current_round = Some(round);
+            }
             AgentEvent::ModelTextDelta { text } => self.append_stream(text, StreamKind::Assistant),
             AgentEvent::ModelThinkingDelta { text } => {
                 self.append_stream(text, StreamKind::Thinking)
@@ -775,6 +795,7 @@ impl App {
         self.abort_requested = false;
         self.turn_started_at = None;
         self.current_round = None;
+        self.live_text_slot = None;
         self.suppress_user_echo = 0;
         self.tool_index.clear();
         // **不**强制贴底：回合结算行（Summary）已按「尾部追加」记过提示位。
@@ -823,27 +844,38 @@ impl App {
         self.md_cache.borrow_mut().reset_from(keep);
         self.layout.borrow_mut().reset();
         self.transcript.truncate(keep);
+        // 重放会把同一条消息的正文重新流一遍 ⇒ 上一游标指向的行已不存在（或即将被新行取代）。
+        self.live_text_slot = None;
     }
 
-    /// 流式增量：末尾同为该类型则追加，否则新起一条。
+    /// 流式增量：按**轮边界**归并（见 [`Self::live_text_slot`]）。
+    ///
+    /// - `Thinking`：末尾同类型则追加，否则新起一条。思考段天然是本轮的一段，
+    ///   插入在正文条目之间不改变正文的归并。
+    /// - `Assistant`：本轮已有正文槽位就追加到**那一槽**（即使末尾是 `Thinking`），
+    ///   否则新起一条并记住槽位。这样「正文 → 思考 → 正文」仍是一条消息、一条条目。
     fn append_stream(&mut self, text: String, kind: StreamKind) {
-        let same_kind = matches!(
-            (self.transcript.last(), kind),
-            (Some(TranscriptLine::Assistant(_)), StreamKind::Assistant)
-                | (Some(TranscriptLine::Thinking(_)), StreamKind::Thinking)
-        );
-        if same_kind {
-            match self.transcript.last_mut() {
-                Some(TranscriptLine::Assistant(buf)) | Some(TranscriptLine::Thinking(buf)) => {
-                    buf.push_str(&text)
+        match kind {
+            StreamKind::Thinking => {
+                if let Some(TranscriptLine::Thinking(buf)) = self.transcript.last_mut() {
+                    buf.push_str(&text);
+                } else {
+                    self.transcript.push(TranscriptLine::Thinking(text));
                 }
-                _ => unreachable!("same_kind 已断言末尾类型"),
             }
-        } else {
-            self.transcript.push(match kind {
-                StreamKind::Assistant => TranscriptLine::Assistant(text),
-                StreamKind::Thinking => TranscriptLine::Thinking(text),
-            });
+            StreamKind::Assistant => {
+                if let Some(slot) = self.live_text_slot {
+                    if let Some(TranscriptLine::Assistant(buf)) = self.transcript.get_mut(slot) {
+                        buf.push_str(&text);
+                        self.note_appended_below();
+                        return;
+                    }
+                    // 槽位已被弹掉（丢弃重放 / 整体替换）⇒ 退化为新起一条。
+                    self.live_text_slot = None;
+                }
+                self.live_text_slot = Some(self.transcript.len());
+                self.transcript.push(TranscriptLine::Assistant(text));
+            }
         }
         // 流式增量追加在**尾部** ⇒ 脱离底部时视窗原地不动（只置提示位）。
         self.note_appended_below();
@@ -1168,17 +1200,75 @@ mod tests {
         }
     }
 
-    /// assistant 与 thinking 交替时必须**分段**，不能串到一条里。
+    /// assistant 与 thinking 交替时，**思考段**必须单独成条（不得串进正文），
+    /// 而**正文**仍归并成一条 —— 与回放路径「一条 assistant 消息 → 一条 `Assistant` 行」同口径。
+    ///
+    /// 正文若按「末尾同类型」归并，这里会变成 3 条：`Assistant("answer")` +
+    /// `Thinking("hmm")` + `Assistant("more")`，一条消息被画成两段、两段各自从新行起排
+    /// （视觉上就是「一段话被切成两行」）。
     #[test]
     fn test_assistant_and_thinking_do_not_merge() {
         let mut a = app();
         a.apply_event(text_delta("answer"));
         a.apply_event(env(AgentEvent::ModelThinkingDelta { text: "hmm".into() }));
         a.apply_event(text_delta("more"));
-        assert_eq!(a.transcript.len(), 3);
-        assert!(matches!(&a.transcript[0], TranscriptLine::Assistant(s) if s == "answer"));
+        assert_eq!(a.transcript.len(), 2, "正文归并成一条，思考单独成条");
+        assert!(matches!(&a.transcript[0], TranscriptLine::Assistant(s) if s == "answermore"));
         assert!(matches!(&a.transcript[1], TranscriptLine::Thinking(s) if s == "hmm"));
-        assert!(matches!(&a.transcript[2], TranscriptLine::Assistant(s) if s == "more"));
+    }
+
+    /// 正文归并的**边界**：`RoundStarted` 之后到达的正文必须新起一条。
+    ///
+    /// 没有这条边界，下一轮的正文会接进上一轮那一条里 —— 两条消息合成一段，
+    /// 回放（按消息边界各起一条）就与实时不一致了。
+    ///
+    /// 变异：把 `RoundStarted` 里的 `live_text_slot = None` 删掉 ⇒ 只剩 1 条 `Assistant`，
+    /// 第二条断言变红。
+    #[test]
+    fn test_round_boundary_starts_new_assistant_line() {
+        let mut a = app();
+        a.apply_event(text_delta("第一轮"));
+        a.apply_event(env(AgentEvent::RoundStarted { round: 2 }));
+        a.apply_event(text_delta("第二轮"));
+        let texts: Vec<&str> = a
+            .transcript
+            .iter()
+            .filter_map(|l| match l {
+                TranscriptLine::Assistant(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["第一轮", "第二轮"], "跨轮不得归并");
+    }
+
+    /// 丢弃重放后，重放的正文不得接进**已被弹掉**的那条（槽位已不存在）。
+    ///
+    /// 变异：`discard_stream_attempt` 里不清 `live_text_slot` ⇒ 追加落到已被截断的下标，
+    /// `get_mut` 落空后本条已退化为新起一条（这条保险行为由下面第二条断言钉住）；
+    /// 若改成「回退到上一条 `Assistant`」，就会接进上一轮的正文，断言变红。
+    #[test]
+    fn test_discard_then_replay_starts_fresh_assistant_line() {
+        let mut a = app();
+        a.apply_event(text_delta("上一轮正文"));
+        a.apply_event(env(AgentEvent::RunFinished {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            rounds: 1,
+        }));
+        a.apply_event(text_delta("本次尝试"));
+        a.apply_event(env(AgentEvent::ModelStreamDiscarded {
+            reason: "retry".into(),
+        }));
+        a.apply_event(text_delta("重放正文"));
+        let texts: Vec<&str> = a
+            .transcript
+            .iter()
+            .filter_map(|l| match l {
+                TranscriptLine::Assistant(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["上一轮正文", "重放正文"], "重放不得接进上一轮");
     }
 
     /// `ModelStreamDiscarded` —— 循环丢弃整次模型尝试并重发 ⇒ 本轮已渲染的行全作废。

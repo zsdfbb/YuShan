@@ -1743,6 +1743,13 @@ mod tests {
     use ratatui::buffer::Buffer;
     use std::time::Duration;
     use ys_core::ToolCallId;
+    use ys_event::AgentEvent;
+    use ys_protocol::{Envelope, Source};
+
+    /// 测试辅助：把一个 agent 事件包成信封（`draw` 侧不关心来源与序号）。
+    fn ev(event: AgentEvent) -> Envelope {
+        Envelope::new(Source::agent(), 1, event)
+    }
 
     /// 测试用 `App`：**关掉引言**。
     ///
@@ -4601,5 +4608,65 @@ mod tests {
             Some(W as usize - 2),
             "内区宽 = 总宽 − 边框"
         );
+    }
+    /// 同一轮内「正文 → 思考 → 正文」必须画成**一条**正文（症状回归）。
+    ///
+    /// provider 可以在正文中途插入 `reasoning_content` 增量（思考态与正文态在同一轮内
+    /// 来回切换）。若正文按「末尾同类型」归并，后半截会新起一条 `Assistant`：两段各自
+    /// 从新行开始排版，屏上就是「一段话被切成两行，且后一行远不满宽」。
+    ///
+    /// 断言取的是**行宽分布**：除末行外，这段正文折出的每一行都必须填满。
+    ///
+    /// 变异：`append_stream` 的正文分支改回「末尾同类型才追加」⇒ 折出 4 行、第二段
+    /// 从新行起排 ⇒ 红。
+    #[test]
+    fn interleaved_thinking_does_not_split_assistant_text() {
+        // 单段长正文：段内没有任何换行，折出来的非末行必须填满。
+        let head = "长段落被切成两行的原因我已在代码里定位到，直接给结论：TUI 里长段落被切成两行，\
+                    是因为 assistant 正文不做预折行，而交给 ratatui 的 Paragraph 按 Chat 内区宽度";
+        let tail = "软折行；一段内容超过这个宽度时，就会折成两个视觉行。";
+        let (w, h) = (120u16, 30u16);
+        let mut app = app_with(CodingView::for_test());
+        app.apply_event(ev(AgentEvent::ModelTextDelta { text: head.into() }));
+        app.apply_event(ev(AgentEvent::ModelThinkingDelta {
+            text: "先想一下怎么解释。".into(),
+        }));
+        app.apply_event(ev(AgentEvent::ModelTextDelta { text: tail.into() }));
+
+        // 归并的形态：一条正文（思考条目不参与正文归并）。
+        let assistants: Vec<&String> = app
+            .transcript
+            .iter()
+            .filter_map(|l| match l {
+                TranscriptLine::Assistant(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistants.len(),
+            1,
+            "同一条消息的正文不得被思考增量切成两条"
+        );
+        assert_eq!(assistants[0], &format!("{head}{tail}"));
+
+        // 渲染形态：正文折出的非末行必须填满。
+        let inner_w = chat_block()
+            .inner(chat_area(&app, Rect::new(0, 0, w, h)))
+            .width as usize;
+        let rows = rows_of(&mut app, w, h);
+        let body_rows: Vec<&String> = rows
+            .iter()
+            .skip(1) // Chat 标题行
+            .filter(|r| !r.trim().is_empty())
+            .take_while(|r| !r.trim_start().starts_with('✓') && !r.trim_start().starts_with('┌'))
+            .collect();
+        assert!(body_rows.len() >= 2, "长正文必须折行：{body_rows:?}");
+        for row in &body_rows[..body_rows.len() - 1] {
+            let used = row.trim_end().chars().count();
+            assert!(
+                used >= inner_w * 9 / 10,
+                "折出的行必须填满（内宽 {inner_w}，实际 {used}）：{row:?}"
+            );
+        }
     }
 }

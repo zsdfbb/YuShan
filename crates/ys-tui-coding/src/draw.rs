@@ -323,8 +323,8 @@ const INTRO_MIN_COLS: usize = 40;
 /// 空 transcript 时 Chat 区显示的**引言**（纯文本逐行）—— 由 TUI 路径
 /// （[`intro_lines`]）与对照路径（[`transcript_plain_lines`]）共用。
 ///
-/// 只在「本会话还没任何内容」时出现（新会话、`/clear` 之后、`/resume` 回放到空会话）：
-/// 它在**已渲染的历史之外**，不进 transcript、不参与滚动 —— 对话一开就自然消失。
+/// 它是对话区内容的**第 0 块**（[`crate::layout`] 的第一块）：会话一开口就被顶上
+/// 视窗，往上翻能翻回来 —— 它**不会**在用户输入后消失。
 ///
 /// 形态随可用宽度分两种：**够宽 ⇒ logo 与信息左右并排**，窄 ⇒ 退回纯文字（logo
 /// 被裁成一堆斜线比不放更差）。两种形态共用后面那两行信息（模型 / 目录 / 提示），
@@ -390,7 +390,10 @@ const INTRO_TIP: &str = "  /help 看命令与键位 · /resume 恢复历史会�
 /// 取色只走两个语义槽位：**山体 `land`（绿）、水面 `sea`（蓝）**；右侧信息与提示行
 /// 沿用旧规 —— 品牌行 `accent`、其余 `muted`。**不在这里折行**：视窗渲染会按内区
 /// 宽度裁掉超宽部分，而引言一旦折行就把「开场面」变成一堆碎行。
-fn intro_lines(app: &App, width: usize, palette: Palette) -> Vec<Line<'static>> {
+///
+/// `pub(crate)`：布局把它当第 0 块折行（[`crate::layout::TranscriptLayout::sync`]），
+/// 故它的行高也参与滚动数学。
+pub(crate) fn intro_lines(app: &App, width: usize, palette: Palette) -> Vec<Line<'static>> {
     let info = intro_infos(app);
     let info_style = Style::default().fg(palette.muted);
     let brand_style = Style::default().fg(palette.accent);
@@ -437,36 +440,20 @@ fn intro_lines(app: &App, width: usize, palette: Palette) -> Vec<Line<'static>> 
     out
 }
 
-/// 当前视窗要画的行（含「空 transcript ⇒ 引言」）—— [`draw_transcript`] 与
-/// 判断占位行时的依据必须同源。
+/// 当前视窗要画的行 —— [`draw_transcript`] 与判断占位行时的依据必须同源。
+///
+/// 空会话不再在这里特判：引言是布局的第 0 块（[`crate::layout`]），视窗自然就包含它。
 ///
 /// 返回 `(lines, skip_rows)`：`skip_rows` 是窗口首行内部要跳过的视觉行数。
-fn window_lines(
-    app: &App,
-    top_row: usize,
-    inner_w: usize,
-    inner_h: usize,
-    palette: Palette,
-) -> (Vec<Line<'static>>, usize) {
+fn window_lines(app: &App, top_row: usize, inner_h: usize) -> (Vec<Line<'static>>, usize) {
     let window = app.layout.borrow().window(top_row, inner_h);
-    let lines = if window.lines.is_empty() && app.transcript.is_empty() {
-        intro_lines(app, inner_w, palette)
-    } else {
-        window.lines
-    };
-    (lines, window.skip_rows)
+    (window.lines, window.skip_rows)
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, palette: Palette) {
     let block = chat_block();
     let inner = block.inner(area);
-    let (lines, skip_rows) = window_lines(
-        app,
-        top_row,
-        inner.width as usize,
-        inner.height as usize,
-        palette,
-    );
+    let (lines, skip_rows) = window_lines(app, top_row, inner.height as usize);
     if inner.is_empty() {
         frame.render_widget(block, area);
         return;
@@ -1026,11 +1013,10 @@ pub(crate) fn build_text(app: &App, width: usize, now: Instant) -> Text<'static>
 #[cfg(test)]
 fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant) -> Text<'static> {
     let palette = chrome(app);
-    if app.transcript.is_empty() {
-        return Text::from(intro_lines(app, width, palette));
-    }
+    // 引言是布局的**第 0 块**，整段参考渲染也必须从它开头（否则两边行数对不上）。
+    // 经 `App::intro_lines` 取行：测试开关（`show_intro`）对参考路径同样生效。
+    let mut lines: Vec<Line<'static>> = app.intro_lines(width as u16);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
     // 「上一条的类别」与「已有可见行」共同决定本条之前的留白。
     // 二者都由 `gap_rows` 统一算（两条渲染路径共用同一套规则）。
     let mut prev_class: Option<LineClass> = None;
@@ -1499,7 +1485,13 @@ pub(crate) fn exit_summary_lines(app: &App) -> Vec<String> {
 #[cfg(test)]
 pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let mut out: Vec<String> = Vec::new();
+    // 与 TUI 路径同序：引言（第 0 块）在前，之后才是 transcript。
+    // 测试开关（`show_intro`）对参考路径同样生效（见 `App::intro_lines`）。
+    let mut out: Vec<String> = if app.intro_lines(width as u16).is_empty() {
+        Vec::new()
+    } else {
+        intro_text(app, width)
+    };
     // 与 TUI 路径（`build_text_with`）**同一套**留白规则：同一个 `gap_rows`。
     // `prev_class` / `has_visible` 的推进方式也一致（“本条是否产出行”）。
     let mut prev_class: Option<LineClass> = None;
@@ -1527,11 +1519,6 @@ pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
             has_visible = true;
             prev_class = Some(LineClass::of(item));
         }
-    }
-    if out.is_empty() {
-        // 与 TUI 路径**同一份**文本（[`intro_text`]）：退出回放见到的是同一段引言，
-        // 只是不着色。
-        out.extend(intro_text(app, width));
     }
     out
 }
@@ -1757,10 +1744,23 @@ mod tests {
     use std::time::Duration;
     use ys_core::ToolCallId;
 
+    /// 测试用 `App`：**关掉引言**。
+    ///
+    /// 本文件绝大多数用例断言的是 transcript 自身的几何（首条贴顶、留白行数、
+    /// 折行列数、滚动上限）。引言是恒在的第 0 块，会把那些数字整体平移 ⇒ 一律关掉；
+    /// 引言自身的行为由 `intro_*` 系列用例走生产路径验（那里显式打开）。
     fn app_with(view: CodingView) -> App {
         let mut app = App::new(view);
         // 状态行未端有钟点段：固定成已知值，剥段断言就不依赖「跑测试时机器的时区与时刻」。
         app.clock_now = Some("12:00".to_string());
+        app.show_intro = false;
+        app
+    }
+
+    /// 带引言的 `App`（生产形态）—— 只给 `intro_*` 系列用例用。
+    fn app_with_intro(view: CodingView) -> App {
+        let mut app = app_with(view);
+        app.show_intro = true;
         app
     }
 
@@ -2880,7 +2880,7 @@ mod tests {
 
     #[test]
     fn test_empty_transcript_shows_intro() {
-        let mut app = app_with(CodingView::for_test());
+        let mut app = app_with_intro(CodingView::for_test());
         let joined = rows_of(&mut app, 120, 40).join("\n");
         assert!(joined.contains("YuShan"), "空会话显示引言：{joined}");
         assert!(joined.contains("deepseek-chat"), "引言带当前模型：{joined}");
@@ -4423,14 +4423,14 @@ mod tests {
         assert_eq!(chat_viewport(&app, 80, MIN_HEIGHT - 1), (0, 0));
     }
 
-    /// **空 transcript ⇒ 引言**（`window_lines` 与 `draw_transcript` 同源）。
+    /// **空 transcript ⇒ 引言**（引言是布局的第 0 块，`window_lines` 与 `draw_transcript` 同源）。
     ///
-    /// 变异：把 `window_lines` 的空分支改回单行占位 ⇒ 第一条断言变红。
+    /// 变异：把引言从布局里拿掉（回到「空才画」）⇒ 第二条断言里的行数变红。
     #[test]
     fn window_lines_yields_intro_when_empty() {
-        let mut app = app_with(CodingView::for_test());
+        let mut app = app_with_intro(CodingView::for_test());
         app.sync_scroll_state(80, 24, Instant::now());
-        let (lines, _) = window_lines(&app, 0, 80, 10, ThemeKind::default().palette());
+        let (lines, _) = window_lines(&app, 0, 10);
         // 4 行 logo（右侧挂 3 行信息）+ 1 空行 + 1 提示行。
         assert_eq!(lines.len(), 6, "引言的固定行数：{lines:?}");
         let text =
@@ -4443,12 +4443,44 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("YuShan")), "渲染应包含引言");
     }
 
+    /// **引言不随输入消失**：首条消息进来后，引言仍是滚动内容的第 0 块 ——
+    /// 被顶出视窗但能滚回来。
+    ///
+    /// 变异：把引言退回「仅空 transcript 才画」⇒ 第三条断言（滚到顶能看见）变红。
+    #[test]
+    fn intro_stays_in_scroll_content_after_first_message() {
+        let mut app = app_with_intro(CodingView::for_test());
+        for i in 0..40 {
+            app.transcript.push(TranscriptLine::User(format!("问 {i}")));
+        }
+        let state = app.sync_scroll_state(80, 24, Instant::now());
+        assert!(state.max_scroll > 0, "前置：内容超过一屏");
+
+        // 贴底（跟着输出）：引言已被顶出视窗。
+        let bottom = rows_of(&mut app, 80, 24);
+        assert!(
+            !bottom.iter().any(|r| r.contains("YuShan")),
+            "贴底时引言不该还占着视窗：{bottom:?}"
+        );
+
+        // 滚到顶：引言回来了，且是**最顶上那几行**。
+        app.follow = false;
+        app.scroll_offset = state.max_scroll;
+        let top = rows_of(&mut app, 80, 24);
+        let joined = top.join("\n");
+        assert!(joined.contains("YuShan"), "滚到顶必须能看见引言：{joined}");
+        assert!(
+            joined.contains("cwd:"),
+            "引言的信息也随它一起回来：{joined}"
+        );
+    }
+
     /// **山绿、海蓝**：logo 的水波行必须**两段两个颜色** —— 山体 `land`、水面 `sea`。
     ///
     /// 变异：把 `sea` 也写成 `land`（或把整行当一段上色）⇒ 第三条断言变红。
     #[test]
     fn intro_logo_paints_land_green_and_sea_blue() {
-        let app = app_with(CodingView::for_test());
+        let app = app_with_intro(CodingView::for_test());
         let p = ThemeKind::default().palette();
         let lines = intro_lines(&app, 80, p);
         // 最后一行 logo（水波行）：首段是山体、次段是水面。
@@ -4469,7 +4501,7 @@ mod tests {
     /// 变异：去掉宽度判定（恒画 logo）⇒ 第一条断言变红。
     #[test]
     fn intro_falls_back_to_text_on_narrow_terminal() {
-        let app = app_with(CodingView::for_test());
+        let app = app_with_intro(CodingView::for_test());
         let p = ThemeKind::default().palette();
         let narrow = intro_lines(&app, INTRO_MIN_COLS - 1, p);
         let wide = intro_lines(&app, 80, p);

@@ -160,9 +160,19 @@ impl TranscriptLayout {
     ///
     /// `theme` 是**必填**参数（不给默认值）：记忆里存的是已上色的行，漏传就是
     /// 「屏上还是旧配色」这种只在缓存命中时才现形的偶发 bug。
+    ///
+    /// `intro` 是**第 0 块**：开场 logo 与身份信息（见 [`crate::draw::intro_lines`]）。
+    /// 它属于对话内容（有行高、占滚动空间）：会话一开口就被顶出视窗，往上翻能翻回来。
+    /// 故它**恒在**（不随 transcript 是否为空而增删）—— 有它没它若会改变总行数，
+    /// 首条消息到达时 `max_scroll` 会跳动，正在往上翻的视窗就会移位。
+    ///
+    /// 参数多（8 个）：每一个都是**必填的运行期输入**，打包成 struct 只是把「漏传」
+    /// 从编译错推后到运行时（与 `theme` 不得给默认值同一个理由）。
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         transcript: &[TranscriptLine],
+        intro: &[Line<'static>],
         cache: &mut RenderCache,
         thinking_visible: bool,
         theme: Palette,
@@ -187,27 +197,55 @@ impl TranscriptLayout {
             self.structural_rev += 1;
         }
         // 条目数变化（追加 / 回放替换）。
-        self.entries.truncate(transcript.len());
-        while self.entries.len() < transcript.len() {
-            self.entries.push(None);
-        }
+        // 记忆槽位按**块数**对齐：第 0 块是引言，其后是 transcript 的每一条。
+        self.entries.resize_with(transcript.len() + 1, || None);
 
         // 缓存槽位与 transcript 对齐（增长即「上一条结束」）。
         cache.sync_len(transcript.len());
 
         let mut recomputed_entries = 0usize;
+
+        // 第 0 块：引言。`intro` 已是渲染好的行（调用方按当前主题现算）
+        // ⇒ 无缓存、无滞后产物。它没有前置留白；首条消息的「不留白」由
+        // transcript 侧的 `has_visible` 从假起算保证，两处不冲突。
+        //
+        // 空引言（仅测试会这样构造）⇒ 不占行、不消耗版本号，总行数与「无引言」完全一致。
+        if intro.is_empty() {
+            self.entries[INTRO_SLOT] = None;
+        } else {
+            let intro_sig = intro_signature(intro);
+            let intro_fresh = self.entries[INTRO_SLOT]
+                .as_ref()
+                .is_some_and(|memo| memo.sig == intro_sig);
+            if !intro_fresh {
+                let previous = self.entries[INTRO_SLOT].take();
+                let (memo, recomputed) = remember(
+                    previous,
+                    intro_sig,
+                    intro.to_vec(),
+                    false,
+                    width,
+                    &mut self.rev_alloc,
+                );
+                recomputed_entries += usize::from(recomputed);
+                self.entries[INTRO_SLOT] = Some(memo);
+            }
+        }
+
         for (idx, item) in transcript.iter().enumerate() {
+            let slot = INTRO_SLOT + 1 + idx;
             if !crate::draw::is_visible(item, thinking_visible) {
-                self.entries[idx] = None;
+                self.entries[slot] = None;
                 continue;
             }
             let sig = entry_sig(item);
-            if let Some(memo) = &self.entries[idx]
-                && memo.sig == sig
+            if self.entries[slot]
+                .as_ref()
+                .is_some_and(|memo| memo.sig == sig)
             {
                 continue;
             }
-            let rendered = render_entry(
+            let RenderedEntry { lines, stale } = render_entry(
                 transcript,
                 cache,
                 idx,
@@ -216,49 +254,23 @@ impl TranscriptLayout {
                 theme,
                 now,
             );
-            let RenderedEntry { lines, stale } = rendered;
-            let render_sig = lines_hash(&lines);
-            let previous = self.entries[idx].take();
-            // 折行真的换了才算一次「重算」—— 产物没变（流式节流窗口内）不计入。
-            let reused = previous
-                .as_ref()
-                .is_some_and(|previous| previous.render_sig == render_sig);
-            if !reused {
-                recomputed_entries += 1;
-            }
-            // 版本号：产物没变 ⇒ 沿用旧号；否则从分配器取新号（首次渲染同此路径）。
-            let rev = if reused {
-                previous.as_ref().map_or(0, |previous| previous.rev)
-            } else {
-                self.rev_alloc += 1;
-                self.rev_alloc
-            };
-            let row_starts = match previous {
-                // 产物没真变（流式节流窗口内）⇒ 折行结果照旧。
-                Some(previous) if reused => previous.row_starts,
-                _ => line_row_starts(&lines, width),
-            };
-            // **产物滞后时不得推进 `sig`**：`sig` 的语义是「这份产物对应的源状态」。
-            // 若在这里记下源的新哈希、而产物还是上一帧的短版本，下一帧 `sig` 相同
-            // ⇒ 命中并 `continue` ⇒ 那份完整产物永远没人来取，该条永久停在半句话上
-            // （用户实测的「半句话」缺陷）。写回旧源哈希 ⇒ 下一帧必然重算。
-            //
-            // 旧 memo 被 `take()` 走了，故这里用「源长度减一」以外没有可靠旧值 —— 用一个
-            // 不可能等于任何真实 sig 的哨兵即可：它只需保证**下一帧不命中**。
-            let sig = if stale { STALE_SIG } else { sig };
-            self.entries[idx] = Some(EntryMemo {
-                sig,
-                render_sig,
-                rev,
-                lines,
-                row_starts,
-            });
+            let previous = self.entries[slot].take();
+            let (memo, recomputed) =
+                remember(previous, sig, lines, stale, width, &mut self.rev_alloc);
+            recomputed_entries += usize::from(recomputed);
+            self.entries[slot] = Some(memo);
         }
 
-        // 全局行号：逐条目累计（前置留白 + 自身内容）。
-        let mut starts = Vec::with_capacity(transcript.len() + 1);
-        let mut gaps = Vec::with_capacity(transcript.len());
+        // 全局行号：逐块累计（前置留白 + 自身内容）。第 0 块是引言、无留白。
+        let mut starts = Vec::with_capacity(self.entries.len() + 1);
+        let mut gaps = Vec::with_capacity(self.entries.len());
         let mut acc = 0usize;
+        starts.push(acc);
+        gaps.push(0);
+        acc += self.entries[INTRO_SLOT]
+            .as_ref()
+            .and_then(|memo| memo.row_starts.last().copied())
+            .unwrap_or(0);
         let mut prev_class = None;
         let mut has_visible = false;
         for (idx, item) in transcript.iter().enumerate() {
@@ -270,7 +282,7 @@ impl TranscriptLayout {
             let gap = crate::draw::gap_rows(item, prev_class, has_visible, thinking_visible);
             gaps.push(gap);
             acc += gap;
-            acc += self.entries[idx]
+            acc += self.entries[INTRO_SLOT + 1 + idx]
                 .as_ref()
                 .and_then(|memo| memo.row_starts.last().copied())
                 .unwrap_or(0);
@@ -500,6 +512,65 @@ impl TranscriptLayout {
     }
 }
 
+/// 引言在记忆表里的固定槽位（第 0 块）；transcript 的第 `i` 条占 `INTRO_SLOT + 1 + i`。
+const INTRO_SLOT: usize = 0;
+
+/// 引言的内容签名 —— 行文本与行数都变过才算变。
+///
+/// 宽度变化由 `sync` 的「宽度变 ⇒ 全部记忆作废」覆盖，不必进这里。
+fn intro_signature(intro: &[Line<'static>]) -> u64 {
+    lines_hash(intro)
+}
+
+/// 把一份渲染产物写进记忆 —— 「产物没变 ⇒ 沿用旧版本号与折行」的**唯一**判定点
+/// （引言与 transcript 条目共用，避免两处各写一份而慢慢分叉）。
+///
+/// 返回 `(memo, 是否真的重算了折行)`：后者是 `recomputed_entries` 的口径 ——
+/// 产物没变（流式节流窗口内「源变、产物没变」）不算一次重算。
+fn remember(
+    previous: Option<EntryMemo>,
+    sig: u64,
+    lines: Vec<Line<'static>>,
+    stale: bool,
+    width: u16,
+    rev_alloc: &mut u64,
+) -> (EntryMemo, bool) {
+    let render_sig = lines_hash(&lines);
+    let reused = previous
+        .as_ref()
+        .is_some_and(|previous| previous.render_sig == render_sig);
+    // 版本号：产物没变 ⇒ 沿用旧号；否则从分配器取新号（首次渲染同此路径）。
+    let rev = if reused {
+        previous.as_ref().map_or(0, |previous| previous.rev)
+    } else {
+        *rev_alloc += 1;
+        *rev_alloc
+    };
+    let row_starts = match previous {
+        // 产物没真变（流式节流窗口内）⇒ 折行结果照旧。
+        Some(previous) if reused => previous.row_starts,
+        _ => line_row_starts(&lines, width),
+    };
+    // **产物滞后时不得推进 `sig`**：`sig` 的语义是「这份产物对应的源状态」。
+    // 若在这里记下源的新哈希、而产物还是上一帧的短版本，下一帧 `sig` 相同
+    // ⇒ 命中并 `continue` ⇒ 那份完整产物永远没人来取，该条永久停在半句话上
+    // （用户实测的「半句话」缺陷）。写回旧源哈希 ⇒ 下一帧必然重算。
+    //
+    // 旧 memo 被 `take()` 走了，故这里用「源长度减一」以外没有可靠旧值 —— 用一个
+    // 不可能等于任何真实 sig 的哨兵即可：它只需保证**下一帧不命中**。
+    let sig = if stale { STALE_SIG } else { sig };
+    (
+        EntryMemo {
+            sig,
+            render_sig,
+            rev,
+            lines,
+            row_starts,
+        },
+        !reused,
+    )
+}
+
 impl EntryMemo {
     /// 条目内行号 → （行下标，行内偏移）。
     fn locate(&self, rel: usize) -> (usize, usize) {
@@ -665,6 +736,10 @@ mod tests {
 
     fn app_with(lines: Vec<TranscriptLine>) -> App {
         let mut app = App::new(CodingView::for_test());
+        // 本文件的用例测的是 transcript 自己的几何 / 行号空间（首条贴顶、留白行数…），
+        // 引言作为第 0 块会把那些数字整体平移 ⇒ 一律关掉；引言自身的行号占位由
+        // `intro_occupies_the_first_block` 专门钉。
+        app.show_intro = false;
         app.transcript = lines;
         app
     }
@@ -706,12 +781,14 @@ mod tests {
 
         let mut app = app_with(vec![TranscriptLine::Assistant(head.clone())]);
         let t0 = Instant::now();
+        let intro = intro_of(&app, w, ThemeKind::default().palette());
         let mut cache = app.md_cache.borrow_mut();
         let mut layout = TranscriptLayout::default();
 
         // 第 1 帧：节流窗口内 —— 有意的中间态（此时短是正常的）。
         layout.sync(
             &app.transcript,
+            &intro,
             &mut cache,
             app.thinking_visible,
             ThemeKind::default().palette(),
@@ -726,6 +803,7 @@ mod tests {
         // 但源文本已经长完了。这一帧正是把「新 sig + 旧产物」同时写进 memo 的地方。
         layout.sync(
             &app.transcript,
+            &intro,
             &mut cache,
             app.thinking_visible,
             ThemeKind::default().palette(),
@@ -737,6 +815,7 @@ mod tests {
         // 正确行为：这一帧必须重新渲染并把完整文本显示出来。
         layout.sync(
             &app.transcript,
+            &intro,
             &mut cache,
             app.thinking_visible,
             ThemeKind::default().palette(),
@@ -774,11 +853,13 @@ mod tests {
                 let mut app = sample();
                 app.thinking_visible = thinking_visible;
                 let total = {
+                    let intro = intro_of(&app, w, ThemeKind::default().palette());
                     let mut cache = app.md_cache.borrow_mut();
                     let mut layout = TranscriptLayout::default();
                     layout
                         .sync(
                             &app.transcript,
+                            &intro,
                             &mut cache,
                             thinking_visible,
                             ThemeKind::default().palette(),
@@ -814,11 +895,13 @@ mod tests {
         // 同步与取整段文本**分两段**做 —— `build_text` 自己也要借 md 缓存
         // （`RefCell` 不可重入）。
         let total = {
+            let intro = intro_of(&app, w, ThemeKind::default().palette());
             let mut cache = app.md_cache.borrow_mut();
             let mut layout = TranscriptLayout::default();
             layout
                 .sync(
                     &app.transcript,
+                    &intro,
                     &mut cache,
                     true,
                     ThemeKind::default().palette(),
@@ -830,9 +913,11 @@ mod tests {
         assert!(total > 3, "前置：内容不止几行");
         let mut layout = TranscriptLayout::default();
         {
+            let intro = intro_of(&app, w, ThemeKind::default().palette());
             let mut cache = app.md_cache.borrow_mut();
             layout.sync(
                 &app.transcript,
+                &intro,
                 &mut cache,
                 true,
                 ThemeKind::default().palette(),
@@ -872,17 +957,34 @@ mod tests {
         let w = 40u16;
         crate::md::reset_render_calls();
         let theme = ThemeKind::default().palette();
+        let intro = intro_of(&app, w, theme);
         {
             let mut cache = app.md_cache.borrow_mut();
             let mut layout = TranscriptLayout::default();
-            layout.sync(&app.transcript, &mut cache, true, theme, w, Instant::now());
+            layout.sync(
+                &app.transcript,
+                &intro,
+                &mut cache,
+                true,
+                theme,
+                w,
+                Instant::now(),
+            );
         }
         let first = crate::md::render_calls();
         assert!(first > 0, "前置：首轮确实渲染了");
         {
             let mut cache = app.md_cache.borrow_mut();
             let mut layout = TranscriptLayout::default();
-            layout.sync(&app.transcript, &mut cache, true, theme, w, Instant::now());
+            layout.sync(
+                &app.transcript,
+                &intro,
+                &mut cache,
+                true,
+                theme,
+                w,
+                Instant::now(),
+            );
         }
         assert_eq!(
             crate::md::render_calls(),
@@ -920,15 +1022,22 @@ mod tests {
         theme: Palette,
         now: Instant,
     ) -> SyncResult {
+        let intro = intro_of(app, width, theme);
         let mut cache = app.md_cache.borrow_mut();
         layout.sync(
             &app.transcript,
+            &intro,
             &mut cache,
             thinking_visible,
             theme,
             width,
             now,
         )
+    }
+
+    /// 引言（布局的第 0 块）—— 与 `app::sync_scroll_state` 同一份取法（含测试开关）。
+    fn intro_of(app: &App, width: u16, _theme: Palette) -> Vec<Line<'static>> {
+        app.intro_lines(width)
     }
 
     fn synced(app: &App, width: u16, thinking_visible: bool, now: Instant) -> TranscriptLayout {
@@ -1116,8 +1225,16 @@ mod tests {
     }
 
     /// 六个等高的 `User` 块：每个块 = 2 行留白 + 4 行内容（首块无留白）。
+    ///
+    /// 引言是第 0 块（`INTRO_SLOT`），故「第 `i` 条」在记忆表里是 `INTRO_SLOT + 1 + i`
+    /// —— 下面的用例统一用 `slot_of(i)` 换算，不手写下标。
     fn revision_sample() -> App {
         app_with((1..=6).map(|n| user_block(&"p".repeat(n))).collect())
+    }
+
+    /// transcript 第 `i` 条对应的辅助函数（引言固定占第 0 槽）。
+    fn slot_of(i: usize) -> usize {
+        INTRO_SLOT + 1 + i
     }
 
     /// `revision_range` 只折叠**窗口内**条目 —— 窗口上方 / 下方的条目更新不得打红缓存。
@@ -1189,8 +1306,8 @@ mod tests {
             "窗口下方条目更新 ⇒ 窗口版本键不得变（不得多算一行）"
         );
 
-        // 改窗口**内**条目。
-        app.transcript[k] = user_block("qq");
+        // 改窗口**内**条目。块号 `k` 对应 transcript 的 `k - 1`（块 0 是引言）。
+        app.transcript[k - 1] = user_block("qq");
         sync_once(
             &app,
             &mut layout,
@@ -1427,7 +1544,7 @@ mod tests {
         let mut layout = TranscriptLayout::default();
 
         sync_once(&app, &mut layout, width, true, base);
-        let rev0 = layout.entries[0].as_ref().expect("已渲染").rev;
+        let rev0 = layout.entries[slot_of(0)].as_ref().expect("已渲染").rev;
         assert_eq!(layout.rev_alloc, rev0, "首次渲染从分配器取新号");
 
         // 节流窗口内增长：**源**变了、**产物**没变 ⇒ 不换号、不消耗新号。
@@ -1441,7 +1558,7 @@ mod tests {
         );
         assert_eq!(result.recomputed_entries, 0, "产物没变 ⇒ 不算重算");
         assert_eq!(
-            layout.entries[0].as_ref().expect("已渲染").rev,
+            layout.entries[slot_of(0)].as_ref().expect("已渲染").rev,
             rev0,
             "不换号"
         );
@@ -1456,7 +1573,7 @@ mod tests {
             true,
             base + Duration::from_secs(1),
         );
-        let rev1 = layout.entries[0].as_ref().expect("已渲染").rev;
+        let rev1 = layout.entries[slot_of(0)].as_ref().expect("已渲染").rev;
         assert!(rev1 > rev0, "重算 ⇒ 必须换新号（{rev1} > {rev0}）");
         assert_eq!(layout.rev_alloc, rev1, "分配器与最新分配号一致");
     }

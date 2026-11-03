@@ -122,6 +122,14 @@ pub struct App {
     /// 改动**只能**经 [`Self::set_theme`] —— 它一并作废 markdown 缓存与布局记忆；
     /// 直接赋值会让屏上留着旧配色的已渲染产物。
     pub(crate) theme: ThemeKind,
+    /// 测试专用：是否把引言作为布局的第 0 块（生产恒为真）。
+    ///
+    /// 关掉后 `intro_lines` 返回空 ⇒ 不占块、不进总行数。既有的大量用例断言的是
+    /// **transcript 自己的几何**（首条贴顶、留白行数、滚动上限 = 内容行数 − 可见行数），
+    /// 引言恒在会让那些数字整体平移 —— 与其在每个用例里加一个常数，不如让它们继续
+    /// 只看 transcript；引言自身的几何与滚动行为由专门用例钉（见 `draw::tests`）。
+    #[cfg(test)]
+    pub(crate) show_intro: bool,
     pub should_quit: bool,
     pub turn_started_at: Option<Instant>,
     /// Working 动画相位（0..WORKING_DOTS）。
@@ -219,6 +227,9 @@ impl App {
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
             pending_echo_texts: VecDeque::new(),
+            // 生产路径恒为真；用例按需关掉（`show_intro` 的文档说明了理由）。
+            #[cfg(test)]
+            show_intro: true,
         }
     }
 
@@ -619,6 +630,21 @@ impl App {
         crate::draw::max_scroll_offset(self, width, height)
     }
 
+    /// 引言的行（布局的第 0 块：开场 logo + 版本 / 模型 / 目录 / 提示）。
+    ///
+    /// `pub(crate)`：布局同步与整段参考路径（`build_text` / `transcript_plain_lines`）
+    /// 都经它取行，保证三条路径看到**同一份**引言。
+    ///
+    /// 它属于对话内容：有行高、占滚动空间，会话一开口就被顶出视窗，往上翻能翻回来。
+    /// 极窄终端（`< INTRO_MIN_COLS`）退回纯文字，不丢信息。
+    pub(crate) fn intro_lines(&self, width: u16) -> Vec<ratatui::text::Line<'static>> {
+        #[cfg(test)]
+        if !self.show_intro {
+            return Vec::new();
+        }
+        crate::draw::intro_lines(self, width as usize, self.theme.palette())
+    }
+
     /// 同步布局（逐条目的折行记忆）并维护滚动状态。
     ///
     /// 返回视窗顶部的**全局视觉行号**与滚动上限 —— 帧路径据此渲染视窗，
@@ -640,10 +666,13 @@ impl App {
             return crate::layout::ScrollState::default();
         }
         let (total_rows, width_changed) = {
+            // 引言是布局的第 0 块（参与滚动）：按当前色板与内区宽现算。
+            let intro = self.intro_lines(inner_w);
             let mut cache = self.md_cache.borrow_mut();
             let mut layout = self.layout.borrow_mut();
             let result = layout.sync(
                 &self.transcript,
+                &intro,
                 &mut cache,
                 self.thinking_visible,
                 self.theme.palette(),
@@ -2363,11 +2392,12 @@ mod tests {
         out
     }
 
-    /// 该色板 10 个槽位的值集合（“产出色只准来自主题”这条的判据）。
+    /// 该色板 12 个槽位的值集合（“产出色只准来自主题”这条的判据）。
     fn palette_colors(kind: ThemeKind) -> HashSet<Color> {
         let p = kind.palette();
         [
-            p.bg, p.fg, p.accent, p.code, p.muted, p.user, p.ok, p.warn, p.fail, p.info,
+            p.bg, p.fg, p.accent, p.code, p.muted, p.user, p.ok, p.warn, p.fail, p.info, p.land,
+            p.sea,
         ]
         .into_iter()
         .collect()

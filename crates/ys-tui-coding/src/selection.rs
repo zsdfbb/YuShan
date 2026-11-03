@@ -1064,11 +1064,15 @@ mod tests {
 
     /// 用真实的 `TranscriptLayout` 行号空间造样本（**不**直接摆字串）——
     /// 提取读的是「`Paragraph` 渲出来的字形」，只有经过 `sync` 才有那份产物。
+    ///
+    /// 引言传空（`&[]`）：本文件的用例只看 transcript 的字形，不需要开场块 ——
+    /// 它只占 0 行，行号空间与「无引言」完全一致。
     fn layout_of(lines: Vec<TranscriptLine>, width: u16) -> TranscriptLayout {
         let mut cache = crate::cache::RenderCache::default();
         let mut layout = TranscriptLayout::default();
         layout.sync(
             &lines,
+            &[],
             &mut cache,
             true,
             crate::theme::ThemeKind::default().palette(),

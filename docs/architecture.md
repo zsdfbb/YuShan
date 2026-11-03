@@ -645,8 +645,8 @@ flowchart TB
 ```
 
 **默认新会话**：`persistent_new` 只 `create_dir_all` + 算出 `{unix秒}_{纳秒}.jsonl`，**零目录扫描、
-不预建**（首次 `append` 才落盘）。会话目录非空时，启动期给一行 `Resume with --resume` 提示（TUI 走
-transcript，`-p` / `--json` 走 stderr）。
+不预建**（首次 `append` 才落盘）。启动期**不再**提示可恢复会话 —— 可发现性改由空会话引言
+（`/resume`）承担。
 
 **启动期恢复走显式 `--resume`**：
 
@@ -711,8 +711,8 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 **异常是唯一的例外**：一次性模式（`-p` / `--json`）的 stderr 正常路径**完全为空**；
 只在消费侧出错时写一行错误（回合错误优先传播，且不覆盖消费侧那一行）。
 
-**收尾提示与可发现性提示都在 TTY 门控下**（ADR-0067）：`session: <id>` / `worktree: <name>` /
-`Resume with --resume` 只在 **stdout 是终端**时打 —— 被程序调用时（管道 / 脚本 / `$(...)`）
+**收尾提示都在 TTY 门控下**（ADR-0067）：`session: <id>` / `worktree: <name>`
+只在 **stdout 是终端**时打 —— 被程序调用时（管道 / 脚本 / `$(...)`）
 调用方要的是结果与退出码，会话 id 可以从会话目录或自身日志里取。
 `stdin` 不参与判定（`echo q | yushan -p …` 仍然是人）。
 **例外**：纯建树分支（`worktree create` 起不了 TUI，无会话也无结果流）照旧打告知行。

@@ -88,8 +88,7 @@ parse_args（含 --resume）→ Config::from_env → load_auth → 用户配置 
 
 - `--resume` 的解析与 picker **必须在建 runtime / 起屏之前**：读回的 meta 参与模型选择；picker 的
   一切输出走 **stderr**（`enable_raw_mode` / alt-screen 之后 stderr 会冲屏）。
-- 默认新会话且会话目录非空时，启动期给一行 `Resume with --resume`（走既有启动期提示通道：
-  TUI → transcript，`-p`/`--json` → stderr）。
+- 默认新会话**不**给可恢复提示：可发现性由空会话引言（含 `/resume`）承担。
 
 ## meta 行：格式与判别
 

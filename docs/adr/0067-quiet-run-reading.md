@@ -11,6 +11,9 @@ accepted（2026-11-02）。取代 ADR-0062 决策 1 的**出口部分**（度量
 记录不变）。as-built 见 `docs/design-final/task-latency-levers.md`「四个出口」与
 `docs/design-final/usage-observability.md`「回合级读数记录」。
 
+**后续变更**：§2 表格里的 `Resume with --resume` 一行已随该提示本身下线（见
+`docs/architecture.md` §12「默认新会话」）。TTY 门控本身不变。
+
 ## 背景
 
 - `summary_line` 的每个字段都是**调优量**（`tpr_x100` / `input_med` / `ttft_ms` …），

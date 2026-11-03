@@ -1290,25 +1290,6 @@ fn startup_hints(
     }
 }
 
-/// 默认新会话、但会话目录非空时，把一行 `Resume with --resume` 可发现性提示追加进
-/// 既有启动期提示（设计 §9）。
-///
-/// **只在面向人的终端里加**（[`stderr_is_human_facing`]）：它是「你可能想恢复既有会话」的
-/// 建议，对脚本而言只是噪音。
-///
-/// **绝不覆盖**已有提示：`triggered` 为假时原样返回 `hint`；为真时多行拼接、
-/// 原有提示在前（与 [`startup_hints`] 的「一行一事」同规）。
-fn with_resume_hint(hint: Option<String>, triggered: bool) -> Option<String> {
-    if !triggered {
-        return hint;
-    }
-    let line = "Resume with --resume".to_string();
-    Some(match hint {
-        Some(h) => format!("{h}\n{line}"),
-        None => line,
-    })
-}
-
 /// 把一条提示**前置**到既有启动期提示，**不覆盖**（`None` 原样返回）。
 fn prepend_hint(hint: Option<String>, note: Option<String>) -> Option<String> {
     let Some(note) = note else {
@@ -1322,7 +1303,7 @@ fn prepend_hint(hint: Option<String>, note: Option<String>) -> Option<String> {
 
 /// 把建树告知（`worktree create` 成功）并入启动期提示，**放在最前**（它是最相关的上下文）。
 ///
-/// 与 [`with_resume_hint`] 同规：不覆盖既有提示，多行拼接。
+/// 与 [`prepend_hint`] 同规：不覆盖既有提示，多行拼接。
 fn with_worktree_note(hint: Option<String>, note: Option<String>) -> Option<String> {
     prepend_hint(hint, note)
 }
@@ -1709,14 +1690,6 @@ fn resolve_resume(
     };
     let meta = path.as_deref().and_then(sessions::read_meta);
     (path, meta)
-}
-
-/// 会话目录是否已有条目（仅用于启动期 `Resume with --resume` 提示）：只读一个
-/// 条目，不做列表 / 解析。
-fn sessions_dir_has_entries(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
 }
 
 /// 模型选择的**纯解析结果** —— [`resolve_model_from_meta`] 的产物。
@@ -3271,15 +3244,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &skill_diags,
         custom_prompt_note(&workspace, config.skills.len()),
         fixed_cost_note(&agent_limits),
-    );
-
-    // 启动期可发现性：默认新会话且目录非空时，提示存在可恢复会话。
-    // 只在面向人的终端里提（ADR-0067）：管道调用只要结果。
-    let hint = with_resume_hint(
-        hint,
-        stderr_is_human_facing()
-            && matches!(args.resume, Resume::New)
-            && sessions_dir_has_entries(&sessions_dir),
     );
 
     // 建树告知（`create` 路径）并入同一条启动期提示：名字 / 路径 / 分支未合并。
@@ -5485,28 +5449,6 @@ mod tests {
         assert_eq!(
             startup_hints(None, &["x".into()], None, None).as_deref(),
             Some("x")
-        );
-    }
-
-    /// 启动期可发现性提示（`Resume with --resume`）：`triggered` 为假时**原样返回**
-    /// （`None→None`、`Some(x)→Some(x)`），为真时追加一行且**原有提示在前**。
-    ///
-    /// 变异：忽略 `triggered`（恒加提示）⇒ 第三条断言变红。
-    #[test]
-    fn with_resume_hint_only_appends_when_triggered() {
-        assert_eq!(
-            with_resume_hint(None, true).as_deref(),
-            Some("Resume with --resume")
-        );
-        assert_eq!(
-            with_resume_hint(Some("原有提示".into()), true).as_deref(),
-            Some("原有提示\nResume with --resume")
-        );
-        assert_eq!(with_resume_hint(None, false), None);
-        assert_eq!(
-            with_resume_hint(Some("原有提示".into()), false).as_deref(),
-            Some("原有提示"),
-            "未触发必须原样返回，不得追加"
         );
     }
 

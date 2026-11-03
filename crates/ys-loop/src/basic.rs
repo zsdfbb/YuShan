@@ -818,24 +818,26 @@ impl AgentLoop for BasicLoop {
 
             // Step 6：通过 Forwarder 调用 model
             //
-            // **流中断重试**（`stream_interrupt_retries`，默认 0 = 关闭）：
-            // provider 可以在 200 + 正常 ttfb 之后把流中途截断；适配器因
-            // 「已吐 delta」拒绝重试（重放会把已渲染文本再渲染一遍）。
-            // 那个理由只对「流边渲染给用户看」成立 —— 子 agent 的输出不进屏幕，
-            // 故可丢弃部分输出、用**同一请求**重发。会话未受污染（失败分支不
-            // `append`），因此重试幂等。
+            // **流中断重试**（`stream_interrupt_retries`）:provider 可以在 200 + 正常 ttfb
+            // 之后把流中途截断；适配器因「已吐 delta」不重试（重放会把已渲染文本
+            // 再渲染一遍），但那个理由只对**适配器自己**成立 —— 重发之前先发
+            // `ModelStreamDiscarded` 让消费端丢弃本轮已收到的增量，会话未受污染
+            // （失败分支不 `append`），重试因此幂等。库面默认 `0` = 不重试。
             let mut stream_retries_left = ctx.limits.stream_interrupt_retries;
             let response = loop {
                 let mut forwarder = Forwarder { sink: ctx.events };
                 match ctx.model.complete(request.clone(), &mut forwarder).await {
-                    // 只有 `Provider` 可重试：`Cancelled` 是用户意图，
-                    // `Sink` / `Serde` 是本地缺陷 —— 三者重发都无意义。
-                    Err(ys_model::ModelError::Provider(_)) if stream_retries_left > 0 => {
+                    // **只**对 `StreamInterrupted` 重试 —— 适配器只在自己不重试时才产出它
+                    // （已吐 delta），重发不会与适配器内部退避相乘。`Provider` 不在此列：
+                    // 它还装着“适配器已退避耗尽”的传输失败，整梯重来会把预算再乘一遍。
+                    // `Cancelled` 是用户意图，`Sink` / `Serde` 是本地缺陷。
+                    Err(ys_model::ModelError::StreamInterrupted(reason))
+                        if stream_retries_left > 0 =>
+                    {
                         stream_retries_left -= 1;
-                        // 告知消费端：本轮已发出的流式增量作废（重发从头开始）。
-                        // 子 agent 只取 `ToolResult`，多余 delta 对它无副作用；
-                        // TUI / `-p` 下本开关恒为 0，不会走到这里。
-                        emit(ctx.events, AgentEvent::ModelStreamDiscarded)
+                        // 告知消费端：本轮已发出的流式增量作废（重发从头开始），
+                        // `reason` 原样带上适配器给出的错误文本供归因。
+                        emit(ctx.events, AgentEvent::ModelStreamDiscarded { reason })
                             .await
                             .map_err(LoopError::Event)?;
                         continue;
@@ -4549,6 +4551,89 @@ mod tests {
 
         assert_eq!(result.stop_reason, StopReason::NoOutput);
         assert_eq!(result.rounds, 1, "关闭重试 ⇒ 一轮即收场");
+    }
+
+    /// 流中断重试：首选响应是 `ModelError::StreamInterrupted`，且
+    /// `stream_interrupt_retries > 0` ⇒ 丢弃本轮增量、重发同一请求；
+    /// `ModelStreamDiscarded` **恰好一条**且带上原始错误文本，回合以 `Completed` 收场。
+    ///
+    /// 变异：不发 `ModelStreamDiscarded` ⇒ 计数为 0 ⇒ 变红；丢掉 `reason` ⇒ 文本不符 ⇒ 变红。
+    #[tokio::test]
+    async fn stream_interrupt_retry_emits_discarded_with_reason() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = MockModel::new("m");
+        model.push_stream_interrupted("boom");
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.stream_interrupt_retries = 1;
+        let result = {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(result.stop_reason, StopReason::Completed);
+        assert_eq!(result.rounds, 1, "重试是同一轮内的重发，不推进 round");
+
+        let discarded: Vec<&String> = events
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ModelStreamDiscarded { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            discarded,
+            vec![&"boom".to_string()],
+            "应恰好一条作废事件且带上原始错误文本；events = {:?}",
+            events.events()
+        );
+    }
+
+    /// **`ModelError::Provider` 不得被整次重试** —— 它就是适配器“已退避耗尽”的
+    /// 传输失败，循环再重试会把适配器预算再乘一遍（2 次循环额度 × 6 次适配器尝试）。
+    ///
+    /// 变异：把重试匹配改回 `ModelError::Provider(_)` ⇒ 第二、三条被消费 ⇒ 回合
+    /// 以 `Completed` 收场且 `discarded` 非空 ⇒ 变红。
+    #[tokio::test]
+    async fn provider_error_is_not_retried_by_the_loop() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = MockModel::new("m");
+        model.push_error("attachment exhausted (after 6 attempt(s))");
+        // 备好两条：若实现错误地重试，会消费它们并得到 Completed。
+        model.push_stream_interrupted("second");
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        let mut limits = RunLimits::new(5);
+        limits.stream_interrupt_retries = 2;
+        let result = {
+            let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+        };
+
+        let Err(error) = result else {
+            panic!("Provider 错误必须直接失败，不得重试；events = {:?}", events.events());
+        };
+        assert!(
+            error.to_string().contains("attachment exhausted"),
+            "应如实上报适配器给出的原因：{error}"
+        );
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ModelStreamDiscarded { .. })),
+            "未重试就不该发作废事件；events = {:?}",
+            events.events()
+        );
     }
 
     // ==================== 回合级工具输出总量闸门（第二批） ====================

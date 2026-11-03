@@ -3629,7 +3629,7 @@ mod tests {
     ///
     /// 变异：把 `RunLimits::stream_interrupt_retries` 的默认值改成非零（污染 TUI
     /// 行为）⇒ `stream_retry_default_is_off` 变红；把 `basic.rs` 的重试循环去掉
-    /// ⇒ 本用例变红（`Provider` 错误直接冒到 `Err` 分支）。
+    /// ⇒ 本用例变红（`StreamInterrupted` 错误直接冒到 `Err` 分支）。
     #[tokio::test]
     async fn stream_interrupt_is_retried_and_task_survives() {
         use ys_model::MockModel;
@@ -3637,7 +3637,7 @@ mod tests {
         let base = unique_subagent_test_dir("stream_retry");
         let model = MockModel::new("m");
         // 第一次断流（模拟 SSE 截断），第二次成功。
-        model.push_error(
+        model.push_stream_interrupted(
             "SSE stream error: error decoding response body \
              (streaming already began; not retried)",
         );
@@ -3676,8 +3676,8 @@ mod tests {
 
         let base = unique_subagent_test_dir("stream_retry_bounded");
         let model = MockModel::new("m");
-        model.push_error("SSE stream error: first");
-        model.push_error("SSE stream error: second");
+        model.push_stream_interrupted("SSE stream error: first");
+        model.push_stream_interrupted("SSE stream error: second");
         model.push_text("不应到达这里");
 
         let dir = Arc::new(SubagentsDir::at(base.join("artifacts"), false));

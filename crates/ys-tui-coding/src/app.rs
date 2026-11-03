@@ -425,6 +425,18 @@ impl App {
             AgentEvent::ModelThinkingDelta { text } => {
                 self.append_stream(text, StreamKind::Thinking)
             }
+            AgentEvent::ModelStreamDiscarded { reason: _ } => {
+                // 循环丢弃了**整次**模型尝试（provider 可重试错误）并用同一请求重发 ⇒ 屏上
+                // 已渲染的正文 / 思考 / 工具行全部作废，重放会把它们再画一遍。故按「本轮」
+                // 边界把它们弹掉。
+                //
+                // 不显示 `reason`：屏幕上是重放能救回的场景，报错只会制造噪音（归因看 debug
+                // 记录 `model_stream_discarded`）。
+                //
+                // 非终局事件：回合仍在跑，**不调** `finish_turn`。弹行不算「下方有新内容」
+                // ⇒ 不调 `note_appended_below`（视窗原地不动）。
+                self.discard_stream_attempt();
+            }
             AgentEvent::ToolCall { call } => {
                 let idx = self.transcript.len();
                 self.transcript.push(TranscriptLine::Tool {
@@ -767,6 +779,50 @@ impl App {
         self.tool_index.clear();
         // **不**强制贴底：回合结算行（Summary）已按「尾部追加」记过提示位。
         // 视窗在底部时靠 `follow` 继续跟随；用户翻上去时视窗原地不动。
+    }
+
+    /// 从 transcript 尾部弹掉**本次尝试**产生的行（`ModelStreamDiscarded` 的处理体）。
+    ///
+    /// 边界：自尾部向前扫，`Assistant` / `Thinking` / `Tool { .. }` 一律弹出（同一轮内它们
+    /// 交替出现，例如「思考 → 工具 → 思考 → 正文」）；遇到任何其他变体（`User` / `System` /
+    /// `Summary` / `Error`）即停 —— 那些属于之前的轮或用户自己的行，重放不会重画它们。
+    /// 栈空即停，故历史上没有本轮行的场景是 no-op。按扫描结果弹，不假定「各至多一条」。
+    ///
+    /// **同时清 `tool_index`**：重放后同一 `ToolCallId` 会重新到达，残留映射指向已被弹掉的
+    /// 下标 —— 结果是本轮的工具结果回填被静默丢弃（`get_mut` 落空）。代价是上一轮尚未回填的
+    /// 映射也一并丢失，但那种映射本来就已指向不存在的行（落在下面那段被弹出区间里），
+    /// 回填本来也会落空。
+    /// 丢弃「当前这次模型尝试」已渲染的内容（provider 断流、请求将重发）。
+    ///
+    /// 只弹尾部的 `Assistant` / `Thinking` 行：这两者只由流式增量产生，且只在
+    /// 一次尝试内部累积。
+    ///
+    /// **`Tool { .. }` 行不在范围内**：`AgentEvent::ToolCall` 只在模型响应**完整收敛后**
+    /// 才由循环层发出（`basic.rs` Step 7），而 `ModelStreamDiscarded` 发生在响应之前 ——
+    /// 此刻屏上的工具行必定属于**已经提交的轮次**，弹掉它会让已执行的调用凭空消失。
+    /// 同理 `tool_index` **不清理**：重放不会产生工具行，已提交的映射仍然有效。
+    fn discard_stream_attempt(&mut self) {
+        let keep = self
+            .transcript
+            .iter()
+            .rposition(|line| {
+                !matches!(
+                    line,
+                    TranscriptLine::Assistant(_) | TranscriptLine::Thinking(_)
+                )
+            })
+            .map_or(0, |pos| pos + 1);
+        if keep == self.transcript.len() {
+            return; // 尾部没有本次尝试的行：无扫描代价之外的副作用
+        }
+        // 两套缓存都必须显式作废，它们**互不知晓**：
+        // - `md_cache` 按槽下标记忆，键只有 `(len, width)` ⇒ 重放会往**同一**下标装另一段文本；
+        // - `layout` 的条目签名对正文/思考只得哈**长度**（见 `layout::entry_sig`）⇒ 重放文本
+        //   与被弹文本等长时会在 `sync` 里直接命中旧 memo（`continue`），屏上留下旧折行结果。
+        // 只重置其中一个就会两套缓存不一致。
+        self.md_cache.borrow_mut().reset_from(keep);
+        self.layout.borrow_mut().reset();
+        self.transcript.truncate(keep);
     }
 
     /// 流式增量：末尾同为该类型则追加，否则新起一条。
@@ -1123,6 +1179,195 @@ mod tests {
         assert!(matches!(&a.transcript[0], TranscriptLine::Assistant(s) if s == "answer"));
         assert!(matches!(&a.transcript[1], TranscriptLine::Thinking(s) if s == "hmm"));
         assert!(matches!(&a.transcript[2], TranscriptLine::Assistant(s) if s == "more"));
+    }
+
+    /// `ModelStreamDiscarded` —— 循环丢弃整次模型尝试并重发 ⇒ 本轮已渲染的行全作废。
+    ///
+    /// 承重四点：
+    ///  1. 本轮 `Thinking` / `Assistant` / `Tool` 行**全部弹掉**（含尾部交替的多个变体）；
+    ///  2. 边界外的行（`User` / 上一轮的 `Assistant` / `Error`）**丝毫不动**；
+    ///  3. `tool_index` 清空 —— 残留映射指向已不存在的下标；
+    ///  4. 非终局事件：`is_turning` 仍为真。
+    ///
+    /// 变异：不弹 `Tool { .. }` ⇒ 第 1 点变红；扫描边界写成「扫到 `Tool` 就停」⇒ 只剩
+    /// 尾部 `Assistant` 被弹，第 1 点变红；不清 `tool_index` ⇒ 第 3 点变红；
+    /// 调 `finish_turn()` ⇒ 第 4 点变红。
+    #[test]
+    fn test_stream_discarded_pops_current_attempt_lines() {
+        let mut a = app();
+        // 上一回合留下的一行 —— 作废不得跨过它。
+        a.apply_event(text_delta("上一回合"));
+        a.apply_event(env(AgentEvent::RunFinished {
+            stop_reason: StopReason::Completed,
+            rounds: 1,
+            usage: Usage::default(),
+        }));
+        a.begin_local_turn("再来一次".into());
+        let baseline = a.transcript.clone();
+
+        a.apply_event(env(AgentEvent::ModelThinkingDelta {
+            text: "先想".into(),
+        }));
+        a.apply_event(text_delta("半句"));
+        assert_eq!(a.transcript.len(), baseline.len() + 2, "本轮两条已渲染");
+
+        a.apply_event(env(AgentEvent::ModelStreamDiscarded {
+            reason: "provider stream error".into(),
+        }));
+
+        assert_eq!(
+            a.transcript.len(),
+            baseline.len(),
+            "本轮的 Thinking / Assistant 行全部消失：{:?}",
+            a.transcript
+        );
+        assert_eq!(a.transcript, baseline, "边界外的行必须丝毫不动");
+        assert!(a.is_turning, "非终局事件不得结束回合");
+    }
+
+    /// **已提交轮次的工具行不得被弹掉**。
+    ///
+    /// `ToolCall` 只在该轮模型响应**完整收敛**后才发出，而 discard 发生在下一次尝试
+    /// 之前 —— 屏上的工具行必属已提交轮次，弹掉它会让已执行的调用凭空消失。
+    ///
+    /// 变异：把 `discard_stream_attempt` 的扫描重新纳入 `Tool { .. }` ⇒ 本用例变红。
+    #[test]
+    fn test_stream_discarded_keeps_committed_tool_lines() {
+        let mut a = app();
+        a.begin_local_turn("问".into());
+
+        // 已提交的一轮：工具调用 + 结果。
+        a.apply_event(tool_call(
+            "c1",
+            "read",
+            serde_json::json!({"path": "src/x.rs"}),
+        ));
+        a.apply_event(tool_result("c1", "file body", false));
+        let committed = a.transcript.clone();
+        assert_eq!(a.tool_index.len(), 1);
+
+        // 下一轮开始流式，随后断流。
+        a.apply_event(env(AgentEvent::ModelThinkingDelta {
+            text: "先想".into(),
+        }));
+        a.apply_event(text_delta("半句"));
+        a.apply_event(env(AgentEvent::ModelStreamDiscarded {
+            reason: "provider stream error".into(),
+        }));
+
+        assert_eq!(a.transcript, committed, "已提交的工具行必须原样保留");
+        assert_eq!(a.tool_index.len(), 1, "映射也不得清空");
+        match a.transcript.last() {
+            Some(TranscriptLine::Tool { result, .. }) => {
+                assert_eq!(result.as_deref(), Some("file body"))
+            }
+            other => panic!("expected committed Tool line, got {other:?}"),
+        }
+    }
+
+    /// 作废时必须同时作废**布局记忆**（`layout::EntryMemo`），不只是 `md_cache`。
+    ///
+    /// `layout::entry_sig` 对正文 / 思考只哈希**长度** —— 重放文本与被弹文本等长时，
+    /// `sync` 会在旧 memo 上命中并 `continue`，屏上于是留着旧折行结果，与两套缓存
+    /// 不同步。本用例用**同长度**的不同文本（“旧作” / “新作”）砸中这条路径。
+    ///
+    /// 变异：删掉 `discard_stream_attempt` 里的 `layout.reset()` ⇒ 屏上仍是旧文本 ⇒ 变红。
+    #[test]
+    fn test_stream_discard_resets_layout_memo() {
+        let mut a = app();
+        a.begin_local_turn("问".into());
+
+        // 先渲染一次：把带“旧作”的条目写进 layout 的 memo。
+        a.apply_event(env(AgentEvent::ModelThinkingDelta {
+            text: "旧思".into(),
+        }));
+        a.apply_event(text_delta("旧作"));
+        let _ = rendered_fgs(&mut a);
+
+        // 断流后重放同长度文本。
+        a.apply_event(env(AgentEvent::ModelStreamDiscarded {
+            reason: "provider stream error".into(),
+        }));
+        a.apply_event(env(AgentEvent::ModelThinkingDelta {
+            text: "新思".into(),
+        }));
+        a.apply_event(text_delta("新作"));
+
+        a.sync_scroll_state(80, 40, Instant::now());
+        let layout = a.layout.borrow();
+        let total = layout.total_rows();
+        let window = layout.window(0, total.max(1));
+        let screen: String = window.lines.iter().map(|line| line.to_string()).collect();
+        // 渲染路径在行内插入零宽空格（换行保护），比较前去掉。
+        let screen = screen.replace('\u{200b}', "");
+        assert!(
+            screen.contains("新作") && !screen.contains("旧作"),
+            "布局记忆未作废 ⇒ 屏上仍是旧文本；screen = {screen:?}"
+        );
+    }
+
+    /// 作废后重放：屏幕上**只剩重放的那一份**，不重复；且重放的 `ToolResult` 仍能按
+    /// 同一 `ToolCallId` 回填到**重放后**的新行。
+    ///
+    /// 变异：不清 `tool_index` ⇒ 回填落到已被弹掉的下标（`get_mut` 落空）⇒ 最后一个
+    /// 断言（`result == Some(...)`）变红。
+    #[test]
+    fn test_replay_after_discard_leaves_only_one_copy() {
+        let mut a = app();
+        a.begin_local_turn("问".into());
+
+        a.apply_event(env(AgentEvent::ModelThinkingDelta {
+            text: "旧思考".into(),
+        }));
+        a.apply_event(text_delta("作品"));
+        a.apply_event(env(AgentEvent::ModelStreamDiscarded {
+            reason: "provider stream error".into(),
+        }));
+
+        a.apply_event(env(AgentEvent::ModelThinkingDelta {
+            text: "新思考".into(),
+        }));
+        a.apply_event(text_delta("完成"));
+        a.apply_event(tool_call(
+            "c1",
+            "read",
+            serde_json::json!({"path": "src/x.rs"}),
+        ));
+        a.apply_event(tool_result("c1", "file body", false));
+
+        let rendered: Vec<String> = a
+            .transcript
+            .iter()
+            .map(|line| match line {
+                TranscriptLine::User(s)
+                | TranscriptLine::Assistant(s)
+                | TranscriptLine::Thinking(s)
+                | TranscriptLine::System(s)
+                | TranscriptLine::Error(s) => s.clone(),
+                TranscriptLine::Tool { summary, .. } => format!("[tool] {summary}"),
+                TranscriptLine::Summary { .. } => "[summary]".into(),
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "问".to_string(),
+                "新思考".into(),
+                "完成".into(),
+                "[tool] src/x.rs".into(),
+            ],
+            "旧尝试的思考 / 正文一行不得留在屏上；重放后的工具行正常渲染"
+        );
+        match &a.transcript[1] {
+            TranscriptLine::Thinking(t) => assert_eq!(t, "新思考"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        match &a.transcript[3] {
+            TranscriptLine::Tool { result, .. } => {
+                assert_eq!(result.as_deref(), Some("file body"), "工具结果应回填到该行")
+            }
+            other => panic!("expected Tool, got {other:?}"),
+        }
     }
 
     #[test]

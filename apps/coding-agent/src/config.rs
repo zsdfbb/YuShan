@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use ys_component::{DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS, DEFAULT_SOFT_ROUND_ADVICE_AT};
+use ys_component::{
+    DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS, DEFAULT_SOFT_ROUND_ADVICE_AT,
+    DEFAULT_STREAM_INTERRUPT_RETRIES,
+};
 use ys_core::EffortLevel;
 use ys_model::Model;
 
@@ -56,6 +59,10 @@ struct RawUserConfig {
     /// A6 轮数软提醒阈值（回合内轮数）。`0` = 关闭。
     #[serde(default)]
     soft_round_advice_at: Option<serde_json::Value>,
+    /// 流中断重试次数（已吐过 delta 后 provider 掐断流时，整次尝试作废并重发）。
+    /// `0` = 关闭。
+    #[serde(default)]
+    stream_interrupt_retries: Option<serde_json::Value>,
     #[serde(default)]
     model_retry: RawModelRetry,
     #[serde(default)]
@@ -161,6 +168,9 @@ struct UserConfig {
     /// A6 轮数软提醒阈值覆盖（`0` = 关闭）。`None` = 未给 ⇒ 默认
     /// [`DEFAULT_SOFT_ROUND_ADVICE_AT`]。
     soft_round_advice_at: Option<usize>,
+    /// 流中断重试次数覆盖（`0` = 关闭）。`None` = 未给 ⇒ 默认
+    /// [`DEFAULT_STREAM_INTERRUPT_RETRIES`]。
+    stream_interrupt_retries: Option<u32>,
     /// 重试策略（逐字段独立，缺省已由 [`ModelRetryConfig::default`] 填好）。
     model_retry: ModelRetryConfig,
     /// 超时旋钮（逐字段独立，缺省已由 [`ModelTimeoutConfig::default`] 填好）。
@@ -384,6 +394,15 @@ impl Config {
         self.user_config
             .soft_round_advice_at
             .unwrap_or(DEFAULT_SOFT_ROUND_ADVICE_AT)
+    }
+
+    /// 流中断重试次数（`config.json` 的 `stream_interrupt_retries`）。
+    ///
+    /// 缺省 [`DEFAULT_STREAM_INTERRUPT_RETRIES`]；`0` = 关闭。
+    pub fn stream_interrupt_retries(&self) -> u32 {
+        self.user_config
+            .stream_interrupt_retries
+            .unwrap_or(DEFAULT_STREAM_INTERRUPT_RETRIES)
     }
 
     /// 压缩策略：`config.json` 的比例覆盖叠在 [`ys_component::CompactPolicy::default`] 上。
@@ -667,6 +686,11 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
     );
     user.soft_round_advice_at =
         sanitize_uint("soft_round_advice_at", raw.soft_round_advice_at, 0usize);
+    user.stream_interrupt_retries = sanitize_uint(
+        "stream_interrupt_retries",
+        raw.stream_interrupt_retries,
+        0u32,
+    );
 
     // 重试 / 超时**逐字段独立**覆盖：未给的项保持默认（照 `compaction` 的
     // `trigger_ratio` / `keep_ratio` 关系）。重试三项允许 0（`max_attempts: 0` = 不重试、

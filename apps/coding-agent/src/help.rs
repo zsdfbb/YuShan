@@ -9,7 +9,7 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
 
 用法：
   ys-coding-agent                       启动交互式 TUI（默认）
-  ys-coding-agent -p <任务>              单次 print 模式（边生成边打印文本增量）
+  ys-coding-agent -p <任务>              单次 print 模式（整回合跑完才输出正文）
   ys-coding-agent --json <任务>          JSON 事件模式（逐行 Envelope）
   ys-coding-agent --resume [<id>]        恢复既有会话（默认新会话；裸 --resume 列出候选并选择，
                                         --resume <id> 指定会话 id 或文件路径）

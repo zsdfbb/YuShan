@@ -38,7 +38,7 @@ $ ./target/release/ys-coding-agent             # 交互式 TUI（默认）
 | 模式 | 启动方式 | stdout 是什么 | 适合 |
 |---|---|---|---|
 | **TUI** | `ys-coding-agent` | 无（画面走 alt-screen） | 交互干活、看过程、翻历史 |
-| **Print** | `ys-coding-agent -p "<任务>"` | 模型正文的**文本增量**，边生成边打印 | 一次性任务、管道、肉眼观察 |
+| **Print** | `ys-coding-agent -p "<任务>"` | 模型正文（整回合结束后一次写出） | 一次性任务、管道、跑脚本 |
 | **JSON** | `ys-coding-agent --json "<任务>"` | 每行一个 `Envelope` JSON | 给别的程序吃事件流 |
 
 ```console
@@ -272,7 +272,8 @@ worktree: feat-a
 | `Cancelled`（墙钟预算用尽）、`NoOutput`（模型没给出可见内容） | `1` |
 | `Completed` / `MaxRounds` / `Truncated`（至少有输出） | `0` |
 
-**stdout 只放数据**：`-p` 放正文增量，`--json` 放逐行 `Envelope`。
+**stdout 只放数据**：`-p` 放正文（`RunFinished` 时一次写出，失败回合零输出），
+`--json` 放逐行 `Envelope`。
 启动提示、最后一条回复的排版、背压统计、错误说明**全部走 stderr**，所以
 `ys-coding-agent --json "..." > events.jsonl` 是干净的。
 
@@ -301,5 +302,5 @@ skill 目录只在启动期扫一次，重启 agent；再用 `/skills` 或 `/hel
 用终端自己的 `Ctrl+Shift+V`。复制方向上 `Ctrl+C` / 拖选会**同时**走本机工具和 OSC 52。
 
 **想给 agent 做脚本化集成**
-用 `--json` 吃事件流，不要解析 `-p` 的 stdout（那是给人看的增量文本）。
+用 `--json` 吃事件流，不要解析 `-p` 的 stdout（那是给人看的正文文本）。
 需要稳定契约时读 [`docs/architecture.md`](../../docs/architecture.md) 的事件一节。

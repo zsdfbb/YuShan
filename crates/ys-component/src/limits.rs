@@ -33,6 +33,14 @@ pub const DEFAULT_BATCH_NUDGE_AT_TOOL_CALLS: usize = 12;
 /// 库面默认是 `0`（关闭）⇒ 老调用方逐字节不变；app 侧显式设为本值。
 pub const DEFAULT_SOFT_ROUND_ADVICE_AT: usize = 60;
 
+/// 流中断重试次数的**应用默认值**。
+///
+/// 库面默认是 `0`（关闭）⇒ 老调用方逐字节不变；app 侧显式设为本值。
+///
+/// 取 `2` 而非 `1`：实测断流多为 provider 侧瞬时故障，单次重发仍有概率撞上；
+/// 而每次重发都是一次完整请求，故必须有界。
+pub const DEFAULT_STREAM_INTERRUPT_RETRIES: u32 = 2;
+
 /// 一次 run 的执行限制
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -112,20 +120,18 @@ pub struct RunLimits {
     /// 成本口径：DeepSeek 实测关思考可省 **18.3%** 总费用
     /// （`docs/arch/effort-per-call-type/cost-analysis.md`）。
     pub main_disable_thinking: Option<bool>,
-    /// 流式中断后**重试整个模型轮**的次数上限（默认 `0` = 关闭）。
+    /// 流式中断后**重试整个模型轮**的次数上限（默认 `0` = 不重试）。
     ///
     /// 背景：provider 流可以返回 `200` + 正常 `ttfb`，然后在持续输出几十秒后
     /// 被**中途截断**。此类故障归为 `ModelError::Provider`，且因为**已吐出 delta**
     /// 而被适配器拒绝重试（重放会把已渲染文本再渲染一遍）。
     ///
-    /// 但那个理由只对「流边渲染边给用户看」的路径成立。**子 agent 的输出不进
-    /// 用户屏幕**（它只把最终 summary 交回父），所以对子 agent 可以安全地丢弃
-    /// 已收到的部分输出、用**同一请求**从头重发 —— 会话未被污染（`Err` 分支不
-    /// `append` 任何消息），故重试是幂等的。
+    /// 故重试的责任落在循环层，且必须同时发 `AgentEvent::ModelStreamDiscarded` ——
+    /// 消费端据此丢弃本轮已收到的增量，重放才不会重复渲染。会话未被污染（`Err`
+    /// 分支不 `append` 任何消息），故重试是幂等的。
     ///
     /// 账：用一次重复的 token 支出，换回前面几十上百次工具调用的上下文不丢。
-    /// 只在子 agent 场景划算（重建上下文要几十轮），故默认 `0`，由 subagent
-    /// 的 child_limits 置非零。
+    /// 库面默认 `0`，由调用方显式开启（app 主轮与子 agent 都设非零）。
     ///
     /// **只对 `ModelError::Provider` 生效**：`Cancelled` 是用户意图，`Sink` /
     /// `Serde` 是本地缺陷 —— 三者重试都无意义。

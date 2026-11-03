@@ -340,8 +340,15 @@ fn build_client(timeouts: &TimeoutConfig) -> reqwest::Client {
 
 /// 一次尝试的失败分类。只在本模块内活 —— `ModelError` 是纯 `String` 且非
 /// `#[non_exhaustive]`（ADR-0028 决策 1），不承载分类。
+///
+/// ## 两处重试机制各管一段，不相乘
+///
+/// 本模块的 attempt 循环只处理**传输层**抖动（连接 / 超时 / 429 / 5xx）；
+/// **流已开始后中断**在 ARM 的 `meta.stream_started` 处就停手（重放会把已渲染
+/// 文本再渲染一遍），改以 [`ModelError::StreamInterrupted`] 上报，交给上层循环
+/// 丢弃增量后重发。于是一次用户请求的 HTTP 次数上限是两者之和，不是之积。
 enum AttemptError {
-    /// 值得重试。`server_delay` 是服务端要求的等待（`Retry-After` / `Retry-After-ms`）。
+    /// 值得在本模块内重试。`server_delay` 是服务端要求的等待（`Retry-After` / `Retry-After-ms`）。
     Retryable {
         reason: String,
         reason_class: ModelAttemptReason,
@@ -503,11 +510,13 @@ impl Model for OpenAICompatibleModel {
                 }) => {
                     record.outcome = ModelAttemptOutcome::Retryable;
                     record.reason_class = Some(reason_class);
-                    // 已吐出 delta ⇒ 一律不重试（重放会把已渲染的文本再渲染一遍）。
+                    // 已吐出 delta ⇒ **本模块不重发**（重放会把已渲染文本再渲染一遍）。
+                    // 能丢弃增量后重发的只有上层循环，故以独立变体上报而不是 `Provider`：
+                    // `Provider` 还装“适配器已退避耗尽”，上层若一律重试会把预算再乘一遍。
                     if meta.stream_started {
                         record.retry_suppressed = Some(ModelAttemptRetrySuppressed::StreamStarted);
                         self.trace(&record);
-                        return Err(ModelError::Provider(format!(
+                        return Err(ModelError::StreamInterrupted(format!(
                             "{reason} (streaming already began; not retried)"
                         )));
                     }
@@ -714,7 +723,7 @@ impl OpenAICompatibleModel {
                 accumulator
                     .finish_with_logger(&|message| self.log(message))
                     .map_err(|error| AttemptError::Retryable {
-                        reason: error.to_string(),
+                        reason: bare_message(&error),
                         reason_class: ModelAttemptReason::Stream,
                         server_delay: None,
                     })
@@ -782,6 +791,21 @@ fn jitter_fraction() -> f64 {
     (nanos % 1001) as f64 / 1000.0
 }
 
+/// 取 `ModelError` 的**无前缀**消息文本。
+///
+/// `ModelError` 的 provider 类变体 `Display` 自带 `model provider error: ` 前缀，
+/// 而调用方会在自己的上下文里再包一层 —— 直接用 `to_string()`
+/// 会让同一前缀出现两次（`model provider error: model provider error: …`）。
+///
+/// 只用于构造 `AttemptError::Retryable.reason`：那些 reason 随后会在 `complete`
+/// 里被重新包进 provider 类错误，而日志（`self.log(..)`）不用它。
+fn bare_message(error: &ModelError) -> String {
+    match error {
+        ModelError::Provider(message) | ModelError::StreamInterrupted(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// 传输层错误（连接 / DNS / TLS / 超时）一律可重试。
 fn retryable_transport_error(error: reqwest::Error) -> AttemptError {
     AttemptError::Retryable {
@@ -793,9 +817,11 @@ fn retryable_transport_error(error: reqwest::Error) -> AttemptError {
 
 /// 流阶段错误分类：空闲超时可重试（属传输层）；其余（`on_event` / sink 错误）不可重试。
 fn classify_stream_error(error: ModelError) -> AttemptError {
-    if error.to_string().contains(stream::IDLE_TIMEOUT_MARKER) {
+    // 用 `bare_message` 匹配：空闲超时的标记子串在 `Provider` 的内层文本里，
+    // 无论带不带前缀都包含它。
+    if bare_message(&error).contains(stream::IDLE_TIMEOUT_MARKER) {
         AttemptError::Retryable {
-            reason: error.to_string(),
+            reason: bare_message(&error),
             reason_class: ModelAttemptReason::IdleTimeout,
             server_delay: None,
         }
@@ -2464,6 +2490,90 @@ mod tests {
         assert!(
             delay <= Duration::from_millis(cap),
             "时钟路径退避 {delay:?} 越过硬上限"
+        );
+    }
+
+    /// **已吐 delta 后断流**：错误消息只带一份 `model provider error:` 前缀，
+    /// 且带出底层根因。
+    ///
+    /// 两条守卫合在一个真实路径上（构造 `reqwest::Error` 只能靠真回环）：
+    /// 1. `attempt` 把流阶段错误包成 `Provider` 后，`complete` 又包一层 `Provider` ——
+    ///    reason 若取自 `ModelError::to_string()`（自带前缀），用户会看到
+    ///    `model provider error: model provider error: …`。
+    /// 2. `parse_sse_stream` 只用 `reqwest::Error` 的 `Display` 时只剩
+    ///    `error decoding response body`一句空壳，根因全在 `source()` 链里。
+    ///
+    /// 变异：把 `finish_with_logger` 那处的 `bare_message` 改回 `error.to_string()`
+    /// ⇒ 前缀计数变 2；把 `parse_sse_stream` 改回 `e.to_string()` ⇒ 消息里
+    /// 不再有 ` ← ` 分段。两条都会让本用例变红。
+    #[tokio::test]
+    async fn stream_truncation_error_has_single_provider_prefix() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 回环 mock：200 + 半截 SSE，声明的 `Content-Length` 大于实发字节 ⇒
+        // 客户端读到 delta 后连接关闭，hyper 判定消息不完整 ⇒ 传输层错误。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // 先读完请求头，避免客户端还在写请求时就回写。
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len() + 4096
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+            // 留出时间让客户端先收到 delta，再关闭连接。
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let config = OpenAICompatibleConfig {
+            api_base: format!("http://127.0.0.1:{port}/v1"),
+            ..config_with(ProviderCompat::standard())
+        };
+        // 回环地址需绕过代理：`.no_proxy()` 直连，不改进程级 env。
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let model = OpenAICompatibleModel::with_client(config, client).with_retry(RetryConfig {
+            max_attempts: 0,
+            base_delay_ms: 10,
+            max_delay_ms: 10,
+        });
+
+        let mut sink = RecordingModelSink::default();
+        let error = model
+            .complete(ModelRequest::default(), &mut sink)
+            .await
+            .expect_err("断流的半截流必须是 Err");
+        server.join().unwrap();
+
+        let message = error.to_string();
+        assert!(
+            matches!(error, ModelError::StreamInterrupted(_)),
+            "断流必须是 StreamInterrupted（上层可丢弃增量后重发），而不是 Provider：{message}"
+        );
+        assert_eq!(
+            message.matches("model provider error:").count(),
+            1,
+            "同一前缀不得出现两次：{message}"
+        );
+        assert!(
+            message.contains("SSE stream error") && message.contains("streaming already began"),
+            "应保留流阶段上下文：{message}"
+        );
+        assert!(
+            message.contains(" ← "),
+            "断流错误必须带出 source() 链里的根因，不得只剩 Display 空壳：{message}"
         );
     }
 

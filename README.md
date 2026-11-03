@@ -163,7 +163,7 @@ $ ys-coding-agent -p "这个项目是做什么的"
 - **git worktree**：一个需求一棵树，`worktree create / attach / list / remove`
 
 **用起来**
-- 三种模式：TUI / `-p` 边生成边打印 / `--json` 事件流
+- 三种模式：TUI / `-p` 整回合跑完再输出 / `--json` 事件流
 - 会话：默认开新的，`--resume` 恢复旧的，`/new` 再开一个，`/compact` 压上下文，`/export` 导出
 - TUI：滚轮、拖选、输入历史、命令和 skill 补全
 - 结构化日志默认开着，`--stats` 能看背压

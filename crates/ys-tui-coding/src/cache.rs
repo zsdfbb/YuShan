@@ -131,6 +131,21 @@ impl RenderCache {
         }
     }
 
+    /// 作废 `idx` 及其之后的全部槽位 —— **作废尾部**专用：transcript 被截短、随后同一槽位
+    /// 会装上**另一段**文本（流式尝试作废后重放，见 `App::discard_stream_attempt`）。
+    ///
+    /// 必须显式作废，不能靠 [`Self::sync_len`] 兜：重放把长度补回原值时，若新文本更短，
+    /// 旧槽位仍满足 `width` 相同且 `src.len() >= slot.len` ⇒ 缓存命中并返回**已作废的**产物
+    /// （且能绕过 [`Self::lines_for`] 里「源文本只增不减」的 `debug_assert`）。
+    ///
+    /// `streaming` 指向被作废的槽位时归零：它只用于「增长即上一条结束」的收尾。
+    pub fn reset_from(&mut self, idx: usize) {
+        self.slots.truncate(idx);
+        if self.streaming.is_some_and(|s| s >= idx) {
+            self.streaming = None;
+        }
+    }
+
     /// 清空全部槽位 —— **回放（`/resume`）专用**：transcript 将被整体替换，任何按「槽下标」
     /// 记忆的产物都已失效（见模块头的不变量与等长碰撞陷阱）。
     ///

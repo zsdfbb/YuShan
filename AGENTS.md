@@ -86,7 +86,7 @@ YuShan/
 - `./scripts/install-skills.sh` — 把仓库 `skills/` 下的 skill 铺进 `~/.yushan/skills`（默认**软链**，`git pull` 即生效；`--copy` 改复制、`--dest` 换目标、`--list` 列清单、`--dry-run` 预演）。**不覆盖**目标已有的非本仓库条目。重启 agent 后生效（skill 目录只在启动期扫一次）
 - `cargo run -p ys-coding-agent` — 交互式 TUI
 - `cargo run -p ys-coding-agent -- --resume [<id>]` — 恢复既有会话（**默认新会话**；裸 `--resume` 列表选择，`--resume <id>` 指定 id / 路径；`=` 形态已移除）
-- `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（边生成边打印文本增量）
+- `cargo run -p ys-coding-agent -- -p "任务"` — 单次 Print 模式（整回合跑完才输出正文；失败回合零输出）
 - `cargo run -p ys-coding-agent -- --json "任务"` — JSON 事件模式（逐行 `Envelope`）
 - `cargo run -p ys-coding-agent -- --json --stats "任务"` — 额外输出背压统计到 stderr
 - `cargo test -p ys-coding-agent e2e -- --ignored --nocapture` — 端到端（需 `YUSHAN_API_BASE` + `YUSHAN_API_KEY`）

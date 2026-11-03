@@ -124,7 +124,10 @@ fn attach_background_context(wiring: &mut Wiring) {
 /// 运行模式。
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
-    /// 单次 print 模式：边生成边打印文本增量。
+    /// 单次 print 模式：回合结束才输出正文（失败回合零输出）。
+    ///
+    /// **不边生成边打印**：循环遇到可重试的 provider 错误会丢弃整次模型尝试并重发，
+    /// 已写出的半句无法撕回 —— 缓冲到终局才能保证「只在成功时输出完整正文」。
     Print(String),
     /// JSON 事件模式：逐行序列化 [`Envelope`]。
     Json(String),
@@ -582,6 +585,40 @@ fn print_delta_text(env: &Envelope) -> Option<&str> {
     }
 }
 
+/// `-p` 的正文累计器：整回合先攒着，到终局才决定写不写。
+///
+/// 之所以不能逐 delta 直写 stdout：循环遇到可重试的 provider 错误会丢弃**整次**模型尝试
+/// 并用同一请求重发（并发一条 [`AgentEvent::ModelStreamDiscarded`]）—— 已写出的那半句无法
+/// 撤回，重放会让屏幕上出现两份。故：[`discard`](Self::discard) 清空、
+/// [`RunFinished`](AgentEvent::RunFinished) 一次性写出、其余什么都不写（回合失败 ⇒ 零输出）。
+#[derive(Default)]
+struct PrintBuffer {
+    text: String,
+    /// 是否真向 `w` 写出过文本（`run_print_mode` 据此补末尾换行）。
+    written: bool,
+}
+
+impl PrintBuffer {
+    fn push(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    /// 作废本次尝试已累计的正文（重放会重新累计）。
+    fn discard(&mut self) {
+        self.text.clear();
+    }
+
+    /// 回合正常结束：一次性写出并标记「写过」。空缓冲不产生任何 `write` 调用。
+    fn commit(&mut self, w: &mut impl Write) -> io::Result<()> {
+        if self.text.is_empty() {
+            return Ok(());
+        }
+        w.write_all(self.text.as_bytes())?;
+        self.written = true;
+        Ok(())
+    }
+}
+
 /// 终局事件：消费循环的退出条件。
 fn is_terminal(event: &AgentEvent) -> bool {
     matches!(
@@ -747,10 +784,11 @@ pub(crate) fn observe_event(
     }
 }
 
-/// 把压缩与截断这类低频、高影响的边界事件翻成 debug 记录。
+/// 把压缩 / 截断 / 流式作废这类低频、高影响的边界事件翻成 debug 记录。
 ///
 /// 抽成纯构造函数以便单测；它们不属于逐轮时钟的状态机，避免把 `RoundClock`
-/// 变成所有事件的转储点。
+/// 变成所有事件的转储点。**增量事件（`ModelTextDelta` / `ModelThinkingDelta`）不在此列**：
+/// 只记段、不记增量（长回答不会撑爆文件）。
 fn special_event_record(env: &Envelope) -> Option<DebugRecord> {
     let mut fields = Map::new();
     let ev = match &env.event {
@@ -787,6 +825,11 @@ fn special_event_record(env: &Envelope) -> Option<DebugRecord> {
             fields.insert("dropped_tool_calls".into(), json!(dropped_tool_calls));
             "response_truncated"
         }
+        // 整次模型尝试被丢弃后重发：屏上那半句作废、会重画一遍。
+        AgentEvent::ModelStreamDiscarded { reason } => {
+            fields.insert("reason".into(), json!(clip_reason(reason)));
+            "model_stream_discarded"
+        }
         _ => return None,
     };
     Some(DebugRecord {
@@ -796,6 +839,27 @@ fn special_event_record(env: &Envelope) -> Option<DebugRecord> {
         fields,
     })
 }
+
+/// 作废原因的可记录形式：压掉内嵌控制字符（保一行一条 JSON 可读），再按**字符**截到
+/// [`DISCARD_REASON_MAX_CHARS`]，超长补 `…`。
+///
+/// `reason` 是 provider / 适配器给的诊断串，可能很长（含响应体片段）—— 记录里只需足够归因，
+/// 不能让一个巨型响应体把一行刷成几十 KiB。
+fn clip_reason(reason: &str) -> String {
+    let flat: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.trim();
+    let mut out: String = flat.chars().take(DISCARD_REASON_MAX_CHARS).collect();
+    if flat.chars().count() > DISCARD_REASON_MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// 作废原因在 debug 记录里的字符上界。
+const DISCARD_REASON_MAX_CHARS: usize = 200;
 
 fn record_special_event(sink: &mut DebugSink, session_id: &str, env: &Envelope) {
     if let Some(record) = special_event_record(env) {
@@ -1044,8 +1108,14 @@ pub(crate) fn record_boundary(
 /// 记录**：`-p` / `--json` 的 stdout 承载结果、stderr 只在有异常时说话，故读数行既不
 /// 进 stdout 也不进 stderr，只经 `record_run_reading_fields` 落 debug JSONL（供 bench
 /// 与事后分析）。`dead_code`：`-p` / `--json` 的唯一出口是 debug，关掉 debug 时无人读。
+#[derive(Debug)]
 struct ConsumeOutcome {
     rounds: u32,
+    /// 消费循环是**看到终局事件**才退出的（`false` = 信道提前关闭）。
+    ///
+    /// 正常路径恒为 `true`：`agent` 持有 sender 且不 drop 它。`false` 意味着事件流
+    /// 被截断 —— 此时输出不完整，调用方**必须**当异常处理，不能按内容已完整收场。
+    terminal: bool,
     #[cfg_attr(not(test), allow(dead_code))]
     reading: String,
     /// 与 `reading` 同源的数字字段（见 [`RoundClock::summary_fields`]）。
@@ -1058,7 +1128,8 @@ struct ConsumeOutcome {
 /// **终止条件是终局事件，不是信道关闭** —— sender 在 Agent 里，
 /// Agent 不 drop 信道就不会关闭；若等关闭会死锁。
 ///
-/// 每个事件 `on_event` 写出后 `flush()`（保证 `-p` 增量实时可见）。
+/// 每个事件 `on_event` 处理完后 `flush()`：`-p` 只在终局那一次写出正文，flush 仍须保证
+/// 那一刻写出的字节落到终端（stdout 非行缓冲时尤其必要）。
 ///
 /// `turn` 是**回合号**（`-p` / `--json` 恒为 1，取自 `begin_turn(1)` 的同一取值），
 /// 只用于读数行的 `turn=` 字段（该行只进 debug，见 [`ConsumeOutcome`]）。
@@ -1111,6 +1182,7 @@ where
             }
             return Ok(ConsumeOutcome {
                 rounds: observed_rounds,
+                terminal: true,
                 reading: clock.summary_line(turn),
                 reading_fields: clock.summary_fields(turn),
             });
@@ -1119,10 +1191,13 @@ where
     for line in clock.take_lines() {
         logging::log(&line);
     }
-    // 信道关闭（正常路径不依赖此分支：agent 不 drop 信道）——不 panic，正常收尾。
+    // 信道关闭前没见到终局事件 ⇒ 事件流被截断。仍正常返回（由调用方决定如何
+    // 降级），但 `terminal = false` 必须带出去 —— 默认当“已收全”会让调用方
+    // 把半截结果当完整结果交付。
     w.flush()?;
     Ok(ConsumeOutcome {
         rounds: observed_rounds,
+        terminal: false,
         reading: clock.summary_line(turn),
         reading_fields: clock.summary_fields(turn),
     })
@@ -1191,6 +1266,13 @@ fn resolve_limits(config: &config::Config) -> ys_component::RunLimits {
     // app 侧走配置的 12 / 60。
     limits.batch_nudge_at_tool_calls = config.batch_nudge_at_tool_calls();
     limits.soft_round_advice_at = config.soft_round_advice_at();
+    // 流中断重试：provider 可以在 200 + 正常 ttfb 之后把流中途截断，而适配器
+    // 因「已吐 delta」拒绝重试（重放会把已渲染文本再渲染一遍）。那个理由只对
+    // **适配器单体**成立 —— 循环层能发 `ModelStreamDiscarded` 让消费端丢弃本轮
+    // 增量、再重发同一请求，失败分支不 append ⇒ 会话幂等。
+    //
+    // 库面默认 `0`（关闭）；app 侧走配置值，`config.json` 可覆盖。
+    limits.stream_interrupt_retries = config.stream_interrupt_retries();
     // 主轮关思考：**默认 `None`**（不干预）⇒ 未设 env 时行为逐字节不变。
     //
     // 用 env 而非配置项：先拿 A/B 读数，再决定要不要把它升格为默认值或用户配置。
@@ -2089,27 +2171,39 @@ async fn run_single_turn(
     outcome
 }
 
-/// `-p` 模式的事件消费：只把 [`AgentEvent::ModelTextDelta`] 的文本增量写入 `w`
-/// （**不换行、按序拼接**），其余事件不产出任何输出；返回是否写出过文本。
+/// `-p` 模式的事件消费：把 [`AgentEvent::ModelTextDelta`] 的文本增量**按序拼接**后整回合
+/// 写出（**不换行**），其余事件不产出任何输出；返回是否写出过文本。
+///
+/// 为什么是「整回合缓冲」而不是逐 delta 直写：循环丢弃整次模型尝试（provider 可重试错误）后
+/// 会用同一请求重发 —— 已写出的字无法撤回，重放会造成屏幕上两份。故
+/// [`AgentEvent::ModelStreamDiscarded`] 清空缓冲、只在 [`AgentEvent::RunFinished`] 时写出；
+/// [`AgentEvent::RunFailed`] 不写（失败回合零输出，故它中途累计的正文也不外泄）。
 ///
 /// 写出目标参数化为 `W: Write`：生产传 `io::stdout()`，测试传 `Vec<u8>`，
-/// 保证被测的就是生产消费路径（`consume_events` + `print_delta_text`）。
+/// 保证被测的就是生产消费路径（`consume_events` + [`PrintBuffer`]）。
 /// 终止由 `consume_events` 依**终局事件**判定，不依赖信道关闭。
 async fn consume_print_events<W: Write>(
     rx: mpsc::Receiver<Envelope>,
-    w: W,
+    mut w: W,
     debug: Option<&mut DebugSink>,
     session_id: &str,
 ) -> io::Result<(bool, ConsumeOutcome)> {
-    let mut printed_any = false;
+    let mut buf = PrintBuffer::default();
     let tap = debug.map(|sink| DebugTap { sink, session_id });
+    let mut truncated = false;
     let consumed = consume_events(
         rx,
-        w,
+        &mut w,
         |w, env| {
-            if let Some(text) = print_delta_text(env) {
-                w.write_all(text.as_bytes())?;
-                printed_any = true;
+            match &env.event {
+                AgentEvent::ModelStreamDiscarded { .. } => buf.discard(),
+                AgentEvent::RunFinished { .. } => buf.commit(w)?,
+                // `RunFailed` 与非文本事件都不写：前者刻意零输出，后者无正文。
+                _ => {
+                    if let Some(text) = print_delta_text(env) {
+                        buf.push(text);
+                    }
+                }
             }
             Ok(())
         },
@@ -2117,7 +2211,21 @@ async fn consume_print_events<W: Write>(
         1,
     )
     .await?;
-    Ok((printed_any, consumed))
+    if !consumed.terminal {
+        // 未见到终局事件 ⇒ 本回合的文本永远等不到 `RunFinished` 来提交。
+        // 重置为“逐 delta 直写”时代的底线行为：已生成的部分仍写出去（尽力而为，
+        // 宁可给半截也不静默丢弃），同时把消费结果标为异常 —— 让退出码非 0。
+        truncated = true;
+        buf.commit(&mut w)?;
+        w.flush()?;
+    }
+    if truncated {
+        return Err(io::Error::other(format!(
+            "{EVENT_TRUNCATED}: event stream closed after {} round(s) without a terminal event",
+            consumed.rounds
+        )));
+    }
+    Ok((buf.written, consumed))
 }
 
 /// 把背压读数摘要写到 **stderr**（固定不污染 stdout 的 JSON / 文本流）。
@@ -2138,6 +2246,10 @@ fn report_channel_stats(handle: &ChannelStatsHandle, force: bool) {
 
 /// 消费侧异常时 stderr 的**首段**。测试以它判定「报的是消费异常而非回合错误」。
 const EVENT_STREAM_BROKEN: &str = "event stream broken";
+
+/// 事件流**未收到终局事件**就关闭了。与 [`EVENT_STREAM_BROKEN`] 分开：前者是消费者
+/// 自身出错，这里是上游提前断流 —— 回合结果可能已经不完整。
+const EVENT_TRUNCATED: &str = "event stream truncated";
 
 /// 一次性模式的收尾：合并回合结果与消费结果，必要时向 stderr 报**消费**异常，再传播错误。
 ///
@@ -3561,6 +3673,23 @@ mod tests {
         assert_eq!(truncated.ev, "response_truncated");
         assert_eq!(truncated.fields["dropped_tool_calls"], 2);
 
+        let discarded = special_event_record(&env(AgentEvent::ModelStreamDiscarded {
+            reason: "provider stream error".into(),
+        }))
+        .expect("整次尝试被丢弃应有记录（屏上那半句已作废，否则无法归因）");
+        assert_eq!(discarded.ev, "model_stream_discarded");
+        assert_eq!(discarded.fields["reason"], "provider stream error");
+
+        // 超长 `reason`：压掉换行并截到字符上界，不能让一个巨型响应体把一行刷爆。
+        let huge = format!("line1\nline2 {}", "æ¼¢".repeat(500));
+        let huge_record = special_event_record(&env(AgentEvent::ModelStreamDiscarded { reason: huge }))
+            .expect("超长 reason 仍应有记录");
+        let clipped = huge_record.fields["reason"].as_str().unwrap();
+        assert!(!clipped.contains('\n'), "记录里不得残留换行：{clipped}");
+        assert_eq!(clipped.chars().count(), DISCARD_REASON_MAX_CHARS + 1, "应截到上界 + 省略号：{clipped}");
+        assert!(clipped.ends_with('…'), "截断必须可见地标明：{clipped}");
+
+        // 增量事件不产记录 —— 只记段、不记增量。
         assert!(special_event_record(&env(delta("x"))).is_none());
     }
 
@@ -4197,19 +4326,19 @@ mod tests {
         assert_eq!(worker_threads(), available.min(MAX_WORKER_THREADS));
     }
 
-    /// 12. **-p 按序增量拼接（Task 14 核心不变量）**：多个 `ModelTextDelta` 必须**按序、
-    ///     分次**拼接到写出目标；非文本事件（`UserMessage` / `ToolCall`）不产出；
-    ///     终局事件（`RunFinished`）不产出且触发**正常返回**（不依赖 sender drop）。
-    ///     拼接结果恰为 `"Hello world"` —— 锁定「无丢字、无重复、无多余换行」。
+    /// 12. **-p 按序拼接（整回合缓冲后一次写出）**：多个 `ModelTextDelta` 必须**按序**拼接到
+    ///     写出目标；非文本事件（`UserMessage` / `ToolCall`）不产出；终局事件（`RunFinished`）
+    ///     触发写出并**正常返回**（不依赖 sender drop）。拼接结果恰为 `"Hello world"` ——
+    ///     锁定「无丢字、无重复、无多余换行」。
     ///
-    ///     **「增量」语义单独锁定**：用 [`CountingWriter`] 断言 `write_calls >= 3`
-    ///     （每个 delta 至少一次 write）。若实现退化为「全部缓冲、收到终局事件后
-    ///     一次性写出」，内容仍为 `"Hello world"` 但 `write_calls == 1`，此断言失败。
+    ///     **缓冲语义单独锁定**：正文只在 `RunFinished` 时写出一次（`write_calls == 1`）。
+    ///     逐 delta 直写会让被作废的尝试（`ModelStreamDiscarded` 后重发）在屏上留下两份；
+    ///     **变异**：改回「每个 delta 写一次」⇒ 本断言变红。
     ///
     ///     说明：模型适配器已接通流式（`stream: true`），生产中一次响应会发多个
-    ///     delta，本路径即为其真实消费路径；本测试**手工投递多个 delta**锁定顺序
-    ///     与增量写出语义。消费走**生产路径** `consume_print_events`
-    ///     （内部即 `consume_events` + `print_delta_text`），未重写逻辑。
+    ///     delta，本路径即为其真实消费路径；本测试**手工投递多个 delta** 锁定顺序。
+    ///     消费走**生产路径** `consume_print_events`（内部即 `consume_events` + [`PrintBuffer`]），
+    ///     未重写逻辑。
     #[tokio::test]
     async fn print_mode_writes_deltas_in_order() {
         let (tx, rx) = mpsc::channel(8);
@@ -4253,16 +4382,104 @@ mod tests {
         assert_eq!(out.bytes.len(), "Hello world".len(), "字节数应恰为 11");
         assert_eq!(String::from_utf8(out.bytes).unwrap(), "Hello world");
 
-        // **增量写出**：3 个 delta 各写一次，而非缓冲后一次写出。
-        // 用 `>= 3`（而非 `== 3`）容忍 `write_all` 内部可能的合并写出。
-        assert!(
-            out.write_calls >= 3,
-            "每个 delta 至少一次 write，证明是增量写出而非缓冲后一次写出；write_calls = {}",
-            out.write_calls
+        // **整回合缓冲**：只在 `RunFinished` 时写出一次。
+        assert_eq!(
+            out.write_calls, 1,
+            "正文只在终局时写一次（逐 delta 直写会让作废的尝试在屏上留两份）"
         );
 
         // 显式保留到断言之后：证明 consume_print_events 未依赖 tx 被 drop。
         drop(tx);
+    }
+
+    /// 信道**提前关闭**（未发终局事件）不得静默丢弃已生成的正文，也不得报成功。
+    ///
+    /// 整回合缓冲把写盘时机推到了 `RunFinished` —— 一旦上游 sender 先消失，那段正文就
+    /// 再没机会写出。此时底线是「写出已累计的部分 + 报错」，而不是空 stdout 且退出码为 0。
+    ///
+    /// **变异**：恢复「信道关闭即 `Ok`」⇒ 本用例的 `is_err` 与正文断言全变红。
+    #[tokio::test]
+    async fn print_mode_reports_truncated_stream_and_still_writes_text() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(env(delta("工"))).await.unwrap();
+        tx.send(env(delta("作"))).await.unwrap();
+        // 不发 `RunFinished` ⇒ 信道关闭。
+        drop(tx);
+
+        let mut out: Vec<u8> = Vec::new();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            consume_print_events(rx, &mut out, None, "test-session"),
+        )
+        .await
+        .expect("信道关闭 ⇒ 应立即返回，不得挂起")
+        .expect_err("未收到终局事件就必须报错（否则退出码为 0 且 stdout 空白）");
+
+        assert!(
+            error.to_string().contains(EVENT_TRUNCATED),
+            "错误里须能看出是事件流被截断：{error}"
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "工作",
+            "已生成的部分仍须写出（宁可半截也不静默丢弃）"
+        );
+    }
+
+    /// `-p` 的「作废后重放」：本轮流式增量作废时，已累计的正文必须丢掉，只写重放后的那一份。
+    ///
+    /// 两条序列各自钉一个出口：
+    ///  1. `[delta("工"), delta("作"), RunFailed]` ⇒ 零输出且 `printed_any == false`
+    ///     （失败回合的正文不得外泄，调用方也不会多补一个换行）；
+    ///  2. `[delta("工"), ModelStreamDiscarded, delta("完成"), RunFinished]` ⇒ 恰好 `"完成"`
+    ///     （作废前的那半句不得残留在输出里）。
+    ///
+    /// **变异**：`RunFailed` 也写出缓冲 ⇒ 第 1 条变红；不清缓冲 ⇒ 第 2 条得到 `"工完成"`
+    /// （屏上就是两份）；把 `printed_any` 改成「收到过 delta 即为真」⇒ 第 1 条变红。
+    #[tokio::test]
+    async fn print_mode_drops_discarded_attempt_and_keeps_failed_turn_silent() {
+        // ① 失败回合：缓冲里的半句话不写。
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(env(delta("工"))).await.unwrap();
+        tx.send(env(delta("作"))).await.unwrap();
+        tx.send(env(AgentEvent::RunFailed {
+            error: "provider boom".into(),
+        }))
+        .await
+        .unwrap();
+
+        let mut failed_out: Vec<u8> = Vec::new();
+        let (printed_any, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            consume_print_events(rx, &mut failed_out, None, "test-session"),
+        )
+        .await
+        .expect("RunFailed 是终局事件，应即返回")
+        .expect("消费本身不应异常");
+        assert!(!printed_any, "没写出任何正文 ⇒ printed_any 为假（不补换行）");
+        assert!(failed_out.is_empty(), "失败回合必须零输出");
+
+        // ② 作废后重放：只留重放的那一份。
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(env(delta("工"))).await.unwrap();
+        tx.send(env(AgentEvent::ModelStreamDiscarded {
+            reason: "provider stream error".into(),
+        }))
+        .await
+        .unwrap();
+        tx.send(env(delta("完成"))).await.unwrap();
+        tx.send(env(finished())).await.unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let (printed_any, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            consume_print_events(rx, &mut out, None, "test-session"),
+        )
+        .await
+        .expect("应收到终局事件即返回")
+        .unwrap();
+        assert!(printed_any, "重放后写出了正文");
+        assert_eq!(String::from_utf8(out).unwrap(), "完成", "作废的那半句必须丢掉");
     }
 
     /// 13. **一次性模式的回合号**：`-p`/`--json` 走 [`run_single_turn`]
@@ -4756,8 +4973,46 @@ mod tests {
             "app 产品默认必须与库的保守默认（10）分离（防恒真）"
         );
 
+        // 流中断重试：缺省走 app 产品默认（非零），与库默认（`0` = 关闭）分离。
+        assert_eq!(
+            limits_default.stream_interrupt_retries,
+            ys_component::DEFAULT_STREAM_INTERRUPT_RETRIES,
+            "缺省必须走 app 产品默认"
+        );
+        assert_ne!(
+            limits_default.stream_interrupt_retries,
+            ys_component::RunLimits::default().stream_interrupt_retries,
+            "若等于库默认 0，说明装配没接上（主轮就不会重试）"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir_default);
+    }
+
+    /// `stream_interrupt_retries` 可被 `config.json` 覆盖（`0` = 关闭）。
+    ///
+    /// 变异：把 `resolve_limits` 里的赋值删掉 / 写死成 `0` ⇒ 本用例变红。
+    #[test]
+    fn resolve_limits_reads_stream_interrupt_retries_from_config() {
+        let _guard = crate::test_env::env_lock();
+
+        for (raw, expect) in [("1", 1u32), ("0", 0), ("3", 3)] {
+            let dir = unique_tmp_dir("resolve_limits_stream_retry");
+            let path = dir.join("config.json");
+            std::fs::write(&path, format!(r#"{{ "stream_interrupt_retries": {raw} }}"#)).unwrap();
+
+            let mut config = config::Config::from_env().unwrap();
+            config.model = "resolve-limits-model".into();
+            config.load_user_config(&path);
+
+            assert_eq!(
+                resolve_limits(&config).stream_interrupt_retries,
+                expect,
+                "config.json 的显式值必须生效（raw = {raw}）"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// 主轮思考开关只认 `YUSHAN_MAIN_THINKING=off`，其余一律 `None`（不干预）。

@@ -15,6 +15,11 @@ pub enum MockResponse {
         arguments: serde_json::Value,
     },
     Error(String),
+    /// **流已开始后中断**的失败（适配器给出 `ModelError::StreamInterrupted`）。
+    ///
+    /// 与 [`Self::Error`] 分开：两者在上层重试判定里待遇不同 —— 本变体可丢弃增量后
+    /// 整次重发，`Error` 不重发。依 stderr（没有增量）时上层无从区分二者。
+    StreamInterrupted(String),
     /// 被截断的纯文本响应（`finish_reason = Length`）。
     TruncatedText(String),
     /// 被截断的 tool call 响应（`finish_reason = Length`）。
@@ -80,6 +85,17 @@ impl MockModel {
             .lock()
             .unwrap()
             .push(MockResponse::Error(msg.into()));
+    }
+
+    /// 压入一个**流已开始后中断**的失败响应。
+    ///
+    /// 前置 `TextDelta` 不发 —— 与真实 "已吐 delta 再断" 不完全同形，但重试链路上的
+    /// 差异点只有错误类别，故足以钉住上层行为（`ModelStreamDiscarded` 与重发次数）。
+    pub fn push_stream_interrupted(&self, msg: impl Into<String>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push(MockResponse::StreamInterrupted(msg.into()));
     }
 
     /// 压入一个「被截断的 tool call」响应（finish_reason = Length）。
@@ -154,6 +170,7 @@ impl Model for MockModel {
                 })
             }
             MockResponse::Error(msg) => Err(ModelError::Provider(msg)),
+            MockResponse::StreamInterrupted(msg) => Err(ModelError::StreamInterrupted(msg)),
             // 截断分支**不** emit `TextDelta` —— 与 `push_tool_call` 一致，
             // 只有 `push_text` 才发增量。
             MockResponse::TruncatedText(text) => Ok(ModelResponse {

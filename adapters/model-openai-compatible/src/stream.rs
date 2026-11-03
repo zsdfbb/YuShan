@@ -92,6 +92,41 @@ where
     Ok(false)
 }
 
+/// 错误链的诊断深度上限（含首段）。
+///
+/// 必须有上限：`source()` 的某个实现可能返回自引用链，无界跟进会死循环。
+/// 八层足以覆盖 `reqwest` → `hyper` → `h2` → `io` 这类现实深度。
+const ERROR_CHAIN_MAX_DEPTH: usize = 8;
+
+/// 把错误连同 `source()` 链拼成一行诊断，形如 `外层 ← 内层 ← 最内层`。
+///
+/// `reqwest::Error` 的 `Display` 只说 `error decoding response body`，真正的根因
+/// （`unexpected eof`、`connection reset by peer` 等）只在 `source()` 链里 ——
+/// 丢弃它等于丢掉断流排障的唯一线索。
+///
+/// 相邻两层文本完全相同时只保留一层：有些 crate 的 `source()` 直接回指自身。
+fn describe_error_chain(error: &dyn std::error::Error) -> String {
+    let mut described = error.to_string();
+    let mut last = described.clone();
+    let mut source = error.source();
+    // 首段已计入，故从 1 起算。
+    let mut visited: usize = 1;
+    while let Some(current) = source {
+        if visited >= ERROR_CHAIN_MAX_DEPTH {
+            break;
+        }
+        visited += 1;
+        let text = current.to_string();
+        if text != last {
+            described.push_str(" ← ");
+            described.push_str(&text);
+            last = text;
+        }
+        source = current.source();
+    }
+    described
+}
+
 /// 流空闲超时错误消息的标记子串。
 ///
 /// `complete` 用它从其他流阶段错误里区分出**可重试**的空闲超时（属传输层）：
@@ -141,7 +176,8 @@ where
                 }
             }
             Ok(Some(Err(e))) => {
-                on_event(StreamEvent::Error(e.to_string()))?;
+                // 带出 `source()` 链：裸 `Display` 只有「解码响应体失败」这句空壳。
+                on_event(StreamEvent::Error(describe_error_chain(&e)))?;
                 return Ok(());
             }
         }
@@ -328,5 +364,82 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n";
         assert_eq!(usage.prompt_tokens, 3);
         assert_eq!(usage.completion_tokens, 4);
         assert_eq!(usage.total_tokens, 0);
+    }
+
+    /// 测试用错误层：`source()` 返回下一层，用于构造任意深度的错误链。
+    #[derive(Debug)]
+    struct Layer {
+        text: String,
+        inner: Option<Box<Layer>>,
+    }
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.text)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.inner
+                .as_ref()
+                .map(|inner| inner.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// 按「外层 → 内层」顺序构造错误链。
+    fn error_chain(layers: &[&str]) -> Layer {
+        let mut rest = layers.iter().rev();
+        let mut layer = Layer {
+            text: rest.next().expect("至少一层").to_string(),
+            inner: None,
+        };
+        for text in rest {
+            layer = Layer {
+                text: (*text).to_string(),
+                inner: Some(Box::new(layer)),
+            };
+        }
+        layer
+    }
+
+    /// 10. `source()` 链按 `外层 ← 内层` 拼成一行 —— 底层根因不得被丢弃。
+    ///
+    /// 变异：改回 `error.to_string()`（只取首段）⇒ 本用例变红。
+    #[test]
+    fn describe_error_chain_joins_source_chain() {
+        let error = error_chain(&["outer", "middle", "root cause"]);
+        assert_eq!(describe_error_chain(&error), "outer ← middle ← root cause");
+    }
+
+    /// 11. 相邻层同文不重复拼接（自指 `source()` 不得变成 `x ← x ← x`）。
+    #[test]
+    fn describe_error_chain_skips_duplicate_adjacent_layers() {
+        let error = error_chain(&["same text", "same text", "leaf"]);
+        assert_eq!(describe_error_chain(&error), "same text ← leaf");
+    }
+
+    /// 12. 超深链被截断到上限层数（防自引用链死循环，也防诊断行无界膨胀）。
+    #[test]
+    fn describe_error_chain_caps_depth() {
+        let labels: Vec<String> = (0..ERROR_CHAIN_MAX_DEPTH + 5)
+            .map(|i| format!("layer{i}"))
+            .collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let error = error_chain(&refs);
+
+        let described = describe_error_chain(&error);
+        let segments: Vec<&str> = described.split(" ← ").collect();
+        assert_eq!(
+            segments.len(),
+            ERROR_CHAIN_MAX_DEPTH,
+            "层数必须恰好截到上限：{described}"
+        );
+        assert_eq!(segments[0], "layer0", "首段是外层错误");
+        assert_eq!(
+            segments[ERROR_CHAIN_MAX_DEPTH - 1],
+            format!("layer{}", ERROR_CHAIN_MAX_DEPTH - 1),
+            "最后一层是上限处的那层"
+        );
     }
 }

@@ -118,10 +118,23 @@ flowchart TB
 
 ## 快速开始
 
+需要 Rust 1.88+（edition 2024）。Ubuntu 另需 `build-essential pkg-config libssl-dev`：
+
 ```console
 $ git clone https://github.com/zsdfbb/YuShan.git && cd YuShan
-$ ./scripts/cargo-build.sh build --release
-$ ./target/release/ys-coding-agent
+$ ./scripts/install.sh                  # 构建 release，装到 ~/.local/bin
+$ ys-coding-agent
+```
+
+脚本会先查一遍工具链，缺什么就打印对应的 `apt-get` / `rustup` 命令，不代跑。
+`--with-skills` 顺带装仓库自带的 skill，`--dry-run` 只看计划，`--uninstall` 只删二进制、
+不动 `~/.yushan`；升级就是 `git pull && ./scripts/install.sh`。
+
+不想装到 `~/.local/bin`，或者只想跑一下不安装：
+
+```console
+$ ./scripts/install.sh --dest ~/bin     # 换安装目录（或 YUSHAN_INSTALL_DIR）
+$ ./scripts/cargo-build.sh build --release && ./target/release/ys-coding-agent
 ```
 
 首次启动在界面里输入 `/login` 选 provider 并填入 key（`deepseek` / `minimax` /
@@ -131,7 +144,7 @@ $ ./target/release/ys-coding-agent
 不想开界面：
 
 ```console
-$ ./target/release/ys-coding-agent -p "这个项目是做什么的"
+$ ys-coding-agent -p "这个项目是做什么的"
 ```
 
 ## 现在能做什么

@@ -182,6 +182,15 @@ pub struct App {
     /// 类型是 `pub(crate)`（`draw.rs` 的高亮层与 `events.rs` 的鼠标分支都要直接访问），
     /// 故字段同用 `pub(crate)` —— 与 [`Self::layout`] / [`Self::md_cache`] 一贯。
     pub(crate) selection: crate::selection::Selection,
+    /// 输入框拖选中**冻结**的滚动偏移；`None` = 当前没在输入框里拖选。
+    ///
+    /// 存冻结值而不是 `bool`：输入区的可视行会随光标滚动（`draw_input` 的 `offset`），
+    /// 若拖选期间还跟着滚，命中映射与画面就会同时移动 ⇒ 选区追不上指针。冻结后
+    /// 拖选期间输入区不自动滚动，坐标与画面始终同一套。
+    ///
+    /// 输入区最多 [`crate::draw::INPUT_MAX_LINES`] 行，滚不到屏幕外，故不需要
+    /// 聊天区那套「贴边自动滚动」。
+    pub(crate) input_drag: Option<usize>,
     /// `ToolCallId` → transcript 下标 —— 工具结果据此回填到对应的 Tool 行。
     pub(crate) tool_index: HashMap<ToolCallId, usize>,
     /// 本地回显抑制计数：提交时已本地 push 的那条 `UserMessage`，
@@ -239,6 +248,7 @@ impl App {
             md_cache: std::cell::RefCell::new(crate::cache::RenderCache::default()),
             layout: std::cell::RefCell::new(crate::layout::TranscriptLayout::default()),
             selection: crate::selection::Selection::default(),
+            input_drag: None,
             tool_index: HashMap::new(),
             suppress_user_echo: 0,
             pending_echo_texts: VecDeque::new(),

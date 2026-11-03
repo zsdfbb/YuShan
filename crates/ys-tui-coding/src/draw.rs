@@ -204,6 +204,38 @@ fn input_inner_width(total_width: u16) -> usize {
     total_width.saturating_sub(2).max(1) as usize
 }
 
+/// 输入区的几何 + 可视窗口：`(内区矩形, 折行宽度, 滚动偏移, 可视行数)`。
+///
+/// **渲染与鼠标命中共用这一个来源** —— 否则「高亮按 A 算、命中按 B 算」，
+/// 拖选就会与文字错位。`offset` 取拖选期间冻结的值（[`App::input_drag`]）：
+/// 拖选时输入区不跟着光标滚，坐标与画面才是同一套。
+///
+/// 尺寸低于 [`MIN_WIDTH`] / [`MIN_HEIGHT`] ⇒ `None`（[`ui`] 整屏不渲染）。
+pub(crate) fn input_geom(
+    app: &App,
+    width: u16,
+    height: u16,
+) -> Option<(Rect, usize, usize, usize)> {
+    if width < MIN_WIDTH || height < MIN_HEIGHT {
+        return None;
+    }
+    let area = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(input_height(app, width)),
+        Constraint::Length(1),
+    ])
+    .split(Rect::new(0, 0, width, height))[1];
+    let block = Block::bordered().title(" Input ");
+    let inner = block.inner(area);
+    let inner_w = input_inner_width(width);
+    let inner_h = inner.height as usize;
+    let offset = app.input_drag.unwrap_or_else(|| {
+        let (_, cursor_row, _) = wrap_input(&app.input.text, app.input.cursor, inner_w);
+        cursor_row.saturating_sub(inner_h.saturating_sub(1))
+    });
+    Some((inner, inner_w, offset, inner_h))
+}
+
 /// Chat 区（含边框）—— 与 [`ui`] 的布局同源，供滚动算术复用。
 fn chat_area(app: &App, area: Rect) -> Rect {
     Layout::vertical([
@@ -506,9 +538,12 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     // 于是「一行长文本」会折到后续视觉行显示，而不是被 pane 裁掉尾部。
     let (rows, cursor_row, cursor_col) = wrap_input(&app.input.text, app.input.cursor, inner_w);
 
-    // turn 进行中也照常渲染输入缓冲与光标：`Working` 心跳只由状态行承担。
     // 视觉行超过 pane 时滚动，让光标所在行可见（贴住窗口底部）。
-    let offset = cursor_row.saturating_sub(inner_h.saturating_sub(1));
+    // **拖选期间冻结** —— 偏移与鼠标命中映射必须是同一份值，否则选区追不上指针。
+    // 冻结值由 `input_geom` 给（与鼠标分支同源）。
+    let offset = app
+        .input_drag
+        .unwrap_or_else(|| cursor_row.saturating_sub(inner_h.saturating_sub(1)));
 
     // 选区高亮与光标**共用这一份折行结果**：`rows` 已折好，逐行取选区相交的列区间即可。
     // 重算一份就会「高亮框与文字错一位」。

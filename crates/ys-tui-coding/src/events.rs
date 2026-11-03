@@ -159,7 +159,13 @@ pub fn handle_event(
         Event::Mouse(m) => handle_mouse(m, app, width, height),
         // resize 后 wrap 行数全变 ⇒ 全局视觉行号空间作废，选区里的行号已无意义。
         // 不必重算位置：重算后的选区对用户而言已是「另一段文字」。
-        Event::Resize(_, _) => app.selection.clear(),
+        Event::Resize(_, _) => {
+            // resize 后 wrap 行数全变 ⇒ 全局视觉行号空间作废，选区里的行号已无意义。
+            // 输入框的 char 索引选区**本身仍有效**（不依赖宽度），但滚动偏移冻结值
+            // 是旧宽度算的 ⇒ 拖选中的状态一并作废，否则命中映射会错位。
+            app.selection.clear();
+            app.input_drag = None;
+        }
         _ => {}
     }
 }
@@ -223,10 +229,16 @@ fn refine_gesture(kind: MouseEventKind, app: &mut App) -> bool {
             | MouseEventKind::Up(MouseButton::Right)
             | MouseEventKind::Drag(MouseButton::Right)
     );
-    if !is_right || !app.selection.is_active() {
+    if !is_right || !(app.selection.is_active() || app.input.selection().is_some()) {
         return false;
     }
-    copy_marked_selection(app);
+    // 两个区各自有自己的选区，按「哪个有高亮就重拷哪个」补救：
+    // 输入框优先 —— 它是更小的范围，用户刚在那拖完的可能性更大。
+    if app.input.selection().is_some() {
+        copy_input_selection(app);
+    } else {
+        copy_marked_selection(app);
+    }
     true
 }
 
@@ -321,7 +333,10 @@ pub fn fold_wheel(events: &[MouseEvent]) -> WheelDelta {
 /// （[`WheelDelta::one`]）—— 位移折算只有一份。
 pub(crate) fn scroll_wheel_batch(app: &mut App, width: u16, height: u16, delta: WheelDelta) {
     // 用户主动滚动了 ⇒ 选区里的全局行号已对不上屏幕内容。
+    // 输入框选区不受滚动影响（它是 char 索引，不是行号）⇒ **不清**，
+    // 只丢弃拖选中的冻结偏移（否则下一次拖选的命中映射会沿用旧值）。
     app.selection.clear();
+    app.input_drag = None;
     let net = delta.rows();
     if net == 0 {
         return;
@@ -329,16 +344,25 @@ pub(crate) fn scroll_wheel_batch(app: &mut App, width: u16, height: u16, delta: 
     scroll(app, width, height, net);
 }
 
-/// 左键按下：**先清旧选区**，在内区内那么建新锚点。
+/// 左键按下：**先清旧选区**，再按落点分派到聊天区或输入框。
 ///
 /// 左键是**清除键**：不论旧选区是「已标记待拷」还是「已复制、高亮仍在」，一次左键
-/// 按下就把它清掉（用户看到的「点击一下高亮消失」）。内区外按下同样清 —— 点到边框或
-/// 输入框就是「我不选了」。
+/// 按下就把它清掉（用户看到的「点击一下高亮消失」）。两区都清 —— 切区就是换一个
+/// 选，不能让旧高亮留在另一边。
 ///
-/// 按下点在内区外时钳制语义没有意义（用户意图不是选 Chat），故不建选区 ——
-/// 与 `Drag` / `Up` 的「窗外钳制」有意不同。
+/// **分派依据是落点，不是「哪边有内容」**：两个区各自的坐标空间不同（聊天区是全局
+/// 视觉行，输入区是内区局部行 + 显示列），混用会错位。落点在两个区之外时都不建选区。
 fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     app.selection.clear();
+    // 切到聊天区：输入框的拖选态一并作废（否则高亮留在输入框里）。
+    app.input_drag = None;
+    app.input.begin_move(false);
+    app.input.settle();
+
+    if begin_input_drag(app, m, width, height) {
+        return;
+    }
+
     let Some(inner) = crate::draw::chat_inner_rect(app, width, height) else {
         return;
     };
@@ -358,8 +382,41 @@ fn begin_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     // 真正冻结视窗的是 [`extend_selection`] 里「指针确实离开了按下点」那一刻。
 }
 
+/// 按下点在输入框内区 ⇒ 在那里建拖选锚点并冻结滚动偏移，返回 `true`。
+///
+/// 坐标换算（屏幕 → 视觉行 / 显示列）全部经 [`crate::draw::input_geom`]，与渲染
+/// 同源 —— 这是「高亮与文字不错位」的唯一保证。
+///
+/// 越出内区时**钳到边界**（而不是像聊天区那样拒绝）：输入框只有几行，用户很容易
+/// 拖出去一点，钳制符合「拖到哪选到哪」的直觉。
+fn begin_input_drag(app: &mut App, m: MouseEvent, width: u16, height: u16) -> bool {
+    let Some((inner, inner_w, offset, inner_h)) = crate::draw::input_geom(app, width, height)
+    else {
+        return false;
+    };
+    if m.column < inner.x
+        || m.column >= inner.x + inner.width
+        || m.row < inner.y
+        || m.row >= inner.y + inner.height
+    {
+        return false;
+    }
+    app.input_drag = Some(offset);
+    let row = (m.row - inner.y) as usize + offset;
+    let col = (m.column - inner.x) as usize;
+    let _ = inner_h;
+    app.input.begin_drag_at(inner_w, row, col);
+    true
+}
+
 /// 拖动 / 松开时把屏幕坐标钳进内区，并据钳制方向定 `edge`（触发自动滚动）。
+///
+/// **输入框拖选中优先**：它有自己的坐标空间（内区局部行 + 显示列），不经过
+/// 聊天区的全局视觉行号，故在 `is_dragging()` 之前分派。
 fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
+    if extend_input_drag(app, m, width, height) {
+        return;
+    }
     if !app.selection.is_dragging() {
         return;
     }
@@ -398,18 +455,63 @@ fn extend_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
     }
 }
 
+/// 输入框拖选的伸端点：`app.input_drag` 已置位才生效，返回 `true` 表示本事件已消费。
+///
+/// 坐标钳到输入框内区：拖出去（常见于选到行尾）按边界算，不丢选区。
+/// 行号加冻结的 `offset` —— 与按下时的坐标同一套，否则拖选期间一旦重算偏移
+/// （光标移动会触发）选区就会跳。
+fn extend_input_drag(app: &mut App, m: MouseEvent, width: u16, height: u16) -> bool {
+    let Some(offset) = app.input_drag else {
+        return false;
+    };
+    let Some((inner, inner_w, _, _)) = crate::draw::input_geom(app, width, height) else {
+        return false;
+    };
+    let row = m
+        .row
+        .clamp(inner.y, inner.y + inner.height.saturating_sub(1));
+    let col = m
+        .column
+        .clamp(inner.x, inner.x + inner.width.saturating_sub(1));
+    let row = (row - inner.y) as usize + offset;
+    let col = (col - inner.x) as usize;
+    app.input.drag_to(inner_w, row, col);
+    true
+}
+
 /// 松开左键：先把选区转为「已标记」，**随即复制**。
 ///
 /// 复制由松手触发而不是右键（见模块文档）：右键在 VS Code 等终端里被 DOM 拦走，
 /// 挂右键就等于那类终端永远复制不了。两端点重合（按下未拖动）⇒ `mark()` 直接清选区，
 /// 此时 `is_active()` 为假，[`copy_marked_selection`] 自然什么都不做。
 fn finish_selection(app: &mut App, m: MouseEvent, width: u16, height: u16) {
+    // 输入框拖选：松手就是复制（与聊天区同一语义）。
+    // 复制**不清**选区 —— 高亮留着，用户才看得见刚拷走哪段；清除交给下一次按下。
+    if app.input_drag.is_some() {
+        extend_input_drag(app, m, width, height);
+        app.input_drag = None;
+        copy_input_selection(app);
+        return;
+    }
     if !app.selection.is_dragging() {
         return;
     }
     extend_selection(app, m, width, height);
     app.selection.mark();
     copy_marked_selection(app);
+}
+
+/// 把输入框选区写进剪贴板，**保留**选区（高亮不消失）。
+///
+/// 空选区（按下未拖动）⇒ 什么都不做：`selection()` 自己就返回 `None`，不会白写一次
+/// 「已复制 0 字」。
+fn copy_input_selection(app: &mut App) {
+    let Some(text) = app.input.selection_text().map(str::to_owned) else {
+        return;
+    };
+    let chars = text.chars().count();
+    app.note_status(format!("已复制 {chars} 字"));
+    app.pending_clipboard = Some(text);
 }
 
 /// 把选区写进剪贴板，**保留**选区（高亮不消失，用户看得见刚拷走哪段）。
@@ -1765,6 +1867,300 @@ mod tests {
         }
         assert!(a.selection.is_marked(), "前置：松手后应转为已标记");
         assert!(a.pending_clipboard.is_some(), "前置：松手即复制");
+    }
+
+    // -----------------------------------------------------------------------
+    // 输入框拖选
+    // -----------------------------------------------------------------------
+
+    /// 输入区内区的屏幕坐标（`input_geom` 的唯一来源，测试不自己推几何）。
+    fn input_inner(a: &App, w: u16, h: u16) -> ratatui::layout::Rect {
+        crate::draw::input_geom(a, w, h)
+            .expect("前置：尺寸足够渲染")
+            .0
+    }
+
+    /// 在输入框内按显示列拖选（同一条视觉行）。
+    fn drag_input(a: &mut App, w: u16, h: u16, from_col: u16, to_col: u16) {
+        let inner = input_inner(a, w, h);
+        let y = inner.y;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let x = if kind == MouseEventKind::Down(MouseButton::Left) {
+                from_col
+            } else {
+                to_col
+            };
+            handle_mouse(mouse_at(kind, inner.x + x, y), a, w, h);
+        }
+    }
+
+    /// **在输入框里拖选 ⇒ 选中那段文字并复制**。
+    ///
+    /// 变异：
+    /// - `begin_selection` 不调 `begin_input_drag`（退回「只认聊天区」）⇒ 无选区、
+    ///   复制断言全红；
+    /// - `finish_selection` 不调 `copy_input_selection` ⇒ `pending_clipboard` 红；
+    /// - `input_geom` 的 `offset` 不冻结（拖选期间跟着光标滚）⇒ 多行用例的
+    ///   行号断言红。
+    #[test]
+    fn test_drag_selects_input_and_copies() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        a.input.insert_str("hello world");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+        a.pending_clipboard = None;
+
+        // 从列 0 拖到列 5（"hello" 之后）。
+        drag_input(&mut a, w, h, 0, 5);
+
+        assert_eq!(
+            a.input.selection_text(),
+            Some("hello"),
+            "应选中按下点到松开点之间的文字"
+        );
+        assert_eq!(
+            a.pending_clipboard.as_deref(),
+            Some("hello"),
+            "松手即复制到剪贴板"
+        );
+        assert!(
+            !a.selection.is_active(),
+            "聊天区选区不得被同时建出来（两区坐标空间不同）"
+        );
+    }
+
+    /// 反向拖（从右往左）也得到同一段 —— 选区按两端点归一化，与方向无关。
+    #[test]
+    fn test_drag_input_backwards_selects_same_text() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        a.input.insert_str("hello world");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+
+        drag_input(&mut a, w, h, 5, 0);
+        assert_eq!(a.input.selection_text(), Some("hello"));
+        assert_eq!(a.pending_clipboard.as_deref(), Some("hello"));
+    }
+
+    /// 按下但**不拖动**（两端点重合）⇒ 无选区、不写剪贴板。
+    ///
+    /// 这条防的是「点一下输入框就报『已复制 0 字』」那类噪声。
+    #[test]
+    fn test_click_input_without_drag_copies_nothing() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        a.input.insert_str("hello");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+        a.pending_clipboard = None;
+
+        drag_input(&mut a, w, h, 2, 2);
+
+        assert_eq!(a.input.selection(), None, "两端点重合即无选区");
+        assert!(a.pending_clipboard.is_none(), "不得白写一次剪贴板");
+    }
+
+    /// **宽字符按显示列命中**：拖到 `你` 的第二列仍算选中 `你`。
+    ///
+    /// 变异：`index_at` 改成按 char 索引当列用 ⇒ 命中偏到后一个字，断言红。
+    #[test]
+    fn test_drag_input_hits_wide_chars_by_display_column() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        a.input.insert_str("你好世界");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+
+        // `你` 占显示列 0-1，`好` 占 2-3：拖到列 3 应选中「你好」。
+        drag_input(&mut a, w, h, 0, 3);
+        assert_eq!(a.input.selection_text(), Some("你好"));
+    }
+
+    /// 拖出输入框下边界 ⇒ 钳到内区末行（不丢选区、不 panic）。
+    #[test]
+    fn test_drag_input_below_bounds_clamps() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        a.input.insert_str("hello");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+        let inner = input_inner(&a, w, h);
+
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), inner.x, inner.y),
+            &mut a,
+            w,
+            h,
+        );
+        // 拖到输入区下方很远（状态行之外）。
+        handle_mouse(
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), inner.x + 5, h - 1),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse_at(MouseEventKind::Up(MouseButton::Left), inner.x + 5, h - 1),
+            &mut a,
+            w,
+            h,
+        );
+        assert_eq!(
+            a.input.selection_text(),
+            Some("hello"),
+            "拖出下边界应钳到行尾，仍是整段"
+        );
+    }
+
+    /// **端到端**：鼠标拖选 → 渲染一帧 → 反显落在选中的那几个字上。
+    ///
+    /// 前面几条用例断言的是「选中了哪些 char」，本用例断言「画出来的就是那几个字」——
+    /// 命中映射（`index_at`）与渲染映射（`input_selection_cells`）是两段独立代码，
+    /// 各自测通不代表拼起来对。这条把它们钉在一起。
+    ///
+    /// 变异：让 `begin_input_drag` 的 `col` 少减 `inner.x`（坐标原点错位）⇒ 高亮整体
+    /// 偏移一列，列区间断言红。
+    #[test]
+    fn test_drag_input_highlight_lands_on_selected_glyphs() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        const W: u16 = 60;
+        const H: u16 = 20;
+        let mut a = app();
+        a.input.insert_str("abcdef");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+
+        // 选 "bcd"：命中列是**左闭右开**（`index_at` 落在该列起第一个 char 之前），
+        // 故右端点要给到 4 才能把 `d` 包进来。
+        drag_input(&mut a, W, H, 1, 4);
+        assert_eq!(a.input.selection_text(), Some("bcd"), "前置：选中 bcd");
+
+        let buf = {
+            let backend = TestBackend::new(W, H);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| crate::draw::ui(f, &mut a)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let mut cols: Vec<u16> = Vec::new();
+        for y in 0..H {
+            for x in 0..W {
+                if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                    cols.push(x);
+                }
+            }
+        }
+        // 内区左边框占 1 列 ⇒ 缓冲里的 "bcd" 在列 2..=4。
+        assert_eq!(cols, vec![2, 3, 4], "高亮应正好盖住 bcd：{cols:?}");
+    }
+
+    /// **多行输入 + 视窗滚动时，命中行号要加上冻结的 offset**。
+    ///
+    /// 输入区最多 [`crate::draw::INPUT_MAX_LINES`] 行（含边框），超出则跟着光标滚。
+    /// 拖选期间若 offset 每帧重算，命中映射与画面会同时移动 ⇒ 选区追不上指针。
+    ///
+    /// 变异：`input_geom` 的 `offset` 不用 `app.input_drag`（退回「永远跟光标滚」）
+    /// ⇒ 行号断言红。
+    #[test]
+    fn test_drag_input_multiline_uses_frozen_offset() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        // 8 行 ⇒ 内区装不下（`INPUT_MAX_LINES = 5`），光标在末行 ⇒ offset > 0。
+        a.input.insert_str("L0\nL1\nL2\nL3\nL4\nL5\nL6\nL7");
+        a.input.anchor = None;
+
+        let (inner, inner_w, offset, inner_h) =
+            crate::draw::input_geom(&a, w, h).expect("前置：尺寸足够");
+        assert!(offset > 0, "前置：多行应触发滚动（offset={offset}）");
+        let _ = inner_w;
+        let _ = inner_h;
+
+        // 在**屏幕上可见的第一行**按下 —— 它对应缓冲里的第 `offset` 个视觉行。
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), inner.x, inner.y),
+            &mut a,
+            w,
+            h,
+        );
+        // 按下时两端点重合 ⇒ `selection()` 返回 `None`（空选区），故直接读锚点。
+        // `L0..L7` 每行 3 个 char（"Lx\n"）⇒ 第 n 行首的 char 索引是 3n。
+        assert_eq!(
+            a.input.anchor,
+            Some(offset * 3),
+            "按下的可见行应映射到缓冲的第 {offset} 行（offset={offset}）"
+        );
+
+        // **拖动期间光标移到缓冲开头** —— 若 offset 每帧重算，它会从 3 掉回 0，
+        // 于是同一个屏幕行会被映射到缓冲第 0 行，选区整段错位。
+        // 冻结的 offset 必须让命中映射保持在按下时那一套。
+        a.input.cursor = 0;
+        let (_, _, offset_after, _) = crate::draw::input_geom(&a, w, h).expect("前置：尺寸足够");
+        assert_eq!(
+            offset_after, offset,
+            "拖选期间 offset 必须冻结，不得随光标移动重算"
+        );
+        handle_mouse(
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                inner.x + 1,
+                inner.y,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        assert_eq!(
+            a.input.anchor,
+            Some(offset * 3),
+            "锚点不得因拖动期间光标移动而漂移"
+        );
+    }
+
+    /// 按下聊天区后拖到输入框：**仍在聊天选区里**（分派看按下点，不看拖动点）。
+    ///
+    /// 这条钉住「两区坐标空间不可混用」：若拖动路径按当前落点重新分派，
+    /// 选区会被从聊天区搬到输入框，用户看到的是「拖着拖着选区跑了」。
+    #[test]
+    fn test_drag_from_chat_into_input_stays_in_chat() {
+        let (w, h) = (120u16, 40u16);
+        let mut a = app_scrollable();
+        a.input.insert_str("hello");
+        let chat = crate::draw::chat_inner_rect(&a, w, h).expect("前置：尺寸足够");
+        let input = input_inner(&a, w, h);
+
+        handle_mouse(
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                chat.x + 2,
+                chat.y + 2,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                input.x + 3,
+                input.y,
+            ),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(
+            a.selection.is_dragging(),
+            "聊天区拖选应仍在进行（未被输入框接管）"
+        );
+        assert_eq!(a.input.selection(), None, "输入框不应被建出选区");
     }
 
     #[test]

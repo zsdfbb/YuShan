@@ -321,6 +321,34 @@ impl InputBuffer {
         }
     }
 
+    /// 鼠标按下：把光标与锚点都钉在 `(row, col)` 命中的那个 char 上。
+    ///
+    /// `row` / `col` 是**输入区内区的视觉行号与显示列**（均从 0 起），
+    /// `width` 是同一帧的折行宽度。映射走 [`Self::index_at`] —— 与光标、`↑`/`↓`
+    /// 落点共用同一个口径，故高亮边界与光标位置不可能漂移。
+    ///
+    /// 按下就同时置 `anchor`：拖选是「按下定锚、拖动伸端点」，没有「先拖再定锚」
+    /// 的中间态。此时两端点重合，[`Self::selection`] 返回 `None`（空选区）。
+    pub fn begin_drag_at(&mut self, width: usize, row: usize, col: usize) {
+        let idx = self.index_at(width, row, col);
+        self.cursor = idx;
+        self.anchor = Some(idx);
+    }
+
+    /// 拖动：把光标移到 `(row, col)`，锚点不动 ⇒ 选区随之伸长或反向。
+    ///
+    /// 只有**正在拖**（`anchor.is_some()`）才生效：没有按下就来的 `Drag`
+    /// （触控板在单击时也会补发一个坐标相同的 `Drag`）不该凭空建出选区。
+    ///
+    /// 不在这里调 [`Self::settle`]：拖回起点途中会瞬时出现「两端点重合」，
+    /// 那是拖动中的正常经过点，抹掉锚点会让后续拖动变成「从头开始选」。
+    pub fn drag_to(&mut self, width: usize, row: usize, col: usize) {
+        if self.anchor.is_none() {
+            return;
+        }
+        self.cursor = self.index_at(width, row, col);
+    }
+
     // -----------------------------------------------------------------------
     // 按视觉行移动（`Up` / `Down`）
     // -----------------------------------------------------------------------
@@ -428,8 +456,9 @@ impl InputBuffer {
     /// 即「光标落在显示列 `col`（可偏差到最近的 char 边界）」的位置。
     ///
     /// 列越界 ⇒ 落到该行行尾；行越界 ⇒ `char_count()`。本函数是 [`Self::unwrap`] /
-    /// [`Self::down_visual`] 的落点求解器。
-    fn index_at(&self, width: usize, row: usize, col: usize) -> usize {
+    /// [`Self::down_visual`] 的落点求解器，也是**鼠标拖选**（[`Self::index_at_point`]）
+    /// 的底层映射 —— 光标与鼠标命中必须是同一个口径，否则高亮与光标会差一格。
+    pub fn index_at(&self, width: usize, row: usize, col: usize) -> usize {
         let width = width.max(1);
         let total = self.char_count();
         let mut cur_row = 0usize;

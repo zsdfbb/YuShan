@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -305,6 +305,40 @@ fn coalesce_wheel(
     (batch, deferred)
 }
 
+/// 排空紧跟 `first` 的一串 `Drag(Left)`，**只留最后一个**，返回该事件与被推迟的首个非拖拽事件。
+///
+/// 拖拽的语义是「选区末端跟到指针当前所在位置」⇒ 中间位置没有任何可观察效果。
+/// 而事件循环是「一个事件 = 一整帧」，于是快速拖动时终端爆发的一串 `Drag`
+/// 会逐个换来一次全屏重绘 —— 中间帧画完立刻被下一帧覆盖，纯属浪费。
+///
+/// 与 [`coalesce_wheel`] **有意不同**：滚轮是**增量**语义（每个事件的位移都要累加），
+/// 故那里保留全部事件；拖拽是**绝对位置**语义，只留最后一个即为等价。
+///
+/// 碰到的首个非拖拽事件（`Up` / 按键 / 滚轮…）**不丢**：原样返回，由调用方本轮消费 ——
+/// 否则松手那一拍会被吞，选区停在 `Dragging`。
+///
+/// 批大小由 [`MAX_WHEEL_BATCH`] 夹住 ⇒ 排空循环在任何事件源下都有界。
+fn coalesce_drag(
+    first: MouseEvent,
+    next: impl FnMut() -> Option<Event>,
+) -> (MouseEvent, Option<Event>) {
+    let mut latest = first;
+    let mut seen = 1usize;
+    let mut next = next;
+
+    while seen < MAX_WHEEL_BATCH {
+        match next() {
+            Some(Event::Mouse(m)) if m.kind == MouseEventKind::Drag(MouseButton::Left) => {
+                latest = m;
+                seen += 1;
+            }
+            Some(other) => return (latest, Some(other)),
+            None => break,
+        }
+    }
+    (latest, None)
+}
+
 fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -352,8 +386,22 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             app.selection.is_dragging() && app.selection.edge() != 0,
         ))? {
             let event = crossterm::event::read()?;
-            // 滚轮：终端把触控板一次滑动合批成多个事件，**批内累加**才跟手
-            // （ADR-0050 决策 2）。其余事件直接交给 `handle_round`。
+            // 两类高频事件各自合批，其余事件直接交给 `handle_round`：
+            //
+            // - **滚轮**：触控板一次滑动会爆发多个事件，批内**累加**净位移才跟手
+            //   （ADR-0050 决策 2）；
+            // - **拖拽**：只关心指针最后落点，中间位置无可观察效果。终端快速拖动时
+            //   同样爆发一串 `Drag`，逐事件画帧会把 30 个事件拖成 300 ms（debug）——
+            //   用户看到的就是「高亮追不上手」。
+            //
+            // 两者都必须把碰到的首个异类事件**推迟**到本轮尾部消费，否则松手 / 按键
+            // 会被吞一拍。
+            let next_event = || {
+                if !crossterm::event::poll(Duration::ZERO).ok()? {
+                    return None;
+                }
+                crossterm::event::read().ok()
+            };
             match event {
                 Event::Mouse(m)
                     if matches!(
@@ -361,18 +409,38 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     ) =>
                 {
-                    let (batch, deferred) = coalesce_wheel(m, || {
-                        if !crossterm::event::poll(Duration::ZERO).ok()? {
-                            return None;
-                        }
-                        crossterm::event::read().ok()
-                    });
+                    let (batch, deferred) = coalesce_wheel(m, next_event);
                     // 批内只施加**一次**净位移 ⇒ 一次 `layout.sync`；与逐事件累加等价。
                     events::scroll_wheel_batch(
                         app,
                         size.width,
                         size.height,
                         events::fold_wheel(&batch),
+                    );
+                    if let Some(other) = deferred {
+                        handle_round(
+                            app,
+                            other,
+                            requests,
+                            boundaries,
+                            size.width,
+                            size.height,
+                            &mut write_clipboard,
+                            &mut read_system_clipboard,
+                        );
+                    }
+                }
+                Event::Mouse(m) if m.kind == MouseEventKind::Drag(MouseButton::Left) => {
+                    let (latest, deferred) = coalesce_drag(m, next_event);
+                    handle_round(
+                        app,
+                        Event::Mouse(latest),
+                        requests,
+                        boundaries,
+                        size.width,
+                        size.height,
+                        &mut write_clipboard,
+                        &mut read_system_clipboard,
                     );
                     if let Some(other) = deferred {
                         handle_round(
@@ -1853,6 +1921,63 @@ mod tests {
         );
         assert!(seq.contains("\x1b[?1049h"), "须进 alt-screen：{seq:?}");
         assert!(seq.contains("\x1b[?2004h"), "须开括号粘贴：{seq:?}");
+    }
+
+    /// 拖拽合批：一串 `Drag(Left)` 只留**最后一个**，首个异类事件被推迟而不丢弃。
+    ///
+    /// 变异：把 `latest = m` 换成 `break`（只留第一个）⇒ 第二条断言红（选区末端
+    /// 停在批次起点，用户看到「拖不动」）；把 `Some(other) => return (latest, Some(other))`
+    /// 改成 `None => {}` 吞掉 ⇒ 第三条断言红（松手事件丢失，选区卡在 `Dragging`）。
+    #[test]
+    fn coalesce_drag_keeps_last_and_defers_other() {
+        let drag = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 99,
+            row: 99,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        // 两个 Drag 后面跟着松手：只留第 2 个位置（(4,5)），松手被推迟。
+        let mut queue = std::collections::VecDeque::from(vec![
+            Event::Mouse(drag(2, 3)),
+            Event::Mouse(drag(4, 5)),
+            Event::Mouse(up),
+        ]);
+        let (latest, deferred) = coalesce_drag(drag(1, 1), || queue.pop_front());
+        assert_eq!(
+            (latest.column, latest.row),
+            (4, 5),
+            "须留批次里最后一个 Drag"
+        );
+        assert!(
+            matches!(deferred, Some(Event::Mouse(m)) if m.kind == MouseEventKind::Up(MouseButton::Left)),
+            "松手必须被推迟而不是丢弃：{deferred:?}"
+        );
+
+        // 队列立即空：只剩首事件本身。
+        let (latest, deferred) = coalesce_drag(drag(7, 8), || None);
+        assert_eq!((latest.column, latest.row), (7, 8));
+        assert!(deferred.is_none(), "无后续事件时不产生推迟项");
+
+        // 首个异类是滚轮：不被吞进拖拽批。
+        let mut queue = std::collections::VecDeque::from(vec![Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })]);
+        let (latest, deferred) = coalesce_drag(drag(1, 1), || queue.pop_front());
+        assert_eq!((latest.column, latest.row), (1, 1), "滚轮不算拖拽批成员");
+        assert!(
+            matches!(deferred, Some(Event::Mouse(m)) if m.kind == MouseEventKind::ScrollUp),
+            "滚轮须被推迟：{deferred:?}"
+        );
     }
 
     /// `EnableMouseReporting` 命令自身只写三个序列（与 [`setup_sequence`] 同源）。

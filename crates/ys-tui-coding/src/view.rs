@@ -144,6 +144,11 @@ pub struct CodingView {
     /// `Outbound::View` 快照覆盖 —— 切主题是 UI 本地动作（`/theme`、浮层预览），
     /// 本字段此后仅是 app 侧持久化镜像的载体。
     pub theme: ThemeKind,
+    /// 二进制版本号（开场引言的 `v…`）。
+    ///
+    /// 由接线器注入，而不是本 crate 读自己的 `env!("CARGO_PKG_VERSION")`：后者是
+    /// **库**的版本号，用户关心的是他跑的那个可执行文件的版本。
+    pub version: String,
 }
 
 impl Default for CodingView {
@@ -174,6 +179,7 @@ impl Default for CodingView {
             effort: None,
             thinking_visible: false,
             theme: ThemeKind::default(),
+            version: "0.0.0".to_string(),
         }
     }
 }
@@ -270,6 +276,7 @@ impl CodingView {
             effort: None,
             thinking_visible: false,
             theme: ThemeKind::default(),
+            version: "0.0.0".to_string(),
         }
     }
 }

@@ -173,6 +173,8 @@ pub fn build_view(
         thinking_visible: wiring.meta().map(|m| m.thinking_visible).unwrap_or(false),
         // 主题的**启动初值**（来自 `state.json`；`App::new` 消费一次）。
         theme,
+        // 开场引言显示的版本号：取**可执行文件**的版本（本 crate 自己的版本是库的）。
+        version: env!("CARGO_PKG_VERSION").to_string(),
         // `/effort` 的当前有效档位：会话覆盖优先，否则配置默认（默认 `high`）。
         effort: cfg.effective_effort_level(),
     }

@@ -22,9 +22,15 @@
 //! | `warn` | alert `Warning` + `Important` |
 //! | `fail` | 工具失败标记 / `Error:` 前缀 / alert `Caution` |
 //! | `info` | 链接 / alert `Note` + `Tip` |
+//! | `land` | 开场 logo 的**山体**（绿系） |
+//! | `sea` | 开场 logo 的**水面**（蓝/青系） |
 //!
-//! 渲染层（`styles.rs` / `draw.rs` / `md.rs`）**只准**从这 10 个槽位取色，不得出现
+//! 渲染层（`styles.rs` / `draw.rs` / `md.rs`）**只准**从这 12 个槽位取色，不得出现
 //! 具名色 —— 否则「默认色泄漏」与「主题漂移」都失去单一判据。
+//!
+//! `land` / `sea` 只服务开场 logo：它是唯一需要「具象颜色」的地方（山是绿的、
+//! 海是蓝的），归到 `ok` / `user` 会让换主题时 logo 变色成「成功标记色」。两个新
+//! 槽位仍走同一色板、同一紫色守卫。
 //!
 //! # 为什么不做用户自定义主题
 //!
@@ -35,7 +41,7 @@
 //!
 //! # 紫色守卫
 //!
-//! 产品需求：任何主题的 9 个非 `bg` 槽位（5 套 × 9 = 45 色）都不得落在紫色色相区。
+//! 产品需求：任何主题的 11 个非 `bg` 槽位（5 套 × 11 = 55 色）都不得落在紫色色相区。
 //! 判据见 [`is_purple`]，由单测 C2 守卫。改色板时若触发它，**改色板而不是放宽判据**。
 //!
 //! **已知合法撞色**（不属紫色守卫范围，允许）：`gruvbox-dark` 的 `user` 与 `info` 同色；
@@ -166,6 +172,10 @@ pub struct Palette {
     pub warn: Color,
     pub fail: Color,
     pub info: Color,
+    /// 开场 logo 的山体（绿）。
+    pub land: Color,
+    /// 开场 logo 的水面（蓝）。
+    pub sea: Color,
 }
 
 /// `0xRRGGBB` → `Color::Rgb`。高位为红、中位为绿、低位为蓝。
@@ -184,6 +194,8 @@ static AYU_MIRAGE: Palette = Palette {
     warn: rgb(0xffd173),
     fail: rgb(0xf28779),
     info: rgb(0x95e6cb),
+    land: rgb(0x87d96c),
+    sea: rgb(0x5ccfe6),
 };
 
 static GRUVBOX_DARK: Palette = Palette {
@@ -197,6 +209,8 @@ static GRUVBOX_DARK: Palette = Palette {
     warn: rgb(0xfe8019),
     fail: rgb(0xfb4934),
     info: rgb(0x83a598),
+    land: rgb(0xb8bb26),
+    sea: rgb(0x83a598),
 };
 
 static NORD: Palette = Palette {
@@ -210,6 +224,8 @@ static NORD: Palette = Palette {
     warn: rgb(0xebcb8b),
     fail: rgb(0xbf616a),
     info: rgb(0x5e81ac),
+    land: rgb(0xa3be8c),
+    sea: rgb(0x81a1c1),
 };
 
 static EVERFOREST_DARK: Palette = Palette {
@@ -223,6 +239,8 @@ static EVERFOREST_DARK: Palette = Palette {
     warn: rgb(0xe69875),
     fail: rgb(0xe67e80),
     info: rgb(0x83c092),
+    land: rgb(0xa7c080),
+    sea: rgb(0x7fbbb3),
 };
 
 static SOLARIZED_DARK: Palette = Palette {
@@ -236,6 +254,8 @@ static SOLARIZED_DARK: Palette = Palette {
     warn: rgb(0xcb4b16),
     fail: rgb(0xdc322f),
     info: rgb(0x2aa198),
+    land: rgb(0x859900),
+    sea: rgb(0x268bd2),
 };
 
 /// 紫色守卫：`Color::Rgb` → sRGB → HSL，判「色相 ∈ [255°, 330°] 且 sat ≥ 0.20 且
@@ -359,6 +379,8 @@ mod tests {
                 ("warn", p.warn),
                 ("fail", p.fail),
                 ("info", p.info),
+                ("land", p.land),
+                ("sea", p.sea),
             ];
             for (slot, c) in slots {
                 assert!(!is_purple(c), "{} 的 {} 落紫色区", kind.name(), slot);
@@ -410,6 +432,8 @@ mod tests {
                 ("warn", p.warn),
                 ("fail", p.fail),
                 ("info", p.info),
+                ("land", p.land),
+                ("sea", p.sea),
             ];
             for (slot, c) in slots {
                 assert!(

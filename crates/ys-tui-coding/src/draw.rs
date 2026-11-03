@@ -303,22 +303,154 @@ pub fn max_scroll_offset_at(app: &mut App, width: u16, height: u16, now: Instant
 /// 与滚动数学读的是同一份布局 ⇒ 画面与滚动位置必然一致。
 ///
 /// 视窗切片依赖「整段折行 == 逐行折行之和」（N4）—— 故切片后拼起来与整段折行等价。
-/// 当前视窗要画的行（含「空 transcript ⇒ 占位行」）—— [`draw_transcript`] 与
+/// 开场 logo：四行岛屿剪影 —— 中峰为**玉山**，两侧为岸，最下为海面。
+///
+/// 每行拆成**山体**与**水面**两段（后者只在水波行非空）：颜色是这两个
+/// 语义槽位（`land` / `sea`）的唯一消费者。只用 ASCII，宽度全是 1 列。
+const LOGO: [(&str, &str); 4] = [
+    ("          /\\", ""),
+    ("     /\\  /  \\   /\\", ""),
+    ("    /  \\/    \\_/  \\", ""),
+    ("  ~~", "^~~~~~~~~~~~~~~^~"),
+];
+
+/// logo 整体占位宽度（最长行的显示宽度）—— 右侧信息从此列之后起排。
+const LOGO_WIDTH: usize = 22;
+/// logo + 右侧信息并排需要的最小内区宽度。窄于此值时（[`intro_text`]）退回纯文字
+/// 引言：`/\` 被裁掉一半的「山」比没有山更难看。
+const INTRO_MIN_COLS: usize = 40;
+
+/// 空 transcript 时 Chat 区显示的**引言**（纯文本逐行）—— 由 TUI 路径
+/// （[`intro_lines`]）与对照路径（[`transcript_plain_lines`]）共用。
+///
+/// 只在「本会话还没任何内容」时出现（新会话、`/clear` 之后、`/resume` 回放到空会话）：
+/// 它在**已渲染的历史之外**，不进 transcript、不参与滚动 —— 对话一开就自然消失。
+///
+/// 形态随可用宽度分两种：**够宽 ⇒ logo 与信息左右并排**，窄 ⇒ 退回纯文字（logo
+/// 被裁成一堆斜线比不放更差）。两种形态共用后面那两行信息（模型 / 目录 / 提示），
+/// 故窄终端只是没有图，不丢信息。
+///
+/// **仅测试用**：它是「整段文本」的参考路径，视窗化渲染（[`crate::layout`]）的
+/// 等价性用例拿它当对照。生产路径走 [`intro_lines`]。
+#[cfg(test)]
+fn intro_text(app: &App, width: usize) -> Vec<String> {
+    let info = intro_infos(app);
+    if width < INTRO_MIN_COLS {
+        let mut out = vec![format!("◈ YuShan  v{}", app.view.version)];
+        out.extend(info);
+        out.push(String::new());
+        out.push(INTRO_TIP.to_string());
+        return out;
+    }
+    // 并排：logo 在左、信息在右，第 i 行配第 i 条信息；行数不等时空行补齐。
+    let mut out: Vec<String> = (0..LOGO.len().max(info.len()))
+        .map(|i| {
+            let left = match LOGO.get(i) {
+                Some((mountain, sea)) => format!("{mountain}{sea}"),
+                None => String::new(),
+            };
+            // 按**显示宽度**补齐（logo 是 ASCII 所以宽度 == 字符数，但右侧信息
+            // 该列是纯空格，故用 `[:LOGO_WIDTH]` 的字节补齐即可）。
+            let padded = format!("{left:<LOGO_WIDTH$}");
+            let right = info.get(i).map(String::as_str).unwrap_or("");
+            if right.is_empty() {
+                padded.trim_end().to_string()
+            } else {
+                format!("{padded}  {right}")
+            }
+        })
+        .collect();
+    out.push(String::new());
+    out.push(INTRO_TIP.to_string());
+    out
+}
+
+/// 并排形态右侧那几行信息（也是窄形态的全部正文）。
+///
+/// 首行是品牌 + 版本：**版本号只在这里出现**，不容错不省略 —— 报 bug 第一件事就是
+/// 问版本，而 TUI 里没有任何其它地方能回答它。
+fn intro_infos(app: &App) -> Vec<String> {
+    vec![
+        format!("◈ YuShan  v{}", app.view.version),
+        // 没模型时不得留白：那是用户最需要知道的事，否则屏幕上唯一能提示它的地方
+        // 只剩状态行一个 `model` 段。
+        match app.view.model.as_deref() {
+            Some(model) => format!("model: {model}"),
+            None => "model: (未配置) —— /login 或 /model".to_string(),
+        },
+        format!("cwd:   {}", app.view.cwd.display()),
+    ]
+}
+
+/// 引言最后一行（两种形态共用）。
+const INTRO_TIP: &str = "  /help 看命令与键位 · /resume 恢复历史会话";
+
+/// 引言的上色版本（TUI 路径）。
+///
+/// 取色只走两个语义槽位：**山体 `land`（绿）、水面 `sea`（蓝）**；右侧信息与提示行
+/// 沿用旧规 —— 品牌行 `accent`、其余 `muted`。**不在这里折行**：视窗渲染会按内区
+/// 宽度裁掉超宽部分，而引言一旦折行就把「开场面」变成一堆碎行。
+fn intro_lines(app: &App, width: usize, palette: Palette) -> Vec<Line<'static>> {
+    let info = intro_infos(app);
+    let info_style = Style::default().fg(palette.muted);
+    let brand_style = Style::default().fg(palette.accent);
+    let land = Style::default().fg(palette.land);
+    let sea = Style::default().fg(palette.sea);
+
+    if width < INTRO_MIN_COLS {
+        let mut out = vec![Line::from(Span::styled(info[0].clone(), brand_style))];
+        out.extend(
+            info[1..]
+                .iter()
+                .map(|s| Line::from(Span::styled(s.clone(), info_style))),
+        );
+        out.push(Line::from(""));
+        out.push(Line::from(INTRO_TIP.to_string()));
+        return out;
+    }
+
+    let mut out: Vec<Line<'static>> = (0..LOGO.len().max(info.len()))
+        .map(|i| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut left_w = 0usize;
+            if let Some((mountain, water)) = LOGO.get(i) {
+                // 山体是一段、水面是一段 —— 两段各自一个 `Span`，颜色互不影响。
+                spans.push(Span::styled((*mountain).to_string(), land));
+                spans.push(Span::styled((*water).to_string(), sea));
+                left_w = mountain.len() + water.len();
+            }
+            let right = info.get(i);
+            if let Some(right) = right {
+                let pad = LOGO_WIDTH.saturating_sub(left_w) + 2;
+                spans.push(Span::raw(" ".repeat(pad)));
+                let style = if i == 0 { brand_style } else { info_style };
+                spans.push(Span::styled(right.clone(), style));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled(
+        INTRO_TIP.to_string(),
+        Style::default().fg(palette.fg),
+    )));
+    out
+}
+
+/// 当前视窗要画的行（含「空 transcript ⇒ 引言」）—— [`draw_transcript`] 与
 /// 判断占位行时的依据必须同源。
 ///
 /// 返回 `(lines, skip_rows)`：`skip_rows` 是窗口首行内部要跳过的视觉行数。
 fn window_lines(
     app: &App,
     top_row: usize,
+    inner_w: usize,
     inner_h: usize,
     palette: Palette,
 ) -> (Vec<Line<'static>>, usize) {
     let window = app.layout.borrow().window(top_row, inner_h);
     let lines = if window.lines.is_empty() && app.transcript.is_empty() {
-        vec![Line::from(Span::styled(
-            "(no messages yet)",
-            Style::default().fg(palette.muted),
-        ))]
+        intro_lines(app, inner_w, palette)
     } else {
         window.lines
     };
@@ -328,7 +460,13 @@ fn window_lines(
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, top_row: usize, palette: Palette) {
     let block = chat_block();
     let inner = block.inner(area);
-    let (lines, skip_rows) = window_lines(app, top_row, inner.height as usize, palette);
+    let (lines, skip_rows) = window_lines(
+        app,
+        top_row,
+        inner.width as usize,
+        inner.height as usize,
+        palette,
+    );
     if inner.is_empty() {
         frame.render_widget(block, area);
         return;
@@ -889,10 +1027,7 @@ pub(crate) fn build_text(app: &App, width: usize, now: Instant) -> Text<'static>
 fn build_text_with(app: &App, width: usize, thinking_visible: bool, now: Instant) -> Text<'static> {
     let palette = chrome(app);
     if app.transcript.is_empty() {
-        return Text::from(vec![Line::from(Span::styled(
-            "(no messages yet)",
-            Style::default().fg(palette.muted),
-        ))]);
+        return Text::from(intro_lines(app, width, palette));
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1394,7 +1529,9 @@ pub(crate) fn transcript_plain_lines(app: &App, width: usize) -> Vec<String> {
         }
     }
     if out.is_empty() {
-        out.push("(no messages yet)".to_string());
+        // 与 TUI 路径**同一份**文本（[`intro_text`]）：退出回放见到的是同一段引言，
+        // 只是不着色。
+        out.extend(intro_text(app, width));
     }
     out
 }
@@ -2742,10 +2879,13 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_transcript_placeholder() {
+    fn test_empty_transcript_shows_intro() {
         let mut app = app_with(CodingView::for_test());
         let joined = rows_of(&mut app, 120, 40).join("\n");
-        assert!(joined.contains("(no messages yet)"), "{joined}");
+        assert!(joined.contains("YuShan"), "空会话显示引言：{joined}");
+        assert!(joined.contains("deepseek-chat"), "引言带当前模型：{joined}");
+        assert!(joined.contains("/resume"), "引言提示可发现性入口：{joined}");
+        assert!(joined.contains('v'), "引言带版本号：{joined}");
     }
 
     #[test]
@@ -4283,22 +4423,73 @@ mod tests {
         assert_eq!(chat_viewport(&app, 80, MIN_HEIGHT - 1), (0, 0));
     }
 
-    /// **空 transcript ⇒ 占位行**（`window_lines` 与 `draw_transcript` 同源）。
+    /// **空 transcript ⇒ 引言**（`window_lines` 与 `draw_transcript` 同源）。
+    ///
+    /// 变异：把 `window_lines` 的空分支改回单行占位 ⇒ 第一条断言变红。
     #[test]
-    fn window_lines_yields_placeholder_when_empty() {
+    fn window_lines_yields_intro_when_empty() {
         let mut app = app_with(CodingView::for_test());
         app.sync_scroll_state(80, 24, Instant::now());
-        let (lines, _) = window_lines(&app, 0, 10, ThemeKind::default().palette());
-        assert_eq!(lines.len(), 1, "空 transcript 只给一行占位");
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "(no messages yet)");
+        let (lines, _) = window_lines(&app, 0, 80, 10, ThemeKind::default().palette());
+        // 4 行 logo（右侧挂 3 行信息）+ 1 空行 + 1 提示行。
+        assert_eq!(lines.len(), 6, "引言的固定行数：{lines:?}");
+        let text =
+            |i: usize| -> String { lines[i].spans.iter().map(|s| s.content.as_ref()).collect() };
+        assert!(text(0).contains("YuShan"), "首行带品牌：{}", text(0));
+        assert!(text(0).contains('v'), "首行带版本号：{}", text(0));
 
         // 实际渲染也应出现同一句。
         let rows = rows_of(&mut app, 80, 24);
-        assert!(
-            rows.iter().any(|r| r.contains("(no messages yet)")),
-            "渲染应包含占位行"
-        );
+        assert!(rows.iter().any(|r| r.contains("YuShan")), "渲染应包含引言");
+    }
+
+    /// **山绿、海蓝**：logo 的水波行必须**两段两个颜色** —— 山体 `land`、水面 `sea`。
+    ///
+    /// 变异：把 `sea` 也写成 `land`（或把整行当一段上色）⇒ 第三条断言变红。
+    #[test]
+    fn intro_logo_paints_land_green_and_sea_blue() {
+        let app = app_with(CodingView::for_test());
+        let p = ThemeKind::default().palette();
+        let lines = intro_lines(&app, 80, p);
+        // 最后一行 logo（水波行）：首段是山体、次段是水面。
+        let sea_row = &lines[LOGO.len() - 1];
+        let fgs: Vec<Option<ratatui::style::Color>> =
+            sea_row.spans.iter().map(|s| s.style.fg).collect();
+        assert_eq!(fgs[0], Some(p.land), "山体用 land");
+        assert_eq!(fgs[1], Some(p.sea), "水面用 sea");
+        assert_ne!(p.land, p.sea, "绿与蓝必须是两个色位");
+
+        // 纯山峰行：山体段在最前（水面段为空但仍在位，不制造额外颜色）。
+        assert_eq!(lines[0].spans[0].style.fg, Some(p.land), "山体在最前");
+        assert_eq!(lines[0].spans[1].content.as_ref(), "", "首行无水面");
+    }
+
+    /// 窄于 [`INTRO_MIN_COLS`] ⇒ 退回纯文字（无 logo），且**信息一条不少**。
+    ///
+    /// 变异：去掉宽度判定（恒画 logo）⇒ 第一条断言变红。
+    #[test]
+    fn intro_falls_back_to_text_on_narrow_terminal() {
+        let app = app_with(CodingView::for_test());
+        let p = ThemeKind::default().palette();
+        let narrow = intro_lines(&app, INTRO_MIN_COLS - 1, p);
+        let wide = intro_lines(&app, 80, p);
+        assert!(narrow.len() < wide.len(), "窄屏行数更少（没有 logo）");
+        for lines in [&narrow, &wide] {
+            let joined: String = lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(joined.contains("YuShan"), "品牌不得丢：{joined}");
+            assert!(joined.contains("model:"), "模型行不得丢：{joined}");
+            assert!(joined.contains("cwd:"), "目录行不得丢：{joined}");
+            assert!(joined.contains("/resume"), "可发现性入口不得丢：{joined}");
+        }
     }
 
     /// 输入框选区高亮必须落在**它自己的字上**（与 Chat 选区同一口径：`REVERSED`）。

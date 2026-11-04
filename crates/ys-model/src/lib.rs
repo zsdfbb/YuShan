@@ -179,17 +179,16 @@ mod tests {
 
     /// N10：`boundary` 是进程内取消通道，不是数据字段。
     ///
-    /// 守护方式是**类型层**而非运行期断言：`ModelRequest` 不派生 `Serialize`
-    /// （线格式在适配器的 `ChatCompletionRequest`），故「把 boundary 序列化出去」
-    /// 不可表达。若有人给 `ModelRequest` 加回 `Serialize`，则 `boundary` 字段
-    /// （`Arc<dyn BoundarySource>` 无 `Serialize`）会让编译失败 —— 那正是需要
-    /// 重新审视「请求体是否已变成线格式契约」的时刻。
-    /// N11 仍钉住 clone 的共享语义（见下一条）。
-
     /// N11：`clone` 后 `boundary` 仍是**同一份** `Arc`（`Arc::ptr_eq`）。
     ///
     /// 共享语义是取消能生效的前提：loop 侧与 model 侧必须看到**同一个**
     /// abort 状态；clone 若产生独立副本，模型侧就永远看不到 abort。
+    ///
+    /// `boundary` 不进线格式的守护在**类型层**而非运行期断言：`ModelRequest`
+    /// 不派生 `Serialize`（线格式在适配器的 `ChatCompletionRequest`），故
+    /// 「把 boundary 序列化出去」不可表达。若有人给 `ModelRequest` 加回
+    /// `Serialize`，`Arc<dyn BoundarySource>` 无 `Serialize` 会让编译失败 ——
+    /// 那正是需要重新审视「请求体是否已变成线格式契约」的时刻。
     #[test]
     fn model_request_clone_keeps_same_boundary_arc() {
         let boundary: Arc<dyn ys_protocol::BoundarySource> =
@@ -225,6 +224,27 @@ mod tests {
         assert!(
             Arc::ptr_eq(&cloned.messages, &request.messages),
             "clone 后必须共享同一份 messages，否则每次模型调用都会深拷贝整个历史"
+        );
+    }
+
+    /// `tools` 同理：它是每轮请求的固定开销，clone 不得重拷整个 schema 表。
+    ///
+    /// 变异：把 `tools` 改回 `Vec<ToolSpec>` ⇒ 本用例变红。
+    #[test]
+    fn model_request_clone_shares_tools_arc() {
+        let tools = Arc::new(vec![ys_tool::ToolSpec::new(
+            "bash",
+            "run a command",
+            Default::default(),
+        )]);
+        let request = ModelRequest {
+            tools: tools.clone(),
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        assert!(
+            Arc::ptr_eq(&cloned.tools, &request.tools),
+            "clone 后必须共享同一份 tools，否则每轮请求都要重拷整张工具 schema 表"
         );
     }
 }

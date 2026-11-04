@@ -298,14 +298,14 @@ mod tests {
         assert_eq!(session.messages(), [text_msg("new1"), text_msg("new2")]);
     }
 
-    /// `shared_messages()` 必须返回**同一份** `Arc`，不是每次重算新快照。
+    /// `shared_messages()` 必须把**内部那份** `Arc` 交出来，且是 O(1) 的 `Arc::clone`。
     ///
-    /// 契约为：持有内部 `Arc` 快照的实现覆写后是 O(1) 取快照；若退回 trait 默认实现
-    /// （`Arc::new(self.messages().to_vec())`），每轮请求构造都要复制整个历史，
-    /// 且两次调用必然不是同一个 `Arc`。
+    /// 契约：两次调用返回同一份 `Arc`，并且它指向的 `Vec` 就是 `messages()` 看到的那块
+    /// 内存 —— 后者才是「没有复制历史」的实质判定。只看 `ptr_eq(a, b)` 不够：一个
+    /// 每次新建、却缓存了结果的实现也能通过，但它与 session 内存储无关。
     ///
     /// 变异：删掉 `impl Session for MemorySession` 里的 `shared_messages` 覆写
-    /// （即退回 trait 默认实现）⇒ 本用例红。
+    /// （退回 trait 默认实现 `Arc::new(self.messages().to_vec())`）⇒ 两条断言同时红。
     #[tokio::test]
     async fn memory_session_shared_messages_is_stable() {
         let mut session = MemorySession::new();
@@ -315,8 +315,12 @@ mod tests {
         let b = session.shared_messages();
         assert!(
             Arc::ptr_eq(&a, &b),
-            "两次 shared_messages 必须返回同一份 Arc：{}",
-            "否则每轮请求构造都要复制整个历史"
+            "两次 shared_messages 必须返回同一份 Arc：否则每轮请求构造都要复制整个历史"
+        );
+        assert_eq!(
+            a.as_ptr(),
+            session.messages().as_ptr(),
+            "快照必须指向 session 内存储的那块内存，而不是另拷一份"
         );
     }
 }

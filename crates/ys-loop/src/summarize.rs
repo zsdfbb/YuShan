@@ -10,6 +10,8 @@
 //! ⚠️ **本模块不负责**「不可信内容」的防御 —— 全部防御只有下方固定系统提示词里的一条规则
 //! 与调用方输出里的标题行标注（设计 §7 风险 1：**安慰剂级，不得宣传为防护**）。
 
+use std::sync::Arc;
+
 use ys_core::{ContentBlock, EventError, Message, Role, ThinkingOverride};
 use ys_model::{Model, ModelEvent, ModelEventSink, ModelRequest};
 
@@ -59,15 +61,15 @@ pub(crate) struct ModelSummarizer<'a> {
 impl ys_tool::Summarizer for ModelSummarizer<'_> {
     async fn summarize(&self, content: &str, prompt: &str) -> Result<String, String> {
         let request = ModelRequest {
-            messages: vec![Message {
+            messages: Arc::new(vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: format!("{prompt}\n\n<document>\n{content}\n</document>"),
                 }],
-            }],
+            }]),
             // 不带工具表：省下 ~1.5–2K token 的 schema 开销，且杜绝摘要模型吐 `tool_call`
             // （它拿不到工具结果，吐了只会污染这一次调用）。
-            tools: vec![],
+            tools: Arc::new(vec![]),
             system: Some(SUMMARIZE_SYSTEM.into()),
             // 工具侧摘要的固定上限（见 `SUMMARIZE_MAX_TOKENS`）：app 不再有 config 级
             // 覆盖，故这里就是线上生效值。

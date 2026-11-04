@@ -17,8 +17,20 @@ use ys_tool::ToolSpec;
 /// [`Model::complete`]: crate::Model::complete
 #[derive(Debug, Clone, Default)]
 pub struct ModelRequest {
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolSpec>,
+    /// 消息历史快照。
+    ///
+    /// **`Arc` 是为了让 `clone()` 变 O(1)**：重试循环每轮都 `request.clone()` 一次，
+    /// 而 `ModelRequest` 的 `Clone` 是派生实现 —— 若这里是 `Vec<Message>`，
+    /// 每次 clone 都会深拷贝整个历史。
+    ///
+    /// 读侧不受影响：`Arc<Vec<T>>` 的 deref 链是 `Arc<Vec<T>> → Vec<T> → [T]`，
+    /// `&request.messages` / `.iter()` / `.len()` / `[i]` 均照旧可用。
+    pub messages: Arc<Vec<Message>>,
+    /// 工具 schema 表。
+    ///
+    /// **同样是 `Arc`**：它是每轮请求的固定开销（实测 10 个工具 ≈ 9 KB、`to_vec` ≈ 42 µs），
+    /// 而循环内从不修改它 —— 没有理由每轮深拷一份。
+    pub tools: Arc<Vec<ToolSpec>>,
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,

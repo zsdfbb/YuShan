@@ -12,6 +12,7 @@ pub use meta::SessionMeta;
 pub use ys_core::Message;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 /// 打开既有会话时执行的一次性修复记录。
 ///
@@ -44,6 +45,17 @@ impl SessionRecovery {
 pub trait Session: Send {
     /// 获取 session 中的所有消息
     fn messages(&self) -> &[Message];
+
+    /// 取消息历史的共享快照。
+    ///
+    /// `ModelRequest.messages` 是 `Arc<Vec<Message>>`，构造请求时需要一份快照；
+    /// 默认实现现拷一份，行为正确但不优化 —— 持有内部快照的实现应覆写为 O(1)。
+    ///
+    /// 返回值必须是**某一时刻的完整历史**：调用方拿到后可自由持有，不受后续
+    /// `append` / `clear` 影响。
+    fn shared_messages(&self) -> Arc<Vec<Message>> {
+        Arc::new(self.messages().to_vec())
+    }
 
     /// 取走打开会话时产生的修复记录。
     ///
@@ -284,5 +296,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.messages(), [text_msg("new1"), text_msg("new2")]);
+    }
+
+    /// `shared_messages()` 必须返回**同一份** `Arc`，不是每次重算新快照。
+    ///
+    /// 契约为：持有内部 `Arc` 快照的实现覆写后是 O(1) 取快照；若退回 trait 默认实现
+    /// （`Arc::new(self.messages().to_vec())`），每轮请求构造都要复制整个历史，
+    /// 且两次调用必然不是同一个 `Arc`。
+    ///
+    /// 变异：删掉 `impl Session for MemorySession` 里的 `shared_messages` 覆写
+    /// （即退回 trait 默认实现）⇒ 本用例红。
+    #[tokio::test]
+    async fn memory_session_shared_messages_is_stable() {
+        let mut session = MemorySession::new();
+        session.append(text_msg("hi")).await.unwrap();
+
+        let a = session.shared_messages();
+        let b = session.shared_messages();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "两次 shared_messages 必须返回同一份 Arc：{}",
+            "否则每轮请求构造都要复制整个历史"
+        );
     }
 }

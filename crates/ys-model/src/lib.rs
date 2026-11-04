@@ -32,8 +32,8 @@ mod tests {
         model.push_text("hello world");
         let mut sink = MockEventSink;
         let req = ModelRequest {
-            messages: vec![],
-            tools: vec![],
+            messages: Arc::new(vec![]),
+            tools: Arc::new(vec![]),
             ..Default::default()
         };
         let resp = model.complete(req, &mut sink).await.unwrap();
@@ -49,8 +49,8 @@ mod tests {
         model.push_tool_call("bash", serde_json::json!({"command": "ls"}));
         let mut sink = MockEventSink;
         let req = ModelRequest {
-            messages: vec![],
-            tools: vec![],
+            messages: Arc::new(vec![]),
+            tools: Arc::new(vec![]),
             ..Default::default()
         };
         let resp = model.complete(req, &mut sink).await.unwrap();
@@ -65,8 +65,8 @@ mod tests {
         model.push_error("connection failed");
         let mut sink = MockEventSink;
         let req = ModelRequest {
-            messages: vec![],
-            tools: vec![],
+            messages: Arc::new(vec![]),
+            tools: Arc::new(vec![]),
             ..Default::default()
         };
         let err = model.complete(req, &mut sink).await.unwrap_err();
@@ -97,8 +97,8 @@ mod tests {
         model.push_tool_call("bash", serde_json::json!({"command": "ls"}));
         let mut sink = MockEventSink;
         let req = ModelRequest {
-            messages: vec![],
-            tools: vec![],
+            messages: Arc::new(vec![]),
+            tools: Arc::new(vec![]),
             ..Default::default()
         };
         let text_resp = model
@@ -119,8 +119,8 @@ mod tests {
         model.push_truncated_tool_call("bash", serde_json::json!({"command": "ls -l"}));
         let mut sink = MockEventSink;
         let req = ModelRequest {
-            messages: vec![],
-            tools: vec![],
+            messages: Arc::new(vec![]),
+            tools: Arc::new(vec![]),
             ..Default::default()
         };
         let resp = model.complete(req, &mut sink).await.unwrap();
@@ -137,8 +137,8 @@ mod tests {
         model.push_truncated_text("a long and cut off senten");
         let mut sink = MockEventSink;
         let req = ModelRequest {
-            messages: vec![],
-            tools: vec![],
+            messages: Arc::new(vec![]),
+            tools: Arc::new(vec![]),
             ..Default::default()
         };
         let resp = model.complete(req, &mut sink).await.unwrap();
@@ -205,6 +205,26 @@ mod tests {
                 .as_ref()
                 .is_some_and(|b| Arc::ptr_eq(b, &boundary)),
             "clone 后必须仍是同一份 Arc"
+        );
+    }
+
+    /// 重试循环每轮都 `request.clone()`：`messages` 必须是共享 `Arc`，不能每次深拷贝。
+    ///
+    /// 变异：把 `messages` 改回 `Vec<Message>` ⇒ 本用例变红。
+    #[test]
+    fn model_request_clone_shares_messages_arc() {
+        let messages = Arc::new(vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+        }]);
+        let request = ModelRequest {
+            messages: messages.clone(),
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        assert!(
+            Arc::ptr_eq(&cloned.messages, &request.messages),
+            "clone 后必须共享同一份 messages，否则每次模型调用都会深拷贝整个历史"
         );
     }
 }

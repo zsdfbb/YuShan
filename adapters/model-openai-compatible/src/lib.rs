@@ -1248,7 +1248,7 @@ pub fn translate_request(
     }
 
     // Session 消息
-    for msg in &request.messages {
+    for msg in request.messages.iter() {
         let role = match msg.role {
             // `Harness` 在线上没有对应角色，按 `user` 发送；本地靠 `Role` 区分来源。
             Role::User | Role::Harness => "user",
@@ -1419,13 +1419,13 @@ mod tests {
         };
 
         let request = ModelRequest {
-            messages: vec![ys_core::Message {
+            messages: Arc::new(vec![ys_core::Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
                     text: "hello".into(),
                 }],
-            }],
-            tools: vec![],
+            }]),
+            tools: Arc::new(vec![]),
             system: Some("You are helpful.".into()),
             max_tokens: None,
             temperature: None,
@@ -1469,15 +1469,15 @@ mod tests {
         ];
         for (i, bad) in bad_values.into_iter().enumerate() {
             let request = ModelRequest {
-                messages: vec![ys_core::Message {
+                messages: Arc::new(vec![ys_core::Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::ToolUse {
                         id: ToolCallId(format!("call_{i}")),
                         name: "edit".into(),
                         arguments: bad.clone(),
                     }],
-                }],
-                tools: vec![],
+                }]),
+                tools: Arc::new(vec![]),
                 system: None,
                 max_tokens: None,
                 temperature: None,
@@ -1498,15 +1498,15 @@ mod tests {
 
         // 合法的对象必须**原样保留**（归一化不得损害正常路径）。
         let request = ModelRequest {
-            messages: vec![ys_core::Message {
+            messages: Arc::new(vec![ys_core::Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
                     id: ToolCallId("call_ok".into()),
                     name: "edit".into(),
                     arguments: serde_json::json!({"path": "a.rs"}),
                 }],
-            }],
-            tools: vec![],
+            }]),
+            tools: Arc::new(vec![]),
             system: None,
             max_tokens: None,
             temperature: None,
@@ -1539,13 +1539,13 @@ mod tests {
         };
 
         let request = ModelRequest {
-            messages: vec![ys_core::Message {
+            messages: Arc::new(vec![ys_core::Message {
                 role: Role::Harness,
                 content: vec![ContentBlock::Text {
                     text: "[bg1] cargo build — finished (exit 0) in 2.0s".into(),
                 }],
-            }],
-            tools: vec![],
+            }]),
+            tools: Arc::new(vec![]),
             system: None,
             max_tokens: None,
             temperature: None,
@@ -1581,15 +1581,15 @@ mod tests {
         };
 
         let request = ModelRequest {
-            messages: vec![ys_core::Message {
+            messages: Arc::new(vec![ys_core::Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_call_id: ToolCallId("call_1".into()),
                     content: "file contents".into(),
                     is_error: false,
                 }],
-            }],
-            tools: vec![],
+            }]),
+            tools: Arc::new(vec![]),
             system: None,
             max_tokens: None,
             temperature: None,

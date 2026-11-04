@@ -25,6 +25,7 @@
 //! `session.replace_all(outcome.messages)` 由调用方做 —— 这正是不静默丢历史（B-3）的结构保证。
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use ys_component::CompactPolicy;
 use ys_core::{ContentBlock, Message, Role, Usage};
@@ -351,8 +352,8 @@ async fn generate_summary(
         }],
     });
     let request = ModelRequest {
-        messages: request_messages,
-        tools: vec![],
+        messages: Arc::new(request_messages),
+        tools: Arc::new(vec![]),
         // **活对话的 system**（与主调用逐字相同）⇒ 前缀不断 ⇒ 命中 KV cache。
         // `None` = 活对话本就没有 system（此时摘要指令仍作末尾 user 消息）。
         system: live_system.map(str::to_string),

@@ -4,6 +4,7 @@ use crate::turn_budget;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ys_component::RuntimeContext;
 use ys_core::{
@@ -694,7 +695,7 @@ impl AgentLoop for BasicLoop {
                 soft_round_advice_threshold = Some(soft_round_advice_at);
                 soft_round_advice_at = soft_round_advice_at.saturating_mul(2);
             }
-            let tools = ctx.registry.specs().to_vec();
+            let tools = ctx.registry.shared_specs();
             // 提醒注入：**只影响本轮请求**，不落 session（见 `narration_nudge` 声明处）。
             //
             // 时机：上一轮的工具调用把对应计数推到阀值 ⇒ 本轮开头把一条 `User` 消息
@@ -702,7 +703,7 @@ impl AgentLoop for BasicLoop {
             //
             // 优先级固定 `narration > A4 > A6`，**每轮至多一条**；未选中的标志保留到
             // 下一轮（不清零）—— 同时发三条会浪费 token 且互相稀释。
-            let mut request_messages = ctx.session.messages().to_vec();
+            let mut request_messages = ctx.session.shared_messages();
             // 收卷轮指令**优先级最高**：它要模型停止取数、把已有结果写成最终答复。
             // 与三条提醒同形（保留 tools、末尾追加一条 `User`）—— 前缀逐字不变 ⇒ 命中缓存。
             // 同时把三条提醒全部作废：收卷轮里它们只会与「现在交卷」互相稀释。
@@ -711,7 +712,7 @@ impl AgentLoop for BasicLoop {
                     FinalReportCause::MaxRounds => "the round budget for this task is exhausted",
                     FinalReportCause::WallClock => "the time budget for this task is exhausted",
                 };
-                request_messages.push(Message {
+                Arc::make_mut(&mut request_messages).push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: format!(
@@ -741,7 +742,7 @@ impl AgentLoop for BasicLoop {
                 batch_nudge = false;
                 soft_round_advice = false;
             } else if narration_nudge {
-                request_messages.push(Message {
+                Arc::make_mut(&mut request_messages).push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: NARRATION_NUDGE_PROMPT.to_string(),
@@ -763,7 +764,7 @@ impl AgentLoop for BasicLoop {
                 .map_err(LoopError::Event)?;
                 narration_nudge = false;
             } else if batch_nudge {
-                request_messages.push(Message {
+                Arc::make_mut(&mut request_messages).push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: BATCH_NUDGE_PROMPT.to_string(),
@@ -781,7 +782,7 @@ impl AgentLoop for BasicLoop {
                 .map_err(LoopError::Event)?;
                 batch_nudge = false;
             } else if soft_round_advice {
-                request_messages.push(Message {
+                Arc::make_mut(&mut request_messages).push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::Text {
                         text: SOFT_ROUND_ADVICE.to_string(),
@@ -6519,7 +6520,10 @@ mod tests {
             request: ModelRequest,
             _sink: &mut dyn ModelEventSink,
         ) -> Result<ModelResponse, ModelError> {
-            self.requests.lock().unwrap().push(request.messages.clone());
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // 子 agent 正在第 1 轮里跑工具：此刻父 agent 投来一句话。
@@ -6657,6 +6661,119 @@ mod tests {
             )),
             "插话必须发出 UserMessage 事件（父/UI 靠它把消息标为已生效）：{:?}",
             events.events()
+        );
+    }
+
+    // ==================== 主路径复用会话快照 ====================
+
+    /// 包装真实 session，记下 `shared_messages()` **交出过的所有快照**。
+    ///
+    /// 请求构造与写路径处于回合内的不同时刻：assistant 消息一写回，会话语义上就有了新
+    /// 历史，无法只比对终态 `Arc` 来判定「请求是否复用了快照」。这里把 os 侧交出的每份
+    /// `Arc` 都留住，再看请求携带的是不是其中某一份 —— 复用它必然是（`Arc::clone`
+    /// 不改地址），`to_vec()` 重拷则必然不是。
+    struct SnapshotRecordingSession {
+        inner: MemorySession,
+        handed_out: Mutex<Vec<Arc<Vec<Message>>>>,
+    }
+
+    #[async_trait]
+    impl Session for SnapshotRecordingSession {
+        fn messages(&self) -> &[Message] {
+            self.inner.messages()
+        }
+
+        fn shared_messages(&self) -> Arc<Vec<Message>> {
+            let snapshot = self.inner.shared_messages();
+            self.handed_out.lock().unwrap().push(Arc::clone(&snapshot));
+            snapshot
+        }
+
+        async fn append(&mut self, message: Message) -> Result<(), ys_session::SessionError> {
+            self.inner.append(message).await
+        }
+    }
+
+    /// 恒返回纯文本的 model，并记下每次请求携带的 `messages` 快照。
+    struct SnapshotRecordingModel {
+        requests: Mutex<Vec<Arc<Vec<Message>>>>,
+    }
+
+    #[async_trait]
+    impl Model for SnapshotRecordingModel {
+        fn model_id(&self) -> &str {
+            "snapshot-recording"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.requests.lock().unwrap().push(request.messages.clone());
+            Ok(ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// 主路径必须把 session 的快照**直接交给**请求，不得经过 `to_vec()` 重拷。
+    ///
+    /// 契约：`ModelRequest.messages` 与本次回合 `session.shared_messages()` 交出过的
+    /// 某一份是**同一个** `Arc`（`Arc::ptr_eq`）。`to_vec()` 得到的是新缓冲区，与所有
+    /// 已交出的快照都不等。
+    ///
+    /// 变异：把 Step 5 的 `ctx.session.shared_messages()` 换成
+    /// `Arc::new(ctx.session.messages().to_vec())` ⇒ 本用例红。
+    #[tokio::test]
+    async fn turn_request_reuses_session_snapshot() {
+        let registry = ToolRegistry::build(vec![]).unwrap();
+        let model = SnapshotRecordingModel {
+            requests: Mutex::new(Vec::new()),
+        };
+        let mut session = SnapshotRecordingSession {
+            inner: MemorySession::new(),
+            handed_out: Mutex::new(Vec::new()),
+        };
+        let mut events = CollectingSink::new();
+
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(3),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "单轮纯文本任务只应调用模型一次");
+        let sent = &requests[0];
+
+        // 前置：回合确实推进了会话（用户消息 + assistant 回复），否则下面「复用」无意义。
+        assert_eq!(session.messages().len(), 2, "一条用户消息 + 一条回复");
+        assert_eq!(session.messages()[1].role, Role::Assistant);
+        let handed_out = session.handed_out.lock().unwrap();
+        assert!(
+            !handed_out.is_empty(),
+            "本回合必须至少取过一次共享快照"
+        );
+
+        assert!(
+            handed_out.iter().any(|s| Arc::ptr_eq(s, sent)),
+            "请求必须直接复用 session 的快照；与所有已交出的快照都不等 ⇒ 请求构造把整个历史重拷了一遍"
         );
     }
 }

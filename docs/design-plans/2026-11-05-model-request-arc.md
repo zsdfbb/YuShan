@@ -134,30 +134,42 @@ fn shared_messages(&self) -> Arc<Vec<Message>> {
 **备选（不采用）**：`JsonlSession` 保留 `Vec<Message>` + 缓存 `Arc`（脏标记失效）。
 代价是多一个状态机要维护，而 §2.3 的时序已证明 `Arc` 独占在真实路径上成立。
 
-### 2.4 `translate_request` 单块复用
+### 2.4 `tools` 同样改 `Arc`
 
-现状（`adapters/model-openai-compatible/src/lib.rs:1251` 起）：每条消息循环拼 `String`，
-即使只有 1 个 `Text` 块也要 `push_str` 到空 `String`。
+`basic.rs:697`：`ctx.registry.specs().to_vec()` —— 每轮请求都深拷一整张工具 schema 表。
 
-改为：
+实测（`build_tools` 产出 10 个工具）：**约 9 KB / 次，单次 `to_vec` ≈ 42 µs**。
+它在每轮都付，且**循环内从不修改它** —— 没有任何理由复制。
 
 ```rust
-// 单块且是 Text ⇒ 直接 clone，不走 String 拼接
-let text_content = match msg.content.as_slice() {
-    [ContentBlock::Text { text }] => Some(text.clone()),
-    blocks => {
-        // 多块仍要拼（极少见）
-        ...
-    }
-};
+pub tools: Arc<Vec<ToolSpec>>,
 ```
 
-注意：这仍是**一次 `String` clone**（`ChatMessage.content: Option<String>` 是所有权类型）。
-要真正零拷贝得把 `ChatMessage.content` 改成 `Cow<'a, str>`，但 `ChatCompletionRequest`
-是 `Serialize` 后立即消费的临时结构，改 `Cow` 只省一次 `String` 分配 —— **收益远小于代价，
-不做**。（这与 `ModelRequest.messages` 的取舍不同：那是 `Vec<Message>` 的 O(n) 深拷贝。）
+比 `messages` 更简单：无追加需求，故不需要 `Arc::make_mut`。
 
-### 2.5 不在范围内
+### 2.5 `translate_request` 单块快速路径 —— 实测后否决
+
+原计划要在这里做「单块且是 `Text` 时直接 `clone`，不拼 `String`」。**实测后不做**。
+
+理由：它省不掉任何东西。
+
+```rust
+let mut text_content = String::new();
+text_content.push_str(text);            // 现状：1 次分配 + 1 次拷贝
+```
+对比
+```rust
+let text_content = text.clone();         // 所谓“快速路径”：也是 1 次分配 + 1 次拷贝
+```
+
+两者代价相同 —— `ChatMessage.content` 是 `Option<String>`（所有权类型），
+**无论如何都要拥有一个 `String`**。要真正省掉得改 `Cow<'a, str>`，而
+`ChatCompletionRequest` 是 `Serialize` 后立即丢弃的临时结构，为它引入生命周期
+得不偿失。
+
+结论：这是**假优化**，从设计里删除。记录在此是为了不再有人提第二次。
+
+### 2.6 不在范围内
 
 - `compact.rs:353` 的 `to_vec()` —— 压缩时一次性，且它要 push 尾巴，本来就得复制
 - `summarize.rs:61` —— 单条消息
@@ -188,6 +200,7 @@ let text_content = match msg.content.as_slice() {
 | **无提示的轮次零拷贝** | `Arc::ptr_eq(&session.shared_messages(), &request.messages)` 为真 |
 | **`shared_messages` 是快照不是重算** | 连续两次调用返回同一 `Arc`（`Arc::ptr_eq`） |
 | **`request.clone()` 是 O(1)** | clone 后 `Arc::ptr_eq(request.messages, cloned.messages)` 为真 |
+| **`tools` 也是共享的** | clone 后 `Arc::ptr_eq(request.tools, cloned.tools)` 为真 |
 | **append 不因快照而复制** | 取出快照并释放后 `append`，再取快照仍 `Arc::ptr_eq` 前一次（说明未 `make_mut` 复制） |
 | **线上字节不变** | 适配器 golden 基线逐字节相同 |
 | **行为不变** | `./scripts/par-test.sh` 全绿 |
@@ -197,6 +210,7 @@ let text_content = match msg.content.as_slice() {
 | 测试 | 位置 | 变异（去掉即应变红） |
 |---|---|---|
 | `request_clone_shares_messages_arc` | `ys-model` | 把 `messages` 改回 `Vec<Message>` ⇒ 红 |
+| `request_clone_shares_tools_arc` | `ys-model` | 把 `tools` 改回 `Vec<ToolSpec>` ⇒ 红 |
 | `session_shared_messages_is_stable` | `ys-session` | 让默认实现每次 `to_vec` ⇒ 红 |
 | `loop_request_reuses_session_snapshot` | `ys-loop` | 恢复 `ctx.session.messages().to_vec()` ⇒ 红 |
 | `append_after_request_dropped_does_not_copy` | `ys-session` | 持 `Arc` 不放时 `make_mut` 复制 ⇒ 红 |

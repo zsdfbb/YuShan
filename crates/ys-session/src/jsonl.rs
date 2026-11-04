@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
@@ -14,7 +15,7 @@ pub struct JsonlSession {
     path: PathBuf,
     /// 会话级元数据，落盘于文件**首行**；缺省即无首行 meta。
     meta: Option<SessionMeta>,
-    messages: Vec<Message>,
+    messages: Arc<Vec<Message>>,
     /// 已落盘的消息条数 —— `append` 的增量起点。
     ///
     /// 与 `messages.len()` 的差值就是尚未写进文件的尾巴。全量路径
@@ -57,7 +58,7 @@ impl JsonlSession {
         let session = Self {
             path,
             meta,
-            messages,
+            messages: Arc::new(messages),
             persisted,
             recovery: (!recovery.is_empty()).then_some(recovery),
             #[cfg(test)]
@@ -205,7 +206,7 @@ impl JsonlSession {
                     SessionError::Storage(format!("write meta newline failed: {e}"))
                 })?;
             }
-            for msg in &self.messages {
+            for msg in self.messages.iter() {
                 let line = serde_json::to_string(msg)
                     .map_err(|e| SessionError::Storage(format!("serialize failed: {e}")))?;
                 file.write_all(line.as_bytes())
@@ -228,6 +229,10 @@ impl JsonlSession {
 impl Session for JsonlSession {
     fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    fn shared_messages(&self) -> Arc<Vec<Message>> {
+        Arc::clone(&self.messages)
     }
 
     fn meta(&self) -> Option<&SessionMeta> {
@@ -253,7 +258,7 @@ impl Session for JsonlSession {
     /// 必须带 `.create(true)` —— `open` 从不创建文件，全新会话的第一次 append 时
     /// 文件还不存在。
     async fn append(&mut self, message: Message) -> Result<(), SessionError> {
-        self.messages.push(message);
+        Arc::make_mut(&mut self.messages).push(message);
         // `persisted` 只由本类型维护，正常路径下恒 `<= messages.len()`。若曾出现越界
         // （全量路径漏对齐、或写成功但计数前中断），退化为「从当前尾部重新对齐」——
         // 宁可多写一行也不要把消息静默留在内存里，更不要索引越界崩掉整个会话。
@@ -289,7 +294,7 @@ impl Session for JsonlSession {
     }
 
     async fn clear(&mut self) -> Result<(), SessionError> {
-        self.messages.clear();
+        Arc::make_mut(&mut self.messages).clear();
         self.flush_to_file().await?;
         self.persisted = 0;
         Ok(())
@@ -302,7 +307,7 @@ impl Session for JsonlSession {
     ///    这里复用 `flush_to_file()`（tmp + rename）的原子路径，中途失败不落盘；
     /// 2. `flush_to_file` 是 meta 行的**唯一**写入实现，整体替换必须经它，meta 才不会丢。
     async fn replace_all(&mut self, messages: Vec<Message>) -> Result<(), SessionError> {
-        self.messages = messages;
+        self.messages = Arc::new(messages);
         self.flush_to_file().await?;
         self.persisted = self.messages.len();
         Ok(())
@@ -1399,6 +1404,50 @@ mod tests {
                 "第 {i} 次 append 后磁盘长度不对：其它读者看不到已写入的数据"
             );
         }
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 回合内快照释放后，`append` 必须**原地**修改 `Vec`，不复制整个历史。
+    ///
+    /// 这是 `Arc::make_mut` 的性能假设：session 自身恒持 1 份引用，请求用完释放掉
+    /// 自己那份后计数回到 1 ⇒ 就地 push，下层堆缓冲区不变。
+    ///
+    /// 判定靠两个可观察事实：
+    /// ① 快照存活时计数为 2（session + 快照），没有额外隐藏副本；
+    /// ② 快照释放后 append 完，`Vec` 的堆缓冲区仍是原来那一块 —— `Vec` 原地 push
+    ///    （容量充足时）不搬数据，而任何全量重建都会换一块新缓冲区。
+    ///    这一条才是本用例的核心：只看 `strong_count` 无法区分「原地」与「重建」（两者
+    ///    在快照释放后都是 1）。
+    ///
+    /// 变异：把 `append` 改成 `self.messages = Arc::new(...)` 全量重建 ⇒ ② 变红。
+    #[tokio::test]
+    async fn jsonl_append_after_snapshot_release_is_in_place() {
+        let path = temp_path("append_in_place");
+        let _ = tokio::fs::remove_file(&path).await;
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        session.append(text_msg(Role::User, "first")).await.unwrap();
+
+        // 模拟一轮请求：取快照 → 放进请求 → 请求在调用结束后被释放
+        let snapshot = session.shared_messages();
+        assert_eq!(Arc::strong_count(&snapshot), 2, "session + 快照各一份");
+        let buf_before = snapshot.as_ptr();
+        drop(snapshot);
+
+        // 快照已释放 ⇒ append 应原地修改
+        session.append(text_msg(Role::Assistant, "second")).await.unwrap();
+        let after = session.shared_messages();
+        assert_eq!(after.len(), 2, "两条消息都在");
+        assert_eq!(
+            Arc::strong_count(&after),
+            2,
+            "session + 本次快照，没有多出的副本"
+        );
+        assert_eq!(
+            after.as_ptr(),
+            buf_before,
+            "append 必须原地修改：堆缓冲区换了地址 ⇒ 整个历史被复制了一份"
+        );
 
         let _ = tokio::fs::remove_file(&path).await;
     }

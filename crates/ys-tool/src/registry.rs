@@ -1,10 +1,16 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{Tool, ToolError, ToolSpec};
 
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
-    specs: Vec<ToolSpec>,
+    /// 构建时收集的 spec 表，顺序即注册顺序。
+    ///
+    /// 用 `Arc` 是为了让请求构造能直接共享（[`Self::shared_specs`]）：
+    /// 这张表是每轮请求的固定开销（实测 10 个工具 ≈ 9 KB），而它在构建后就
+    /// 不再变化 —— 没有理由每轮深拷一份。
+    specs: Arc<Vec<ToolSpec>>,
 }
 
 impl std::fmt::Debug for ToolRegistry {
@@ -34,7 +40,10 @@ impl ToolRegistry {
             map.insert(name, tool);
             specs.push(spec);
         }
-        Ok(Self { tools: map, specs })
+        Ok(Self {
+            tools: map,
+            specs: Arc::new(specs),
+        })
     }
 
     /// 按名字查找 tool
@@ -45,6 +54,11 @@ impl ToolRegistry {
     /// 获取全部 tool spec（构建时缓存）
     pub fn specs(&self) -> &[ToolSpec] {
         &self.specs
+    }
+
+    /// 取 spec 表的共享快照，供 `ModelRequest.tools` 直接使用（O(1)）。
+    pub fn shared_specs(&self) -> Arc<Vec<ToolSpec>> {
+        Arc::clone(&self.specs)
     }
 
     /// 获取全部 tool 名字（借用自缓存的 spec，零分配）。

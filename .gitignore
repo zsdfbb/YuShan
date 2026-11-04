@@ -26,3 +26,7 @@ tmp/
 
 # skill 自带的 Python venv（由 skills/*/scripts/setup.sh 创建，机器相关）
 skills/*/scripts/.venv/
+
+# Python 缓存（变异脚本运行产生）
+__pycache__/
+*.pyc

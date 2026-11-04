@@ -50,8 +50,9 @@ provider compat、事件流三层，与「最小核心」冲突。
 OCR 的两个解析器同签名、零状态、唯一调用点。`dyn` 换来的是**丢掉穷尽性检查**——
 `Vec<Box<dyn>>` 漏填静默少一个后端，`match` 漏臂是编译错误。
 
-加第三后端（如 RapidOCR）的实际改动面：**1 个枚举变体 + 3 个 match 臂 + 1 个解析函数 +
-1 行顺序表**，参数面与渲染零改动。
+加第三后端（如 RapidOCR）的实际改动面：**1 个枚举变体 + 3 个 match 臂 + 1 行顺序表**，
+参数面与渲染零改动。**零个新解析函数** —— 决策三已把线上格式统一为 TSV，新后端自己负责吐同列序。
+（决策三与决策一的这条耦合在初稿里漏写，导致两处「改动面」算术不一致。）
 
 ### 决策二：默认 `lang="chi_sim+eng"`，**不做 OSD**
 
@@ -103,7 +104,8 @@ Vision 原生是行级、tesseract 是词级。让 Swift 造同列序 TSV（+约
 
 **负面**：
 
-- 纯英文图慢 1.9×（+0.2–0.4 s）——可由模型显式传 `lang="eng"` 规避
+- 纯英文图慢 1.9×（+0.2–0.4 s）——可由模型显式传 `lang="eng"` 规避。
+  **该规避只在 Linux 成立**：macOS 走 Vision，而 Vision 不消费 `lang`（见下方修订）
 - `word_boxes=true` 在 mac 退化为行框（Vision 无词框），须附 notice
 - `swiftc` 缓存路径无 CI 覆盖（Linux 跑不了真编译），靠纯函数测路径 + golden fixture 钉契约
 - 工具表指纹变更：`EXPECTED_ORDER` 9→10，`fp_tools` / `fp_parent` 两个锚须重算，
@@ -115,9 +117,25 @@ Vision 原生是行级、tesseract 是词级。让 Swift 造同列序 TSV（+约
   ⇒ 成功分支必须扫 stderr，不能只判退出码
 - `--list-langs` 要 1161 ms ⇒ 绝不能在启动期探测，改为按调用 stderr 惰性发现
 
+## 修订（2026-11-04，随 design v2）
+
+架构质量分析（`docs/arch/ocr-tool/review.md`）发现三处需要在本 ADR 层面收口的矛盾：
+
+1. **`lang` 在 Vision 路径上不生效**（决策二的遗留前提）。Vision 自动识别、无语言旋钮，
+   故 mac 上 `lang` 被忽略。三处必须一致：schema 描述写明忽略、头行打 `lang=n/a` 而非回显入参、
+   缓存键不含 `lang`（否则同图按 lang 落多份内容相同的文件）。本 ADR「后果 / 负面」里
+   「传 `lang="eng"` 规避 1.9× 慢」因此**只在 Linux 成立**。
+2. **加后端的改动面**（决策一）与**统一 TSV**（决策三）耦合：新后端**不带新解析函数**。
+   已就地修正。
+3. **`OSD` 的删除结论不变**，但「按调用 stderr 惰性发现语言包」需附加一条：发现结果
+   **不进进程状态** —— 与 `is_concurrency_safe = true` 的无状态前提一致。
+
+其余决策（enum + 穷尽 match、`chi_sim+eng` 默认、`psm 6` 固定、TSV 统一）**不变**。
+
 ## 关联
 
-- [design.md](../arch/ocr-tool/design.md)
+- [design.md](../arch/ocr-tool/design.md) — **当前形态以它为准**（v2）
+- [review.md](../arch/ocr-tool/review.md) — v2 的改动来源（架构质量分析）
 - [context.md](../arch/ocr-tool/context.md) — 全部实测数据与方法
 - `adapters/tools-web/src/backends.rs` — 「常量表 + 穷尽 match」的先例
 - ADR-0015 — 后端探测不在启动期 fork

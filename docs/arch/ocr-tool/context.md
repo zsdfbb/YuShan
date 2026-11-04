@@ -1,7 +1,9 @@
 # OCR 工具 — 架构上下文
 
 > 日期：2026-11-04
-> 状态：**需求已澄清，待方案设计**（下一步 `arch-design`）。
+> 状态：需求已澄清，设计已成文（[design.md](./design.md) v2，2026-11-04）。
+> **本文件是探索期产物**：记录实测数据与判断形成过程。当前契约形态以 `design.md` 为准 ——
+> 下文凡与它冲突处，均已就地标注。
 > 基线：`master` @ `4f1142e`。
 > 缘起：模型无法看到 png / jpg 等图片里的内容。
 
@@ -64,7 +66,7 @@
   │      Vision JSON：脚本已把坐标换成像素 / 左上原点
   │
   ├─ ⑤ 渲染（默认行级）
-  │      <line_no>  <x>,<y>,<w>,<h>  conf_min: <该行文本>
+  │      <line_no> (<x>,<y>,<w>,<h>) conf_min:<conf> <text>
   │
   ├─ ⑥ 预算判定
   │      ├─ ≤ 8 KiB  ⇒ 直接作为 ToolResult 返回
@@ -139,8 +141,9 @@ Vision 给的是归一化 0–1、**左下原点**，换算全部在 Swift 脚�
 1. **触发可靠性**：`prompt-delivery/notes.md:66` 自己记的是 skill 目录行「触发**不可靠**」。
    OCR 恰是最易漏的一步 —— 模型 `read` 图片拿到 `stream did not contain valid UTF-8`，
    很可能直接把错误报给用户；工具表里有 `ocr` 则描述就在眼前。
-2. **坐标格式稳定**：行级渲染形状 `12 (98,66,821,24) conf_min: 文本` 是**契约**，
-   模型据此回填位置。skill 靠模型每次手拼 `tesseract … tsv | awk`，列序与精度每次可能不同。
+2. **坐标格式稳定**：行级渲染形状 `<line_no> (<x>,<y>,<w>,<h>) conf_min:<conf> <text>`
+   是**契约**，模型据此回填位置。skill 靠模型每次手拼 `tesseract … tsv | awk`，列序与精度每次可能不同。
+   （唯一真值与逐字节样例见 design.md §1。）
 3. **可测**：代码有单测 + 变异测试；skill 的脚本只能靠端到端跑。
 
 > **成本不是判据（修正）**：skill 目录行每轮约 **6 token**（命中缓存），正文只在触发时
@@ -215,14 +218,16 @@ Vision 给的是归一化 0–1、**左下原点**，换算全部在 Swift 脚�
 ### 范围内
 
 - 图片格式：`png` / `jpg` / `jpeg` / `webp` / `gif` / `bmp` / `tiff`
-- **默认行级坐标**：
+- **默认行级坐标**（完整形状与 golden fixture 见 design.md §1）：
   ```
-  <line_no>  <x>,<y>,<w>,<h>  conf_min: <该行文本>
+  <line_no> (<x>,<y>,<w>,<h>) conf_min:<conf> <text>
   ```
-- `word_boxes=true` ⇒ 词级（tesseract 用 `level 5`，Vision 用每词框），**强制落盘**
-- 语言经 `lang` 参数（默认按 `chi_sim+eng`；拼装时校验字符集防注入），仅 tesseract 生效
-- macOS 走 Vision（中文更好），`swift` 不可用时静默回退 tesseract
-- 超 8 KiB 自动落盘，结果给路径 + 行数 + 前 N 行
+- `word_boxes=true` ⇒ 词级（tesseract 用 `level 5`，Vision 退化为行框按空格切词），**强制落盘**
+- 语言经 `lang` 参数（默认 `chi_sim+eng`；拼装时校验字符集防注入），**仅 tesseract 生效**
+  —— 故 Vision 下头行打 `lang=n/a` 且不入缓存键（design.md §2.3）
+- macOS 走 Vision（中文更好）；Vision 运行期失败则降级 tesseract，**必带 notice 不静默**
+  （探索期的「静默回退」已被否决 —— 静默降级会让模型把降级结果当原生结果）
+- 超 8 KiB 自动落盘，结果给路径 + 行数 + 前 N 行（落盘**必是全量**，见 design.md §4.3）
 - 后端缺失时给出两平台安装命令
 
 ### 范围外（明确不做的）
@@ -512,7 +517,7 @@ ui_zh 147→146，real3 62→36）。**不要按 `conf` 过滤** —— 实测 `
 | `--psm` | 内部固定 `--psm 6`，**不进参数面**；`psm 7` 在多行图上静默吐空（实测 CER 100%），明确不用 |
 | 结果过滤 | 只丢**纯空白 + `width < 6`** 的碎片；**绝不按 `conf` 过滤**（`conf: 0` 的行是真文本） |
 | 脚本形态 | **自包含**：`include_str!` 内嵌 Swift 脚本，首次调用落临时文件 |
-| 输出 | **默认行级**（`<line_no> <x>,<y>,<w>,<h> conf_min: <text>`），`word_boxes=true` 走词级 |
+| 输出 | **默认行级**（`<line_no> (<x>,<y>,<w>,<h>) conf_min:<conf> <text>`），`word_boxes=true` 走词级 |
 | 用量控制 | 超 8 KiB 落盘给路径；词级**强制落盘** |
 | PDF | **不做**，留给 `pdf-analysis` skill |
 | 工具名 | 独立 `ocr` 工具（不扩 `read`） |

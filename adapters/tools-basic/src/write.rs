@@ -55,10 +55,7 @@ impl Tool for WriteTool {
             .map_err(|e| ToolError::Execution(format!("Failed to write {path}: {e}")))?;
 
         Ok(attach_notice(
-            ToolResult {
-                content: format!("Successfully wrote to {path}"),
-                is_error: false,
-            },
+            ToolResult::text(format!("Successfully wrote to {path}"), false),
             path_notice.as_deref(),
         ))
     }

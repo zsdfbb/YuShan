@@ -91,10 +91,7 @@ mod tests {
             _input: serde_json::Value,
             _ctx: ToolContext<'_>,
         ) -> Result<ToolResult, ToolError> {
-            Ok(ToolResult {
-                content: "ok".into(),
-                is_error: false,
-            })
+            Ok(ToolResult::text("ok", false))
         }
     }
 

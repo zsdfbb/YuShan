@@ -35,6 +35,10 @@ fn message_tool_result_tokens(message: &Message) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::ToolResult { content, .. } => crate::token::estimate_text_tokens(content),
+            // 图片**有意**不计入（`_ => 0`）：`turn_budget` 的超支靠 `elide_message` 缩短
+            // `ToolResult` 的文本来降，而 `Image` 块在 `elide_message` 里无法缩短。若计入，
+            // 超支源于图片时 `plan_elisions` 会给出「降不掉」的方案 ⇒ 每回合空转。
+            // 图片成本由 `crate::token::IMAGE_TOKEN_ESTIMATE` 反映。
             _ => 0,
         })
         .sum()
@@ -169,6 +173,22 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn image_block(path: &str) -> ContentBlock {
+        ContentBlock::Image {
+            path: path.to_string(),
+            detail: Some(ys_core::ImageDetail::High),
+        }
+    }
+
+    /// 带 `media` 折叠后的形态：一条消息 = `ToolResult` + N 个 `Image`。
+    fn tool_result_msg_with_images(id: &str, content: String, images: usize) -> Message {
+        let mut msg = tool_result_msg(id, content);
+        for i in 0..images {
+            msg.content.push(image_block(&format!("/tmp/img-{i}.png")));
+        }
+        msg
     }
 
     /// N15 / 边界：`needs_elision` 只在「非空 + 未降级 + 超头部预算」时为真。
@@ -325,5 +345,76 @@ mod tests {
         assert!(elide_message(&plain_msg("just text")).is_none());
         // 小工具结果（预算内）返回 None。
         assert!(elide_message(&tool_result_msg("c", "tiny".into())).is_none());
+    }
+
+    // ==================== T16t：图片**不计入**回合预算（C7，反向用例） ====================
+    //
+    // 这里把「不做」钉成要求：图片既然降不掉，就不能进入闸门的分子。
+
+    /// T16t-1：含 `Image` 块（且有对应 `ToolResult`）的消息 ⇒ `tool_result_tokens` 只算
+    /// `ToolResult` 文本，加图前后**相等**。
+    ///
+    /// 变异自检：把 `_ => 0` 改成计入 `crate::token::IMAGE_TOKEN_ESTIMATE` ⇒ 两值不再相等，
+    /// 本用例红。
+    #[test]
+    fn tool_result_tokens_ignores_image_blocks() {
+        let text = "https://example.com/a.png".to_string();
+        let without_images = vec![tool_result_msg("c1", text.clone())];
+        let with_images = vec![tool_result_msg_with_images("c1", text, 3)];
+
+        assert!(
+            crate::token::estimate_tokens(&with_images[0]) > 0,
+            "前置：图片确实被 token 估算器看见"
+        );
+        assert_eq!(
+            tool_result_tokens(&with_images),
+            tool_result_tokens(&without_images),
+            "回合预算只看 ToolResult 文本：加 3 张图不得改变分子"
+        );
+    }
+
+    /// T16t-2：只有 `Image` 块、文本为空的`ToolResult` ⇒ `tool_result_tokens == 0`。
+    #[test]
+    fn tool_result_tokens_zero_for_empty_text_with_images() {
+        let msgs = vec![tool_result_msg_with_images("c1", String::new(), 2)];
+        assert_eq!(
+            tool_result_tokens(&msgs),
+            0,
+            "文本为空、只有图片 ⇒ 回合预算分子为 0"
+        );
+    }
+
+    /// T16t-3：超支完全由图片体积造成 ⇒ `plan_elisions` 返回空。
+    ///
+    /// 场景：本回合两条工具结果的**文本**恰好刚好用完预算（Get 图前不超），但还各带 25 张图。
+    /// 若图片计入分子，闸门会认为超预算，而降 `ToolResult` 文本降不下来 ⇒ 给出「降不掉」
+    /// 的计划，执行后仍“超” ⇒ 每回合空转重试。
+    ///
+    /// 变异自检：把 `_ => 0` 改成计入 `IMAGE_TOKEN_ESTIMATE` ⇒ 计划变为 `[1]`，本用例红。
+    #[test]
+    fn plan_elisions_empty_when_overage_is_caused_only_by_images() {
+        let text = big_lines(200);
+        let msgs = vec![
+            plain_msg("hello"),
+            tool_result_msg_with_images("c1", text.clone(), 25),
+            tool_result_msg_with_images("c2", text.clone(), 25),
+        ];
+        // 预算按**剥掉图片**的同一批文本算 —— 不依赖被测函数的图片口径，
+        // 否则变异会在前置处先红，掩盖真正要钉的那条断言。
+        let text_only = [
+            msgs[0].clone(),
+            tool_result_msg("c1", text.clone()),
+            tool_result_msg("c2", text),
+        ];
+        let budget = tool_result_tokens(&text_only[1..]);
+        assert!(
+            tool_result_tokens(&text_only[1..]) <= budget,
+            "前置：文本部分本就在预算内（超支完全来自图片）"
+        );
+        assert_eq!(
+            plan_elisions(&msgs, 1, budget),
+            Vec::<usize>::new(),
+            "图片降不掉 ⇒ 不得计划降级（否则每回合空转）"
+        );
     }
 }

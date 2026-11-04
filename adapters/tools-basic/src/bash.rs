@@ -230,16 +230,13 @@ fn render_result(
     if let Some(code) = exit_code
         && code != 0
     {
-        return ToolResult {
-            content: format!("{content}\n\nCommand exited with code {code}"),
-            is_error: true,
-        };
+        return ToolResult::text(
+            format!("{content}\n\nCommand exited with code {code}"),
+            true,
+        );
     }
 
-    ToolResult {
-        content,
-        is_error: false,
-    }
+    ToolResult::text(content, false)
 }
 
 /// 把完整输出落盘，返回路径。
@@ -625,8 +622,8 @@ impl Tool for BashTool {
                     tasks.mark_finished(handle, code);
                 });
 
-                Ok(ToolResult {
-                    content: format!(
+                Ok(ToolResult::text(
+                    format!(
                         "Command exceeded its {}s timeout and is now running in the background.\n\
                          handle: {}\n\
                          Its result will be delivered to you automatically when it finishes — \
@@ -634,8 +631,8 @@ impl Tool for BashTool {
                         deadline_secs(deadline),
                         handle.label()
                     ),
-                    is_error: false,
-                })
+                    false,
+                ))
             }
             Err(outcome) => {
                 // 中止 / 超时（未挂后台能力）/ 等待失败：先杀进程组（含孙进程），再杀子进程兜底，最后收尸

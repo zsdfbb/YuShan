@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ys_component::RuntimeContext;
 use ys_core::{
-    ContentBlock, Message, Role, StopReason, ThinkingOverride, ToolResult as CoreToolResult, Usage,
+    ContentBlock, MediaAttachment, Message, Role, StopReason, ThinkingOverride,
+    ToolResult as CoreToolResult, Usage,
 };
 use ys_event::{AdviceKind, AgentEvent, RoundPurpose, emit};
 use ys_model::{FinishReason, ModelEvent, ModelEventSink, ModelRequest};
@@ -379,31 +380,22 @@ async fn call_one(
 ) -> CoreToolResult {
     match tokio::time::timeout(budget, tool.call(args, tool_ctx)).await {
         Ok(Ok(r)) => r,
-        Ok(Err(ToolError::Execution(msg))) => CoreToolResult {
-            content: msg,
-            is_error: true,
-        },
-        Ok(Err(ToolError::InvalidInput(msg))) => CoreToolResult {
-            content: format!("Invalid input: {msg}"),
-            is_error: true,
-        },
-        Ok(Err(ToolError::PermissionDenied(msg))) => CoreToolResult {
-            content: format!("Permission denied: {msg}"),
-            is_error: true,
-        },
-        Ok(Err(ToolError::Timeout(msg))) => CoreToolResult {
-            content: format!("Tool timed out: {msg}"),
-            is_error: true,
-        },
-        Ok(Err(e)) => CoreToolResult {
-            content: e.to_string(),
-            is_error: true,
-        },
-        Err(_elapsed) => CoreToolResult {
+        Ok(Err(ToolError::Execution(msg))) => CoreToolResult::text(msg, true),
+        Ok(Err(ToolError::InvalidInput(msg))) => {
+            CoreToolResult::text(format!("Invalid input: {msg}"), true)
+        }
+        Ok(Err(ToolError::PermissionDenied(msg))) => {
+            CoreToolResult::text(format!("Permission denied: {msg}"), true)
+        }
+        Ok(Err(ToolError::Timeout(msg))) => {
+            CoreToolResult::text(format!("Tool timed out: {msg}"), true)
+        }
+        Ok(Err(e)) => CoreToolResult::text(e.to_string(), true),
+        Err(_elapsed) => CoreToolResult::text(
             // 保留 `timed out` 子串（既有文案惯性），并补上工具名与生效预算。
-            content: format!("Tool '{tool_name}' timed out after {budget:?}"),
-            is_error: true,
-        },
+            format!("Tool '{tool_name}' timed out after {budget:?}"),
+            true,
+        ),
     }
 }
 
@@ -1070,10 +1062,7 @@ impl AgentLoop for BasicLoop {
                         ctx.events,
                         AgentEvent::ToolResult {
                             id: tool_call_id.clone(),
-                            result: CoreToolResult {
-                                content: content.clone(),
-                                is_error: true,
-                            },
+                            result: CoreToolResult::text(content.clone(), true),
                         },
                     )
                     .await
@@ -1218,10 +1207,10 @@ impl AgentLoop for BasicLoop {
                     match approval.request_approval(tool_name, tool_args).await {
                         ys_tool::ApprovalDecision::Approved => {}
                         ys_tool::ApprovalDecision::Denied { reason } => {
-                            outcomes[idx] = Some(CoreToolResult {
-                                content: format!("operation denied: {reason}"),
-                                is_error: true,
-                            });
+                            outcomes[idx] = Some(CoreToolResult::text(
+                                format!("operation denied: {reason}"),
+                                true,
+                            ));
                             continue;
                         }
                     }
@@ -1323,10 +1312,10 @@ impl AgentLoop for BasicLoop {
                         // 探针放在 emit `ToolCall` **之前** ⇒ 被中止的那次调用连事件都不发，
                         // 消费端不会看到一个「叫了但没执行」的工具调用。
                         if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
-                            outcomes[i] = Some(CoreToolResult {
-                                content: "tool not executed: turn cancelled".to_string(),
-                                is_error: true,
-                            });
+                            outcomes[i] = Some(CoreToolResult::text(
+                                "tool not executed: turn cancelled",
+                                true,
+                            ));
                             continue;
                         }
                         emit(
@@ -1366,10 +1355,9 @@ impl AgentLoop for BasicLoop {
                                 )
                                 .await
                             }
-                            None => CoreToolResult {
-                                content: format!("tool not found: {tool_name}"),
-                                is_error: true,
-                            },
+                            None => {
+                                CoreToolResult::text(format!("tool not found: {tool_name}"), true)
+                            }
                         };
 
                         emit(
@@ -1390,9 +1378,8 @@ impl AgentLoop for BasicLoop {
             let mut tool_results_for_message: Vec<ContentBlock> =
                 Vec::with_capacity(tool_calls.len());
             for (idx, (tool_call_id, tool_name, _)) in tool_calls.iter().enumerate() {
-                let result = outcomes[idx].take().unwrap_or_else(|| CoreToolResult {
-                    content: format!("tool not executed: {tool_name}"),
-                    is_error: true,
+                let result = outcomes[idx].take().unwrap_or_else(|| {
+                    CoreToolResult::text(format!("tool not executed: {tool_name}"), true)
                 });
 
                 // T11c：连续错误跟踪（按原始顺序更新）。
@@ -1407,11 +1394,26 @@ impl AgentLoop for BasicLoop {
                     consecutive_errors.remove(tool_name);
                 }
 
+                // `ToolResult` 与随它回喂的图片是同一次工具调用的产物 ⇒ 图片块追加到
+                // **同一条**消息（块数 = `1 + media.len()`）。拆成两条消息会让消息数与工具
+                // 调用数不再一一对应，多数 provider 对此敏感。
+                //
+                // 先解构再 push：`content` 被 move 进 `ToolResult`，`media` 在其后仍要用。
+                let CoreToolResult {
+                    content,
+                    is_error,
+                    media,
+                } = result;
                 tool_results_for_message.push(ContentBlock::ToolResult {
                     tool_call_id: tool_call_id.clone(),
-                    content: result.content,
-                    is_error: result.is_error,
+                    content,
+                    is_error,
                 });
+                // 图片与 `ToolResult` 同属这一次调用 ⇒ 追加到**同一条**消息的尾部。
+                for attachment in media {
+                    let MediaAttachment::Image { path, detail } = attachment;
+                    tool_results_for_message.push(ContentBlock::Image { path, detail });
+                }
             }
 
             // 将工具结果作为单条消息追加并继续循环
@@ -2345,10 +2347,7 @@ mod tests {
             _ctx: ToolContext<'_>,
         ) -> Result<CoreToolResult, ys_tool::ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(CoreToolResult {
-                content: "spy ok".into(),
-                is_error: false,
-            })
+            Ok(CoreToolResult::text("spy ok", false))
         }
     }
 
@@ -2373,10 +2372,7 @@ mod tests {
             _ctx: ToolContext<'_>,
         ) -> Result<CoreToolResult, ys_tool::ToolError> {
             tokio::time::sleep(self.sleep).await;
-            Ok(CoreToolResult {
-                content: "ok".into(),
-                is_error: false,
-            })
+            Ok(CoreToolResult::text("ok", false))
         }
     }
 
@@ -2481,10 +2477,7 @@ mod tests {
                 if ctx.subagent.is_some() {
                     self.0.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(CoreToolResult {
-                    content: "ok".into(),
-                    is_error: false,
-                })
+                Ok(CoreToolResult::text("ok", false))
             }
         }
 
@@ -2545,10 +2538,7 @@ mod tests {
             self.peak.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(self.sleep).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(CoreToolResult {
-                content: format!("{} ok", self.name),
-                is_error: false,
-            })
+            Ok(CoreToolResult::text(format!("{} ok", self.name), false))
         }
     }
 
@@ -2957,14 +2947,14 @@ mod tests {
                     .await
                     .map_err(|_| ys_tool::ToolError::Execution("gate dropped".into()))?;
             }
-            Ok(CoreToolResult {
-                content: if self.is_error {
+            Ok(CoreToolResult::text(
+                if self.is_error {
                     format!("{} failed", self.name)
                 } else {
                     format!("{} ok", self.name)
                 },
-                is_error: self.is_error,
-            })
+                self.is_error,
+            ))
         }
     }
 
@@ -3265,10 +3255,7 @@ mod tests {
             ) -> Result<CoreToolResult, ys_tool::ToolError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.boundary.push(Boundary::Abort);
-                Ok(CoreToolResult {
-                    content: "aborted".into(),
-                    is_error: false,
-                })
+                Ok(CoreToolResult::text("aborted", false))
             }
         }
 
@@ -3357,10 +3344,7 @@ mod tests {
             _ctx: ToolContext<'_>,
         ) -> Result<CoreToolResult, ys_tool::ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(CoreToolResult {
-                content: "ok".into(),
-                is_error: false,
-            })
+            Ok(CoreToolResult::text("ok", false))
         }
     }
 
@@ -4615,13 +4599,14 @@ mod tests {
         limits.stream_interrupt_retries = 2;
         let result = {
             let mut ctx = make_ctx(&model, &registry, &mut session, &mut events, limits);
-            BasicLoop
-                .run_turn(AgentInput::text("go"), &mut ctx)
-                .await
+            BasicLoop.run_turn(AgentInput::text("go"), &mut ctx).await
         };
 
         let Err(error) = result else {
-            panic!("Provider 错误必须直接失败，不得重试；events = {:?}", events.events());
+            panic!(
+                "Provider 错误必须直接失败，不得重试；events = {:?}",
+                events.events()
+            );
         };
         assert!(
             error.to_string().contains("attachment exhausted"),
@@ -4659,10 +4644,7 @@ mod tests {
             _input: serde_json::Value,
             _ctx: ToolContext<'_>,
         ) -> Result<CoreToolResult, ys_tool::ToolError> {
-            Ok(CoreToolResult {
-                content: big_result_content(),
-                is_error: false,
-            })
+            Ok(CoreToolResult::text(big_result_content(), false))
         }
     }
 
@@ -4826,10 +4808,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((self.name.clone(), ctx.tool_budget));
-            Ok(CoreToolResult {
-                content: "probe ok".into(),
-                is_error: false,
-            })
+            Ok(CoreToolResult::text("probe ok", false))
         }
     }
 
@@ -5415,10 +5394,7 @@ mod tests {
             _input: serde_json::Value,
             _ctx: ToolContext<'_>,
         ) -> Result<ys_core::ToolResult, ys_tool::ToolError> {
-            Ok(ys_core::ToolResult {
-                content: "ok".into(),
-                is_error: false,
-            })
+            Ok(ys_core::ToolResult::text("ok", false))
         }
     }
 
@@ -6766,14 +6742,160 @@ mod tests {
         assert_eq!(session.messages().len(), 2, "一条用户消息 + 一条回复");
         assert_eq!(session.messages()[1].role, Role::Assistant);
         let handed_out = session.handed_out.lock().unwrap();
-        assert!(
-            !handed_out.is_empty(),
-            "本回合必须至少取过一次共享快照"
-        );
+        assert!(!handed_out.is_empty(), "本回合必须至少取过一次共享快照");
 
         assert!(
             handed_out.iter().any(|s| Arc::ptr_eq(s, sent)),
             "请求必须直接复用 session 的快照；与所有已交出的快照都不等 ⇒ 请求构造把整个历史重拷了一遍"
         );
+    }
+
+    // ==================== T11t：折叠时图片追加到**同一条**消息 ====================
+
+    /// 固定返回一张图（+ 文本）的工具：图的 `path`/`detail` 由构造时给定。
+    struct ImageTool {
+        name: &'static str,
+        media: Vec<ys_core::MediaAttachment>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ImageTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.name, "returns an image", serde_json::json!({}))
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ToolContext<'_>,
+        ) -> Result<CoreToolResult, ys_tool::ToolError> {
+            Ok(CoreToolResult {
+                content: format!("{} ok", self.name),
+                is_error: false,
+                media: self.media.clone(),
+            })
+        }
+    }
+
+    fn image_attachment(path: &str, detail: ys_core::ImageDetail) -> ys_core::MediaAttachment {
+        ys_core::MediaAttachment::Image {
+            path: path.to_string(),
+            detail: Some(detail),
+        }
+    }
+
+    /// 跑一个「一次调用 `tool` → 收尾」的回合，返回折叠后的工具结果消息。
+    ///
+    /// 返回 `(消息, 折叠后的消息总数)`：条数与块数必须同时可见，才能断言「图片没另起一条消息」。
+    async fn run_one_tool_and_get_result_message(
+        tool: Box<dyn Tool>,
+        tool_name: &str,
+    ) -> (Message, usize) {
+        let registry = ToolRegistry::build(vec![tool]).unwrap();
+        let model = MockModel::new("m");
+        model.push_tool_call(tool_name, serde_json::json!({}));
+        model.push_text("done");
+        let mut session = MemorySession::new();
+        let mut events = CollectingSink::new();
+        {
+            let mut ctx = make_ctx(
+                &model,
+                &registry,
+                &mut session,
+                &mut events,
+                RunLimits::new(5),
+            );
+            BasicLoop
+                .run_turn(AgentInput::text("go"), &mut ctx)
+                .await
+                .unwrap();
+        }
+        let msgs = session.messages();
+        let msg = msgs
+            .iter()
+            .find(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            })
+            .expect("折叠必须产生一条含 ToolResult 的消息")
+            .clone();
+        (msg, msgs.len())
+    }
+
+    /// T11t：`ToolResult` 之后**在同一条消息**里追加 `Image` 块。
+    ///
+    /// 承重语义：图片与 `ToolResult` 属于同一次工具调用，拆成两条消息会让消息数与工具调用数
+    /// 不再对应（provider 敏感）。
+    ///
+    /// 变异自检：删掉折叠处的 `for attachment in media` 循环 ⇒ 块数断言（1+media.len()）
+    /// 与「最后一块是 Image」断言变红；把图片改为另建一条消息再 push ⇒ 消息总数断言变红。
+    #[tokio::test]
+    async fn collapse_appends_images_to_the_same_tool_result_message() {
+        let tool = ImageTool {
+            name: "view_image",
+            media: vec![
+                image_attachment("/tmp/a.png", ys_core::ImageDetail::High),
+                image_attachment("/tmp/b.jpg", ys_core::ImageDetail::Low),
+            ],
+        };
+        let (msg, msg_count) =
+            run_one_tool_and_get_result_message(Box::new(tool), "view_image").await;
+
+        assert_eq!(
+            msg.content.len(),
+            1 + 2,
+            "块数 = 1 个 ToolResult + media.len() 个 Image；content = {:?}",
+            msg.content
+        );
+        assert!(
+            matches!(
+                &msg.content[0],
+                ContentBlock::ToolResult { tool_call_id, content, .. }
+                    if tool_call_id.0 == "mock-view_image" && content == "view_image ok"
+            ),
+            "首块仍是该次调用的 ToolResult；content = {:?}",
+            msg.content
+        );
+        assert_eq!(
+            &msg.content[1..],
+            &[
+                ContentBlock::Image {
+                    path: "/tmp/a.png".into(),
+                    detail: Some(ys_core::ImageDetail::High),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/b.jpg".into(),
+                    detail: Some(ys_core::ImageDetail::Low),
+                },
+            ][..],
+            "图片块的 path/detail 必须与原 MediaAttachment 逐字段一致"
+        );
+        assert!(
+            matches!(msg.content.last(), Some(ContentBlock::Image { .. })),
+            "最后一块必须是 Image；content = {:?}",
+            msg.content
+        );
+        // 用户消息 + assistant 工具调用 + 折叠结果消息 + 收尾 assistant = 4。
+        // 图片若另起消息，这里会变成 5（或更多）。
+        assert_eq!(msg_count, 4, "折叠仍只产生一条消息，图片不得另起一条");
+    }
+
+    /// T11t 补充：`media` 为空 ⇒ 块数仍是 1（无附件不凭空多块）。
+    #[tokio::test]
+    async fn collapse_without_media_yields_single_block() {
+        let tool = ImageTool {
+            name: "view_image",
+            media: Vec::new(),
+        };
+        let (msg, msg_count) =
+            run_one_tool_and_get_result_message(Box::new(tool), "view_image").await;
+        assert_eq!(
+            msg.content.len(),
+            1,
+            "无附件时块数仍是 1：{:?}",
+            msg.content
+        );
+        assert!(matches!(&msg.content[0], ContentBlock::ToolResult { .. }));
+        assert_eq!(msg_count, 4, "无附件时消息数同样不变");
     }
 }

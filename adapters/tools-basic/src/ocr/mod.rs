@@ -135,8 +135,8 @@ impl Tool for OcrTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "ocr",
-            "Extract the text in an image together with its pixel positions — the only way to \
-             see what an image contains here; set word_boxes for per-word coordinates",
+            "Extract the text in an image together with its pixel positions; set word_boxes for \
+             per-word coordinates",
             json!({
                 "type": "object",
                 "properties": {
@@ -180,24 +180,21 @@ impl Tool for OcrTool {
         let image = match validate(&self.workspace, &args.path) {
             Ok(image) => image,
             Err(message) => {
-                return Ok(ToolResult {
-                    content: message,
-                    is_error: true,
-                });
+                return Ok(ToolResult::text(message, true));
             }
         };
 
         // ① 探测（启动期一次纯路径扫描，不 fork）。链空 ⇒ 明确说「一个后端都没有」。
         let candidates = self.engine.candidates();
         if candidates.is_empty() {
-            return Ok(ToolResult {
-                content: format!(
+            return Ok(ToolResult::text(
+                format!(
                     "ocr: no OCR backend found on PATH — cannot read {}. {}",
                     image.display(),
                     OcrEngine::install_hint()
                 ),
-                is_error: true,
-            });
+                true,
+            ));
         }
 
         // ② 逐候选 spawn，成功即停。失败原因**逐个累积**：只报最后一个会让「Vision 挂了 +
@@ -229,14 +226,14 @@ impl Tool for OcrTool {
         }
 
         let Some((kind, bounded)) = attempt else {
-            return Ok(ToolResult {
-                content: format!(
+            return Ok(ToolResult::text(
+                format!(
                     "ocr: every OCR backend failed on {}. {}",
                     image.display(),
                     failures.join(" | ")
                 ),
-                is_error: true,
-            });
+                true,
+            ));
         };
 
         // ③ 解析 + 过滤（纯函数）。空结果的**四**种成因靠 stdout 是否有任何输出 +
@@ -322,10 +319,7 @@ impl Tool for OcrTool {
             ys_tool::append_notices(&mut content, &notices);
             content
         };
-        Ok(ToolResult {
-            content,
-            is_error: silent_failure,
-        })
+        Ok(ToolResult::text(content, silent_failure))
     }
 }
 

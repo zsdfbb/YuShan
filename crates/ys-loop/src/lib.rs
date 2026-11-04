@@ -97,10 +97,7 @@ mod tests {
             input: serde_json::Value,
             _ctx: ToolContext<'_>,
         ) -> Result<ys_tool::ToolResult, ys_tool::ToolError> {
-            Ok(ys_tool::ToolResult {
-                content: input.to_string(),
-                is_error: false,
-            })
+            Ok(ys_tool::ToolResult::text(input.to_string(), false))
         }
     }
 
@@ -223,10 +220,7 @@ mod tests {
                 .store(ctx.summarizer.is_some(), Ordering::SeqCst);
             self.saw_boundary
                 .store(ctx.boundary.is_some(), Ordering::SeqCst);
-            Ok(ys_tool::ToolResult {
-                content: "probed".into(),
-                is_error: false,
-            })
+            Ok(ys_tool::ToolResult::text("probed", false))
         }
     }
 
@@ -393,10 +387,7 @@ mod tests {
                 _ctx: ys_tool::ToolContext<'_>,
             ) -> Result<ys_core::ToolResult, ys_tool::ToolError> {
                 self.boundary.push(Boundary::Abort);
-                Ok(ys_core::ToolResult {
-                    content: "ok".into(),
-                    is_error: false,
-                })
+                Ok(ys_core::ToolResult::text("ok", false))
             }
         }
 

@@ -139,10 +139,7 @@ impl Tool for LsTool {
         append_notices(&mut content, &notices);
 
         Ok(attach_notice(
-            ToolResult {
-                content,
-                is_error: false,
-            },
+            ToolResult::text(content, false),
             path_notice.as_deref(),
         ))
     }
@@ -186,10 +183,7 @@ async fn read_entries(dir: &Path) -> std::io::Result<(Vec<Entry>, bool)> {
 
 /// 模型可见的错误结果（`is_error = true`，不是 `Err`）。
 fn error_result(content: String) -> ToolResult {
-    ToolResult {
-        content,
-        is_error: true,
-    }
+    ToolResult::text(content, true)
 }
 
 #[cfg(test)]

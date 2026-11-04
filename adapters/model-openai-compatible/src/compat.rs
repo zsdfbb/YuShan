@@ -1,3 +1,5 @@
+use ys_core::ImageDetail;
+
 /// `reasoning_effort` 的 wire 方言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EffortDialect {
@@ -38,6 +40,14 @@ pub struct ProviderCompat {
     /// 目前只有 DeepSeek 方言**实测确认**接受该字段（见
     /// [`ProviderCompat::deepseek`]）；GLM 明确「始终思考，不支持关闭」。
     pub supports_thinking_control: bool,
+    /// 该 provider 的 `/chat/completions` 是否接受**图像内容块**
+    /// （`content` 为块数组、含 `{"type":"image_url"}`）。
+    ///
+    /// 这是**第一层**门控（能力位）；第二层是模型级可识别性
+    /// [`ProviderCompat::supports_image`]。默认 `false`：未声明的端点一律不发图
+    /// （降级为文本占位），因为多模态请求体在不认它的端点上会 400，
+    /// 而不是被忽略。
+    pub supports_image_input: bool,
 }
 
 /// 手写而非 derive：`supports_stream_usage` 的「默认」必须是 **true**。
@@ -53,6 +63,7 @@ impl Default for ProviderCompat {
             supports_reasoning_effort: false,
             effort_dialect: EffortDialect::Verbatim,
             supports_thinking_control: false,
+            supports_image_input: false,
         }
     }
 }
@@ -67,6 +78,11 @@ impl ProviderCompat {
             // `thinking: {"type": "enabled"|"disabled"}` 是**开关**，
             // `reasoning_effort` 是**强度**，两者独立。
             supports_thinking_control: true,
+            // 图像输入：`/chat/completions` 接受块数组形态的 `image_url`
+            // （<https://api-docs.deepseek.com/zh-cn/guides/vision>）。
+            // 能力位只表示「端点认这个字段」，具体模型是否可读图由
+            // [`ProviderCompat::supports_image`] 判。
+            supports_image_input: true,
             ..Default::default()
         }
     }
@@ -232,6 +248,51 @@ impl ProviderCompat {
             }
         }
     }
+
+    /// 该 provider **是否接受图像输入**（第一层：能力位）。
+    ///
+    /// 只管「端点认不认这个字段」，不含模型级判断 —— 那是
+    /// [`ProviderCompat::supports_image`]。把两层拆开是为了让能力位可以整体关闭
+    /// （`docs/design-plans/2026-11-05-vision-input.md` §10 的降级手段：
+    /// `supports_image_input` 全部置 `false` 即退回纯文本）。
+    pub fn supports_image_input(&self) -> bool {
+        self.supports_image_input
+    }
+
+    /// 该**模型**是否接受图像输入（第二层：模型 id 可识别性）。
+    ///
+    /// 这是全仓**唯一**的模型级图像判断来源：`translate_request` 的分支与
+    /// [`ProviderCompat::image_detail_for`] 都调它，不得各自再按 id 推一遍。
+    ///
+    /// `/v1/models` 不提供能力标记 ⇒ 只能按 id 认（[`is_vision_model`]）。
+    /// **识别不出 ⇒ `false`（fail-closed）**：把图发给读不了它的模型是 400 或
+    /// 静默丢内容，而发文本占位永远安全。
+    pub fn supports_image(&self, model: &str) -> bool {
+        self.supports_image_input && is_vision_model(model)
+    }
+
+    /// 这次请求实际要发的 `image_url.detail`（`None` = 不发送该字段）。
+    ///
+    /// 先过模型级门控（[`ProviderCompat::supports_image`]）；`requested` 为 `None`
+    /// 时同样不发 —— 缺省档位由 provider 决定，与既有请求体形态一致。
+    ///
+    /// 取值是**verbatim** 的：DeepSeek 的图像接口接受
+    /// `low|high|original|auto`，与 [`ImageDetail`] 的 serde 拼写一致，无需折叠。
+    pub fn image_detail_for(&self, model: &str, requested: Option<ImageDetail>) -> Option<String> {
+        if !self.supports_image(model) {
+            return None;
+        }
+        let requested = requested?;
+        Some(
+            match requested {
+                ImageDetail::Low => "low",
+                ImageDetail::High => "high",
+                ImageDetail::Original => "original",
+                ImageDetail::Auto => "auto",
+            }
+            .to_string(),
+        )
+    }
 }
 
 /// MiMo 音频模型的**能力标记**（id 的 `-` 分段里出现即判为音频）。
@@ -299,6 +360,33 @@ pub fn is_mimo_chat_model(model: &str) -> bool {
     };
     // 前缀之后必须有**实际的模型名**：`mimo-`（光秃秃的前缀）不是模型。
     !rest.is_empty() && !is_mimo_audio_model(model) && !is_mimo_disabled_model(model)
+}
+
+/// 该 id 是否是可读图的模型（视觉能力）。
+///
+/// `/v1/models` **不提供**能力标记（`context_length` 之外无 modality 字段），
+/// 所以只能按 id 认。两条判据：
+///
+/// - id 里出现显式的 `vision` / `vl` 分段（`-` 分隔）；或
+/// - `deepseek-` 前缀 **且** 含 `flash` 分段：DeepSeek 的图像理解绑在 Flash 上
+///   （<https://api-docs.deepseek.com/zh-cn/guides/vision>）。旧名
+///   `deepseek-v4-flash-vision-exp` 已下线但请求仍被承接，故也认。
+///
+/// **`flash` 不单独成为判据**：`glm-5.3-flash` / `mimo-v2.6-flash` 也含该分段，
+/// 但没有任何依据说它们能读图。把图发给读不了它的模型会 400，而发文本占位永远安全
+/// ⇒ 识别不出就 `false`（fail-closed）。
+fn is_vision_model(model: &str) -> bool {
+    // 音频 / TTS 模型永远不能读图，哪怕 id 里带了 `flash` / `vision` 字样。
+    if is_mimo_audio_model(model) {
+        return false;
+    }
+    if id_has_token(model, &["vision", "vl"]) {
+        return true;
+    }
+    model
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("deepseek-"))
+        && id_has_token(model, &["flash"])
 }
 
 /// 从模型 id 解析 GLM 代际 `(major, minor)`，无法解析时 `None`。
@@ -753,5 +841,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **图像门控第一层（能力位）**：默认保守关闭，只有实测接受块数组的方言打开。
+    ///
+    /// 变异：把 `Default` 的 `supports_image_input` 改成 `true` ⇒ 未知端点会收到
+    /// 它们不认的多模态请求体（非降级路径），本用例变红。
+    #[test]
+    fn image_input_bit_is_conservative_by_default() {
+        assert!(!ProviderCompat::default().supports_image_input());
+        assert!(!ProviderCompat::standard().supports_image_input());
+        assert!(!ProviderCompat::minimax().supports_image_input());
+        assert!(!ProviderCompat::glm().supports_image_input());
+        assert!(!ProviderCompat::mimo().supports_image_input());
+        assert!(ProviderCompat::deepseek().supports_image_input());
+    }
+
+    /// **图像门控第二层（模型 id）**：两层必须同时成立。
+    ///
+    /// `deepseek-flash` 能读图，`deepseek-chat` 不能 —— 但两者共享同一个 provider
+    /// 能力位 ⇒ 区分只能靠 id。
+    #[test]
+    fn image_gate_needs_both_layers() {
+        let compat = ProviderCompat::deepseek();
+        assert!(compat.supports_image("deepseek-flash"));
+        assert!(compat.supports_image("deepseek-v4-flash"));
+        assert!(!compat.supports_image("deepseek-chat"));
+        assert!(!compat.supports_image("deepseek-reasoner"));
+
+        // 能力位关 ⇒ 即使 id 看着能读图也不发。
+        assert!(!ProviderCompat::standard().supports_image("deepseek-flash"));
+    }
+
+    /// **fail-closed**：识别不出的 id 一律不发图。
+    ///
+    /// 变异：把 `is_vision_model` 的兜底改成 `true` ⇒ 本用例变红（并把图发给
+    /// 读不了它的模型 ⇒ 400 或静默丢内容）。
+    #[test]
+    fn unknown_model_ids_fail_closed() {
+        let compat = ProviderCompat::deepseek();
+        for model in ["", "gpt-4o", "qwen-vl-max", "some-custom-model", "deepseek"] {
+            let expected = model == "qwen-vl-max";
+            assert_eq!(compat.supports_image(model), expected, "model = {model:?}");
+            if !expected {
+                assert_eq!(
+                    compat.image_detail_for(model, Some(ImageDetail::High)),
+                    None
+                );
+            }
+        }
+    }
+
+    /// `flash` 分段**不单独**成为视觉判据：GLM / MiMo 的 flash 模型不因这个名字变得能读图。
+    ///
+    /// 变异：把 `flash` 从「必须配 `deepseek-` 前缀」降到无条件分词 ⇒ 本用例变红。
+    #[test]
+    fn flash_alone_is_not_a_vision_marker() {
+        for model in ["glm-5.3-flash", "mimo-v2.6-flash", "claude-3-5-haiku-flash"] {
+            assert!(!super::is_vision_model(model), "model = {model}");
+        }
+    }
+
+    /// `detail` 取值：请求了什么发什么；`None` 不发；门控不过不发。
+    ///
+    /// 变异：把 `image_detail_for` 里的门控删掉 ⇒ 不支持图像的模型也会收到
+    /// `detail`（与「不发 image_url」自相矛盾）。
+    #[test]
+    fn image_detail_folds_through_the_gate() {
+        let compat = ProviderCompat::deepseek();
+        assert_eq!(
+            compat.image_detail_for("deepseek-flash", Some(ImageDetail::High)),
+            Some("high".into())
+        );
+        assert_eq!(
+            compat.image_detail_for("deepseek-flash", Some(ImageDetail::Original)),
+            Some("original".into())
+        );
+        assert_eq!(compat.image_detail_for("deepseek-flash", None), None);
+        assert_eq!(
+            compat.image_detail_for("deepseek-chat", Some(ImageDetail::High)),
+            None
+        );
     }
 }

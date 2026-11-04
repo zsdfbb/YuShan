@@ -670,12 +670,20 @@ pub(crate) fn unix_now_ms() -> u64 {
 }
 
 /// 回合输入的字节数（仅正文块；用于 `turn_start.input_bytes`）。
+///
+/// 它是「本回合输入有多大规模」的**观测值**，不是 token 估算：
+/// - `Image` 块计**路径长度**：路径就是该块在消息里的全部文本内容。**不计图片字节** ——
+///   那要在统计路径上读盘、且数字会随图大小暴涨。
+/// - 图片的真实上下文开销由 `ys_loop::token` 用固定估算承担（`IMAGE_TOKEN_ESTIMATE`），
+///   两处不重复承担同一职责。
+/// - 非正文块（`ToolUse` / `ToolResult`）计 0：它们的体积不进本指标。
 pub(crate) fn message_bytes(message: &ys_core::Message) -> usize {
     message
         .content
         .iter()
         .map(|block| match block {
             ys_core::ContentBlock::Text { text } => text.len(),
+            ys_core::ContentBlock::Image { path, .. } => path.len(),
             _ => 0,
         })
         .sum()
@@ -3682,15 +3690,61 @@ mod tests {
 
         // 超长 `reason`：压掉换行并截到字符上界，不能让一个巨型响应体把一行刷爆。
         let huge = format!("line1\nline2 {}", "æ¼¢".repeat(500));
-        let huge_record = special_event_record(&env(AgentEvent::ModelStreamDiscarded { reason: huge }))
-            .expect("超长 reason 仍应有记录");
+        let huge_record =
+            special_event_record(&env(AgentEvent::ModelStreamDiscarded { reason: huge }))
+                .expect("超长 reason 仍应有记录");
         let clipped = huge_record.fields["reason"].as_str().unwrap();
         assert!(!clipped.contains('\n'), "记录里不得残留换行：{clipped}");
-        assert_eq!(clipped.chars().count(), DISCARD_REASON_MAX_CHARS + 1, "应截到上界 + 省略号：{clipped}");
+        assert_eq!(
+            clipped.chars().count(),
+            DISCARD_REASON_MAX_CHARS + 1,
+            "应截到上界 + 省略号：{clipped}"
+        );
         assert!(clipped.ends_with('…'), "截断必须可见地标明：{clipped}");
 
         // 增量事件不产记录 —— 只记段、不记增量。
         assert!(special_event_record(&env(delta("x"))).is_none());
+    }
+
+    /// **U9**：`message_bytes` 对 `Image` 块计**路径长度**，不读图。
+    ///
+    /// 它服务的是 `turn_start.input_bytes`（回合输入规模的观测值），不是 token 估算 ——
+    /// 图片的真实开销由 `ys_loop::token` 的固定估算承担。故这里只需要「图片块不再计 0」：
+    /// 一个 0 字节的图片块会让这场回合看起来比实际更小。
+    ///
+    /// **变异**：把 `Image` 臂删回 `_ => 0` ⇒ 第一个断言变红。
+    #[test]
+    fn u9_message_bytes_counts_image_path_only() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "看图".into(),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/a.png".into(),
+                    detail: Some(ys_core::ImageDetail::High),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/b.png".into(),
+                    detail: None,
+                },
+            ],
+        };
+        assert_eq!(
+            message_bytes(&msg),
+            "看图".len() + "/tmp/a.png".len() + "/tmp/b.png".len(),
+            "图片块只计路径字节（档位不参与）"
+        );
+        // 同一张图换档位 ⇒ 字节数不变：`detail` 不是文本内容。
+        let other = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                path: "/tmp/a.png".into(),
+                detail: Some(ys_core::ImageDetail::Original),
+            }],
+        };
+        assert_eq!(message_bytes(&other), "/tmp/a.png".len());
     }
 
     fn delta(text: &str) -> AgentEvent {
@@ -4456,7 +4510,10 @@ mod tests {
         .await
         .expect("RunFailed 是终局事件，应即返回")
         .expect("消费本身不应异常");
-        assert!(!printed_any, "没写出任何正文 ⇒ printed_any 为假（不补换行）");
+        assert!(
+            !printed_any,
+            "没写出任何正文 ⇒ printed_any 为假（不补换行）"
+        );
         assert!(failed_out.is_empty(), "失败回合必须零输出");
 
         // ② 作废后重放：只留重放的那一份。
@@ -4479,7 +4536,11 @@ mod tests {
         .expect("应收到终局事件即返回")
         .unwrap();
         assert!(printed_any, "重放后写出了正文");
-        assert_eq!(String::from_utf8(out).unwrap(), "完成", "作废的那半句必须丢掉");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "完成",
+            "作废的那半句必须丢掉"
+        );
     }
 
     /// 13. **一次性模式的回合号**：`-p`/`--json` 走 [`run_single_turn`]
@@ -5394,10 +5455,7 @@ mod tests {
         let _ = clock.observe(
             &env(AgentEvent::ToolResult {
                 id: ToolCallId("c1".into()),
-                result: ys_core::ToolResult {
-                    content: "ok".into(),
-                    is_error: false,
-                },
+                result: ys_core::ToolResult::text("ok", false),
             }),
             t0 + Duration::from_millis(30),
         );

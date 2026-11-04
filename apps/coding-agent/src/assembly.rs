@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(
             built_short.agent.tool_names(),
             expected,
-            "父表应为 10 基础 + bash_bg + subagent_async + subagent_send（后三者追加在末位）"
+            "父表应为 11 基础 + bash_bg + subagent_async + subagent_send（后三者追加在末位）"
         );
         assert_eq!(
             built_long.agent.tool_names(),
@@ -378,18 +378,18 @@ mod tests {
         let f = factory(&base);
         let built = f.build(&base).unwrap();
 
-        // ① 真实父表 13 元、子表 10 元（子 agent 天然没有后台能力）。
+        // ① 真实父表 14 元、子表 11 元（子 agent 天然没有后台能力）。
         let parent_names: Vec<&str> = built
             .parent_specs
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert_eq!(parent_names.len(), 13, "真实父表应为 13 元");
-        assert_eq!(built.child_specs.len(), 10, "真实子表应为 10 元");
+        assert_eq!(parent_names.len(), 14, "真实父表应为 14 元");
+        assert_eq!(built.child_specs.len(), 11, "真实子表应为 11 元");
         assert_eq!(
             built.agent.tool_names().len(),
-            13,
-            "注册进 agent 的父表应为 13 元"
+            14,
+            "注册进 agent 的父表应为 14 元"
         );
         assert!(
             !built.child_specs.iter().any(|spec| spec.name == "bash_bg"),

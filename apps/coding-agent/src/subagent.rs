@@ -1766,15 +1766,50 @@ fn tool_text_of(m: &ys_core::Message) -> String {
         .join("\n")
 }
 
+/// 把一条消息里的**文本**拼成文本（`Image` 块渲染成图片标记，其余块返回空）。
+///
+/// 图片**不重传给父 agent**（父 agent 的请求里没有这个 `Image` 块），回传的只是
+/// **可识别的引用**：路径 + 档位，与 TUI 的 `[image: …]` 同一个形态 —— 父 agent 看到
+/// 它就知道「子 agent 手里有张图、在哪」，而不是一句 `[unknown content block]`。
 fn text_of(m: &ys_core::Message) -> String {
     m.content
         .iter()
         .filter_map(|b| match b {
-            ys_core::ContentBlock::Text { text } => Some(text.as_str()),
+            ys_core::ContentBlock::Text { text } => Some(text.clone()),
+            ys_core::ContentBlock::Image { path, detail } => Some(image_ref(path, *detail)),
             _ => None,
         })
-        .collect::<Vec<_>>()
+        .collect::<Vec<String>>()
         .join("\n")
+}
+
+/// 图片块在子 agent 回传文本里的引用形态：`[image: /path (high)]`。
+///
+/// 返回 `&str` 不行（要拼接档位），故返回 `String`。路径超长时保留文件名。
+fn image_ref(path: &str, detail: Option<ys_core::ImageDetail>) -> String {
+    const MAX_CHARS: usize = 120;
+    let len = path.chars().count();
+    let path = if len <= MAX_CHARS {
+        path.to_string()
+    } else {
+        let tail: String = path.chars().skip(len - (MAX_CHARS - 1)).collect();
+        format!("…{tail}")
+    };
+    match detail {
+        Some(detail) => format!("[image: {path} ({})]", image_detail_label(detail)),
+        None => format!("[image: {path}]"),
+    }
+}
+
+/// 档位文本形态：小写，与 `ImageDetail` 的 serde 形态一致。
+fn image_detail_label(detail: ys_core::ImageDetail) -> &'static str {
+    use ys_core::ImageDetail;
+    match detail {
+        ImageDetail::Low => "low",
+        ImageDetail::High => "high",
+        ImageDetail::Original => "original",
+        ImageDetail::Auto => "auto",
+    }
 }
 
 fn transcript_body(
@@ -1820,6 +1855,9 @@ fn transcript_body(
                         "[tool_result id={} is_error={is_error}]\n{content}\n",
                         tool_call_id.0
                     ));
+                }
+                ContentBlock::Image { path, detail } => {
+                    out.push_str(&format!("{}\n", image_ref(path, *detail)));
                 }
                 _ => out.push_str("[unknown content block]\n"),
             }
@@ -2003,15 +2041,15 @@ impl Tool for SubagentAsyncTool {
         let handle = runner
             .spawn(prompt, model, mode, ctx.boundary)
             .map_err(ToolError::Execution)?;
-        Ok(ToolResult {
-            content: format!(
+        Ok(ToolResult::text(
+            format!(
                 "Started sub-agent in the background.\nhandle: {handle}\n\
                  Its result will be delivered to you automatically when it finishes — do NOT \
                  poll for it. Keep working on your own part now: it keeps running after this \
                  turn ends, and its result arrives to you as a new turn."
             ),
-            is_error: false,
-        })
+            false,
+        ))
     }
 }
 
@@ -2069,10 +2107,10 @@ impl Tool for SubagentSendTool {
             .subagent
             .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
         runner.send(handle, message).map_err(ToolError::Execution)?;
-        Ok(ToolResult {
-            content: format!("Message queued for {handle}."),
-            is_error: false,
-        })
+        Ok(ToolResult::text(
+            format!("Message queued for {handle}."),
+            false,
+        ))
     }
 }
 
@@ -2564,7 +2602,8 @@ mod tests {
     ///
     /// 变异 1：`Explore` 分支原样返回基础表 ⇒ 元数与名字断言变红。
     /// 变异 2：过滤器改成去掉 `read` ⇒ 名字序列断言变红。
-    /// 变异 3：把 `ocr` 加进排除集 ⇒ 名字序列与元数变红（`ocr` 是有意留在 explore 的）。
+    /// 变异 3：把 `ocr` / `view_image` 加进排除集 ⇒ 名字序列与元数变红（两者都是
+    /// 只读本地输入，有意留在 explore 的）。
     #[test]
     fn explore_child_toolset_is_eight_without_writers() {
         use ys_tools_web::FetchedDir;
@@ -2574,13 +2613,13 @@ mod tests {
 
         let general = child_tools(SubagentMode::General, &base, web());
         let general_names: Vec<String> = general.iter().map(|t| t.spec().name).collect();
-        assert_eq!(general_names.len(), 10, "通用子表仍是 10 元");
+        assert_eq!(general_names.len(), 11, "通用子表仍是 11 元");
         assert!(general_names.contains(&"write".to_string()));
         assert!(general_names.contains(&"edit".to_string()));
 
         let explore = child_tools(SubagentMode::Explore, &base, web());
         let explore_names: Vec<String> = explore.iter().map(|t| t.spec().name).collect();
-        assert_eq!(explore_names.len(), 8, "探索子表应为 8 元");
+        assert_eq!(explore_names.len(), 9, "探索子表应为 9 元");
         assert_eq!(
             explore_names,
             vec![
@@ -2590,10 +2629,11 @@ mod tests {
                 "find",
                 "ls",
                 "ocr",
+                "view_image",
                 "websearch",
                 "webfetch"
             ],
-            "探索表是通用表按名字去掉 write/edit 后的子序列（`ocr` 有意留下）"
+            "探索表是通用表按名字去掉 write/edit 后的子序列（`ocr` / `view_image` 有意留下）"
         );
         assert!(
             !explore_names.iter().any(|n| n == "write" || n == "edit"),
@@ -2648,13 +2688,13 @@ mod tests {
             Some("GENERAL-CHILD-PROMPT"),
             "general 必须用 child_prompt"
         );
-        assert_eq!(requests[0].tools.len(), 10, "general 工具表 10 元");
+        assert_eq!(requests[0].tools.len(), 11, "general 工具表 11 元");
         assert_eq!(
             requests[1].system.as_deref(),
             Some("EXPLORE-CHILD-PROMPT"),
             "explore 必须用 explore_prompt"
         );
-        assert_eq!(requests[1].tools.len(), 8, "explore 工具表 8 元");
+        assert_eq!(requests[1].tools.len(), 9, "explore 工具表 9 元");
         assert!(
             !requests[1]
                 .tools
@@ -2956,6 +2996,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **U9**：图片块在子转录里**可识别**，不再是 `[unknown content block]`。
+    ///
+    /// 两种档位形态各一条：`detail: None` ⇒ 不写括号；`Some` ⇒ 小写档位。只显示路径，
+    /// 字节从未进入消息（`ContentBlock::Image` 本来就只存路径）。
+    ///
+    /// **变异**：把 `transcript_body` 的 `Image` 臂删回 `_ =>` ⇒ 两个断言同时变红。
+    #[tokio::test]
+    async fn transcript_body_renders_image_refs() {
+        let mut s = MemorySession::new();
+        s.append(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "先看这张".into(),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/a.png".into(),
+                    detail: Some(ys_core::ImageDetail::High),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/b.png".into(),
+                    detail: None,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+        let body = transcript_body(
+            &s,
+            &HashMap::new(),
+            &[],
+            &StopReason::Completed,
+            None,
+            0,
+            None,
+        );
+        assert!(body.contains("[image: /tmp/a.png (high)]\n"), "{body}");
+        assert!(body.contains("[image: /tmp/b.png]\n"), "{body}");
+        assert!(
+            !body.contains("[unknown content block]"),
+            "图片块必须有明确渲染，不能落进通配臂：{body}"
+        );
+    }
+
+    /// **U9**：回传给父 agent 的摘要里，图片同样保留为**可识别的引用**。
+    ///
+    /// 父 agent 看不到子 agent 的 `Image` 块（那会需要跨 agent 重传图片），但它必须
+    /// 知道「子 agent 手里有张图、在哪」 —— 故是路径引用而不是 `[unknown content block]`。
+    #[test]
+    fn text_of_renders_image_as_reference() {
+        let m = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "找到图".into(),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/a.png".into(),
+                    detail: Some(ys_core::ImageDetail::Low),
+                },
+            ],
+        };
+        assert_eq!(
+            text_of(&m),
+            "找到图\n[image: /tmp/a.png (low)]",
+            "父 agent 看到的文本要能说明「有一张图」"
+        );
+    }
+
     /// 子 agent 内部会话独立：`Role` 齐备且不含父历史。
     #[test]
     fn transcript_body_renders_roles() {
@@ -3169,10 +3278,7 @@ mod tests {
         let full_len = content.len();
         sink.emit(AgentEvent::ToolResult {
             id: ToolCallId("c1".into()),
-            result: ToolResult {
-                content,
-                is_error: false,
-            },
+            result: ToolResult::text(content, false),
         })
         .await
         .unwrap();

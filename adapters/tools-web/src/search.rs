@@ -333,19 +333,16 @@ async fn attempt(
 /// 不可用」的唯一线索，缺了它 `[via x]` 只说明「换了家」，不说明「为什么换」。
 pub fn render_chain_outcome(outcome: ChainOutcome, query: &str, limit: usize) -> ToolResult {
     match outcome {
-        ChainOutcome::Aborted => ToolResult {
-            content: "Search aborted by user.".into(),
-            is_error: false,
-        },
+        ChainOutcome::Aborted => ToolResult::text("Search aborted by user.", false),
         ChainOutcome::Failed { reasons } => {
             let listed: Vec<String> = reasons.iter().map(|r| format!("- {r}")).collect();
-            ToolResult {
-                content: format!(
+            ToolResult::text(
+                format!(
                     "All search backends failed for query `{query}`:\n{}",
                     listed.join("\n")
                 ),
-                is_error: true,
-            }
+                true,
+            )
         }
         ChainOutcome::Answered {
             backend,
@@ -368,10 +365,7 @@ pub fn render_chain_outcome(outcome: ChainOutcome, query: &str, limit: usize) ->
             if hits.is_empty() {
                 let mut content = format!("No results found for query `{query}`.");
                 append_notices(&mut content, &notices);
-                return ToolResult {
-                    content,
-                    is_error: false,
-                };
+                return ToolResult::text(content, false);
             }
 
             // 去重（保序）→ 截 limit。
@@ -402,10 +396,7 @@ pub fn render_chain_outcome(outcome: ChainOutcome, query: &str, limit: usize) ->
 
             let mut content = head.content;
             append_notices(&mut content, &notices);
-            ToolResult {
-                content,
-                is_error: false,
-            }
+            ToolResult::text(content, false)
         }
     }
 }
@@ -465,8 +456,5 @@ fn one_line(raw: &str) -> String {
 
 /// 模型可见的错误结果（与 `tools-basic` 同款的小助手）。
 fn error_result(content: String) -> ToolResult {
-    ToolResult {
-        content,
-        is_error: true,
-    }
+    ToolResult::text(content, true)
 }

@@ -371,13 +371,8 @@ async fn generate_summary(
     // 压缩调用的 token 成本必须可上报，不能因为只关心文本而丢掉。
     let usage = response.usage;
 
-    // 拼接**全部** `Text` block —— 有的 provider 会把一次回答拆成多块。
-    let mut text = String::new();
-    for block in &response.message.content {
-        if let ContentBlock::Text { text: t } = block {
-            text.push_str(t);
-        }
-    }
+    // 拼接**全部**正文 block（紧接，无分隔符）—— 有的 provider 会把一次回答拆成多块。
+    let text = response.message.joined_text(ys_core::TextJoin::None);
 
     // B-2：空（或全空白）响应是**失败**，不是「成功的空摘要」。旧实现这里 `Ok(String::new())`，
     // 于是模型回 tool call（响应无 `Text` 块）时写出空摘要 —— 历史被静默丢掉。

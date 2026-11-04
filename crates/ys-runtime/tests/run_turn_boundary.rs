@@ -34,10 +34,7 @@ impl ys_tool::Tool for EchoTool {
         input: serde_json::Value,
         _ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult {
-            content: input.to_string(),
-            is_error: false,
-        })
+        Ok(ToolResult::text(input.to_string(), false))
     }
 }
 

@@ -3,6 +3,7 @@
 mod effort;
 mod error;
 mod id;
+mod media;
 mod message;
 mod stop;
 mod tool;
@@ -11,6 +12,7 @@ mod usage;
 pub use effort::*;
 pub use error::*;
 pub use id::*;
+pub use media::*;
 pub use message::*;
 pub use stop::*;
 pub use tool::*;

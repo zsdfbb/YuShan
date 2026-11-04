@@ -28,10 +28,7 @@ mod tests {
             input: serde_json::Value,
             _ctx: ys_tool::ToolContext<'_>,
         ) -> Result<ys_tool::ToolResult, ys_tool::ToolError> {
-            Ok(ys_tool::ToolResult {
-                content: input.to_string(),
-                is_error: false,
-            })
+            Ok(ys_tool::ToolResult::text(input.to_string(), false))
         }
     }
 

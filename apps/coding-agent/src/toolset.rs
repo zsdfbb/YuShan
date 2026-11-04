@@ -23,7 +23,7 @@ use std::path::Path;
 use ys_tool::Tool;
 use ys_tools_basic::exec::SearchBackends;
 use ys_tools_basic::{
-    BashTool, EditTool, FindTool, GrepTool, LsTool, OcrTool, ReadTool, WriteTool,
+    BashTool, EditTool, FindTool, GrepTool, LsTool, OcrTool, ReadTool, ViewImageTool, WriteTool,
 };
 use ys_tools_web::{WebConfig, WebFetchTool, WebSearchTool};
 
@@ -48,6 +48,7 @@ pub(crate) const EXPECTED_ORDER: &[&str] = &[
     "find",
     "ls",
     "ocr",
+    "view_image",
     "websearch",
     "webfetch",
 ];
@@ -60,7 +61,7 @@ pub(crate) const EXPECTED_ORDER: &[&str] = &[
 /// 进而决定将来系统提示词里工具清单的顺序。固定为：
 ///
 /// ```text
-/// read, write, edit, bash, grep, find, ls, ocr, websearch, webfetch
+/// read, write, edit, bash, grep, find, ls, ocr, view_image, websearch, webfetch
 /// ```
 ///
 /// 即「读写改 → 执行 → 检索 → 列目录 → 读图 → 联网」：模型最常用的文件读写与 shell 排在最前，
@@ -105,6 +106,9 @@ pub fn build_tools(workspace: &Path, web: WebConfig) -> (Vec<Box<dyn Tool>>, Opt
         // `ocr` 是**只读本地输入**（不写 workspace，落盘只在 `<temp>/yushan-ocr/`）⇒
         // 与文件类工具同组，紧跟 `ls` 之后；带网络的两个工具仍留在最后（本机能力优先）。
         Box::new(OcrTool::new().with_workspace(ws.clone())),
+        // `view_image` 同样只读（只读文件头 + `metadata`，不写任何位置）⇒ 紧跟 `ocr`：
+        // 两者是同一件事的两面（`ocr` 给文字与坐标，它给像素），相邻便于模型读清单。
+        Box::new(ViewImageTool::default().with_workspace(ws.clone())),
         // `WebConfig` 是 `Clone` 的值（`Client` 内含 `Arc`，克隆只复制指针）：
         // 两个工具各持一份，连接池与 UA 策略仍是同一套。
         Box::new(WebSearchTool::new(web.clone())),
@@ -221,17 +225,17 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// 1. `build_tools` 返回恰好 **10** 个工具，且 name 序列**逐字**等于固定顺序。
+    /// 1. `build_tools` 返回恰好 **11** 个工具，且 name 序列**逐字**等于固定顺序。
     ///
     /// 变异 1：`toolset.rs` 里把 `grep` / `find` 互换 → 本用例变红。
     /// 变异 2：`vec![...]` 少写一个工具（或与 `EXPECTED_ORDER` 不一致）→ 本用例变红。
     #[test]
-    fn build_tools_returns_fixed_order_of_ten() {
+    fn build_tools_returns_fixed_order_of_eleven() {
         let _guard = env_lock();
         let dir = unique_dir("order");
 
         let (tools, _hint) = build_tools(&dir, offline_web());
-        assert_eq!(tools.len(), 10, "工具表应为 10 个");
+        assert_eq!(tools.len(), 11, "工具表应为 11 个");
 
         let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
         assert_eq!(
@@ -244,7 +248,7 @@ mod tests {
     }
 
     /// 2. **顺序穿透到 agent**：`build_tools` → `AgentBuilder::tools` →
-    ///    `agent.tool_names()` 同为该 10 元序列。
+    ///    `agent.tool_names()` 同为该 11 元序列。
     ///
     ///    钉住「顺序经 `ToolRegistry` 到达 agent」这条承重链路 —— 注册表若改成
     ///    `HashMap`/排序容器，`spec()` 顺序会静默丢失，而 1 只看 `build_tools`
@@ -263,7 +267,7 @@ mod tests {
             .working_dir(dir.clone(), dir.clone())
             .approval(AutoApprove)
             .build()
-            .expect("装配 10 个基本工具应能建成 agent");
+            .expect("装配 11 个基本工具应能建成 agent");
 
         assert_eq!(agent.tool_names(), expected_order());
 
@@ -288,7 +292,7 @@ mod tests {
         let (tools, hint) = build_tools(&dir, offline_web());
         assert_eq!(
             tools.len(),
-            10,
+            11,
             "降级不影响工具数量（grep/find 退 POSIX 路径；web 工具恒注册）"
         );
 
@@ -321,7 +325,7 @@ mod tests {
         let _env = set_path(&dir);
 
         let (tools, hint) = build_tools(&dir, configured_web());
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         assert_eq!(hint, None, "两侧都无问题时不得产出任何提示");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -498,7 +502,7 @@ mod tests {
         let web = WebConfig::offline(FetchedDir::Primary(fetched.clone()));
         let (tools, _hint) = build_tools(&workspace, web);
 
-        assert_eq!(tools.len(), 10, "装配本身不应受影响");
+        assert_eq!(tools.len(), 11, "装配本身不应受影响");
         assert!(
             aged.exists(),
             "build_tools 装配不得清理落盘目录（设计 §1.1）；被删 = {}",
@@ -516,7 +520,8 @@ mod tests {
     ///    则会让同一批里的两个写操作并发跑。两个方向都必须被钉住，故本条断言的是**精确集合**，
     ///    不是「至少含有」。
     ///
-    ///    变异 1：删掉 `read`/`grep`/`find`/`ls`/`ocr` 任一处的 `is_concurrency_safe` ⇒ 变红。
+    ///    变异 1：删掉 `read`/`grep`/`find`/`ls`/`ocr`/`view_image` 任一处的
+    ///    `is_concurrency_safe` ⇒ 变红。
     ///    变异 2：给 `bash`/`write`/`edit` 加上 `is_concurrency_safe() -> true` ⇒ 变红。
     ///    （`subagent` 不在这张表里：它由 `main` 追加，且在自己的模块里声明。）
     #[test]
@@ -532,8 +537,8 @@ mod tests {
             .collect();
         assert_eq!(
             safe,
-            vec!["read", "grep", "find", "ls", "ocr"],
-            "并发安全的应恰是五个只读工具（顺序随工具表）；写/执行/联网工具必须保持默认 false"
+            vec!["read", "grep", "find", "ls", "ocr", "view_image"],
+            "并发安全的应恰是六个只读工具（顺序随工具表）；写/执行/联网工具必须保持默认 false"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -606,17 +611,17 @@ mod tests {
     }
 
     /// 断言三件：
-    ///  1. 基础表（子 agent 的工具表）恰 10 个、顺序 == [`EXPECTED_ORDER`]；
+    ///  1. 基础表（子 agent 的工具表）恰 11 个、顺序 == [`EXPECTED_ORDER`]；
     ///  2. **同一份工具表构造两次，序列化后逐字节相同**（ADR-0022 决策 19 的抖动面：
     ///     子 agent 每次派发都重建表，`spec()` 若非纯函数会让子自己的缓存跨派发抖动）；
     ///  3. 系统提示（空 skill catalogue）的指纹可复现。
     ///
     /// # 两个指纹锚各覆盖什么
     ///
-    /// - `fp_tools`：**只**覆盖基础 10 元（子 agent 的工具表）。它守的是子表自身的
+    /// - `fp_tools`：**只**覆盖基础 11 元（子 agent 的工具表）。它守的是子表自身的
     ///   字节稳定性，对追加段完全无感。
-    /// - `fp_parent`：覆盖基础 10 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）
-    ///   共 **13 元**，与 `assembly.rs` 的生产父表同形。追加段工具的 schema 漂移
+    /// - `fp_parent`：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）
+    ///   共 **14 元**，与 `assembly.rs` 的生产父表同形。追加段工具的 schema 漂移
     ///   在 `fp_tools` 那里是**静默的**（本会话已实际发生过一次：给派发工具加
     ///   `mode` 参数后 `fp_tools` 纹丝不动），故必须由父表锚补上。
     ///
@@ -633,15 +638,15 @@ mod tests {
 
         let (tools, _) = build_tools(&dir, offline_web());
         let specs: Vec<ys_tool::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
-        assert_eq!(specs.len(), 10, "基础表应为 10 个（子 agent 的表）");
+        assert_eq!(specs.len(), 11, "基础表应为 11 个（子 agent 的表）");
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
         assert_eq!(names, expected_order(), "顺序即语义");
 
         let json = serde_json::to_string(&specs).unwrap();
         let fp_tools = fnv1a64(json.as_bytes());
 
-        // **父表锚点**：父表 = 这 10 元 + `bash_bg` + `subagent_async` + `subagent_send`
-        // ⇒ **13 元**（与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的
+        // **父表锚点**：父表 = 这 11 元 + `bash_bg` + `subagent_async` + `subagent_send`
+        // ⇒ **14 元**（与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的
         // **字节前缀 + 追加项**（子表命中父的前缀缓存）。
         //
         // 三个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
@@ -652,8 +657,8 @@ mod tests {
         parent_specs.push(crate::subagent::SubagentSendTool::new().spec());
         assert_eq!(
             parent_specs.len(),
-            13,
-            "父表应为 13 元（10 基础 + bash_bg + subagent_async + subagent_send）"
+            14,
+            "父表应为 14 元（11 基础 + bash_bg + subagent_async + subagent_send）"
         );
         // 合同：父表**不得**含已删除的同步 `subagent` 工具 —— 子 agent 只能靠
         // `subagent_async` 派发（`subagent_send` 只对**已在跑**的子 agent 插话，
@@ -718,16 +723,18 @@ mod tests {
         // `fp_prompt` **不入锚** —— 它含 `Current working directory: <临时目录>`，逐次运行都不同，
         // 只由「同一目录两次构建一致」那条断言守卫。
         assert_eq!(
-            fp_tools, 0x470a916fb4af968cu64,
+            fp_tools, 0x81803a5e1b81b71eu64,
             "工具表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
-        // 父表指纹锚：覆盖基础 10 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）。
+        // 父表指纹锚：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）。
         // `fp_tools` 只覆盖子表，追加段工具的 schema 漂移在它那里是静默的 —— 这里补上。
         //
-        // 最近一次漂移：基础表新增 `ocr`（只读本地输入，排在 `ls` 之后）。两个锚同时平移 ——
-        // 基础表项在父表里，故 `fp_parent` 必须跟随；`fp_tools` 只覆盖子表。
+        // 最近一次漂移：基础表新增 `view_image`（只读本地输入，紧跟 `ocr`），同时 `ocr`
+        // 的 description 去掉「the only way to see what an image contains」这句（图像输入落地后
+        // 它已不成立）。两个锚同时平移 —— 基础表项在父表里，故 `fp_parent` 必须跟随；
+        // `fp_tools` 只覆盖子表。
         assert_eq!(
-            fp_parent, 0x0ca1d7f2e96de67du64,
+            fp_parent, 0xce43764fed837393u64,
             "父表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
 

@@ -271,14 +271,16 @@ fn tool_snippet(name: &str) -> &'static str {
         "webfetch" => {
             "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
         }
-        // 图片里的文字**唯一**的模型可见通道：`ContentBlock` 只有 `Text`/`ToolUse`/
-        // `ToolResult`，`ChatMessage.content` 是 `Option<String>`，均无多模态字段。
-        // 故文案必须点明「没有别的办法」—— 否则模型对着截图只会猜或要求用户复述。
         // 括号里补坐标：取证类任务（「报错在哪一行按钮上」）靠的正是位置，而词级坐标
         // 只能由 `word_boxes` 换来，模型无从自己推断。
         "ocr" => {
-            "Extract the text in an image together with its pixel positions — the only way to \
-             see what an image contains here; set word_boxes for per-word coordinates"
+            "Extract the text in an image together with its pixel positions; set word_boxes for \
+             per-word coordinates"
+        }
+        // 与 `ViewImageTool::spec()` 的 description 逐字一致：陈述自己的场景，**不**声明独家
+        //（`ocr` 与本工具并存，「唯一能看图」已是假话）。第二句消解「拿 URL 来试」的歧义。
+        "view_image" => {
+            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk."
         }
         // 派发工具（装配端 `spec().name` 是契约）。
         "subagent_async" => {
@@ -910,10 +912,16 @@ mod tests {
         );
         assert_eq!(tool_snippet("find"), "Search for files by glob pattern");
         assert_eq!(tool_snippet("ls"), "List directory contents");
-        // `ocr` 的两句承重语义：「唯一能看图」与「词级坐标只能靠 `word_boxes` 换」。
+        // `ocr` 的两句承重语义：「出文字 + 像素坐标」与「词级坐标只能靠 `word_boxes` 换」。
         assert_eq!(
             tool_snippet("ocr"),
-            "Extract the text in an image together with its pixel positions — the only way to see what an image contains here; set word_boxes for per-word coordinates"
+            "Extract the text in an image together with its pixel positions; set word_boxes for per-word coordinates"
+        );
+        // `view_image` 与 `ViewImageTool::spec()` 的 description 同一份字串（schema 与清单
+        // 不得说两样话）；「不声明独家」是本条承重的语义。
+        assert_eq!(
+            tool_snippet("view_image"),
+            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk."
         );
         assert_eq!(
             tool_snippet("websearch"),
@@ -925,6 +933,49 @@ mod tests {
         );
         // 兜底分支本身也要在（外部工具靠它列出而不报错）。
         assert_eq!(tool_snippet("__no_such_tool__"), "Custom tool");
+    }
+
+    /// `ocr` 的 snippet 与适配器的 `spec().description` **逐字同一份事实**。
+    ///
+    /// 两者分居两个 crate、各手写一份：任一侧改了文案而另一侧没跟，模型就会听到
+    /// 两个说法（一个是常驻的系统提示，一个是工具表）。本用例直接拿真适配器比，
+    /// 不另抄字面量。
+    ///
+    /// 变异：只改 `ocr/mod.rs` 的 description（或只改 snippet）⇒ 本用例变红。
+    #[test]
+    fn ocr_snippet_matches_adapter_description() {
+        use ys_tool::Tool as _;
+        let spec = ys_tools_basic::OcrTool::new().spec();
+        assert_eq!(spec.name, "ocr");
+        assert_eq!(
+            tool_snippet("ocr"),
+            spec.description,
+            "`tool_snippet(\"ocr\")` 与 `OcrTool::spec().description` 必须逐字一致"
+        );
+    }
+
+    /// `ocr` 不得声明自己是看图的**独家**通道（C2）。
+    ///
+    /// 文案里一旦冒出「唯一」「没有别的办法」这类断言，模型面对截图就不会想到
+    /// 用 `view_image`，只会拿 `ocr` 抠文字。两个能力并存，各自陈述作用域。
+    ///
+    /// 变异：把 `the only way` 或「唯一」加回任一文案 ⇒ 本用例变红。
+    #[test]
+    fn ocr_copy_claims_no_exclusivity() {
+        use ys_tool::Tool as _;
+        let snippet = tool_snippet("ocr").to_string();
+        let description = ys_tools_basic::OcrTool::new().spec().description;
+        for (label, text) in [("snippet", &snippet), ("description", &description)] {
+            let lower = text.to_lowercase();
+            assert!(
+                !lower.contains("the only way"),
+                "`ocr` 的 {label} 不得声称独家：{text}"
+            );
+            assert!(
+                !text.contains("唯一"),
+                "`ocr` 的 {label} 不得声称独家：{text}"
+            );
+        }
     }
 
     /// web 两条 guideline 在工具**在场**时出现、**缺席**时不出现（照 `grep`/`find` 的
@@ -2071,7 +2122,7 @@ mod tests {
         let normalized = body.replace(&dir.display().to_string(), "<cwd>");
         assert_eq!(
             fnv1a64(normalized.as_bytes()),
-            0x4ce143161b13432fu64,
+            0x74ddeff50176daba_u64,
             "主 agent 提示主体漂移：确认是有意改动，再更新此锚点"
         );
 

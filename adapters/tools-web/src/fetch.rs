@@ -327,10 +327,7 @@ impl Tool for WebFetchTool {
             Ok(fetched) => fetched,
             // 用户取消**不是错误**（与 `grep` 被我们自己杀掉同款）：正常收场。
             Err(FetchError::Aborted) => {
-                return Ok(ToolResult {
-                    content: "Fetch aborted by user.".into(),
-                    is_error: false,
-                });
+                return Ok(ToolResult::text("Fetch aborted by user.", false));
             }
             // 网络族失败（DNS / 连接 / TLS / 超时 / 非 2xx / 重定向被拒）→ **模型可见的
             // 错误结果**，不是工具失败（ADR-0001）：换一个 URL 就能解决。
@@ -462,17 +459,14 @@ impl Tool for WebFetchTool {
                 // 只有一句短消息，**不经过 `append_notices`、不挂指针、不回灌头部**
                 // —— 与抓取期 `FetchError::Aborted` 的处置逐字同形。
                 Outcome::Aborted => {
-                    return Ok(ToolResult {
-                        content: "Fetch aborted by user during summarization.".into(),
-                        is_error: false,
-                    });
+                    return Ok(ToolResult::text(
+                        "Fetch aborted by user during summarization.",
+                        false,
+                    ));
                 }
             };
             append_notices(&mut content, &notices);
-            return Ok(ToolResult {
-                content,
-                is_error: false,
-            });
+            return Ok(ToolResult::text(content, false));
         }
 
         let mut notices = fetch_notices(&fetched, decode_notice);
@@ -480,10 +474,7 @@ impl Tool for WebFetchTool {
 
         let mut content = head.content;
         append_notices(&mut content, &notices);
-        Ok(ToolResult {
-            content,
-            is_error: false,
-        })
+        Ok(ToolResult::text(content, false))
     }
 }
 
@@ -545,10 +536,7 @@ fn saved_notice(head: &ys_tool::Truncation, saved: Result<std::path::PathBuf, St
 
 /// 模型可见的错误结果（与 `tools-basic` 同款的小助手）。
 fn error_result(content: String) -> ToolResult {
-    ToolResult {
-        content,
-        is_error: true,
-    }
+    ToolResult::text(content, true)
 }
 
 // ─────────────────────── 可选 `prompt` 的摘要路径 ───────────────────────

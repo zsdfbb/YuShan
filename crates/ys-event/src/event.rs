@@ -296,4 +296,20 @@ mod tests {
             other => panic!("期望 RoundUsage，实得 {other:?}"),
         }
     }
+
+    // 无媒体附件的 `ToolResult` 事件必须**不写出** `media` 键（靠 `skip_serializing_if`）。
+    //
+    // 变异说明：去掉 `ToolResult.media` 上的 `skip_serializing_if` ⇒ 多出 `"media":[]` ⇒ 变红。
+    // golden 基线 `json_no_debug_baseline.jsonl` 不含 `ToolResult` 行，押不住这条契约。
+    #[test]
+    fn tool_result_event_without_media_has_no_media_key() {
+        let event = AgentEvent::ToolResult {
+            id: ToolCallId("c1".into()),
+            result: ToolResult::text("x", false),
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"ToolResult":{"id":"c1","result":{"content":"x","is_error":false}}}"#
+        );
+    }
 }

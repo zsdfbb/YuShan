@@ -103,13 +103,8 @@ impl ys_tool::Summarizer for ModelSummarizer<'_> {
             .await
             .map_err(|e| e.to_string())?;
 
-        // 拼接**全部** `Text` block —— 有的 provider 会把一次回答拆成多块。
-        let mut text = String::new();
-        for block in &response.message.content {
-            if let ContentBlock::Text { text: t } = block {
-                text.push_str(t);
-            }
-        }
+        // 拼接**全部**正文 block（紧接，无分隔符）—— 有的 provider 会把一次回答拆成多块。
+        let text = response.message.joined_text(ys_core::TextJoin::None);
 
         // 空（或全空白）响应是**失败**而不是「成功的空摘要」：`Ok("")` 会让调用方
         // 把「模型什么都没说」渲染成一段看起来权威的空白摘要。

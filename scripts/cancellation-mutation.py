@@ -79,10 +79,10 @@ MUTANTS: list[Mutant] = [
                 "adapters/model-openai-compatible/src/lib.rs",
                 """            biased;
             _ = wait_abort(boundary) => SendOutcome::Cancelled,
-            result = self.send(url, chat_request) => SendOutcome::Sent(result),""",
+            result = self.send(url, chat_request, body_cache) => SendOutcome::Sent(result),""",
                 """            biased;
             _ = std::future::pending::<()>() => SendOutcome::Cancelled,
-            result = self.send(url, chat_request) => SendOutcome::Sent(result),""",
+            result = self.send(url, chat_request, body_cache) => SendOutcome::Sent(result),""",
             )
         ],
     ),
@@ -276,10 +276,10 @@ MUTANTS: list[Mutant] = [
             (
                 "crates/ys-loop/src/basic.rs",
                 """                        if ctx.boundary.as_ref().is_some_and(|b| b.is_aborted()) {
-                            outcomes[i] = Some(CoreToolResult {
-                                content: "tool not executed: turn cancelled".to_string(),
-                                is_error: true,
-                            });
+                            outcomes[i] = Some(CoreToolResult::text(
+                                "tool not executed: turn cancelled",
+                                true,
+                            ));
                             continue;
                         }""",
             """                        // MUTATION: abort 探针被去掉""",

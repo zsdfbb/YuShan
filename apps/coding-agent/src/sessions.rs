@@ -13,7 +13,7 @@ use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ys_core::{ContentBlock, Message, Role};
+use ys_core::{Message, Role, TextJoin};
 use ys_protocol::SessionSummary;
 use ys_session::SessionMeta;
 
@@ -178,24 +178,25 @@ pub fn derive_stored_title(raw: &str) -> String {
 }
 
 /// 从一条消息取用户原文：仅 `Role::User` 且含非空 `Text` 块时拼接，否则 `None`
-/// （纯 `ToolResult` 的 user 消息不算用户文本）。
+/// （纯 `ToolResult` 的 user 消息不算用户文本；纯 `Image` 的消息也不算 —— 标题只取文字）。
+///
+/// 块选择交给 [`Message::joined_text`]（内部走 `ContentBlock::as_text` 的穷尽 match，
+/// 新变体在定义 crate 里就强制表态）；`Role::User` 检查与「非空」过滤仍留在本函数。
 pub fn user_text(message: &Message) -> Option<String> {
     if message.role != Role::User {
         return None;
     }
-    let parts: Vec<&str> = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
+    // 「空文本框不算原文」是本函数的额外约束，`joined_text` 不过滤空白 ——
+    // 先判「有无非空 Text」再拼接，避免纯空白消息算出 `Some("")`。
+    let has_nonempty_text = message.content.iter().any(|block| {
+        block
+            .as_text()
+            .is_some_and(|text| !text.trim().is_empty())
+    });
+    if !has_nonempty_text {
+        return None;
     }
+    Some(message.joined_text(TextJoin::Space))
 }
 
 /// 折叠任意空白（含换行）为单个空格并去首尾。
@@ -213,6 +214,7 @@ fn unix_secs(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ys_core::ContentBlock;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;

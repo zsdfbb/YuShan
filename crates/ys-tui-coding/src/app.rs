@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use ys_core::{ContentBlock, Message, Role, StopReason, ToolCallId};
+use ys_core::{ContentBlock, ImageDetail, Message, Role, StopReason, ToolCallId};
 use ys_event::AgentEvent;
 use ys_protocol::{Envelope, Outbound, Request, SessionSummary};
 
@@ -902,14 +902,59 @@ enum StreamKind {
 ///
 /// `pub(crate)`：`events.rs` 提交普通消息时用它回显 —— 回显文本与真正发出去的
 /// 消息必须**同源**，否则 trim / 多块拼接上的差异会让两边对不上。
+///
+/// **`Image` 块渲染成一行 [`image_marker`]，绝不渲染字节** —— 图片只以路径 + 档位
+/// 出现在 transcript 里（字节在适配器出站时才现读，见 `ys_core::ContentBlock::Image`）。
 pub(crate) fn message_text(message: &Message) -> String {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     for block in &message.content {
-        if let ContentBlock::Text { text } = block {
-            parts.push(text);
+        match block {
+            ContentBlock::Text { text } => parts.push(text.clone()),
+            ContentBlock::Image { path, detail } => parts.push(image_marker(path, *detail)),
+            // `ToolUse` / `ToolResult` 不显示：工具行由 `TranscriptLine::Tool` 单独承载。
+            // `ContentBlock` 是 `#[non_exhaustive]` ⇒ 未知变体仍静默跳过，新变体须在此表态。
+            _ => {}
         }
     }
     parts.join("\n")
+}
+
+/// 图片标记里路径的**字符**上限（不是显示宽度，只是防一条超长路径撑爆 transcript）。
+const IMAGE_PATH_MAX_CHARS: usize = 120;
+
+/// 一个 `Image` 块在文本里的唯一表示：`[image: /tmp/a.png (high)]`。
+///
+/// **只显示路径与档位，绝不显示字节**（那会瞬间撑爆 transcript）。`detail: None` 表示
+/// 「用默认档位」⇒ 不写档位括号。路径超长时从**尾部**保留（文件名与末级目录是辨识关键），
+/// 前面补 `…`，故总长有界且仍可定位。
+pub(crate) fn image_marker(path: &str, detail: Option<ImageDetail>) -> String {
+    let path = elide_middle(path, IMAGE_PATH_MAX_CHARS);
+    match detail {
+        Some(detail) => format!("[image: {path} ({})]", detail_label(detail)),
+        None => format!("[image: {path}]"),
+    }
+}
+
+/// 档位的文本形态：小写，与 [`ImageDetail`] 的 serde 形态一致（落盘为 `"high"`）。
+fn detail_label(detail: ImageDetail) -> &'static str {
+    match detail {
+        ImageDetail::Low => "low",
+        ImageDetail::High => "high",
+        ImageDetail::Original => "original",
+        ImageDetail::Auto => "auto",
+    }
+}
+
+/// 按 **char 边界**保留尾部：超长时切掉开头并补 `…`。
+///
+/// 保留尾部而非头部：路径的**文件名**在最末，切掉它等于让两条路径看起来一样。
+fn elide_middle(s: &str, max_chars: usize) -> String {
+    let len = s.chars().count();
+    if len <= max_chars {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(len - (max_chars - 1)).collect();
+    format!("…{tail}")
 }
 
 /// 把一条 `Role::Harness` 消息渲染成一行 System 摘要。
@@ -1178,10 +1223,7 @@ mod tests {
     fn tool_result(id: &str, content: &str, is_error: bool) -> Envelope {
         env(AgentEvent::ToolResult {
             id: ToolCallId(id.into()),
-            result: ToolResult {
-                content: content.into(),
-                is_error,
-            },
+            result: ToolResult::text(content, is_error),
         })
     }
 
@@ -2706,6 +2748,102 @@ mod tests {
             ],
         };
         assert_eq!(message_text(&msg), "a\nb", "只取 Text 块，非 Text 块跳过");
+    }
+
+    /// **Image 渲染的两种档位形态**。
+    ///
+    /// `detail: None` 表示「用默认档位」⇒ 不写括号；`Some` ⇒ 括号里是小写档位
+    /// （与 `ImageDetail` 的 serde 形态一致，`"high"` 而不是 `"High"`）。
+    ///
+    /// **变异**：把 `image_marker` 改成总是省略档位 ⇒ 第二个断言变红。
+    #[test]
+    fn u9_message_text_renders_image_marker_with_and_without_detail() {
+        let with_detail = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                path: "/tmp/a.png".into(),
+                detail: Some(ImageDetail::High),
+            }],
+        };
+        assert_eq!(
+            message_text(&with_detail),
+            "[image: /tmp/a.png (high)]",
+            "档位用小写拼写（与 ImageDetail 的 serde 形态一致）"
+        );
+
+        let without_detail = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                path: "/tmp/a.png".into(),
+                detail: None,
+            }],
+        };
+        assert_eq!(
+            message_text(&without_detail),
+            "[image: /tmp/a.png]",
+            "detail: None ⇒ 不写档位括号"
+        );
+    }
+
+    /// **图片字节绝不进 transcript**，且渲染文本长度有界。
+    ///
+    /// 两条不变量合在一个用例里，因为它们的失败形态相同：一个巨型路径被整段抄进
+    /// transcript（那是 `image_marker` 漏了截断的唯一后果）。
+    ///
+    /// **变异**：删掉 `elide_middle` 的截断 ⇒ 长度断言变红。
+    #[test]
+    fn u9_image_marker_is_bounded_and_never_contains_bytes() {
+        let long = format!("/tmp/{}/deep.png", "很长的目录/".repeat(300));
+        assert!(long.chars().count() > 1000, "前提：路径确实超长");
+        let marker = super::image_marker(&long, Some(ImageDetail::Low));
+
+        assert!(
+            marker.chars().count() < 200,
+            "渲染文本必须长度有界，实际 {} 字符：{marker:?}",
+            marker.chars().count()
+        );
+        assert!(
+            marker.contains("deep.png"),
+            "截断后仍须保留文件名（可辨识）：{marker:?}"
+        );
+        assert!(
+            !marker.contains("base64") && !marker.contains("data:"),
+            "图片字节绝不能出现在渲染文本里：{marker:?}"
+        );
+    }
+
+    /// **U4 白名单**：`message_text` 已处理的块集合 —— 当前只取 `Text`，`Image` 应产出
+    /// `[image: …]` 标记但尚未实现 ⇒ 本用例**预期红**，U9 转绿。
+    ///
+    /// 为什么需要它：`ContentBlock` 是 `#[non_exhaustive]`，本函数用 `if let` 取块 ⇒ 加变体
+    /// **零编译错误**、静默丢弃（不报错、不告警）。编译器不守护，只能把块集合钉成断言：
+    /// 本用例变红 = 提醒更新此处（`transcript.rs` 的 `u4_replay_lines_must_render_image_block`
+    /// 是同批的另一半）。
+    ///
+    /// 断言只看路径是否出现，不钉标记文案 —— 文案由 U9 决定。
+    #[test]
+    fn u4_message_text_includes_image_marker() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "看图".into(),
+                },
+                ContentBlock::Image {
+                    path: "/tmp/a.png".into(),
+                    detail: None,
+                },
+            ],
+        };
+        let text = message_text(&msg);
+        assert!(
+            text.contains("看图"),
+            "前提：Text 块仍照旧取出（本用例只新增 Image 的诉求）。实际：{text:?}"
+        );
+        assert!(
+            text.contains("/tmp/a.png"),
+            "message_text 丢弃了 Image 块 —— 加变体后必须更新它。实际：{text:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -196,14 +196,14 @@ impl Tool for GrepTool {
                 // 故**明确报错**（与降级路径同款处理），绝不静默给错答案。
                 if let Some(g) = glob.filter(|g| g.starts_with('/')) {
                     return Ok(attach_notice(
-                        ToolResult {
-                            content: format!(
+                        ToolResult::text(
+                            format!(
                                 "glob '{g}' starts with '/' — ripgrep anchors such globs to the \
                                  working directory, not to the search root. Drop the leading '/' \
                                  (e.g. 'src/*.rs') to match at any depth under the search root."
                             ),
-                            is_error: true,
-                        },
+                            true,
+                        ),
                         path_notice.as_deref(),
                     ));
                 }
@@ -218,15 +218,15 @@ impl Tool for GrepTool {
                 // 会一条都匹配不到。**不能静默给错答案** —— 返回明确的错误结果。
                 if glob.is_some_and(|g| g.contains('/')) {
                     return Ok(attach_notice(
-                        ToolResult {
-                            content: format!(
+                        ToolResult::text(
+                            format!(
                                 "glob '{g}' contains '/' which the POSIX fallback (grep --include) \
                                  cannot express — it matches basenames only. Retry with a basename \
                                  glob (e.g. '*.rs'), or install ripgrep (rg) for path-aware globs.",
                                 g = glob.unwrap_or_default()
                             ),
-                            is_error: true,
-                        },
+                            true,
+                        ),
                         path_notice.as_deref(),
                     ));
                 }
@@ -276,10 +276,7 @@ impl GrepTool {
                 Some(0) => {}
                 // 1 = 无命中。**不是错误** —— 否则模型每次搜空都以为工具坏了。
                 Some(1) => {
-                    return ToolResult {
-                        content: "No matches found".into(),
-                        is_error: false,
-                    };
+                    return ToolResult::text("No matches found", false);
                 }
                 // ≥2 = 真出错（路径不存在、正则非法…）：stderr 前 4 KiB 是给模型看的线索。
                 _ => return exit_error(label, bounded),
@@ -291,13 +288,13 @@ impl GrepTool {
         // ★ 退出码 0 却一个 `type:"match"` 都解析不出来 = **输出格式漂移**。
         // 这正是「静默当无命中」最危险的形态：模型会据此断言「代码里没有这个东西」。
         if matches == 0 && !killed_by_us {
-            return ToolResult {
-                content: format!(
+            return ToolResult::text(
+                format!(
                     "{label} exited 0 but produced no parseable match events — its output format \
                      may have changed. Refusing to report a false 'no matches'.",
                 ),
-                is_error: true,
-            };
+                true,
+            );
         }
 
         let (lines, limit_reached, lines_truncated, total_matches) =
@@ -381,10 +378,7 @@ impl GrepTool {
         }
         append_notices(&mut content, &notices);
 
-        ToolResult {
-            content,
-            is_error: false,
-        }
+        ToolResult::text(content, false)
     }
 }
 
@@ -672,10 +666,7 @@ fn exit_error(label: &str, bounded: &Bounded) -> ToolResult {
     } else {
         stderr.to_string()
     };
-    ToolResult {
-        content,
-        is_error: true,
-    }
+    ToolResult::text(content, true)
 }
 
 #[cfg(test)]

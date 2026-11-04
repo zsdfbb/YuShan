@@ -13,7 +13,7 @@
 #
 # # 用法
 #
-#   ./scripts/verify.sh                # 全量：测试 + 3 个变异脚本
+#   ./scripts/verify.sh                # 全量：测试 + 5 个变异脚本
 #   ./scripts/verify.sh --tests-only   # 只跑测试（改动很小、想快速过一遍时）
 #   ./scripts/verify.sh --jobs 4       # 传给 par-test.sh 的并行度
 #
@@ -28,6 +28,11 @@
 # `selection-mutation.py` 要求 `selection.rs` / `events.rs` **无未提交改动**
 # （它在启动时快照这两份源码）。故本脚本在跑变异前不检查工作区，由各脚本
 # 自己把关；带着未提交改动跑会在前置阶段硬失败，属预期行为。
+#
+# `vision-mutation.py` **不要**这个前置：它与 `cancellation-mutation.py` 一样靠
+# **进程内快照**还原（不用 `git checkout`），因此可以带着未提交改动跑。
+# 它在跑第一个 mutant 之前会做一遍**锚点自检**：任何 `old` 文本不再唯一命中就
+# 整体失败（退出码 1）—— 那是「代码变了而脚本没跟上」，必须算失败。
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -52,7 +57,7 @@ fi
 
 if [ "$tests_only" -eq 0 ]; then
     printf '\n=== 2/2 变异测试（注入 bug，期望测试变红）===\n'
-    for s in cancellation-mutation wheel-mutation selection-mutation theme-mutation; do
+    for s in cancellation-mutation wheel-mutation selection-mutation theme-mutation vision-mutation; do
         printf '\n--- %s ---\n' "$s"
         if python3 "scripts/$s.py"; then
             printf '✓ %s\n' "$s"

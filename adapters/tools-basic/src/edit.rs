@@ -1124,10 +1124,10 @@ impl Tool for EditTool {
             }
         }
 
-        let mut tool_result = ToolResult {
-            content: format!("Successfully replaced {} block(s) in {path}.", edits.len()),
-            is_error: false,
-        };
+        let mut tool_result = ToolResult::text(
+            format!("Successfully replaced {} block(s) in {path}.", edits.len()),
+            false,
+        );
         ys_tool::append_notices(&mut tool_result.content, &notices);
         Ok(attach_notice(tool_result, path_notice.as_deref()))
     }

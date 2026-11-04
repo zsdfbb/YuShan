@@ -1796,14 +1796,24 @@ async fn run_turn_once(
 ///
 /// # 三个「不」
 ///
-/// - 首块**不是 `Text`**（例如带图/多块消息）⇒ 不展开（只认纯文本首块的 `/` 命名空间）。
+/// - 首块**不是 `Text`**（例如首块即图片）⇒ **整条不展开**（只认纯文本首块的 `/` 命名空间）。
+///   这是刻意保留的既有语义：`/name` 只在「用户敲的第一段是命令」时成立；放宽到
+///   任意位置会把正文中途出现的 `/foo`、以及 `[Image, Text("/foo")]` 这类组合
+///   也当命令解析。首块非 `Text` 时消息**原样返回**，块一个不丢。
 /// - 未知命令 / `user-invocable: false` / 正文读不出来 ⇒ `expand_invocation` 返回
 ///   `None` ⇒ 原样返回（宁可发一条普通消息，也不塞半截指令）。
 /// - **不缓存**正文：skill 目录可写（agent 会往里写文件），缓存会给出陈旧指令。
+///
+/// # 只替换首个 `Text` 块，其余块原位保留
+///
+/// 展开结果**只占首个 `Text` 块的位置**；`Image` 等其余块原封不动、且**下标不变**
+/// （`[Text(…), Image, Text(尾巴)]` ⇒ `[Text(信封), Image, Text(尾巴)]`）。
+/// 绝不可把消息重建成「只有展开结果一个 `Text` 块」—— 那会**静默丢图**：用户发
+/// 「`/skill` + 一张截图」时图片在无编译错误、无运行时告警的情况下从上下文里消失。
 fn expand_skill_invocation(message: Message, skills: &[crate::skills::SkillEntry]) -> Message {
     // skill 调用是**用户输入**的概念：只有 `Role::User` 才展开。harness 注入的输入
-    // （后台命令结果等）与用户原文可以长得一样，但它不是用户在敲命令 —— 展开会
-    // 顺带把角色重建成 `User`（见下面的 `Message { role: Role::User, .. }`）。
+    // （后台命令结果等）与用户原文可以长得一样，但它不是用户在敲命令 —— 展开路径
+    // 写的是 `Role::User` 的用户发言语义。
     if message.role != Role::User {
         return message;
     }
@@ -1816,10 +1826,18 @@ fn expand_skill_invocation(message: Message, skills: &[crate::skills::SkillEntry
                 "skill invocation expanded ({} bytes) for this turn",
                 expanded.len()
             ));
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: expanded }],
+            let mut message = message;
+            // 首个 `Text` 块换成展开结果，其余块（图片等）**保持原位**。
+            // `first_text` 已确认首块是 `Text`，所以这个循环必然在第一轮命中并 `break`；
+            // 写成循环而非 `message.content[0] = …` 是为了不把「首块即 Text」这个前提
+            // 变成隐式下标依赖。
+            for block in &mut message.content {
+                if let ContentBlock::Text { text } = block {
+                    *text = expanded;
+                    break;
+                }
             }
+            message
         }
         None => message,
     }
@@ -4289,6 +4307,164 @@ mod tests {
         let out = expand_skill_invocation(harness.clone(), &skills);
         assert_eq!(out, harness, "harness 输入必须逐字节原样返回");
         assert_eq!(out.role, Role::Harness, "角色不得被改写成 `User`");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 建一份临时 skill 目录并扫描成表（恰好一条 `demo`）。
+    fn demo_skill_table(tag: &str) -> (PathBuf, Vec<crate::skills::SkillEntry>) {
+        let root = temp_dir_for(tag);
+        let dir = root.join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\ndescription: 演示技能\n---\n正文第一行\n正文第二行\n",
+        )
+        .unwrap();
+        let (skills, _) = crate::skills::scan(std::slice::from_ref(&root));
+        assert_eq!(skills.len(), 1, "测试前提：恰好扫到一条 skill");
+        (root, skills)
+    }
+
+    /// **展开只换首个 `Text` 块，图片块原位保留**。
+    ///
+    /// 用户发「`/demo` + 一张截图」时，`content` 是 `[Text("/demo"), Image]`；
+    /// 展开若把消息重建成「只有一个 `Text` 块」，图片就会**静默消失**（无编译错误、
+    /// 无运行时告警）。本用例逐字段把图片块钉住。
+    ///
+    /// 变异：展开时写回 `content: vec![ContentBlock::Text { text: expanded }]`
+    /// ⇒ 本用例变红（`content.len()` 变 1，图片断言失败）。
+    #[test]
+    fn skill_expansion_keeps_image_block() {
+        let (root, skills) = demo_skill_table("expand_image");
+        let image = ContentBlock::Image {
+            path: "/tmp/shot.png".into(),
+            detail: Some(ys_core::ImageDetail::High),
+        };
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "/demo 帮我看看".into(),
+                },
+                image.clone(),
+            ],
+        };
+
+        let out = expand_skill_invocation(msg, &skills);
+        assert_eq!(out.role, Role::User, "展开后仍是用户发言");
+        assert_eq!(out.content.len(), 2, "块数不得变化：{:?}", out.content);
+        match &out.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(
+                    text.contains("<skill name=\"demo\""),
+                    "首块应为展开信封：{text}"
+                );
+                assert!(text.contains("正文第一行"), "信封里要有 skill 正文：{text}");
+                assert!(text.contains("帮我看看"), "参数要在信封尾部：{text}");
+            }
+            other => panic!("首位应仍是 `Text` 块，实为 {other:?}"),
+        }
+        assert_eq!(out.content[1], image, "图片块必须逐字段原样保留");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **不回归**：不命中的普通消息逐字段不变（既不套信封、也不动块结构）。
+    #[test]
+    fn plain_message_is_untouched_by_expansion() {
+        let (root, skills) = demo_skill_table("expand_plain");
+        let msg = user_message("普通消息，不是命令");
+        let out = expand_skill_invocation(msg.clone(), &skills);
+        assert_eq!(out, msg, "不命中的消息必须逐字段不变");
+        assert_eq!(out.content.len(), 1, "块数不得变化");
+
+        // 未知命令同样不变。
+        let unknown = user_message("/nope 参数");
+        assert_eq!(expand_skill_invocation(unknown.clone(), &skills), unknown);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **多块保序**：`[Text(/demo), Image, Text(尾巴)]` ⇒ 只有首个 `Text` 被替换，
+    /// 图片与**第二个 `Text` 都还在各自的下标**上（不得被吞、不得被前移）。
+    ///
+    /// 变异：展开时只保留首个 `Text`（或把展开结果 unshift 到最前）⇒ 本用例变红。
+    #[test]
+    fn skill_expansion_preserves_block_order() {
+        let (root, skills) = demo_skill_table("expand_order");
+        let image = ContentBlock::Image {
+            path: "/tmp/a.png".into(),
+            detail: None,
+        };
+        let tail = ContentBlock::Text {
+            text: "尾巴".into(),
+        };
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "/demo".into(),
+                },
+                image.clone(),
+                tail.clone(),
+            ],
+        };
+
+        let out = expand_skill_invocation(msg, &skills);
+        assert_eq!(out.content.len(), 3, "块数不得变化：{:?}", out.content);
+        match &out.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(
+                    text.contains("<skill name=\"demo\""),
+                    "首块应为展开信封：{text}"
+                )
+            }
+            other => panic!("首位应仍是 `Text` 块，实为 {other:?}"),
+        }
+        assert_eq!(out.content[1], image, "图片必须留在下标 1");
+        assert_eq!(
+            out.content[2], tail,
+            "第二个 `Text` 必须原样留在下标 2（不得被替换成展开结果）"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **首块非 `Text` ⇒ 整条不展开**（保持既有语义：只认纯文本首块的 `/` 命名空间）。
+    ///
+    /// 放宽到「在任意位置找首个 `Text`」会改变既有语义，不在本任务范围。这里把
+    /// 契约钉住：`[Image, Text("/demo")]` 原样返回，图片仍在首位。
+    #[test]
+    fn non_text_first_block_is_not_expanded() {
+        let (root, skills) = demo_skill_table("expand_nontext");
+        // 前置：同样的调用在纯文本下确实会展开，否则本用例分不出「首块门控」与
+        // 「这个命令本来就没命中」。
+        assert_ne!(
+            expand_skill_invocation(user_message("/demo"), &skills),
+            user_message("/demo"),
+            "测试前提：纯文本 `/demo` 会展开"
+        );
+
+        let image_first = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Image {
+                    path: "/tmp/first.png".into(),
+                    detail: Some(ys_core::ImageDetail::Low),
+                },
+                ContentBlock::Text {
+                    text: "/demo".into(),
+                },
+            ],
+        };
+        let out = expand_skill_invocation(image_first.clone(), &skills);
+        assert_eq!(out, image_first, "首块非 `Text` ⇒ 整条逐字段不变");
+        assert!(
+            matches!(out.content.first(), Some(ContentBlock::Image { .. })),
+            "图片仍在首位：{:?}",
+            out.content
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

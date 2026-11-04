@@ -616,10 +616,7 @@ mod tests {
     fn tool_result_id(id: &str) -> AgentEvent {
         AgentEvent::ToolResult {
             id: ToolCallId(id.into()),
-            result: ToolResult {
-                content: "ok".into(),
-                is_error: false,
-            },
+            result: ToolResult::text("ok", false),
         }
     }
 
@@ -1129,10 +1126,7 @@ mod tests {
 
         let result = AgentEvent::ToolResult {
             id: ToolCallId("c1".into()),
-            result: ToolResult {
-                content: "line1\nline2\n".into(),
-                is_error: true,
-            },
+            result: ToolResult::text("line1\nline2\n", true),
         };
         let result_observation = clock.observe_debug(&env_of(result), t0 + 70 * MS);
         let result_record = &result_observation.records[0];

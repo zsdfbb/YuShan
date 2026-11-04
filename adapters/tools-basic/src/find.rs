@@ -227,10 +227,7 @@ fn build_result(bounded: &Bounded, search_root: &Path, limit: usize, label: &str
     }
     append_notices(&mut content, &notices);
 
-    ToolResult {
-        content,
-        is_error: false,
-    }
+    ToolResult::text(content, false)
 }
 
 /// 非零退码且无结果 → 模型可见的错误结果，附 stderr 前 4 KiB。
@@ -245,10 +242,7 @@ fn exit_error(label: &str, bounded: &Bounded) -> ToolResult {
     } else {
         stderr.to_string()
     };
-    ToolResult {
-        content,
-        is_error: true,
-    }
+    ToolResult::text(content, true)
 }
 
 #[cfg(test)]

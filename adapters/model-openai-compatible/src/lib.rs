@@ -1,4 +1,5 @@
 pub mod compat;
+pub mod media;
 pub mod request;
 pub mod response;
 pub mod stream;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use compat::ProviderCompat;
 use inline_thinking::{Segment, SegmentKind};
+use media::{MediaCache, MediaError, resolve_image};
 use request::*;
 use response::*;
 use stream::{StreamEvent, parse_sse_stream};
@@ -211,6 +213,12 @@ pub struct OpenAICompatibleModel {
     /// client 是本模型自建（`new`）还是调用方注入（`with_client`）。
     /// 自建时 `with_timeouts` 按新超时重建 client；注入时其连接策略归调用方。
     owns_client: bool,
+    /// 出站图片解析的缓存（路径 + mtime + len → data URL）。
+    ///
+    /// 跨请求存活：同一张图在多个回合里重放时命中缓存，不必重读盘、重编码。
+    /// 这个字段也是 [`translate_request`] 需要 `&MediaCache` 的原因 —— 翻译是
+    /// **本仓唯一读图字节的地方**。
+    media: Arc<MediaCache>,
 }
 
 impl OpenAICompatibleModel {
@@ -227,6 +235,7 @@ impl OpenAICompatibleModel {
             trace: None,
             extra_headers: Vec::new(),
             owns_client: true,
+            media: Arc::new(MediaCache::new()),
         }
     }
 
@@ -245,7 +254,17 @@ impl OpenAICompatibleModel {
             trace: None,
             extra_headers: Vec::new(),
             owns_client: false,
+            media: Arc::new(MediaCache::new()),
         }
+    }
+
+    /// 注入出站图片解析的缓存（默认是新建的空缓存）。
+    ///
+    /// 主要用于测试注入小上限（`MediaLimits`）：真实上限 32 MiB / 48 MiB 在用例
+    /// 里无法构造夹具，而逻辑与尺寸无关（C8.6）。
+    pub fn with_media_cache(mut self, cache: Arc<MediaCache>) -> Self {
+        self.media = cache;
+        self
     }
 
     /// 设置有界重试策略。
@@ -308,22 +327,74 @@ impl OpenAICompatibleModel {
         }
     }
 
-    /// 发送一次 `/chat/completions` 请求。只负责传输层错误，不解读状态码——
+    /// 发送一次 `/chat/completions` 请求。只负责传输层错误与序列化错误，不解读状态码——
     /// 状态码由 [`Model::complete`] 统一处理（便于实现一次性回退）。
+    ///
+    /// 请求体经 [`cached_body`] 取得：命中共用缓存 ⇒ **不重复序列化**（带图请求体
+    /// 可达几十 MiB）。缓存由调用方持有并负责失效，本方法只读 `chat_request`。
     async fn send(
         &self,
         url: &str,
         chat_request: &ChatCompletionRequest,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+        body_cache: &mut Option<Arc<Vec<u8>>>,
+    ) -> Result<reqwest::Response, SendError> {
+        let body = cached_body(chat_request, body_cache).map_err(SendError::Serialize)?;
         let mut request = self
             .client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
+            // `.json()` 会自动带该头，`.body()` 不会 ⇒ 必须显式保留。
             .header("Content-Type", "application/json");
         for (name, value) in &self.extra_headers {
             request = request.header(name.clone(), value.clone());
         }
-        request.json(chat_request).send().await
+        // `Vec` → `reqwest::Body` 会拷一次内容；换 `bytes::Bytes` 可免掉这次拷贝，
+        // 但那要多一条显式依赖 —— MB 级拷贝比新依赖便宜。
+        let response = request.body((*body).clone()).send().await;
+        response.map_err(SendError::Transport)
+    }
+}
+
+/// `send` 的失败分类。
+///
+/// 序列化发生在**发请求之前**，与传输层失败不是同一类故障：同一份 `chat_request`
+/// 无论重发多少次都会序列化失败（确定性），而连接 / 超时抖动值得重试。
+/// 两者重试分类相反，故不挤进同一个 `reqwest::Error`（后者无法承载 `serde_json::Error`）。
+enum SendError {
+    Serialize(serde_json::Error),
+    Transport(reqwest::Error),
+}
+
+/// `send` 失败 → attempt 分类。
+///
+/// 传输层仍走 [`retryable_transport_error`]（分类与阈值一字不变）；序列化是确定性
+/// 失败 ⇒ [`AttemptError::Fatal`]，不消耗重试预算 —— 重试只会把同一个错误再报一遍。
+fn send_error_to_attempt(error: SendError) -> AttemptError {
+    match error {
+        SendError::Transport(error) => retryable_transport_error(error),
+        SendError::Serialize(error) => AttemptError::Fatal {
+            error: ModelError::Serde(error),
+            reason_class: ModelAttemptReason::Fatal,
+        },
+    }
+}
+
+/// 取请求体字节：已有缓存则复用，否则序列化后写回缓存。
+///
+/// **缓存的有效性由调用方维护**：`chat_request` 一旦被写入，缓存就必须置 `None`；
+/// 否则重发会带上陈旧字节（例如仍含 `stream_options` ⇒ 回退永远失败）。
+fn cached_body(
+    chat_request: &ChatCompletionRequest,
+    body_cache: &mut Option<Arc<Vec<u8>>>,
+) -> Result<Arc<Vec<u8>>, serde_json::Error> {
+    match body_cache {
+        Some(cached) => Ok(Arc::clone(cached)),
+        None => {
+            let bytes = serde_json::to_vec(chat_request)?;
+            let fresh = Arc::new(bytes);
+            *body_cache = Some(Arc::clone(&fresh));
+            Ok(fresh)
+        }
     }
 }
 
@@ -443,7 +514,11 @@ impl Model for OpenAICompatibleModel {
     ) -> Result<ModelResponse, ModelError> {
         // 1. 翻译 v0 内部格式 → OpenAI API 格式（`stream: true`）。
         //    `supports_stream_usage` 决定是否带 `stream_options.include_usage`。
-        let mut chat_request = translate_request(&request, &self.config)?;
+        let mut chat_request = translate_request(&request, &self.config, &self.media)?;
+        // 请求体的序列化缓存。**跨外层重试复用**（带图请求体可达几十 MiB，重复序列化
+        // 是纯浪费），但**任何对 `chat_request` 的写入都必须同时把它置 `None`** ——
+        // 目前唯一写点是 `attempt` 里剥 `stream_options` 的那处。
+        let mut body_cache: Option<Arc<Vec<u8>>> = None;
 
         // 2. URL：base 已 trim 尾部 `/`，统一追加 `/chat/completions`。
         let url = format!(
@@ -462,7 +537,13 @@ impl Model for OpenAICompatibleModel {
             let (outcome, meta) = {
                 let mut watcher = DeltaWatchingSink::new(&mut *sink);
                 let outcome = self
-                    .attempt(&url, &mut chat_request, &mut watcher, boundary)
+                    .attempt(
+                        &url,
+                        &mut chat_request,
+                        &mut body_cache,
+                        &mut watcher,
+                        boundary,
+                    )
                     .await;
                 let mut meta = outcome.meta;
                 meta.duration_ms = started.elapsed().as_millis() as u64;
@@ -577,6 +658,7 @@ impl OpenAICompatibleModel {
         &self,
         url: &str,
         chat_request: &mut ChatCompletionRequest,
+        body_cache: &mut Option<Arc<Vec<u8>>>,
         sink: &mut dyn ModelEventSink,
         boundary: Option<&dyn BoundarySource>,
     ) -> AttemptCall {
@@ -587,7 +669,7 @@ impl OpenAICompatibleModel {
         // `select!` 的结果先落到一个中间枚举再 `match`：`select!` 本身已是
         // `match` 展开，直接嵌进 `match` 的臂里会破坏解析。
         enum SendOutcome {
-            Sent(Result<reqwest::Response, reqwest::Error>),
+            Sent(Result<reqwest::Response, SendError>),
             Cancelled,
         }
         let send_outcome = tokio::select! {
@@ -598,13 +680,13 @@ impl OpenAICompatibleModel {
             // 必须**确定性地**走到中止分支 —— 否则请求照发，取消请求形同虚设。
             biased;
             _ = wait_abort(boundary) => SendOutcome::Cancelled,
-            result = self.send(url, chat_request) => SendOutcome::Sent(result),
+            result = self.send(url, chat_request, body_cache) => SendOutcome::Sent(result),
         };
         let response = match send_outcome {
             SendOutcome::Sent(Ok(response)) => response,
             SendOutcome::Sent(Err(error)) => {
                 return AttemptCall {
-                    result: Err(retryable_transport_error(error)),
+                    result: Err(send_error_to_attempt(error)),
                     meta,
                 };
             }
@@ -652,7 +734,10 @@ impl OpenAICompatibleModel {
                  token usage for this run will be reported as 0"
             ));
             chat_request.stream_options = None;
-            match self.send(url, chat_request).await {
+            // **写 `chat_request` 必须紧跟失效缓存**：否则下面这次重发会带上仍含
+            // `stream_options` 的陈旧字节 ⇒ 端点再回 400，回退形同失效。
+            *body_cache = None;
+            match self.send(url, chat_request, body_cache).await {
                 Ok(response) => {
                     meta.response_headers_ms = Some(started.elapsed().as_millis() as u64);
                     meta.http_status = Some(response.status().as_u16());
@@ -660,7 +745,7 @@ impl OpenAICompatibleModel {
                 }
                 Err(error) => {
                     return AttemptCall {
-                        result: Err(retryable_transport_error(error)),
+                        result: Err(send_error_to_attempt(error)),
                         meta,
                     };
                 }
@@ -1230,17 +1315,102 @@ fn normalize_finish_reason(raw: Option<String>) -> FinishReason {
     }
 }
 
+/// 「你的模型看不了图」的占位。
+///
+/// **不带路径**（照 `docs/design-plans/2026-11-05-vision-input.md` C3）：模型对「看不了图」
+/// 这件事无能为力，逐图重复路径只是烧 token。因此同一批里只发一次。
+pub const UNSUPPORTED_IMAGE_PLACEHOLDER: &str =
+    "image content omitted because you do not support image input";
+
+/// [`MediaError`] → 给模型看的一条文本占位。
+///
+/// 除了「模型不支持图像」那条（不带路径、每批只发一次），其余每种失败都带**路径与原因**：
+/// 模型据此能改策略（换路径、换文件、改用 `ocr`），这正是占位串存在的意义。
+pub fn media_error_placeholder(path: &str, err: &MediaError) -> String {
+    match err {
+        MediaError::ReadFailed { reason, .. } => {
+            format!("yushan could not read the local image at `{path}`: {reason}")
+        }
+        MediaError::NotAnImage { reason, .. } => {
+            format!("Image located at `{path}` is invalid: {reason}")
+        }
+        MediaError::UnsupportedFormat { mime, .. } => {
+            format!("yushan cannot attach image at `{path}`: unsupported image `{mime}`.")
+        }
+        // 本仓无缩放能力 ⇒ 只能拒绝并说明。报「超了哪个上限」而不是裸字节数：
+        // 上限会经 `MediaLimits` 注入变化，拼死一个数值会与真实判定脱钩。
+        MediaError::SingleTooLarge { bytes, limit } => format!(
+            "yushan cannot attach image at `{path}`: too large ({} > {}).",
+            human_bytes(*bytes),
+            human_bytes(*limit)
+        ),
+    }
+}
+
+/// 请求体累计预算超限的占位。
+pub fn request_budget_placeholder(path: &str, limit: usize) -> String {
+    format!(
+        "[image too large: {path} (would exceed the {} request budget)]",
+        human_bytes(limit)
+    )
+}
+
+/// 单请求图数超限的占位。
+pub fn image_count_placeholder(path: &str, limit: usize) -> String {
+    format!("[image too large: {path} (over the {limit} images per request limit)]")
+}
+
+/// 字节数 → 给模型看的可读单位（`1.5 KiB` / `32 MiB` / `900 B`）。
+///
+/// 单位取 1024 进制；只保留一位小数，**向上去整**（`ceil`）。
+///
+/// 取整方向是承重的：该函数的主要用途是报「实际有多大」。若四舍五入
+/// （32.04 MiB → `32 MiB`），就会印出 `too large (32 MiB > 32 MiB)` 这种自相矛盾的句子；
+/// 向上取整保证「报出的尺寸 > 上限」总是写成严格大于。上限值本身都是整齐的
+/// 2 的幂（32 MiB / 48 MiB / 1 KiB），向上取整对它们是无害的恒等。
+fn human_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = KIB * 1024;
+    if bytes >= MIB {
+        format_unit(bytes, MIB, "MiB")
+    } else if bytes >= KIB {
+        format_unit(bytes, KIB, "KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_unit(bytes: usize, unit: usize, suffix: &str) -> String {
+    // 整数运算得到「十分位」并**向上去整**：`(bytes * 10 + unit - 1) / unit`。
+    // 不用 f64：这里的输入都是 ≤ 48 MiB 的整数，整数运算无精度问题且更好读。
+    let tenths = bytes.saturating_mul(10).div_ceil(unit);
+    if tenths.is_multiple_of(10) {
+        format!("{} {suffix}", tenths / 10)
+    } else {
+        format!("{}.{} {suffix}", tenths / 10, tenths % 10)
+    }
+}
+
 pub fn translate_request(
     request: &ModelRequest,
     config: &OpenAICompatibleConfig,
+    cache: &MediaCache,
 ) -> Result<ChatCompletionRequest, ModelError> {
     let mut messages = Vec::new();
+
+    // 请求级图片限额（C8 / D19）。两张 32 MiB 的图就是 64 MiB，已超 48 MiB
+    // 请求体预算 ⇒ 单图上限与累计预算必须**同时**判，否则两条限额自相矛盾。
+    //
+    // 计数只在本轮**真的 push 了一幅图**时前进（降级的图不占预算、不占位）：
+    // 否则一串降级图会把后面本来合法的图也拖下水。
+    let mut image_bytes: usize = 0;
+    let mut image_count: usize = 0;
 
     // 系统提示词
     if let Some(system) = &request.system {
         messages.push(ChatMessage {
             role: "system".into(),
-            content: Some(system.clone()),
+            content: Some(Content::Text(system.clone())),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -1258,6 +1428,12 @@ pub fn translate_request(
 
         let mut text_content = String::new();
         let mut tool_calls = Vec::new();
+        // 本消息的图像部分。为空时主消息走 `Content::Text`（纯文本线上字节不变）；
+        // 非空时 `text_content` 与它合并成 `Content::Parts`。
+        let mut image_parts: Vec<ContentPart> = Vec::new();
+        // 「你的模型看不了图」在**本消息内**只发一次（C3 第四条）。按消息去重而非按请求：
+        // 请求级去重会让后续只含图的消息整条消失，破坏消息数守恒。
+        let mut unsupported_notice_sent = false;
 
         for block in &msg.content {
             match block {
@@ -1299,28 +1475,106 @@ pub fn translate_request(
                     messages.push(ChatMessage {
                         role: "tool".into(),
                         content: Some(if *is_error {
-                            format!("[ERROR] {content}")
+                            Content::Text(format!("[ERROR] {content}"))
                         } else {
-                            content.clone()
+                            Content::Text(content.clone())
                         }),
                         tool_calls: None,
                         tool_call_id: Some(tool_call_id.0.clone()),
                         name: None,
                     });
                 }
-                _ => {} // 处理未来的 ContentBlock 变体
+                ContentBlock::Image { path, detail } => {
+                    // **判定顺序不得调换**（design.md §5 / C8.4）：
+                    // 门控 → 单图（`resolve_image` 内部判 32 MiB）→ 图数 → 累计 → push。
+                    //
+                    // 每一级不满足都写一条文本占位（**不静默**），且占位只进
+                    // `image_parts` 这个**出站临时副本**：`ContentBlock::Image` 保持
+                    // 原样，原图补齐后下一回合仍会重试送图（D11）。
+                    //
+                    // 门控只问 `supports_image` 一处；`image_detail_for` 内部会再问它，
+                    // 本分支**不得**自己按 id 再判一遍（否则两条逻辑会漂移）。
+                    if !config.compat.supports_image(&config.model) {
+                        // 模型看不了图：它对此无能为力，故**不带路径**，且本消息内
+                        // 只发一次 —— 逐图重复同一句话只烧 token（C3 第四条）。
+                        if !unsupported_notice_sent {
+                            unsupported_notice_sent = true;
+                            image_parts.push(ContentPart::Text {
+                                text: UNSUPPORTED_IMAGE_PLACEHOLDER.to_string(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    let url = match resolve_image(path, cache) {
+                        Ok(url) => url,
+                        // 读不到 / 不是图 / 格式不支持 / 单图超限：带路径与原因，
+                        // 模型可以据此换策略（换路径、改用 `ocr`）。
+                        Err(err) => {
+                            image_parts.push(ContentPart::Text {
+                                text: media_error_placeholder(path, &err),
+                            });
+                            continue;
+                        }
+                    };
+
+                    let limits = cache.limits();
+                    if image_count >= limits.max_images_per_request {
+                        image_parts.push(ContentPart::Text {
+                            text: image_count_placeholder(path, limits.max_images_per_request),
+                        });
+                        continue;
+                    }
+                    // 请求体累计预算：单图 32 MiB × 2 = 64 MiB 已超 48 MiB，
+                    // 所以两条限额必须**协调**判（D19）。计数器只在真正 push 时前进。
+                    let projected = image_bytes.saturating_add(url.len());
+                    if projected > limits.request_budget_bytes {
+                        image_parts.push(ContentPart::Text {
+                            text: request_budget_placeholder(path, limits.request_budget_bytes),
+                        });
+                        continue;
+                    }
+                    image_bytes = projected;
+                    image_count += 1;
+                    image_parts.push(ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: url.to_string(),
+                            detail: config.compat.image_detail_for(&config.model, *detail),
+                        },
+                    });
+                }
+                // 本臂因 `ContentBlock` 的 `#[non_exhaustive]` 而**必须存在**（跨 crate 消费时
+                // Rust 强制要求覆盖 `_`；删掉即 `E0004`）。它也因此是**唯一**会静默吞掉新增
+                // 变体的位置 —— 落进这里既不报错也不告警。守护靠 `tests/translate_image.rs`
+                // 的块集合用例（按 `ContentBlock` 全集断言出站结果），而不是靠编译器。
+                _ => {}
             }
         }
 
-        // 追加主消息
-        if !text_content.is_empty() || !tool_calls.is_empty() {
-            messages.push(ChatMessage {
-                role: role.into(),
-                content: if text_content.is_empty() {
+        // 追加主消息。
+        //
+        // `image_parts` 必须参与条件：只含 `Image` 块的消息没有文本也没有工具调用，
+        // 漏了它就是整条消息不出场（`"messages":[]`）—— 那是 K2 的另一半（D10）。
+        if !text_content.is_empty() || !tool_calls.is_empty() || !image_parts.is_empty() {
+            let content = if image_parts.is_empty() {
+                // 纯文本 / 纯工具消息：线上仍是 `"content":"…"`，逐字节不变。
+                if text_content.is_empty() {
                     None
                 } else {
-                    Some(text_content)
-                },
+                    Some(Content::Text(text_content))
+                }
+            } else {
+                // 有图像 ⇒ 块数组。文本块排在前面，与既有阅读顺序一致。
+                let mut parts = Vec::with_capacity(image_parts.len() + 1);
+                if !text_content.is_empty() {
+                    parts.push(ContentPart::Text { text: text_content });
+                }
+                parts.extend(image_parts);
+                Some(Content::Parts(parts))
+            };
+            messages.push(ChatMessage {
+                role: role.into(),
+                content,
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -1433,7 +1687,7 @@ mod tests {
             thinking: None,
         };
 
-        let chat_req = translate_request(&request, &config).unwrap();
+        let chat_req = translate_request(&request, &config, &MediaCache::new()).unwrap();
         assert_eq!(chat_req.model, "deepseek-chat");
         assert_eq!(chat_req.messages.len(), 2); // system + user 各一条
         assert_eq!(chat_req.messages[0].role, "system");
@@ -1485,7 +1739,7 @@ mod tests {
                 thinking: None,
             };
 
-            let chat_req = translate_request(&request, &config).unwrap();
+            let chat_req = translate_request(&request, &config, &MediaCache::new()).unwrap();
             let serialized = &chat_req.messages[0].tool_calls.as_ref().unwrap()[0]
                 .function
                 .arguments;
@@ -1513,7 +1767,7 @@ mod tests {
             boundary: None,
             thinking: None,
         };
-        let chat_req = translate_request(&request, &config).unwrap();
+        let chat_req = translate_request(&request, &config, &MediaCache::new()).unwrap();
         let serialized = &chat_req.messages[0].tool_calls.as_ref().unwrap()[0]
             .function
             .arguments;
@@ -1553,15 +1807,17 @@ mod tests {
             thinking: None,
         };
 
-        let chat_req = translate_request(&request, &config).unwrap();
+        let chat_req = translate_request(&request, &config, &MediaCache::new()).unwrap();
         assert_eq!(chat_req.messages.len(), 1);
         assert_eq!(
             chat_req.messages[0].role, "user",
             "Harness 在线上没有对应角色，必须按 user 发送"
         );
         assert_eq!(
-            chat_req.messages[0].content.as_deref(),
-            Some("[bg1] cargo build — finished (exit 0) in 2.0s"),
+            chat_req.messages[0].content.as_ref(),
+            Some(&Content::Text(
+                "[bg1] cargo build — finished (exit 0) in 2.0s".into()
+            )),
             "正文不得因角色映射而变"
         );
     }
@@ -1597,7 +1853,7 @@ mod tests {
             thinking: None,
         };
 
-        let chat_req = translate_request(&request, &config).unwrap();
+        let chat_req = translate_request(&request, &config, &MediaCache::new()).unwrap();
         assert_eq!(chat_req.messages[0].role, "tool");
         assert_eq!(chat_req.messages[0].tool_call_id, Some("call_1".into()));
     }
@@ -2030,7 +2286,7 @@ mod tests {
             compat: ProviderCompat::standard(),
         };
         let request = ModelRequest::default();
-        let chat_req = translate_request(&request, &config).unwrap();
+        let chat_req = translate_request(&request, &config, &MediaCache::new()).unwrap();
         assert_eq!(chat_req.stream, Some(true));
     }
 
@@ -2043,12 +2299,12 @@ mod tests {
         let mut config = config_with(ProviderCompat::standard());
         let request = ModelRequest::default();
 
-        let absent = translate_request(&request, &config).unwrap();
+        let absent = translate_request(&request, &config, &MediaCache::new()).unwrap();
         let json = serde_json::to_value(&absent).unwrap();
         assert!(json.get("reasoning_effort").is_none(), "{json}");
 
         config.reasoning_effort = Some("low".into());
-        let present = translate_request(&request, &config).unwrap();
+        let present = translate_request(&request, &config, &MediaCache::new()).unwrap();
         let json = serde_json::to_value(&present).unwrap();
         assert_eq!(json["reasoning_effort"], "low", "{json}");
     }
@@ -2070,7 +2326,9 @@ mod tests {
         // ① 既有调用（None）⇒ 字段不出现。
         let config = config_with(ProviderCompat::deepseek());
         let request = ModelRequest::default();
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(
             json.get("thinking").is_none(),
             "既有调用不得出现 thinking 字段；json = {json}"
@@ -2081,12 +2339,16 @@ mod tests {
             thinking: Some(ThinkingOverride::off()),
             ..Default::default()
         };
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert_eq!(json["thinking"]["type"], "disabled", "json = {json}");
 
         // ③ 显式关闭但 provider 不支持 ⇒ 不发。
         let strict = config_with(ProviderCompat::standard());
-        let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &strict, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(
             json.get("thinking").is_none(),
             "未声明支持的 provider 不得收到 thinking；json = {json}"
@@ -2100,7 +2362,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(json.get("thinking").is_none(), "json = {json}");
     }
 
@@ -2118,14 +2382,18 @@ mod tests {
         assert!(config.reasoning_effort.is_none());
 
         let request = ModelRequest::default();
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(
             json.get("thinking").is_none(),
             "默认不得关闭；json = {json}"
         );
 
         config.disable_thinking = true;
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert_eq!(
             json["thinking"]["type"], "disabled",
             "配置层 off 必须落成 thinking.disabled；json = {json}"
@@ -2134,7 +2402,9 @@ mod tests {
         // 不支持该字段的端点：即使配置要求也**不得**发送。
         let mut strict = config_with(ProviderCompat::standard());
         strict.disable_thinking = true;
-        let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &strict, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(json.get("thinking").is_none(), "json = {json}");
     }
 
@@ -2157,12 +2427,16 @@ mod tests {
             }),
             ..Default::default()
         };
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert_eq!(json["reasoning_effort"], "low", "json = {json}");
 
         // 未声明支持的方言：请求覆盖**不得**绕门控。
         let strict = config_with(ProviderCompat::standard());
-        let json = serde_json::to_value(translate_request(&request, &strict).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &strict, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(
             json.get("reasoning_effort").is_none(),
             "standard 不接受强度，请求覆盖也不得绕过；json = {json}"
@@ -2171,9 +2445,10 @@ mod tests {
         // 无请求覆盖 ⇒ 完全回到既有路径（config 值原样透传，不再门控）。
         let mut config = config_with(ProviderCompat::standard());
         config.reasoning_effort = Some("low".into());
-        let json =
-            serde_json::to_value(translate_request(&ModelRequest::default(), &config).unwrap())
-                .unwrap();
+        let json = serde_json::to_value(
+            translate_request(&ModelRequest::default(), &config, &MediaCache::new()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             json["reasoning_effort"], "low",
             "config 侧必须原样透传（既有行为）；json = {json}"
@@ -2198,7 +2473,9 @@ mod tests {
         assert!(!config.disable_thinking, "前置：默认不要求关思考");
 
         let request = ModelRequest::default();
-        let json = serde_json::to_value(translate_request(&request, &config).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &config, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(
             json.get("thinking").is_none(),
             "能力位开启但未要求关思考时，不得发出 thinking；json = {json}"
@@ -2207,7 +2484,9 @@ mod tests {
         // 配了 `off` 之后才落地。
         let mut off = config_with(ProviderCompat::opencode_go());
         off.disable_thinking = true;
-        let json = serde_json::to_value(translate_request(&request, &off).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &off, &MediaCache::new()).unwrap())
+                .unwrap();
         assert_eq!(
             json["thinking"]["type"], "disabled",
             "`/effort off` 必须能在网关方言上落地；json = {json}"
@@ -2236,7 +2515,9 @@ mod tests {
             supports_stream_usage: true,
             ..ProviderCompat::standard()
         });
-        let json = serde_json::to_value(translate_request(&request, &on).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &on, &MediaCache::new()).unwrap())
+                .unwrap();
         assert_eq!(
             json.get("stream_options"),
             Some(&serde_json::json!({ "include_usage": true })),
@@ -2253,7 +2534,9 @@ mod tests {
             supports_stream_usage: false,
             ..ProviderCompat::standard()
         });
-        let json = serde_json::to_value(translate_request(&request, &off).unwrap()).unwrap();
+        let json =
+            serde_json::to_value(translate_request(&request, &off, &MediaCache::new()).unwrap())
+                .unwrap();
         assert!(
             json.get("stream_options").is_none(),
             "不支持时不得序列化 stream_options，json = {json}"
@@ -2600,5 +2883,268 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 请求体序列化缓存（C9）
+    // -----------------------------------------------------------------------
+
+    /// 带 `stream_options` 的最小请求体 —— 供缓存用例观察「写 `chat_request`
+    /// （剥 `stream_options`）后字节是否变了」。
+    fn request_with_stream_options() -> ChatCompletionRequest {
+        translate_request(
+            &ModelRequest::default(),
+            &config_with(ProviderCompat::standard()),
+            &MediaCache::new(),
+        )
+        .expect("translate ok")
+    }
+
+    /// **缓存真的被用上**（正向）：同请求体两次取值 ⇒ 同一份字节。
+    ///
+    /// 断言的是**内容**而不是「序列化次数」（后者不可观测）：两次取值逐字节相等，
+    /// 且第二次必须与缓存里那份 `Arc` 指向同一分配 ⇒ 命中而非重新序列化。
+    #[test]
+    fn cached_body_reuses_the_serialized_bytes() {
+        let request = request_with_stream_options();
+        let mut cache = None;
+
+        let first = cached_body(&request, &mut cache).expect("first serialize");
+        assert!(cache.is_some(), "首次取值必须把结果写回缓存");
+        let second = cached_body(&request, &mut cache).expect("second take");
+
+        assert_eq!(&*first, &*second, "两份字节必须逐字节相等");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "第二次必须命中缓存（同一份 Arc），不得重新序列化"
+        );
+        assert_eq!(*first, serde_json::to_vec(&request).unwrap());
+    }
+
+    /// **反向用例（核心）**：改了 `chat_request` 却**不**失效缓存 ⇒ 拿到的仍是
+    /// 旧字节（仍带 `stream_options`）。
+    ///
+    /// 这就是 `attempt` 里必须紧跟 `*body_cache = None;` 的理由：一旦漏掉，回退重发
+    /// 会带着陈旧请求体，端点再回 400，回退失效。
+    #[test]
+    fn stale_cache_would_resend_the_old_body() {
+        let mut request = request_with_stream_options();
+        assert!(
+            request.stream_options.is_some(),
+            "前置：请求带 stream_options"
+        );
+
+        let mut cache = None;
+        let before = cached_body(&request, &mut cache).expect("serialize");
+
+        // 模拟 `attempt` 的回退写入，但**故意不失效缓存**。
+        request.stream_options = None;
+        let stale = cached_body(&request, &mut cache).expect("stale take");
+        assert!(
+            Arc::ptr_eq(&before, &stale)
+                && String::from_utf8_lossy(&stale).contains("stream_options"),
+            "不失效缓存就会重发仍带 stream_options 的陈旧请求体：{}",
+            String::from_utf8_lossy(&stale)
+        );
+
+        // 正确做法：写入后立即失效 ⇒ 新字节不再含该字段。
+        cache = None;
+        let refreshed = cached_body(&request, &mut cache).expect("refreshed serialize");
+        assert!(
+            !String::from_utf8_lossy(&refreshed).contains("stream_options"),
+            "失效后必须重新序列化，且不再含 stream_options：{}",
+            String::from_utf8_lossy(&refreshed)
+        );
+    }
+
+    /// **序列化失败归类**：确定性失败 ⇒ `Fatal`，**不得**归入 `Retryable`。
+    ///
+    /// 同一份请求体重发多少次都还是同一个序列化错误，重试只会把预算耗在同一处。
+    /// `to_vec` 对非有限浮点写 `null` 而不报错，在请求体上造不出真失败；
+    /// 这里用 `from_str` 造一个 `serde_json::Error`，走的就是 `send` 同一条映射。
+    #[test]
+    fn serialization_failure_is_fatal_not_retryable() {
+        let error = serde_json::from_str::<u8>("not-an-int").expect_err("类型不符必出错");
+
+        match send_error_to_attempt(SendError::Serialize(error)) {
+            AttemptError::Fatal {
+                error,
+                reason_class,
+            } => {
+                assert!(
+                    matches!(error, ModelError::Serde(_)),
+                    "序列化失败应映射到既有 Serde 变体，不得新增变体：{error}"
+                );
+                assert_eq!(reason_class, ModelAttemptReason::Fatal);
+            }
+            other => panic!(
+                "序列化失败必须归为 Fatal（不消耗重试预算），实际是 {}",
+                match other {
+                    AttemptError::Retryable { .. } => "Retryable",
+                    AttemptError::Cancelled { .. } => "Cancelled",
+                    AttemptError::Fatal { .. } => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 回退分支的请求体（C9 的核心行为）
+    // -----------------------------------------------------------------------
+
+    /// 本地回环 mock：先读完请求（头 + `Content-Length` 体），记下**请求体字节**，
+    /// 再依次回预设响应。请求体按字节记（不是字符串）—— 本组的断言是逐字节相等。
+    fn spawn_loopback(replies: Vec<Vec<u8>>) -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_thread = seen.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    use std::io::Read;
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break 0,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        }
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+                let len = headers
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                {
+                    use std::io::Read;
+                    while buf.len() < header_end + len {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                }
+                seen_thread.lock().unwrap().push(buf[header_end..].to_vec());
+                use std::io::Write;
+                let _ = stream.write_all(&reply);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), seen)
+    }
+
+    fn http_response(status: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// 一条含正文与终止原因的完整 SSE（供回环用例走通成功路径）。
+    fn full_sse_bytes() -> Vec<u8> {
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n"
+            .to_vec()
+    }
+
+    fn sse_response(sse: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            sse.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(sse);
+        out
+    }
+
+    fn loopback_model(api_base: String, max_attempts: u32) -> OpenAICompatibleModel {
+        OpenAICompatibleModel::with_client(
+            OpenAICompatibleConfig {
+                api_base,
+                ..config_with(ProviderCompat::standard())
+            },
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .with_retry(RetryConfig {
+            max_attempts,
+            base_delay_ms: 1,
+            max_delay_ms: 10,
+        })
+    }
+
+    /// **核心用例**：`stream_options` 回退分支发出的请求体**不含**该字段。
+    ///
+    /// 这是缓存失效的唯一理由：一旦漏掉 `*body_cache = None;`，第二次请求就会
+    /// 复用带 `stream_options` 的陈旧字节 ⇒ 端点再回 400 ⇒ 回退永远失败。
+    ///
+    /// 变异：删掉 `:chat_request.stream_options = None;` 后的 `*body_cache = None;`
+    /// ⇒ 本用例第二次请求体仍含 `stream_options`，且调用链以 400 失败 ⇒ 红。
+    #[tokio::test]
+    async fn stream_options_fallback_resends_a_body_without_the_field() {
+        let (api_base, seen) = spawn_loopback(vec![
+            http_response(
+                "400 Bad Request",
+                "{\"error\":\"unknown field: stream_options\"}",
+            ),
+            sse_response(super::tests::full_sse_bytes().as_slice()),
+        ]);
+        let model = loopback_model(api_base, 0);
+        let mut sink = RecordingModelSink::default();
+
+        model
+            .complete(ModelRequest::default(), &mut sink)
+            .await
+            .expect("剥掉 stream_options 后应成功");
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "回退必须恰好重发一次");
+        assert!(
+            String::from_utf8_lossy(&bodies[0]).contains("stream_options"),
+            "首次请求必须带 stream_options（否则根本没触发回退）"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bodies[1]).contains("stream_options"),
+            "回退重发的必须是**剥掉该字段的新 body**，不得复用缓存里的陈旧字节：{}",
+            String::from_utf8_lossy(&bodies[1])
+        );
+    }
+
+    /// 429 触发**外层重试**时，第二次请求体与第一次**逐字节相同**（缓存命中）。
+    ///
+    /// 断言是行为级的（不观测序列化次数）：`chat_request` 在重试间未被修改，
+    /// 故线上字节必须一致 —— 重现了“带图请求体被重写一遍”的反面。
+    #[tokio::test]
+    async fn retry_after_429_resends_byte_identical_body() {
+        let (api_base, seen) = spawn_loopback(vec![
+            http_response("429 Too Many Requests", "{}"),
+            sse_response(super::tests::full_sse_bytes().as_slice()),
+        ]);
+        let model = loopback_model(api_base, 2);
+        let mut sink = RecordingModelSink::default();
+
+        model
+            .complete(ModelRequest::default(), &mut sink)
+            .await
+            .expect("退避后应成功");
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "应恰好经历一次重试");
+        assert_eq!(bodies[0], bodies[1], "重试请求体必须逐字节一致");
     }
 }

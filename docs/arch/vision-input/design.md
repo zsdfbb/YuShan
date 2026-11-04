@@ -113,6 +113,10 @@ pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
     /// 附件：**只有路径**。`skip_serializing_if` 让既有事件 JSON 逐字节不变。
+    ///
+    /// **不变量：`is_error` 为真时本字段恒为空。** 折叠点（`ys-loop/basic.rs`）为每个附件
+    /// 追加一个 `ContentBlock::Image` 而不看 `is_error`，若二者共存，模型会同时收到
+    /// ⌈失败了⌋与那张图。工具层在失败时只报事实，不给附件。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaAttachment>,
 }

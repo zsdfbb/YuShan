@@ -10,6 +10,7 @@ pub mod ls;
 pub mod ocr;
 pub mod proc_group;
 pub mod read;
+pub mod view_image;
 pub mod write;
 
 pub use background::{
@@ -24,6 +25,7 @@ pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use ocr::OcrTool;
 pub use read::ReadTool;
+pub use view_image::ViewImageTool;
 pub use write::WriteTool;
 
 /// `read` / `write` / `edit` / `grep` / `find` / `ls` 共用的 workspace 路径提示。
@@ -162,25 +164,13 @@ pub(crate) mod workspace_path {
 
         #[test]
         fn attach_notice_preserves_empty_content() {
-            let result = attach_notice(
-                ToolResult {
-                    content: String::new(),
-                    is_error: false,
-                },
-                Some("read: note"),
-            );
+            let result = attach_notice(ToolResult::text(String::new(), false), Some("read: note"));
             assert_eq!(result.content, "");
         }
 
         #[test]
         fn attach_notice_appends_fact_to_nonempty_content() {
-            let result = attach_notice(
-                ToolResult {
-                    content: "body".into(),
-                    is_error: false,
-                },
-                Some("read: note"),
-            );
+            let result = attach_notice(ToolResult::text("body", false), Some("read: note"));
             assert_eq!(result.content, "body\n\n[read: note]");
         }
     }

@@ -124,8 +124,8 @@ impl Tool for BashBgTool {
 
         // 文案断言**不要轮询**：结果是 harness 主动送达的，模型该继续自己那部分工作。
         let label = snapshot.handle.label();
-        Ok(ToolResult {
-            content: format!(
+        Ok(ToolResult::text(
+            format!(
                 "Started in background.\n\
                  handle: {label}\n\
                  pid: {}\n\
@@ -139,8 +139,8 @@ impl Tool for BashBgTool {
                 snapshot.cwd.display(),
                 snapshot.output_path.display(),
             ),
-            is_error: false,
-        })
+            false,
+        ))
     }
 }
 

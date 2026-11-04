@@ -2426,6 +2426,7 @@ name = "ys-model-openai-compat"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "reqwest",
  "serde",

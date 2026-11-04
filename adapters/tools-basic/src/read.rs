@@ -89,10 +89,7 @@ impl Tool for ReadTool {
 
         if total_lines == 0 {
             return Ok(attach_notice(
-                ToolResult {
-                    content: String::new(),
-                    is_error: false,
-                },
+                ToolResult::text(String::new(), false),
                 path_notice.as_deref(),
             ));
         }
@@ -103,12 +100,10 @@ impl Tool for ReadTool {
             0 => 0,
             o if o > total_lines => {
                 return Ok(attach_notice(
-                    ToolResult {
-                        content: format!(
-                            "Offset {o} is beyond end of file ({total_lines} lines total)"
-                        ),
-                        is_error: true,
-                    },
+                    ToolResult::text(
+                        format!("Offset {o} is beyond end of file ({total_lines} lines total)"),
+                        true,
+                    ),
                     path_notice.as_deref(),
                 ));
             }
@@ -157,10 +152,7 @@ impl Tool for ReadTool {
         }
 
         Ok(attach_notice(
-            ToolResult {
-                content: output,
-                is_error: false,
-            },
+            ToolResult::text(output, false),
             path_notice.as_deref(),
         ))
     }
@@ -220,15 +212,9 @@ impl ReadTool {
         }
 
         if !any_ok {
-            return Ok(ToolResult {
-                content: out.trim_end().to_string(),
-                is_error: true,
-            });
+            return Ok(ToolResult::text(out.trim_end().to_string(), true));
         }
-        Ok(ToolResult {
-            content: out.trim_end().to_string(),
-            is_error: false,
-        })
+        Ok(ToolResult::text(out.trim_end().to_string(), false))
     }
 }
 

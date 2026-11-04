@@ -151,18 +151,25 @@ pub fn replay_lines(messages: &[Message]) -> Vec<TranscriptLine> {
             Role::Assistant => {
                 // 一条 assistant 消息 → 一条 `Assistant` 行；Text 块直接拼接
                 // （镜像流式期多个 `ModelTextDelta` 合并成一条的行为）。
+                //
+                // `Image` 块与 `crate::app::message_text` **同源**渲染（共用
+                // [`crate::app::image_marker`]）：回放与 live 对同一段历史必须画成同一行。
                 let text: String = message
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        // 非 `Text`/`ToolUse` 的变体**有意忽略**（回放只认识这两类）。
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        ContentBlock::Image { path, detail } => {
+                            Some(crate::app::image_marker(path, *detail))
+                        }
+                        // 非 `Text`/`Image`/`ToolUse` 的变体**有意忽略**（回放只认识这三类）。
                         // `ContentBlock` 是 `#[non_exhaustive]`：**加变体时必须同步本函数与
                         // `crate::app::message_text`** —— 二者都按白名单取块，漏了就静默不渲染、
                         // 不报错也不告警（无编译期兜底）。
                         _ => None,
                     })
-                    .collect();
+                    .collect::<Vec<String>>()
+                    .join("\n");
                 if !text.is_empty() {
                     lines.push(TranscriptLine::Assistant(text));
                 }
@@ -519,10 +526,7 @@ mod tests {
         }));
         a.apply_event(env(AgentEvent::ToolResult {
             id: ToolCallId("c1".into()),
-            result: ToolResult {
-                content: "body".into(),
-                is_error: false,
-            },
+            result: ToolResult::text("body", false),
         }));
 
         let replay = replay_lines(&[user, assistant, results]);
@@ -568,6 +572,128 @@ mod tests {
             ["assistant", "tool", "user"],
             "块集合变化须同步本用例（并更新 replay_lines 的白名单注释）"
         );
+    }
+
+    /// **U4 白名单**：`replay_lines` 已处理的块集合 —— `Image` 尚未渲染 ⇒ 本用例**预期红**，
+    /// U9 实现 `[image: …]` 后转绿。
+    ///
+    /// 为什么需要它：`ContentBlock` 是 `#[non_exhaustive]`，而本函数的消费点全是通配臂
+    /// （assistant 侧的 `filter_map` 的 `_ => None`、`ToolUse` 扫描的 `if let`）⇒ 加变体**零编译错误**
+    /// 、静默不渲染。编译器不守护，只能把「我们已经决定怎么处理这些变体」钉成断言：
+    /// 本用例变红 = 提醒在此处更新块白名单（并同步 `crate::app::message_text`）。
+    ///
+    /// 断言只看**图片路径是否出现在回放结果里**，不看它落在哪个变体、带什么前缀 —— 那是
+    /// U9 的渲染选择，钉死它会让改文案也误红。
+    #[test]
+    fn u4_replay_lines_must_render_image_block() {
+        // assistant 路径：`replay_lines` 里按 `Text` 取块的 `filter_map`（`_ => None` 是静默丢弃点）。
+        let assistant = assistant_msg(vec![
+            ContentBlock::Text {
+                text: "看图".into(),
+            },
+            image("/tmp/a.png"),
+        ]);
+        // user 路径：经 `crate::app::message_text`（另一处白名单，见 `app.rs` 的 U4 用例）。
+        let user = user_msg(vec![image("/tmp/b.png")]);
+
+        let lines = replay_lines(&[assistant, user]);
+        let all = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            all.contains("/tmp/a.png"),
+            "assistant 消息里的 Image 块回放后消失了 —— 加变体后必须更新 replay_lines 的块白名单。实际：{lines:?}"
+        );
+        assert!(
+            all.contains("/tmp/b.png"),
+            "user 消息里的 Image 块回放后消失了 —— 与 crate::app::message_text 同批更新。实际：{lines:?}"
+        );
+    }
+
+    fn image(path: &str) -> ContentBlock {
+        ContentBlock::Image {
+            path: path.into(),
+            detail: None,
+        }
+    }
+
+    fn image_with_detail(path: &str, detail: ys_core::ImageDetail) -> ContentBlock {
+        ContentBlock::Image {
+            path: path.into(),
+            detail: Some(detail),
+        }
+    }
+
+    /// **U9**：`Image` 在回放的**两条独立路径**上都渲染成图片标记 ——
+    /// assistant 侧走本函数的 `filter_map`，user 侧经 [`crate::app::message_text`]。
+    ///
+    /// U4 用例只断言「路径出现过」；本用例钉住**渲染出的整行形状**与两种档位形态
+    /// （`detail: Some` ⇒ 写档位，`None` ⇒ 不写），否则两条路径可以被画成不一样的样子
+    /// 而 U4 仍是绿的。
+    ///
+    /// **变异**：把 assistant 分支的 `ContentBlock::Image` 臂删回 `_ => None` ⇒ 第一行变回
+    /// `Assistant("看图")`，本用例红。
+    #[test]
+    fn u9_replay_renders_image_on_both_paths_with_and_without_detail() {
+        let assistant = assistant_msg(vec![
+            ContentBlock::Text {
+                text: "看图".into(),
+            },
+            image_with_detail("/tmp/a.png", ys_core::ImageDetail::High),
+        ]);
+        let user = user_msg(vec![image("/tmp/b.png")]);
+
+        let lines = replay_lines(&[assistant, user]);
+        assert_eq!(
+            lines,
+            vec![
+                TranscriptLine::Assistant("看图\n[image: /tmp/a.png (high)]".into()),
+                TranscriptLine::User("[image: /tmp/b.png]".into()),
+            ],
+            "两条路径用同一套图片标记：只显示路径与档位，绝无字节"
+        );
+    }
+
+    /// **U9**：回放与 live 对含 `Image` 的会话**逐行相等**。
+    ///
+    /// live 侧的图片行不是事件推的（`apply_event` 只收文本增量），而是本地回显：
+    /// 用户提交带图消息时 [`crate::app::App::begin_local_turn`] 拿到的是 `message_text`
+    /// 的结果。故本用例直接拿 `message_text` 做参照 —— 与回放 user 分支同源。
+    ///
+    /// **变异**：让 `replay_lines` 的 user 分支自己拼图片标记（而不是调
+    /// `message_text`）⇒ 一旦两处文案漂移本用例红。
+    #[test]
+    fn u9_replay_user_image_matches_local_echo_text() {
+        let msg = user_msg(vec![image_with_detail(
+            "/tmp/c.png",
+            ys_core::ImageDetail::Original,
+        )]);
+        let echoed = crate::app::message_text(&msg);
+        assert_eq!(
+            replay_lines(std::slice::from_ref(&msg)),
+            vec![TranscriptLine::User(echoed)],
+            "回放的 User 行与本地回显同源"
+        );
+    }
+
+    /// 一行里的可读文本（**仅测试用**）：让「某段内容是否被渲染」的断言不绑定变体与前缀。
+    ///
+    /// 故意写成穷尽 `match`（不是通配臂）：`TranscriptLine` 加变体时本函数编译失败，
+    /// 提醒这里也要表态。
+    fn line_text(line: &TranscriptLine) -> String {
+        match line {
+            TranscriptLine::User(s)
+            | TranscriptLine::Assistant(s)
+            | TranscriptLine::Thinking(s)
+            | TranscriptLine::Error(s)
+            | TranscriptLine::System(s) => s.clone(),
+            TranscriptLine::Tool {
+                name,
+                summary,
+                result,
+                ..
+            } => format!("{name} {summary} {}", result.as_deref().unwrap_or("")),
+            TranscriptLine::Summary { .. } => String::new(),
+        }
     }
 
     // ---- 回放 ≠ 重演：已知形状分叉（P1-1） ----

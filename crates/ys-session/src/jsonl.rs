@@ -1369,4 +1369,37 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
     }
+
+    /// `append` 返回时数据必须已对文件系统中的其它读者可见（长度含本条整行）。
+    ///
+    /// 钉死的契约：`append` 成功后立刻用 `std::fs::metadata` 去看文件长度 ==
+    /// 追加前长度 + 序列化行长度 + 1（换行）。`write_all` 只保证数据进了内核缓冲，
+    /// `tokio::fs::File` 是异步 close（drop 仅把关闭任务丢给阻塞线程池），
+    /// 因此 `append` 必须显式 flush —— 否则在 close 真正完成前另开句柄去 stat，
+    /// 会读到 0 或旧长度。
+    ///
+    /// 单次检查是概率事件，故循环 20 次逐条累加期望值，任一次不符即失败。
+    /// 变异：删掉 `append` 里的 `file.flush().await` ⇒ 本用例红。
+    #[tokio::test]
+    async fn append_is_visible_to_other_readers_immediately() {
+        let path = temp_path("append_visible");
+        let _ = tokio::fs::remove_file(&path).await;
+        let mut session = JsonlSession::open(&path).await.unwrap();
+
+        let mut expected = 0u64;
+        for i in 0..20 {
+            let msg = text_msg(Role::User, &format!("visible{i}"));
+            expected += serde_json::to_string(&msg).unwrap().len() as u64 + 1;
+            session.append(msg).await.unwrap();
+            // 另一个读者（`std::fs` 走的不是 tokio 的句柄）必须立刻看到完整长度。
+            // `append` 只 `write_all` 不 flush 时，异步 close 未完成，这里会读到 0 或旧长度。
+            let on_disk = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(
+                on_disk, expected,
+                "第 {i} 次 append 后磁盘长度不对：其它读者看不到已写入的数据"
+            );
+        }
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
 }

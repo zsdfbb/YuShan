@@ -57,7 +57,7 @@
 
 | # | 决策 | 理由 / 依据 |
 |---|---|---|
-| **D1** | `ContentBlock::Image { id, path, detail }` —— **默认只带路径**；字节按需快照到旁路文件（见 §3.7） | 保留可复现性，同时不让 base64 进主 JSONL（体积/重写问题见 §3.7） |
+| **D1** | `ContentBlock::Image { path, detail }` —— **只带路径，字节不进会话**；出站时现读并 base64 内联进**请求**（见 §3.7） | 会话体积与文本可读性；base64 只存在于 wire 形态 |
 | **D2** | **唯一的读盘 + base64 点：适配器出站** | 依赖方向：只有适配器认识 wire 格式；像素字节不出适配器 |
 | **D3** | 格式嗅探是 `ys-core` 里的**纯函数**（`&[u8] → Option<ImageFormat>`） | 纯数据无 IO；`ocr::image_dims` 的同构实现，宿主零依赖 |
 | **D4** | 能力门控**两层**：`supports_image_input`（provider）+ `supports_image(model)`（模型） | 照搬 `effort` 的既有骨架（`docs/design-final/effort.md` §3，ADR-0042） |
@@ -169,77 +169,40 @@ pub(crate) struct MediaCache { /* Mutex<HashMap<PathBuf, Entry>>，键含 mtime+
 `transcript.rs::replay_lines` + `app.rs::message_text` 各加一条 `Image` 分支：
 渲染成 `[image: /path (1920×1080)]`（有嗅探结果时带尺寸）。**无 IO，只显示路径字符串。**
 
-## 3.7 图片的持久化：三个方案，以及为什么选混合
+### 3.7 图片的持久化：只存路径
 
-用户问到了关键一点：**base64 保留才能复现之前的运行结果**。这个诉求是对得，
-但直接存 base64 有三个代价，其中一个与本仓现有实现碰上就是致命的。
+`ContentBlock::Image` **只存路径**（D1/D2），图片字节不随消息进历史。
+字节在**适配器出站时**从磁盘现读、编码成 data URL —— 这是全链路唯一的 IO 点。
 
-### 代价 1（致命）：全量重写 × 体积
+会话文件里因此只有一个路径字符串：
 
-`crates/ys-session/src/jsonl.rs:167-170`：`append()` 就是 `messages.push` + `flush_to_file()`，
-而 `flush_to_file`（`:112-141`）**每次都把整个会话重写成临时文件再 rename**。
-叠加 base64 后的真实数字（本机实测一张 906 KiB 截图）：
-
-| 项 | 数值 |
-|---|---|
-| 单图 base64 | ≈ **1.18 MiB** |
-| 10 张图 | ≈ **11 MiB** |
-| 一条消息的 append 开销 | 重写**全部** 11 MiB |
-| 一次 1000 条消息的会话 | ≈ **11 GB 磁盘写入** + 1000 次全文件解析 |
-
-这不是理论担忧：它把每回合 O(1) 的 append 变成 O(会话总字节)，且随图片数线性放大。
-
-### 代价 2：context 与存储被混为一谈
-
-压缩（compaction）的目的就是**把旧内容移出 context**。若旧图在 JSONL 里仍以 base64 存在，
-那么「压缩后的会话文件」与「压缩前的」尺寸几乎一样 —— 用户看到 `/compact` 成功，
-磁盘却一点没小。这与 `docs/design-final/compaction.md` 的预算模型也矛盾。
-
-### 代价 3：base64 是 wire 细节，进 core 就是污染
-
-`ys-core` 是不认识 provider 方言的。把 base64 放进去，等于让每个读 `ContentBlock` 的地方
-（TUI 渲染、token 估算、压缩、事件流）都能看见一个几 MB 的字符串 —— 而它们只需要路径。
-
-### 三个候选
-
-| 方案 | 图片字节存哪 | 可复现 | 文件增长 | 结论 |
-|---|---|---|---|---|
-| **S1 只存路径** | 不存 | ✗ 文件删/改即失真 | 零 | 不满足你的诉求 |
-| **S2 base64 进 JSONL** | 消息行内 | ✓ 完全 | 线性且**每次 append 全量重写** | ✗ 代价 1 致命 |
-| **S3 旁路快照（选定）** | **内容寻址的独立文件** | ✓ 完全 | 线性但**永不重写主文件** | ✓ 见下 |
-
-### S3：内容寻址的旁路快照
-
-```
-ContentBlock::Image {
-    id: String,            // 内容指纹：sha256(字节) 的前 16 hex
-    path: String,          // 人类可读的原始路径（失效时仍能告知用户）
-    detail: Option<ImageDetail>,
-}
+```json
+{"Image":{"path":"/tmp/a.png","detail":"high"}}
 ```
 
-字节落点：`<sessions_dir>/media/<id>.<ext>`
+**这个选择依赖 B（append-only）已落地**：`JsonlSession::append` 现在是
+`O_APPEND` 单次 `write_all`，代价与已落盘条数无关（`docs/design-final/session-append-only.md`）。
+若写路径仍是全量重写，内联任何体积可观的内容都会把每次 append 变成 O(会话总字节)。
 
-- **只在首次入历史时写一次**（`tokio::fs::write`，原子 rename）。
-- 主 JSONL 只多一个 16 字节十六进制串 —— **append 开销仍然 O(1)**，代价 1 消失。
-- 出站时：**先看 id 旁路文件是否存在**，存在则直接用（快、且与原始文件脱钩）；
-  不存在则回落到 `path` 现读（兼容没快照的老会话 / 手工构造的请求）。
-- `path` 失效但 `id` 命中 ⇒ **仍能复现**（这正是你要的能力，且比 S2 更强：
-  原图被改后 S2 给的是旧内容，S3 也是*旧内容*但**能被识别出来**——id 不匹配就开新 id）。
-- 清理：删会话时删它的 `media/` 目录；未引用文件由启动期 GC（按引用计数扫）。
+### 已知代价：路径是引用，不是快照
 
-### 与 Codex 的对比
+原图被改名/删除/改写后，**历史里的那张图就复原不出来**。这不是待修缺陷，是本节
+明确接受的取舍：
 
-Codex 把 base64 **留在历史里**（`snapshot_local_user_input` 原地替换成 `UserInput::Image`）。
-它付得起这个代价，因为：(a) 它不重写整个会话文件；(b) 它的 32 MiB 传输上限是
-**WebSocket 单消息**限制，不是文件限制。
-**本仓两个前提都不同** ⇒ 不照抄它的存储形态，只照抄它的**行为契约**（读者不该
-因为图而失败、失败要可见）。
+- 出站时读不到 ⇒ **文本占位**（含原因），回合不失败（§5）
+- 原图被改写 ⇒ 下次出站送的是**新内容**，历史与线上不再逐字节对应
 
-### 这也修了压缩语义（代价 2）
+要「完全可复现」就得把字节留在会话里（base64 内联进消息行）或旁路存一份，
+两者都会让会话体积随图片线性增长，且与本仓「文本可读、可 diff」的会话形态冲突。
+**不做**。（用户已裁决：走 base64 内联进请求，不落会话。）
 
-压缩丢弃 Image 块 ⇒ 主 JSONL 里那行本来就没了；旁路文件成为**无引用** ⇒ 启动 GC 回收。
-**磁盘与 context 同步收缩**，除非用户从 `/resume` 回滚到更早的会话（那时引用仍在）。
+> 注意区分两个「base64 内联」：**请求**里是 `data:image/png;base64,…`（wire 形态，
+> 适配器构造，瞬时存在）；**会话**里永远是路径。前者是本节要的，后者是本节拒绝的。
+
+### 压缩与磁盘
+
+压缩丢弃 Image 块 ⇒ 该路径从历史消失。因为字节从未落进会话文件，
+**磁盘与 context 本来就同步**，不需要 GC、不需要清理命令。
 
 ## 4. 数据流
 
@@ -268,20 +231,20 @@ Codex 把 base64 **留在历史里**（`snapshot_local_user_input` 原地替换�
 **出站细节（唯一 IO 点）**
 
 ```
-ContentBlock::Image{id, path, detail}
+ContentBlock::Image{path, detail}
    ↓ compat 门控（D4）
    ├─ 不支持 → Text { "[image omitted: model has no image input] /path" }   ← D5
    └─ 支持
-       ↓ 先查 sideline: <sessions>/media/<id>.<ext>          ← D7 快照优先
-       ├─ 存在 → 直接用（与原文件已脱钩）
-       └─ 不存在 → 回落到 path 现读
+       ↓ 按 path 读盘
            ↓ 失败 ⇒ Text 占位（含原因）                        ← D6
-       ↓ sniff_image 校验 → 非图片/不支持格式 ⇒ Text 占位
+       ↓ sniff_image 按内容校验 → 非图片/不支持格式 ⇒ Text 占位
        ↓ 体积超限 ⇒ Text 占位
-       ↓ MediaCache 查 (id 或 path+mtime+len) → 命中则零重编码    ← D7
+       ↓ MediaCache 查 (path + mtime + len) → 命中则零重编码    ← D7
        ↓ base64 → data:{mime};base64,·
        ↓ ChatMessage { role: "user", content: [ {type:"text"}, {type:"image_url"} ] }
 ```
+
+缓存键是 `(path, mtime, len)`：同一路径内容被改写时键自然变化，不会送回陈旧字节。
 
 ## 5. 失败与降级矩阵（全部**不静默**）
 
@@ -340,7 +303,6 @@ ContentBlock::Image{id, path, detail}
 | `apps/coding-agent/src/main.rs:676` `message_bytes` | Image 计入（路径长度即可） | — |
 | `apps/coding-agent/src/app_loop.rs:1821` | ⚠️ `expand_skill_invocation` **重建 Message 会丢 Image 块** —— 必须保留非 Text 块 | **A 档，静默丢数据** |
 | `crates/ys-session/src/meta.rs` | v→2（首个 Image 块出现时） | — |
-| `crates/ys-session/src/media_store.rs`（新） | 旁路快照：写、查、GC（内容寻址） | 新文件；主 JSONL 写入路径**不动** |
 
 ## 9. 测试矩阵与变异点
 
@@ -358,21 +320,20 @@ ContentBlock::Image{id, path, detail}
 | TUI 渲染 Image 块 | `transcript.rs` | 恢复白名单 ⇒ 红（`transcript.rs:538` 已有同型用例） |
 | skill 展开保留 Image 块 | `app_loop` | 恢复 `vec![Text]` ⇒ 红（A 档变异） |
 | 老会话（无 Image）可正常回放 | `ys-session` | — |
-| **单图 append 不重写全文件**：1000 条消息 + 10 张图的会话，一次 append 写入字节数 < 2 KiB | `ys-session` | 把快照改成内联 base64 ⇒ 红（**代价 1 的护栏**） |
-| **原图删除后仍能回放**：写快照 → 删原图 → resolve 仍得 data URL | 适配器 + session | 去掉快照优先查找 ⇒ 红（**可复现性的护栏**） |
-| **原图改内容 ⇒ 新 id**：改字节后重建块，id 必须不同 | `ys-core` / session | 只用路径当键 ⇒ 红 |
+| **图片字节不进会话文件**：含 Image 块的会话落盘后，文件里出现的只有路径字符串，且全文不含 `base64` | `ys-session` | 把 `Image.path` 改成 `Image.data`（内联字节）⇒ 红（**B 与 C 的接缝护栏**） |
+| **出站时才读盘**：Image 块入历史后删原图，构造请求仍不报错，降级为占位 | 适配器 | 在入历史时就读盘并缓存字节 ⇒ 红（会变成入历史即失败） |
+| **原图改内容 ⇒ 送出字节跟着变**：缓存键含 mtime/len，改写后不再命中旧缓存 | 适配器 | 缓存键只用 path ⇒ 红 |
 
 **变异测试**：新增 `scripts/vision-mutation.py`，照 `scripts/cancellation-mutation.py` 的形态，
 注入 ≥8 处 bug（含 K2/K3/A 档三处静默点）。
 
 ## 10. 已知边界（写进 as-built）
 
-1. **路径是引用不是快照 —— 但字节有快照（S3）**：旁路文件一旦写出，原图改名/删除
-   **不影响回放**；原图被**改内容**则 id 不匹配 ⇒ 开新 id、旧快照仍在（能被识别为两张图）。
-   剩下真正的边界：快照文件被手工删掉后，回落路径又已失效 ⇒ 占位报错。
-2. **旁路目录体积会线性增长**：每张入过历史的图永久占一份。启动 GC 只能回收
-   无引用的；**有引用的旧图不会被自动清**。需一条用户可见的手动清理（`/cleanup` 或
-   安装脚本），本次只写进 as-built 边界。
+1. **路径是引用，不是快照**：原图改名/删除后再回放 ⇒ 出站降级为文本占位，回合不失败；
+   原图被改写 ⇒ 下次出站送的是**新内容**，历史与线上不再逐字节对应。
+   「完全可复现」不在本设计范围内（见 §3.7）。
+2. **会话体积不因图片增长**：Image 块只有路径，压缩丢弃它即彻底释放。
+   代价是依赖原图仍在其路径上 —— 这是如实写明的边界，不是待修项。
 3. **不做本地缩放**：超 32 MiB 的图直接拒绝。大截图（如 4K Retina 全屏）可能触线，
    用户需自己压。Codex 有 `image` crate 做 2048 缩放，本仓不引。
 4. **不做发送去重**：同一张图在多个回合里各占 1024 token 预算。

@@ -6,15 +6,21 @@ use ys_protocol::BoundarySource;
 use ys_tool::ToolSpec;
 
 /// 发送给 model 以完成 completion 的请求。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// **不派生 `Serialize` / `Deserialize`** —— 它是**进程内调用契约**，不是线格式：
+/// 从 `ys-loop` 构造、交给 [`Model::complete`]，生命周期不超出一个回合。
+/// 真正跨线的请求体是适配器内部的 `ChatCompletionRequest`（那里才需要 serde）。
+///
+/// 把 `boundary`（`Arc<dyn BoundarySource>`）留在本结构里也依赖这一点：
+/// 它无 `Serialize`，一旦给本类型加回派生就会编译失败。
+///
+/// [`Model::complete`]: crate::Model::complete
+#[derive(Debug, Clone, Default)]
 pub struct ModelRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
-    #[serde(default)]
     pub system: Option<String>,
-    #[serde(default)]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
     pub temperature: Option<f32>,
     /// **思考覆盖**（可选）—— 本次调用的思考开关 / 强度覆盖。
     ///
@@ -28,21 +34,13 @@ pub struct ModelRequest {
     /// **为何不用 `reasoning_effort = "off"`**：`off` 不是 DeepSeek 的合法 wire 值
     /// （实测返回 422 `unknown variant 'off'`），要关思考只能发
     /// `thinking: {"type": "disabled"}`。
-    ///
-    /// **不参与序列化**：与 [`Self::boundary`] 同理，`ModelRequest` 是会话契约的一部分，
-    /// 加值字段会改字节。（此字段曾是 `disable_thinking: Option<bool>`，泛化时保持了
-    /// 同一条 `serde(skip)` 契约 ⇒ 序列化字节逐字节不变。）
-    #[serde(skip, default)]
     pub thinking: Option<ThinkingOverride>,
     /// 轮边界控制源（可选）—— 模型调用期间的**中止**通道。
     ///
     /// `None` = 不支持中止（适配器不装探针，行为与不挂载时一致）。
     ///
-    /// **不参与序列化**（`serde(skip)`）⇒ 既有序列化字节逐字节不变。
-    ///
     /// 共享引用语义：loop 侧与 model 侧看到**同一个** abort 状态
     /// （`Arc` 是 `Clone` ⇒ clone 后指向同一队列）。
-    #[serde(skip, default)]
     pub boundary: Option<Arc<dyn BoundarySource>>,
 }
 

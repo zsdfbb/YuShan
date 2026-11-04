@@ -177,38 +177,14 @@ mod tests {
         assert_eq!(back.finish_reason, FinishReason::default());
     }
 
-    /// N10：`boundary` **不参与序列化** ⇒ 既有序列化字节逐字节不变。
+    /// N10：`boundary` 是进程内取消通道，不是数据字段。
     ///
-    /// 该字段带 `serde(skip)`；若误改成普通字段，JSON 里会多出 `boundary`
-    /// 键（且 `Arc<dyn BoundarySource>` 无 `Serialize` ⇒ 直接编译失败）。
-    /// 这里钉住的是「挂载边界源**不改变**请求的线上字节」。
-    #[test]
-    fn model_request_serialization_ignores_boundary() {
-        let request = ModelRequest {
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-            }],
-            tools: vec![],
-            ..Default::default()
-        };
-        let without_boundary = serde_json::to_string(&request).unwrap();
-
-        let with_boundary = ModelRequest {
-            boundary: Some(Arc::new(ys_protocol::QueueBoundarySource::new())),
-            ..request.clone()
-        };
-        let with_boundary = serde_json::to_string(&with_boundary).unwrap();
-
-        assert_eq!(
-            without_boundary, with_boundary,
-            "挂载边界源不得改变序列化字节"
-        );
-        assert!(
-            !with_boundary.contains("boundary"),
-            "序列化结果不得含 boundary 键：{with_boundary}"
-        );
-    }
+    /// 守护方式是**类型层**而非运行期断言：`ModelRequest` 不派生 `Serialize`
+    /// （线格式在适配器的 `ChatCompletionRequest`），故「把 boundary 序列化出去」
+    /// 不可表达。若有人给 `ModelRequest` 加回 `Serialize`，则 `boundary` 字段
+    /// （`Arc<dyn BoundarySource>` 无 `Serialize`）会让编译失败 —— 那正是需要
+    /// 重新审视「请求体是否已变成线格式契约」的时刻。
+    /// N11 仍钉住 clone 的共享语义（见下一条）。
 
     /// N11：`clone` 后 `boundary` 仍是**同一份** `Arc`（`Arc::ptr_eq`）。
     ///

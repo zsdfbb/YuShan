@@ -271,6 +271,15 @@ fn tool_snippet(name: &str) -> &'static str {
         "webfetch" => {
             "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
         }
+        // 图片里的文字**唯一**的模型可见通道：`ContentBlock` 只有 `Text`/`ToolUse`/
+        // `ToolResult`，`ChatMessage.content` 是 `Option<String>`，均无多模态字段。
+        // 故文案必须点明「没有别的办法」—— 否则模型对着截图只会猜或要求用户复述。
+        // 括号里补坐标：取证类任务（「报错在哪一行按钮上」）靠的正是位置，而词级坐标
+        // 只能由 `word_boxes` 换来，模型无从自己推断。
+        "ocr" => {
+            "Extract the text in an image together with its pixel positions — the only way to \
+             see what an image contains here; set word_boxes for per-word coordinates"
+        }
         // 派发工具（装配端 `spec().name` 是契约）。
         "subagent_async" => {
             "Start a sub-agent in the background and get a handle immediately; its result arrives automatically when it finishes"
@@ -854,7 +863,7 @@ mod tests {
 
         // 先确认取到的是真实工具表（空表会让下面的循环平凡通过）。
         let actual: Vec<&str> = names.iter().map(String::as_str).collect();
-        assert_eq!(actual, EXPECTED_ORDER, "应取到装配端的真实 9 元工具表");
+        assert_eq!(actual, EXPECTED_ORDER, "应取到装配端的真实 10 元工具表");
 
         for name in &names {
             let snippet = tool_snippet(name);
@@ -869,7 +878,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 派发工具的 snippet **逐字**钉死（它只出现在父表的真实工具表里，不在基础 9 元中，
+    /// 派发工具的 snippet **逐字**钉死（它只出现在父表的真实工具表里，不在基础 10 元中，
     /// 故上一用例的全表循环覆盖不到它）。
     ///
     /// 变异：把它改成兜底文案或别的措辞 ⇒ 本用例变红。
@@ -881,8 +890,8 @@ mod tests {
         );
     }
 
-    /// `grep` / `find` / `ls` / `websearch` / `webfetch` 的 snippet **逐字**钉死
-    /// （T11 review 点名的无守卫项 + T13 新增的 web 两条）。
+    /// `grep` / `find` / `ls` / `ocr` / `websearch` / `webfetch` 的 snippet **逐字**钉死
+    /// （T11 review 点名的无守卫项 + T13 新增的 web 两条 + `ocr`）。
     ///
     /// 非兜底断言（上一用例）只能证明「有专属文案」，证不了「文案说对了」；
     /// 这几条是模型真正读到的检索 / 列目录 / 联网指引，故用字面量锁文本。
@@ -901,6 +910,11 @@ mod tests {
         );
         assert_eq!(tool_snippet("find"), "Search for files by glob pattern");
         assert_eq!(tool_snippet("ls"), "List directory contents");
+        // `ocr` 的两句承重语义：「唯一能看图」与「词级坐标只能靠 `word_boxes` 换」。
+        assert_eq!(
+            tool_snippet("ocr"),
+            "Extract the text in an image together with its pixel positions — the only way to see what an image contains here; set word_boxes for per-word coordinates"
+        );
         assert_eq!(
             tool_snippet("websearch"),
             "Search the web (tries the configured backends in a fixed order, stops at the first one that answers)"
@@ -1724,7 +1738,7 @@ mod tests {
         );
     }
 
-    /// 子 agent 的工具表（基础 9 元）**不含 bg 工具** ⇒ 天然看不到这两条 guideline。
+    /// 子 agent 的工具表（基础 10 元）**不含 bg 工具** ⇒ 天然看不到这两条 guideline。
     ///
     /// 这与派发工具那组的「在场才出现」同形：子表少一项，父表多一项，
     /// 提示词各说各话，互不越界。
@@ -2057,7 +2071,7 @@ mod tests {
         let normalized = body.replace(&dir.display().to_string(), "<cwd>");
         assert_eq!(
             fnv1a64(normalized.as_bytes()),
-            0x74d85548c8ce4034u64,
+            0x4ce143161b13432fu64,
             "主 agent 提示主体漂移：确认是有意改动，再更新此锚点"
         );
 

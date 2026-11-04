@@ -450,3 +450,13 @@ v1 的「内联 vs 落盘」二选一有个洞：8 KiB 是**软**阈值，而 `S
 | 可观测性：`command_fp` 认 `ocr` + `summarize_tool_args` 加臂 | review R4（P1） | §6 |
 | `find_in_path` 提为 `pub(crate)` | review M2（P3） | 模块划分 |
 | 加后端改动面统一为「1 变体 + 3 臂 + 1 行表」（无新解析函数） | review I3（P3） | §2.1 |
+
+## 修订记录（v2 → as-built 对账，2026-11-04）
+
+来源：W3 / W4 执行期的回查（产物见 [`docs/design-final/ocr-tool.md`](../../design-final/ocr-tool.md)）。
+
+| 改动 | 来源 | 落在 |
+|---|---|---|
+| 元数契约确认：子表 **10** / 父表 **13** / explore 子表 **8**（`ocr` 排在 `ls` 之后、`websearch` 之前） | W3 装配 + 4 处 `len()` + 两个指纹锚重算 | §5 #1–#8、`docs/design.md` §10/§12 |
+| 真机验证通过：macOS 27.0.1 / arm64，`tesseract 5.5.4`（leptonica 1.87.0）+ `chi_sim`/`chi_sim_vert`/`eng`/`osd`；1200x400 中英混排图识别正确，TSV 12 列与 `parse_tsv` 契约一致 | W4 真机实测 | `docs/design-final/ocr-tool.md`「真机验证」 |
+| `swiftc` 编译缓存（§3.5）与本版 §7 的 40 MP 像素上限均**未落地**；`degraded=` 实际只产 `lang-missing` | W4 回查 | `docs/design-final/ocr-tool.md`「与设计的偏差」 |

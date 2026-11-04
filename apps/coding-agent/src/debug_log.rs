@@ -1078,20 +1078,51 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// 命令类工具名：其 `command` 参数即**命令串**。
+/// 命令类工具名：其参数里含**决定外部进程产出**的输入串。
 ///
 /// 判定按工具名而非参数形状 —— 只有命令类工具才落指纹，其余工具一律 `None`。
+/// `ocr` 也在此列：它 spawn 外部引擎（`tesseract` / Vision）、外部进程的输出决定结果内容，
+/// 与 `bash` 同类；区别是它**没有 `command` 键**，指纹对象是输入三元组（见
+/// [`command_fingerprint`]）。
 fn is_command_tool(tool: &str) -> bool {
-    matches!(tool.to_ascii_lowercase().as_str(), "bash" | "bash_bg")
+    matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "bash" | "bash_bg" | "ocr"
+    )
 }
 
 /// 命令串指纹：命令类工具给 `Some`，其余工具给 `None`。
 ///
-/// 指纹取**脱敏后**的命令串原文：`command` 键不在敏感键名单里，脱敏不改它；
+/// 指纹取**脱敏后**的输入原文：`command` 键不在敏感键名单里，脱敏不改它；
 /// 取脱敏后的值是为了让「指纹不泄密」这条契约不依赖名单的变更。
+///
+/// `ocr` 没有 `command` 键：它的输入是 `(path, lang, word_boxes)`，按
+/// `path ‖ \0 ‖ lang ‖ \0 ‖ granularity` 求 `fnv1a64`。分隔符不可省 —— 否则
+/// `path="a", lang="b"` 与 `path="a\0b", lang=""` 会拼成同一串。
+///
+/// 该三元组与 `ocr` 落盘名用的是**同一算法、同一输入**（`ocr/engine.rs::file_name`）⇒
+/// 一个数字同时索引「重复输入」与「落盘产物」。
 fn command_fingerprint(tool: &str, redacted_args: &Value) -> Option<u64> {
     if !is_command_tool(tool) {
         return None;
+    }
+    if tool.eq_ignore_ascii_case("ocr") {
+        let path = redacted_args.get("path").and_then(Value::as_str)?;
+        let lang = redacted_args
+            .get("lang")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let granularity = match redacted_args.get("word_boxes").and_then(Value::as_bool) {
+            Some(true) => "w",
+            _ => "l",
+        };
+        let mut buf = Vec::with_capacity(path.len() + lang.len() + 2);
+        buf.extend_from_slice(path.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(lang.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(granularity.as_bytes());
+        return Some(fnv1a64(&buf));
     }
     let command = redacted_args.get("command").and_then(Value::as_str)?;
     Some(fnv1a64(command.as_bytes()))
@@ -1127,6 +1158,7 @@ pub(crate) fn summarize_tool_args(tool: &str, args: &Value, mode: ArgsMode) -> T
             "grep" | "find" | "ls" => summarize_search(&redacted, &mut out, &mut truncated),
             "websearch" => summarize_websearch(&redacted, mode, &mut out, &mut truncated),
             "webfetch" => summarize_webfetch(&redacted, &mut out, &mut truncated),
+            "ocr" => summarize_ocr(&redacted, &mut out, &mut truncated),
             "subagent" => summarize_subagent(&redacted, &mut out, &mut truncated),
             _ => {
                 if mode == ArgsMode::Full {
@@ -1286,6 +1318,21 @@ fn summarize_websearch(
         out.insert("query".to_string(), Value::String(value));
     }
     copy_numbers(args, out, &["limit"]);
+}
+
+fn summarize_ocr(args: &Value, out: &mut Map<String, Value>, truncated: &mut bool) {
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        let (value, cut) = head_str(path, 512);
+        *truncated |= cut;
+        out.insert("path".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(lang) = args.get("lang").and_then(Value::as_str) {
+        out.insert("lang".to_string(), Value::String(lang.to_string()));
+    }
+    // `word_boxes` 的缺省值是 `false` ⇒ 缺省值不携带信息，不写省字节。
+    if args.get("word_boxes").and_then(Value::as_bool) == Some(true) {
+        out.insert("word_boxes".to_string(), Value::Bool(true));
+    }
 }
 
 fn summarize_webfetch(args: &Value, out: &mut Map<String, Value>, truncated: &mut bool) {
@@ -2549,6 +2596,82 @@ mod tests {
             "指纹是索引而非内容 ⇒ `none` 档也算"
         );
         assert_eq!(none.arguments, json!({}), "`none` 档参数投影仍为空");
+    }
+
+    /// `ocr` 是**唯一没有 `command` 键的命令类工具**：指纹取
+    /// `path ‖ \0 ‖ lang ‖ \0 ‖ granularity`，与 `ocr/engine.rs::file_name` 同一算法、
+    /// 同一输入 ⇒ 一个数字双重索引「重复输入」与「落盘产物」。
+    ///
+    /// 变异 1：`is_command_tool` 去掉 `"ocr"` ⇒ 首条断言变红。
+    /// 变异 2：删掉两个 `\0` ⇒ 拼接歧义断言变红。
+    /// 变异 3：`word_boxes` 不进指纹 ⇒ 词级 / 行级同指纹的断言变红。
+    #[test]
+    fn test_ocr_fingerprint_indexes_the_input_triple() {
+        let line = summarize_tool_args(
+            "ocr",
+            &json!({ "path": "a.png", "lang": "chi_sim+eng" }),
+            ArgsMode::Head,
+        );
+        assert!(line.command_fp.is_some(), "ocr 是命令类工具 ⇒ 有指纹");
+
+        // 与手算的同一算法逐值相等（分量顺序与定界符都是契约）。
+        let mut buf = b"a.png".to_vec();
+        buf.push(0);
+        buf.extend_from_slice(b"chi_sim+eng");
+        buf.push(0);
+        buf.push(b'l');
+        assert_eq!(line.command_fp, Some(fnv1a64(&buf)));
+
+        // 三个分量任一变化都换指纹。
+        for changed in [
+            json!({ "path": "b.png", "lang": "chi_sim+eng" }),
+            json!({ "path": "a.png", "lang": "eng" }),
+            json!({ "path": "a.png", "lang": "chi_sim+eng", "word_boxes": true }),
+        ] {
+            assert_ne!(
+                summarize_tool_args("ocr", &changed, ArgsMode::Head).command_fp,
+                line.command_fp,
+                "输入三元组变了 ⇒ 指纹必须不同；args = {changed}"
+            );
+        }
+
+        // 定界符承重：没有 `\0` 时 `("a", "b")` 与 `("a\0b", "")` 会拼成一串。
+        let joined =
+            summarize_tool_args("ocr", &json!({ "path": "a", "lang": "b" }), ArgsMode::Head);
+        let split = summarize_tool_args(
+            "ocr",
+            &json!({ "path": "a\u{0}b", "lang": "" }),
+            ArgsMode::Head,
+        );
+        assert_ne!(
+            joined.command_fp, split.command_fp,
+            "分量之间必须有不参与内容的定界符"
+        );
+    }
+
+    /// `ocr` 的参数投影只留 `path` / `lang` / `word_boxes`；缺省 `word_boxes` 不写（省字节）。
+    ///
+    /// 变异：把 `false` 也写进去 ⇒ `truncated` 之外多一个无信息键 ⇒ 首条反向断言变红。
+    #[test]
+    fn test_ocr_summary_records_three_keys_and_omits_the_default() {
+        let line = summarize_tool_args(
+            "ocr",
+            &json!({ "path": "a.png", "lang": "eng" }),
+            ArgsMode::Head,
+        );
+        assert_eq!(line.arguments["path"], "a.png");
+        assert_eq!(line.arguments["lang"], "eng");
+        assert!(
+            line.arguments.get("word_boxes").is_none(),
+            "`word_boxes=false` 是默认值，不携带信息 ⇒ 不写"
+        );
+
+        let word = summarize_tool_args(
+            "ocr",
+            &json!({ "path": "a.png", "lang": "eng", "word_boxes": true }),
+            ArgsMode::Head,
+        );
+        assert_eq!(word.arguments["word_boxes"], true);
     }
 
     /// 脱敏在所有档位都生效；指纹**不因脱敏而变** —— `command` 键不在敏感键名单里，

@@ -2560,12 +2560,13 @@ mod tests {
         );
     }
 
-    /// 探索子表恰 7 元且**不含** `write` / `edit`；通用子表仍 9 元。
+    /// 探索子表恰 8 元且**不含** `write` / `edit`；通用子表仍 10 元。
     ///
     /// 变异 1：`Explore` 分支原样返回基础表 ⇒ 元数与名字断言变红。
     /// 变异 2：过滤器改成去掉 `read` ⇒ 名字序列断言变红。
+    /// 变异 3：把 `ocr` 加进排除集 ⇒ 名字序列与元数变红（`ocr` 是有意留在 explore 的）。
     #[test]
-    fn explore_child_toolset_is_seven_without_writers() {
+    fn explore_child_toolset_is_eight_without_writers() {
         use ys_tools_web::FetchedDir;
 
         let base = unique_subagent_test_dir("mode_tools");
@@ -2573,13 +2574,13 @@ mod tests {
 
         let general = child_tools(SubagentMode::General, &base, web());
         let general_names: Vec<String> = general.iter().map(|t| t.spec().name).collect();
-        assert_eq!(general_names.len(), 9, "通用子表仍是 9 元");
+        assert_eq!(general_names.len(), 10, "通用子表仍是 10 元");
         assert!(general_names.contains(&"write".to_string()));
         assert!(general_names.contains(&"edit".to_string()));
 
         let explore = child_tools(SubagentMode::Explore, &base, web());
         let explore_names: Vec<String> = explore.iter().map(|t| t.spec().name).collect();
-        assert_eq!(explore_names.len(), 7, "探索子表应为 7 元");
+        assert_eq!(explore_names.len(), 8, "探索子表应为 8 元");
         assert_eq!(
             explore_names,
             vec![
@@ -2588,10 +2589,11 @@ mod tests {
                 "grep",
                 "find",
                 "ls",
+                "ocr",
                 "websearch",
                 "webfetch"
             ],
-            "探索表是通用表按名字去掉 write/edit 后的子序列"
+            "探索表是通用表按名字去掉 write/edit 后的子序列（`ocr` 有意留下）"
         );
         assert!(
             !explore_names.iter().any(|n| n == "write" || n == "edit"),
@@ -2646,13 +2648,13 @@ mod tests {
             Some("GENERAL-CHILD-PROMPT"),
             "general 必须用 child_prompt"
         );
-        assert_eq!(requests[0].tools.len(), 9, "general 工具表 9 元");
+        assert_eq!(requests[0].tools.len(), 10, "general 工具表 10 元");
         assert_eq!(
             requests[1].system.as_deref(),
             Some("EXPLORE-CHILD-PROMPT"),
             "explore 必须用 explore_prompt"
         );
-        assert_eq!(requests[1].tools.len(), 7, "explore 工具表 7 元");
+        assert_eq!(requests[1].tools.len(), 8, "explore 工具表 8 元");
         assert!(
             !requests[1]
                 .tools

@@ -7,6 +7,7 @@ pub mod exec;
 pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod ocr;
 pub mod proc_group;
 pub mod read;
 pub mod write;
@@ -21,6 +22,7 @@ pub use edit::EditTool;
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
+pub use ocr::OcrTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 

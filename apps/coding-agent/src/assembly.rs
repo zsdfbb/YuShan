@@ -97,12 +97,12 @@ pub struct BuiltAgent {
     pub tool_specs: Vec<(String, usize)>,
     /// 真实**父表**的 spec（装配产物）—— assembly 级断言用。
     ///
-    /// 父表 = 基础 9 元 + `bash_bg` + `subagent_async` + `subagent_send`（后三者追加末位）。
+    /// 父表 = 基础 10 元 + `bash_bg` + `subagent_async` + `subagent_send`（后三者追加末位）。
     #[cfg(test)]
     pub parent_specs: Vec<ys_tool::ToolSpec>,
     /// 真实**子表**的 spec（装配产物）—— assembly 级断言用。
     ///
-    /// 子表 = 基础 9 元（**无后台能力**）。
+    /// 子表 = 基础 10 元（**无后台能力**）。
     #[cfg(test)]
     pub child_specs: Vec<ys_tool::ToolSpec>,
 }
@@ -145,13 +145,23 @@ impl AgentFactory {
     /// 顺序照设计 §1.2「启动期」：**先探测装工具**（`toolset` 是唯一装配接缝），
     /// **再由工具表派生提示词的工具清单** —— 同一份表，清单顺序 == 注册顺序。
     pub fn build(&self, workspace: &Path) -> Result<BuiltAgent, BuildError> {
-        // 子 agent 的工具表 = 基础 9 元表（**去掉派发工具**）—— 结构上不可能递归。
+        // 子 agent 的工具表 = 基础 10 元表（**去掉派发工具**）—— 结构上不可能递归。
         let (base_tools, hint) = toolset::build_tools(workspace, self.web.clone());
         let child_specs: Vec<_> = base_tools.iter().map(|t| t.spec()).collect();
         let child_prompt = prompt::build_system_prompt(workspace, &child_specs, &self.catalogue);
 
-        // 探索模式从同一张子表里按名字去掉写工具（7 元）—— 装配逻辑只有一份，
-        // 模式只是过滤器；提示词单独构建（只读角色 + `path:line` 输出契约）。
+        // 探索模式从同一张子表里按名字去掉写工具（10 元 ⇒ 8 元）
+        // —— 装配逻辑只有一份，模式只是过滤器；提示词单独构建（只读角色 + `path:line` 输出契约）。
+        //
+        // **新增工具默认进 explore 表**：下面是「排除集之外全进」的补集推导，故否决某个
+        // 工具的只读准入时，必须把它**显式**写进排除集（`write` / `edit` 即此），而不是
+        // 依赖「记得别让它进来」。加工具时顺手判一条：它只读输入、不写 workspace 吗？
+        //
+        // `ocr` 注册进 `base_tools` 后**有意留在这里**，不加进排除集：只读输入 + 内容
+        // 哈希幂等落盘到临时目录（不碰 workspace）+ 子 agent 自带 8 轮 / 300s 硬预算，
+        // 三条合起来正好落在 explore 的既有权限边界内。承重理由是 explore 的典型任务
+        // 就是「这张截图里的错误是什么」—— 禁掉它，子 agent 只能答「我只能告诉你有个
+        // png」，或改道 `bash` 绕过工具级禁令（后者一条也拦不住）。
         let explore_specs: Vec<_> = child_specs
             .iter()
             .filter(|spec| !matches!(spec.name.as_str(), "write" | "edit"))
@@ -177,11 +187,11 @@ impl AgentFactory {
         .with_explore_prompt(explore_prompt)
         .with_handles(self.subagent_handles.clone());
 
-        // 父表 = 基础 9 元 + `bash_bg` + 派发工具**追加末位**
+        // 父表 = 基础 10 元 + `bash_bg` + 派发工具**追加末位**
         // （子 tools JSON 仍是父的字节前缀 ⇒ 命中缓存）。
         //
         // **插入位置是契约**：追加段只能长在子表之后（`bash_bg` 先、派发工具后） ⇒
-        // 父表的前 9 项逐字节等于子表 ⇒ 父 JSON 仍以子 JSON 去末尾 `]` 开头。
+        // 父表的前 10 项逐字节等于子表 ⇒ 父 JSON 仍以子 JSON 去末尾 `]` 开头。
         //
         // 后台命令的结果由注册表的清扫路径**主动投递**（`Boundary::Deferred`）——
         // 模型不需要轮询工具，故父表里没有 `bash_poll`。
@@ -189,7 +199,7 @@ impl AgentFactory {
         if let Some(context) = &self.backgrounds {
             // **父表的 `bash` 换上挂了后台能力的版本**：超时不杀进程组，改为过继给
             // 注册表，结果由完成通知送达。位置不能动 —— 它仍在第 4 位，否则父表
-            // 的前 9 项就不再逐字节等于子表（缓存前缀契约）。
+            // 的前 10 项就不再逐字节等于子表（缓存前缀契约）。
             if let Some(bash) = tools.iter_mut().find(|t| t.spec().name == "bash") {
                 *bash = Box::new(
                     BashTool::new(workspace.to_path_buf())
@@ -203,7 +213,7 @@ impl AgentFactory {
             )));
         }
         // **追加顺序是契约**：`subagent_async` 必须排在 `bash_bg` **之后**，且追加段只能往后长 ——
-        // 子表（= 基础 9 元）仍是父表 JSON 的**字节前缀**（`toolset.rs` 的
+        // 子表（= 基础 10 元）仍是父表 JSON 的**字节前缀**（`toolset.rs` 的
         // `prefix_fingerprint_is_anchored_and_stable` 钉住这条）。
         tools.push(Box::new(crate::subagent::SubagentAsyncTool::new()));
         tools.push(Box::new(SubagentSendTool::new()));
@@ -291,7 +301,7 @@ mod tests {
         .with_backgrounds(backgrounds)
     }
 
-    /// 同一工厂、两个工作区：工具表恒 12 元（9 基础 + bg×2 + `subagent_async` + `subagent_send`），而 system prompt 的
+    /// 同一工厂、两个工作区：工具表恒 13 元（10 基础 + bg×2 + `subagent_async` + `subagent_send`），而 system prompt 的
     /// `Current working directory` **跟着工作区变** —— 这是「三者一起换」中提示词那一处
     /// 的可观测证据。
     ///
@@ -325,7 +335,7 @@ mod tests {
         assert_eq!(
             built_short.agent.tool_names(),
             expected,
-            "父表应为 9 基础 + bash_bg + subagent_async + subagent_send（后三者追加在末位）"
+            "父表应为 10 基础 + bash_bg + subagent_async + subagent_send（后三者追加在末位）"
         );
         assert_eq!(
             built_long.agent.tool_names(),
@@ -352,10 +362,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **assembly 级断言** —— 真实父表 12 元 / 子表 9 元；父表 JSON 以子表 JSON
+    /// **assembly 级断言** —— 真实父表 13 元 / 子表 10 元；父表 JSON 以子表 JSON
     /// 去末尾 `]` 开头；派发工具族收尾。
     ///
-    /// **为什么必须是 assembly 级**：`toolset` 里那条 9 元顺序用例**自拼父表**
+    /// **为什么必须是 assembly 级**：`toolset` 里那条 10 元顺序用例**自拼父表**
     /// （自己在子表后面追加 `subagent_async`）⇒ 往父表里插新工具后它照样全绿，
     /// 却已经不再描述真实父表。本用例断言的是**装配产物本身**（`build` 的真实输出），
     /// 不是另拼一份。
@@ -368,18 +378,18 @@ mod tests {
         let f = factory(&base);
         let built = f.build(&base).unwrap();
 
-        // ① 真实父表 12 元、子表 9 元（子 agent 天然没有后台能力）。
+        // ① 真实父表 13 元、子表 10 元（子 agent 天然没有后台能力）。
         let parent_names: Vec<&str> = built
             .parent_specs
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert_eq!(parent_names.len(), 12, "真实父表应为 12 元");
-        assert_eq!(built.child_specs.len(), 9, "真实子表应为 9 元");
+        assert_eq!(parent_names.len(), 13, "真实父表应为 13 元");
+        assert_eq!(built.child_specs.len(), 10, "真实子表应为 10 元");
         assert_eq!(
             built.agent.tool_names().len(),
-            12,
-            "注册进 agent 的父表应为 12 元"
+            13,
+            "注册进 agent 的父表应为 13 元"
         );
         assert!(
             !built.child_specs.iter().any(|spec| spec.name == "bash_bg"),
@@ -418,7 +428,7 @@ mod tests {
 
     /// **assembly 级断言（末位）** —— 派发工具族收尾。
     ///
-    /// 派发工具永远追加在最后 ⇒ 子表（基础 9 元）既是父表的**前缀**，又与末位相距
+    /// 派发工具永远追加在最后 ⇒ 子表（基础 10 元）既是父表的**前缀**，又与末位相距
     /// 两项（`bash_bg` / `subagent_async`）。
     ///
     /// 变异：把派发工具插到 `bash_bg` **之前** ⇒ 本用例变红。
@@ -433,7 +443,7 @@ mod tests {
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        // **发消息工具在末位**（`subagent_async` 在其前）：子表（基础 9 元）仍是父表
+        // **发消息工具在末位**（`subagent_async` 在其前）：子表（基础 10 元）仍是父表
         // JSON 的字节前缀。末位一旦换人，已缓存的父前缀就提前断掉。
         assert_eq!(
             &parent_names[parent_names.len() - 2..],

@@ -110,7 +110,10 @@ impl SearchBackends {
 }
 
 /// 在目录序列里找第一个可执行候选（目录顺序优先，其次候选名顺序）。
-fn find_in_path(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
+///
+/// `ocr/engine.rs` 复用本函数构造候选链 —— 路径探测只有这一份实现，复制一份就是第二个
+/// 可能漂移的真值（且「不 fork、不跑 `--version`」这条约束必须对 OCR 同样成立）。
+pub(crate) fn find_in_path(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
     for dir in dirs {
         for name in names {
             let cand = dir.join(name);

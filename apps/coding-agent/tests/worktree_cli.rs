@@ -33,6 +33,9 @@
 //! （`worktree add ... HEAD` 需要一个已存在的 HEAD）；所有 git 命令都带
 //! `-c user.name=… -c user.email=…`，否则 commit 会因缺身份而失败。
 //!
+//! **`GIT_DIR` / `GIT_WORK_TREE` 必须剥掉**：它们盖过 `-C`，`git init` 会落到被指向的仓上
+//! 并给那个仓写 `core.bare = true` —— 受害者是调用者自己的仓库，而非临时仓。
+//!
 //! # 挂起即失败
 //!
 //! 所有用例套 [`CHILD_TIMEOUT`]：挂起必须是 panic（带已捕获输出），而非测试挂死。
@@ -143,6 +146,11 @@ fn command_with_debug(sb: &Sandbox, cwd: &Path, debug_env: DebugEnv) -> Command 
         .env_remove("OPENAI_API_BASE")
         .env_remove("OPENAI_API_KEY")
         .env_remove("YUSHAN_CHANNEL_CAPACITY")
+        // 子进程的 `git` 只认 `current_dir`：`GIT_DIR` / `GIT_WORK_TREE` 若被继承，
+        // `worktree create` 会在别处的仓上动手（详见文件头「真调 git」）。
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
         // 回环 mock：绕过可能存在的代理。
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
@@ -249,6 +257,10 @@ fn created_path(stderr: &str) -> PathBuf {
 /// 真调 `git`：`-C <dir>` + 身份 `-c`（否则 commit 因缺身份失败）+ `args`。
 ///
 /// 身份用 `-c` 而非 `Command::env`：`-c` 对所有 `git` 子命令生效，无遗漏。
+///
+/// **剥掉父进程的 `GIT_DIR` / `GIT_WORK_TREE`**：它们盖过 `-C`，会让 `git init` 落到被
+/// 指向的仓上并给那个仓写 `core.bare = true`（把已存在的 `.git` 当裸库初始化）——
+/// 受害者是调用者自己的仓库，之后它的所有命令报「该操作必须在一个工作区中运行」。
 fn git(dir: &Path, args: &[&str]) -> Output {
     Command::new("git")
         .arg("-C")
@@ -260,6 +272,8 @@ fn git(dir: &Path, args: &[&str]) -> Output {
             "user.email=ys-test@example.com",
         ])
         .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .expect("spawn git（测试环境应装有 git）")
 }

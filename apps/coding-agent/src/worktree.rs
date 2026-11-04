@@ -485,6 +485,26 @@ mod tests {
     use crate::test_env::{EnvRestore, env_lock};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// 测试里 spawn `git`（`-C <dir> <args>`），**剥掉父进程的 `GIT_*` 定位变量**。
+    ///
+    /// `GIT_DIR` / `GIT_WORK_TREE` 一旦被导出，就会盖过 `-C`：`git init` 于是往**被指向的
+    /// 那个仓**里写 `core.bare = true`（它把已存在的 `.git` 当成裸库初始化）。测试本意是
+    /// 在临时目录建仓，实际却是改写调用者自己的仓库 —— 一次 `cargo test` 就能让真仓库
+    /// 之后所有命令报「该操作必须在一个工作区中运行」。
+    ///
+    /// 变异：删掉下面两行 `env_remove` ⇒ `a_git_init_in_a_test_does_not_flip_bare_on_the_caller_repo`
+    /// 变红。
+    fn test_git(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("spawn git（测试环境应装有 git）")
+    }
+
     /// 进程内唯一临时目录（原子序号 + `process::id()`，与 `main.rs` / `toolset.rs` 同规）。
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -600,6 +620,93 @@ mod tests {
         );
     }
 
+    /// 回归：测试里的 `git init` 不得改写**调用者自己的**仓库。
+    ///
+    /// 曾经真实发生：shell 里导出了 `GIT_DIR` 时跑 `worktree::` 测试，测试内的 `git init`
+    /// 把 `<被指向的仓>/.git/config` 的 `core.bare` 写成 `true`，此后该仓的所有命令报
+    /// 「该操作必须在一个工作区中运行」，且 `git -c core.bare=false` 盖不住（覆盖发生在
+    /// 仓库发现之后）。
+    ///
+    /// 本用例把 `GIT_DIR` 指向一个**真实形态的受害者**：一个主仓的 linked worktree
+    /// gitdir（`<victim>/.git/worktrees/wt`，与事故现场一致），再让被测路径
+    /// （[`test_git`]）在另一个临时目录里 `init`：受害者必须毫发无损。
+    ///
+    /// 变异：删掉 [`test_git`] 的两行 `env_remove` ⇒ `init` 指向受害者内部、给它的
+    /// `core.bare` 写上 `true` ⇒ 本用例变红。
+    #[test]
+    fn a_git_init_in_a_test_does_not_flip_bare_on_the_caller_repo() {
+        let _guard = env_lock();
+        let _restore = EnvRestore::capture(&["GIT_DIR", "GIT_WORK_TREE"]);
+
+        // 受害者仓（= 用户自己的仓）：正常非裸库，且带一棵 linked worktree。
+        let victim = canonical(&unique_tmp_dir("bare_victim"));
+        assert!(test_git(&victim, &["init", "-q"]).status.success());
+        let commit = test_git(
+            &victim,
+            &[
+                "-c",
+                "user.name=ys-test",
+                "-c",
+                "user.email=ys-test@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        assert!(commit.status.success(), "git commit 应成功");
+        let tree = unique_tmp_dir("bare_victim_tree");
+        std::fs::remove_dir_all(&tree).unwrap();
+        let tree_str = tree.to_string_lossy().into_owned();
+        let add = test_git(&victim, &["worktree", "add", "-b", "wt", &tree_str, "HEAD"]);
+        assert!(
+            add.status.success(),
+            "worktree add 应成功：{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        // 前提：受害者此时是可用的非裸库。
+        let before = test_git(&victim, &["config", "core.bare"]);
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            "false",
+            "前提：受害者的 core.bare 是 false"
+        );
+
+        // 复现导入条件：子进程会继承 `GIT_DIR`（事故里它指向 linked worktree 的 gitdir）。
+        // 登记名是树落点的 **basename**（不是分支名）。
+        let linked = victim
+            .join(".git")
+            .join("worktrees")
+            .join(tree.file_name().unwrap());
+        assert!(linked.is_dir(), "受害者应有一棵已登记的树：{linked:?}");
+        unsafe { std::env::set_var("GIT_DIR", &linked) };
+
+        // 测试本以为自己在建的仓 —— 它才是 `init` 该落的地方。
+        let target = canonical(&unique_tmp_dir("bare_target"));
+        assert!(test_git(&target, &["init", "-q"]).status.success());
+
+        // 先断言事故现象：受害者被写成了裸库。
+        let after = test_git(&victim, &["config", "core.bare"]);
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "false",
+            "`GIT_DIR` 不得把别处的仓变成裸库"
+        );
+        let inside = test_git(&victim, &["rev-parse", "--is-inside-work-tree"]);
+        assert_eq!(
+            String::from_utf8_lossy(&inside.stdout).trim(),
+            "true",
+            "受害者仓必须仍是可用工作区（否则所有命令报「必须在一个工作区中运行」）"
+        );
+        assert!(
+            target.join(".git").is_dir(),
+            "init 应落在 `-C` 指定的目录：{target:?}"
+        );
+        unsafe { std::env::remove_var("GIT_DIR") };
+    }
+
     /// `attach_target`（**N7**）：仓内已建同名树 ⇒ 返回该树路径；树不存在 ⇒ `NotFound`；
     /// 非 git ⇒ `NotARepo`。
     #[test]
@@ -618,12 +725,7 @@ mod tests {
         // 真建一个 git 仓：`attach_target` 先走 `main_repo`（`rev-parse --git-common-dir`）。
         let repo = home.join("Develop").join("YuShan");
         std::fs::create_dir_all(&repo).unwrap();
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["init", "-q"])
-            .output()
-            .expect("spawn git（测试环境应装有 git）");
+        let init = test_git(&repo, &["init", "-q"]);
         assert!(init.status.success(), "git init 应成功");
 
         // 成功：落点上已存在同名目录（`attach_target` 只认 `is_dir`）。
@@ -677,17 +779,11 @@ mod tests {
         // 真建一个带一次提交的仓（`worktree add … HEAD` 需要 HEAD 存在）。
         let repo = home.join("Develop").join("YuShan");
         std::fs::create_dir_all(&repo).unwrap();
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["init", "-q"])
-            .output()
-            .expect("spawn git（测试环境应装有 git）");
+        let init = test_git(&repo, &["init", "-q"]);
         assert!(init.status.success(), "git init 应成功");
-        let commit = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args([
+        let commit = test_git(
+            &repo,
+            &[
                 "-c",
                 "user.name=ys-test",
                 "-c",
@@ -697,12 +793,12 @@ mod tests {
                 "--allow-empty",
                 "-m",
                 "init",
-            ])
-            .output()
-            .unwrap();
+            ],
+        );
         assert!(commit.status.success(), "git commit 应成功");
 
         let path = path_for(&repo, "feat").unwrap();
+        let path_str = path.to_string_lossy().into_owned();
         // 尚未登记 ⇒ false。
         assert!(
             !is_stale_registration(&repo, &path),
@@ -711,14 +807,10 @@ mod tests {
 
         // 建树：登记在、目录也在。
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let add = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "add", "-b", "worktree-feat"])
-            .arg(&path)
-            .arg("HEAD")
-            .output()
-            .unwrap();
+        let add = test_git(
+            &repo,
+            &["worktree", "add", "-b", "worktree-feat", &path_str, "HEAD"],
+        );
         assert!(
             add.status.success(),
             "worktree add 应成功：{}",
@@ -739,12 +831,7 @@ mod tests {
         );
 
         // `git worktree prune` 清掉登记 ⇒ false（这正是 create 重试前的一步）。
-        let prune = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "prune"])
-            .output()
-            .unwrap();
+        let prune = test_git(&repo, &["worktree", "prune"]);
         assert!(prune.status.success(), "prune 应成功");
         assert!(
             !is_stale_registration(&repo, &path),
@@ -779,17 +866,11 @@ mod tests {
 
         let repo = home.join("Develop").join("YuShan");
         std::fs::create_dir_all(&repo).unwrap();
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["init", "-q"])
-            .output()
-            .expect("spawn git（测试环境应装有 git）");
+        let init = test_git(&repo, &["init", "-q"]);
         assert!(init.status.success(), "git init 应成功");
-        let commit = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args([
+        let commit = test_git(
+            &repo,
+            &[
                 "-c",
                 "user.name=ys-test",
                 "-c",
@@ -799,9 +880,8 @@ mod tests {
                 "--allow-empty",
                 "-m",
                 "init",
-            ])
-            .output()
-            .unwrap();
+            ],
+        );
         assert!(commit.status.success(), "git commit 应成功");
 
         let path = path_for(&repo, "feat").unwrap();
@@ -815,12 +895,7 @@ mod tests {
         );
 
         // 建出该分支（不建树）⇒ 只有「分支已存在」这一条命中。
-        let create_branch = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["branch", "worktree-feat", "HEAD"])
-            .output()
-            .unwrap();
+        let create_branch = test_git(&repo, &["branch", "worktree-feat", "HEAD"]);
         assert!(create_branch.status.success(), "git branch 应成功");
 
         let by_branch = create_error_hint(&repo, "feat", "worktree-feat", &path);

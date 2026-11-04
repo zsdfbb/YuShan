@@ -75,10 +75,9 @@ pub trait Session: Send {
     /// ⚠️ **默认实现非原子** —— 它是 `clear()` + 逐条 `append()`，中途失败会留下被截断的 session。
     /// 要求原子性的实现**必须覆写**本方法（见 `JsonlSession`）。
     ///
-    /// 另外，对「`append` 每次全量重写整个文件」的实现（如 `JsonlSession`），默认实现会把整体替换
-    /// 退化成 **O(n²)**：`clear()` 一次全量写，其后 N 次 `append()` 又各写一遍整个文件 ——
-    /// 而整体替换恰恰出现在会话最大时（压缩场景），代价最高。覆写为「赋值一次 + 单次落盘」
-    /// 可把它降到一次写。
+    /// 另外，默认实现的代价是 **1 次 `clear()` + N 次 `append()`**，由各实现自己的
+    /// `append` 成本决定；要求「整体替换只落盘一次」或「原子」的实现必须覆写本方法
+    /// （`JsonlSession` 覆写为「赋值一次 + 单次 `flush_to_file`」）。
     async fn replace_all(&mut self, messages: Vec<Message>) -> Result<(), SessionError> {
         self.clear().await?;
         for m in messages {

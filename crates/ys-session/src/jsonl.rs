@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
 use ys_core::{ContentBlock, Role, ToolCallId};
 
@@ -14,6 +15,12 @@ pub struct JsonlSession {
     /// 会话级元数据，落盘于文件**首行**；缺省即无首行 meta。
     meta: Option<SessionMeta>,
     messages: Vec<Message>,
+    /// 已落盘的消息条数 —— `append` 的增量起点。
+    ///
+    /// 与 `messages.len()` 的差值就是尚未写进文件的尾巴。全量路径
+    /// （`clear` / `replace_all` / `open` 的修复落盘）成功后必须把它对齐到
+    /// `messages.len()`；`append` 成功后 +1。`set_meta` 不改 `messages`，全量写之后本就对齐。
+    persisted: usize,
     /// 打开文件时完成的修复记录；由 [`Session::take_recovery`] 一次性取走。
     recovery: Option<SessionRecovery>,
     /// 仅测试用：`flush_to_file` 的调用次数。用来断言 `replace_all` 只触发一次落盘
@@ -26,11 +33,19 @@ impl JsonlSession {
     /// 打开或创建 JSONL session 文件
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, SessionError> {
         let path = path.into();
-        let (meta, mut messages, skipped_lines) = if path.exists() {
+        let existed = path.exists();
+        let (meta, mut messages, skipped_lines) = if existed {
             Self::load_from_file(&path).await?
         } else {
             (None, Vec::new(), 0)
         };
+        // 末尾残行必须在构造 `Self` 之前截掉：`append` 只往文件尾部追加，残行留着会让
+        // 下一条消息接在它后面，两条消息缝成一行坏数据。
+        // 残行已由 `load_from_file` 计入 `skipped_lines`（它是被读出的坏行）；本函数只负责
+        // 把它从磁盘切掉，**不重复计数**。返回的字节数仅用于日志/诊断。
+        if existed {
+            let _ = Self::truncate_partial_tail(&path).await?;
+        }
         let repaired_tool_calls = repair_dangling_tool_calls(&mut messages);
         let normalized_tool_arguments = normalize_tool_arguments(&mut messages);
         let recovery = SessionRecovery {
@@ -38,10 +53,12 @@ impl JsonlSession {
             normalized_tool_arguments,
             skipped_lines,
         };
+        let persisted = messages.len();
         let session = Self {
             path,
             meta,
             messages,
+            persisted,
             recovery: (!recovery.is_empty()).then_some(recovery),
             #[cfg(test)]
             flush_count: std::sync::atomic::AtomicUsize::new(0),
@@ -52,6 +69,67 @@ impl JsonlSession {
             session.flush_to_file().await?;
         }
         Ok(session)
+    }
+
+    /// 截掉文件末尾**没有换行结尾**的残行，返回被截掉的字节数（`原长度 - keep`，
+    /// 未截断时为 `0`）。
+    ///
+    /// 一次写入可能只落下一行 JSON 的前缀（崩溃或短写），尾部于是留下既无 `\n` 也无法
+    /// 解析的残行。截断保留到最后一个 `\n` 为止；整份文件没有 `\n` ⇒ 截为空文件。
+    ///
+    /// 只在 `open` 里调用，且必须早于构造 `Self`：`append` 是纯追加，残行不清会让
+    /// 后续消息接在它后面。已读入内存的行不受影响 —— 本条只处理磁盘上的尾巴。
+    ///
+    /// 不整份读：先看末字节（常见路径是「文件以 `\n` 结尾」，读完 1 字节即返回），
+    /// 只有确实要找最后一个 `\n` 时才按块从尾部向前扫，命中即停。
+    async fn truncate_partial_tail(path: &Path) -> Result<u64, SessionError> {
+        const CHUNK: u64 = 8 * 1024;
+        let len = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| SessionError::Storage(format!("failed to stat session: {e}")))?
+            .len();
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|e| SessionError::Storage(format!("failed to open session: {e}")))?;
+        file.seek(SeekFrom::End(-1))
+            .await
+            .map_err(|e| SessionError::Storage(format!("failed to seek session: {e}")))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)
+            .await
+            .map_err(|e| SessionError::Storage(format!("failed to read session: {e}")))?;
+        if last[0] == b'\n' {
+            return Ok(0);
+        }
+        // `end` 是尚未扫描过的区域末端（开区间）。命中 `\n` ⇒ keep = 它之后的位置。
+        let mut end = len;
+        let keep = loop {
+            if end == 0 {
+                break 0;
+            }
+            let start = end.saturating_sub(CHUNK);
+            let mut buf = vec![0u8; (end - start) as usize];
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|e| SessionError::Storage(format!("failed to seek session: {e}")))?;
+            file.read_exact(&mut buf)
+                .await
+                .map_err(|e| SessionError::Storage(format!("failed to read session: {e}")))?;
+            if let Some(index) = buf.iter().rposition(|byte| *byte == b'\n') {
+                break start + index as u64 + 1;
+            }
+            end = start;
+        };
+        file.set_len(keep)
+            .await
+            .map_err(|e| SessionError::Storage(format!("failed to truncate session: {e}")))?;
+        Ok(len - keep)
     }
 
     /// 逐行判别：先按 `Message` 解析（绝大多数行），失败再按 `SessionMeta` 解析；
@@ -114,8 +192,9 @@ impl JsonlSession {
             let mut file = File::create(&tmp_path).await.map_err(|e| {
                 SessionError::Storage(format!("failed to create tmp session file: {e}"))
             })?;
-            // 先写 meta 行（若存在）：这是 C1「meta 永不因重写丢失」的唯一落点 ——
-            // append / clear / replace_all / set_meta 都经本函数，故不存在漏写路径。
+            // 先写 meta 行（若存在）。本函数是 meta 行的**唯一**写入实现 ——
+            // `set_meta` / `clear` / `replace_all` / `open` 的修复落盘都经它，故 meta 不会被某条路径漏写。
+            // `append` 是唯一不经过本函数的写入路径，它只追加消息行、完全不碰 meta。
             if let Some(meta) = &self.meta {
                 let line = serde_json::to_string(meta)
                     .map_err(|e| SessionError::Storage(format!("serialize meta failed: {e}")))?;
@@ -161,29 +240,72 @@ impl Session for JsonlSession {
 
     async fn set_meta(&mut self, meta: SessionMeta) -> Result<(), SessionError> {
         self.meta = Some(meta);
+        // `flush_to_file` 全量写 `messages`，而本方法不改变 `messages` ⇒ 它之前
+        // `persisted` 已等于 `messages.len()`，不需要再对齐。
         self.flush_to_file().await
     }
 
+    /// 只往文件尾部追加一行，不重写既有内容：代价与已落盘条数无关。
+    ///
+    /// 单次 `write_all` 写完整行（含 `\n`）：分开写会在 `O_APPEND` 下留下半行，
+    /// 崩溃后那条半行把下一次 append 串坏。
+    ///
+    /// 必须带 `.create(true)` —— `open` 从不创建文件，全新会话的第一次 append 时
+    /// 文件还不存在。
     async fn append(&mut self, message: Message) -> Result<(), SessionError> {
         self.messages.push(message);
-        self.flush_to_file().await
+        // `persisted` 只由本类型维护，正常路径下恒 `<= messages.len()`。若曾出现越界
+        // （全量路径漏对齐、或写成功但计数前中断），退化为「从当前尾部重新对齐」——
+        // 宁可多写一行也不要把消息静默留在内存里，更不要索引越界崩掉整个会话。
+        if self.persisted >= self.messages.len() {
+            debug_assert!(
+                false,
+                "persisted={} 越界 (len={})",
+                self.persisted,
+                self.messages.len()
+            );
+            self.persisted = self.messages.len() - 1;
+        }
+        let line = serde_json::to_string(&self.messages[self.persisted])
+            .map_err(|e| SessionError::Storage(format!("serialize failed: {e}")))?;
+        // 单次 write_all 写完整行：O_APPEND 下分两次写会留下半行，
+        // 崩溃后那条半行会污染下一次 append。
+        let mut buf = line.into_bytes();
+        buf.push(b'\n');
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)
+            .await
+            .map_err(|e| SessionError::Storage(format!("failed to open session: {e}")))?;
+        file.write_all(&buf)
+            .await
+            .map_err(|e| SessionError::Storage(format!("write failed: {e}")))?;
+        file.flush()
+            .await
+            .map_err(|e| SessionError::Storage(format!("flush failed: {e}")))?;
+        self.persisted += 1;
+        Ok(())
     }
 
     async fn clear(&mut self) -> Result<(), SessionError> {
         self.messages.clear();
-        self.flush_to_file().await
+        self.flush_to_file().await?;
+        self.persisted = 0;
+        Ok(())
     }
 
     /// 覆写默认实现：**赋值一次 + 单次落盘**，而不是 `clear()` + N 次 `append()`。
     ///
     /// 必要性有二：
-    /// 1. 默认实现对本类型是 **O(n²)** —— `append` 每次都全量重写整个文件，
-    ///    而压缩场景恰逢会话最大时，整体替换的代价最高；
-    /// 2. 默认实现**非原子** —— `clear()` 成功后某个 `append()` 失败会留下被截断的 session。
-    ///    这里复用 `flush_to_file()`（tmp + rename）的原子路径，中途失败不落盘。
+    /// 1. 默认实现**非原子** —— `clear()` 成功后某个 `append()` 失败会留下被截断的 session。
+    ///    这里复用 `flush_to_file()`（tmp + rename）的原子路径，中途失败不落盘；
+    /// 2. `flush_to_file` 是 meta 行的**唯一**写入实现，整体替换必须经它，meta 才不会丢。
     async fn replace_all(&mut self, messages: Vec<Message>) -> Result<(), SessionError> {
         self.messages = messages;
-        self.flush_to_file().await
+        self.flush_to_file().await?;
+        self.persisted = self.messages.len();
+        Ok(())
     }
 }
 
@@ -315,6 +437,15 @@ mod tests {
             role,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
+    }
+
+    /// 文件当前字节数（从内容读出）。
+    ///
+    /// 不用 `metadata().len()`：本机上刚 `append` 完就去 stat，size 会滞后一步（读到的
+    /// 内容已是新长度，metadata 还报旧值，连新开 fd 的 `fstat` 也会滞后），断言会随机变红。
+    /// 读出的字节数则是实时的。
+    async fn file_len(path: &Path) -> u64 {
+        tokio::fs::read(path).await.unwrap().len() as u64
     }
 
     fn tool_use_msg(calls: &[(&str, &str)]) -> Message {
@@ -510,7 +641,9 @@ mod tests {
                 .unwrap();
         }
         let before = session.flush_count.load(Ordering::SeqCst);
-        assert_eq!(before, 3, "3 次 append 各落盘一次");
+        // append 是纯追加，不经 flush_to_file —— 增量写入的断言见
+        // `append_writes_only_new_line_bytes`，那里才校验「每次都写了新行」。
+        assert_eq!(before, 0, "append 不走 flush_to_file，故一次都不该计数");
 
         session
             .replace_all(vec![
@@ -905,5 +1038,335 @@ mod tests {
             value.get("type").is_none(),
             "Message 不得带 type 键，否则 meta 判别不再安全：{value}"
         );
+    }
+
+    /// append 只往文件尾追加新行，不重写既有内容。
+    ///
+    /// 断言：文件长度增量 == 该行序列化长度 + 1（换行），且文件尾部就是这行字节。
+    ///
+    /// 变异：若 append 退回全量重写，增量会等于「两行的总长度」⇒ 断言红。
+    #[tokio::test]
+    async fn append_writes_only_new_line_bytes() {
+        let path = temp_path("append_incremental");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        let first = text_msg(Role::User, "first");
+        session.append(first.clone()).await.unwrap();
+        let baseline = file_len(&path).await;
+        let before_body = tokio::fs::read_to_string(&path).await.unwrap();
+
+        let second = text_msg(Role::Assistant, "second");
+        let second_line = serde_json::to_string(&second).unwrap();
+        let expected_delta = second_line.len() as u64 + 1;
+        session.append(second).await.unwrap();
+
+        let grown = file_len(&path).await;
+        assert_eq!(
+            grown - baseline,
+            expected_delta,
+            "增量必须只等于新行的字节数，否则说明既有内容被重写"
+        );
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            body,
+            format!("{before_body}{second_line}\n"),
+            "既有内容必须原样在前，新行紧随其后"
+        );
+        assert!(
+            body.ends_with(&format!("{second_line}\n")),
+            "文件尾部必须就是新行：{body}"
+        );
+        assert!(
+            body.starts_with(&serde_json::to_string(&first).unwrap()),
+            "首行内容必须原样保留：{body}"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// append 不经 flush_to_file：flush_count 在多次 append 前后不变。
+    ///
+    /// 变异：若 append 走 flush_to_file（全量重写），计数被 +3 ⇒ 断言红。
+    #[tokio::test]
+    async fn append_does_not_flush() {
+        let path = temp_path("append_no_flush");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        let before = session.flush_count.load(Ordering::SeqCst);
+        assert_eq!(before, 0, "新建会话尚未有任何一次落盘");
+
+        for i in 0..3 {
+            session
+                .append(text_msg(Role::User, &format!("m{i}")))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            session.flush_count.load(Ordering::SeqCst),
+            before,
+            "append 是纯追加，不得触发 flush_to_file"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// set_meta 落盘后不得丢掉既有消息；重开后 meta 与消息双双还原。
+    ///
+    /// 变异：若 set_meta 只写 meta 行、不清写/保留消息 ⇒ 重开消息数变少，断言红。
+    #[tokio::test]
+    async fn set_meta_keeps_meta_and_messages() {
+        let path = temp_path("set_meta_keeps");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let meta = SessionMeta {
+            title: Some("mid-session meta".into()),
+            turns: 2,
+            ..Default::default()
+        };
+
+        let expected = vec![
+            text_msg(Role::User, "m0"),
+            text_msg(Role::Assistant, "m1"),
+            text_msg(Role::User, "m2"),
+        ];
+        {
+            let mut session = JsonlSession::open(&path).await.unwrap();
+            for msg in &expected {
+                session.append(msg.clone()).await.unwrap();
+            }
+            session.set_meta(meta.clone()).await.unwrap();
+        }
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(reopened.meta(), Some(&meta), "meta 字段必须逐项还原");
+        assert_eq!(
+            reopened.messages(),
+            expected.as_slice(),
+            "消息既不能丢也不能乱序"
+        );
+        assert!(reopened.recovery.is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 末尾残行只计一次 `skipped_lines`，且 `open` 必须把它从磁盘切掉。
+    ///
+    /// 变异：截断也计数 ⇒ `skipped_lines` 变 2；不截断 ⇒ 文件不以 `\n` 结尾，
+    /// 且后续 append 会与残行粘连。
+    #[tokio::test]
+    async fn open_skips_truncated_tail_line() {
+        let path = temp_path("truncated_tail");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let msg = text_msg(Role::User, "complete");
+        let mut body = serde_json::to_string(&msg).unwrap();
+        body.push('\n');
+        body.push_str("{\"role\":\"User\",\"content\":[");
+        tokio::fs::write(&path, body.as_bytes()).await.unwrap();
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(session.messages(), std::slice::from_ref(&msg));
+        let recovery = session.take_recovery().expect("残行必须计入修复摘要");
+        assert_eq!(recovery.skipped_lines, 1, "残行只计一次，不得重复计数");
+        assert_eq!(recovery.repaired_tool_calls, 0);
+        assert_eq!(recovery.normalized_tool_arguments, 0);
+
+        let after_truncate = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(
+            after_truncate.last(),
+            Some(&b'\n'),
+            "open 必须把残行截到最后一个换行为止"
+        );
+
+        session
+            .append(text_msg(Role::Assistant, "next"))
+            .await
+            .unwrap();
+        drop(session);
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.messages().len(),
+            2,
+            "残行截断后新消息应成为独立一行"
+        );
+        assert!(reopened.recovery.is_none(), "截断后不应再有残行可计");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 多条 append 中间夹一次 set_meta：重开后消息条数与顺序都不变。
+    ///
+    /// 变异：若 set_meta 或 append 的 `persisted` 对齐错位 ⇒ 重开条数不对。
+    #[tokio::test]
+    async fn reopen_after_multi_append_counts_messages() {
+        let path = temp_path("multi_append");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let expected = vec![
+            text_msg(Role::User, "m0"),
+            text_msg(Role::Assistant, "m1"),
+            text_msg(Role::User, "m2"),
+            text_msg(Role::Assistant, "m3"),
+            text_msg(Role::User, "m4"),
+        ];
+        {
+            let mut session = JsonlSession::open(&path).await.unwrap();
+            session.append(expected[0].clone()).await.unwrap();
+            session.append(expected[1].clone()).await.unwrap();
+            session.set_meta(SessionMeta::default()).await.unwrap();
+            for msg in &expected[2..] {
+                session.append(msg.clone()).await.unwrap();
+            }
+        }
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(reopened.messages().len(), 5);
+        assert_eq!(
+            reopened.messages(),
+            expected.as_slice(),
+            "顺序必须与追加顺序一致"
+        );
+        assert!(reopened.meta().is_some());
+        assert!(reopened.recovery.is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// meta 不因 `replace_all(vec![])` 丢失：清空消息后文件仍有 meta 行。
+    ///
+    /// 变异：若 `replace_all` 绕开 `flush_to_file` 自己写文件、不写 meta ⇒ 文件为空，断言红。
+    #[tokio::test]
+    async fn replace_all_without_prior_meta_keeps_meta() {
+        let path = temp_path("replace_keeps_meta");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let meta = SessionMeta::new(11);
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        // 先写 meta 再测：从未有过 meta 的会话清空后本就该是空文件。
+        session.set_meta(meta.clone()).await.unwrap();
+        session.append(text_msg(Role::User, "a")).await.unwrap();
+        session
+            .append(text_msg(Role::Assistant, "b"))
+            .await
+            .unwrap();
+
+        session.replace_all(Vec::new()).await.unwrap();
+        assert!(session.messages().is_empty());
+
+        let len = file_len(&path).await;
+        assert!(len > 0, "meta 行必须留在文件里，清空消息不等于清空文件");
+        drop(session);
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(reopened.meta(), Some(&meta));
+        assert!(reopened.messages().is_empty());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// `replace_all` 之后 append 必须落在文件尾部，且不重复写已有行。
+    ///
+    /// 变异：若 `replace_all` 忘记把 `persisted` 对齐到 `messages.len()`，append 会
+    /// 重复写 `"new"` 或跳过本次消息 ⇒ 重开条数/内容断言红。
+    #[tokio::test]
+    async fn append_after_replace_all_lands_at_end() {
+        let path = temp_path("append_after_replace");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        session.append(text_msg(Role::User, "old0")).await.unwrap();
+        session
+            .append(text_msg(Role::Assistant, "old1"))
+            .await
+            .unwrap();
+        session
+            .replace_all(vec![text_msg(Role::User, "new")])
+            .await
+            .unwrap();
+        session
+            .append(text_msg(Role::Assistant, "tail"))
+            .await
+            .unwrap();
+        drop(session);
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(reopened.messages().len(), 2);
+        assert_eq!(
+            reopened.messages(),
+            [
+                text_msg(Role::User, "new"),
+                text_msg(Role::Assistant, "tail")
+            ]
+        );
+        assert!(reopened.recovery.is_none());
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 首次 append 自己创建文件：`open` 从不创建，`.create(true)` 缺一不可。
+    ///
+    /// 变异：`OpenOptions` 去掉 `.create(true)` ⇒ append 返回 `Err` ⇒ 断言红。
+    #[tokio::test]
+    async fn first_append_creates_file() {
+        let path = temp_path("first_append_creates");
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists(), "前置条件：文件尚不存在");
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        assert!(!path.exists(), "open 不得创建文件");
+        let msg = text_msg(Role::User, "first ever");
+        session.append(msg.clone()).await.unwrap();
+        drop(session);
+
+        assert!(path.exists(), "第一次 append 必须创建文件");
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            body,
+            format!("{}\n", serde_json::to_string(&msg).unwrap()),
+            "文件内容应恰为该行加换行"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// 残行被截掉后 append 不与它粘连：重开仍是两条独立消息。
+    ///
+    /// 变异：去掉 `open` 的尾行截断 ⇒ 半行与 `"after"` 缝成一行坏数据，重开只剩 1 条。
+    #[tokio::test]
+    async fn append_after_truncated_tail_does_not_merge() {
+        let path = temp_path("truncated_tail_append");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let kept = text_msg(Role::User, "kept");
+        let mut body = serde_json::to_string(&kept).unwrap();
+        body.push('\n');
+        body.push_str("{\"broken\":");
+        tokio::fs::write(&path, body.as_bytes()).await.unwrap();
+
+        let mut session = JsonlSession::open(&path).await.unwrap();
+        session
+            .append(text_msg(Role::Assistant, "after"))
+            .await
+            .unwrap();
+        drop(session);
+
+        let reopened = JsonlSession::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.messages().len(),
+            2,
+            "残行若未截断，半行会与新消息粘连成一行坏数据"
+        );
+        assert_eq!(
+            reopened.messages(),
+            [kept, text_msg(Role::Assistant, "after")]
+        );
+        assert!(reopened.recovery.is_none(), "截断后重开不应再报残行");
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

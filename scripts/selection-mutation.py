@@ -96,9 +96,15 @@ MUTATIONS = [
         6,
         "Resize 不清选区",
         EV,
-        "        Event::Resize(_, _) => app.selection.clear(),",
-        "        Event::Resize(_, _) => {}",
-        "v9_resize_clears_selection",
+        # resize 后 wrap 行数全变 ⇒ 全局视觉行号空间作废、输入框拖选的滚动偏移冻结值
+        # 也是旧宽度算的，故两处状态一并清掉。锚点必须覆盖**整个分支体**：只匹配头行
+        # 会在分支体增长时静默失效（锚点未命中 = 脚本对这段代码不再有防护力）。
+        # 变异体用 `let _ = (&app.selection, app.input_drag);` 而非注释 —— 它必靠两处状态
+        # 保持可编译（否则「编译失败」会掩盖「测试抓不到」）。
+        "            app.selection.clear();\n"
+        "            app.input_drag = None;\n",
+        "            let _ = (&app.selection, app.input_drag);",
+        ("v9_resize_clears_selection", "v9_resize_clears_input_drag_too"),
         EV_TESTS,
     ),
     (

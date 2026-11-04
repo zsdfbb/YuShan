@@ -4122,6 +4122,49 @@ mod tests {
         );
     }
 
+    /// resize 也必须作废**输入框拖选中**的状态（`input_drag`）。
+    ///
+    /// 与上面那条分开的原因：它们恰是两套坐标空间。输入框的 char 索引选区不依赖宽度，
+    /// 但 [`App::input_drag`] 存的是**旧宽度**算出的滚动偏移冻结值，resize 后与新的
+    /// 命中映射对不上 ⇒ 错位。只清 `selection` 不够。
+    ///
+    /// 变异：`Event::Resize` 分支删掉 `app.input_drag = None;`（只清 `selection`）⇒ 本用例红。
+    #[test]
+    fn v9_resize_clears_input_drag_too() {
+        let ch = channels();
+        let (w, h) = (120u16, 40u16);
+        let mut a = app();
+        a.input.insert_str("abcdef");
+        a.input.cursor = 0;
+        a.input.anchor = None;
+
+        // 只按下 + 拖，**不松手** —— 留在拖选中，`input_drag` 仍置位。
+        let inner = input_inner(&a, w, h);
+        let y = inner.y;
+        handle_mouse(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), inner.x, y),
+            &mut a,
+            w,
+            h,
+        );
+        handle_mouse(
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), inner.x + 3, y),
+            &mut a,
+            w,
+            h,
+        );
+        assert!(
+            a.input_drag.is_some(),
+            "前置：拖选中应冻结滚动偏移"
+        );
+
+        handle_event(Event::Resize(80, 24), &mut a, &ch.req_tx, &ch.bnd_tx, w, h);
+        assert!(
+            a.input_drag.is_none(),
+            "resize 必须作废拖选冻结的偏移（旧宽度算的，与新的命中映射对不上）"
+        );
+    }
+
     /// 用户主动滚动清选区：`ScrollUp` / `PageUp` 都要清。
     ///
     /// 与 `drag_tick` 的自动滚动形成对照（后者**不得**清，否则拖到边缘自我取消）。

@@ -15,13 +15,16 @@
 //!
 //! ```text
 //! loop {
-//!   draw
 //!   排空 rx_out（try_recv，非阻塞）
-//!   poll(50ms) → 按键 / 粘贴
 //!   300ms 节拍 → Working 动画前进（仅 turn 中）
+//!   frame_due（脏标记 / 状态行秒数变化）→ 夹取滚动 + draw
+//!   poll(50ms) → 按键 / 粘贴（只置脏，下一轮开头画）
 //!   should_quit / app 线程消失 → 退出
 //! }
 //! ```
+//!
+//! 没有状态变化时**不画帧** —— 空闲时只剩 1 Hz 的状态行刷新与 50 ms 一次的
+//! `poll`，不再以 20 fps 无条件重绘。
 //!
 //! 退出**无条件**恢复终端：把完整对话按当前宽度 wrap 后逐行写回主屏 scrollback，
 //! 再离开 alt-screen（pi 语义 —— 退出后对话仍在终端历史里可翻）。
@@ -58,12 +61,60 @@ use crate::transcript::TranscriptLine;
 use crate::view::CodingView;
 use crate::{draw, events, selection};
 
-/// 等输入的时长上限（空闲重绘节拍）。
+/// 等输入的上限。主循环只在帧到期时画；模态浮层仍按此周期重绘。
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 拖选贴边时的轮询周期 —— 自动滚动要跟手，故比空闲节拍短。
 const DRAG_TICK: Duration = Duration::from_millis(16);
 /// Working 动画节拍。
 const TICK_INTERVAL: Duration = Duration::from_millis(300);
+
+/// 按需重绘的帧调度：只有「该画了」才让 [`event_loop`] 画一帧。
+///
+/// 状态行含 `HH:MM` 与会话时长，**秒数变化本身**就是一帧到期的理由；其余更新
+/// （输入、流式输出、滚动、拖选…）由调用方显式 [`Self::mark`]。
+struct FrameSchedule {
+    dirty: bool,
+    last_status_second: u64,
+}
+
+impl FrameSchedule {
+    /// 新建即脏 —— 保证启动后第一帧必定画出。
+    fn new(now_secs: u64) -> Self {
+        Self {
+            dirty: true,
+            last_status_second: now_secs,
+        }
+    }
+
+    /// 标记「有一处状态变了，下一轮必须重画」。
+    fn mark(&mut self) {
+        self.dirty = true;
+    }
+
+    /// 是否到期该画一帧。
+    ///
+    /// 状态行有 `HH:MM` 与会话秒数，1 Hz 足够。秒数变化本身也会让帧到期。
+    ///
+    /// 变异：恒返回 `true` ⇒ 回到空闲 20 fps 无条件重绘；去掉秒数比较 ⇒
+    /// 时钟 / 会话时长在屏幕上停住不走。
+    fn frame_due(&mut self, now_secs: u64) -> bool {
+        if now_secs != self.last_status_second {
+            self.last_status_second = now_secs;
+            self.dirty = true;
+        }
+        let due = self.dirty;
+        self.dirty = false;
+        due
+    }
+}
+
+/// 当前墙钟秒数 —— 状态行 `HH:MM` / 会话时长的刷新判据。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// 本轮的等输入时长：拖到内区边缘时用 [`DRAG_TICK`]（16 ms），否则用 [`POLL_INTERVAL`]。
 ///
@@ -126,6 +177,7 @@ pub fn run(
     // 都不会再经过那条正常恢复路径。
     install_panic_hook();
     let mut terminal = setup_terminal()?;
+    spawn_tty_hangup_watchdog();
     let mut app = App::new(view);
 
     let result = event_loop(&mut terminal, &mut app, outbound, &requests, &boundaries);
@@ -348,16 +400,20 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
 ) -> Result<(), TuiError> {
     let mut outbound_open = true;
     let mut last_tick = Instant::now();
+    let mut frames = FrameSchedule::new(now_secs());
 
     loop {
+        // 尺寸每轮重取：事件命中测试与滚动夹取都用它；窗口缩放后 wrap 行数会变。
         let size = terminal.size()?;
-        terminal.draw(|frame| draw::ui(frame, app))?;
 
         // 1) 排空 Outbound（非阻塞）—— 单一出站写者，事件/视图/输出保序
         if outbound_open {
             loop {
                 match outbound.try_recv() {
-                    Ok(out) => app.apply_outbound(out),
+                    Ok(out) => {
+                        app.apply_outbound(out);
+                        frames.mark();
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         outbound_open = false;
@@ -379,12 +435,47 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                 &mut outbound_open,
                 requests,
             );
+            // 浮层关闭后底衬要回到主界面。
+            frames.mark();
         }
 
-        // 2) 等输入，最多 poll 周期。拖选贴边时缩短周期 —— 自动滚动靠它驱动。
-        if crossterm::event::poll(poll_interval(
-            app.selection.is_dragging() && app.selection.edge() != 0,
-        ))? {
+        // 2) 状态行提示过期 / Working 动画节拍（只在 turn 中有意义）
+        //
+        // 状态行提示的过期也挂在这里：它是屏幕上**唯一**的时间驱动文字（除 Working
+        // 动画），且两者共用同一个判定周期。不在 turn 中也必须跑 —— `已复制` 几乎
+        // 总是发生在空闲时。
+        let had_status_note = app.status_note.is_some();
+        app.expire_status_note();
+        if had_status_note && app.status_note.is_none() {
+            frames.mark();
+        }
+        if app.is_turning && last_tick.elapsed() >= TICK_INTERVAL {
+            app.tick_working();
+            last_tick = Instant::now();
+            frames.mark();
+        }
+
+        // 贴边拖选靠「每轮醒来推自动滚动」驱动，帧必须每轮跟随。先 mark 再结算，
+        // 保证本轮 `frame_due` 一定为真。
+        let edge_dragging = app.selection.is_dragging() && app.selection.edge() != 0;
+        if edge_dragging {
+            frames.mark();
+        }
+
+        // 3) 先结算帧到期（含状态行秒数变化）：到期才夹取滚动并画。
+        //
+        // 顺序：`drag_tick` 会重算 `top_row`，`compute_max_scroll` 依赖它夹取，
+        // 两者都必须在 draw **之前**。放在 poll 之前 ⇒ outbound 的新内容与启动
+        // 首帧都不必多等一次 poll 周期。
+        if frames.frame_due(now_secs()) {
+            selection::drag_tick(app, size.width, size.height, Instant::now());
+            app.compute_max_scroll(size.width, size.height);
+            terminal.draw(|frame| draw::ui(frame, app))?;
+        }
+
+        // 4) 等输入，最多 poll 周期。拖选贴边时缩短周期 —— 自动滚动靠它驱动。
+        //    事件只置脏、不画：下一轮开头会立刻画出来，不必再等一次 poll。
+        if crossterm::event::poll(poll_interval(edge_dragging))? {
             let event = crossterm::event::read()?;
             // 两类高频事件各自合批，其余事件直接交给 `handle_round`：
             //
@@ -466,6 +557,8 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                     &mut read_system_clipboard,
                 ),
             }
+            // 任何 crossterm 事件（含被推迟消费的异类事件）都可能改状态 ⇒ 必须重画。
+            frames.mark();
             // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
             // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
             if let Some(kind) = app.pending_prompt.take() {
@@ -477,26 +570,11 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
                     &mut outbound_open,
                     requests,
                 );
+                frames.mark();
             }
         }
 
-        // 3) Working 动画节拍（只在 turn 中有意义）
-        //
-        // 状态行提示的过期也挂在这里：它是屏幕上**唯一**的时间驱动文字（除 Working
-        // 动画），且两者共用同一个判定周期。不在 turn 中也必须跑 —— `已复制` 几乎
-        // 总是发生在空闲时。
-        app.expire_status_note();
-        if app.is_turning && last_tick.elapsed() >= TICK_INTERVAL {
-            app.tick_working();
-            last_tick = Instant::now();
-        }
-
-        // 滚动位置按当前尺寸重新夹紧（窗口缩放后 wrap 行数会变）——
-        // 必须在 `compute_max_scroll` **之前**跑自动滚动：它会重算 `top_row`，
-        // 而 `drag_tick` 的 `cursor_row` 依赖新的 `top_row`。
-        selection::drag_tick(app, size.width, size.height, Instant::now());
-        app.compute_max_scroll(size.width, size.height);
-
+        // 5) 退出判据
         if app.should_quit {
             break;
         }
@@ -1244,6 +1322,103 @@ fn restore_terminal_on_panic() {
     // 绘制中途 panic 时光标可能仍处于隐藏状态，恢复回显。
     let _ = execute!(out, Show);
 }
+
+/// 终端挂断判定：`POLLHUP` / `POLLERR` / `POLLNVAL` 任一置位即视为终端已消失。
+///
+/// 抽成纯函数以便单测 —— 看守线程本身依赖真 tty，无法在测试里启动。
+#[cfg(unix)]
+fn tty_hung_up(revents: libc::c_short) -> bool {
+    (revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
+/// 选一个与 crossterm 读取的终端等价的 fd 供看守线程 poll。
+///
+/// crossterm 0.29 的 `tty_fd()` 规则是「stdin 是 tty 就用 stdin，否则另开
+/// `/dev/tty`」。看守线程必须盯住**同一终端**：盯 fd 0 会因为「已关闭写端的管道
+/// stdin」误判挂断（假阳性），也看不到 crossterm 在 `/dev/tty` 上的真实挂断（假阴性）。
+///
+/// 但 Darwin 的 `poll(2)` 对**新打开**的 `/dev/tty` fd 恒报 `POLLNVAL`（实测：
+/// C / Python / Rust 三方一致；`select(2)` 与 `poll` 一个已存在的 tty fd 则正常）。
+/// 因此这里优先 dup 一个已经打开的 tty 描述符（0 → 1 → 2），它们与 `/dev/tty`
+/// 指向同一终端，且 `poll` 能正常上报 `POLLHUP`。三者都不是 tty 时没有可可靠
+/// 看守的终端，返回 `None` 不启动线程 —— 打开 `/dev/tty` 只会立刻误报挂断。
+#[cfg(unix)]
+fn hangup_watch_fd() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    for fd in [0, 1, 2] {
+        // SAFETY: isatty 只读该 fd 的类型信息。
+        if unsafe { libc::isatty(fd) } != 1 {
+            continue;
+        }
+        // 用 `F_DUPFD_CLOEXEC` 而不是 `dup`：看守 fd 会活到进程结束，普通 `dup`
+        // 不带 `FD_CLOEXEC`，会被之后启动的所有工具 / 后台命令子进程继承。
+        // SAFETY: `F_DUPFD_CLOEXEC` 成功返回一个新的有效 fd，且带 `FD_CLOEXEC`；
+        // 所有权交给 `OwnedFd`。
+        let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if raw < 0 {
+            return None;
+        }
+        return Some(unsafe { OwnedFd::from_raw_fd(raw) });
+    }
+    None
+}
+
+/// 终端挂断看守线程。
+///
+/// 终端消失后 stdin 的 `read(2)` 立即返回 EOF/EIO，而 crossterm 0.29 的
+/// `UnixInternalEventSource::try_read` 在内层循环里不 break ⇒ `poll` 永不返回、
+/// 主线程 100% CPU 自旋。主线程卡在 crossterm 内部无法自救，故由本线程用
+/// `libc::poll` 独立盯住与 crossterm 读取的终端等价的 tty fd（见
+/// [`hangup_watch_fd`]）：一旦挂断就恢复终端并退出进程。
+///
+/// 不用 `SIGHUP`：本例是孤儿进程组，收不到该信号。
+#[cfg(unix)]
+fn spawn_tty_hangup_watchdog() {
+    let Some(watch) = hangup_watch_fd() else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("yushan-tty-watchdog".into())
+        .spawn(move || loop {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&watch);
+            let mut pfd = libc::pollfd {
+                fd,
+                // 必须请求 `POLLIN`：Darwin 的 `poll(2)` 在未请求 `POLLIN` 时
+                // **不会**上报 `POLLHUP`（实测：pty 关闭 master / pipe 关闭写端，
+                // `events = 0` 只超时返回 0，`events = POLLIN` 才返回
+                // `POLLIN | POLLHUP`）。本仓主平台是 macOS，以实测为准。
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` 指向本栈上有效的 `pollfd`，`nfds = 1`，超时 1000ms。
+            let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            if n < 0 {
+                // EINTR 直接重试；其余持续性错误（EINVAL / ENOMEM…）限速，
+                // 否则会退化成 100% 自旋。
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+            if n > 0 {
+                if tty_hung_up(pfd.revents) {
+                    // 终端已消失：恢复是 best-effort（写向死 tty 无害），然后退出。
+                    restore_terminal_on_panic();
+                    std::process::exit(0);
+                }
+                // 普通输入（`POLLIN`）醒来：本线程不读 stdin，不能立即重试 —— 否则
+                // 输入突发 / 粘贴 / 鼠标事件期间会空转。睡 50ms 把唤醒上限压到
+                // 20 次/秒，成本可忽略；挂断仍由下一次 poll 的 `POLLHUP` 捕获
+                // （最坏多等 50ms）。
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+}
+
+/// 非 unix 平台没有这个故障模式（本仓只支持 Linux/macOS，保留空实现保证可编译）。
+#[cfg(not(unix))]
+fn spawn_tty_hangup_watchdog() {}
 
 /// 模态选择器里 ↑↓ 的落点（回卷；空列表原地不动）。
 ///
@@ -2257,5 +2432,92 @@ mod tests {
             restored_before_delegate.load(Ordering::SeqCst),
             "恢复必须发生在 delegate 之前"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 按需重绘：空闲时不得以 20 fps 无条件画帧
+    // -----------------------------------------------------------------------
+
+    /// 新建后第一帧必定到期（否则启动后屏幕一片空白，直到用户按键）。
+    ///
+    /// 变异：`FrameSchedule::new` 里 `dirty: false` ⇒ 本用例红。
+    #[test]
+    fn test_frame_schedule_first_frame_is_due() {
+        let mut sched = FrameSchedule::new(1000);
+        assert!(sched.frame_due(1000), "启动后第一帧必须画");
+    }
+
+    /// **空闲不重绘的核心断言**：同一秒内没有 `mark` ⇒ 后续调用都不画帧。
+    ///
+    /// 变异：`frame_due` 恒返回 `true` ⇒ 回到每轮循环（约 20 fps）无条件重绘，
+    /// 这正是本 bug 的形态。
+    #[test]
+    fn test_frame_schedule_idle_same_second_is_not_due() {
+        let mut sched = FrameSchedule::new(1000);
+        assert!(sched.frame_due(1000), "首帧");
+        for _ in 0..20 {
+            assert!(
+                !sched.frame_due(1000),
+                "同一秒内无状态变化时不得重绘"
+            );
+        }
+    }
+
+    /// `mark` 后下一轮必须重画（输入 / 流式输出 / 滚动…都靠它）。
+    ///
+    /// 变异：`mark` 不置 `dirty` ⇒ 本用例红（用户按键后屏幕没有反应）。
+    #[test]
+    fn test_frame_schedule_mark_forces_draw() {
+        let mut sched = FrameSchedule::new(1000);
+        assert!(sched.frame_due(1000), "首帧");
+        assert!(!sched.frame_due(1000), "空闲");
+        sched.mark();
+        assert!(sched.frame_due(1000), "mark 后必须重画");
+        assert!(!sched.frame_due(1000), "画完即清，回到空闲");
+    }
+
+    /// 秒数变化本身到期 —— 状态行的 `HH:MM` 与会话秒数靠它刷新。
+    ///
+    /// 变异：去掉 `now_secs != last_status_second` 比较 ⇒ 时钟 / 耗时不走 ⇒ 红。
+    #[test]
+    fn test_frame_schedule_second_change_is_due() {
+        let mut sched = FrameSchedule::new(1000);
+        assert!(sched.frame_due(1000), "首帧");
+        assert!(!sched.frame_due(1000), "同一秒");
+        assert!(sched.frame_due(1001), "秒数变化必须刷新");
+        assert!(!sched.frame_due(1001), "新的一秒内回到空闲");
+    }
+
+    // -----------------------------------------------------------------------
+    // 终端挂断判定
+    // -----------------------------------------------------------------------
+
+    /// `POLLHUP` / `POLLERR` / `POLLNVAL` 任一置位 ⇒ 终端已消失。
+    ///
+    /// 实测（Darwin）：pty 关闭 master / pipe 关闭写端时返回的是
+    /// `POLLIN | POLLHUP`，`POLLHUP` 是主信号；`POLLNVAL` 只在 fd 无效 / 已关闭
+    /// 时出现。三者都要判，缺一不可。
+    ///
+    /// 变异：只判 `POLLHUP` ⇒ `POLLERR` / `POLLNVAL` 两条断言红。
+    #[cfg(unix)]
+    #[test]
+    fn test_tty_hung_up_detects_hangup_flags() {
+        assert!(tty_hung_up(libc::POLLHUP));
+        assert!(tty_hung_up(libc::POLLERR));
+        assert!(tty_hung_up(libc::POLLNVAL));
+        assert!(
+            tty_hung_up(libc::POLLHUP | libc::POLLIN),
+            "挂断可与可读同时置位"
+        );
+    }
+
+    /// 正常可读 / 无事件 ⇒ 不挂断（不得误杀仍在工作的终端）。
+    ///
+    /// 变异：把判定改成恒 `true` 或误判 `POLLIN` ⇒ 本用例红。
+    #[cfg(unix)]
+    #[test]
+    fn test_tty_hung_up_ignores_normal_events() {
+        assert!(!tty_hung_up(0), "无事件不是挂断");
+        assert!(!tty_hung_up(libc::POLLIN), "可读不是挂断");
     }
 }

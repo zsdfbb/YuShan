@@ -53,10 +53,14 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 ```
 ┌─ UI 线程（普通 fn，无 runtime）────────────────────────────────┐
 │  ys_tui_coding::run(view₀, rx_out, tx_req, tx_boundary)        │
+│  spawn_tty_hangup_watchdog（unix）                                │
+│    从 0/1/2 取首个 isatty fd，F_DUPFD_CLOEXEC 后 poll(POLLIN, 1s）│
+│    挂断（HUP/ERR/NVAL）⇒ 恢复终端 + exit(0)                     │
 │  loop {                                                         │
-│    draw(三 pane)                                                │
 │    排空 rx_out（try_recv，非阻塞）→ 更新 transcript / view       │
-│    poll(50ms) → 按键 / bracketed paste                          │
+│      变化 ⇒ 置脏（出站 / 按键 / 浮层 / tick / 提示 / 贴边拖选）  │
+│    frame_due（脏或状态行秒数变化）→ 夹取滚动 + draw（1Hz 刷钟）  │
+│    poll(50ms) → 按键 / bracketed paste（只置脏，下一轮开头画）   │
 │    300ms 节拍 → Working 动画（仅 turn 中）                       │
 │    提交输入 → tx_req.blocking_send(Request)                     │
 │    中途插话 / Ctrl+C → tx_boundary.blocking_send(Boundary)       │
@@ -88,6 +92,10 @@ ys-protocol ──► ys-tui-coding ──► apps/coding-agent
 │  }                                                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+主循环**按需重绘**：没有状态变化就不画帧，空闲时不再 20 fps 无条件重绘，只剩
+50 ms 一次的 `poll` 与 1 Hz 的状态行（`HH:MM` / 会话秒数）刷新。终端挂断由
+`#[cfg(unix)]` 看守线程独立监测（见 ADR-0069）。
 
 | 信道 | 类型 | 方向 | 目的地 / 消费时机 | 容量 |
 |---|---|---|---|---|

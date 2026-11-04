@@ -126,7 +126,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     subgraph UI["UI 线程 · 普通同步 fn，无 runtime"]
-        UIRUN["ys_tui_coding::run(view₀, rx_out, tx_req, tx_boundary)<br/>draw 三 pane · try_recv 排空出站<br/>poll(50ms) 键鼠 · 300ms 节拍"]
+        UIRUN["ys_tui_coding::run(view₀, rx_out, tx_req, tx_boundary)<br/>按需 draw · try_recv 排空出站<br/>poll(50ms) 键鼠 · 300ms 节拍 · 挂断看守"]
     end
 
     subgraph APP["app 线程 · tokio worker（rt.spawn）"]

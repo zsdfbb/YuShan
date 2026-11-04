@@ -47,6 +47,15 @@ class Mutant:
     edits: list[tuple[str, str, str]] = field(default_factory=list)
     #: 期望至少有一个测试变红；为空表示「该 mutant 只要求整包不绿」。
     expect_red: str = ""
+    #: 本变异的守护**就在类型层**：注入使它**编译失败**即为被抓住。
+    #:
+    #: 典型例：给 `ModelRequest` 加回 serde 派生 ⇒ `Arc<dyn BoundarySource>` 无
+    #: `Serialize` ⇒ `error[E0277]`。没有运行期用例能抓它（"把 boundary 序列化出去"
+    #: 这件事不可表达），所以「编译失败」恰恰是守卫生效的证据；如果它编译通过了，
+    #: 说明类型层守护已经失尘，反而应当报错。
+    compile_is_catch: bool = False
+    #: 类型层守护的靶子：编译错误里必须出现它，否则说明注入错在别处。
+    compile_must_mention: str = ""
 
 
 # 全部待注入文件（跑完统一还原）。
@@ -278,40 +287,26 @@ MUTANTS: list[Mutant] = [
         ],
     ),
     Mutant(
-        name="boundary 参与序列化",
+        name="ModelRequest 重新成为线格式契约（加回 serde 派生）",
         package="ys-model",
-        desc="挂载边界源改变了请求的线上字节 ⇒ 既有序列化契约被破坏",
-        expect_red="model_request_serialization_ignores_boundary",
+        desc="请求体重新可以序列化 ⇒ 既有的「进程内契约 / 线格式在适配器」边界被破坏",
+        # 设计上守护在**类型层**：`ModelRequest` 不派生 `Serialize`，而 `boundary`
+        # （`Arc<dyn BoundarySource>`）无 `Serialize`，故「把 boundary 序列化出去」不可表达。
+        # 加回派生会编译失败 —— 本变异期望的正是「不绿」，具体是被编译器拦住。
+        #
+        # 为什么不再用旧的 `#[serde(skip)]` 洗白法：那要求结构体本就派生 serde，
+        # 而当前设计恰恰取消了派生（请求体不再是线格式）。变异锚点必须跟设计走。
+        expect_red="",
+        compile_is_catch=True,
+        compile_must_mention="Arc<dyn BoundarySource>: serde::Serialize",
         edits=[
             (
                 "crates/ys-model/src/request.rs",
-                """    #[serde(skip, default)]
-    pub boundary: Option<Arc<dyn BoundarySource>>,""",
-                """    #[serde(
-        default,
-        skip_deserializing,
-        serialize_with = "serialize_boundary_placeholder"
-    )]
-    pub boundary: Option<Arc<dyn BoundarySource>>,""",
-            ),
-            (
-                "crates/ys-model/src/request.rs",
-                """/// provider 的 finish_reason **归一化后**的形态。""",
-                """fn serialize_boundary_placeholder<S>(
-    value: &Option<Arc<dyn BoundarySource>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        Some(_) => serializer.serialize_str("present"),
-        None => serializer.serialize_none(),
-    }
-}
-
-/// provider 的 finish_reason **归一化后**的形态。""",
-            ),
+                """#[derive(Debug, Clone, Default)]
+pub struct ModelRequest {""",
+                """#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelRequest {""",
+            )
         ],
     ),
     Mutant(
@@ -322,9 +317,9 @@ where
         edits=[
             (
                 "crates/ys-model/src/request.rs",
-                """#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+                """#[derive(Debug, Clone, Default)]
 pub struct ModelRequest {""",
-                """#[derive(Debug, Default, Serialize, Deserialize)]
+                """#[derive(Debug, Default)]
 pub struct ModelRequest {""",
             ),
             (
@@ -339,10 +334,9 @@ pub struct ModelRequest {""",
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             thinking: self.thinking.clone(),
-            boundary: self
-                .boundary
-                .as_ref()
-                .map(|_| Arc::new(ys_protocol::QueueBoundarySource::new()) as Arc<dyn BoundarySource>),
+            boundary: self.boundary.as_ref().map(|_| {
+                Arc::new(ys_protocol::QueueBoundarySource::new()) as Arc<dyn BoundarySource>
+            }),
         }
     }
 }
@@ -382,8 +376,11 @@ def run_package_tests(package: str) -> tuple[str, list[str]]:
     返回 (状态, 失败的用例名列表)：
       - ``"red"``   —— 编译通过且**有**用例失败（真正的「被抓住」）。
       - ``"green"`` —— 编译通过且全绿（**覆盖缺口**）。
-      - ``"build-failed"`` —— 编译不过（注入写法有问题，**不算**被抓住）。
+      - ``"build-failed"`` —— 编译不过。对普通变异是「注入写法有问题、不算被抓住」；
+        对 [`Mutant.compile_is_catch`] 的变异则**正是被抓住**（类型层守护）。
       - ``"errored"`` —— 跑起来了但非零退出、且没有 FAILED 行（测试二进制崩溃/挂住）。
+
+    第三个元素是编译错误正文，供类型层守护校验「错误确实来自预期靶子」。
     """
     proc = subprocess.run(
         ["cargo", "test", "-p", package, "--", "--test-threads=1"],
@@ -397,16 +394,16 @@ def run_package_tests(package: str) -> tuple[str, list[str]]:
         if m:
             failed.append(m.group(1))
     if failed:
-        return "red", failed
+        return "red", failed, ""
     # 编译失败：stderr 里会有 cargo/rustc 的编译错误标记。
     if "could not compile" in proc.stderr or re.search(r"^error\[E", proc.stderr, re.M):
-        return "build-failed", []
+        return "build-failed", [], proc.stderr
     if "running " not in proc.stdout:
-        return "build-failed", []
+        return "build-failed", [], proc.stderr
     if proc.returncode != 0:
         # 跑起来了但非零退出、且没抓到 FAILED 行（如某个测试二进制挂掉）。
-        return "errored", []
-    return "green", []
+        return "errored", [], ""
+    return "green", [], ""
 
 
 def main() -> int:
@@ -448,7 +445,7 @@ def main() -> int:
                 print(f"  注入失败：{err}", file=sys.stderr)
                 results.append((m, "injection-failed", [], "injection-failed"))
                 continue
-            status, failed = run_package_tests(m.package)
+            status, failed, build_err = run_package_tests(m.package)
             restore(snapshot)
             if status == "red":
                 hit = [f for f in failed if m.expect_red in f] if m.expect_red else failed
@@ -460,6 +457,18 @@ def main() -> int:
                     status = "wrong-catcher"
                 else:
                     print(f"  ✓ 被抓住（{len(failed)} 个用例红）：{', '.join(failed[:5])}")
+            elif status == "build-failed" and m.compile_is_catch:
+                # 类型层守护：编译失败**就是**被抓住，但必须确认错误来自预期靶子 ——
+                # 否则「注入写错了」也会被当成守护生效。
+                if m.compile_must_mention and m.compile_must_mention not in build_err:
+                    print(
+                        f"  ! 编译失败，但错误里没有预期靶子 {m.compile_must_mention!r}"
+                        " —— 可能是注入写法问题"
+                    )
+                    status = "build-failed"
+                else:
+                    print(f"  ✓ 被编译器拦住（类型层守护）：{m.compile_must_mention}")
+                    status = "compile-caught"
             elif status == "build-failed":
                 print("  ! 编译失败 —— 注入写法有问题，不算被抓住")
             elif status == "errored":
@@ -475,12 +484,14 @@ def main() -> int:
     print("=" * 72)
     caught = 0
     for m, status, failed, _ in results:
-        mark = {"red": "✓", "wrong-catcher": "!"}.get(status, "✗")
-        if status == "red":
+        mark = {"red": "✓", "wrong-catcher": "!", "compile-caught": "✓"}.get(status, "✗")
+        if status in ("red", "compile-caught"):
             caught += 1
         print(f"{mark} [{m.package}] {m.name}")
         if failed:
             print(f"    抓住它的用例：{', '.join(failed[:3])}")
+        elif status == "compile-caught":
+            print("    编译被拦住（类型层守护，无运行期用例可抓）")
         elif status == "injection-failed":
             print("    注入失败（源码已变，需更新本脚本）")
         elif status == "build-failed":

@@ -57,9 +57,13 @@ MUTATIONS = [
     (
         "M3 其余鼠标事件也滚动（抢终端拖选）",
         EV,
-        "        _ => {}\n    }\n}\n\n/// 一个滚轮事件滚动的**视觉行数**。",
+        # 锚点必须带上 `handle_mouse` 的 `_ => {}` 与其后的文档注释。
+        # 只取 `_ => {}\n    }\n}` 会命中 3 处（其余两处是 `handle_event` 的分支尾），
+        # 而注入要求文本**唯一**。也不带 `refine_gesture` 头 —— 那是右键补救入口，
+        # 与本变异无关；锚点越小越不容易被无关改动带偏。
+        "        _ => {}\n    }\n}\n\n/// 高亮还在 ⇒ 右键的**任一位**",
         "        _ => scroll_wheel_batch(app, width, height, WheelDelta::one(true)),\n"
-        "    }\n}\n\n/// 一个滚轮事件滚动的**视觉行数**。",
+        "    }\n}\n\n/// 高亮还在 ⇒ 右键的**任一位**",
         "test_other_mouse_events_are_ignored",
     ),
     (

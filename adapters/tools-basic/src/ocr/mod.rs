@@ -256,11 +256,7 @@ impl Tool for OcrTool {
         //
         // "没有输出" = 没有**任何一个非空白字节**：只剩一个 `\n` 同样是没输出（否则一个
         // 空行就能绕过本档，把静默失败退化成「图里没字」）。
-        let silent_failure = !bounded
-            .stdout
-            .iter()
-            .any(|byte| !byte.is_ascii_whitespace())
-            && matches!(kind, Kind::Tesseract);
+        let silent_failure = is_silent_failure(kind, &bounded.stdout);
 
         // ④ 渲染。头行的 `lang=` 走 `header_lang`：Vision 下回显入参会因果倒置。
         let (width, height) = image_dims(&image);
@@ -390,6 +386,21 @@ fn visible_rows(lines: &[tsv::OcrLine], granularity: Granularity) -> usize {
             Granularity::Word => line.word_no.is_some(),
         })
         .count()
+}
+
+/// 静默失败判据：`exit 0` 但 stdout **没有非空白字节** ⇒ 引擎没跑通。
+///
+/// 只对 **Tesseract** 成立：它的 TSV 模式即使图中无字也会吐头行 + level 1-3（页 / 块 / 段），
+/// 故空 stdout 不可能是「真没字」；`vision.swift` 不吐头行，空图本来就是零字节，把它算成
+/// 失败会误杀 Vision 的正常「图里没字」。
+///
+/// 「没有输出」= 没有任何非空白字节：只剩一个 `\n` 同样是没输出，否则一个空行就能绕过本档、
+/// 把静默失败退化成「图里没字」。
+///
+/// 提成纯函数使判据可脱离平台候选链测试 —— [`Kind::order`] 在非 macOS 上不含 Vision，
+/// 端到端用例在那些平台上跑不到 Vision 分支。
+fn is_silent_failure(kind: Kind, stdout: &[u8]) -> bool {
+    matches!(kind, Kind::Tesseract) && !stdout.iter().any(|byte| !byte.is_ascii_whitespace())
 }
 
 /// 空结果**第四**种成因的文案：`exit 0` 但引擎 stdout 一个字节都没有（静默失败）。
@@ -1150,8 +1161,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 静默失败判据（[`is_silent_failure`]）**只对 Tesseract 成立**，与平台无关。
+    ///
+    /// 这是下面那条 macOS 端到端用例在**所有平台**上的替身：`Kind::order` 在非 macOS 上
+    /// 不含 Vision，端到端到不了该分支，但判据本身必须钉死 —— 否则「零字节 = 失败」会误杀
+    /// Vision 的正常「图里没字」。
+    #[test]
+    fn silent_failure_is_tesseract_only() {
+        // Tesseract：零字节 / 只有空白 ⇒ 静默失败（引擎没跑通）。
+        for blank in [b"".as_slice(), b"\n", b" \n\t\r\n"] {
+            assert!(
+                is_silent_failure(Kind::Tesseract, blank),
+                "Tesseract 的零字节/纯空白输出应判为静默失败：{blank:?}"
+            );
+        }
+        // 只要有**一个**非空白字节就不算静默 —— 头行也是真输出。
+        assert!(
+            !is_silent_failure(Kind::Tesseract, b"level\tpage_num\n"),
+            "有任何非空白字节 = 引擎吐了东西，不是静默失败"
+        );
+        // Vision：零字节是**正常空结果**，不得判失败。
+        for blank in [b"".as_slice(), b"\n", b"  \n"] {
+            assert!(
+                !is_silent_failure(Kind::Vision, blank),
+                "Vision 的零字节输出是正常空结果，不得判成失败：{blank:?}"
+            );
+        }
+    }
+
     /// 静默失败档**只对 Tesseract** 成立：`vision.swift` 不吐头行，空白图本来就是零字节
     /// 输出 —— 把它判成失败会把 Vision 的正常「图里没字」误报成引擎坏了。
+    ///
+    /// 限 macOS：本用例靠 `detect_from` 走**平台候选链**，而 [`Kind::order`] 在非 macOS 上
+    /// 只有 Tesseract ⇒ 探不到 Vision、根本到不了该分支。判据本身与平台无关，由
+    /// [`silent_failure_is_tesseract_only`] 钉住。
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn zero_byte_vision_output_is_still_a_plain_empty_result() {
         let dir = dir("silent_vision");

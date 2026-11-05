@@ -82,7 +82,38 @@ if [ "$DO_BUILD" -eq 1 ]; then
   build_status=$?
   if [ "$build_status" -ne 0 ]; then
     echo "par-test: 构建失败（退出码 $build_status）" >&2
+    # stderr 只装 cargo 自己的提示（如 `Blocking waiting for file lock`）；
+    # **`--message-format=json` 会把真正的 error 诊断写进 stdout**，故两路都要打。
+    # 只打 stderr 时，链接器 / rustc 的报错会完全丢失，日志里只剩一行「构建失败」，
+    # 无从定位。
     cat "$BUILD_ERR" >&2 2>/dev/null
+    # `SIGXFSZ`（signal 25）不是代码错误：链接器在 `ftruncate` 把输出文件撑到最终
+    # 大小时撞上 `RLIMIT_FSIZE`。本仓的测试二进制（带调试符号）实测已达 65 MiB，
+    # 若进程的 `ulimit -f` 小于此值就必然失败 —— rust-lld 只报一句
+    # 「PLEASE submit a bug report」加堆栈，极易被误判为编译器 bug。
+    if grep -q 'SIGXFSZ' "$BUILD_ERR" 2>/dev/null || \
+       grep -q 'signal 25' "$BUILD_OUT" 2>/dev/null; then
+      fsize=$(ulimit -f)
+      echo "par-test: ⚠ 构建遇到 SIGXFSZ（文件大小超限）" >&2
+      echo "par-test:   当前 ulimit -f = $fsize 块 = $((fsize * 512)) 字节" >&2
+      echo "par-test:   本仓测试二进制实测已到 65 MiB；请用 `ulimit -f unlimited` 重试" >&2
+    fi
+    # 注意：**不能**写 `>&2 2>/dev/null` —— 那会把 stderr 重定向到 /dev/null，
+    # 顺序是左到右生效的。python 自己把诊断写到 stderr 即可。
+    python3 -c '
+import sys, json
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("reason") != "compiler-message":
+        continue
+    d = m.get("message") or {}
+    if d.get("level") != "error":
+        continue
+    print(d.get("rendered") or d.get("message") or "", file=sys.stderr)
+' <"$BUILD_OUT"
     exit 1
   fi
   python3 -c '

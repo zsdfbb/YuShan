@@ -723,18 +723,17 @@ mod tests {
         // `fp_prompt` **不入锚** —— 它含 `Current working directory: <临时目录>`，逐次运行都不同，
         // 只由「同一目录两次构建一致」那条断言守卫。
         assert_eq!(
-            fp_tools, 0x81803a5e1b81b71eu64,
+            fp_tools, 0xf017256b30c9d6f7u64,
             "工具表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
         // 父表指纹锚：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）。
         // `fp_tools` 只覆盖子表，追加段工具的 schema 漂移在它那里是静默的 —— 这里补上。
         //
-        // 最近一次漂移：基础表新增 `view_image`（只读本地输入，紧跟 `ocr`），同时 `ocr`
-        // 的 description 去掉「the only way to see what an image contains」这句（图像输入落地后
-        // 它已不成立）。两个锚同时平移 —— 基础表项在父表里，故 `fp_parent` 必须跟随；
-        // `fp_tools` 只覆盖子表。
+        // 最近一次漂移：`view_image` 的 description 补上到 `ocr` 的分流指引并写明 URL 不被
+        // 接受（design.md §3.3 要求写明「何时该用本工具」）。基础表项在父表里，故两锚同时平移；
+        // 上一轮漂移是基础表新增 `view_image` 本身（同时 `ocr` 去掉「唯一能看图」那句）。
         assert_eq!(
-            fp_parent, 0xce43764fed837393u64,
+            fp_parent, 0x318be4770f32c8e6u64,
             "父表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
 

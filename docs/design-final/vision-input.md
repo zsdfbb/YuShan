@@ -47,10 +47,13 @@
 
 | 层 | 判据 | 实现 | 结果 |
 |---|---|---|---|
-| 第一层 provider 能力位 | `compat.supports_image_input` | `adapters/model-openai-compatible/src/compat.rs:50` | 默认 `false`，仅 `deepseek()` 置 `true`（`:85`） |
+| 第一层 provider 能力位 | `compat.supports_image_input` | `adapters/model-openai-compatible/src/compat.rs:50` | 默认 `false`；`deepseek()`（`:85`）与 `opencode_go()`（`:133`）置 `true` |
 | 第二层 模型 id 可识别性 | `is_vision_model(model)` | `adapters/model-openai-compatible/src/compat.rs:378` | id 含 `vision`/`vl` token ⇒ true；`deepseek-` 前缀且含 `flash` token ⇒ true；其余 fail-closed（音频/TTS 模型例外，永远 false） |
 | 合并判据 | `supports_image(model)` | `adapters/model-openai-compatible/src/compat.rs:270` | `supports_image_input && is_vision_model(model)`；**全仓唯一**模型级判断来源 |
 | `detail` 下发 | `image_detail_for(model, requested)` | `adapters/model-openai-compatible/src/compat.rs:282` | 先过 `supports_image`，再 `requested?` ⇒ 缺省不发该字段 |
+
+打开 `opencode_go()` 的第一层后，网关目录 29 个模型里真正会发图的**只有 `deepseek-*flash`**
+（第二层拦下其余 28 个，含实测能读图的 `glm-5.3-flash`）—— 见 §6.1。
 
 ### 3.2 七条占位（按判定顺序）
 
@@ -83,7 +86,7 @@
 | # | 计划怎么说 | 实现实际怎么做 | 指针 |
 |---|---|---|---|
 | C1 | `SessionMeta.v → 2`（design.md §11 步 11）；plan C1 裁决「不做」 | **保持 1**，`default_version()` 与 `new()` 都写 1；全仓唯一读点是 `wiring.rs:593` 的测试断言 ⇒ `v` 只写不读 | `crates/ys-session/src/meta.rs:22`、`:35`、`:71` |
-| C2 | `ocr` 文案改为「陈述作用域」，不再声明独家 | 已落地：`ocr` 的 description 只说「取图内文字 + 像素位置」，`view_image` 只说「给像素」 | `adapters/tools-basic/src/ocr/mod.rs:138`、`adapters/tools-basic/src/view_image.rs:22`–`24` |
+| C2 | `ocr` 文案改为「陈述作用域」，不再声明独家；`view_image` 的 description **写明何时改用 `ocr`**（design.md §3.3） | 已落地：`ocr` 的 description 只说「取图内文字 + 像素位置」；`view_image` 为三层 —— 场景（visual inspection）→ 分流（“use `ocr` instead when you need the text … together with its pixel coordinates”）→ 消歧（`URLs are not accepted`）。分流句在 `spec()` 与 `prompt.rs` 的 `tool_snippet` **逐字同一份**，两处各有钉死用例 | `adapters/tools-basic/src/ocr/mod.rs:138`、`adapters/tools-basic/src/view_image.rs:92`–`100`、`apps/coding-agent/src/prompt.rs:283`–`285` |
 | C6 | 5 处取文本统一到 `as_text()`，分隔符由 `TextJoin` 枚举三档 | `message_text` / `user_text` / `summarize` / `compact` 已收口；`User` 检查与空白过滤**留在原处** | `message.rs:60`（穷尽 match）、`:82`（`TextJoin`）、`:108`（`joined_text`）；`sessions.rs:185`–`200` |
 | C7 | `turn_budget` 计入图片 | **有意不计入**：`_ => 0` + 四处注释 + 三条反向用例 | `crates/ys-loop/src/turn_budget.rs:38`–`42` |
 | C8 | 体积按 **base64 后**判 | 已实现，两道闸门（编码前按 `metadata().len()` 预估、编码后按 `url.len()` 复核） | `adapters/model-openai-compatible/src/media.rs:345`、`:358`、`:375` |
@@ -137,7 +140,8 @@
 | 块集合白名单（TUI 两条路径） | `u4_message_text_includes_image_marker`（`app.rs:2825`）、`u4_replay_lines_must_render_image_block`（`transcript.rs:588`）、`u9_replay_renders_image_on_both_paths_with_and_without_detail`（`transcript.rs:636`）、`p2_3_only_text_and_tool_use_produce_lines`（`transcript.rs:545`） | `crates/ys-tui-coding` |
 | 回放与 live 逐行相等 | `u9_replay_user_image_matches_local_echo_text`（`transcript.rs:665`）；另有一条不含图的一般性回放相等断言（`transcript.rs:533`–`537`） | `crates/ys-tui-coding/src/transcript.rs` |
 | 子 agent 回传只带引用 | `text_of_renders_image_as_reference` `:3048`、`transcript_body_renders_image_refs` `:3006` | `apps/coding-agent/src/subagent.rs` |
-| 两层门控各自成立 + 合并判据 | `image_input_bit_is_conservative_by_default` `:851`、`image_gate_needs_both_layers` `:865`、`unknown_model_ids_fail_closed` `:881`、`image_detail_folds_through_the_gate` `:910`、`flash_alone_is_not_a_vision_marker` `:899` | `adapters/model-openai-compatible/src/compat.rs` |
+| 两层门控各自成立 + 合并判据 | `image_input_bit_is_conservative_by_default` `:863`（含 `opencode_go()` 为 `true`）、`image_gate_needs_both_layers` `:901`、`unknown_model_ids_fail_closed` `:917`、`image_detail_folds_through_the_gate` `:946`、`flash_alone_is_not_a_vision_marker` `:935` | `adapters/model-openai-compatible/src/compat.rs` |
+| `opencode_go` 图像位的**实际射程**（只放行 `deepseek-*flash`；`glm-5.3-flash` 不得放行） | `opencode_go_image_bit_only_reaches_deepseek_flash` `:887` | 同上 |
 | 两个工具表指纹锚（工具表未被静默改动） | `prefix_fingerprint_is_anchored_and_stable` | `apps/coding-agent/src/toolset.rs:635` |
 | `v` 恒为 1 | `wiring.rs:593` 的 `assert_eq!(meta.v, 1)` | `apps/coding-agent/src/wiring.rs:593` |
 
@@ -157,16 +161,28 @@
 
 ## 6. 已知边界
 
-### 6.1 `opencode-go` 网关不发图
+### 6.1 `opencode-go` 网关：已实测支持，但只对 `deepseek-*flash` 生效
 
-`ProviderCompat::opencode_go()`（`adapters/model-openai-compatible/src/compat.rs:122`）用
-`..Default::default()`，因此继承 `supports_image_input: false`（`:66`）。经该网关接入的模型
-（如 `deepseek-v4.1-flash`，真实 A/B 记录见 `docs/design-final/coding-agent-tui.md`）**永远走
-第 1 条占位**。
+`ProviderCompat::opencode_go()`（`adapters/model-openai-compatible/src/compat.rs:133`）
+显式置 `supports_image_input: true`。依据是一次真实凭证探测（2026-11-05，
+`https://opencode.ai/zen/go/v1/chat/completions`，块数组 `image_url` + base64 data URI）：
 
-这是 fail-closed 的保守选择：多模态请求体在不认它的端点上会 **400**（不是被忽略），而发文本
-占位永远安全。**没有实测依据**说明该网关不支持图像 —— 放开需要真实凭证验证后再改
-`opencode_go()`，或为该网关单列一个能力位。
+| 探测 | 结果 |
+|---|---|
+| 128×128 已知答案图（黑色字母 K），`deepseek-v4.1-flash` 连发 3 次 | **3/3 答对 `K`**，`finish_reason: stop` |
+| 同上 + `image_url.detail: "high"` | **200 + 答对** ⇒ 该字段也被接受 |
+| 同请求体发给 `glm-5.2` / `glm-5.3` | **`400 Invalid image or video input`** |
+| `gpt-5.6-luna` / `gpt-6-luna` / `beam-free` / `muse-spark-*` | `403` 地区限制（与该功能无关） |
+
+**打开后的实际射程只有 1 个模型**：网关目录 29 个模型中，第二层 `is_vision_model` 仅放行
+`deepseek-v4.1-flash`（`deepseek-` 前缀 + `flash` 分段）。⇒ 能力位虽为 `true`，被拦下的 28 个
+**仍走 §3.2 第 1 条占位**，包括实测能读图但 id 无 `vision` / `vl` 分段的 `glm-5.3-flash`。
+这是**有意**的 fail-closed，不是漏配：为它放宽 `is_vision_model` 会把同样含 `flash` 分段、
+但真实返 400 的 `glm-5.2` / `glm-5.3` 一起放进去。
+
+> 本次只实测 `deepseek-v4.1-flash`。同网关的 `minimax-*` / `kimi-*` / `qwen3.8-*` 等模型
+> 同样 200 答对（旁证：多模态在该网关是普遍能力而非 flash 独有），但本仓**不**据此放开它们 ——
+> 能力位与 `is_vision_model` 均保持现状，需时另行实测再改。
 
 ### 6.2 `ocr` 的 BMP / TIFF 尺寸偏移 bug（**不在本次范围**）
 
@@ -187,13 +203,16 @@
 
 ### 6.3 指纹漂移 ⇒ 所有用户提示缓存冷启动一次
 
-工具表新增 `view_image` 后两个锚点已更新为 `0x81803a5e1b81b71e`（`fp_tools`）与
-`0xce43764fed837393`（`fp_parent`），并含 `ocr` 文案修正。
+当前锚点：`0xf017256b30c9d6f7`（`fp_tools`）、`0x318be4770f32c8e6`（`fp_parent`）、
+`0x2fd268573e284877`（`main_system_prompt_body_is_byte_stable` 的提示主体）。
+历次漂移：① 工具表新增 `view_image`（同时 `ocr` 去掉「唯一能看图」那句）；
+② `view_image` 的 description 补上到 `ocr` 的分流指引与 `URLs are not accepted`。
 
 | 锚点 | 覆盖范围 | 断言行 |
 |---|---|---|
 | `fp_tools` | **只**基础 11 元（子 agent 的工具表） | `apps/coding-agent/src/toolset.rs:726` |
-| `fp_parent` | 基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`） | `apps/coding-agent/src/toolset.rs:737` |
+| `fp_parent` | 基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`） | `apps/coding-agent/src/toolset.rs:736` |
+| 提示主体 | `<project_context>` 之前的整段（含工具清单与全部 guideline） | `apps/coding-agent/src/prompt.rs:2112` |
 
 面向上游的后果：工具清单进了系统提示的常驻段，指纹一变即代表**提示前缀改变** ⇒ 既有用户的
 provider 侧提示缓存全部失效，冷启动一次（只影响首回合的 `cache_read`，不影响正确性）。
@@ -245,11 +264,12 @@ provider 侧提示缓存全部失效，冷启动一次（只影响首回合的 `
 它是**类型层契约**，不是运行期不变量；写进来只会是永远绿的假 mutant。同理
 `Mutant.compile_is_catch` 字段保留但**当前无条目使用**（`scripts/vision-mutation.py:23`–`26`）。
 
-### 7.2 尚未接入 `scripts/verify.sh`
+### 7.2 已接入 `scripts/verify.sh`
 
-`scripts/verify.sh:55` 的变异循环只列
-`cancellation-mutation wheel-mutation selection-mutation theme-mutation`，**不含** `vision-mutation`
-（计划 T21 的第二项要求）。因此这条脚本目前**不会**在 `verify.sh` 中被跑到。
+`scripts/verify.sh:60` 的变异循环已列入 `vision-mutation`（与
+`cancellation-mutation wheel-mutation selection-mutation theme-mutation` 同批）⇒
+`./scripts/verify.sh` 会跑到这 18 条。`scripts/verify.sh:32` 的注释说明了它**不需要**别的
+变异脚本共用的前置步骤。
 
 ### 7.3 手工运行方式
 
@@ -267,5 +287,5 @@ python3 scripts/vision-mutation.py 8      # 只跑第 8 条
 | 用户输入侧路径自动解析 | **不做** | 歧义（文本里哪段是图片）与 `expand_skill_invocation` 重建 Message 的行为冲突 |
 | `SessionMeta.v → 2` | **不做** | `v` 只写不读，升版本只换来一次 `O(会话总字节)` 的全量重写（`crates/ys-session/src/meta.rs:22`） |
 | 图片压缩 / 缩放 | **不做** | 无缩放能力 ⇒ 超限只能拒绝并说明（占位 5/6/7，`lib.rs:1340`） |
-| `vision-mutation` 接入 `verify.sh` | **未接入** | 见 §7.2 |
-| `transcript.rs` assistant 回放臂 | **当前缺失** | 见 §6.5 |
+| 为 `glm-*flash` 放宽 `is_vision_model` | **不做** | `glm-5.3-flash` 实测能读图，但同名字段的 `glm-5.2` / `glm-5.3` 返 400；id 无法区分 ⇒ 整体 fail-closed（§6.1） |
+| 把 `opencode_go()` 的图像位扩散到别的方言 | **不做** | 只在 `deepseek-v4.1-flash` 上实测过（§6.1） |

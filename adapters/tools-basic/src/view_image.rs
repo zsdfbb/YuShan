@@ -90,9 +90,14 @@ impl Tool for ViewImageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "view_image",
-            // 逐字（C2 原则：陈述自己的场景，不声明独家；第二句消解「拿 URL 来试」的歧义）。
+            // C2 原则：陈述自己的场景，**不**声明独家；后两句分别是分流指引与
+            // 「拿 URL 来试」的歧义消除（design.md §3.3 要求写明何时用 `ocr`）。
+            // 分流句必须在两处都写：`ocr` 的描述只说「出文字 + 像素坐标」，没有反向指向
+            // 本工具；模型要在两个都可见的地方各读到一次，才能判「要字还是要形」。
             "View a local image file from the filesystem when visual inspection is needed. \
-             Use this for images already available on disk.",
+             Use this for images already available on disk; use `ocr` instead when you need the \
+             text in the image together with its pixel coordinates. \
+             URLs are not accepted.",
             json!({
                 "type": "object",
                 "properties": {
@@ -402,8 +407,10 @@ mod tests {
         assert_eq!(
             spec.description,
             "View a local image file from the filesystem when visual inspection is needed. \
-             Use this for images already available on disk.",
-            "描述逐字（陈述自己的场景，不声明独家）"
+             Use this for images already available on disk; use `ocr` instead when you need the \
+             text in the image together with its pixel coordinates. \
+             URLs are not accepted.",
+            "描述逐字（陈述自己的场景，不声明独家；含到 `ocr` 的分流指引）"
         );
 
         let detail = &spec.parameters["properties"]["detail"];

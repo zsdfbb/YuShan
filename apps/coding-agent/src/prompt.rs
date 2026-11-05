@@ -278,9 +278,10 @@ fn tool_snippet(name: &str) -> &'static str {
              per-word coordinates"
         }
         // 与 `ViewImageTool::spec()` 的 description 逐字一致：陈述自己的场景，**不**声明独家
-        //（`ocr` 与本工具并存，「唯一能看图」已是假话）。第二句消解「拿 URL 来试」的歧义。
+        //（`ocr` 与本工具并存，「唯一能看图」已是假话）。后两句是分流指引与 URL 歧义消除 ——
+        // 缺了分流句，模型只能靠两个工具的字面猜测何时用哪个。
         "view_image" => {
-            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk."
+            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk; use `ocr` instead when you need the text in the image together with its pixel coordinates. URLs are not accepted."
         }
         // 派发工具（装配端 `spec().name` 是契约）。
         "subagent_async" => {
@@ -918,10 +919,10 @@ mod tests {
             "Extract the text in an image together with its pixel positions; set word_boxes for per-word coordinates"
         );
         // `view_image` 与 `ViewImageTool::spec()` 的 description 同一份字串（schema 与清单
-        // 不得说两样话）；「不声明独家」是本条承重的语义。
+        // 不得说两样话）；「不声明独家」与「分流到 `ocr`」是本条承重的语义。
         assert_eq!(
             tool_snippet("view_image"),
-            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk."
+            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk; use `ocr` instead when you need the text in the image together with its pixel coordinates. URLs are not accepted."
         );
         assert_eq!(
             tool_snippet("websearch"),
@@ -2120,9 +2121,10 @@ mod tests {
             .next()
             .expect("split 至少返回一段");
         let normalized = body.replace(&dir.display().to_string(), "<cwd>");
+        // 最近一次漂移：`view_image` 的清单文案补上到 `ocr` 的分流指引（design.md §3.3）。
         assert_eq!(
             fnv1a64(normalized.as_bytes()),
-            0x74ddeff50176daba_u64,
+            0x2fd268573e284877_u64,
             "主 agent 提示主体漂移：确认是有意改动，再更新此锚点"
         );
 

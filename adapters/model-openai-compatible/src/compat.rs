@@ -119,11 +119,23 @@ impl ProviderCompat {
     /// 与 `request.disable_thinking` 共同决定（两者默认都是「不干预」）⇒
     /// **不配 `/effort off` 时请求体逐字节不变**。
     /// 同网关的 `minimax-*` 是否接受该字段**未测** ⇒ 本能力位不得据此扩散到别的方言。
+    ///
+    /// **图像输入**：实测网关接受块数组形态的 `image_url` —— 128×128 已知答案图
+    /// （字母 K）连发 3 次，`deepseek-v4.1-flash` 3/3 答对、`finish_reason: stop`；
+    /// 带 `image_url.detail: "high"` 同样 200 且答对，故该字段也放行。
+    /// 能力位只表示「本端点认这个字段」，具体模型是否可读图仍由
+    /// [`ProviderCompat::supports_image`] 的第二层判。
+    ///
+    /// ⚠️ 本次实测**只覆盖 `deepseek-v4.1-flash`**：同网关 `glm-5.2` / `glm-5.3` 对该
+    /// 请求体返 `400 Invalid image or video input`。它们被第二层挡下（见
+    /// [`is_vision_model`]：`flash` 分段不单独成判据）⇒ 打开本能力位不会让它们收到
+    /// 多模态请求体。**不得**据此给别的 provider 或 `glm()` 置位。
     pub fn opencode_go() -> Self {
         Self {
             has_reasoning_content: true,
             supports_reasoning_effort: true,
             supports_thinking_control: true,
+            supports_image_input: true,
             ..Default::default()
         }
     }
@@ -855,6 +867,30 @@ mod tests {
         assert!(!ProviderCompat::glm().supports_image_input());
         assert!(!ProviderCompat::mimo().supports_image_input());
         assert!(ProviderCompat::deepseek().supports_image_input());
+        assert!(ProviderCompat::opencode_go().supports_image_input());
+    }
+
+    /// **`opencode_go` 打开图像位后的实际射程**：只放行 `deepseek-*flash`。
+    ///
+    /// 网关共 29 个模型，第二层 [`is_vision_model`] 只认 `deepseek-` 前缀 + `flash`
+    /// 分段（以及 `vision` / `vl` 分段）⇒ 打开能力位后**只有 flash 真的会发图**，
+    /// 其余 28 个仍走文本占位。
+    ///
+    /// 这不是「漏配」而是**有意**：同网关 `glm-5.2` / `glm-5.3` 对该请求体返
+    /// `400 Invalid image or video input`，`glm-5.3-flash` 虽实测能读图但 id 无
+    /// `vision` / `vl` 分段且非 `deepseek-` 前缀 ⇒ 仍 fail-closed，不得为它放宽
+    /// [`is_vision_model`]。
+    ///
+    /// 变异：把 `is_vision_model` 的 `deepseek-` 前缀判据改成只看 `flash` 分段
+    /// ⇒ 第二个断言变红（`glm-5.3-flash` 会收到它不认的请求体）。
+    #[test]
+    fn opencode_go_image_bit_only_reaches_deepseek_flash() {
+        let compat = ProviderCompat::opencode_go();
+        assert!(compat.supports_image("deepseek-v4.1-flash"));
+        assert!(!compat.supports_image("glm-5.3-flash"));
+        assert!(!compat.supports_image("mimo-v2.6-flash"));
+        assert!(!compat.supports_image("deepseek-v4-pro"));
+        assert!(!compat.supports_image("glm-5.2"));
     }
 
     /// **图像门控第二层（模型 id）**：两层必须同时成立。

@@ -127,7 +127,7 @@
 //!   选区归终端、应用看不到它（实测现象：「高亮两套、右键无反应」）。
 //! - **水平滚动 / `Moved` 忽略**：对话是单列竖排，无水平语义；不绑悬停。
 //! - **模态浮层不吃滚轮**：浮层自己读事件（`run.rs` 的 `Prompter` 实现），它 `_ => {}`
-//!   掉鼠标 —— 浮层内容不滚动（见 `docs/TODO.md` §C）。
+//!   掉鼠标 —— 浮层内容不滚动（见 `docs/TODO.md` §D）。
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,

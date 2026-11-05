@@ -42,7 +42,8 @@ YuShan/
 │   ├── design.md                 # 架构规范、核心 trait、Hook/Event 边界、测试矩阵
 │   ├── extension-points.md       # 新需求归类（Event / Tool / Follow-up / 还是真需要 Hook）
 │   ├── CONTEXT.md                # 术语表（Turn / Round / StopReason / 错误结果 vs 基础设施失败…）
-│   ├── TODO.md                   # 未完成工作台账（完成即删条目）
+│   ├── TODO.md                   # 未完成工作台账（完成即删条目；按**已有设计**组织）
+│   ├── goals.md                  # 能力目标台账（按**目标场景**倒推缺口，与 TODO.md 互补）
 │   ├── adr/                      # 决策记录，**文件名即摘要**
 │   ├── arch/                     # 逐需求的 arch-explore → design → review 产出（目录名即主题）
 │   ├── design-final/             # as-built：**当前实现的实际形态**（含实现与设计的分歧）

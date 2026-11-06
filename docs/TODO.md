@@ -177,6 +177,7 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 | `docs/arch/prompt-delivery/notes.md` | 唯一未决项：**产品内置 vs 项目可配** | `notes.md:98`（文档头自标「状态：未决」） |
 | `docs/arch/subagent-budget/` | 🟡 **部分已决**（2026-10-31）：**`General` 不设硬上限**、`General` 软提醒 50 已定；`Explore` 软提醒 10 待定（修「继承 60」但硬上限 16（`apps/coding-agent/src/subagent.rs:37`、`:45`）的死角）。未澄清：低轮次竞速是否正常、不活工具与空心轮的区分依据 | `context.md:289` |
 | `docs/arch/input-delivery-latency/` | ⚠️ **部分已解**：<br>· ✅ **G2**（F2）已修，见 `docs/adr/0049-final-answer-boundary-drain.md`；<br>· ✅ **G4**（F4）已解 —— 随 `8a08bd6` 落地；<br>· ⬜ **G1 / G3 / G5 / G6** 未做 —— app 侧 `Delivery` 队列、降级投递的触发机制、`origin` 是否外送、状态机载体（`docs/arch/input-delivery-latency/design.md:16-17` 自标）；<br>· ⬜ 设计 §7 仍有 **3 项「待用户确认」**（命令与消息谁先 / 回合中命令是否即时拒绝 / 投递状态显示落点） | `review.md` §7 闸门表、`docs/adr/0047-input-delivery-target-and-queue.md` |
+| `docs/arch/screenshot-tool/` | ⚠️ **需求已澄清、实测已完成，候选已比完，只缺用户拍板**：<br>· 两条需求不可合并 —— **页面渲染截图**（G2，`goals.md:18`；两平台同一条命令，实测应为 **S** 而非 goals 里标的 M）与 **屏幕捕获**（三套工具 × 三套权限模型）；<br>· ❗ **决定性事实**：`CGPreflightScreenCaptureAccess() == false` 时 `screencapture` 仍 **exit 0 且写出假图**，写不进去时也 exit 0 且无图 ⇒ **必须自验后置条件**；<br>· `xcap`（唯一一份代码覆盖三平台）实测两个扣分项：**不是 CLI**（无 `[[bin]]`）、**全屏截图不做权限判定**（`impl_monitor.rs:205`，静默返回黑图），且 Linux 依赖锁在 **git `branch = \"main\"`、仓库无 `Cargo.lock`**；<br>· ⬜ 未决：是否新增 `apps/yushan-shot/`、依赖取舍（纯 FFI vs `xcap`）、是否限定桌面环境、skill 合一个还是拆两个 | `context.md:6`（§6 未澄清问题） |
 
 ---
 
@@ -271,3 +272,4 @@ ADR-0013 发生在 coding-agent TUI 落地**之前** ⇒ 产品需要该语义�
 | 4 | **TUI 两份失效键合不合并？** | `entry_sig`（`crates/ys-tui-coding/src/layout.rs:658`）仍在，`STALE_SIG`（`:715`）只是止痛。改动面在渲染层，无对外契约 |
 | 5 | **TUI 模态浮层滚轮？** | `select_modal`（`crates/ys-tui-coding/src/run.rs:796`）仍无滚动分支、`_ => {}`（`:865`）吃掉鼠标；会话/模型列表超一屏时只能方向键逐项走 |
 | 6 | **A4 按调用类型分档强度接不接？** | 通道已通（`lib.rs:1632` 消费 `thinking.effort`），但 `crates/ys-loop/` 无一处赋值；需求是否真实存在未定 |
+| 7 | **截图工具做不做、放哪？** | 需求已证实（页面渲染 + 屏幕捕获两条），实测：页面截图两平台同一条命令、应为 **S**（goals 原估 M）；屏幕捕获的权限判定是**唯一静默失败源**（无权限时 `screencapture` 仍 exit 0 且出假图，`xcap` 全屏路径同样不判权限）。选项：`apps/yushan-shot/` workspace 成员（进得进 `par-test.sh` 与变异测试）/ `skills/screenshot/scripts/` 自举（进不了测试体系）/ 只用 shell 不做二进制。据 `docs/arch/screenshot-tool/context.md` §6 |

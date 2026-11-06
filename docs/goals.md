@@ -15,7 +15,7 @@
 | 场景 | 判定「能端到端」的标准 | 现状 | 缺口类别 |
 |---|---|---|---|
 | **G1 代码编写** | 给定一个真实仓库任务，agent 能改代码、跑测试、自我修正到绿 | ✅ **已闭环**：11 元基础表（`apps/coding-agent/src/toolset.rs:42`）+ `subagent_async` 派发 + 6 个自带 skill（`skills/`） | 无结构性缺口 |
-| **G2 网页制作** | 写完页面 → **自己看图验收** → 改到满意 | 🟡 可写文件、可 `bash` 起服务；`view_image` / `ocr` 已能看图（`adapters/tools-basic/src/view_image.rs:90`） | **缺「把页面变成图」这一步**（无截图/浏览器能力） |
+| **G2 网页制作** | 写完页面 → **自己看图验收** → 改到满意 | 🟡 可写文件、可 `bash` 起服务；`view_image` / `ocr` 已能看图（`adapters/tools-basic/src/view_image.rs:90`） | **缺「把页面变成图」这一步**（无截图/浏览器能力）。实测见 `docs/arch/screenshot-tool/context.md`（两条需求已拆开、只需一条命令，应为 S） |
 | **G3 GitHub 项目维护** | 拉 issue → 改 → 测 → 提交 → 回写 issue/PR | 🟡 `bash` 可调 `git` / `gh`，零代码 | **缺凭证托管** + **缺跨回合推进**（批量 issue 循环） |
 | **G4 连接飞书** | 收到事件 → 处理 → 回发消息 | ❌ 出站可 `bash` + `curl`；入站无落点 | **缺外部资源接入缝**（MCP 代码零命中）+ **缺跨回合推进** |
 | **G5 投资分析** | 取数据 → 算指标 → 出报告（图表 + 结论） | ❌ `adapters/tools-finance` crate 不存在；`docs/arch/etf-display-tool/` 只有 `context.md` | **架构未启动**，不是差实现 |
@@ -87,9 +87,13 @@ MCP 在 `crates/` / `adapters/` / `apps/` 全部 **零命中**（只在 `docs/de
 - **为什么是它**：四类场景的共同瓶颈都是"跑命令读输出"，而它是**唯一一项既省钱又防 Termux 拖死**的改动
   （`docs/TODO.md` §D 的 R2）。
 
-### 第 2 步 · 页面截图（M）—— 装成 skill，**不进核心**
+### 第 2 步 · 页面截图（**S**）—— 装成 skill，**不进核心**
 
-`view_image` 已能看图，缺的只是"把页面变成 png"。用 skill（脚本 + 本机 Playwright）接上。
+`view_image` 已能看图，缺的只是"把页面变成 png"。用 skill（脚本 + 本机 headless 浏览器）接上。
+
+> 实测见 `docs/arch/screenshot-tool/context.md` §2：`chrome-headless-shell --screenshot` **两个平台同一条命令**
+> （1.28s / 187 MB），原估的 M 应改为 **S**；纯 Rust 渲染器不执行 JS，不适用。
+> 另注：该文档还拆出了**第二条不同**的需求（屏幕捕获），与本步不可合并。
 
 - **判定依据**：G2 的判定标准在**不看终端**的情况下走通一次（写完 → 截图 → 看图 → 改）。
 - **边界**：不进 `adapters/tools-basic` —— 不破前缀指纹锚，不增核心面积。

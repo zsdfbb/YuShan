@@ -603,6 +603,26 @@ workspace 975 → 1005 passed，ignored 7 → 8（新增的 1 个 `ignore` 是 `
 - `ys-tui-coding` 的模态浮层与补全浮层共享 `Clear` 后覆盖渲染，未做统一的 `Overlay` 抽象
   （design §1 注允许二选一）。
 - **长程完成（ADR-0027 / 0028）本轮的债务**（未校准初值 / 设计层缺口 / 复核层残余）见 §12。
+- **拖选依赖终端是否守约（宿主缺陷，应用无解）**：VS Code on macOS 在右键
+  （默认 `rightClickBehavior: "selectWord"`）后，xterm.js 的 `mousedragListener` /
+  `mouseupListener` 被 `clear()` 且不再挂回 ⇒ 「右键之后的左键拖选彻底失效」。
+  规避写在宿主侧：`"terminal.integrated.rightClickBehavior": "nothing"`。
+  完整机制、错误取值的后果（`copyPaste` / `paste` 会退化成粘贴）、
+  以及为何 `?1003h` / 重发协议均无效，见 §5「右键的宿主副作用会连带打掉拖选」。
+
+  **真机实测**（`YUSHAN_MOUSE_TRACE` 临时探针，2026-11，macOS + VS Code 1.144.1）：
+  未改设置时，日志里出现连续 `Down(Left)` 而**没有配对的 `Up(Left)`**，且两次之间
+  的 `Drag` 数依次递减至 0；每次真实拖选的 `DRAW` 行仍算出正确 `rects`（`rects=3`），
+  证明**渲染链路与选区状态机均正常** —— 丢失发生在事件到达之前。改设为 `"nothing"`
+  后同一操作序列恢复正常。Codex CLI 0.165.0 在 macOS 上同样失败（其初始化序列里
+  `?1000h ?1002h ?1003h` 各只出现 1 次、零重发），live 录制还显示它在
+  `--no-alt-screen` 下**根本没开鼠标**。
+
+  **应用侧曾尝试但被证伪的两条路**（勿重试）：① 加 `?1003h` —— 不豁免 `clear()`
+  路径，Codex 已证无效；② 重发协议序列 —— `activeProtocol` 的 setter 无同值短路，
+  会再触发一次 `clear()`，收益为负。另「macOS 右键只发 `Down` 不发 `Up` 会破坏
+  后续拖选」也不是根因：`Selection::begin` 会无条件重建锚点与相位，
+  不依赖先收到 `Up` 收尾（见 `crates/ys-tui-coding/src/selection.rs` 的 `begin`）。
 
 **md 渲染（§14）的诚实清单**：
 
@@ -1472,6 +1492,29 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
   `contextmenu` 弹自己的菜单（`terminal.integrated.rightClickBehavior`），应用发什么
   都改变不了它。挂右键就等于在那类终端里永远复制不了。右键保留为**补救**入口：高亮
   还在时任一位都能重写剪贴板（各终端上报形态不同：`Down` / `Up` / `Drag(Right)` 都算）。
+- **右键的宿主副作用会连带打掉拖选**（VS Code on macOS，**宿主侧缺陷，应用无解**）：
+  macOS 上 `terminal.integrated.rightClickBehavior` 默认 `"selectWord"` ⇒ xterm.js
+  `rightClickSelectsWord: true` ⇒ 右键触发 `rightClickSelect()` 改动内部选区，随后
+  `_handleProtocolChange` 里 `t & 4 ? mousedrag ??= … : (mousedragListener.clear(), …)`
+  走到 `clear()` 且**不再挂回**。该监听器是 `Drag`（`_handleMouseDrag`）**与** `Up`
+  （`_handleMouseUp` 同步清的 `mouseupListener`）的唯一来源，而 `Down` 由
+  `_handleMouseDown` 直接 `_sendEvent`、不依赖监听器 ⇒ 症状恰是「按下有反应、拖动与
+  松手全丢」。真机判据：相邻两次 `Down(Left)` 之间**没有 `Up(Left)`** —— 一次真实点击
+  不可能如此（见下「真机实测」）。
+
+  **应用侧无法规避**：`?1003h`（ANY，events=31）不豁免 `_handleMouseUp` / 协议变更的
+  `clear()` 路径，且实测用 `?1003h` 的 Codex 同样失败；重发协议序列反而会因为
+  `activeProtocol` 的 setter 无同值短路（每次赋值都 `fire`）再次触发 `clear()`，收益为负。
+  **唯一可行的规避在宿主设置**：
+
+  ```json
+  "terminal.integrated.rightClickBehavior": "nothing"
+  ```
+
+  **不能取 `copyPaste` / `paste`**：`handleMouseEvent` 判的是 **xterm 自己的**选区
+  （`this._ctx.instance.hasSelection()`），而本应用的选区画在 ratatui 里、xterm 完全
+  不知道 ⇒ 该判断恒 false，右键会退化成**粘贴**，把剪贴板内容插进输入框。`"nothing"`
+  同时绕过 `rightClickSelectsWord` 与右键菜单，是唯一干净的取值。
 - **复制后高亮保留**：`Selection::mark()` 不清选区——高亮留到下次左键点击、用户主动
   滚动或 resize。左键**不是**复制键：它的语义是「清掉旧选区 + 开始新选区」。滚轮
   **不算**复制触发（它的语义是滚动，清选区不复制）。
@@ -1480,7 +1523,8 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
   此时事件**根本不到应用** —— 应用侧无论如何改都看不见那个手势。这也是为什么
   「高亮两套、右键拷不了」只能靠「别按 ⇧」解决，而不是靠应用内分支。
 - **`?1002h` 不可省**：不开它终端**根本不产生 `Drag` 事件**，拖选会停在按下点。
-  另 `?1003h` 有意不开 —— 它对拖选无用，却让指针一动就产生 `Moved` 风暴。
+  另 `?1003h` 有意不开 —— 它对拖选无用，却让指针一动就产生 `Moved` 风暴，且不解决
+  上面那条宿主缺陷（events=31 只是多了 `mousemove`，拖拽仍走 `mousedragListener`）。
 
 选区清理是契约（`Event::Resize` / `PageUp`·`PageDown` / 滚轮 / 跳首跳尾 / 回放替换 /
 左键按下 / 两端点重合的 `Up`），而 `drag_tick` 的**自动滚动不得清**（否则拖到边缘即自我取消）；

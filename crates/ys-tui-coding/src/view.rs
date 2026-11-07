@@ -151,7 +151,7 @@ pub struct CodingView {
     pub version: String,
     /// 定时循环的状态投影（`/loop`）。`None` = 没有循环在跑。
     ///
-    /// **已投影的显示值**：“间隔怎么格式化”、“下次几点”由 app 侧算好 ——
+    /// **已投影的显示值**：「间隔怎么格式化」「还有多久」都由 app 侧算好 ——
     /// 渲染层不做时间格式判断，只把两段文字拼进状态行。
     pub loop_state: Option<LoopView>,
 }
@@ -161,8 +161,12 @@ pub struct CodingView {
 pub struct LoopView {
     /// 间隔的显示串（`5m` / `2h`）。
     pub interval: String,
-    /// `None` = 正在跑回合；`Some` = 空闲，等这个时刻（`HH:MM`）。
-    pub next_at: Option<String>,
+    /// `None` = 正在跑回合；`Some` = 空闲，给的是**相对时长**（如 `14 分后`）。
+    ///
+    /// 不是钟点：`Instant → 本地时间` 需要时区偏移，而那个函数在
+    /// `ys-tui-coding::clock` 里是 `pub(crate)`、app 侧拿不到。相对时长与机器
+    /// 时区无关且永远正确。
+    pub next_label: Option<String>,
 }
 
 impl Default for CodingView {

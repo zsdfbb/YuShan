@@ -970,10 +970,14 @@ fn status_text(app: &App, width: usize) -> String {
     if let Some((note, _)) = &app.status_note {
         segs.push(format!("✓ {note}"));
     }
-    // 定时循环段排在**首段之后、model 之前**（与 `status_note` 同规）：窄终端剥尾时
-    // 它得留下 —— 它是「正在被自动推进」的信号，比 model / tokens 更紧急。
+    // 定时循环段排在**首段之后、model 之前**（与 `status_note` 同规）：剥尾是从
+    // 尾部逐段进行的，所以它比 model / tokens 更晚被剥 —— 「正在被自动推进」
+    // 这个信号因此保得住。
+    //
+    // 但它**不是不可剥夺的**：极窄终端（连「首段 + 本段」都放不下）会退到只剩首段，
+    // 此时本段消失。这是剥尾算法的必然 —— 没有哪一段能在宽度不足时强制留下。
     if let Some(loop_state) = &app.view.loop_state {
-        let phase = match &loop_state.next_at {
+        let phase = match &loop_state.next_label {
             Some(at) => format!("下次 {at}"),
             None => "正在跑".to_string(),
         };

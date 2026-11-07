@@ -50,7 +50,7 @@ const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|
 /// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
 const EFFORT_DEFAULT_TOKEN: &str = "default";
 
-static COMMANDS: [CommandSpec; 17] = [
+static COMMANDS: [CommandSpec; 18] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -132,6 +132,13 @@ static COMMANDS: [CommandSpec; 17] = [
         // 用户在 `/help` 里要的是「这条命令干什么、会看到什么」。
         description: "压缩上下文；先提示再报告前后估算",
         arg_hint: None,
+    },
+    CommandSpec {
+        name: "loop",
+        // 「仅 git 仓库生效」必须写在说明里：判据是 `git HEAD` 变化，非 git
+        // 工作区下 `/loop` 会被拒绝登记（不然状态行会显示一个永不会触发的循环）。
+        description: "定时唤醒（仅 git 仓库；靠 HEAD 变化判断）",
+        arg_hint: Some("<间隔> <提示词> | off"),
     },
     CommandSpec {
         name: "export",
@@ -423,13 +430,21 @@ const LOOP_USAGE: &str =
 ///
 /// 只收单个 `<数字><单位>`：`1h30m` 这种复合写法不支持 —— 它要额外的解析与
 /// 进位规则，而幂数场景（盯 CI、等构建）用单一单位就够。
+///
+/// **按字符切、不按字节切**：`spec.len()` 是字节长度，`split_at(len - 1)` 要求
+/// 落在 UTF-8 字符边界上。中文单位（`5秒`、`5分`）末字符占 3 字节 ⇒ 字节下标
+/// 落在字符内部 ⇒ `split_at` **panic**。而这条路径的契约是「非法输入只本地
+/// 提示、不改变任何状态」，panic 会让整个 TUI 进程退出（`install_panic_hook`
+/// 有意不做 `catch_unwind`）⇒ 用户丢全部会话现场。
 fn parse_interval_secs(spec: &str) -> Option<u64> {
-    let (digits, unit) = spec.split_at(spec.len().checked_sub(1)?);
+    // `char_indices` 取最后**一个字符**的起点，而不是「长度减一」。
+    let (unit_at, unit) = spec.char_indices().next_back()?;
+    let digits = &spec[..unit_at];
     let n: u64 = digits.parse().ok()?;
     let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(3600)?,
+        's' => n,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3600)?,
         _ => return None,
     };
     (LOOP_MIN_SECS..=LOOP_MAX_SECS)
@@ -1527,7 +1542,8 @@ mod tests {
             names,
             vec![
                 "help", "keybind", "status", "skills", "copy", "quit", "thinking", "effort",
-                "theme", "model", "login", "logout", "new", "clear", "resume", "compact", "export",
+                "theme", "model", "login", "logout", "new", "clear", "resume", "compact", "loop",
+                "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );
@@ -2226,6 +2242,13 @@ mod tests {
         assert_eq!(parse_interval_secs("m"), None);
         // 负号不是数字 ⇒ 解析失败（而不是溢出成一个巨大的 u64）。
         assert_eq!(parse_interval_secs("-5m"), None);
+        // **多字节单位不得 panic**：`split_at(len-1)` 会切在字符内部。
+        // 这条路径的契约是「非法输入只提示」，崩溃会让整个 TUI 退出。
+        assert_eq!(parse_interval_secs("5秒"), None);
+        assert_eq!(parse_interval_secs("5分"), None);
+        assert_eq!(parse_interval_secs("分"), None);
+        // 纯多字节串 / 中文数字同样只是解析失败。
+        assert_eq!(parse_interval_secs("五分钟"), None);
     }
 
     /// `5m` 与 `300s` 等价 —— 单位只是书写方式，不是语义。

@@ -398,7 +398,7 @@ C4 决定了什么能放进 `has_work`：
 **改动面**：`Request` 加一个 `Request::Loop { interval, prompt }`（`ys-protocol/src/request.rs`），
 在 `app_loop` 的 `Request` 分支处理（不发回合，只更新定时器状态）。
 
-**命令解析在 `crates/ys-tui-coding/src/commands.rs:355`**（`"compact"` 那一带），
+**命令解析在 `crates/ys-tui-coding/src/commands.rs` 的命令分派处**（`"compact"` 那一带），
 **不在** `capabilities.rs` —— 后者是「收到 `Request` 之后世界怎么变」，
 命令名 → `Action` 的映射归 TUI。两类结果分开：
 
@@ -406,7 +406,8 @@ C4 决定了什么能放进 `has_work`：
 |---|---|---|
 | `/loop 5m xxx` | `Request::Loop { .. }` | app 更新定时器 |
 | `/loop off` | `Request::LoopOff` | app 清定时器 |
-| `/loop`（无参）/ 非法间隔 | `Action::Local(LocalAction::Hint(..))` | **TUI 本地提示**，不发请求 |
+| `/loop`（无参）/ 非法间隔 | `Action::Local(LocalAction::Hint(..))` | **TUI 本地提示**，不发请求（**多字节单位也不得 panic** —— 按字符切、不按字节切） |
+| `/loop` 但工作区非 git 仓库 | `Request::Loop` 被拒 | app 报一行诊断、**不登记**（见 §4.3） |
 | 状态显示 | — | 状态行读**视图快照**，不是命令输出 |
 
 **间隔格式**：只收 `<数字><单位>`，单位 ∈ `s` / `m` / `h`（`5m` / `90s` / `2h`）。
@@ -417,8 +418,13 @@ C4 决定了什么能放进 `has_work`：
 | 触发器 | 行为 |
 |---|---|
 | `/loop off` | 清定时器；**已在跑的回合不中断** |
-| `Ctrl+C` / `Esc`（空闲时） | 等价于 `/loop off` |
+| `Ctrl+C`（空闲时） | **不单独接** —— 它直接退出进程，循环随进程一起消失。多按一次确认是 `Ctrl-D` 的既有语义，插入一层「先停循环、不退出」会让退出路径变长 |
+| `Esc`（空闲时） | **不接** —— 它是「清空输入框」，被用户高频用来改错字。让它顺手停掉循环 = 一次误按丢掉定时器 |
 | 用户直接敲字 | **默认不取消** —— 用户可能只是想插话 |
+
+**只有 `/loop off` 一个取消入口**，这是刻意的：定时唤醒会在「用户不在看屏幕」时
+花钱，所以停它的动作必须是**明确的、不能被别的键顺带触发**的。退出进程也是一条
+合法取消路径（进程没了就没有定时器），只是它同时结束会话。
 
 **“已在跑的回合不中断”是硬规则**：取消定时器 ≠ 取消当前工作。
 若一并中断，用户会因为“取消了个循环”而丢掉一个已干一半的回合。
@@ -429,25 +435,34 @@ C4 决定了什么能放进 `has_work`：
 
 | 层 | 落点 | 改什么 |
 |---|---|---|
-| 协议/视图 | `crates/ys-tui-coding/src/view.rs:83` `CodingView` | 加 `loop_state: Option<LoopView>` |
-| 快照 | `apps/coding-agent/src/view.rs:41` `build_view` | loop 状态是 `build_view` 的**新入参** |
-| 渲染 | `crates/ys-tui-coding/src/draw.rs:961` `status_text` | 插一段（位置见下） |
+| 协议/视图 | `crates/ys-tui-coding/src/view.rs` `CodingView` | 加 `loop_state: Option<LoopView>` |
+| 快照 | `apps/coding-agent/src/view.rs` `build_view_with_loop` | 在 `build_view` 之上填 `loop_state`（`build_view` 有十余处调用点，其中绝大多数与定时器无关，所以另开一个入口而不是拉长签名） |
+| 渲染 | `crates/ys-tui-coding/src/draw.rs` `status_text` | 插一段（位置见下） |
 
 ```rust
 pub struct LoopView {
     /// 间隔的显示串（`5m` / `2h`）——已格式化，渲染层不再算。
     pub interval: String,
-    /// `None` = 正在跑回合；`Some` = 空闲，等这个时刻（`HH:MM`）。
-    pub next_at: Option<String>,
+    /// `None` = 正在跑回合；`Some` = 空闲，给的是**相对时长**（`14 分后`）。
+    ///
+    /// 不是钟点：`Instant → 本地时间` 需要时区偏移，而 `ys-tui-coding::clock`
+    /// 里的 `hhmm_at` 是 `pub(crate)`、app 侧拿不到。冒充一个 UTC 钟点让用户
+    /// 按错的时间等待，比给相对时长更糟。
+    pub next_label: Option<String>,
 }
 ```
 
 状态行形状：
 
 ```
-[loop] 5m · 下次 14:32     ← 空闲
-[loop] 5m · 正在跑        ← 有回合在执行
+[loop] 5m · 14 分后     ← 空闲
+[loop] 5m · 正在跑      ← 有回合在执行
 ```
+
+**视图刷新只有一个位置**：循环尾部那次统一 `emit_view`。各请求臂不自行补刷 ——
+那会让每个 `/loop` 产生两个 `View`（UI 白重绘一帧，且测试会把第一条命令的第二个
+`View` 误认成第二条命令的结果）。`Wake::TimerFired` 是例外（它 `continue`，走不到
+尾部），故由它自己发。
 
 **段的位置**：紧跟首段（`⏳` / `○`）之后、`model` 之前。理由同 `status_note`
 （`draw.rs:967-969`）：窄终端剥尾时它先掉不了；它是「正在被自动推进」的信号，
@@ -549,7 +564,10 @@ ADR-0041 否决的是「模型自述」作为依据。判据来源的合法集�
 | 13 | `has_work` 为假 ⇒ **不 append、不调模型、不增 session**（零 token 的变异测试点） | 判据 | 二期 |
 | 14 | `has_work` 为假 ⇒ 定时器被推远，不忙转（C3） | 并发 | 二期 |
 | 15 | `/loop 5m x` 再敲一次 ⇒ **覆盖**，不叠加（单条语义） | 命令 | 二期 |
-| 16 | `/loop off` ⇒ 定时器清空；**已在跑的回合不中断** | 命令 | 二期 |
+| 16 | `/loop off` ⇒ 定时器清空；**已在跑的回合不中断**；没在跑时**零输出** | 命令 | 二期 |
+| 16a | `/clear` ⇒ 循环作废 | 命令 | 二期 |
+| 16b | 非 git 工作区 ⇒ `/loop` 拒绝登记并说明原因 | 命令 | 二期 |
+| 16c | 多字节间隔（`5秒`）⇒ 本地提示，**不得 panic** | 命令 | 二期 |
 | 17 | 状态行显示 `[loop] <间隔> · <还有多久>` / `正在跑`（可见性） | 集成 | 二期 |
 | 18 | `/resume` 后不自动续跑，且**运行中换会话**时显式提示 | 集成 | 二期 |
 | 19 | 判官判「未达成」⇒ 继续；「达成」⇒ 停 | 判据 | 三期 |
@@ -583,6 +601,23 @@ ADR-0041 否决的是「模型自述」作为依据。判据来源的合法集�
 **视图刷新只有一个位置**：`loop_state` 必须在**循环尾部那次统一 `emit_view`** 里带上。
 曾分别在各请求臂里补刷，结果是每个 `/loop` 产生两个 `View` —— UI 白重绘一帧，
 且连测试都会把第一条命令的第二个 View 误认为第二条命令的结果。
+
+### 8.2 评审发现（已修，记录防止回退）
+
+| # | 缺陷 | 根因 | 守卫用例 |
+|---|---|---|---|
+| 1 | `/loop 5秒` 让整个 TUI **panic** | `spec.split_at(len - 1)` 按**字节**切，落在多字节字符内部。而该路径的契约是「非法输入只本地提示」 | `test_parse_interval_rejects_out_of_range_and_malformed`（含 `5秒` / `5分` / `五分钟`） |
+| 2 | 非 git 工作区下 `/loop` 静默永不生效，状态行却一直显示在跑 | `should_tick` 恒假 ⇒ 循环登记成功但永不触发。**主动误导**比报错更坑 | `loop_rejected_in_non_git_workspace` |
+| 3 | 没在跑时 `/loop off` 发一条**空 `Output`** ⇒ transcript 落一条空白 System 行 | `lines.push("")` 让 `Vec` 非空 ⇒ 尾部 `if !lines.is_empty()` 通过 | `loop_off_without_loop_is_silent`（断言**任何** `Output` 都不许有，而非「不含 Loop stopped」） |
+| 4 | `/clear` / `/resume` 两条清零点零测试 | 只测了 `/new` | `clear_session_clears_loop` / `resume_to_other_session_stops_loop_with_notice` |
+| 5 | `/resume` 到**同一**会话也报 `session changed` 并丢掉循环 | 只看 `resumed.is_some()`，没比对前后路径 | `resume_to_same_session_keeps_loop` |
+| 6 | 8 条新用例绕过 `env_lock` 且真往 `~/.yushan/logs` 写文件 | 用 `spawn_app_loop_prelocked` 却没持锁（该参数的契约就是「调用方已持锁」） | `LoopEnv`（持锁 + 隔离 `YUSHAN_LOG_DIR` + 关 debug） |
+| 7 | `/loop` 不在 `COMMANDS` 表 ⇒ 补全浮层 / `/help` / 未知命令提示都看不到它 | 只加了分派分支 | 表内条目 + `test_every_command_maps_to_the_designed_action` |
+
+**`env_lock` 的粒度**：只圈住 spawn（`Config::from_env` / `resolve_log_dir` /
+`debug_enabled` 都在那时读环境变量），不留到用例结束 —— 后者会让 8 条用例整段
+串行，实测 2.6s → 9s 而收益为零。注意它是**不可重入**的 `std::sync::Mutex`：
+`env_prelocked = true` 的调用方自己持锁，`spawn_app_loop_full` 内**不得**再加。
 
 ## 9. 固有限制（不是缺陷，不要当 bug 修）
 

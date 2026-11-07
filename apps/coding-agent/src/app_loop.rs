@@ -339,8 +339,13 @@ struct LoopState {
     interval: std::time::Duration,
     /// 给模型的提示词（原样作为 tick 消息正文）。
     prompt: String,
-    /// 上次起完回合时的 `HEAD`。判据拿它与当前值比 ——
-    /// **基准是「上次醒来时」而不是「本回合前后」**，这与一期的取点不同。
+    /// 判据的基准 `HEAD`：`HEAD != last_head` ⇒ 外部状态变了 ⇒ 起回合。
+    ///
+    /// 只在两处更新：`/loop` 创建时（取当前值）、每次定时回合**结束后**
+    /// （再取一次）。取在回合**之前**会让本回合自己提交的代码在下一个周期被
+    /// 误判为「外部有新变化」⇒ 空闲循环每个间隔白跑一次。
+    /// 零 token 的 tick **不**更新它 —— 那些 tick 没有观察对象，取了也只会
+    /// 掩盖期间真正发生的变化。
     last_head: Option<String>,
 }
 
@@ -371,7 +376,7 @@ impl LoopState {
     fn view(&self, turning: bool) -> ys_tui_coding::LoopView {
         ys_tui_coding::LoopView {
             interval: self.interval_label(),
-            next_at: (!turning)
+            next_label: (!turning)
                 .then(|| relative_label(self.next_at.saturating_duration_since(Instant::now()))),
         }
     }
@@ -841,15 +846,29 @@ pub async fn run(
                 //
                 // `git_head` 是阻塞调用，但本条命令本来就是**偶尔一次**的用户动作
                 // （不是每回合、也不是每次重绘），几毫秒的 `rev-parse` 在这里无需
-                // 挤线程池；C4 约束的是**每间隔一次**的 `has_work`，不是这里。
+                // 挤线程池；C4 约束的是**每间隔一次**的 `should_tick`，不是这里。
                 let last_head = crate::post_turn::git_head(Some(&config.cwd));
-                let interval = std::time::Duration::from_secs(interval_secs);
-                loop_state = Some(LoopState {
-                    next_at: Instant::now() + interval,
-                    interval,
-                    prompt,
-                    last_head,
-                });
+                if last_head.is_none() {
+                    // **取不到 `HEAD` 就不登记**：`should_tick` 在那种环境下恒为假
+                    // ⇒ 循环永远不触发。若照旧登记，状态行会一直显示「4 分后」
+                    // 却一个回合也不起 —— 那是**主动误导**，比报错更坑。
+                    //
+                    // 判据需要「上次的 HEAD」作为基准；没有基准就没有定时唤醒的
+                    // 可能性，连带下限也没有意义。
+                    lines.push(
+                        "Loop not started: current workspace is not a git repository \
+                         (timed wake-ups key off `git HEAD` changes)."
+                            .to_string(),
+                    );
+                } else {
+                    let interval = std::time::Duration::from_secs(interval_secs);
+                    loop_state = Some(LoopState {
+                        next_at: Instant::now() + interval,
+                        interval,
+                        prompt,
+                        last_head,
+                    });
+                }
                 // **不在这里刷视图**：本臂末尾会落到循环尾部的统一刷新，
                 // 那里已用 `build_view_with_loop` 带上 `loop_state`。多刷一次会让
                 // 每个 `/loop` 产生两个 View —— UI 白重绘一帧，测试也会把第一条
@@ -860,14 +879,14 @@ pub async fn run(
                 // **已在跑的回合不中断**：取消只影响“下一次唤醒”，不影响当前回合。
                 // 硬规则 —— 用户敲 `/loop off` 通常是发现它跑得不对，而不是要丢掉
                 // 手头这一轮已经花了钱的结果。
-                let was_running = loop_state.take().is_some();
-                lines.push(if was_running {
-                    "Loop stopped.".to_string()
-                } else {
-                    // 没在跑就不发文案：`/loop off` 幂等，静默成功。
-                    // （与 `SetThinking` / `SetTheme` 同纪律：无变化不产用户可见输出。）
-                    String::new()
-                });
+                //
+                // 没在跑就不发文案：`/loop off` 幂等，静默成功（与 `SetThinking` /
+                // `SetTheme` 同纪律：无变化不产用户可见输出）。**不得 `push("")`**——
+                // 全空串的 `Vec` 是 non-empty，会发一条 `Outbound::Output("")`，
+                // 在 transcript 里落一条空白 System 行。
+                if loop_state.take().is_some() {
+                    lines.push("Loop stopped.".to_string());
+                }
                 // 视图交给循环尾部的统一刷新（它按 `loop_state` 现算，此刻已是 `None`）。
             }
 
@@ -1174,11 +1193,15 @@ pub async fn run(
                 lines = out_lines;
                 if let Some(r) = resumed {
                     // **`--resume` 不自动续跑**：`loop_state` 从不落盘，故恢复后恒为
-                    // `None`。但本臂是「运行中换会话」，若这里有条 在跑的循环，它属于
-                    // **旧** session —— 作废，并显式告知（否则用户毫不知情地失去定时器）。
-                    // 静默不续跑是对的（回归用户发现自己回来就持续烧钱更糟），但**不能
-                    // 静默地停掉一个用户刚设的循环**。
-                    if loop_state.take().is_some() {
+                    // `None`。本臂是「运行中换会话」：旧循环属于**旧** session，
+                    // 作废。静默不续跑是对的（用户发现自己回来就持续烧钱更糟），
+                    // 但**不能静默停掉一个则设的循环**。
+                    //
+                    // **同路径不是「换会话」**：批到同一文件时只开新 run，
+                    // 工作区未变、循环依旧有效 ⇒ **保留**。否则用户只是「重开了
+                    // 当前会话」就丢掉刚设的定时器，且文案（session changed）是假的。
+                    let switched = wiring.session_path().map(Path::to_path_buf) != path_before;
+                    if switched && loop_state.take().is_some() {
                         lines.push(
                             "Loop stopped (session changed). Use /loop to restart.".to_string(),
                         );
@@ -1767,12 +1790,12 @@ fn loop_placeholder(prompt: &str) -> Message {
     }
 }
 
-/// 把一个 `Instant` 渲染成 `HH:MM`（状态行的「下次几点」）。
+/// 把剩余时长渲染成状态行的「还有多久」（`14 分后`）。
 ///
-/// **不算时区**：`Instant` 与系统钟点不可互推，而本 crate 没有本地时区偏移
-/// （那在 `ys-tui-coding::clock` 里，且是 `pub(crate)`）。给定一个 UTC 值再冒充
-/// 本地时间，比不显示更糟 —— 用户会按错的时间预期下一轮。
-/// 所以这里改用**相对时长**：“14 分后”，与机器时区无关且永远正确。
+/// **给的是相对时长，不是钟点**：`Instant` 与系统钟点不可互推，而本地时区偏移
+/// 在 `ys-tui-coding::clock` 里是 `pub(crate)`、本 crate 拿不到。给一个 UTC 钟点
+/// 再冒充本地时间比不显示更糟 —— 用户会按错的时间预期下一轮。相对时长与机器
+/// 时区无关且永远正确。
 fn relative_label(d: std::time::Duration) -> String {
     // **向上取整**：截断会把「还有 0.9 秒」显示成「0 秒后」—— 一个不存在的时刻。
     // 对短间隔（10s 量级）这条差别直接决定状态行是否可信。
@@ -2495,6 +2518,12 @@ mod tests {
         // `env_lock` 下 `set_var` / `remove_var` —— 只读也须串行。
         // 锁**只圈住这次 `getenv`**，不跨下方的 `.await`：`MutexGuard` 非 `Send`，
         // 跨 await 会让整个 future 失去 `Send`（且本就无故长持全局锁）。
+        // `Config::from_env` 会 `getenv` 凭证 key，而 `config.rs` 的用例正在
+        // `env_lock` 下 `set_var` / `remove_var` —— 只读也须串行。
+        //
+        // `env_prelocked = true` 表示**调用方已持有 `env_lock`**（该锁是不可重入的
+        // `std::sync::Mutex`，此处再锁会**同线程死锁**）⇒ 直接取用。
+        // 锁不跨下方任何 `.await`：`MutexGuard` 非 `Send`，且无故长持全局锁。
         let mut config = if env_prelocked {
             Config::from_env().unwrap()
         } else {
@@ -2546,6 +2575,8 @@ mod tests {
 
         // 与生产侧同规：debug sink 在 `Wiring` 建好、会话路径已知之后打开，
         // 并由「启动期一方」写第一条 `run_start`。关闭时 `open_enabled` 早退。
+        // 两条路径都必须持锁：`resolve_log_dir` 与 `debug_enabled` 都读环境变量。
+        // `env_prelocked` 的调用方**已**持锁（同一把），这里直接取用。
         let mut debug = if env_prelocked {
             let log_dir = crate::logging::resolve_log_dir();
             crate::debug_log::open_enabled(debug_flag, wiring.session_path(), log_dir.as_ref())
@@ -5291,6 +5322,36 @@ mod tests {
         .await
     }
 
+    /// 同 [`spawn_resumable`]，但把工作目录建在一个**真实 git 仓库**里。
+    ///
+    /// `/loop` 在非 git 工作区会被拒绝登记（判据无法成立），而这些用例要的是
+    /// 「有循环在跑时换会话」这个前提，所以仓库必须存在。
+    async fn spawn_resumable_in_git(replies: usize, tag: &str) -> Harness {
+        let tmp = TempDir::new(tag);
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        // `tmp` 的 `Drop` 会删掉 repo ⇒ 本用例要求它在整个用例期间存在，
+        // 而 `Harness` 持有的是它**自己**的临时目录，装不下这个。
+        // 故显式泄漏：测试进程短命，路径带 pid + 原子序号，不会串台。
+        std::mem::forget(tmp);
+        let initial = MockModel::new("initial");
+        initial.push_text("initial");
+        spawn_app_loop_with(Box::new(initial), true, Vec::new(), move |config, _tmp| {
+            config.cwd = repo;
+            config.api_base = Some("http://resume-base/v1".into());
+            config.api_key = Some("sk-resume".into());
+            config.set_model_factory(move |_| {
+                let m = MockModel::new("resumed");
+                for _ in 0..replies {
+                    m.push_text("done");
+                }
+                Some(Box::new(m))
+            });
+        })
+        .await
+    }
+
     /// 往 harness 的 `sessions/` 里落一个会话文件（首行 meta + 若干消息）。
     fn write_target_session(
         h: &Harness,
@@ -6935,16 +6996,58 @@ mod tests {
 
     // ---- 定时循环的端到端接线（`Wake::TimerFired`）----
 
+    /// 定时循环用例的**环境护栏**：整段独占 `env_lock`、关 debug、日志落临时目录。
+    ///
+    /// 必须与 [`FollowUpEnv`] 同规：`spawn_app_loop_prelocked` 的契约是「调用方已持锁」，
+    /// 而它据此**不再隔离** `YUSHAN_LOG_DIR`（`resolve_log_dir()` 未设时落
+    /// `~/.yushan/logs`，且 debug 未设时**默认开启**）⇒ 不持锁的用例每跑一次
+    /// 就往开发机写一批 `debug-*.jsonl`，同时把 `getenv` 暴露在并行 `set_var` 下。
+    struct LoopEnv {
+        _dir: TempDir,
+        _restore: crate::test_env::EnvRestore,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl LoopEnv {
+        fn new(tag: &str) -> Self {
+            let guard = crate::test_env::env_lock();
+            let dir = TempDir::new(tag);
+            let restore = crate::test_env::EnvRestore::capture(&[
+                crate::debug_log::DEBUG_ENV,
+                crate::logging::LOG_DIR_ENV,
+            ]);
+            // SAFETY: 持有 env_lock，独占这两个变量的修改与恢复。
+            unsafe {
+                std::env::set_var(crate::debug_log::DEBUG_ENV, "0");
+                std::env::set_var(crate::logging::LOG_DIR_ENV, dir.join("logs"));
+            }
+            Self {
+                _dir: dir,
+                _restore: restore,
+                _guard: guard,
+            }
+        }
+    }
+
     /// 定时循环用例的**统一前设**：开关关（本批不测提交追问）、cwd 指向真实仓库。
     ///
     /// `cwd` 必须经 `tweak` 在起循环前改到仓库 —— `/new` / `/resume` 会重算工作区，
     /// 但本批用例不碰它们。
+    /// **锁只圈住 spawn**：`Config::from_env` / `resolve_log_dir` / `debug_enabled`
+    /// 都在 spawn 期间读环境变量，此后 app 循环不再 `getenv`。把 `LoopEnv` 留到
+    /// 用例结束会让 8 条用例整段串行（实测 2.6s → 9s），而收益为零。
+    ///
+    /// `LoopEnv` 在函数返回时 `Drop` ⇒ 恢复环境变量并释放锁；debug 文件已按
+    /// 临时目录打开，后续写入不受影响。
     async fn loop_harness(model: Box<dyn Model>, repo: &Path) -> Harness {
+        let env = LoopEnv::new("loop-env");
         let repo = repo.to_path_buf();
-        spawn_app_loop_prelocked(model, move |config, _tmp| {
+        let h = spawn_app_loop_prelocked(model, move |config, _tmp| {
             config.cwd = repo;
         })
-        .await
+        .await;
+        drop(env);
+        h
     }
 
     /// **命中一次时间点且 `HEAD` 真的变了 ⇒ 恰好起一个回合。**
@@ -7116,7 +7219,7 @@ mod tests {
             Outbound::View(v) => v.loop_state.clone(),
             _ => None,
         });
-        let label = state.expect("循环在跑 ⇒ 视图必须有 loop 段").next_at;
+        let label = state.expect("循环在跑 ⇒ 视图必须有 loop 段").next_label;
         // 上面那次刷新取自 `advance()` 之后的 `next_at`；缺 `advance()` 时它是过去
         // 时刻 ⇒ `relative_label` 的向上取整给出 `0 秒后`（`saturating_duration_since`
         // 对过去时刻返回 0）。
@@ -7175,6 +7278,51 @@ mod tests {
         );
     }
 
+    /// **非 git 工作区拒绝登记**并说明原因。
+    ///
+    /// 不拒绝的后果不是「没效果」而是**状态行撒谎**：它会显示一个永远不触发的
+    /// 循环，用户以为在自动推进、实际一个回合都没起。
+    #[tokio::test]
+    async fn loop_rejected_in_non_git_workspace() {
+        let dir = TempDir::new("loop-nongit");
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let log = Arc::new(CallLog {
+            calls: AtomicU32::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut h = loop_harness(Box::new(CountingModel(Arc::clone(&log))), &plain).await;
+
+        h.requests
+            .send(Request::Loop {
+                interval_secs: 1,
+                prompt: "查 CI".into(),
+            })
+            .await
+            .expect("投 /loop");
+        let msgs = collect_until_view(&mut h).await;
+
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                Outbound::Output(t) if t.contains("not a git repository")
+            )),
+            "非 git 工作区必须明确拒绝并说明原因：{msgs:?}"
+        );
+        let state = msgs.iter().rev().find_map(|m| match m {
+            Outbound::View(v) => Some(v.loop_state.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            state,
+            Some(None),
+            "被拒绝时不得留下 loop 段（否则状态行显示一个永不触发的循环）"
+        );
+        // 并且真的不会起回合。
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(log.count(), 0, "被拒绝的循环不得产生任何模型调用");
+    }
+
     /// **`/loop off` 幂等**：没在跑时静默成功，不发任何文案。
     #[tokio::test]
     async fn loop_off_without_loop_is_silent() {
@@ -7189,11 +7337,13 @@ mod tests {
             .await
             .expect("投 /loop off");
         let msgs = collect_until_view(&mut h).await;
+        // **不得产生任何 `Output`**，而不只是「不含 Loop stopped」——
+        // 曾经走的是 `lines.push("")`：空 `Vec` 判非空 ⇒ 发一条空 `Output`
+        // ⇒ transcript 里落一条空白 System 行。「不含某个字符串」这种断言
+        // 对那个 bug 恒真。
         assert!(
-            !msgs
-                .iter()
-                .any(|m| matches!(m, Outbound::Output(t) if t.contains("Loop stopped"))),
-            "没在跑时 /loop off 不得产生 `Loop stopped` 文案"
+            !msgs.iter().any(|m| matches!(m, Outbound::Output(_))),
+            "没在跑时 /loop off 必须完全静默（连空行都不能发）：{msgs:?}"
         );
     }
 
@@ -7227,6 +7377,151 @@ mod tests {
         assert!(commit_in(&repo, "after-new"), "外部提交失败");
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert_eq!(log.count(), 0, "/new 之后旧循环必须失效");
+    }
+
+    /// **`/clear` 作废循环**：与 `/new` 同规（循环归 session）。
+    ///
+    /// 变异：删掉 `Request::ClearSession` 臂的 `loop_state = None` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn clear_session_clears_loop() {
+        let dir = TempDir::new("loop-clear");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        if init_git_repo(&repo).is_none() {
+            return;
+        }
+        let log = Arc::new(CallLog {
+            calls: AtomicU32::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut h = loop_harness(Box::new(CountingModel(Arc::clone(&log))), &repo).await;
+
+        h.requests
+            .send(Request::Loop {
+                interval_secs: 1,
+                prompt: "查 CI".into(),
+            })
+            .await
+            .expect("投 /loop");
+        collect_until_view(&mut h).await;
+
+        h.requests
+            .send(Request::ClearSession)
+            .await
+            .expect("投 /clear");
+        collect_until_view(&mut h).await;
+
+        assert!(commit_in(&repo, "after-clear"), "外部提交失败");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(log.count(), 0, "/clear 之后旧循环必须失效");
+    }
+
+    /// **`/resume` 到别的会话 ⇒ 作废循环并显式告知**（设计 §8 矩阵 #18）。
+    ///
+    /// 变异：删掉 `Request::ResumeSession` 臂里的 `loop_state.take()` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn resume_to_other_session_stops_loop_with_notice() {
+        let mut h = spawn_resumable_in_git(0, "resume-notice").await;
+        let mut meta = ys_session::SessionMeta::new(0);
+        meta.title = Some("目标会话".into());
+        write_target_session(&h, "target-1", &meta, &[user_message("hello")]);
+
+        // 先在**当前**会话设一条循环（`spawn_resumable` 不保证工作区是 git 仓库，
+        // 故这里不依赖定时触发 —— 本用例只验「换会话时被作废并告知」）。
+        let repo = h.temp_path("resume-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let _ = init_git_repo(&repo);
+        h.requests
+            .send(Request::Loop {
+                interval_secs: 3600,
+                prompt: "查 CI".into(),
+            })
+            .await
+            .expect("投 /loop");
+        let reg = collect_until_view(&mut h).await;
+        assert!(
+            reg.iter()
+                .any(|m| matches!(m, Outbound::View(v) if v.loop_state.is_some())),
+            "前置：循环必须真的登记成功（工作区是 git 仓库）：{reg:?}"
+        );
+
+        h.requests
+            .send(Request::ResumeSession {
+                target: "target-1".into(),
+            })
+            .await
+            .expect("投 /resume");
+        let msgs = collect_until_view(&mut h).await;
+
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                Outbound::Output(t) if t.contains("Loop stopped (session changed)")
+            )),
+            "换会话时必须显式告知循环已停（否则用户毫不知情地失去定时器）：{msgs:?}"
+        );
+        // 循环确实没了：后续任何请求的视图里都不该再有 loop 段。
+        h.requests
+            .send(Request::SetThinking { visible: false })
+            .await
+            .expect("取一帧视图");
+        let msgs = collect_until_view(&mut h).await;
+        let still = msgs.iter().rev().find_map(|m| match m {
+            Outbound::View(v) => Some(v.loop_state.clone()),
+            _ => None,
+        });
+        assert_eq!(still, Some(None), "换会话后视图不得再有 loop 段");
+    }
+
+    /// **`/resume` 到同一会话 ⇒ 循环保留**（没换会话就不该说 session changed）。
+    ///
+    /// 变异：把 `if switched && …` 退回 `if loop_state.take().is_some()` ⇒ 本用例变红。
+    #[tokio::test]
+    async fn resume_to_same_session_keeps_loop() {
+        let mut h = spawn_resumable_in_git(0, "resume-same").await;
+        // 让当前会话有落盘路径，才能「恢复自己」。
+        h.requests
+            .send(Request::Prompt(user_message("hi")))
+            .await
+            .expect("先跑一个回合把会话落盘");
+        let _ = collect_until_view(&mut h).await;
+        let path = h.session_path.get().expect("落盘后应有会话路径");
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("会话 id")
+            .to_string();
+
+        h.requests
+            .send(Request::Loop {
+                interval_secs: 3600,
+                prompt: "查 CI".into(),
+            })
+            .await
+            .expect("投 /loop");
+        collect_until_view(&mut h).await;
+
+        h.requests
+            .send(Request::ResumeSession { target: id })
+            .await
+            .expect("投 /resume（同一会话）");
+        let msgs = collect_until_view(&mut h).await;
+
+        assert!(
+            !msgs.iter().any(|m| matches!(
+                m,
+                Outbound::Output(t) if t.contains("Loop stopped")
+            )),
+            "恢复**同一**会话没换 session，不得误报循环已停：{msgs:?}"
+        );
+        let kept = msgs.iter().rev().find_map(|m| match m {
+            Outbound::View(v) => Some(v.loop_state.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(kept, Some(Some(_))),
+            "同一会话恢复后循环必须保留：{kept:?}"
+        );
     }
 
     /// **`/loop` 覆盖不叠加**：再敲一次替换前一条（只有一个定时器）。

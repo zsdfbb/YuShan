@@ -1,10 +1,19 @@
-//! `--help` 文案：**纯文本常量**。
+//! `--help` 文案。
 //!
-//! 零 IO、零状态、零副作用、零依赖 —— 不读环境变量、不读 `all_commands()`、不碰文件系统。
-//! 文案是**手写**的静态字符串：与真实 CLI 语义可能漂移，由 `main.rs` 里的
-//! `parse_args` 侧单测与文案内容单测共同兜底。
+//! 零 IO、零状态、零副作用 —— 不读环境变量、不碰文件系统。
+//!
+//! **TUI 斜杠命令段不在这里**：它由 [`ys_tui_coding::command_list_text`] 从命令表
+//! 生成，与 TUI 内 `/help` 同源。手写那份已经漂移过（`/clear` 的描述与 `/compact`
+//! 的措辞都和命令表不同），而人眼读两份清单比不出差异 —— 让生成消除这一类偏离。
+//!
+//! 静态的四段（用法 / 公共 flag / 环境变量 / 示例）留在常量里：它们**没有**运行时
+//! 事实源可查（`parse_args` 的语义不是数据），只能靠 `main.rs` 侧单测兜。
 
-/// 帮助文档全文（四段：用法 / 环境变量 / TUI 斜杠命令 / 示例）。
+/// 静态三段（用法 / 公共 flag / 环境变量 / 示例）+ 命令段的**插入点**。
+///
+/// 命令段本身不在这里，由 [`help_text`] 从命令表生成填入。
+///
+/// 命令段占一个标记行，内容由 [`help_text`] 填入其后的空行处。
 const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent 运行时
 
 用法：
@@ -48,34 +57,30 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
   搜索后端各自配置才进链，彼此独立、不互斥。
 
 TUI 斜杠命令：
-  以下斜杠命令仅在交互式 TUI 内可用，入口：先启动 TUI 然后输入 /。
-  /help [command]      显示可用命令
-  /keybind             列出全部快捷键
-  /status              显示当前配置与状态
-  /skills              查看并选择一个 skill
-  /copy                复制最后一条回复的 Markdown 原文到系统剪贴板
-  /quit                退出
-  /thinking [on|off]   开关思考内容的显示
-  /effort [off|minimal|low|medium|high|xhigh|max|default]   设置模型思考档位
-  /theme [name]        切换配色主题（无参时浮层选择）
-  /model [model_name]  切换模型（无参时浮层选择）
-  /login               登录 provider 并保存凭证
-  /logout              登出并清除凭证
-  /new                 开新会话
-  /clear               清空上下文并清屏（旧会话文件保留，可 /resume 找回）
-  /resume [id]         恢复既有会话（无参列出并选择）
-  /compact             压缩上下文（先提示，再报告前后估算）
-  /loop <间隔> <提示词>  定时唤醒（如 /loop 5m 查 CI）；/loop off 停止；仅 git 仓库
-  /export [path]       导出会话到文件
 
 示例：
   ys-coding-agent -p "解释这个仓库的架构"
   ys-coding-agent --json --stats "跑一遍测试"
   ys-coding-agent --resume 2026-10-07-abc"#;
 
-/// 帮助文档全文（供 `main` 在 `parse_args` 之后立即早退打印）。
-pub fn help_text() -> &'static str {
-    HELP_TEXT
+/// 帮助文档全文：静态三段 + **生成**的 TUI 斜杠命令段。
+///
+/// 命令段插在环境变量之后、示例之前 —— 与拆分前的版式一致，也让「先读配置、
+/// 再看命令」这个阅读顺序不变。
+pub fn help_text() -> String {
+    const MARKER: &str = "TUI 斜杠命令：\n";
+    const HEAD: &str = "  以下斜杠命令仅在交互式 TUI 内可用，入口：先启动 TUI 然后输入 /。\n\n";
+
+    let (before, after) = HELP_TEXT
+        .split_once(MARKER)
+        .expect("静态部分必须留命令段的插入点");
+    // 命令表每行自带尾换行 ⇒ 先 `trim_end`，再由这里补**一个**换行 + 空行，
+    // 免得拼出「只有两个空格」的那种游离行（它会破坏 `--help` 的段落节奏）。
+    format!(
+        "{before}{MARKER}{HEAD}{}\n\n{}",
+        ys_tui_coding::command_list_text().trim_end(),
+        after.trim_start_matches('\n')
+    )
 }
 
 #[cfg(test)]
@@ -83,38 +88,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_text_has_no_own_trailing_newline_and_documents_debug_default() {
-        assert!(!HELP_TEXT.ends_with('\n'), "`println!` 负责唯一的尾换行");
-        assert!(HELP_TEXT.contains("默认开启"));
-        assert!(HELP_TEXT.contains("YUSHAN_DEBUG=0"));
+    fn help_text_has_no_trailing_newline_and_documents_debug_default() {
+        let text = help_text();
+        assert!(!text.ends_with('\n'), "`println!` 负责唯一的尾换行");
+        assert!(text.contains("默认开启"));
+        assert!(text.contains("YUSHAN_DEBUG=0"));
 
-        let rendered = format!("{}\n", help_text());
+        let rendered = format!("{text}\n");
         assert!(rendered.ends_with('\n'));
         assert!(!rendered.ends_with("\n\n"), "help stdout 不得有双尾换行");
     }
 
-    /// `--help` 的 TUI 命令段必须列全 [`ys_tui_coding::all_commands`] 的每一条。
+    /// `--help` 的斜杠命令段**逐字**等于命令表渲染结果。
     ///
-    /// 这段文案是**手写**的（见模块头：零依赖、不读运行时状态），而 TUI 内的 `/help`
-    /// 由命令表生成 —— 两份同源信息一旦漂移，用户在启动前查到的命令清单就是错的。
-    /// 本用例把「漏一条」变成编译期之外可执行的失败：新增命令忘了补这里 ⇒ 变红。
+    /// 命令段由 [`ys_tui_coding::command_list_text`] 生成，所以本用例守的是
+    /// 「插入点还在、且没有被别的字符挤掉」——不是「有没有漏一条」。真正的单一
+    /// 事实源由生成保证；这里防的是重组文案时把命令段弄丢或弄脏。
     ///
-    /// 变异：删掉 `/clear` 那行 ⇒ 本用例报「缺 /clear」。
+    /// 变异：把 `MARKER` 里的 `\n` 删掉 ⇒ 命令段与上一段粘连 ⇒ 变红。
     #[test]
-    fn help_text_lists_every_builtin_command() {
-        // 只取斜杠命令段，避免环境变量里的同名子串误命中。
-        let section = HELP_TEXT
-            .split("TUI 斜杠命令：")
-            .nth(1)
-            .expect("`--help` 应含「TUI 斜杠命令」段");
-        let missing: Vec<&str> = ys_tui_coding::all_commands()
-            .iter()
-            .filter(|spec| !section.contains(&format!("/{} ", spec.name)))
-            .map(|spec| spec.name)
-            .collect();
+    fn help_text_embeds_command_list_verbatim() {
+        let text = help_text();
+        let generated = ys_tui_coding::command_list_text();
         assert!(
-            missing.is_empty(),
-            "`--help` 的斜杠命令段漏了这些命令（行尾需带一个空格）：{missing:?}"
+            text.contains(&generated),
+            "命令段未被原样嵌入：\n期望包含：\n{generated}\n实得：\n{text}"
         );
+        // 每条命令的 `arg_hint` 与描述都来自命令表 ⇒ 抽查三处曾经漂移的位置。
+        for needle in [
+            "/clear  ",
+            "清空对话上下文并清屏",
+            "/loop <间隔> <提示词> | off",
+            "仅 git 仓库",
+        ] {
+            assert!(text.contains(needle), "缺 {needle:?}：\n{text}");
+        }
     }
 }

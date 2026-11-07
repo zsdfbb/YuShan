@@ -806,6 +806,49 @@ pub fn command_help_text(name: &str) -> String {
 /// 命令表里一行的渲染：`/model [model_name]  — 切换模型`。
 ///
 /// 补全浮层与 `/help` **共用**本函数 —— 两处措辞不会漂移。
+/// 命令清单的**多行排版**：`/name <hint>   描述`，按显示宽度对齐（CJK = 2 列）。
+///
+/// 为什么这里自己排而不直接用 [`spec_line`]：`spec_line` 用 `—` 分隔，那是给
+/// TUI 内的浮层看的；`--help` 是等宽终端里的纯文本，列对齐比分隔符易读。
+///
+/// 宽度口径与渲染层共用（借 `draw::display_width`）—— 自己数 `chars().count()`
+/// 会把 `<间隔>` 算成 4 列而不是 6 列，中文 `描述` 再各差一倍，整表立刻错位。
+pub fn command_list_text() -> String {
+    let mut rows: Vec<(String, &str)> = all_commands()
+        .iter()
+        .map(|spec| {
+            let mut head = format!("/{}", spec.name);
+            if let Some(hint) = spec.arg_hint {
+                head.push(' ');
+                head.push_str(hint);
+            }
+            (head, spec.description)
+        })
+        .collect();
+    // 对齐列**封顶**：`/effort` 的枚举式提示有 47 列，按它对齐会把其余 17 行的描述
+    // 推到 50 列外 —— 表看着是齐的，读起来却是「逐行找描述」。28 列容得下常规
+    // 提示（最宽的是 `/loop <间隔> <提示词> | off`，27 列），超长的那一行让描述
+    // 直接跟在两格之后。
+    const ALIGN_CAP: usize = 28;
+    let width = rows
+        .iter()
+        .map(|(head, _)| crate::draw::display_width(head))
+        .max()
+        .unwrap_or(0)
+        .min(ALIGN_CAP);
+
+    let mut out = String::new();
+    for (head, desc) in rows.drain(..) {
+        let pad = width.saturating_sub(crate::draw::display_width(&head));
+        out.push_str("  ");
+        out.push_str(&head);
+        out.push_str(&" ".repeat(pad + 2));
+        out.push_str(desc);
+        out.push('\n');
+    }
+    out
+}
+
 pub fn spec_line(spec: &CommandSpec) -> String {
     let mut line = format!("/{}", spec.name);
     if let Some(hint) = spec.arg_hint {

@@ -53,7 +53,9 @@ mod transcript;
 mod view;
 
 pub use app::App;
-pub use commands::{Action, CommandSpec, LocalAction, PromptKind, all_commands, parse};
+pub use commands::{
+    Action, CommandSpec, LocalAction, PromptKind, all_commands, command_list_text, parse,
+};
 pub use completion::{CompletionItem, CompletionState, entries};
 pub use history::InputHistory;
 pub use input::InputBuffer;

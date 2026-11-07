@@ -613,6 +613,18 @@ ADR-0041 否决的是「模型自述」作为依据。判据来源的合法集�
 | 5 | `/resume` 到**同一**会话也报 `session changed` 并丢掉循环 | 只看 `resumed.is_some()`，没比对前后路径 | `resume_to_same_session_keeps_loop` |
 | 6 | 8 条新用例绕过 `env_lock` 且真往 `~/.yushan/logs` 写文件 | 用 `spawn_app_loop_prelocked` 却没持锁（该参数的契约就是「调用方已持锁」） | `LoopEnv`（持锁 + 隔离 `YUSHAN_LOG_DIR` + 关 debug） |
 | 7 | `/loop` 不在 `COMMANDS` 表 ⇒ 补全浮层 / `/help` / 未知命令提示都看不到它 | 只加了分派分支 | 表内条目 + `test_every_command_maps_to_the_designed_action` |
+| 8 | `--help` 手写清单与 `COMMANDS` 漂移（`/clear` 描述、`/compact` 措辞、`/loop` 缺 `off`） | 两份独立文案，对账只比命令名 | 命令段改为生成 + `help_text_embeds_command_list_verbatim` |
+
+**`--help` 的命令段改为生成**（顺带修掉一类同源偏离）：`apps/coding-agent/src/help.rs`
+曾手写一份斜杠命令清单，与 `COMMANDS` 是**两份独立文案**。对账测试只比命令名，
+于是 `/clear` 的描述、`/compact` 的措辞、`/loop` 的 `arg_hint`（少了个 `off`）三处
+已经静默漂移。现在该段由 `ys_tui_coding::command_list_text()` 从 `COMMANDS` 生成，
+`--help` 与 TUI 内 `/help` 同源；静态三段（用法 / 公共 flag / 环境变量 / 示例）
+留在常量里 —— 它们没有运行时事实源可查。
+
+对齐口径：按**显示宽度**（CJK = 2 列，借渲染层同一个 `display_width`），并给对齐列
+**封顶 28 列**。不封顶时 `/effort` 那个 47 列的枚举提示会把其余 17 行的描述推到
+50 列外 —— 表看着齐，读起来是「逐行找描述」。
 
 **`env_lock` 的粒度**：只圈住 spawn（`Config::from_env` / `resolve_log_dir` /
 `debug_enabled` 都在那时读环境变量），不留到用例结束 —— 后者会让 8 条用例整段

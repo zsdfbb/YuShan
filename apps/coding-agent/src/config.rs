@@ -14,6 +14,9 @@ use crate::provider::ProviderRegistry;
 /// 默认推理强度。`high` 是该模型可接受的最低默认档，`low` 只留给显式实验。
 pub(crate) const DEFAULT_REASONING_EFFORT: &str = "high";
 
+/// 提交后追问开关的环境变量名（优先于 `config.json` 的 `follow_up_on_commit`）。
+pub(crate) const FOLLOW_UP_ON_COMMIT_ENV: &str = "YUSHAN_FOLLOW_UP_ON_COMMIT";
+
 /// 有效上下文窗口的默认上限（token）。`context_cap_tokens = 0` 表示不封顶。
 pub const DEFAULT_CONTEXT_CAP_TOKENS: usize = 200_000;
 
@@ -63,6 +66,9 @@ struct RawUserConfig {
     /// `0` = 关闭。
     #[serde(default)]
     stream_interrupt_retries: Option<serde_json::Value>,
+    /// 提交后追问开关（`true` / `false`）。
+    #[serde(default)]
+    follow_up_on_commit: Option<serde_json::Value>,
     #[serde(default)]
     model_retry: RawModelRetry,
     #[serde(default)]
@@ -171,6 +177,8 @@ struct UserConfig {
     /// 流中断重试次数覆盖（`0` = 关闭）。`None` = 未给 ⇒ 默认
     /// [`DEFAULT_STREAM_INTERRUPT_RETRIES`]。
     stream_interrupt_retries: Option<u32>,
+    /// 提交后追问开关。`None` = 未给 ⇒ 默认**关**。
+    follow_up_on_commit: Option<bool>,
     /// 重试策略（逐字段独立，缺省已由 [`ModelRetryConfig::default`] 填好）。
     model_retry: ModelRetryConfig,
     /// 超时旋钮（逐字段独立，缺省已由 [`ModelTimeoutConfig::default`] 填好）。
@@ -434,6 +442,29 @@ impl Config {
         std::time::Duration::from_secs(self.user_config.max_turn_duration_secs.unwrap_or(172_800))
     }
 
+    /// 提交后追问开关。**默认关**（`true` 才开）。
+    ///
+    /// 来源优先级：环境变量 `YUSHAN_FOLLOW_UP_ON_COMMIT` 优先于
+    /// `~/.yushan/config.json` 的 `follow_up_on_commit`。
+    ///
+    /// 环境变量取值：`1` / `true` / `yes` / `on`（忽略大小写）⇒ 开；
+    /// `0` / `false` / `no` / `off` ⇒ 关；其他值 ⇒ 记日志并回落 config.json。
+    pub fn follow_up_on_commit(&self) -> bool {
+        if let Ok(raw) = std::env::var(FOLLOW_UP_ON_COMMIT_ENV) {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => return true,
+                "0" | "false" | "no" | "off" => return false,
+                other => {
+                    crate::logging::log(&format!(
+                        "ignoring {FOLLOW_UP_ON_COMMIT_ENV}={other}: \
+                         expected 1/true/yes/on or 0/false/no/off"
+                    ));
+                }
+            }
+        }
+        self.user_config.follow_up_on_commit.unwrap_or(false)
+    }
+
     /// 配置层推理强度（provider 的 `reasoning_effort`）。缺省 `high`。
     ///
     /// 这是 `/effort` 覆盖之前的值；请求实际发送的是
@@ -691,6 +722,18 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
         raw.stream_interrupt_retries,
         0u32,
     );
+
+    // 布尔开关：`as_bool` 挡下字符串（`"yes"` 不等于 `true`）、数字与 null。
+    user.follow_up_on_commit = raw.follow_up_on_commit.and_then(|v| match v.as_bool() {
+        Some(flag) => Some(flag),
+        None => {
+            crate::logging::log(&format!(
+                "ignoring config.json follow_up_on_commit: \
+                 expected a boolean, got {v}"
+            ));
+            None
+        }
+    });
 
     // 重试 / 超时**逐字段独立**覆盖：未给的项保持默认（照 `compaction` 的
     // `trigger_ratio` / `keep_ratio` 关系）。重试三项允许 0（`max_attempts: 0` = 不重试、
@@ -1779,6 +1822,92 @@ mod tests {
             let user = parse_user_config(&json).unwrap();
             assert_eq!(user.max_turn_duration_secs, None, "case {name} 应被丢弃");
         }
+    }
+
+    /// `follow_up_on_commit`：`true` / `false` 被采纳，缺失为 `None`，非法值丢弃但不 panic。
+    ///
+    /// 变异：把 `as_bool()` 换成 `as_str().is_some_and(|s| s == "true")` ⇒ `false` 那条变红
+    /// （会变成 `None`）；去掉 `as_bool()` 的类型判定（如用 `as_u64().is_some()`）⇒ 非法值
+    /// 那条变红（会得到 `Some(false)` 而非 `None`）。
+    #[test]
+    fn test_follow_up_on_commit_parsed_from_config() {
+        let user = parse_user_config(r#"{"follow_up_on_commit": true}"#).unwrap();
+        assert_eq!(user.follow_up_on_commit, Some(true));
+
+        let user = parse_user_config(r#"{"follow_up_on_commit": false}"#).unwrap();
+        assert_eq!(user.follow_up_on_commit, Some(false));
+
+        let user = parse_user_config("{}").unwrap();
+        assert_eq!(user.follow_up_on_commit, None, "缺失 ⇒ None（默认关）");
+
+        for (name, value) in [
+            ("string", "\"yes\""),
+            ("number", "1"),
+            ("null", "null"),
+            ("object", "{}"),
+        ] {
+            let json = format!(r#"{{"follow_up_on_commit": {value}}}"#);
+            let user = parse_user_config(&json).unwrap();
+            assert_eq!(user.follow_up_on_commit, None, "case {name} 应被丢弃");
+        }
+
+        // 只丢该条：非法值不影响同一份文件里的其他项。
+        let user = parse_user_config(
+            r#"{"follow_up_on_commit": "yes", "context_window": {"deepseek-chat": 64000}}"#,
+        )
+        .unwrap();
+        assert_eq!(user.follow_up_on_commit, None);
+        assert_eq!(user.windows.get("deepseek-chat"), Some(&64_000));
+    }
+
+    /// `Config::follow_up_on_commit()` 的来源优先级：env > config.json，且未配置时**默认关**。
+    ///
+    /// 本测试不受 env 漂移影响：开头就在 `env_lock` 下清掉 `YUSHAN_FOLLOW_UP_ON_COMMIT`，
+    /// 后面的赋值与恢复都经 `EnvRestore`（`Drop` 时还原）。
+    ///
+    /// 变异：把 `unwrap_or(false)` 改成 `unwrap_or(true)` ⇒ 默认关那两条变红；把 env 分支
+    /// 整段删掉 ⇒ 三条带 env 的断言变红（全部回落 config.json）。
+    #[test]
+    fn test_follow_up_on_commit_env_overrides_config_and_defaults_off() {
+        let _guard = env_lock();
+        let _env = EnvRestore::capture(&[FOLLOW_UP_ON_COMMIT_ENV]);
+        // SAFETY: 持有 env_lock，独占该变量的修改与恢复。
+        unsafe { std::env::remove_var(FOLLOW_UP_ON_COMMIT_ENV) };
+
+        // env 未设 + config 未给 ⇒ 默认关。
+        let config = test_config("deepseek-chat");
+        assert!(!config.follow_up_on_commit(), "默认必须关");
+
+        // env 未设 + config `true` ⇒ 开。
+        let mut config = test_config("deepseek-chat");
+        config.user_config = parse_user_config(r#"{"follow_up_on_commit": true}"#).unwrap();
+        assert!(config.follow_up_on_commit());
+
+        // env 未设 + config `false` ⇒ 关。
+        config.user_config = parse_user_config(r#"{"follow_up_on_commit": false}"#).unwrap();
+        assert!(!config.follow_up_on_commit());
+
+        // env 优先于 config：config `true` + env `off` ⇒ 关。
+        config.user_config = parse_user_config(r#"{"follow_up_on_commit": true}"#).unwrap();
+        for value in ["0", "false", "no", "off", " OFF "] {
+            // SAFETY: 持有 env_lock。
+            unsafe { std::env::set_var(FOLLOW_UP_ON_COMMIT_ENV, value) };
+            assert!(!config.follow_up_on_commit(), "env={value:?} 应为关");
+        }
+
+        // env 优先于 config：config 未给 + env `on` ⇒ 开（大小写与空白归一化）。
+        config.user_config = UserConfig::default();
+        for value in ["1", "true", "yes", "on", " On "] {
+            // SAFETY: 持有 env_lock。
+            unsafe { std::env::set_var(FOLLOW_UP_ON_COMMIT_ENV, value) };
+            assert!(config.follow_up_on_commit(), "env={value:?} 应为开");
+        }
+
+        // 无法识别的值 ⇒ 回落 config.json（此处 config `true`）。
+        config.user_config = parse_user_config(r#"{"follow_up_on_commit": true}"#).unwrap();
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var(FOLLOW_UP_ON_COMMIT_ENV, "maybe") };
+        assert!(config.follow_up_on_commit(), "非法 env 应回落 config.json");
     }
 
     /// `model_retry` **逐字段独立**覆盖：只给一项时另两项仍是默认；`max_attempts: 0` 合法。

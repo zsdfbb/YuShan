@@ -188,11 +188,10 @@ pub fn user_text(message: &Message) -> Option<String> {
     }
     // 「空文本框不算原文」是本函数的额外约束，`joined_text` 不过滤空白 ——
     // 先判「有无非空 Text」再拼接，避免纯空白消息算出 `Some("")`。
-    let has_nonempty_text = message.content.iter().any(|block| {
-        block
-            .as_text()
-            .is_some_and(|text| !text.trim().is_empty())
-    });
+    let has_nonempty_text = message
+        .content
+        .iter()
+        .any(|block| block.as_text().is_some_and(|text| !text.trim().is_empty()));
     if !has_nonempty_text {
         return None;
     }
@@ -214,10 +213,10 @@ fn unix_secs(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ys_core::ContentBlock;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+    use ys_core::ContentBlock;
 
     /// 进程内唯一临时目录（原子序号 + `process::id()`，并行安全）。
     fn temp_dir(tag: &str) -> PathBuf {

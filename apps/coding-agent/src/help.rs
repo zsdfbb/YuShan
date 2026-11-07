@@ -36,6 +36,7 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
   YUSHAN_DEBUG                 结构化执行日志：默认开启；1/true/yes/on 开启，其余非空值关闭，
                                优先于 --debug
   YUSHAN_DEBUG_ARGS            工具参数摘要档位：none / head / full，默认 head
+  YUSHAN_FOLLOW_UP_ON_COMMIT   提交后追问一轮（1/true/yes/on 开启，默认关）
   YUSHAN_SEARCH_SEARXNG_URL    搜索后端：SearXNG
   YUSHAN_SEARCH_DEEPSEEK_KEY   搜索后端：DeepSeek（亦认 DEEPSEEK_API_KEY，命名空间名优先）
   YUSHAN_SEARCH_TAVILY_KEY     搜索后端：Tavily（亦认 TAVILY_API_KEY，命名空间名优先）

@@ -51,9 +51,13 @@
 //! **③ 一次性 BoundarySource 每回合新建**：`Abort` 会**永久**置位 `is_aborted`，
 //! 复用同一个源会让「上一回合的取消」把之后每个回合立刻取消。
 //!
-//! **④ 每次用户输入恰好跑一个回合**（ADR-0041 撤回 ADR-0027 决策 2 的完工复核）：
-//! 回合结束即请求结束，没有追问「真的完工了吗」的第二个回合。回合前的边界排空仍在
-//! `run_turn_once` 开头 —— 它挡的是**上一个请求**残留的 `Abort`，与回合数无关。
+//! **④ 每次用户输入跑一个回合，至多追加一个 harness 回合**：
+//! 追加只能由**外部可观测事实**触发（`git HEAD` 前后不等，见 [`crate::post_turn`]），
+//! **不能**由模型自述触发。ADR-0041 撤回的是后者（模型说「我做完了」），不是前者。
+//! 追加至多一次由**调用点的结构**保证（`Request::Prompt` 臂里一个顺序 `if`，
+//! 没有计数器也没有循环），不是靠配置上限。
+//! 回合前的边界排空仍在 `run_turn_once` 开头 —— 它挡的是**上一个请求**残留的
+//! `Abort`，与回合数无关。
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -423,7 +427,9 @@ pub async fn run(
                 // 占位输入**不是**用户说的话 ⇒ `Role::Harness`。真正的内容是随后经
                 // `Boundary::Deferred` 注入的那几条子 agent 结果。
                 let message = subagent_placeholder();
-                run_turn_chain(
+                // 返回值（`TurnOutcome`）**有意丢弃**：自动回合之后不再追问 ——
+                // 追问只在用户发言后发生（追问的判据靠「HEAD 在用户回合里变了」）。
+                let _ = run_turn_chain(
                     &mut agent,
                     &mut wiring,
                     &config,
@@ -480,7 +486,8 @@ pub async fn run(
                 // 进会话（与任何回合的输入同一条路径），TUI 据 `Role` 画 System 行。
                 // 真正的内容是随后经 `Boundary::Deferred` 注入的那几条结果。
                 let message = background_placeholder();
-                run_turn_chain(
+                // 返回值（`TurnOutcome`）**有意丢弃**，理由同 `Wake::SubagentReturned`。
+                let _ = run_turn_chain(
                     &mut agent,
                     &mut wiring,
                     &config,
@@ -567,7 +574,21 @@ pub async fn run(
                 // **只作用于用户原文** —— 复核消息由 `should_review` 直接产出、不再展开。
                 let message = expand_skill_invocation(message, &config.skills);
 
-                run_turn_chain(
+                // 回合**前**记 HEAD。
+                //
+                // 取点用 `config.cwd`（回合真正的工作目录），**不用** `worktree.get()`：
+                // 后者在「共享工作区」下是 `None`（`main.rs` 用 `.zip()` 组绑定，
+                // 未 attach 树时两半都缺）—— 那是绝大多数启动形态，用它会静默地
+                // 让本功能永不生效。`config.cwd` 在 `/resume` 切工作区时已被
+                // `apply_resumed_workspace` 刷新（`:1143`）⇒ 它才是「本回合在哪跑」。
+                //
+                // 开关关时**不 spawn 两次 git**：判据默认关，而那两次是每回合
+                // 实打实的 fork+exec。先把开关读完，关就不取。
+                let enabled = config.follow_up_on_commit();
+                let workspace = enabled.then(|| config.cwd.clone());
+                let head_before = crate::post_turn::git_head(workspace.as_deref());
+
+                let outcome = run_turn_chain(
                     &mut agent,
                     &mut wiring,
                     &config,
@@ -586,6 +607,43 @@ pub async fn run(
                     raw_user_text,
                 )
                 .await?;
+
+                // **追问至多一次，由结构保证**：这里只有一个顺序 `if`，
+                // 没有计数器也没有循环 ⇒ 追问回合里即便又提交，也不可能触发第二次。
+                // 判据只看外部可观测事实（`git HEAD` 前后不等），与 ADR-0041
+                // 撤回的「模型自述完工」不是一回事。
+                //
+                // 开关关时 `workspace` 是 `None` ⇒ 不必再 spawn git（判据必为假）。
+                let head_after = crate::post_turn::git_head(workspace.as_deref());
+                if crate::post_turn::should_follow_up(
+                    &outcome,
+                    head_before.as_deref(),
+                    head_after,
+                    enabled,
+                ) {
+                    // 追问回合的 `TurnOutcome` **有意丢弃**：追问不再递归追问，
+                    // 至多一次由本 `if` 的结构保证。
+                    let _ = run_turn_chain(
+                        &mut agent,
+                        &mut wiring,
+                        &config,
+                        &mut turns,
+                        &mut stats,
+                        thinking_visible,
+                        &mut run_rounds,
+                        &out_tx,
+                        &mut sink_rx,
+                        &mut boundary_rx,
+                        subagent.as_ref(),
+                        debug.as_mut(),
+                        &debug_session_id,
+                        &worktree,
+                        crate::post_turn::harness_input(),
+                        // 占位输入没有用户原文 ⇒ 标题素材传 `None`（不能拿它当标题）。
+                        None,
+                    )
+                    .await?;
+                }
             }
 
             Request::SetThinking { visible } => {
@@ -1318,7 +1376,7 @@ async fn run_turn_chain(
     worktree: &WorktreeHandle,
     message: Message,
     raw_user_text: Option<String>,
-) -> Result<(), AppLoopError> {
+) -> Result<TurnOutcome, AppLoopError> {
     let request_started = Instant::now();
     let deadline = request_started + config.max_turn_duration();
     let subagent_totals = Arc::new(crate::subagent::UsageTotals::default());
@@ -1343,44 +1401,51 @@ async fn run_turn_chain(
     };
     // 外层 `Err` = UI 已收摊（出站失败）：先收尾 debug 再退出；
     // 内层 `TurnOutcome` 的 `Err` 只是本回合模型/工具失败，app 继续。
+    //
+    // **返回值交给调用方**：追问判据需要 `StopReason`（跨回合推进设计 §3.5）。
+    // 既有调用点忽略它，行为不变。
     match run_turn_once(&mut ctx, AgentInput::new(message)).await {
-        Ok(outcome) => match outcome {
-            Ok(result) => {
-                ctx.stats.record_result(&result);
-                // **执行口径**的时长累加：与上面的 usage 同一位置 ⇒
-                // 「token 统计」与「时长统计」覆盖同一批回合。
-                // 失败回合也计入（模型跑过了就是占用了墙钟）⇒ 见下。
-                ctx.stats.record_elapsed(ctx.request_started.elapsed());
-                // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
-                let model = ctx.wiring.model_id().map(str::to_string);
-                // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
-                let ws = worktree.get();
-                if let Err(e) = crate::finalize_turn_meta(
-                    ctx.wiring,
-                    raw_user_text.as_deref(),
-                    ctx.config.provider.as_deref(),
-                    model.as_deref(),
-                    Some(ctx.thinking_visible),
-                    // TUI 模式：档位随回合末写穿会话 meta。
-                    Some(ctx.config.effort),
-                    ws.as_ref().map(|b| b.path.as_path()),
-                    ctx.stats,
-                )
-                .await
-                {
-                    logging::log(&format!("failed to persist session meta: {e}"));
+        Ok(outcome) => {
+            // 用**引用**匹配：`outcome` 整个要交出去，不能在这里被消费。
+            match &outcome {
+                Ok(result) => {
+                    ctx.stats.record_result(result);
+                    // **执行口径**的时长累加：与上面的 usage 同一位置 ⇒
+                    // 「token 统计」与「时长统计」覆盖同一批回合。
+                    // 失败回合也计入（模型跑过了就是占用了墙钟）⇒ 见下。
+                    ctx.stats.record_elapsed(ctx.request_started.elapsed());
+                    // 回合末写穿 meta（title/model/tokens/thinking，三模式共用）。
+                    let model = ctx.wiring.model_id().map(str::to_string);
+                    // 工作区从**跨生命周期句柄**读（`/resume` 可改），不取启动期局部量。
+                    let ws = worktree.get();
+                    if let Err(e) = crate::finalize_turn_meta(
+                        ctx.wiring,
+                        raw_user_text.as_deref(),
+                        ctx.config.provider.as_deref(),
+                        model.as_deref(),
+                        Some(ctx.thinking_visible),
+                        // TUI 模式：档位随回合末写穿会话 meta。
+                        Some(ctx.config.effort),
+                        ws.as_ref().map(|b| b.path.as_path()),
+                        ctx.stats,
+                    )
+                    .await
+                    {
+                        logging::log(&format!("failed to persist session meta: {e}"));
+                    }
+                }
+                // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
+                // Error 行，这里不再往 transcript 重复刷一条，只落日志。
+                // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
+                // **但时长要计入**：模型跑过了就是占用了墙钟 ⇒
+                // 执行口径必须包含失败回合，否则「跑失败的时长」凭空消失。
+                Err(e) => {
+                    ctx.stats.record_elapsed(ctx.request_started.elapsed());
+                    logging::log(&format!("turn {} failed: {e}", ctx.turns));
                 }
             }
-            // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
-            // Error 行，这里不再往 transcript 重复刷一条，只落日志。
-            // 回合失败**不向上传播**：请求到此结束，app 循环继续等下一个。
-            // **但时长要计入**：模型跑过了就是占用了墙钟 ⇒
-            // 执行口径必须包含失败回合，否则「跑失败的时长」凭空消失。
-            Err(e) => {
-                ctx.stats.record_elapsed(ctx.request_started.elapsed());
-                logging::log(&format!("turn {} failed: {e}", ctx.turns));
-            }
-        },
+            Ok(outcome)
+        }
         Err(e) => {
             let rounds = *ctx.run_rounds;
             let usage = ctx.stats.cumulative_usage();
@@ -1392,10 +1457,9 @@ async fn run_turn_chain(
                     usage: Some(&usage),
                 });
             }
-            return Err(e);
+            Err(e)
         }
     }
-    Ok(())
 }
 
 /// 后台结果唤醒的**复核判据**：本会话是否真的有已终态、尚未投出的结果。

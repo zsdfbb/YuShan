@@ -48,6 +48,7 @@ mod config;
 mod debug_log;
 mod help;
 mod logging;
+mod post_turn;
 mod prompt;
 mod provider;
 mod round_clock;

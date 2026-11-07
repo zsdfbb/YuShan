@@ -50,7 +50,11 @@ Request::Prompt(message) => {
     let raw_user_text = crate::sessions::user_text(&message);
     let message = expand_skill_invocation(message, &config.skills);
 
-    let head_before = post_turn::git_head(worktree.get().map(|b| b.path.as_path()));
+    // 取点用**回合真正的工作目录** `config.cwd`，不用 `worktree.get()` ——
+    // 后者在共享工作区（未 attach 树）下是 `None`，会让判据恒为假。
+    let enabled = config.follow_up_on_commit();
+    let workspace = enabled.then(|| config.cwd.clone());
+    let head_before = post_turn::git_head(workspace.as_deref());
 
     let outcome = run_turn_chain(/* … */, message, raw_user_text).await?;
 
@@ -130,7 +134,7 @@ fn git_head(ws: Option<&Path>) -> Option<String>;
 | # | 护栏 | 做法 |
 |---|---|---|
 | ① | **防套娃** | **由结构消除**：追问分支只出现一次，且自己不再递归 ⇒ 追问回合里若又提交，不可能触发第二次 |
-| ② | **开关** | **默认关**。`user_config` 增字段（照 `max_turn_duration_secs` 的形态 `config.rs:161`），来源 `YUSHAN_FOLLOW_UP_ON_COMMIT`（照 `Config::from_env` 的越权形态 `config.rs:252`） |
+| ② | **开关** | **默认关**。`user_config` 增字段（照 `max_turn_duration_secs` 的形态 `config.rs:161`），来源 `YUSHAN_FOLLOW_UP_ON_COMMIT`（照 `Config::from_env` 的越权形态 `config.rs:252`）。**开关关时不 spawn git** —— 先把开关读完，关则不取 `HEAD`（否则每回合白付两次 fork+exec） |
 | ③ | **非 git 仓库静默跳过** | `git_head` 返回 `None` ⇒ 视为「检测不可用」，不追问、不报错 |
 | ④ | **只在正常收场后追问** | `outcome` 为 `Err`，或 `StopReason` ∈ {`Cancelled`, `Truncated`, `MaxRounds`, `NoOutput`, `Failed`} ⇒ **不追问** |
 
@@ -146,7 +150,14 @@ fn git_head(ws: Option<&Path>) -> Option<String>;
 | `config.rs` | 开关字段（`:161` 的 `user_config` + `:252` 的 `from_env`） |
 
 **总量约 80 行**（其中 `post_turn.rs` 约 60 行，含测试）。`worktree: &WorktreeHandle`
-已是 `run_turn_chain` 的参数（`:1318`）⇒ `Request::Prompt` 臂里直接用 `worktree.get()`。
+已是 `run_turn_chain` 的参数（`:1318`）。
+
+> ⚠️ **HEAD 的取点必须是 `config.cwd`，不能是 `worktree.get()`。**
+> `WorktreeBinding` 在**共享工作区**（未 attach 工作树，即绝大多数启动形态）下是 `None`
+> —— 主程序用 `worktree_name.zip(worktree_path)` 组出它，两半缺一即为 `None`。
+> 用它作取点，`git_head(None)` 直接返回 `None` ⇒ 判据恒为假 ⇒ **功能 100% 不生效，
+> 且纯函数测试全绿**。`config.cwd` 才是「本回合在哪跑」，且 `/resume` 切工作区时
+> 已被 `apply_resumed_workspace` 刷新。
 
 > ⚠️ **模块不叫 `follow_up.rs`** —— 那是 ADR-0041 显式删除的文件名，复用会让后人读成回退。
 
@@ -222,7 +233,26 @@ enum Wake {
 ```
 
 `optional_wake` 已把「可选唤醒源」做成一条 `select!` 分支（源为 `None` 时该分支永不就绪），
-加第二条与加第一条同构。
+加第二条与加第一条同构：
+
+```rust
+let timer = loop_state.as_ref().map(|s| s.next_at);
+// tokio::time::sleep_until 吸收 Instant；源为 None 时分支被禁用。
+Some(()) = optional_wake(timer.map(|at| tokio::time::sleep_until(at.into()))) => {
+    Wake::TimerFired
+}
+```
+
+**`LoopState` 存在哪**：`app_loop::run` 主循环的**局部可变变量**（与 `turns` / `stats` / `session_started`
+同级），**不进 `Wiring`**。理由：它不属于任何组件，且生命周期就是本 `run` 调用。
+
+| 事件 | 对 `LoopState` 的效应 |
+|---|---|
+| `/loop <间隔> <提示词>` | 覆盖为 `Some(LoopState { next_at: now + interval, .. })` |
+| `/loop off` | 置 `None` |
+| `Wake::TimerFired` | `next_at = now + interval`（无论是否起回合，**必须先推远**）|
+| `/new` / `/clear` | 置 `None`（新会话不继承旧循环）|
+| `/resume` | 置 `None` + 一次性提示（不自动续跑）|
 
 ### 4.2 硬规则：唤醒后必须先过**零 token 判据**
 
@@ -230,14 +260,23 @@ enum Wake {
 
 ```rust
 Wake::TimerFired => {
-    if !post_turn::has_work(&wiring, &config).await {
-        timer.advance();   // 推远下次唤醒，防忙转
+    // 先推远下次唤醒 —— 无论判据结果如何。放在这里而不是分支末尾，
+    // 是因为下面两条路径都要经过它（包括 `continue`）。
+    let next = timer.advance();
+    let work = post_turn::has_work(ws.clone(), timer.last_head.clone()).await;
+    if !work {
         continue;          // 不 append、不调模型 ⇒ 成本 0
     }
-    let message = timer_placeholder();
+    timer.last_head = post_turn::git_head(ws.as_deref());
+    let message = loop_placeholder();
     run_turn_chain(...).await?;
 }
 ```
+
+**两次 `run_turn_chain` 的位置不同**：`Wake::*` 两臂 `continue` 跳过尾部 `emit_view()`
+（`:972`），所以它们各自补 `build_view`；本臂**不 `continue` 在成功的路径上** ——
+它落到尾部刷新。但 `continue` 在判据为空时仍要执行 ⇒ **那条路径不需要刷视图**
+（什么都没变）。
 
 **这不是新发明** —— 现有两条分支就是这个形状：
 
@@ -246,7 +285,6 @@ Wake::TimerFired => {
 | `Wake::SubagentReturned` | `pending_results().has_pending()` | `app_loop.rs:413-421` |
 | `Wake::BackgroundReturned` | `should_start_background_turn(...)` | `app_loop.rs:472-478` |
 | **`Wake::TimerFired`** | **`has_work(...)`** | 本设计 |
-
 照抄形状，只换判据。另外要照抄一条细节：**判据只读不取**（`app_loop.rs:414` 注释）——
 真正的取走发生在回合开头，双取会重复送达。
 
@@ -258,6 +296,31 @@ Wake::TimerFired => {
 | C2 | **不得 append 任何东西进 session** | 每 5 分钟一条，会话照样涨，压缩白忙 |
 | C3 | **命中后必须 `timer.advance()`** | `continue` 立刻再次就绪 ⇒ 忙转 |
 | C4 | **必须快（毫秒级）且不阻塞用户输入** | 它跑在 `select!` 之后；几秒的判据会拖住用户敲字 |
+
+#### C4 的实现手段：`spawn_blocking`
+
+`git rev-parse` 是**阻塞**调用（`std::process::Command`），直接 `.await` 会卡住整个
+app 循环 —— 用户敲字、后台清扫、子 agent 回传全部停。
+
+⇒ `has_work` 是 `async fn`，内部把 git 调用交给 `tokio::task::spawn_blocking`：
+
+```rust
+pub async fn has_work(workspace: Option<PathBuf>, last_head: Option<String>) -> bool
+```
+
+判据本身只有一条：**HEAD 与上次起完回合时不同**。理由：
+
+| 判据 | 为何不收 |
+|---|---|
+| 文件 mtime | 工作区里**任何**后台进程（含编译器、编辑器自动保存）都能碰它 ⇒ 假阳性常态化，每 5 分钟白跑一轮 |
+| 外部命令 | 起进程秒级，破坏 C1 与 C4 |
+
+**代价**：一期判据（HEAD 不等）在二期被复用，但**基准不同** ——
+一期比「本回合前后」，二期比「上次 tick 之后」。两者共用一个纯函数，两个调用点传不同的基准。
+
+**假阴性风险与缓解**：只看 HEAD 会漏掉「改了文件但没提交」的工作。
+这不是疏忽 —— 它由 §4.4 的代价不对称决定：宁可宽松。真要盯未提交改动，
+写进 `/loop` 的提示词让模型自己看（一期已证明 HEAD 不是唯一信号）。
 
 C4 决定了什么能放进 `has_work`：
 
@@ -332,9 +395,22 @@ C4 决定了什么能放进 `has_work`：
 | config 字段 | ❌ 只能再启动生效，不符合“边聊边用” |
 | 模型调新 tool | ❌ 模型可自己排循环 = 又一个“模型自述驱动”，与 ADR-0041 相左 |
 
-**改动面**：`Request` 加 `Request::Loop { interval, prompt }`，在 `app_loop` 的
-`Request` 分支处理（不发回合，只更新定时器状态）。`capabilities.rs` 负责解析命令
-（**绝不 print**，输出走 `Outbound::Output`）。
+**改动面**：`Request` 加一个 `Request::Loop { interval, prompt }`（`ys-protocol/src/request.rs`），
+在 `app_loop` 的 `Request` 分支处理（不发回合，只更新定时器状态）。
+
+**命令解析在 `crates/ys-tui-coding/src/commands.rs:355`**（`"compact"` 那一带），
+**不在** `capabilities.rs` —— 后者是「收到 `Request` 之后世界怎么变」，
+命令名 → `Action` 的映射归 TUI。两类结果分开：
+
+| 输入 | `Action` | 谁处理 |
+|---|---|---|
+| `/loop 5m xxx` | `Request::Loop { .. }` | app 更新定时器 |
+| `/loop off` | `Request::LoopOff` | app 清定时器 |
+| `/loop`（无参）/ 非法间隔 | `Action::Local(LocalAction::Hint(..))` | **TUI 本地提示**，不发请求 |
+| 状态显示 | — | 状态行读**视图快照**，不是命令输出 |
+
+**间隔格式**：只收 `<数字><单位>`，单位 ∈ `s` / `m` / `h`（`5m` / `90s` / `2h`）。
+下限 **10s**（低于它就是在烧钱）；上限 **24h**。非法值本地提示、不改状态。
 
 #### 取消：单一入口
 
@@ -349,18 +425,38 @@ C4 决定了什么能放进 `has_work`：
 
 #### 状态必须可见
 
-状态行必须显示（无可见性的定时器是隐形烧钱机器）：
+状态行必须显示（无可见性的定时器是隐形烧钱机器）。这要**跨三层**，缺一层就看不见：
+
+| 层 | 落点 | 改什么 |
+|---|---|---|
+| 协议/视图 | `crates/ys-tui-coding/src/view.rs:83` `CodingView` | 加 `loop_state: Option<LoopView>` |
+| 快照 | `apps/coding-agent/src/view.rs:41` `build_view` | loop 状态是 `build_view` 的**新入参** |
+| 渲染 | `crates/ys-tui-coding/src/draw.rs:961` `status_text` | 插一段（位置见下） |
+
+```rust
+pub struct LoopView {
+    /// 间隔的显示串（`5m` / `2h`）——已格式化，渲染层不再算。
+    pub interval: String,
+    /// `None` = 正在跑回合；`Some` = 空闲，等这个时刻（`HH:MM`）。
+    pub next_at: Option<String>,
+}
+```
+
+状态行形状：
 
 ```
-[loop] 5m · next 14:32        ← 空闲，等下一次
-[loop] 5m · running           ← 正在跑回合
+[loop] 5m · 下次 14:32     ← 空闲
+[loop] 5m · 正在跑        ← 有回合在执行
 ```
 
-`--resume` **不自动续跑**，但恢复后状态行显示
-`[loop] 上次的循环已停止，/loop 重启` ⇒ 用户不会误以为还在被盯着。
+**段的位置**：紧跟首段（`⏳` / `○`）之后、`model` 之前。理由同 `status_note`
+（`draw.rs:967-969`）：窄终端剥尾时它先掉不了；它是「正在被自动推进」的信号，
+比 model / tokens 更紧急。
+
+`--resume` **不自动续跑**，但恢复后要显示一条**一次性提示**（走 `Outbound::Output`，
+不常驻状态行）：`上次的循环已停止，/loop 重启` ⇒ 用户不会误以为还在被盯着。
 
 ### 4.7 队列形状：单条（已定）
-
 ```rust
 struct LoopState {
     next_at: Instant,

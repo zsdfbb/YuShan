@@ -95,6 +95,23 @@ pub enum Request {
     ListSessions,
     /// 恢复既有会话。`target` 交给 app 侧 `sessions::resolve` 解析（id 或路径）。
     ResumeSession { target: String },
+    /// 设一个定时循环：每 `interval_secs` 秒醒来一次，有活就起一个回合。
+    ///
+    /// **单条语义**：一个 session 只能有一个循环，再敲一次即**覆盖**（不叠加、
+    /// 不报错）。多条排序要处理「同时到点怎么办」，需求比看上去少。
+    ///
+    /// `prompt` 是给模型的提示词，由 app 侧转成 `Role::Harness` 消息 ——
+    /// 它不是用户说的话，UI 画 System 行。
+    ///
+    /// 仅 TUI 模式有意义：`-p` / `--json` 消费到终局事件即退出，没有第二个
+    /// 回合的位置。
+    Loop {
+        /// 间隔秒数。钳制在 `[10, 86_400]`（见 `ys-tui-coding` 的解析处）。
+        interval_secs: u64,
+        prompt: String,
+    },
+    /// 清掉定时循环。已在跑的回合**不中断** —— 取消定时器 ≠ 取消当前工作。
+    LoopOff,
 }
 
 /// app → UI 的出站消息（设计 §6）。

@@ -550,10 +550,39 @@ ADR-0041 否决的是「模型自述」作为依据。判据来源的合法集�
 | 14 | `has_work` 为假 ⇒ 定时器被推远，不忙转（C3） | 并发 | 二期 |
 | 15 | `/loop 5m x` 再敲一次 ⇒ **覆盖**，不叠加（单条语义） | 命令 | 二期 |
 | 16 | `/loop off` ⇒ 定时器清空；**已在跑的回合不中断** | 命令 | 二期 |
-| 17 | 状态行显示 `next <时刻>` / `running`（可见性） | 集成 | 二期 |
-| 18 | `--resume` 后不自动续跑，状态行显式提示 | 集成 | 二期 |
+| 17 | 状态行显示 `[loop] <间隔> · <还有多久>` / `正在跑`（可见性） | 集成 | 二期 |
+| 18 | `/resume` 后不自动续跑，且**运行中换会话**时显式提示 | 集成 | 二期 |
 | 19 | 判官判「未达成」⇒ 继续；「达成」⇒ 停 | 判据 | 三期 |
 | 20 | 判官连续 N 次无进展 ⇒ 停并告警 | 判据 | 三期 |
+
+### 8.1 实现注记（写在这里的原因：三条都是实现期才暴露的取舍）
+
+| 取舍 | 决定 | 依据 |
+|---|---|---|
+| `last_head` 的初值 | **`/loop` 创建时刻的 `HEAD`**，不是 `None` | 初值为 `None` ⇒「首次醒来必判有活」⇒ 设完就走开的人白花一次模型调用。设计只写了「与上次起完回合时不同」，没写首次怎么办 |
+| 基准取在**回合之后** | `TimerFired` 起完回合**才** `last_head = git_head()`，不是起之前 | 取之前 ⇒ 本回合自己提交的代码在下一周期被当成「外部有新变化」⇒ 空闲循环每个间隔白跑一次，退化成 §4.2 明令禁止的「到点就跑」 |
+| 状态行用**相对时长** | `[loop] 5m · 14 分后`，不是 `next 14:32` | `Instant → 本地钟点` 要时区偏移，而 `ys-tui-coding::clock::hhmm_at` 是 `pub(crate)`、app 侧拿不到。冒充 UTC 钟点比不显示更糟（用户按错的时间等） |
+
+**变异测试实测**（`apps/coding-agent/src/app_loop.rs` 的 `loop_*` 用例，8 个变异体全部被抓）：
+
+| 变异 | 抓它的用例 |
+|---|---|
+| 判据恒真（到点就跑） | `loop_timer_tick_without_changes_costs_nothing` + `loop_tick_does_not_busy_spin` |
+| 缺 `advance()`（忙转） | `loop_tick_does_not_busy_spin`（读状态行的「0 秒后」） |
+| `/loop` 不取初始基线 | `loop_timer_tick_without_changes_costs_nothing` |
+| `last_head` 取在回合之前 | `loop_tick_does_not_busy_spin` |
+| `/loop off` 不清状态 | `loop_off_stops_further_ticks` |
+| `/new` 不清循环 | `new_session_clears_loop` |
+| `loop_placeholder` 改 `Role::User` | `loop_placeholder_is_harness_role` + `loop_timer_fires_one_turn_when_head_moved` |
+| `/loop` 覆盖变叠加 | `loop_overwrites_instead_of_stacking` |
+
+**忙转不可用「模型调用数」检测**：判据为假时本臂 `continue`、一个 token 都不花。
+它的唯一可观测面是**状态行** —— 缺 `advance()` 时 `next_at` 停在过去，
+`relative_label` 恒为 `0 秒后`。这是 `loop_tick_does_not_busy_spin` 后半段的由来。
+
+**视图刷新只有一个位置**：`loop_state` 必须在**循环尾部那次统一 `emit_view`** 里带上。
+曾分别在各请求臂里补刷，结果是每个 `/loop` 产生两个 `View` —— UI 白重绘一帧，
+且连测试都会把第一条命令的第二个 View 误认为第二条命令的结果。
 
 ## 9. 固有限制（不是缺陷，不要当 bug 修）
 

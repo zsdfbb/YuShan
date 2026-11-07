@@ -177,7 +177,41 @@ pub fn build_view(
         version: env!("CARGO_PKG_VERSION").to_string(),
         // `/effort` 的当前有效档位：会话覆盖优先，否则配置默认（默认 `high`）。
         effort: cfg.effective_effort_level(),
+        // 定时循环的状态：由调用方传入（`build_view` 不持有它 —— 它是 app 主循环
+        // 的局部变量，不属于 `Config` / `Agent` / `Wiring` 任何一方）。
+        loop_state: None,
     }
+}
+
+/// [`build_view`] 的变体：额外带上定时循环的状态投影。
+///
+/// 单独开一个入口而不是改 `build_view` 的签名：后者有十余处调用点，其中绝大多数
+/// 与定时器无关。循环状态只存在于 `app_loop::run` 的局部变量里，只有它的几个
+/// 臂能拿到。
+#[allow(clippy::too_many_arguments)]
+pub fn build_view_with_loop(
+    cfg: &Config,
+    agent: &Agent,
+    wiring: &Wiring,
+    registry: &ProviderRegistry,
+    state: &StateStore,
+    stats: &TurnStats,
+    session_started: Instant,
+    theme: ThemeKind,
+    loop_state: Option<ys_tui_coding::LoopView>,
+) -> CodingView {
+    let mut view = build_view(
+        cfg,
+        agent,
+        wiring,
+        registry,
+        state,
+        stats,
+        session_started,
+        theme,
+    );
+    view.loop_state = loop_state;
+    view
 }
 
 /// 往 `/model` 候选里加一条：按 **`(provider, model)`** 判重。

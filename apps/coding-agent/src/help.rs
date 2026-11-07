@@ -65,6 +65,7 @@ TUI 斜杠命令：
   /clear               清空上下文并清屏（旧会话文件保留，可 /resume 找回）
   /resume [id]         恢复既有会话（无参列出并选择）
   /compact             压缩上下文（先提示，再报告前后估算）
+  /loop <间隔> <提示词>  定时唤醒（如 /loop 5m 查 CI）；/loop off 停止
   /export [path]       导出会话到文件
 
 示例：

@@ -970,6 +970,15 @@ fn status_text(app: &App, width: usize) -> String {
     if let Some((note, _)) = &app.status_note {
         segs.push(format!("✓ {note}"));
     }
+    // 定时循环段排在**首段之后、model 之前**（与 `status_note` 同规）：窄终端剥尾时
+    // 它得留下 —— 它是「正在被自动推进」的信号，比 model / tokens 更紧急。
+    if let Some(loop_state) = &app.view.loop_state {
+        let phase = match &loop_state.next_at {
+            Some(at) => format!("下次 {at}"),
+            None => "正在跑".to_string(),
+        };
+        segs.push(format!("[loop] {} · {phase}", loop_state.interval));
+    }
     segs.push(app.view.model_label());
     // 「下方有新内容」提示：脱离底部时才有 —— 排在 model 之后、其余段之前，
     // 于是窄终端下先被剥掉的是 tokens / 轮数 / 时长，提示与 model 都留得住。

@@ -353,6 +353,11 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
             }
         }
         "compact" => Action::Request(Request::Compact),
+        // `/loop <间隔> <提示词>` 设定时循环，`/loop off` 清掉，无参/非法间隔只本地提示。
+        //
+        // **单条语义**：一个 session 一个循环，再敲一次即覆盖（不叠加、不报错）。
+        // 间隔下限 10s（再低就是在烧钱）、上限 24h；没有上限配置就只有这两道钳。
+        "loop" => parse_loop(&args),
         // 无参 → `None`：**默认落点由 app 侧按会话文件决定**（设计 §6「会话文件
         // 在 app 侧」）。TUI 不替 app 猜一个相对 cwd 的路径（那样会静默覆盖同名文件）。
         "export" => Action::Request(Request::Export {
@@ -366,8 +371,7 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
     }
 }
 
-/// 内置表**未命中**时的兜底：首 token 命中一条 skill ⇒ 原文直发；否则既有未知命令提示。
-///
+/// 内置表**未命中**时的兜底：首 token 命中一条 skill ⇒ 原文直发；否则既有未知命令提示。///
 /// `command` 是**目录名**（= `/` 后要敲的那个词），与内置命令名同处一个命名空间。
 /// 精确相等才命中（`/git-status` 不会因为存在 skill `git` 而误命中）。
 ///
@@ -376,6 +380,63 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
 /// `view::build_view`**，不可被用户调用的 skill 根本不会进这份快照。TUI 侧只
 /// 消费已过滤的结果，`SkillEntry` 也刻意不携带 `user_invocable`（数据/显示分离，
 /// UI 不做准入决策）。
+/// `/loop` 的解析：`<间隔> <提示词>` 设一个，`off` 清掉。
+///
+/// **单条语义**：一个 session 只能有一个循环，再敲一次即**覆盖** ——
+/// 不叠加、不报错。多条排序要额外设计「同时到点怎么办」，而那三件事本来就
+/// 能写进同一条提示词让模型每轮自己判断。
+///
+/// 间隔格式 `<数字><单位>`，单位 ∈ `s` / `m` / `h`。钳在 `[10s, 24h]`：
+/// 再短就是每几秒一个回合地烧钱，再长就跟「盯着点」的本意无关了。
+/// 非法输入一律本地提示（`LocalAction::Hint`）、**不发 `Request`** ——
+/// 不改变任何状态，用户改完重敲即可。
+fn parse_loop(args: &[&str]) -> Action {
+    match args.first().copied() {
+        None => Action::Local(LocalAction::Hint(LOOP_USAGE.to_string())),
+        Some("off") => Action::Request(Request::LoopOff),
+        Some(spec) => {
+            let Some(interval_secs) = parse_interval_secs(spec) else {
+                return Action::Local(LocalAction::Hint(format!(
+                    "{LOOP_USAGE}（`{spec}` 不是有效间隔）"
+                )));
+            };
+            let prompt = args[1..].join(" ");
+            if prompt.trim().is_empty() {
+                return Action::Local(LocalAction::Hint(LOOP_USAGE.to_string()));
+            }
+            Action::Request(Request::Loop {
+                interval_secs,
+                prompt,
+            })
+        }
+    }
+}
+
+/// 间隔的下限与上限（秒）。
+const LOOP_MIN_SECS: u64 = 10;
+const LOOP_MAX_SECS: u64 = 24 * 60 * 60;
+
+const LOOP_USAGE: &str =
+    "用法：/loop <间隔> <提示词>\n  间隔如 30s / 5m / 2h（限 10s – 24h）\n  /loop off 停止";
+
+/// `5m` / `90s` / `2h` → 秒。越界或格式非法 → `None`。
+///
+/// 只收单个 `<数字><单位>`：`1h30m` 这种复合写法不支持 —— 它要额外的解析与
+/// 进位规则，而幂数场景（盯 CI、等构建）用单一单位就够。
+fn parse_interval_secs(spec: &str) -> Option<u64> {
+    let (digits, unit) = spec.split_at(spec.len().checked_sub(1)?);
+    let n: u64 = digits.parse().ok()?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(3600)?,
+        _ => return None,
+    };
+    (LOOP_MIN_SECS..=LOOP_MAX_SECS)
+        .contains(&secs)
+        .then_some(secs)
+}
+
 fn skill_fallback(text: &str, name: &str, skills: &[SkillEntry]) -> Action {
     if skills.iter().any(|s| s.command == name) {
         return Action::Request(Request::Prompt(prompt_message(text)));
@@ -1000,6 +1061,14 @@ mod tests {
                 }),
             ),
             ("/compact", Action::Request(Request::Compact)),
+            (
+                "/loop 5m 查 CI",
+                Action::Request(Request::Loop {
+                    interval_secs: 300,
+                    prompt: "查 CI".into(),
+                }),
+            ),
+            ("/loop off", Action::Request(Request::LoopOff)),
             ("/export", Action::Request(Request::Export { path: None })),
             (
                 "/export a.jsonl",
@@ -1039,6 +1108,8 @@ mod tests {
             "/resume",
             "/resume abc",
             "/compact",
+            "/loop 5m 查 CI",
+            "/loop off",
             "/export p",
         ]
         .iter()
@@ -2125,5 +2196,77 @@ mod tests {
         let legacy = line(&view);
         assert_eq!(legacy, "context    65536");
         assert!(!legacy.contains("(capped)"), "{legacy}");
+    }
+
+    // ---- `/loop` 的间隔解析与分派 ----
+
+    /// 合法间隔 ⇒ 秒数（含边界）。纯函数单测，不起会话。
+    #[test]
+    fn test_parse_interval_accepts_valid_specs() {
+        // 三个单位各一条，再加两侧边界 —— 边界正是钳制的全部内容。
+        assert_eq!(parse_interval_secs("90s"), Some(90));
+        assert_eq!(parse_interval_secs("5m"), Some(300));
+        assert_eq!(parse_interval_secs("2h"), Some(7200));
+        // 边界：10s 与 24h 都**收**（`..=` 闭区间）。
+        assert_eq!(parse_interval_secs("10s"), Some(LOOP_MIN_SECS));
+        assert_eq!(parse_interval_secs("24h"), Some(LOOP_MAX_SECS));
+    }
+
+    /// 越界与非法格式 ⇒ `None`。每一条都对应一个真实的敲错方式。
+    #[test]
+    fn test_parse_interval_rejects_out_of_range_and_malformed() {
+        // 越界：5s 太密（每几秒一个回合地烧钱），25h 超出钳制上限。
+        assert_eq!(parse_interval_secs("5s"), None);
+        assert_eq!(parse_interval_secs("25h"), None);
+        // 格式：无单位 / 未知单位 / 复合写法 / 空串 / 纯单位。
+        assert_eq!(parse_interval_secs("abc"), None);
+        assert_eq!(parse_interval_secs("5x"), None);
+        assert_eq!(parse_interval_secs("1h30m"), None);
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("m"), None);
+        // 负号不是数字 ⇒ 解析失败（而不是溢出成一个巨大的 u64）。
+        assert_eq!(parse_interval_secs("-5m"), None);
+    }
+
+    /// `5m` 与 `300s` 等价 —— 单位只是书写方式，不是语义。
+    #[test]
+    fn test_parse_interval_units_are_interchangeable() {
+        assert_eq!(parse_interval_secs("5m"), parse_interval_secs("300s"));
+        assert_eq!(parse_interval_secs("2h"), parse_interval_secs("120m"));
+    }
+
+    /// `/loop` 的四种分派形态，逐条钉住。
+    #[test]
+    fn test_loop_dispatch() {
+        // 1. 合法：间隔 + 提示词（多词提示词按空格拼回）。
+        assert_eq!(
+            parse("/loop 5m 检查 CI 状态"),
+            Action::Request(Request::Loop {
+                interval_secs: 300,
+                prompt: "检查 CI 状态".into(),
+            })
+        );
+        // 2. `off` ⇒ 取消请求（不是提示）。
+        assert_eq!(parse("/loop off"), Action::Request(Request::LoopOff));
+        // 3. 无参数 ⇒ 用法提示，**不发请求**（不改变任何状态）。
+        assert!(matches!(
+            parse("/loop"),
+            Action::Local(LocalAction::Hint(ref h)) if h == LOOP_USAGE
+        ));
+        // 4. 有间隔无提示词 ⇒ 同为用法提示：没有提示词的循环不知道要干什么。
+        assert!(matches!(
+            parse("/loop 5m"),
+            Action::Local(LocalAction::Hint(ref h)) if h == LOOP_USAGE
+        ));
+        // 5. 非法间隔 ⇒ 提示里带出用户敲的那个值（便于定位）。
+        assert!(matches!(
+            parse("/loop 5x 干活"),
+            Action::Local(LocalAction::Hint(ref h)) if h.contains("5x")
+        ));
+        // 6. 只有空白的提示词等同没有 —— `join` 后 `trim` 为空。
+        assert!(matches!(
+            parse("/loop 5m    "),
+            Action::Local(LocalAction::Hint(_))
+        ));
     }
 }

@@ -149,6 +149,20 @@ pub struct CodingView {
     /// 由接线器注入，而不是本 crate 读自己的 `env!("CARGO_PKG_VERSION")`：后者是
     /// **库**的版本号，用户关心的是他跑的那个可执行文件的版本。
     pub version: String,
+    /// 定时循环的状态投影（`/loop`）。`None` = 没有循环在跑。
+    ///
+    /// **已投影的显示值**：“间隔怎么格式化”、“下次几点”由 app 侧算好 ——
+    /// 渲染层不做时间格式判断，只把两段文字拼进状态行。
+    pub loop_state: Option<LoopView>,
+}
+
+/// 定时循环的**显示投影**（不含任何时刻真值，那在 app 侧）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoopView {
+    /// 间隔的显示串（`5m` / `2h`）。
+    pub interval: String,
+    /// `None` = 正在跑回合；`Some` = 空闲，等这个时刻（`HH:MM`）。
+    pub next_at: Option<String>,
 }
 
 impl Default for CodingView {
@@ -180,6 +194,7 @@ impl Default for CodingView {
             thinking_visible: false,
             theme: ThemeKind::default(),
             version: "0.0.0".to_string(),
+            loop_state: None,
         }
     }
 }
@@ -277,6 +292,7 @@ impl CodingView {
             thinking_visible: false,
             theme: ThemeKind::default(),
             version: "0.0.0".to_string(),
+            loop_state: None,
         }
     }
 }

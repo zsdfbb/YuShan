@@ -305,20 +305,26 @@ $ bash scripts/doc-consistency.sh             # 文档对账（改过文档时�
 
 ## 附录：加一个工具
 
-以 `ls` 为例，实际要碰四个地方：
+以 `ls` 为例，实际要碰三个地方：
 
 ```
 adapters/tools-basic/src/ls.rs       实现 Tool，含 spec() 与执行
 adapters/tools-basic/src/lib.rs      pub use
-apps/coding-agent/src/toolset.rs     build_tools() 里 push，且位置即顺序
-apps/coding-agent/src/toolset.rs     EXPECTED_ORDER 加名字（与上一条必须同步）
+apps/coding-agent/src/toolset.rs     builtin_plugins() 里声明 ToolPlugin，order 即顺序
 ```
 
-⚠️ **工具面恒定**是硬约束（见「硬性约束」）。另有两处连带影响：
+⚠️ **工具面恒定**是硬约束（见「硬性约束」）。另有四处连带影响：
 
-- `EXPECTED_ORDER` 与 `build_tools()` **改一处必须改两处**，`cargo test` 会卡住不一致。
+- **顺序的唯一声明处是 `builtin_plugins()` 里各插件的 `order`**（经 `sort_plugins` 升序折表）。
+  测试侧另有一份**独立的** `EXPECTED_ORDER_FOR_TESTS` 字面量对账 —— 两边都改才能保持绿，
+  这正是它要拦的漂移。
+- `order` **必须唯一**（`sort_plugins` 校验）：重复会让工具序退化为「声明先后」，
+  与「序必须是显式常量」相违。
+- **工具描述与 guideline 声明在 `apps/coding-agent/src/tool_prompts.rs`**，按工具名索引
+  （`prompt_for(name)`）。新工具没在那里声明 ⇒ 系统提示词里该工具的描述退化为兑底文案，
+  编译与既有测试全绿。
 - 工具表的**顺序即契约**：子表 JSON 必须是父表的字节前缀，这样 prompt cache 才命中。
-  父表追加段（`bash_bg` + `subagent` + `subagent_async`）的顺序不能重排。
+  父表追加段（`bash_bg` + `subagent_async` + `subagent_send` + `todo`）的顺序不能重排。
   改之前读 [`docs/design-final/coding-agent-tui.md`](docs/design-final/coding-agent-tui.md) §13.1（装配形态在 :723 起）。
 
 ---

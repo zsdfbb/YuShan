@@ -1,6 +1,6 @@
 # 0024 — 长程闭环：todo 真值落外部文件、回合边界注入、follow-up 按「有未完成项」推进
 
-给「长程任务的成功率与闭环」定下**状态、可见性、推进**三件事的落点：① **todo 真值搬出会话**，落在会话同级的 `<stem>.todo.json`（**supersede 0021 决策 5**，并**推翻** 0021 的「否决落盘持久化 todo」）；② 可见性靠 **`app_loop` 在回合边界追加一条 `Role::User` 消息到 `messages` 尾部**，判据是「**状态变了 ∨ 会话里找不到标记**」—— 绝不改 `system`；③ 推进靠 **follow-up 的纯函数判据「有未完成项」**（与一期已上线的 HEAD 判据**并存**，同一循环两个判据），配**五道护栏**。新增终止态 **`Cancelled`**，「全部完成后删除」的判据是「**无 open 项**」而非「全部 Completed」。`todo` **排父表追加段末位**（子表须仍是父表的字节前缀）。**零核心 crate 改动、零改 `BasicLoop`。**
+给「长程任务的成功率与闭环」定下**状态、可见性、推进**三件事的落点：① **todo 真值搬出会话**，落在会话同级的 `<stem>.todo.json`（**supersede 0021 决策 5**，并**推翻** 0021 的「否决落盘持久化 todo」）；② 可见性靠 **`app_loop` 在回合边界追加一条 `Role::Harness` 消息到 `messages` 尾部**，判据是「**状态变了 ∨ 会话里找不到标记**」—— 绝不改 `system`；③ 推进靠 **follow-up 的纯函数判据「有未完成项」**（与一期已上线的 HEAD 判据**并存**，同一循环两个判据），配**五道护栏**。新增终止态 **`Cancelled`**，「全部完成后删除」的判据是「**无 open 项**」而非「全部 Completed」。`todo` **排父表追加段末位**（子表须仍是父表的字节前缀）。**零核心 crate 改动、零改 `BasicLoop`。**
 
 ## Status
 
@@ -20,14 +20,15 @@ accepted（2026-09-23）
 
 - **Supersede 0021 决策 5**（真值 = 会话里最后一次 `todo` 调用的 `arguments`）。会话里的 `arguments` 降级为**写入日志**，也是删除后的审计余量。
 - **推翻 0021 的「否决落盘持久化 todo」**：原否决的两条理由是「另一个量级的产品特性」与「引入第二真值源使 `/new` 语义含糊」。后一半由本决策正面回答（**文件是唯一真值**，`/new` 换 stem ⇒ 计划天然归零，与 0021 自己写的「`/new` 后 todo 归零是正确语义」一致）；前一半由长程需求承担。
-- **落点选会话同级**而非新目录：复用 `Wiring::latest_session_path()`（`wiring.rs:64,155`）的重启恢复，**零新目录、零新环境变量**，且 `YUSHAN_SESSIONS_DIR` 的测试覆盖自动生效（既有测试不改一行就不会碰用户的真实 `~/.yushan`）。
+- **落点选会话同级**而非新目录：`session_path()`（`wiring.rs:302`）直接给出 `<stem>`，重启时由 `Wiring::resume` / `resume_into`（`wiring.rs:124` / `:197`）按同一 stem 开回 ⇒ **零新目录、零新环境变量**，且 `YUSHAN_SESSIONS_DIR` 的测试覆盖自动生效（既有测试不改一行就不会碰用户的真实 `~/.yushan`）。
 - `-p` / `--json`（一次性会话）⇒ **纯内存 store，不落盘**。
 
-### 2. 可见性：`app_loop` 回合边界追加一条 `Role::User` 到 `messages` 尾部
+### 2. 可见性：`app_loop` 回合边界追加一条 `Role::Harness` 到 `messages` 尾部
 
 - **绝不改 `system`** —— 0021 决策 1 的硬约束，本 ADR 首次**真正使用**它，并加一条不变量测试（`system_prompt_does_not_depend_on_todo_state()`）把它变成机械保证。
 - **判据 = `状态变了 ∨ 会话里找不到标记`**（纯函数 `should_inject`）。前半堵住「上下文里堆 N 份互相矛盾的副本」；后半是**自愈** —— 压缩（或手敲 `/compact`）把块吃掉后自动补回，**不需要**监听 `ContextCompacted` 事件，因此也覆盖得了那条不发事件的手敲路径。
 - **注入点选 `app_loop` 而非 `BasicLoop`**：`BasicLoop` 是最高爆炸半径；且直接 `session.append` **不发事件** ⇒ todo 块不显示成用户消息（对比 `Boundary::Steer` 会 emit `AgentEvent::UserMessage`，`basic.rs:222`）。
+- **用 `Role::Harness` 而不是 `Role::User`**（与 `cross-turn-advance/design.md` §3.1a 同一裁定）：用户没说过这些话，记成用户说的会污染「我是谁、我说过什么」。出站时适配器把它映射成 user 角色（`adapters/model-openai-compatible/src/lib.rs:1424`）⇒ 模型看到的仍是 user 输入；TUI 画成 `System` 行 ⇒ 用户一眼能看出不是自己说的。
 - **渲染必须是纯函数**：同样内容恒产出同样字节（**不得含时间戳 / turn 号 / session id**）—— 这是「状态没变就不注入」判据成立的前提。
 
 ### 3. 推进：follow-up 判据换成「有未完成项」，五道护栏
@@ -41,10 +42,12 @@ accepted（2026-09-23）
   | `should_follow_up`（HEAD 不等） | commit 后同步文档 | `follow_up_on_commit`（默认关） |
   | `has_open_items()`（有未完成项） | 用户自己的计划 | **无开关**（计划的有无就是开关） |
 
-  **seam 复用**：两者共用 `while let Some(msg) = pending.take()` 这条循环，各贡献一个 `Option<Message>`。
+  **seam 复用**：两者在 `Request::Prompt` 臂的**同一个 follow-up 循环**里各贡献一个 `Option<Message>`（ADR-0041 删除旧 `while pending.take()` 后已无该循环；现行形态见 `app_loop.rs:801` 的单个顺序 `if`）。
 - **五道护栏**，缺一不可：
   1. **计数上限**（`MAX_FOLLOW_UPS = 8`，替换原默认 1）—— 防「跑太久」；
-  2. **停滞护栏**（本轮 `revision` 未变 **且** 模型自称收尾 ⇒ 停）—— 防「**原地打转**」。这是**真正的防套娃**：上限只防量，它防质；
+  2. **停滞护栏**（todo 集合指纹连续 3 轮不变 **且** 模型自称收尾 ⇒ 停）—— 防「**原地打转**」。这是**真正的防套娃**：上限只防量，它防质；
+     ⚠️ 指纹 = 非终态项的归一化内容集合，**不是** `TodoStore` 的内部版本号（后者任何写入都变，
+     模型把同一项重写一遍就能重置护栏）。三期实现见 `docs/arch/cross-turn-advance/design.md` §5.8。
   3. **`stop_reason` 门**：`Cancelled` / `Truncated` **一律不续**（用户 Ctrl+C 永远赢）；
   4. **用户输入抢占**：追问链路每次迭代开头先 `try_recv`，有待处理输入立即中断（否则 8 次追问会把用户输入排队到 8 个回合之后）；
   5. **防逃逸**：写入拒绝丢弃既有非终态项（见决策 4）。
@@ -63,7 +66,7 @@ accepted（2026-09-23）
 - **扩展 0022 D3**（原：子表 = 父表 − 派发工具）为 **− {`subagent_async`, `subagent_send`, `todo`}**，并加一条更强的硬规则：**被摘的项必须都在后缀区**，否则子 `tools` JSON 不再是父的**字节前缀**，0022 D3 的缓存理由（每次派发省 ~1.6k + 其后 system 命中）失效。
 - **实际顺序**：`… webfetch, bash_bg, subagent_async, subagent_send, todo`。
   子表 = `build_tools()` 的 11 元基础表（`assembly.rs:149-150`）；父表在它之后追加四项（`assembly.rs:199-219`）。
-  ⚠️ **`todo` 只能进父表追加段**，不能进基础表 —— 否则子 agent 也会有 `todo`，违反决策 e。
+  ⚠️ **`todo` 只能进父表追加段**，不能进基础表 —— 否则子 agent 也会有 `todo`，同时打破字节前缀与单写者不变量（理由见 `docs/arch/long-horizon-todo/design.md` §7.4 e）。
   代价：`subagent_send` 让出末位（0022 D18/§6 的措辞需相应更新）。
 - **「只有主 agent 有 todo」由结构保证，零运行时检查**：子 registry 里没有 `todo` ⇒ `registry.get("todo")` 返回 `None` ⇒ 走既有的「tool not found」分支。提示词层同步门控（`if tools.contains(&"todo")`）⇒ 子 agent 的 system prompt 里**既无清单行、也无纪律句**（0022 D15 的「one visibility」：看不见 + 执行拒绝）。
 - **`todo` 永不声明 `is_concurrency_safe()`**（默认 `false`）⇒ 0022 D17 的条件并行路径永远不会并发两个 `todo` 调用。这是「共享状态 + 并行」的唯一防线。

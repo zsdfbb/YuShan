@@ -306,6 +306,6 @@ ADR-0041 的硬要求。本期实现的落点：
 
 通用 hook 系统；多目标 / 目标树；跨会话目标恢复；默认开启的完工复核；
 判官调工具；助手自述进证据池；扩 `ys-event` 词汇；把判官放进 `ys-runtime` 公共 API；
-子 agent 的 todo（ADR-0024 决策 e：同时打破字节前缀与单写者不变量）。
+子 agent 的 todo（同时打破字节前缀与单写者不变量，理由见 `docs/arch/long-horizon-todo/design.md` §7.4 e）。
 
 完整设计与测试矩阵见 `docs/arch/cross-turn-advance/design.md` §5。

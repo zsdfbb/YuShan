@@ -127,7 +127,7 @@ guideline： edit(3条), write(1条), edit|write(1条), [read组(1条), grep(1�
 | **W2** | [U2 → T2] | `apps/coding-agent/src/toolset.rs` | **P0 指纹保持绿**（纯搬家证明） |
 | **W3** | [U3 → T3] | `apps/coding-agent/src/prompt.rs`、`assembly.rs` | **P0 指纹保持绿** |
 | **W4** | [U4 → T4] | `adapters/tools-todo/`（新 crate）、`Cargo.toml` | 清单层单元测试 |
-| **W5** | [U5 → T5] | `apps/coding-agent/src/toolset.rs`、`prompt.rs` | 工具表 11 → 12 元，**指纹显式平移** |
+| **W5** | [U5 → T5] | `apps/coding-agent/src/assembly.rs`、`prompt.rs` | 父表 14 → 15 元，**`fp_parent` 显式平移、`fp_tools` 不变** |
 | **W6** | [U6 → T6] | `apps/coding-agent/src/todo_inject.rs`（新）、`app_loop.rs` | 注入判据 + 自愈 |
 | **W7** | [U7 → T7] | `apps/coding-agent/src/goal.rs`、`goal_judge.rs`（新）、`ys-protocol/src/goal.rs`（新） | 判官 + 引用校验 |
 | **W8** | [U8 → T8] | `apps/coding-agent/src/app_loop.rs`、`main.rs` | 两条入口一致 |
@@ -155,8 +155,8 @@ pub struct ToolPlugin {
 }
 
 pub struct ToolPrompt {
-    pub tool: &'static str,          // 归属工具名（用于 snippet 查表）
-    pub snippet: &'static str,
+    pub tool: String,                // 归属工具名（用于 snippet 查表）
+    pub snippet: String,
     pub guidelines: Vec<GuidelineBlock>,
 }
 
@@ -166,7 +166,7 @@ pub struct GuidelineBlock {
     pub slot: u16,                   // **全局**渲染位次（陷阱 1）
     pub gate: Gate,                  // 门控（陷阱 1）
     pub scope: Scope,                // narrate 维度（陷阱 2）
-    pub lines: Vec<&'static str>,
+    pub lines: Vec<String>,
 }
 
 pub enum Gate {
@@ -183,7 +183,10 @@ pub enum Scope { Always, MainOnly }
 - 拒绝 `inventory` / `linkme`（顺序由链接器决定，撞缓存前缀稳定）。
 - 跨插件重名工具 **fail-fast**，错误信息**点名来源**（形如 `tool "todo" declared by plugin #3 and plugin #7`）——
   否则第三方拿到 `duplicate tool name: todo`（`registry.rs:30`）不知道是谁撞了谁。
-- **`slot` 全局唯一且不重复**（否则排序不稳定）；启动期断言。
+- **`slot` 全局唯一且不重复**（否则排序不稳定）；声明期校验，返回 `Result`（**不 panic**，与 `ToolRegistry::build` 同形）。
+- **用 owned `String` 而非 `&'static str`**：`subagent_async` 的第 1 条 guideline 用 `format!`
+  注入 `ys_component::DEFAULT_MAX_PARALLEL_TOOLS`（`prompt.rs:491`）—— 它不是 `&'static str`，
+  字面类型会让这一块搬不进来。
 
 **测试（T1）**：
 
@@ -243,15 +246,23 @@ pub enum Scope { Always, MainOnly }
 - `render_block` 字节稳定：同内容两次渲染逐字节相同（变异：加时间戳 ⇒ 红）。
 - `/new` retarget ⇒ 新文件且计划为空；同一 `Arc` 身份不变。
 
-### W5：把 todo 接进工具表
+### W5：把 todo 接进父表
 
-- `builtin_plugins()` 加一条 `todo`，`order` 取**倒数第二**（`…, webfetch, todo`）。
-- `EXPECTED_ORDER`（派生量）自动变成 12 元；测试侧独立字面量同步加 `todo`。
-- `toolset.rs` **四处** `assert_eq!(tools.len(), 11)` → `12`（`:238/:328/:505/:641`）；`assembly.rs:388` 子表 `11` → `12`。共**五处**。
-- 子 registry **不得**含 `todo`（ADR-0024 决策 e：同时打破字节前缀与单写者不变量）。
+- 在 `assembly.rs` 的父表追加段**末尾** push `TodoTool`（即 `… bash_bg, subagent_async, subagent_send, todo`）。
+- **`toolset.rs` 一行不改**：`EXPECTED_ORDER`（11 元）与 `vec!` 都不动 —— 它描述的是**子表**，子表不含 `todo`。
+- 父表 `assert_eq!(len, 15)`（`assembly.rs:387`）；子表 `assert_eq!(len, 11)` 保持（`:388`）。
+- ⚠️ **`real_parent_table_ends_with_the_subagent_tools`（`assembly.rs:436`）必红**：
+  它硬钉 `&parent_names[len-2..] == ["subagent_async", "subagent_send"]`，
+  并断言 `tool_names().last() == Some("subagent_send")`。`todo` 追加到末位后两条都不再成立。
+  **改法**：把断言改成「派发工具族之后只剩 `todo`」——
+  `&parent_names[len-3..] == ["subagent_async", "subagent_send", "todo"]`，
+  `last() == Some("todo")`；并在注释里写清**为什么末位换人仍安全**：
+  子表（前 11 项）逐字节未变 ⇒ 缓存前缀契约不变。
+  同时**新增一条**：`child_specs` 不含 `todo`（变异：把它加进基础表 ⇒ 红）。
+- 子 registry **不得**含 `todo`（同时打破字节前缀与单写者不变量，理由见 `docs/arch/long-horizon-todo/design.md` §7.4 e）。
 
-**⚠️ 这是**预期内**的前缀漂移**：`fp_tools` 与 `fp_parent` **都会变**。
-更新锚点时必须在 commit message 里写明「新增 todo 工具，前缀 +N B」，
+**⚠️ 这是**预期内**的前缀漂移**：只有 `fp_parent` 会变，`fp_tools` **不变**（子表未动）。
+更新锚点时必须在 commit message 里写明「父表追加 todo，前缀 +N B」，
 且**从 `git stash` 的干净树取值**，不是从跑红的树里抄。
 
 **验收**：父表 JSON 仍是子表 JSON 的字节前缀（`toolset.rs:684` 那条断言）。
@@ -271,6 +282,15 @@ pub fn should_inject(store: &TodoStore, last_injected_rev: Option<u64>, session:
 **接入点**：`app_loop.rs` 的 `Request::Prompt` 臂，回合边界 `session.append(...)`。
 ⚠️ **直接 append，不发事件** ⇒ UI 不显示（对比 `Boundary::Steer` 会 emit `UserMessage`）。
 ⚠️ **绝不改 `system`**（ADR-0021 新增硬约束：`system` 是每轮整块重发的前缀，动它等于每轮废掉缓存）。
+
+**读会话需要新访问器**：`Wiring.session` 是私有 `Box<dyn Session>`，现有导出只有
+`ports_with_boundary()`（借 `&mut`）与 `session()`（返回 `SessionSlot`）。
+在 `wiring.rs` 新增一个只读访问器（~5 行）：
+
+```rust
+/// 只读借出当前会话 —— 回合边界判「标记还在不在」用（`should_inject`）。
+pub fn session_ref(&self) -> &dyn Session { self.session.as_ref() }
+```
 
 **测试（T6）**：
 
@@ -322,6 +342,33 @@ continue = todo.has_open_items()          // 清单层（无开关）
 **`-p` 默认行为不变**：不写清单、不传 `--goal` ⇒ 三项均假 ⇒ 跑完即退出。
 ⚠️ 但**不是「逐字节不变」** —— 加 `todo` 工具本身会改工具表（W5 的预期内漂移，全入口同步）。
 退出码：`0` = 达成；`2` = 未达成。
+
+#### ⚠️ W8 的头号陷阱：`consume_events` 在首个终局事件就返回
+
+`main.rs:1189` 的 `consume_events` 一遇 `is_terminal`（`RunFinished` / `RunFailed`）就 `return`，
+**且它按值拿走 `rx`**（`main.rs:2195` 的 `rx: mpsc::Receiver<Envelope>`）。
+`RunFinished` 是**每回合**一个（`begin_turn(1)` 是 per-turn 语义），不是整个 run 一个。
+
+⇒ 直接把 `-p` 的 goal 循环包在 `run_single_turn` 外面、只 `join!` 一次，
+第二轮的事件**无人消费** ⇒ 有界信道撞满 ⇒ **死锁**（这正是 AGENTS.md 信道契约那条）。
+
+**改法**：把消费器的 `rx` 从**按值**改为**按 `&mut`** ——
+`consume_print_events(rx: &mut mpsc::Receiver<Envelope>, …)` /
+`consume_events(rx: &mut mpsc::Receiver<Envelope>, …)`。
+然后在 `run_print_mode` 内：
+
+```text
+for turn in 1..=MAX_TURNS {
+    join!( run_one_turn(…) , consume_print_events(&mut rx, …) );
+    if !continue_condition { break }
+}
+```
+
+每轮 `join!` 消费**本轮**的终局事件后返回，下一轮再消费下一轮的 —— 既不提前退出也不死锁。
+`ConsumeOutcome` 按轮累计（`rounds` 求和、`terminal` 取最后一轮）。
+
+**验收**：mock 第 1 轮 `NOT_MET`、第 2 轮 `MET` ⇒ 回合数 = 2、退出码 0，**且不超时**。
+（若忘了这条，该用例会挂死而不是失败 —— 变异测试脚本必须带超时。）
 
 **测试（T8）**：
 
@@ -380,5 +427,5 @@ continue = todo.has_open_items()          // 清单层（无开关）
 - `ToolResult.details` —— ADR-0021 决策 2 继续有效。
 - 通用渲染注册表 —— 消费者仍为 1 个。
 - Hook 系统 —— ADR-0014；消费者仍为 0。
-- 子 agent 的 todo —— ADR-0024 决策 e。
+- 子 agent 的 todo —— `docs/arch/long-horizon-todo/design.md` §7.4 e。
 - 多目标 / 目标树 / 跨会话目标恢复 —— ADR-0072 明确不做。

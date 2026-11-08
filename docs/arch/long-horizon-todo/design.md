@@ -14,8 +14,8 @@
 
 | # | 决策 | 一句话 |
 |---|---|---|
-| **D1** | **真值搬出会话**：`<sessions_dir>/<stem>.todo.json` | 推翻 ADR-0021 决策 5（真值 = 最后一次调用的 `arguments`）。会话同级、同 stem ⇒ 复用 `latest_session_path()` 的重启恢复，**零新目录、零新环境变量** |
-| **D2** | **注入 = 回合边界一条 `Role::User` 消息，进 `messages` 尾部** | 内容是**会变**的 ⇒ 尾部注入是其唯一正当形态（ADR-0021 决策 1 / `prompt-delivery/notes.md:50-56`）。**绝不改 `system`** |
+| **D1** | **真值搬出会话**：`<sessions_dir>/<stem>.todo.json` | 推翻 ADR-0021 决策 5（真值 = 最后一次调用的 `arguments`）。会话同级、同 stem ⇒ 重启时随 `Wiring::resume` 一起回来，**零新目录、零新环境变量** |
+| **D2** | **注入 = 回合边界一条 `Role::Harness` 消息，进 `messages` 尾部** | 内容是**会变**的 ⇒ 尾部注入是其唯一正当形态（ADR-0021 决策 1 / `prompt-delivery/notes.md:50-56`）。**绝不改 `system`**。不用 `Role::User`：用户没说过这些话（同 `cross-turn-advance/design.md` §3.1a） |
 | **D3** | **注入判据 = `状态变了 ∨ 会话里找不到标记`**（纯函数） | 前者堵住「上下文堆 N 份矛盾副本」；后者是**自愈**：压缩把块吃掉后自动补回，**不需要**监听 `ContextCompacted` 事件 |
 | **D4** | **推进 = follow-up 纯函数判据「有未完成项」** + **五道护栏** | 与一期已上线的 git HEAD 判据（`post_turn.rs:66`）**并存**，同一循环两个判据。**不需要开关** —— 开关就是「有没有计划」 |
 | **D5** | **加终止态 `Cancelled`；删除判据 = 「无 open 项」而非「全部 Completed」** | 后者会让「放弃某项」永远卡住 ⇒ 永不删除。执行者是**代码**（`save` 收口），不是模型自觉 |
@@ -112,7 +112,7 @@
 
 - **模块**：`adapters/tools-todo/`（item / store / render / tool）+ app 侧 `follow_up.rs`。**零核心 crate 改动。**
 - **注入**：**每回合无条件重放**（turn 粒度）；另备**逃生门** —— 轮级注入经 `Boundary::Steer`（零 `BasicLoop` 改动）。
-- **推进**：`decide()` 纯函数返回 `FollowUp::Stop(StopCause)`（六种停止原因**显式枚举**）+ 5 道护栏，含 **`ModelDisagrees`**（模型自称收尾但 `revision` 未变 ⇒ 停）。
+- **推进**：`decide()` 纯函数返回 `FollowUp::Stop(StopCause)`（六种停止原因**显式枚举**）+ 5 道护栏，含 **`ModelDisagrees`**（模型自称收尾但 todo 集合指纹连续 3 轮未变 ⇒ 停）。
 - **防逃逸**：`apply()` **拒绝丢弃既有非终态项** ⇒ 模型不能发 `[]` 逃逸追问循环。
 - **成本**：给了逐项算式，50 轮 **+19.3%**；口径对照表（每轮注入 +43.9%；工具面每轮变 **+1,476%**）。
 - **诚实自陈**：轮级新鲜度缺失是明确退化；注入副本会累积。
@@ -253,8 +253,9 @@ impl TodoStore {
     ///
     /// **两条硬规则（都在这里，不靠模型自觉）**：
     /// 1. **拒绝丢弃既有非终态项** —— 否则模型发一个 `[]` 就能关掉追问护栏（丙的发现）；
-    /// 2. **非空且全部终态 ⇒ 清空 + 删文件** —— 「全部完成后删除」（甲的关键修正：判据是
-    ///    「无 open 项」而非「全部 Completed」，后者会让放弃的项永远卡住）。
+    /// 2. **无 open 项 ⇒ 清空 + 删文件** —— 「全部完成后删除」的判据是
+    ///    「无 open 项」而非「全部 `Completed`」，后者会让被放弃（`cancelled`）的项永远卡住。
+    ///    模型在无计划时发 `[]` ⇒ `Updated`（无 open 项可丢，也无文件可删）。
     pub fn apply(&self, incoming: Vec<TodoItem>) -> Result<ApplyOutcome, TodoError>;
 
     /// `/new`：清空 + 换路径。**同一 `Arc` 身份不变** —— 工具持的就是它。
@@ -263,6 +264,12 @@ impl TodoStore {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome { Updated, ClearedAllDone }
+
+/// 写入被拒的原因。**文案面向模型** —— 说清怎么改，不只说错在哪。
+pub enum TodoError {
+    WouldDropOpenItems { dropped: Vec<String> },  // 模型想丢弃非终态项
+    EmptyContent,                                  // `content` 归一化后为空
+}
 ```
 
 ```rust
@@ -279,6 +286,10 @@ pub fn render_block(items: &[TodoItem], revision: u64) -> String;
 // adapters/tools-todo/src/lib.rs
 pub fn todo_tool(store: Arc<TodoStore>) -> Box<dyn Tool>;
 ```
+
+**降级提示的出口**：`TodoStore::take_degraded_hint() -> Option<String>` —— 落盘损坏 / 版本不认时
+产生，**取一次即清**。本 crate **不 print**（与 `capabilities.rs` 同一条纪律：输出走 transcript，
+去处由接线器决定）。
 
 ```rust
 // apps/coding-agent/src/follow_up.rs —— 「一个函数一个 seam」，**不引 trait / registry**
@@ -312,6 +323,10 @@ pub const TODO_MARKER: &str = "<todo_list";
 ///
 /// 「找不到就补」是**自愈**：压缩（或手敲 `/compact`）把块吃掉后自动补回 ——
 /// **不需要监听 `ContextCompacted` 事件**，因此也覆盖得了那条不发事件的手敲路径。
+///
+/// 「找标记」**同时看 `Text` 与 `ToolResult` 块**：`todo` 工具回喂的结果与注入块
+/// 同源（同 `items`、同 `revision`），它还在历史里就说明模型已经看得见这一版，
+/// 再注一份只是重复计费。若只看 `Text`，模型刚调完 `todo` 的那个回合边界会白注一份。
 pub fn should_inject(store: &TodoStore, last_injected_rev: Option<u64>, session: &[Message]) -> bool;
 ```
 
@@ -321,14 +336,15 @@ pub fn should_inject(store: &TodoStore, last_injected_rev: Option<u64>, session:
 Request::Prompt(user_msg)
 │
 ├─ expand_skill_invocation（既有）
-├─ pending = Some(AgentInput::new(user_msg));  used = 0
-└─ while let Some(input) = pending.take():
+├─ let mut pending = Some(AgentInput::new(user_msg));  let mut used = 0u32;
+└─ loop {
      │
+     ├─ let Some(input) = pending.take() else { break };
      ├─ 【用户输入抢占】if request_rx.try_recv() 有待处理 Prompt ⇒ 中断链路，交还外层  ⚠️ 见 §7.4 决策 d
      ├─ turns += 1; begin_turn(turns); set_context_window（既有）
      │
      ├─ 【回合边界 · 注入】if should_inject(..) ⇒
-     │      ports.session.append(Message{ User, [Text(injection())] })
+     │      ports.session.append(Message{ Harness, [Text(injection())] })
      │      ⚠️ 直接 append，**不发事件** ⇒ UI 不显示（对比 `Boundary::Steer` 会 emit UserMessage）
      │      last_injected_rev = store.revision()
      │
@@ -343,14 +359,18 @@ Request::Prompt(user_msg)
      ├─ 排空事件信道（既有）
      ├─ match decide(store, used, stop_reason, rev_before):
      │      Push ⇒ used += 1; pending = Some(追问提示词);  刷 View; 回循环顶
-     │      Stop(_) ⇒ 落下
+     │      Stop(_) ⇒ break
      └─ build_view → Outbound::View（侧栏刷新）
 ```
+
+⚠️ **不是 `while let Some(msg) = pending.take()` 的无限循环**：那条形态随 ADR-0041 一起删了。
+计数上限（`used >= n`，`n = 8`）与 stall 护栏是**两个独立出口**，缺一不可 —— 前者防「跑太久」，
+后者防「原地打转」。
 
 ### 7.4 六个关键决策的取舍
 
 **a. 真值为什么搬出会话？**
-ADR-0021 决策 5 的真值（会话里最后一次调用的 `arguments`）在长程下**必然失效**：压缩摘的就是旧消息，任务越长那条调用越早变成旧消息。而三家调研一致：计划必须**活过压缩**。外部文件的额外收益：`/new` 换 stem ⇒ 计划天然归零（与 v1 判断一致），重启由 `latest_session_path()`（`wiring.rs:64,155`）自动恢复 —— **零新机制**。
+ADR-0021 决策 5 的真值（会话里最后一次调用的 `arguments`）在长程下**必然失效**：压缩摘的就是旧消息，任务越长那条调用越早变成旧消息。而三家调研一致：计划必须**活过压缩**。外部文件的额外收益：`/new` 换 stem ⇒ 计划天然归零（与 v1 判断一致），重启时 `Wiring::resume` / `resume_into`（`wiring.rs:124` / `:197`）按同一 stem 开回会话，todo 文件也随之找到 —— **零新机制**。
 
 **b. 为什么不像 Manus 那样每轮重写？**
 Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上下文管理，文件是唯一持久记忆；(ii) 尾部注入的「扰动」其实只限尾部那一段 —— 与本文算式同构，**不是整段前缀失效**。但本仓有**两家没有的东西**：一个**代码拥有的回合边界**（`app_loop`）与一个**已携带 `## Progress` / `## Next Steps` 的压缩摘要**。⇒ 用「状态变才注入」即可达到同样效果，成本约 **1/10**。
@@ -362,7 +382,8 @@ Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上�
 **d. 防套娃靠什么？**
 三道，缺一不可：
 1. **计数上限**（`MAX_FOLLOW_UPS = 8`）—— 防「跑太久」；
-2. **停滞护栏**（本轮 `revision` 未变 **且** 模型自称收尾 ⇒ 停）—— 防「**原地打转**」。这是**真正的防套娃**：上限只防量，它防质。**取自乙**（丙的 `ModelDisagrees` 是同一件事）；
+2. **停滞护栏**（todo 集合指纹连续 3 轮不变 **且** 模型自称收尾 ⇒ 停）—— 防「**原地打转**」。这是**真正的防套娃**：上限只防量，它防质。**取自乙**（丙的 `ModelDisagrees` 是同一件事）；
+   指纹 = 非终态项归一化内容集合，**不是** store 的 `revision`（后者任何写入都变，重写同一项即可重置护栏）。
 3. **用户输入抢占** —— 追问链路的每次迭代开头先 `try_recv`；有待处理输入立即中断。**用户的意图高于系统的**，否则一个 8 次追问的链路会把用户的输入排队到 8 个回合之后。
 
 **e. 为什么与 Claude Code Tasks 相反（只有主 agent 有 todo）？**

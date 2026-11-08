@@ -163,6 +163,8 @@ pub struct ToolPlugin {
     /// **工具位次**（升序折表），决定 `tools()` 与 tools JSON 的顺序。
     /// **必须是编译期常量** —— 顺序一变，prompt 前缀字节就变，所有用户的缓存全废（§4.3）。
     /// 不得来自 env / 登录态 / 探测结果。
+    /// **同一批插件内必须唯一**：重复则顺序退化为「声明先后」这一隐式规则，
+    /// 与「序必须是显式常量」直接冲突。由 `sort_plugins` 校验（返回 `Result`，不 panic）。
     pub order: u16,
     pub tools: Vec<Box<dyn Tool>>,
     pub prompts: Vec<ToolPrompt>,

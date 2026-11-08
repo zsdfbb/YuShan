@@ -574,7 +574,7 @@ ADR-0024（accepted，**未实现**：全仓 `TodoStore` / `todo.json` / `should
 | 理由 | 说明 |
 |---|---|
 | 活过压缩 | 压缩摘的就是旧消息；todo 在 session 里必然被摘掉。ADR-0021 已记过这个缺口 |
-| 活过重启 | 复用 `Wiring::latest_session_path()` 的既有恢复路径，**零新机制** |
+| 活过重启 | 复用 `Wiring::resume` / `resume_into` 的既有恢复路径（同 stem 开回），**零新机制** |
 | 活过回合 | 长程任务必然撞 `max_rounds` ⇒ 多回合；真值不能只在回合内有效 |
 | `/new` 语义清楚 | 换 stem ⇒ 计划天然归零，与 ADR-0021「`/new` 后 todo 归零是正确语义」一致 |
 | 零新目录 | 会话同级 ⇒ `YUSHAN_SESSIONS_DIR` 的测试覆盖自动生效 |
@@ -732,7 +732,7 @@ CodeWhale 靠模型**自填** `verification` 回执且 harness 不校验（`goal
 |---|---|---|---|
 | 轮数 | **软提醒** | **60 轮**（触发后翻倍） | 提示「已第 N 轮」，**不中断** |
 | 墙钟 | **硬闸门** | **48 h** | 未达成（预算） |
-| 无进展 stall | **硬闸门** | 连续 **3 轮**证据摘要相同 | 无进展 |
+| 无进展 stall | **硬闸门** | 连续 **3 轮** todo 集合指纹不变 | 无进展 |
 | 判官可靠性 | **硬闸门** | 连续 **2 次**解析失败 / 引用未命中 | 判官不可靠 |
 | 回合健康 | **硬闸门** | 主回合 `Failed`/`Cancelled`/`MaxRounds`/`Truncated`/`NoOutput` | 回合失败（**立即停**，不算「未满足」） |
 | token 预算 | **不设** | — | — |
@@ -768,6 +768,7 @@ stall_digest = DefaultHasher( Σ(归一化内容 ‖ 状态) for 非终态项 )
 - 剩余集合不变 ⇒ `stall += 1`；变了 ⇒ 归零。
 - **只算非终态项**：已完成的项不参与（否则模型把已完成项重新描述一遍就重置了 stall）。
 - 阈值**连续 3 轮**（`stall_limit`）。
+- **与 ADR-0024 决策 d 同一判据**：那里的「本轮 `revision` 未变」指的就是这条集合指纹，不是 store 的内部版本号。
 - **和「模型自称收尾」取 AND**（ADR-0024 决策 d）：只靠集合不变会误杀
   「一轮里干了活但还没更新状态」的情形；加上「模型也说自己干完了」才判定为真打转。
 
@@ -880,7 +881,7 @@ continue = todo.has_open_items()          // 清单层（ADR-0024，无开关）
 - 不把「助手自述」纳入证据池。
 - 不改 `ys-event` 词汇、不新增 `AgentEvent` 变体。
 - 不把判官能力放进 `ys-runtime` 的公共 API。
-- **不让子 agent 有 todo**（ADR-0024 决策 e：同时打破字节前缀与单写者不变量）。
+- **不让子 agent 有 todo**（同时打破字节前缀与单写者不变量，理由见 `docs/arch/long-horizon-todo/design.md` §7.4 e）。
 
 ### 5.12 最小可交付切片
 
@@ -889,8 +890,8 @@ continue = todo.has_open_items()          // 清单层（ADR-0024，无开关）
 **切片 1：todo 清单 + 推进闭环**（= 实现 ADR-0024）
 
 `adapters/tools-todo` crate；`TodoStore` 落盘 `<stem>.todo.json`；`apply` 两条硬规则；
-回合边界注入（`should_inject`）；`decide` 五道护栏；`EXPECTED_ORDER` 加 `todo`；
-子表无 `todo`；侧栏渲染。
+回合边界注入（`should_inject`）；`decide` 五道护栏；**父表追加段末位加 `todo`**
+（`toolset.rs` 的 `EXPECTED_ORDER` 不动 —— 它描述子表）；子表无 `todo`；侧栏渲染。
 
 **切片 2：验收层 + 两入口**
 

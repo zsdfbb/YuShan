@@ -443,9 +443,16 @@ flowchart TB
 | `websearch` | 联网搜索：走确定的后端链（一张 `const TABLE`，不建 trait） |
 | `webfetch` | 抓网页 → Markdown → 落盘 + 文件头 + 指针，返回绝对路径供 `read` / `grep` 续读 |
 
-**注册顺序即契约**：`read` → `write` → `edit` → `bash` → `grep` → `find` → `ls` → `ocr` → `websearch` → `webfetch`（共 **10 个**），
-与 `apps/coding-agent/src/toolset.rs::EXPECTED_ORDER` 同源 —— 顺序决定 `ToolRegistry::specs()` 与系统提示词里工具清单的顺序，**勿重排**。
+**注册顺序即契约**：`read` → `write` → `edit` → `bash` → `grep` → `find` → `ls` → `ocr` →
+`view_image` → `websearch` → `webfetch`（共 **11 个**，这是子表 / 基础表），
+与 `apps/coding-agent/src/toolset.rs::builtin_plugins` 的 `order` 同源 —— 顺序决定
+`ToolRegistry::specs()` 与系统提示词里工具清单的顺序，**勿重排**。
 工具仍实现通用 `Tool` 接口，Runtime 不感知 Coding 语义。
+
+> **真值在哪**：顺序的唯一声明处是 `builtin_plugins()` 里各插件的 `order`（升序折表），
+> 测试侧用**独立的** `EXPECTED_ORDER_FOR_TESTS` 字面量对账 —— 两边都改才能保持绿，
+> 这正是它要拦的漂移。父表 = 本表 + 追加段（`bash_bg` / `subagent_async` / `subagent_send` /
+> `todo`），子表 **就是**本表（子 agent 无后台能力、无清单）。
 
 > **状态（2026-09-17）**：`grep` / `find` / `ls` **已实现**（外挂 `rg`/`fd` → 降级 POSIX `grep`/`find`，绝不下载）；
 > 见 `docs/design-final/search-tools.md` 与 ADR-0015。`git` 工具仍未做。

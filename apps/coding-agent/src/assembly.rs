@@ -78,6 +78,11 @@ pub struct AgentFactory {
     /// 注册表对象随工厂冻结 ⇒ `/resume` 重建 agent 时仍是**同一份**；
     /// 会话 id 在**共享槽**里（运行时读）⇒ 换会话不必重建工具表。
     backgrounds: Option<BackgroundContext>,
+    /// todo 清单的唯一真值（**进程级**，与 `backgrounds` 同一理由跨重建共享）。
+    ///
+    /// `todo` 工具持的就是这份 `Arc` ⇒ `/new` 的 retarget 换的是**内部路径**，
+    /// 工具不需要重建。
+    todo: Arc<ys_tools_todo::TodoStore>,
 }
 
 /// [`AgentFactory::build`] 的产物。
@@ -115,6 +120,7 @@ impl AgentFactory {
         limits: RunLimits,
         child_budget: Duration,
         subagents_dir: Arc<SubagentsDir>,
+        todo: Arc<ys_tools_todo::TodoStore>,
     ) -> Self {
         Self {
             web,
@@ -126,6 +132,7 @@ impl AgentFactory {
             subagent_live: Arc::new(crate::subagent::LiveSubagents::default()),
             subagent_handles: Arc::new(SubagentHandles::default()),
             backgrounds: None,
+            todo,
         }
     }
 
@@ -138,6 +145,14 @@ impl AgentFactory {
     pub fn with_backgrounds(mut self, backgrounds: BackgroundContext) -> Self {
         self.backgrounds = Some(backgrounds);
         self
+    }
+
+    /// 清单真值的只读句柄（`Arc` 克隆）—— 入口在会话路径确定后调 [`TodoStore::retarget`]。
+    ///
+    /// 新会话的路径在 `Wiring` 建好之后才知道（惰性落盘），而工厂在那之前就装配了，
+    /// 所以初始 retarget 不能发生在 [`new`](Self::new) 里。
+    pub fn todo(&self) -> Arc<ys_tools_todo::TodoStore> {
+        self.todo.clone()
     }
 
     /// 按 `workspace` 装配（工具表 / working_dir / system prompt 三者同源）。
@@ -217,6 +232,11 @@ impl AgentFactory {
         // `prefix_fingerprint_is_anchored_and_stable` 钉住这条）。
         tools.push(Box::new(crate::subagent::SubagentAsyncTool::new()));
         tools.push(Box::new(SubagentSendTool::new()));
+        // **`todo` 在父表追加段末位**。它只能在这里，不能进 `build_tools()` 的 11 元基础表：
+        // 子表 = 基础表 ⇒ `todo` 进了基础表就同时打破两件事 —— (i) 子表不再是父表的字节前缀
+        // （缓存前缀契约失效）；(ii) 子 agent 与父 agent 并发写同一份清单（lost update）。
+        // 位置本身不影响前缀：追加段里怎么排都不动子表那 11 项。
+        tools.push(ys_tools_todo::todo_tool(self.todo.clone()));
         let specs: Vec<_> = tools.iter().map(|t| t.spec()).collect();
         // `run_start` 的工具元数据：名字 + spec 的 JSON 字节数（不记内容）。
         let tool_specs: Vec<(String, usize)> = specs
@@ -297,6 +317,7 @@ mod tests {
             RunLimits::default(),
             Duration::from_secs(30),
             Arc::new(SubagentsDir::at(base.join("subagents"), false)),
+            ys_tools_todo::TodoStore::open(Some(&base.join("assembly-test.todo.json"))),
         )
         .with_backgrounds(backgrounds)
     }
@@ -323,19 +344,20 @@ mod tests {
         let built_short = f.build(&short).unwrap();
         let built_long = f.build(&long).unwrap();
 
-        let expected: Vec<String> = crate::toolset::EXPECTED_ORDER
-            .iter()
-            .map(|s| s.to_string())
+        let expected: Vec<String> = crate::toolset::tests::expected_order_for_tests()
+            .into_iter()
             .chain([
                 "bash_bg".to_string(),
                 "subagent_async".to_string(),
                 "subagent_send".to_string(),
+                "todo".to_string(),
             ])
             .collect();
         assert_eq!(
             built_short.agent.tool_names(),
             expected,
-            "父表应为 11 基础 + bash_bg + subagent_async + subagent_send（后三者追加在末位）"
+            "父表应为 11 基础 + bash_bg + subagent_async + subagent_send + todo\
+             （后四者追加在末位）"
         );
         assert_eq!(
             built_long.agent.tool_names(),
@@ -378,18 +400,18 @@ mod tests {
         let f = factory(&base);
         let built = f.build(&base).unwrap();
 
-        // ① 真实父表 14 元、子表 11 元（子 agent 天然没有后台能力）。
+        // ① 真实父表 15 元、子表 11 元（子 agent 天然没有后台能力与 todo）。
         let parent_names: Vec<&str> = built
             .parent_specs
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert_eq!(parent_names.len(), 14, "真实父表应为 14 元");
+        assert_eq!(parent_names.len(), 15, "真实父表应为 15 元");
         assert_eq!(built.child_specs.len(), 11, "真实子表应为 11 元");
         assert_eq!(
             built.agent.tool_names().len(),
-            14,
-            "注册进 agent 的父表应为 14 元"
+            15,
+            "注册进 agent 的父表应为 15 元"
         );
         assert!(
             !built.child_specs.iter().any(|spec| spec.name == "bash_bg"),
@@ -405,33 +427,34 @@ mod tests {
         );
 
         // 追加段（子表之后的那几项）必须是 `bash_bg` + `subagent_async` + `subagent_send`
-        // —— 顺序即契约：后台工具排在派发工具**之前**（新增项只能往后加，
-        // 否则已缓存的父前缀提前断掉）。
+        // + `todo` —— 顺序即契约：后台工具排在派发工具**之前**，`todo` 收尾
+        // （新增项只能往后加，否则已缓存的父前缀提前断掉）。
         let appended = &parent_json[child_json.len() - 1..];
         let tail: Vec<ys_tool::ToolSpec> = built.parent_specs[built.child_specs.len()..].to_vec();
         assert_eq!(
             tail.iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<&str>>(),
-            vec!["bash_bg", "subagent_async", "subagent_send"],
-            "父表的追加段必须是 bash_bg + subagent_async + subagent_send（顺序即契约）"
+            vec!["bash_bg", "subagent_async", "subagent_send", "todo"],
+            "父表的追加段必须是 bash_bg + subagent_async + subagent_send + todo（顺序即契约）"
         );
         let tail_json = serde_json::to_string(&tail).unwrap();
         assert_eq!(
             appended,
             format!(",{}", &tail_json[1..]),
-            "父表 JSON 的追加段必须逐字节等于 bash_bg + 派发工具 + 发消息工具的序列化"
+            "父表 JSON 的追加段必须逐字节等于 bash_bg + 派发工具 + 发消息工具 + todo 的序列化"
         );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **assembly 级断言（末位）** —— 派发工具族收尾。
+    /// **assembly 级断言（末位）** —— 追加段收尾。
     ///
-    /// 派发工具永远追加在最后 ⇒ 子表（基础 10 元）既是父表的**前缀**，又与末位相距
-    /// 两项（`bash_bg` / `subagent_async`）。
+    /// 子表（基础 11 元）是父表的**前缀**；追加段里 `bash_bg` 在前，`subagent_async` /
+    /// `subagent_send` / `todo` 收尾。
     ///
-    /// 变异：把派发工具插到 `bash_bg` **之前** ⇒ 本用例变红。
+    /// 变异：把 `todo` 挤进基础表（或插到追加段中间）⇒ 子表不再是父表字节前缀，
+    /// 且子 agent 会拿到清单工具。
     #[test]
     fn real_parent_table_ends_with_the_subagent_tools() {
         let base = unique_dir("parent_last");
@@ -443,17 +466,27 @@ mod tests {
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        // **发消息工具在末位**（`subagent_async` 在其前）：子表（基础 10 元）仍是父表
+        // **清单工具在末位**（`subagent_send` 在其前）：子表（基础 11 元）仍是父表
         // JSON 的字节前缀。末位一旦换人，已缓存的父前缀就提前断掉。
         assert_eq!(
-            &parent_names[parent_names.len() - 2..],
-            &["subagent_async", "subagent_send"],
-            "派发工具族必须是父表末位（subagent_async 在前、subagent_send 收尾）"
+            &parent_names[parent_names.len() - 3..],
+            &["subagent_async", "subagent_send", "todo"],
+            "追加段必须是 subagent_async / subagent_send / todo"
+        );
+        assert_eq!(
+            parent_names.last().copied(),
+            Some("todo"),
+            "父表末位必须是 `todo`"
         );
         assert_eq!(
             built.agent.tool_names().last().map(String::as_str),
-            Some("subagent_send"),
-            "注册进 agent 的父表末位也必须是 `subagent_send`"
+            Some("todo"),
+            "注册进 agent 的父表末位也必须是 `todo`"
+        );
+        // 子 agent 拿不到清单工具 —— 并发写同一份清单会 lost update。
+        assert!(
+            !built.child_specs.iter().any(|spec| spec.name == "todo"),
+            "子表不得包含 `todo`"
         );
 
         let _ = std::fs::remove_dir_all(&base);

@@ -243,349 +243,43 @@ fn skill_section(lines: &str, has_subagent: bool) -> String {
 pub(crate) const SUBAGENT_SEND_DESCRIPTION: &str =
     "Send a message to a sub-agent that is still running; it sees it on its next round";
 
-/// 工具的一句话描述，按 **name** 查表。
+/// 工具的一句话描述 —— 从插件的 [`ToolPrompt::snippet`] 取。
 ///
-/// 名字不在表里时回退到 `"Custom tool"`（外部工具 / 未来新增工具都能列出而不报错）。
-fn tool_snippet(name: &str) -> &'static str {
-    match name {
-        "read" => "Read file contents",
-        "write" => "Create or overwrite files",
-        "edit" => "Make precise file edits with exact text replacement",
-        "bash" => "Execute bash commands",
-        // 后台命令的启动工具（`docs/arch/bg-notify/design.md` 的契约文案）。
-        // 清单里必须说清「后台跑 + 立即给句柄」—— 否则这一行会退化成兜底文案
-        // （`Custom tool`），模型看不出它与 `bash` 的差别。
-        "bash_bg" => {
-            "Start a shell command in the background and get a handle back immediately; the command keeps running while you do other work"
-        }
-        "grep" => {
-            "Search file contents for a pattern (respects .gitignore when ripgrep is available)"
-        }
-        "find" => "Search for files by glob pattern",
-        "ls" => "List directory contents",
-        // 与 `WebSearchTool` / `WebFetchTool` 的 `spec().name` 逐字一致（装配端名字是契约）。
-        "websearch" => {
-            "Search the web (tries the configured backends in a fixed order, stops at the first one that answers)"
-        }
-        // 末尾一句是**可选** `prompt` 参数的唯一线索：按意图取摘要而非整页原文。
-        "webfetch" => {
-            "Fetch a URL as Markdown saved to a file, returning the head plus the full path (continue with read offset= or grep, or pass prompt for a summary)"
-        }
-        // 括号里补坐标：取证类任务（「报错在哪一行按钮上」）靠的正是位置，而词级坐标
-        // 只能由 `word_boxes` 换来，模型无从自己推断。
-        "ocr" => {
-            "Extract the text in an image together with its pixel positions; set word_boxes for \
-             per-word coordinates"
-        }
-        // 与 `ViewImageTool::spec()` 的 description 逐字一致：陈述自己的场景，**不**声明独家
-        //（`ocr` 与本工具并存，「唯一能看图」已是假话）。后两句是分流指引与 URL 歧义消除 ——
-        // 缺了分流句，模型只能靠两个工具的字面猜测何时用哪个。
-        "view_image" => {
-            "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk; use `ocr` instead when you need the text in the image together with its pixel coordinates. URLs are not accepted."
-        }
-        // 派发工具（装配端 `spec().name` 是契约）。
-        "subagent_async" => {
-            "Start a sub-agent in the background and get a handle immediately; its result arrives automatically when it finishes"
-        }
-        // 配套的 `subagent_send`：发给**仍在跑**的子 agent，子在下一个轮边界看到。
-        // 与 `SubagentSendTool::spec()` 的 description 共用 [`SUBAGENT_SEND_DESCRIPTION`]。
-        "subagent_send" => SUBAGENT_SEND_DESCRIPTION,
-        _ => "Custom tool",
-    }
+/// 名字没有声明时回退到 `"Custom tool"`：第三方工具不声明 snippet 也必须能列进清单
+/// 而不报错。内置工具的 snippet 全部在 `tool_prompts` 里声明，故兜底只对第三方生效。
+fn tool_snippet(name: &str) -> &str {
+    crate::tool_prompts::prompt_for(name)
+        .map_or("Custom tool", |prompt| prompt.snippet.as_str())
 }
 
 fn tool_guidelines(tools: &[&str]) -> String {
     render_guidelines(tools, true)
 }
 
-/// guideline 列表的**唯一**渲染处。
+/// 展开**插件声明**的 guideline 块：按 `slot` 全局升序，按门控与 scope 过滤。
 ///
-/// `narrate = false` 只去掉「过程叙述」那一条：它服务于面向用户的进展可见性，
-/// 而子 agent 的输出只回给父模型。其余条目按工具表门控，两种提示共享同一份文案。
-fn render_guidelines(tools: &[&str], narrate: bool) -> String {
-    let mut guidelines: Vec<String> = Vec::new();
-
-    if tools.contains(&"edit") {
-        guidelines
-            .push("Use edit for precise changes (edits[].oldText must match exactly)".to_string());
-        guidelines.push(
-            "When changing multiple separate locations in one file, use one edit call with multiple entries".to_string(),
-        );
-        guidelines.push(
-            "Keep edits[].oldText as small as possible while still being unique in the file"
-                .to_string(),
-        );
-    }
-    if tools.contains(&"write") {
-        guidelines.push("Use write only for new files or complete rewrites".to_string());
-    }
-    // 写入走**结构化工具**，不走脚本：`edit` 的 `edits[].oldText` 精确匹配是变更安全性的
-    // 唯一校验点，而 `sed` / `awk` / `python -c` 之类的脚本化写入绕过了它 —— 匹配失败、
-    // 改错位置都不会被拦住。拆成多次调用本身没有代价（每次仍是一次往返），故不必为了
-    // 「少调几次」而牺牲校验。
-    //
-    // 门控：`edit` / `write` 任一在场才渲染 —— 这条文案只引用这两个工具，缺了就成悬空指令。
-    if tools.contains(&"edit") || tools.contains(&"write") {
-        guidelines.push(
-            "Write with edit and write, never with scripts: one edit call per file (multiple \
-             entries for multiple locations in that same file), one write call per new file. \
-             Splitting writes across several calls is fine — a scripted mutation skips the \
-             exact-match check."
-                .to_string(),
-        );
-    }
-    // 探索走**一条聚合命令产出完整答案**，不走逐轮小查询：问题若是跨多文件的查找或聚合
-    // （「找出每个 X」「按 crate 统计 Y」「带行号列出所有 Z」），应规划整次检索、用一条命令
-    // 直接吐出完整答案（对路径的 `for` 循环、`rg -n --context 2`、`awk`）。每条消息都是一次
-    // 完整的模型往返，故十条小查询要付十次往返，而一条命令一次产出。
-    //
-    // 契约的核心是**强制综合**：命令必须自己完成筛选与汇总，而不是只把素材捞回来；它不限制
-    // 调用数 —— 需要串联的探索仍可多步进行。
-    //
-    // 不写成「把独立命令放进同一条消息」：实测该措辞会被理解成「多跑几条命令」，模型转而做
-    // 广度枚举而非集中验证，总调用数 +33%、轮数 +35%，而「调用/轮」比例几乎不变
-    // （1.50 → 1.48）—— 增加的是命令总量，不是每次往返的产出。
-    //
-    // `.gitignore` 语义与有界输出是聚合命令必须自己守的两点：`rg` 默认尊重 .gitignore，
-    // 用 `-m` / `-l` / `| head -n` 截断，避免一次聚合把上下文撑爆。
-    //
-    // 提示词不写「用 read/grep/find/ls 代替 bash」这类逐工具禁令：它们会把本可聚合的
-    // 检索拆成逐个结构化调用，正是轮数膨胀的来源；结构化工具的胜出场景由下一条正向陈述。
-    //
-    // 门控：只读工具（`read` / `grep` / `find` / `ls`）任一在场才渲染 —— 文案引用 `rg` 与
-    // `read paths=[...]`，没有这些工具时模型无从执行。
-    if tools
+/// `narrate = false`（探索子 agent）只去掉 `Scope::MainOnly` 那一块 —— 它服务于面向用户的
+/// 进展可见性，而子 agent 的输出只回给父模型。其余块两种提示共享同一份文案。
+///
+/// 尾部三条无条件 guideline 不在这里：它们与工具无关，由 [`tail_guidelines`] 逐字追加。
+fn plugin_guidelines(tools: &[&str], narrate: bool) -> Vec<String> {
+    let prompts = crate::tool_prompts::builtin_prompts();
+    let entries: Vec<(&str, &ys_tool::GuidelineBlock)> = prompts
         .iter()
-        .any(|t| matches!(*t, "read" | "grep" | "find" | "ls"))
-    {
-        guidelines.push(
-            "Explore with one command, not one round per look. When the question is a lookup or an \
-             aggregation across many files — \"find every X\", \"count Y per crate\", \"show all Z with \
-             line numbers\" — plan the whole retrieval and write ONE command that emits the complete \
-             answer: a `for` loop over paths, `rg -n --context 2`, an `awk`. Every message is a full \
-             model round-trip, so ten small queries cost ten round-trips for what one command produces \
-             at once. `rg` respects .gitignore; bound the output with `-m`, `-l`, or `| head -n`."
-                .to_string(),
-        );
-        // `grep` 的结果有 **16 KiB 硬上限**：这是模型无法从工具描述推断的事实。
-        // 被截断时只能收窄模式 / 路径（`glob` / `path`），加大 `limit` 在字节上限下无效。
-        // 主提示单独给这一条：explore 子 agent 的 `EXPLORE_SEARCH_METHOD` 已有同款，
-        // 但两套提示各自独立发送，子 agent 知道不等于主 agent 知道。
-        //
-        // 门控：只有 `grep` 在场才渲染 —— 文案只引用它，缺了就是指向不存在工具的悬空指令。
-        if tools.contains(&"grep") {
-            guidelines.push(
-                "The `grep` tool caps its result at 16 KiB regardless of `limit`: when it truncates, \
-                 narrow with `glob`, `path`, or a tighter pattern instead of raising `limit`."
-                    .to_string(),
-            );
-        }
-        guidelines.push(
-            "Reach for read/grep/find/ls when the next step genuinely depends on what you just saw, \
-             when you need offset/limit continuation on a single file, or when one targeted lookup is \
-             already the whole answer — `read paths=[...]` covers a handful of known files in one call."
-                .to_string(),
-        );
-    }
-    // 「先撒网、再下钻」：不知道答案在哪时，逐步试探会把**轮数**推高 —— 而每轮是一次完整的
-    // 模型往返，轮数又是墙钟与输入 token 的共同乘数；一次覆盖全域的调用则能把候选集一次拿全。
-    // 原先这里是「先窄后宽」，理由是省上下文预算；但实测里**工具执行只占墙钟 ~1%**，
-    // 而多一轮要付 ~2–3s 的首 token 延迟。整文件读的代价仍由末句约束（不是取消，是降为兜底）。
-    if tools.iter().any(|t| matches!(*t, "read" | "grep")) {
-        guidelines.push(
-            "Start wide when you don't know where the answer is: one sweeping call (a recursive \
-             file listing, or a single grep for what you're after) beats several probing ones — \
-             then read what you found several files at a time. Keep line ranges narrow to hold a \
-             result's size down, not as the default"
-                .to_string(),
-        );
-    }
-    // 「过程叙述」：多轮工具任务中，用户看不到模型的思考，只能看到工具进出 ⇒ 完全沉默会让
-    // 「改进过程迟迟没有回复」变成黑箱。但**叙述本身也是成本**：它进 `output`（真金白银生成），
-    // 又留在会话里被之后**每一轮**重读 —— 实测一次 14 分钟探索写下 37 段、16,916 字符（≈4,229
-    // token），其中最长一段 2,464 字符是给内部假设做的论证。那段话对用户零价值，却要被重读几十次。
-    //
-    // 故四条**可判定**的约束，缺一条实测就会被突破：
-    //   ① 开头：**新请求的第一个工具调用之前**必须先说一句要做什么 —— 否则用户看到的是
-    //      工具凭空发起，既不知道在做什么、也无从判断方向对不对。这是「聚焦需求」的唯一
-    //      时点：先复述意图，再动手。
-    //   ② 其余时机：只在**里程碑**（换了目标 / 得出结论 / 遇到梗阻），不是每批工具调用。
-    //   ③ 长度：**≤ 120 字符**。「一句话」不可判定（一句话可以写 2,464 字符）。
-    //   ④ 内容：禁止假设与论证（「可能是因为」「我猜」「先验证 A 或 B」）—— 那属于内部推理。
-    //
-    // ① 与 ② 不冲突：开头这一句是**最高优先级的里程碑**（回合起点），`②` 管的是它的**其余**
-    // 出现时机。缺 ① 的实测形态就是「发出需求后工具直接开跑」，用户全程没有落点。
-    //
-    // **「连续 N 次调用必须说一句」不写在这里** —— 模型看不到自己的累计调用次数，
-    // 这条已交给 harness 计数并在到阀时注入提醒（`RunLimits::narration_silence_tool_calls`）。
-    // 把它写进系统提示词只会得到一条模型无法执行的要求（需自己默默数调用）。
-    //
-    // 只要工作型工具在场（`read` / `grep` / `find` / `ls` / `bash` / `edit` / `write` 任一）
-    // 就值得提醒，否则（如纯检索类）不加，避免无谓增大固定前缀。
-    // `narrate = false`（探索子 agent）时整条不渲染：它的读者是父模型，不是用户。
-    if narrate
-        && tools.iter().any(|t| {
-            matches!(
-                *t,
-                "read" | "grep" | "find" | "ls" | "bash" | "edit" | "write"
-            )
-        })
-    {
-        guidelines.push(
-            "Before the first tool call of a new request, state in **one short sentence** what you \
-             are about to do — the user must see the intent before any tool fires. After that, \
-             narrate only at milestones (target changed, conclusion reached, or blocked) — not \
-             before every tool batch. Each update is **one short sentence** (hard limit 120 \
-             characters) saying what you did or will do, nothing else. Never state hypotheses or \
-             reasoning (\"maybe\", \"I suspect\", \"let me check whether A or B\") — those are \
-             internal and cost the user a large re-read on every later round"
-                .to_string(),
-        );
-    }
-    if tools.contains(&"websearch") {
-        guidelines.push(
-            "Use websearch for information outside the repository (API docs, error meanings)"
-                .to_string(),
-        );
-    }
-    if tools.contains(&"webfetch") {
-        // 末尾刻意写明**代价**（多一次模型调用、更慢），这是「按需使用」的唯一闸门：
-        // 模型有「更努力」的倾向，措辞若只说好处，可选参数会被当成每次抓取都该带。
-        guidelines.push(
-            "Use webfetch to save a URL's content to a local file and get back only its head — \
-             read that path (read offset=) or grep it for more, and do not refetch the same URL. \
-             Pass prompt only when you need an answer rather than the page (e.g. \"how is the auth \
-             header built?\"): it costs one extra model call and is slower"
-                .to_string(),
-        );
-    }
-    // 后台命令两条 guideline —— **结果自动送达，不要轮询**（`docs/arch/bg-notify/design.md`）。
-    //
-    // ① 长命令**后台化**，随后继续自己那部分工作：完成时由 harness 把结果送进会话；
-    //    回合先结束则留表、下一回合开头补投 —— 故措辞必须交代**跨回合的送达时机**，
-    //    否则模型会以为「回合结束 = 结果没了」而原地等待。
-    // 「不要 poll」是**显式禁令**：本运行时没有查询后台状态的工具，模型能做的只有等通知。
-    // ② 禁 `sleep` 假装在等 —— `sleep 30` 是真的睡满 30s。
-    //
-    // 守卫形态与既有 `websearch` / `webfetch` / 派发工具的「在场才出现」同形，**只看
-    // `bash_bg`**：两条文案都只引用它，缺了它就是指向不存在工具的悬空指令。
-    // 附带效果：子表不含 bg 工具 ⇒ 子 agent 天然看不到这两条。
-    if tools.contains(&"bash_bg") {
-        guidelines.push(
-            "Run a command that takes more than a few seconds with bash_bg, then keep working on \
-             your own part — its result is delivered to you automatically when it finishes. Do \
-             NOT poll for it. If the turn ends first, the result arrives at the start of your \
-             next turn"
-                .to_string(),
-        );
-        guidelines.push(
-            "Never use sleep to wait for something: start it with bash_bg; you will be notified \
-             when it finishes"
-                .to_string(),
-        );
-    }
-    // 派发：**结果自动送达、不要 poll**，且**父回合不等它**。只在工具在场时出现（子表没有它）。
-    if tools.contains(&"subagent_async") {
-        // 并发槽位数读 `ys-component` 的**单一真值常量**（ADR-0022 决策 14 的双轨：
-        // 常量是唯一真值，`RunLimits.max_parallel_tools` 与这里都取它）。
-        guidelines.push(format!(
-            "At most {} subagents run in parallel in one turn; extra calls queue. Dispatch only \
-             as many independent sub-tasks as you actually have.",
-            ys_component::DEFAULT_MAX_PARALLEL_TOOLS
-        ));
-        // 送达时机是**机制事实**：后台任务与父回合脱钩 —— 父回合正常收场，结果到达时
-        // harness 自动起**新回合**。措辞必须交代这一点，否则模型会原地等，或以为
-        // 「回合结束 = 结果没了」。
-        //
-        // 两条纪律（不得谎报「还在跑」/ 不得重派同一件活）仍然成立：结果未到时
-        // 模型**看不到**子 agent 是否跑着，只能等。
-        guidelines.push(
-            "Use subagent_async to keep big, self-contained investigations out of this context: it \
-             returns a handle immediately, the sub-agent does NOT see this conversation, so \
-             `prompt` must be fully self-contained, and its result is delivered to you \
-             automatically when it finishes — do NOT poll for it. Finish your own part and let \
-             the turn end; the result arrives as a new turn. Never claim a sub-agent is still \
-             running and never re-dispatch the same work"
-                .to_string(),
-        );
-        // 用户要求的「回复后立即汇报并继续」：**报告是义务**，不是可选风格。
-        guidelines.push(
-            "When a sub-agent's result arrives, say in one line what it found and what you are \
-             doing next, then continue"
-                .to_string(),
-        );
-        // **成批派发是机制事实，不是风格建议**：同一条消息里的多个 `subagent_async` 调用进
-        // 同一个并行段（`is_concurrency_safe == true`，`BasicLoop` Step 9 的
-        // `Segment::Parallel`）⇒ 真并发；而**一轮一个**会一个跑完才轮到下一个 ⇒ 串行 N 倍。
-        // 实测（会话 `1792579023_125340094` turn 16）：3 个派发分在 3 轮里，
-        // 串行 1,831 s；同一批只需 965 s。
-        guidelines.push(
-            "Scale the dispatch: one subagent is enough for a simple lookup. For genuinely \
-             independent sub-tasks, send ALL the `subagent_async` calls in ONE message — a single \
-             batch runs concurrently, whereas one call per round runs them one after another \
-             (N times slower)"
-                .to_string(),
-        );
-        guidelines.push(
-            "Write each `prompt` with four parts: goal, expected output format, sources/tools to \
-             use, and explicit boundaries — vague prompts make the sub-agents repeat each other's work"
-                .to_string(),
-        );
-        // 依赖不得靠「等一下」解决：派发是即时的，所以有依赖就**先不派**。
-        guidelines.push(
-            "Before dispatching multiple subagents, check their dependencies and write scopes. If \
-             a task consumes another task's output or verifies its changes, dispatch it only after \
-             the prerequisite's result arrives. Run tasks in parallel only when their outputs are \
-             independent and their write scopes do not overlap; serialize them when the scope is \
-             unclear"
-                .to_string(),
-        );
-        guidelines.push(
-            "If a subagent returns an error or is cancelled, read its diagnostic first, then \
-             either narrow the task and retry or report the failure to the user"
-                .to_string(),
-        );
-        guidelines.push(
-            "A subagent is not free: it is another inference call plus another system prompt — \
-             use it to save context, not to look busy"
-                .to_string(),
-        );
-        // 派发探索只在「多个独立、每个都要多轮」的问题上划算：子 agent 每问多付
-        // 约 25–30 s 固定开销（冷启动 + 独立系统提示），一两个小查找父 agent 自己搜更快。
-        // 成批派发才是收益点 —— 同批调用进 `Segment::Parallel`。
-        guidelines.push(
-            "Delegate exploration only when you have several independent questions that each need \
-             many rounds: send them in ONE message as `subagent_async` with `mode=\"explore\"` so \
-             they run in parallel, then trust their `path:line` findings. For one or two small \
-             lookups, search directly — an agent's cold start costs more than the lookup itself."
-                .to_string(),
-        );
-    }
+        .flat_map(|prompt| prompt.guideline_entries())
+        .collect();
+    ys_tool::expand_guidelines(entries, tools, narrate)
+        .expect("内置 guideline 的 slot 必须全局唯一（声明期常量，见 tool_prompts::slot）")
+}
 
-    // 纠偏：**只对仍在跑的子 agent**有意义，故单独守卫 `subagent_send`（子表没有它）。
-    // 四条都是现行为的事实，不是风格建议：
-    // ① 地址就是 `subagent_async` 打出的那个 handle —— 模型没有别处可查；
-    // ② 送达点是子的**下一个轮边界**（`ChildBoundary::take`）⇒ 必须说「不是立即生效、
-    //    正在跑的工具不会被打断」，否则模型会以为发完就改了方向；
-    // ③ 语意不限（工具只把文本入队），但它是「改已有任务」而不是「再开一件活」——
-    //    后者要新派发（新 handle、新上下文）。
-    if tools.contains(&"subagent_send") {
-        guidelines.push(
-            "Use subagent_send to steer a sub-agent that is still running: tell it to converge, add \
-             a constraint, or change direction, addressing it with the handle subagent_async \
-             returned (e.g. `sa3.2`). Your message reaches it at its next round boundary, not \
-             immediately, and does not interrupt the tool it is running. Any wording is fine, but \
-             it never replaces dispatching new work"
-                .to_string(),
-        );
-    }
-
-    // 任务边界：只做用户要求的事。必要步骤（读取/搜索、对改动代码跑检查、修复自身改动造成的
-    // 破坏）免问；其余（无关重构、新文件/文档、依赖变更、大范围格式化、额外测试、超出要求的
-    // commit/push）先一行提议并等待。单发模式不能问时只做被要求的部分并列出未做项。
-    // 与具体工具无关，故无条件渲染 —— 只有 `bash` 时同样在场。
-    guidelines.push(
-        "Do exactly what the user asked; do not add work they did not request. \
+/// 尾部三条**无条件** guideline —— 与具体工具无关，两种提示都渲染。
+///
+/// 第一条是任务边界：只做用户要求的事。必要步骤（读取/搜索、对改动代码跑检查、修复自身
+/// 改动造成的破坏）免问；其余（无关重构、新文件/文档、依赖变更、大范围格式化、额外测试、
+/// 超出要求的 commit/push）先一行提议并等待。单发模式不能问时只做被要求的部分并列出未做项。
+fn tail_guidelines() -> Vec<String> {
+    vec![
+        "- Do exactly what the user asked; do not add work they did not request. \
          Necessary steps are allowed without asking: reading/searching to understand the task, \
          running checks on code you changed, and fixing breakage your own change caused. \
          Everything else must be proposed first — unrelated refactors, new files or docs, \
@@ -593,16 +287,16 @@ fn render_guidelines(tools: &[&str], narrate: bool) -> String {
          beyond what was asked. State the proposal in one line and wait for the user's answer. \
          If you cannot ask (single-shot run), do only what was asked and list the extra work as not done."
             .to_string(),
-    );
+        "- Be concise in your responses".to_string(),
+        "- Show file paths clearly when working with files".to_string(),
+    ]
+}
 
-    guidelines.push("Be concise in your responses".to_string());
-    guidelines.push("Show file paths clearly when working with files".to_string());
-
-    guidelines
-        .iter()
-        .map(|g| format!("- {g}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// guideline 列表的**唯一**渲染处：插件声明的块（按 `slot`）+ 尾部三条。
+fn render_guidelines(tools: &[&str], narrate: bool) -> String {
+    let mut guidelines = plugin_guidelines(tools, narrate);
+    guidelines.extend(tail_guidelines());
+    guidelines.join("\n")
 }
 
 struct ContextFile {
@@ -684,7 +378,7 @@ fn find_custom_prompt(cwd: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::test_env::{EnvRestore, env_lock};
-    use crate::toolset::EXPECTED_ORDER;
+    use crate::toolset::tests::EXPECTED_ORDER_FOR_TESTS;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -808,9 +502,10 @@ mod tests {
     /// 不查内部名录、不去重。
     ///
     /// 用**两份相反顺序**各跑一次：只跑正向那份的话，「实现偷偷按固定名录排序」
-    /// 会与 `EXPECTED_ORDER` 恰好同形而蒙混过关；逆序那份才真正钉住「派生」。
+    /// 会与 [`EXPECTED_ORDER_FOR_TESTS`] 恰好同形而蒙混过关；逆序那份才真正钉住「派生」。
     ///
-    /// 顺序真值来自 [`toolset::EXPECTED_ORDER`]（装配端的唯一真值），此处**不另抄**。
+    /// 顺序真值来自**测试侧独立硬编码**的 [`EXPECTED_ORDER_FOR_TESTS`]（不引用生产派生量），
+    /// 故装配端顺序一变，这里跟着变红。
     ///
     /// 变异 1：`build_system_prompt` 里给 `names` 加 `.rev()` → 正向断言变红。
     /// 变异 2：实现改成按内部固定名录排序（无视传入顺序）→ 逆序断言变红。
@@ -819,8 +514,8 @@ mod tests {
         let _guard = env_lock();
         let _env = no_global_prompt();
 
-        let reversed: Vec<&str> = EXPECTED_ORDER.iter().rev().copied().collect();
-        for order in [EXPECTED_ORDER.to_vec(), reversed] {
+        let reversed: Vec<&str> = EXPECTED_ORDER_FOR_TESTS.iter().rev().copied().collect();
+        for order in [EXPECTED_ORDER_FOR_TESTS.to_vec(), reversed] {
             let specs: Vec<ToolSpec> = order.iter().map(|name| spec(name)).collect();
             let prompt = build_system_prompt(Path::new("/tmp"), &specs, &no_skills());
 
@@ -866,7 +561,10 @@ mod tests {
 
         // 先确认取到的是真实工具表（空表会让下面的循环平凡通过）。
         let actual: Vec<&str> = names.iter().map(String::as_str).collect();
-        assert_eq!(actual, EXPECTED_ORDER, "应取到装配端的真实 10 元工具表");
+        assert_eq!(
+            actual, EXPECTED_ORDER_FOR_TESTS,
+            "应取到装配端的真实 11 元工具表"
+        );
 
         for name in &names {
             let snippet = tool_snippet(name);
@@ -2114,7 +1812,10 @@ mod tests {
         let _env = no_global_prompt();
         let dir = unique_dir("main_prompt_bytes");
 
-        let specs: Vec<ToolSpec> = EXPECTED_ORDER.iter().map(|name| spec(name)).collect();
+        let specs: Vec<ToolSpec> = EXPECTED_ORDER_FOR_TESTS
+            .iter()
+            .map(|name| spec(name))
+            .collect();
         let prompt = build_system_prompt(&dir, &specs, &no_skills());
         let body = prompt
             .split("\n\n<project_context>")

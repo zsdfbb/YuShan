@@ -10,12 +10,12 @@
 //!
 //! | 契约 | 现有覆盖位置 |
 //! |---|---|
-//! | 工具数 9 + 装配顺序 `EXPECTED_ORDER` | `apps/coding-agent/src/toolset.rs`（3 条） |
+//! | 工具数 11 + 装配顺序（`builtin_plugins` 的 `order`） | `apps/coding-agent/src/toolset.rs`（3 条） |
 //! | 落盘文件名形状 `<slug>-<16hex>.md` | `tests/convert_store.rs::test_fetched_file_name_matches_independent_fnv_reference` |
 //! | `offset` 与文件行号 1:1 / `read` 穿透绝对路径 | `tests/tools.rs::test_fetch_head_lines_match_saved_file_and_read_continues_at_the_same_line` |
 //! | 落盘目录解析必为绝对路径 / 不可用不写 | `src/lib.rs` 单测 + `tests/tools.rs` 降级用例 |
 //! | 清理不碰 `Override` 档（档位语义） | `src/lib.rs::test_fetched_dir_accessors` + `tests/convert_store.rs::test_only_primary_tier_is_cleanable` |
-//! | prompt snippet 的 web 两条 | `apps/coding-agent/src/prompt.rs::search_list_and_web_snippets_are_verbatim` |
+//! | prompt snippet 的 web 两条 | `apps/coding-agent/src/tool_prompts.rs`（`prompt_for` 的声明） |
 //!
 //! 本文件**新增**的只有：env 变量名快照 · 两个工具名/`description` 的 crate 本地钉死 ·
 //! 源码无 print 扫描（`toolset.rs` 只扫了它自己，**没扫本 crate 的 8 个源文件**）。
@@ -187,11 +187,11 @@ fn chain_order_puts_deepseek_first() {
 
 /// **契约：两个工具名逐字**（`websearch` / `webfetch`）。
 ///
-/// 这两个字符串**同时**被 `apps/coding-agent/src/prompt.rs::tool_snippet` 的 match 臂
-/// 依赖（那里逐字写着 `"websearch"` / `"webfetch"`）。改名 → prompt 的行内 snippet
-/// 静默退化到兜底 `"Custom tool"`：**模型看到的工具描述变空**，编译与既有测试全绿。
+/// 这两个字符串**同时**被 `apps/coding-agent/src/tool_prompts.rs` 的声明表依赖
+/// （那里按工具名索引，逐字写着 `"websearch"` / `"webfetch"`）。改名 ⇒ `prompt_for`
+/// 返回 `None` ⇒ 系统提示词里该工具的描述与 guideline **整个消失**，编译与既有测试全绿。
 ///
-/// > 既有覆盖：`toolset.rs` 的 `EXPECTED_ORDER` 断言**间接**钉住了这两个名字
+/// > 既有覆盖：`toolset.rs` 的顺序断言**间接**钉住了这两个名字
 /// > （装配顺序里含它们）。本条的价值是**在定义它们的 crate 里**单独钉一次 ——
 /// > 只跑 `cargo test -p ys-tools-web` 也能挡住改名，不必依赖 app 层。
 ///
@@ -205,12 +205,12 @@ fn web_tool_names_are_the_release_contract() {
     assert_eq!(
         search.spec().name,
         "websearch",
-        "工具名逐字契约；`prompt.rs::tool_snippet` 靠它命中专属文案"
+        "工具名逐字契约；`tool_prompts::prompt_for` 靠它命中专属文案"
     );
     assert_eq!(
         fetch.spec().name,
         "webfetch",
-        "工具名逐字契约；`prompt.rs::tool_snippet` 靠它命中专属文案"
+        "工具名逐字契约；`tool_prompts::prompt_for` 靠它命中专属文案"
     );
 }
 

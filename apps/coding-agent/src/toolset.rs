@@ -1,17 +1,29 @@
-//! 工具装配的**唯一接缝**：启动期探测一次后端 → 建有序工具表 → 暴露降级提示。
+//! 工具装配的**唯一接缝**：启动期探测一次后端 → 折平插件声明成有序工具表 → 暴露降级提示。
 //!
 //! # 为什么收拢成一个模块
 //!
 //! 工具集的「有哪些工具 / 什么顺序 / 探测到什么后端」在三个地方被消费：
-//! 注册进 `ToolRegistry`（`spec()` 顺序由此而定）、将来的系统提示词工具清单、
+//! 注册进 `ToolRegistry`（`spec()` 顺序由此而定）、系统提示词工具清单、
 //! 以及启动期给用户的后端降级提示。若三处各自装配，顺序与探测结果会漂移
 //! （典型症状：提示词里列了 `grep`，注册表里没有；或两次探测结果不一致）。
+//!
+//! # 装配 = 插件声明
+//!
+//! 工具面由 [`builtin_plugins`] 的 **11 条声明**给出，每条一个工具，`order` 是编译期常量。
+//! [`build_tools`] 只做两件事：按 `order` 折表（[`ys_tool::sort_plugins`]）+ 折平成
+//! `Vec<Box<dyn Tool>>`。加一个工具的连锁点因此收敛到**一处声明**，顺序不再有第二份手抄。
+//!
+//! 顺序真值有**两份、故意不合并**：装配端（声明里的 `order`）与测试端
+//! （`EXPECTED_ORDER_FOR_TESTS` 的字面量）。两份才能交叉校验 —— 测试若引用生产派生量，
+//! 「顺序变了」将没有任何断言能发现。
 //!
 //! # 探测只做一次
 //!
 //! [`SearchBackends::detect`] 是**纯路径扫描**（不 fork、不跑 `--version`，见 ADR-0015），
 //! 但在语义上仍是「启动期一次」的事：同一进程内两次探测可能给出不同答案（PATH 被改），
-//! 且 `grep` / `find` 必须看到**同一份**后端认知。故此处探测一次，clone 给两者。
+//! 且 `grep` / `find` 与降级提示必须看到**同一份**后端认知。故 [`build_tools`] 探测一次，
+//! 把结果传给声明函数；[`builtin_plugins`] 单独调用时也只探测一次（`grep` 拿 clone、
+//! `find` 拿走本体）。
 //!
 //! # 不 print
 //!
@@ -20,45 +32,39 @@
 
 use std::path::Path;
 
-use ys_tool::Tool;
+use ys_tool::{Tool, ToolPlugin, sort_plugins};
 use ys_tools_basic::exec::SearchBackends;
 use ys_tools_basic::{
     BashTool, EditTool, FindTool, GrepTool, LsTool, OcrTool, ReadTool, ViewImageTool, WriteTool,
 };
 use ys_tools_web::{WebConfig, WebFetchTool, WebSearchTool};
 
-/// 装配顺序的**唯一真值**：注册顺序 == 提示词工具清单顺序 == `agent.tool_names()`。
+/// 装配顺序的**派生量**：`builtin_plugins()` 按 `order` 升序折表后的工具名序列。
 ///
-/// 放在生产段（而非 `#[cfg(test)]`）是为了让**提示词侧**的漂移测试也引用同一份
-/// 真值 —— 顺序若在测试里各抄一份，「提示词清单」与「装配顺序」的对齐就只能靠
-/// 人眼，而这两者恰恰是本项目最怕漂移的一对。
+/// 这是生产路径的**唯一**顺序来源（`ToolRegistry::specs()` / 系统提示词工具清单 /
+/// `agent.tool_names()` 三者同源）。它由声明派生，**不得**手工维护。
 ///
-/// 与 [`build_tools`] 里 `vec![...]` 的字面量顺序需人工保持一致：Rust 类型系统
-/// 无法把 `vec!` 的元素顺序绑定到常量上。不一致会立刻被两侧的顺序断言抓到。
+/// ⚠️ **测试不得引用本函数**：交叉校验靠「装配端一份真值 + 测试端一份独立字面量」——
+/// 测试侧用 `EXPECTED_ORDER_FOR_TESTS`。若测试也读这里，「顺序变了」就没有任何
+/// 断言能发现（两份真值退化成一份）。
 ///
-/// 目前仅测试消费（生产路径的顺序由 [`build_tools`] 的 `vec!` 字面量决定），
-/// 故非测试构建下允许未使用 —— 保留在生产段正是为了跨模块共享这一份真值。
+/// 目前仅测试消费；生产路径由 [`build_tools`] 就地折平（它要拿同一份探测结果出提示）。
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const EXPECTED_ORDER: &[&str] = &[
-    "read",
-    "write",
-    "edit",
-    "bash",
-    "grep",
-    "find",
-    "ls",
-    "ocr",
-    "view_image",
-    "websearch",
-    "webfetch",
-];
+pub fn builtin_order(workspace: &Path, web: WebConfig) -> Vec<String> {
+    let plugins = sort_plugins(builtin_plugins(workspace, web))
+        .expect("内置 11 条声明必须通过 sort_plugins 的三条声明期校验");
+    plugins
+        .iter()
+        .flat_map(|plugin| plugin.tools.iter().map(|tool| tool.spec().name))
+        .collect()
+}
 
-/// 探测一次搜索后端，据此建**有序**工具表；一并交还降级提示。
+/// 内置工具面的**唯一声明**：11 条，每条一个工具。
 ///
-/// # 顺序即语义
+/// `order` 是**编译期常量**且互不相同 —— 它决定 `tools()` 与 tools JSON 的顺序，
+/// 一变就让 prompt 缓存前缀失效（不得来自 env / 登录态 / 探测结果）。
 ///
-/// 返回的 `Vec` 顺序 **就是**注册顺序，决定 `ToolRegistry::specs()` 的顺序，
-/// 进而决定将来系统提示词里工具清单的顺序。固定为：
+/// 顺序（即 `order` 升序）**固定为**：
 ///
 /// ```text
 /// read, write, edit, bash, grep, find, ls, ocr, view_image, websearch, webfetch
@@ -66,7 +72,6 @@ pub(crate) const EXPECTED_ORDER: &[&str] = &[
 ///
 /// 即「读写改 → 执行 → 检索 → 列目录 → 读图 → 联网」：模型最常用的文件读写与 shell 排在最前，
 /// **带网络的两个工具排在最后**（本机能力优先；联网是外挂能力，见 `tools-web` 文档）。
-/// 与 [`EXPECTED_ORDER`] 同源（测试侧引用后者），**改一处必须改两处**。
 /// **不要**随意重排（会改动 prompt 文本与测试基线）。
 ///
 /// # 工具恒注册
@@ -74,6 +79,83 @@ pub(crate) const EXPECTED_ORDER: &[&str] = &[
 /// `web` 里的两个工具**恒进工具表**，绝不按登录态 / 是否配了搜索后端增减：
 /// 工具面一旦会变，模型会把「工具消失」误读成「我记错了」。降级一律发生在
 /// **调用期**（明确错误结果），而非从工具表里摘掉（设计 §1.8①）。
+///
+/// # 无副作用
+///
+/// 本函数（与 [`WebConfig::from_env`]）**绝不清理落盘目录** —— 清理由 `main`
+/// 在装配序列里显式调，且只对 `FetchedDir::Primary` 生效。否则本函数的测试
+/// 会删掉用户真实的 `~/.yushan/fetched`（设计 §1.1 硬约束）。
+///
+/// 目前仅测试消费声明本身；生产路径走 [`build_tools`]（它必须自己探测一次，
+/// 以便同一份 [`SearchBackends`] 既建表又出降级提示）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn builtin_plugins(workspace: &Path, web: WebConfig) -> Vec<ToolPlugin> {
+    builtin_plugins_from(workspace, web, SearchBackends::detect())
+}
+
+/// [`builtin_plugins`] 的本体：后端认知由调用方传入。
+///
+/// 抽出这一层是为了让「探测一次」在 [`build_tools`] 里可被**机械保证** —— 它既要建表
+/// 又要出降级提示，两者必须看到同一份 [`SearchBackends`]。
+fn builtin_plugins_from(
+    workspace: &Path,
+    web: WebConfig,
+    backends: SearchBackends,
+) -> Vec<ToolPlugin> {
+    let ws = workspace.to_path_buf();
+
+    vec![
+        ToolPlugin::new(0, vec![Box::new(ReadTool::new(ws.clone()))]),
+        ToolPlugin::new(1, vec![Box::new(WriteTool::new(ws.clone()))]),
+        ToolPlugin::new(2, vec![Box::new(EditTool::new(ws.clone()))]),
+        ToolPlugin::new(3, vec![Box::new(BashTool::new(ws.clone()))]),
+        // `grep` 拿 clone、`find` 拿走本体：同一次探测的后端认知，两工具不得分歧。
+        ToolPlugin::new(
+            4,
+            vec![Box::new(GrepTool::new(ws.clone(), backends.clone()))],
+        ),
+        ToolPlugin::new(5, vec![Box::new(FindTool::new(ws.clone(), backends))]),
+        ToolPlugin::new(6, vec![Box::new(LsTool::new(ws.clone()))]),
+        // `ocr` 是**只读本地输入**（不写 workspace，落盘只在 `<temp>/yushan-ocr/`）⇒
+        // 与文件类工具同组，紧跟 `ls` 之后；带网络的两个工具仍留在最后（本机能力优先）。
+        ToolPlugin::new(7, vec![Box::new(OcrTool::new().with_workspace(ws.clone()))]),
+        // `view_image` 同样只读（只读文件头 + `metadata`，不写任何位置）⇒ 紧跟 `ocr`：
+        // 两者是同一件事的两面（`ocr` 给文字与坐标，它给像素），相邻便于模型读清单。
+        ToolPlugin::new(
+            8,
+            vec![Box::new(
+                ViewImageTool::default().with_workspace(ws.clone()),
+            )],
+        ),
+        // `WebConfig` 是 `Clone` 的值（`Client` 内含 `Arc`，克隆只复制指针）：
+        // 两个工具各持一份，连接池与 UA 策略仍是同一套。
+        ToolPlugin::new(9, vec![Box::new(WebSearchTool::new(web.clone()))]),
+        ToolPlugin::new(10, vec![Box::new(WebFetchTool::new(web))]),
+    ]
+    .into_iter()
+    .map(with_prompt_declaration)
+    .collect()
+}
+
+/// 把 [`crate::tool_prompts`] 里该工具的 snippet 与 guideline 块挂到插件上。
+///
+/// 两条清单**故意分处两个模块**：插件声明管「有哪些工具、什么顺序」，`tool_prompts` 管
+/// 「它们各自对固定前缀说什么」。本函数是两者唯一的接合点 —— 声明里没有对应条目时
+/// 插件照旧（第三方工具不必声明 snippet，清单会退化为 `Custom tool`）。
+fn with_prompt_declaration(plugin: ToolPlugin) -> ToolPlugin {
+    let declared: Vec<ys_tool::ToolPrompt> = plugin
+        .tools
+        .iter()
+        .filter_map(|tool| crate::tool_prompts::prompt_for(&tool.spec().name).cloned())
+        .collect();
+    plugin.with_prompts(declared)
+}
+
+/// 探测一次搜索后端，把插件声明折平成**有序**工具表；一并交还降级提示。
+///
+/// 顺序由 [`builtin_plugins`] 的 `order` 给出（经 `sort_plugins` 升序折表），
+/// 该顺序 **就是**注册顺序，决定 `ToolRegistry::specs()` 的顺序，进而决定系统提示词里
+/// 工具清单的顺序。顺序断言与指纹锚在测试侧用**独立的** `EXPECTED_ORDER_FOR_TESTS`。
 ///
 /// # 降级提示
 ///
@@ -83,37 +165,17 @@ pub(crate) const EXPECTED_ORDER: &[&str] = &[
 /// 两者都非空时按 `\n` 拼接，仅一侧非空时返回该条，都为空才 `None`。
 /// 本模块**不**另写文案、**不**打印 —— 何时打印、打到哪由 `main` 决定
 /// （启动期 → stderr）。
-///
-/// # 无副作用
-///
-/// 本函数（与 [`WebConfig::from_env`]）**绝不清理落盘目录** —— 清理由 `main`
-/// 在装配序列里显式调，且只对 `FetchedDir::Primary` 生效。否则本函数的测试
-/// 会删掉用户真实的 `~/.yushan/fetched`（设计 §1.1 硬约束）。
 pub fn build_tools(workspace: &Path, web: WebConfig) -> (Vec<Box<dyn Tool>>, Option<String>) {
+    // 探测一次：同一份 `backends` 既进 `grep` / `find`，又出降级提示。
     let backends = SearchBackends::detect();
-    // 先取提示：`backends` 随即被移入 `find`（`grep` 拿 clone）。
     let hint = merge_hints(backends.degraded_hint(), web.degraded_hint());
 
-    let ws = workspace.to_path_buf();
-    let tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ReadTool::new(ws.clone())),
-        Box::new(WriteTool::new(ws.clone())),
-        Box::new(EditTool::new(ws.clone())),
-        Box::new(BashTool::new(ws.clone())),
-        Box::new(GrepTool::new(ws.clone(), backends.clone())),
-        Box::new(FindTool::new(ws.clone(), backends)),
-        Box::new(LsTool::new(ws.clone())),
-        // `ocr` 是**只读本地输入**（不写 workspace，落盘只在 `<temp>/yushan-ocr/`）⇒
-        // 与文件类工具同组，紧跟 `ls` 之后；带网络的两个工具仍留在最后（本机能力优先）。
-        Box::new(OcrTool::new().with_workspace(ws.clone())),
-        // `view_image` 同样只读（只读文件头 + `metadata`，不写任何位置）⇒ 紧跟 `ocr`：
-        // 两者是同一件事的两面（`ocr` 给文字与坐标，它给像素），相邻便于模型读清单。
-        Box::new(ViewImageTool::default().with_workspace(ws.clone())),
-        // `WebConfig` 是 `Clone` 的值（`Client` 内含 `Arc`，克隆只复制指针）：
-        // 两个工具各持一份，连接池与 UA 策略仍是同一套。
-        Box::new(WebSearchTool::new(web.clone())),
-        Box::new(WebFetchTool::new(web)),
-    ];
+    let plugins = sort_plugins(builtin_plugins_from(workspace, web, backends))
+        .expect("内置 11 条声明必须通过 sort_plugins 的三条声明期校验");
+    let tools: Vec<Box<dyn Tool>> = plugins
+        .into_iter()
+        .flat_map(|plugin| plugin.tools)
+        .collect();
 
     (tools, hint)
 }
@@ -135,7 +197,7 @@ fn merge_hints(search: Option<String>, web: Option<String>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -149,10 +211,33 @@ mod tests {
 
     use crate::test_env::{EnvRestore, env_lock};
 
-    /// [`EXPECTED_ORDER`] 的 owned 形式（`spec().name` / `tool_names()` 都是 `String`）。
-    /// [`EXPECTED_ORDER`]: super::EXPECTED_ORDER
-    fn expected_order() -> Vec<String> {
-        EXPECTED_ORDER.iter().map(|s| s.to_string()).collect()
+    /// **测试侧的独立顺序真值**（硬编码，**不引用** `builtin_plugins()` / `builtin_order()`）。
+    ///
+    /// 装配端与测试端保留两份真值，才能交叉校验：装配端的 `order` 被改乱、或被改成
+    /// 从探测 / env 派生时，本字面量不动 ⇒ 顺序断言变红。若本处也改引生产派生量，
+    /// 「顺序变了」这件事就没有任何断言能发现（两份真值退化成一份）。
+    ///
+    /// `assembly.rs` / `prompt.rs` 的测试也引用这一份 —— 它们不各自另抄一份。
+    pub(crate) const EXPECTED_ORDER_FOR_TESTS: &[&str] = &[
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "grep",
+        "find",
+        "ls",
+        "ocr",
+        "view_image",
+        "websearch",
+        "webfetch",
+    ];
+
+    /// [`EXPECTED_ORDER_FOR_TESTS`] 的 owned 形式（`spec().name` / `tool_names()` 都是 `String`）。
+    pub(crate) fn expected_order_for_tests() -> Vec<String> {
+        EXPECTED_ORDER_FOR_TESTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// **确定性** `WebConfig`：无搜索后端、无 HTTP 栈（`offline`），落盘目录走 `Temp` 档。
@@ -228,7 +313,7 @@ mod tests {
     /// 1. `build_tools` 返回恰好 **11** 个工具，且 name 序列**逐字**等于固定顺序。
     ///
     /// 变异 1：`toolset.rs` 里把 `grep` / `find` 互换 → 本用例变红。
-    /// 变异 2：`vec![...]` 少写一个工具（或与 `EXPECTED_ORDER` 不一致）→ 本用例变红。
+    /// 变异 2：`builtin_plugins()` 少写一个工具（或与测试侧硬编码序不一致）→ 本用例变红。
     #[test]
     fn build_tools_returns_fixed_order_of_eleven() {
         let _guard = env_lock();
@@ -240,8 +325,101 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
         assert_eq!(
             names,
-            expected_order(),
+            expected_order_for_tests(),
             "装配顺序即语义（决定 prompt 工具清单顺序）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1b. `builtin_plugins()` 产出 **11 条声明**（每条一个工具），折平后名字序
+    ///     逐字等于**测试侧硬编码**的 [`EXPECTED_ORDER_FOR_TESTS`]。
+    ///
+    /// 与用例 1 的分工：1 走 [`build_tools`]（含折平），本用例直看**声明本身** ——
+    /// 断言的是「一条声明一个工具」与 `order` 一一对应，不经 `sort_plugins` 的排序。
+    ///
+    /// 变异 1：把两个工具塞进同一条声明 ⇒ 条数断言变红。
+    /// 变异 2：调换任意两条声明的 `order` ⇒ 名字序断言变红。
+    /// 变异 3：删掉一条声明 ⇒ 条数断言变红（`len == 11`）。
+    #[test]
+    fn builtin_plugins_declares_eleven_in_test_side_order() {
+        let dir = unique_dir("plugins_decl");
+
+        let plugins = builtin_plugins(&dir, offline_web());
+        assert_eq!(plugins.len(), 11, "内置工具面应为 11 条声明");
+        assert!(
+            plugins.iter().all(|plugin| plugin.tools.len() == 1),
+            "一条声明一个工具（顺序真值才能与工具名一一对应）"
+        );
+
+        let names: Vec<String> = plugins
+            .iter()
+            .flat_map(|plugin| plugin.tools.iter().map(|tool| tool.spec().name))
+            .collect();
+        assert_eq!(
+            names,
+            expected_order_for_tests(),
+            "声明的 order 升序必须逐字等于测试侧的独立硬编码序"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1c. **交叉校验：装配端派生量 == 测试端硬编码序**。
+    ///
+    /// 这是「两份真值」得以互证的那条缝：`builtin_order` 由声明的 `order` 派生，
+    /// 本用例把它与独立字面量逐项对账。两者都指向同一顺序时才算对齐。
+    ///
+    /// 变异：把任意两条声明的 `order` 对调 ⇒ 派生量变、字面量不变 ⇒ 变红。
+    #[test]
+    fn derived_order_matches_test_side_literal() {
+        let dir = unique_dir("plugins_derived");
+
+        assert_eq!(
+            builtin_order(&dir, offline_web()),
+            expected_order_for_tests(),
+            "装配端派生量必须逐字等于测试侧的独立硬编码序"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1d. **打乱传入顺序 ⇒ 折表结果不变**：`sort_plugins` 按 `order` 升序重排，
+    ///     与声明先后无关。
+    ///
+    /// 反向传入比随机打乱更强：它把**每一条**声明都移到了与 `order` 相反的位置，
+    /// 故任何「按传入顺序折表」的实现必红。
+    ///
+    /// 先断言反向序列**确实**不是期望序（否则下面的正向断言平凡通过）。
+    ///
+    /// 变异：`sort_plugins` 里去掉 `sort_by_key(|p| p.order)` ⇒ 名字序变成反向 ⇒ 变红。
+    #[test]
+    fn sort_plugins_folds_reversed_declarations_back_to_order() {
+        let dir = unique_dir("plugins_sort");
+
+        let mut plugins = builtin_plugins(&dir, offline_web());
+        let mut reversed_names: Vec<String> = plugins
+            .iter()
+            .flat_map(|plugin| plugin.tools.iter().map(|tool| tool.spec().name))
+            .collect();
+        reversed_names.reverse();
+        assert_ne!(
+            reversed_names,
+            expected_order_for_tests(),
+            "反向序列必须与期望序不同，否则本用例无法发现「不排序」"
+        );
+
+        plugins.reverse();
+        let sorted =
+            sort_plugins(plugins).expect("11 条声明互不重名、order 唯一、无 guideline slot");
+        let names: Vec<String> = sorted
+            .iter()
+            .flat_map(|plugin| plugin.tools.iter().map(|tool| tool.spec().name))
+            .collect();
+        assert_eq!(
+            names,
+            expected_order_for_tests(),
+            "折表结果由 order 决定，与传入顺序无关"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -269,7 +447,7 @@ mod tests {
             .build()
             .expect("装配 11 个基本工具应能建成 agent");
 
-        assert_eq!(agent.tool_names(), expected_order());
+        assert_eq!(agent.tool_names(), expected_order_for_tests());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -611,7 +789,7 @@ mod tests {
     }
 
     /// 断言三件：
-    ///  1. 基础表（子 agent 的工具表）恰 11 个、顺序 == [`EXPECTED_ORDER`]；
+    ///  1. 基础表（子 agent 的工具表）恰 11 个、顺序 == [`EXPECTED_ORDER_FOR_TESTS`]；
     ///  2. **同一份工具表构造两次，序列化后逐字节相同**（ADR-0022 决策 19 的抖动面：
     ///     子 agent 每次派发都重建表，`spec()` 若非纯函数会让子自己的缓存跨派发抖动）；
     ///  3. 系统提示（空 skill catalogue）的指纹可复现。
@@ -620,8 +798,8 @@ mod tests {
     ///
     /// - `fp_tools`：**只**覆盖基础 11 元（子 agent 的工具表）。它守的是子表自身的
     ///   字节稳定性，对追加段完全无感。
-    /// - `fp_parent`：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）
-    ///   共 **14 元**，与 `assembly.rs` 的生产父表同形。追加段工具的 schema 漂移
+    /// - `fp_parent`：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send` /
+    ///   `todo`）共 **15 元**，与 `assembly.rs` 的生产父表同形。追加段工具的 schema 漂移
     ///   在 `fp_tools` 那里是**静默的**（本会话已实际发生过一次：给派发工具加
     ///   `mode` 参数后 `fp_tools` 纹丝不动），故必须由父表锚补上。
     ///
@@ -629,8 +807,8 @@ mod tests {
     ///
     /// 变异：把 [`build_tools`] 里 `grep`/`find` 互换 ⇒ 顺序断言与两个指纹都变红。
     /// 变异：改任一**基础**工具的 description ⇒ `fp_tools` 与 `fp_parent` 都变红。
-    /// 变异：改 `subagent_async` / `subagent_send` 的 description ⇒ `fp_parent` 变红、
-    /// `fp_tools` 不变（这正是父表锚存在的理由）。
+    /// 变异：改 `subagent_async` / `subagent_send` / `todo` 的 description ⇒ `fp_parent`
+    /// 变红、`fp_tools` 不变（这正是父表锚存在的理由）。
     #[test]
     fn prefix_fingerprint_is_anchored_and_stable() {
         let _guard = env_lock();
@@ -640,25 +818,26 @@ mod tests {
         let specs: Vec<ys_tool::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
         assert_eq!(specs.len(), 11, "基础表应为 11 个（子 agent 的表）");
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names, expected_order(), "顺序即语义");
+        assert_eq!(names, expected_order_for_tests(), "顺序即语义");
 
         let json = serde_json::to_string(&specs).unwrap();
         let fp_tools = fnv1a64(json.as_bytes());
 
         // **父表锚点**：父表 = 这 11 元 + `bash_bg` + `subagent_async` + `subagent_send`
-        // ⇒ **14 元**（与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的
+        // + `todo` ⇒ **15 元**（与 `assembly.rs` 的生产父表同形），且父 JSON 是子 JSON 的
         // **字节前缀 + 追加项**（子表命中父的前缀缓存）。
         //
-        // 三个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
+        // 四个追加项都取**真工具**的 `spec()`（不是手抄的 `ToolSpec`）—— 锚点要钉的是模型
         // 真看到的那份 schema。
         let mut parent_specs = specs.clone();
         parent_specs.push(bash_bg_spec(&dir));
         parent_specs.push(crate::subagent::SubagentAsyncTool::new().spec());
         parent_specs.push(crate::subagent::SubagentSendTool::new().spec());
+        parent_specs.push(ys_tools_todo::todo_tool(ys_tools_todo::TodoStore::open(None)).spec());
         assert_eq!(
             parent_specs.len(),
-            14,
-            "父表应为 14 元（11 基础 + bash_bg + subagent_async + subagent_send）"
+            15,
+            "父表应为 15 元（11 基础 + bash_bg + subagent_async + subagent_send + todo）"
         );
         // 合同：父表**不得**含已删除的同步 `subagent` 工具 —— 子 agent 只能靠
         // `subagent_async` 派发（`subagent_send` 只对**已在跑**的子 agent 插话，
@@ -672,13 +851,13 @@ mod tests {
             "同步 `subagent` 工具已删除，父表不得含它（子 agent 靠 `subagent_async` 派发）"
         );
         assert_eq!(
-            parent_specs[parent_specs.len() - 3..]
+            parent_specs[parent_specs.len() - 4..]
                 .iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<&str>>(),
-            vec!["bash_bg", "subagent_async", "subagent_send"],
-            "追加段顺序即契约：后台工具在派发工具**之前**（与 assembly.rs 尾断言逐项一致，\
-             否则子表不再是父的字节前缀）"
+            vec!["bash_bg", "subagent_async", "subagent_send", "todo"],
+            "追加段顺序即契约：后台工具在派发工具**之前**，`todo` 收尾\
+             （与 assembly.rs 尾断言逐项一致，否则子表不再是父的字节前缀）"
         );
         let parent_json = serde_json::to_string(&parent_specs).unwrap();
         assert!(
@@ -726,14 +905,14 @@ mod tests {
             fp_tools, 0xf017256b30c9d6f7u64,
             "工具表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
-        // 父表指纹锚：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`）。
+        // 父表指纹锚：覆盖基础 11 元 + 追加段（`bash_bg` / `subagent_async` / `subagent_send`
+        // / `todo`）。
         // `fp_tools` 只覆盖子表，追加段工具的 schema 漂移在它那里是静默的 —— 这里补上。
         //
-        // 最近一次漂移：`view_image` 的 description 补上到 `ocr` 的分流指引并写明 URL 不被
-        // 接受（design.md §3.3 要求写明「何时该用本工具」）。基础表项在父表里，故两锚同时平移；
-        // 上一轮漂移是基础表新增 `view_image` 本身（同时 `ocr` 去掉「唯一能看图」那句）。
+        // 最近一次漂移：追加段末位新增 `todo` 清单工具（父表 14 → 15 元，前缀 +1433 B）。
+        // 上一轮漂移是 `view_image` 的 description 补上到 `ocr` 的分流指引。
         assert_eq!(
-            fp_parent, 0x318be4770f32c8e6u64,
+            fp_parent, 0xe29d34d132355915u64,
             "父表指纹漂移：确认是有意的工具面改动，再更新此锚点"
         );
 

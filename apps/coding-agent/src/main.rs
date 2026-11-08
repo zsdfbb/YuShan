@@ -46,6 +46,10 @@ mod capabilities;
 mod channel;
 mod config;
 mod debug_log;
+mod goal;
+mod goal_judge;
+mod goal_judge_call;
+mod turn_advance;
 mod help;
 mod logging;
 mod post_turn;
@@ -57,6 +61,8 @@ mod skills;
 mod state;
 mod status;
 mod subagent;
+mod todo_inject;
+mod tool_prompts;
 mod toolset;
 mod view;
 mod wiring;
@@ -1143,7 +1149,7 @@ struct ConsumeOutcome {
 /// `turn` 是**回合号**（`-p` / `--json` 恒为 1，取自 `begin_turn(1)` 的同一取值），
 /// 只用于读数行的 `turn=` 字段（该行只进 debug，见 [`ConsumeOutcome`]）。
 async fn consume_events<W, F>(
-    mut rx: mpsc::Receiver<Envelope>,
+    rx: &mut mpsc::Receiver<Envelope>,
     mut w: W,
     mut on_event: F,
     mut debug: Option<DebugTap<'_>>,
@@ -2044,6 +2050,9 @@ struct SingleTurnInputs<'a> {
     subagent: Option<&'a subagent::SubagentSetup>,
     debug: Option<&'a crate::debug_log::DebugHandle>,
     session_id: &'a str,
+    /// 回合号（从 1 起）。`Envelope.turn` 与 debug 记录的 `turn=` 都取它 ——
+    /// 多回合链里两个回合的事件必须可区分，否则事后无法把事件归到具体回合。
+    turn: u32,
 }
 
 /// `-p` / `--json` 的驱动：跑**一个** turn。
@@ -2068,6 +2077,7 @@ async fn run_single_turn(
         subagent,
         debug,
         session_id,
+        turn,
     } = params;
     // 预算计时原点与本回合耗时原点**同一个** —— 两个 `Instant::now()` 会让
     // `elapsed` 与 `budget_remaining` 对不上账。
@@ -2079,7 +2089,7 @@ async fn run_single_turn(
     // 可变借用之前取，避免借用冲突。
     let model_arc = wiring.model_arc();
     let ports = wiring.ports_with_boundary(Some(boundary.clone()));
-    ports.events.begin_turn(1);
+    ports.events.begin_turn(turn);
 
     // subagent 能力：每回合造一份 runner（派发计数器天然 per-turn）。
     // 父边界源与 `AgentPorts` 共用**同一份** `Arc` ⇒ 子 agent 的 `ChildBoundary`
@@ -2192,10 +2202,11 @@ async fn run_single_turn(
 /// 保证被测的就是生产消费路径（`consume_events` + [`PrintBuffer`]）。
 /// 终止由 `consume_events` 依**终局事件**判定，不依赖信道关闭。
 async fn consume_print_events<W: Write>(
-    rx: mpsc::Receiver<Envelope>,
+    rx: &mut mpsc::Receiver<Envelope>,
     mut w: W,
     debug: Option<&mut DebugSink>,
     session_id: &str,
+    turn: u32,
 ) -> io::Result<(bool, ConsumeOutcome)> {
     let mut buf = PrintBuffer::default();
     let tap = debug.map(|sink| DebugTap { sink, session_id });
@@ -2217,7 +2228,7 @@ async fn consume_print_events<W: Write>(
             Ok(())
         },
         tap,
-        1,
+        turn,
     )
     .await?;
     if !consumed.terminal {
@@ -2288,186 +2299,383 @@ where
     Ok((result, consumed))
 }
 
+/// 跨回合推进的**判官 + 判据**组合（`docs/arch/cross-turn-advance/design.md` §5.9）。
+///
+/// TUI（`app_loop`）与 `-p` / `--json` **共用这一份**：两条入口的判据必须逐字同源，
+/// 否则「同一个任务在两条入口上跑出不同轮数」这种漂移无从发现。
+///
+/// 判官失败计数的归零规则在 `decide` 内部（它按 `judge_failures` 判停机），
+/// 故这里只做增量累加：可用结论（`0`）即归零。
+#[allow(clippy::too_many_arguments)]
+async fn advance_after_turn(
+    wiring: &mut Wiring,
+    todo_store: &ys_tools_todo::TodoStore,
+    state: &mut crate::turn_advance::AdvanceState,
+    outcome: &Result<RunResult, LoopError>,
+    enabled: bool,
+    head_before: Option<&str>,
+    head_after: Option<String>,
+    elapsed: Option<Duration>,
+) -> crate::turn_advance::Advance {
+    let model = wiring.model_arc();
+    let delta = crate::turn_advance::judge_failure_delta(
+        model.as_deref(),
+        wiring.session_messages(),
+        todo_store,
+        head_before,
+        &head_after,
+        outcome,
+        elapsed,
+    )
+    .await;
+    if delta == 0 {
+        state.judge_failures = 0;
+    } else {
+        state.judge_failures = state.judge_failures.saturating_add(delta);
+    }
+
+    crate::turn_advance::advance(todo_store, state, outcome, enabled, head_before, head_after)
+}
+
+/// 追问回合的输入。
+///
+/// 优先注入**清单**（模型必须看得见本回合结束时的清单状态）；清单为空或不需重注时
+/// 退回一期的追问句。两种都是 `Role::Harness` —— 用户没说过这些话，记成用户说的
+/// 会污染「我是谁、我说过什么」（设计 §3.1a）。
+/// 追问回合的输入：**由推进理由决定**，两条入口共用。
+///
+/// - 清单驱动（有 open 项）：注入块本身就是输入 —— 它已经把「未完成项优先」摆在末尾，
+///   再叠一句「请继续」只是重复计费。清单版本变了才重注；没变时用一句短的推进句，
+///   避免把**同一份**清单在尾部堆成 N 份副本（`prompt-delivery/notes.md` 的结论：
+///   内容不变却注入 = 纯浪费）。
+/// - 无清单（一期的 `HEAD` 判据）：用 [`crate::post_turn::harness_input`] 的文案，
+///   它说的是「git 历史变了」—— **不能**用于清单驱动的情形，否则模型会去查一个
+///   不存在的提交。
+///
+/// 两者都是 `Role::Harness`：用户没说过这些话。
+fn follow_up_input(
+    todo_store: &ys_tools_todo::TodoStore,
+    last_injected_rev: &mut Option<u64>,
+    session: &[ys_core::Message],
+) -> AgentInput {
+    let text = if todo_store.snapshot().is_empty() {
+        match &crate::post_turn::harness_input().content[0] {
+            ys_core::ContentBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        }
+    } else if crate::todo_inject::should_inject(todo_store, *last_injected_rev, session) {
+        *last_injected_rev = Some(todo_store.revision());
+        crate::todo_inject::injection_text(todo_store)
+    } else {
+        // 清单已在上下文里且版本未变：只给推进句，不重复整块。
+        "继续推进清单里的未完成项；全部完成后收尾。".to_string()
+    };
+    AgentInput::new(ys_core::Message {
+        role: ys_core::Role::Harness,
+        content: vec![ys_core::ContentBlock::Text { text }],
+    })
+}
+
+/// 一条输入消息的字节量（debug 的 `input_bytes` 字段）。
+fn input_bytes(input: &AgentInput) -> usize {
+    input
+        .message
+        .content
+        .iter()
+        .map(|block| match block {
+            ys_core::ContentBlock::Text { text } => text.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// `-p` 模式：并发消费事件流，把文本增量实时写到 stdout。
 ///
 /// 收尾补一个换行，与旧实现（`println!` final_message）的输出保持一致。
 /// turn 结束、消费排空后，把背压读数写到 stderr（见 [`report_channel_stats`]）。
+///
+/// # 跨回合推进（`docs/arch/cross-turn-advance/design.md` §5.9）
+///
+/// 外层 `loop` 每轮跑**一个** turn，跑完经 [`advance_after_turn`] 问一次「要不要
+/// 再来一轮」；判据与 TUI 侧**同一份实现**（`turn_advance::advance`）。
+/// 追问回合的输入由 [`crate::post_turn::harness_input`] 或清单注入给出，
+/// 与 TUI 的 `Request::Prompt` 臂同形。
+///
+/// **`rx` 是 `&mut`**：每轮 `join!` 各调一次消费，信道与消费方**一一对应**；
+/// 按值传会在第二个回合拿不到 `rx`。
+///
+/// 返回**最后一个**回合的 `RunResult` —— 退出码要反映最终收场形态（追问回合失败
+/// 就该非零），不是首个回合。
 #[allow(clippy::too_many_arguments)]
 async fn run_print_mode(
     agent: &mut Agent,
     wiring: &mut Wiring,
-    rx: mpsc::Receiver<Envelope>,
+    rx: &mut mpsc::Receiver<Envelope>,
     task: String,
     budget: Duration,
     stats: &ChannelStatsHandle,
     force_stats: bool,
     config: &config::Config,
     subagent: Option<&subagent::SubagentSetup>,
+    todo_store: &ys_tools_todo::TodoStore,
     mut debug: Option<&mut DebugSink>,
     session_id: &str,
     observed_rounds: &mut u32,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring, debug.as_deref_mut())?;
 
-    // 回合边界记录在 `join` **之前 / 之后**写：`consume_events` 与跑回合必须并发，
-    // 二者不可能同时持有同一个 `&mut DebugSink`（有界信道若无并发消费者即死锁）。
-    // 故 sink 在回合执行期间归消费者；回合执行侧只拿一个可克隆句柄（`DebugHandle`），
-    // 用于在预算 `push` 的同刻写 `boundary`。
-    let turn_started = Instant::now();
-    let deadline = turn_started + budget;
-    if let Some(sink) = reborrow_sink(&mut debug) {
-        record_turn_start(sink, session_id, 1, task.len(), budget);
-    }
-    let debug_handle = debug.as_ref().map(|sink| sink.handle());
+    // `head_before` **只取一次**（首个回合之前），循环里不更新：一期判据是「相对
+    // 首次取值变了没」，每轮重取会把追问回合自己的提交当成新变化 ⇒ 无限追问。
+    // 开关关时**不 spawn git**（每回合两次 fork+exec，判据默认关）。
+    let enabled = config.follow_up_on_commit();
+    let workspace = enabled.then(|| config.cwd.clone());
+    let head_before = crate::post_turn::git_head(workspace.as_deref());
+    let mut advance_state = crate::turn_advance::AdvanceState::new();
+    let mut last_injected_rev = None;
+    // 回合号从 1 起，逐轮递增：`Envelope.turn` 与 debug 的 `turn=` 都取它，
+    // 多回合链里两个回合的事件必须可区分。
+    let mut turn: u32 = 1;
+    let mut input = AgentInput::text(task.as_str());
 
-    // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
-    let (run_result, consume_result) = tokio::join!(
-        run_single_turn(
-            agent,
-            wiring,
-            SingleTurnInputs {
-                input: AgentInput::text(task.as_str()),
-                budget,
-                config: Some(config),
-                subagent,
-                debug: debug_handle.as_ref(),
-                session_id,
-            },
-        ),
-        consume_print_events(rx, io::stdout(), debug.as_deref_mut(), session_id),
-    );
-
-    // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计（成功时仍以 `RunResult` 为准）。
-    if let Ok((_, consumed)) = &consume_result {
-        *observed_rounds = consumed.rounds;
-    }
-    // 读数行在消费侧汇总；debug 记录与 stderr 出口共用同一份文本。
-    let reading = consume_result
-        .as_ref()
-        .ok()
-        .map(|(_, consumed)| (consumed.reading.clone(), consumed.reading_fields.clone()));
-    if let Some(sink) = reborrow_sink(&mut debug) {
-        // `Cancelled` ⇒ 补 `observed`：`enqueued` 说明 Abort 已投递（在
-        // `run_single_turn` 内与 `push` 同刻写），`observed` 说明回合确实看到了它。
-        if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
-            record_boundary(sink, session_id, Some(1), "observed", "abort", None);
+    loop {
+        // 回合边界记录在 `join` **之前 / 之后**写：`consume_events` 与跑回合必须并发，
+        // 二者不可能同时持有同一个 `&mut DebugSink`（有界信道若无并发消费者即死锁）。
+        // 故 sink 在回合执行期间归消费者；回合执行侧只拿一个可克隆句柄（`DebugHandle`），
+        // 用于在预算 `push` 的同刻写 `boundary`。
+        let turn_started = Instant::now();
+        let deadline = turn_started + budget;
+        let input_bytes = input_bytes(&input);
+        if let Some(sink) = reborrow_sink(&mut debug) {
+            record_turn_start(sink, session_id, turn, input_bytes, budget);
         }
-        record_turn_end(
-            sink,
-            session_id,
-            1,
-            run_result
-                .as_ref()
-                .map(|r| r.rounds)
-                .unwrap_or(*observed_rounds),
-            turn_started.elapsed(),
-            deadline.saturating_duration_since(Instant::now()),
-            round_clock::turn_cache(&run_result),
+        let debug_handle = debug.as_ref().map(|sink| sink.handle());
+
+        // 消费与跑回合必须**并发**：有界信道若无并发消费者，agent 撞满即等待 → 死锁。
+        let (run_result, consume_result) = tokio::join!(
+            run_single_turn(
+                agent,
+                wiring,
+                SingleTurnInputs {
+                    input,
+                    budget,
+                    config: Some(config),
+                    subagent,
+                    debug: debug_handle.as_ref(),
+                    session_id,
+                    turn,
+                },
+            ),
+            consume_print_events(rx, io::stdout(), debug.as_deref_mut(), session_id, turn),
         );
-        if let Some((line, fields)) = &reading {
-            record_run_reading_fields(sink, session_id, 1, line, fields);
+
+        // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计（成功时仍以 `RunResult` 为准）。
+        if let Ok((_, consumed)) = &consume_result {
+            *observed_rounds = consumed.rounds;
         }
-    }
+        // 读数行在消费侧汇总；debug 记录与 stderr 出口共用同一份文本。
+        let reading = consume_result
+            .as_ref()
+            .ok()
+            .map(|(_, consumed)| (consumed.reading.clone(), consumed.reading_fields.clone()));
+        if let Some(sink) = reborrow_sink(&mut debug) {
+            // `Cancelled` ⇒ 补 `observed`：`enqueued` 说明 Abort 已投递（在
+            // `run_single_turn` 内与 `push` 同刻写），`observed` 说明回合确实看到了它。
+            if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
+                record_boundary(sink, session_id, Some(turn), "observed", "abort", None);
+            }
+            record_turn_end(
+                sink,
+                session_id,
+                turn,
+                run_result
+                    .as_ref()
+                    .map(|r| r.rounds)
+                    .unwrap_or(*observed_rounds),
+                turn_started.elapsed(),
+                deadline.saturating_duration_since(Instant::now()),
+                round_clock::turn_cache(&run_result),
+            );
+            if let Some((line, fields)) = &reading {
+                record_run_reading_fields(sink, session_id, turn, line, fields);
+            }
+        }
 
-    // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
-    report_channel_stats(stats, force_stats);
-    // 读数行**只进 debug**（上面已写）；stdout 承载模型增量流、stderr 只在异常时说话。
-    let (result, (printed_any, consumed)) =
-        finish_after_reading(&mut io::stderr(), run_result, consume_result)?;
-    *observed_rounds = consumed.rounds;
+        // 消费已排空（join 返回）→ 此刻读读数为终态。先报告，再传播错误。
+        report_channel_stats(stats, force_stats);
+        // 读数行**只进 debug**（上面已写）；stdout 承载模型增量流、stderr 只在异常时说话。
+        let (result, (printed_any, consumed)) =
+            finish_after_reading(&mut io::stderr(), run_result, consume_result)?;
+        *observed_rounds = consumed.rounds;
 
-    if printed_any {
-        println!();
+        if printed_any {
+            println!();
+        }
+
+        // ── 跨回合推进 ──
+        // 判据要的是「本回合的收场形态」，失败也要能判（不可续），故先包成 `Result`。
+        let outcome: Result<RunResult, LoopError> = Ok(result);
+        let head_after = crate::post_turn::git_head(workspace.as_deref());
+        let step = advance_after_turn(
+            wiring,
+            todo_store,
+            &mut advance_state,
+            &outcome,
+            enabled,
+            head_before.as_deref(),
+            head_after,
+            Some(turn_started.elapsed()),
+        )
+        .await;
+        let crate::turn_advance::Advance::Push = step else {
+            // 终止：返回**最后**一个回合的结果（退出码反映最终收场）。
+            return match outcome {
+                Ok(result) => Ok(result),
+                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+            };
+        };
+        advance_state.used = advance_state.used.saturating_add(1);
+        turn = turn.saturating_add(1);
+
+        // 追问回合**之前**注入清单（与 TUI 同形、同一判据）：模型必须看得见
+        // 本回合结束时的清单状态。清单为空 ⇒ 注入的是 harness 追问句。
+        input = follow_up_input(todo_store, &mut last_injected_rev, wiring.session_messages());
     }
-    Ok(result)
 }
 
 /// `--json` 模式：并发消费事件流，逐行输出 `Envelope` 的 JSON。
 ///
 /// 背压读数走 stderr（[`report_channel_stats`]），不混入 stdout 的 JSON 流。
+///
+/// # 跨回合推进
+///
+/// 结构与 [`run_print_mode`] **逐行同形**（同一个 `advance_after_turn`、同一个
+/// `follow_up_input`）：两条入口的推进只允许有一份判据实现，否则「同一个任务在
+/// `-p` 与 `--json` 上跑出不同轮数」这种漂移无从发现。
+///
+/// 差别只在消费端：`--json` 逐行写 `Envelope`（每行都带 `turn` 号，两个回合可区分），
+/// 不攒正文、不补末尾换行。
 #[allow(clippy::too_many_arguments)]
 async fn run_json_mode(
     agent: &mut Agent,
     wiring: &mut Wiring,
-    rx: mpsc::Receiver<Envelope>,
+    rx: &mut mpsc::Receiver<Envelope>,
     task: String,
     budget: Duration,
     stats: &ChannelStatsHandle,
     force_stats: bool,
     config: &config::Config,
     subagent: Option<&subagent::SubagentSetup>,
+    todo_store: &ys_tools_todo::TodoStore,
     mut debug: Option<&mut DebugSink>,
     session_id: &str,
     observed_rounds: &mut u32,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring, debug.as_deref_mut())?;
 
-    // 同 `run_print_mode`：sink 在 join 期间归消费者，回合执行侧只拿可克隆句柄。
-    let turn_started = Instant::now();
-    let deadline = turn_started + budget;
-    if let Some(sink) = reborrow_sink(&mut debug) {
-        record_turn_start(sink, session_id, 1, task.len(), budget);
-    }
-    let debug_handle = debug.as_ref().map(|sink| sink.handle());
+    // `head_before` 只取一次，理由同 `run_print_mode`（一期判据是「相对首次取值」。）
+    let enabled = config.follow_up_on_commit();
+    let workspace = enabled.then(|| config.cwd.clone());
+    let head_before = crate::post_turn::git_head(workspace.as_deref());
+    let mut advance_state = crate::turn_advance::AdvanceState::new();
+    let mut last_injected_rev = None;
+    let mut turn: u32 = 1;
+    let mut input = AgentInput::text(task.as_str());
 
-    let (run_result, consume_result) = tokio::join!(
-        run_single_turn(
-            agent,
-            wiring,
-            SingleTurnInputs {
-                input: AgentInput::text(task.as_str()),
-                budget,
-                config: Some(config),
-                subagent,
-                debug: debug_handle.as_ref(),
-                session_id,
-            },
-        ),
-        consume_events(
-            rx,
-            io::stdout(),
-            write_json_envelope,
-            debug
-                .as_deref_mut()
-                .map(|sink| DebugTap { sink, session_id }),
-            1,
-        ),
-    );
-
-    // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计。
-    if let Ok(consumed) = &consume_result {
-        *observed_rounds = consumed.rounds;
-    }
-    let reading = consume_result
-        .as_ref()
-        .ok()
-        .map(|consumed| (consumed.reading.clone(), consumed.reading_fields.clone()));
-    if let Some(sink) = reborrow_sink(&mut debug) {
-        if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
-            record_boundary(sink, session_id, Some(1), "observed", "abort", None);
+    loop {
+        // 同 `run_print_mode`：sink 在 join 期间归消费者，回合执行侧只拿可克隆句柄。
+        let turn_started = Instant::now();
+        let deadline = turn_started + budget;
+        let bytes = input_bytes(&input);
+        if let Some(sink) = reborrow_sink(&mut debug) {
+            record_turn_start(sink, session_id, turn, bytes, budget);
         }
-        record_turn_end(
-            sink,
-            session_id,
-            1,
-            run_result
-                .as_ref()
-                .map(|r| r.rounds)
-                .unwrap_or(*observed_rounds),
-            turn_started.elapsed(),
-            deadline.saturating_duration_since(Instant::now()),
-            round_clock::turn_cache(&run_result),
+        let debug_handle = debug.as_ref().map(|sink| sink.handle());
+
+        let (run_result, consume_result) = tokio::join!(
+            run_single_turn(
+                agent,
+                wiring,
+                SingleTurnInputs {
+                    input,
+                    budget,
+                    config: Some(config),
+                    subagent,
+                    debug: debug_handle.as_ref(),
+                    session_id,
+                    turn,
+                },
+            ),
+            consume_events(
+                rx,
+                io::stdout(),
+                write_json_envelope,
+                debug
+                    .as_deref_mut()
+                    .map(|sink| DebugTap { sink, session_id }),
+                turn,
+            ),
         );
-        if let Some((line, fields)) = &reading {
-            record_run_reading_fields(sink, session_id, 1, line, fields);
-        }
-    }
 
-    report_channel_stats(stats, force_stats);
-    // 读数行**只进 debug**（上面已写）；stdout 是逐行 `Envelope` 流、stderr 只在异常时说话。
-    let (result, consumed) = finish_after_reading(&mut io::stderr(), run_result, consume_result)?;
-    *observed_rounds = consumed.rounds;
-    Ok(result)
+        // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计。
+        if let Ok(consumed) = &consume_result {
+            *observed_rounds = consumed.rounds;
+        }
+        let reading = consume_result
+            .as_ref()
+            .ok()
+            .map(|consumed| (consumed.reading.clone(), consumed.reading_fields.clone()));
+        if let Some(sink) = reborrow_sink(&mut debug) {
+            if matches!(&run_result, Ok(r) if r.stop_reason == StopReason::Cancelled) {
+                record_boundary(sink, session_id, Some(turn), "observed", "abort", None);
+            }
+            record_turn_end(
+                sink,
+                session_id,
+                turn,
+                run_result
+                    .as_ref()
+                    .map(|r| r.rounds)
+                    .unwrap_or(*observed_rounds),
+                turn_started.elapsed(),
+                deadline.saturating_duration_since(Instant::now()),
+                round_clock::turn_cache(&run_result),
+            );
+            if let Some((line, fields)) = &reading {
+                record_run_reading_fields(sink, session_id, turn, line, fields);
+            }
+        }
+
+        report_channel_stats(stats, force_stats);
+        // 读数行**只进 debug**（上面已写）；stdout 是逐行 `Envelope` 流、stderr 只在异常时说话。
+        let (result, consumed) =
+            finish_after_reading(&mut io::stderr(), run_result, consume_result)?;
+        *observed_rounds = consumed.rounds;
+
+        // ── 跨回合推进 ──
+        let outcome: Result<RunResult, LoopError> = Ok(result);
+        let head_after = crate::post_turn::git_head(workspace.as_deref());
+        let step = advance_after_turn(
+            wiring,
+            todo_store,
+            &mut advance_state,
+            &outcome,
+            enabled,
+            head_before.as_deref(),
+            head_after,
+            Some(turn_started.elapsed()),
+        )
+        .await;
+        let crate::turn_advance::Advance::Push = step else {
+            return match outcome {
+                Ok(result) => Ok(result),
+                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+            };
+        };
+        advance_state.used = advance_state.used.saturating_add(1);
+        turn = turn.saturating_add(1);
+
+        input = follow_up_input(todo_store, &mut last_injected_rev, wiring.session_messages());
+    }
 }
 
 /// 一次性模式的退出码：**没有可用产出**或**预算用尽** ⇒ `1`，否则 `0`。
@@ -2655,6 +2863,8 @@ fn run_interactive(
         }
     })?;
     attach_background_context(&mut wiring);
+    // 清单真值跟随本会话的落盘文件（新会话路径只有 `Wiring` 建好才知道）。
+    factory.todo().retarget(wiring.session_path());
     let startup_hint = with_session_recovery_hint(startup_hint, wiring.take_recovery());
 
     // 会话路径快照：UI 退出后打印 `session: <id>` 用。启动态在此播种（此刻只有
@@ -3342,11 +3552,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
         config.max_turn_duration(),
         subagents_dir,
+        // 清单真值：**只有 TUI 落盘**（`-p` / `--json` 是一次性会话 ⇒ 纯内存，不写盘）。
+        // 新会话的文件名要等 `Wiring` 建好才知道，故这里只给恢复路径，
+        // 新会话由入口在拿到 `wiring` 后 retarget（`Arc` 身份不变）。
+        ys_tools_todo::TodoStore::open(if matches!(args.mode, Mode::Interactive) {
+            resume_path.as_deref()
+        } else {
+            None
+        }),
     );
     let factory = match &backgrounds {
         Some(context) => factory.with_backgrounds(context.clone()),
         None => factory,
     };
+    // 清单真值的**生产路径句柄**：`todo` 工具持的就是这份 `Arc`（`assembly` 里注入），
+    // 故 `-p` / `--json` 的推进循环读到的就是模型写进去的同一份。
+    let todo_store = factory.todo();
     // 一次装配：工具表 / working_dir / system prompt 三者同源于 `workspace`。
     let assembly::BuiltAgent {
         mut agent,
@@ -3392,7 +3613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 与 TUI 的 `Request::Prompt` **同一套**展开：`-p "/git-status"` 也生效。
             // 标题素材（`raw_task`）由 [`raw_and_expanded_task`] 在展开之前留底（C3）。
             let (raw_task, task) = raw_and_expanded_task(task, &config.skills);
-            let (sink, rx) =
+            let (sink, mut rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             // 装箱前取读数句柄：装箱后仍能读到终态背压计数。
             let stats_handle = sink.stats_handle();
@@ -3431,13 +3652,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = match rt.block_on(run_print_mode(
                 &mut agent,
                 &mut wiring,
-                rx,
+                &mut rx,
                 task,
                 config.max_turn_duration(),
                 &stats_handle,
                 args.stats,
                 &config,
                 Some(&subagent),
+                &todo_store,
                 debug.as_mut(),
                 &debug_session_id,
                 &mut observed_rounds,
@@ -3483,7 +3705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{hint}");
             }
             let (raw_task, task) = raw_and_expanded_task(task, &config.skills);
-            let (sink, rx) =
+            let (sink, mut rx) =
                 ChannelSink::new(channel_capacity(), LifecyclePolicy::StopWhenConsumerGone);
             let stats_handle = sink.stats_handle();
             let model = config.build_model();
@@ -3521,13 +3743,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = match rt.block_on(run_json_mode(
                 &mut agent,
                 &mut wiring,
-                rx,
+                &mut rx,
                 task,
                 config.max_turn_duration(),
                 &stats_handle,
                 args.stats,
                 &config,
                 Some(&subagent),
+                &todo_store,
                 debug.as_mut(),
                 &debug_session_id,
                 &mut observed_rounds,
@@ -3639,6 +3862,83 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// 按**调用序**应答的模型替身（主回合与判官共用同一份）。
+    ///
+    /// 两条区分依据是 `request.tools`：判官请求**不带工具表**
+    /// （`goal_judge_call::judge_request`），主回合总是带 ⇒ 按这个分岔，
+    /// 两条路各用自己的计数器，不会互相消耗脚本。
+    ///
+    /// 主回合脚本（按**回合**分岔，不按调用序 —— 一个回合内会有多轮调用）：
+    ///
+    /// - **首回合**：第 1 轮写一份留 `pending` 的清单，第 2 轮收尾正文。
+    ///   ⇒ 回合结束时清单有 open 项 ⇒ 判据放行。
+    /// - **追问回合**：第 1 轮把该项标成 `completed`，第 2 轮收尾正文。
+    ///   ⇒ 清单清空且 `revision > 0` ⇒ `AllDone` 收场，不多跑一轮。
+    ///
+    /// 回合分岔依据：追问输入是 `Role::Harness`（清单注入），它总是会话最后一条。
+    #[derive(Default, Clone)]
+    struct ScriptedModel {
+        main_calls: Arc<AtomicUsize>,
+        judge_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ys_model::Model for ScriptedModel {
+        fn model_id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            request: ys_model::ModelRequest,
+            _sink: &mut dyn ys_model::ModelEventSink,
+        ) -> Result<ys_model::ModelResponse, ys_model::ModelError> {
+            let text = |s: &str| Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: s.into() }],
+            };
+            // 判官：不带工具表。回一份**可解析**的 `NOT_MET` —— 不可解析会计入
+            // `judge_failures`，连续两次就把循环按「判官不可靠」停掉，那就测不到多回合了。
+            if request.tools.is_empty() {
+                self.judge_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(ys_model::ModelResponse {
+                    message: text("VERDICT: NOT_MET\nITEMS:\n- 写文档 | MISSING | -"),
+                    usage: Usage::default(),
+                    finish_reason: ys_model::FinishReason::Stop,
+                });
+            }
+
+            let n = self.main_calls.fetch_add(1, Ordering::SeqCst);
+            // 追问回合的输入是清单注入（`Role::Harness`），它在会话末尾。
+            let follow_up = matches!(
+                request.messages.last().map(|m| &m.role),
+                Some(Role::Harness)
+            );
+            let status = if follow_up { "completed" } else { "pending" };
+            let (message, finish_reason) = match (follow_up, n % 2) {
+                (_, 0) => (
+                    Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ToolCallId(format!("t{n}")),
+                            name: "todo".into(),
+                            arguments: serde_json::json!({
+                                "todos": [{"content": "写文档", "status": status}]
+                            }),
+                        }],
+                    },
+                    ys_model::FinishReason::ToolCalls,
+                ),
+                (_, _) => (text("done"), ys_model::FinishReason::Stop),
+            };
+            Ok(ys_model::ModelResponse {
+                message,
+                usage: Usage::default(),
+                finish_reason,
+            })
+        }
     }
 
     /// 测试用默认 limits —— `build_agent` 现在必须显式收一个（U6b 接线）。
@@ -4256,7 +4556,7 @@ mod tests {
     ///    sender 保持不 drop —— 若实现退化为「等 rx.recv() 返回 None」，此测试会超时。
     #[tokio::test]
     async fn consume_events_stops_at_terminal_event_without_channel_close() {
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(delta("a"))).await.unwrap();
         tx.send(env(delta("b"))).await.unwrap();
         tx.send(env(finished())).await.unwrap();
@@ -4264,7 +4564,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_events(rx, &mut out, write_json_envelope, None, 1),
+            consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
         )
         .await;
 
@@ -4292,7 +4592,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("hello world");
 
-        let (sink, rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
+        let (sink, mut rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
         let mut agent = build_agent(
             String::new(),
             PathBuf::from("."),
@@ -4315,9 +4615,10 @@ mod tests {
                         subagent: None,
                         debug: None,
                         session_id: "test-session",
+                        turn: 1,
                     }
                 ),
-                consume_events(rx, &mut out, write_json_envelope, None, 1),
+                consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
             )
         })
         .await;
@@ -4330,6 +4631,97 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("RunFinished"), "text = {text}");
         assert!(text.contains("ModelTextDelta"), "text = {text}");
+    }
+
+    /// 9b. **多回合不死锁**：小容量（2）下 `run_print_mode` 连跑**两个**回合，
+    ///     两回合的事件都超过容量。
+    ///
+    /// 这是 `rx` 从按值改成 `&mut` 的**唯一理由** —— 第 9 号用例是单回合的，
+    /// 覆盖不到「第二个回合的 `join!` 还能不能拿到 `rx`」，也覆盖不到
+    /// 「第一回合的终局事件与第二回合的开场事件在同一条信道里串行消费」。
+    ///
+    /// 驱动走**生产路径** [`run_print_mode`]（不是手搭 `join!`）：只有走它才能
+    /// 同时钉住「`advance` 真的让循环进第二轮」与「第二轮的消费不挂死」。
+    ///
+    /// 模型替身按**调用序**应答：第 1 次写清单（一项 `pending`），第 2 次收尾正文。
+    /// ⇒ 首回合结束时有 open 项 ⇒ `decide` 判据 8 放行 ⇒ 第二个回合必然发生。
+    #[tokio::test]
+    async fn print_mode_two_turns_do_not_deadlock_at_small_capacity() {
+        let model = ScriptedModel::default();
+        let main_calls = model.main_calls.clone();
+
+        // 清单真值：纯内存（与 `-p` 生产路径的 `TodoStore::open(None)` 同形）。
+        let todo_store = ys_tools_todo::TodoStore::open(None);
+
+        // 容量 2：单个回合的事件数（RoundStarted / ToolCall / ToolResult /
+        // ModelTextDelta / RoundFinished / RunFinished）远超它 ⇒ 两回合都必须
+        // 依赖「消费与跑回合并发」才不挂死。
+        let (sink, mut rx) = ChannelSink::new(2, LifecyclePolicy::StopWhenConsumerGone);
+        let stats_handle = sink.stats_handle();
+        let mut agent = build_agent(
+            String::new(),
+            PathBuf::from("."),
+            // `todo` 工具必须真的注册：清单只能经它写入（`TodoStore::apply` 没有别的生产入口）。
+            vec![ys_tools_todo::todo_tool(todo_store.clone())],
+            default_limits(),
+        )
+        .unwrap();
+        let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
+
+        let mut observed_rounds = 0u32;
+        // `from_env` 会 `getenv` 凭证 key，须与并发改写 env 的测试串行。
+        // 追问开关默认**关** ⇒ 本用例的第二回合只可能来自清单判据。
+        let config = {
+            let _guard = crate::test_env::env_lock();
+            config::Config::from_env().unwrap()
+        };
+
+        // 超时即失败：真挂死时不要等到 CI 杀进程（那样看不出是哪一步挂的）。
+        let joined = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_print_mode(
+                &mut agent,
+                &mut wiring,
+                &mut rx,
+                "hi".to_string(),
+                Duration::from_secs(60),
+                &stats_handle,
+                false,
+                &config,
+                None,
+                &todo_store,
+                None,
+                "test-session",
+                &mut observed_rounds,
+            ),
+        )
+        .await;
+
+        assert!(
+            joined.is_ok(),
+            "多回合（容量 2）不得挂起：第二回合的 join! 必须仍能拿到 rx"
+        );
+        let result = joined.unwrap().expect("两个回合都应成功");
+        // 返回的是**最后**一个回合的结果（退出码反映最终收场）。
+        assert_eq!(result.stop_reason, StopReason::Completed);
+
+        // 两个回合确实都跑了：主模型共 4 次调用 = **两回合 × 每回合 2 轮**
+        // （写清单 + 收尾正文）。只跑一回合会是 2 次 —— 这个差值就是「循环真的进了第二轮」的证据。
+        // 判官调用单独计数，不混入这里。
+        assert_eq!(
+            main_calls.load(Ordering::SeqCst),
+            4,
+            "首回合留 open 项 ⇒ 必须再跑一个追问回合（2 回合 × 2 轮）"
+        );
+        // 首回合 1 轮；追问回合在第 1 轮里就把项标成 completed ⇒ 清单清空 ⇒
+        // 判据 `AllDone` 收场，也不再多跑一轮。故两回合合计 2 轮。
+        assert_eq!(observed_rounds, 2, "两回合各一轮");
+        // 两回合各有一轮 `RoundStarted` ⇒ `Envelope.turn` 必须区分它们。
+        // 这由 `run_print_mode` 的 `turn` 递增保证（每轮传给 `begin_turn`）。
+        assert!(
+            !todo_store.has_open_items(),
+            "第二回合应把清单核完（AllDone 收场，而不是撞上限）"
+        );
     }
 
     /// 10. 容量 clamp：过小容量被抬到下限；正常容量不动。
@@ -4396,7 +4788,7 @@ mod tests {
     ///     未重写逻辑。
     #[tokio::test]
     async fn print_mode_writes_deltas_in_order() {
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(AgentEvent::UserMessage {
             message: Message {
                 role: Role::User,
@@ -4422,7 +4814,7 @@ mod tests {
         let mut out = CountingWriter::default();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(rx, &mut out, None, "test-session"),
+            consume_print_events(&mut rx, &mut out, None, "test-session", 1),
         )
         .await;
 
@@ -4455,7 +4847,7 @@ mod tests {
     /// **变异**：恢复「信道关闭即 `Ok`」⇒ 本用例的 `is_err` 与正文断言全变红。
     #[tokio::test]
     async fn print_mode_reports_truncated_stream_and_still_writes_text() {
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(delta("工"))).await.unwrap();
         tx.send(env(delta("作"))).await.unwrap();
         // 不发 `RunFinished` ⇒ 信道关闭。
@@ -4464,7 +4856,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(rx, &mut out, None, "test-session"),
+            consume_print_events(&mut rx, &mut out, None, "test-session", 1),
         )
         .await
         .expect("信道关闭 ⇒ 应立即返回，不得挂起")
@@ -4494,7 +4886,7 @@ mod tests {
     #[tokio::test]
     async fn print_mode_drops_discarded_attempt_and_keeps_failed_turn_silent() {
         // ① 失败回合：缓冲里的半句话不写。
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(delta("工"))).await.unwrap();
         tx.send(env(delta("作"))).await.unwrap();
         tx.send(env(AgentEvent::RunFailed {
@@ -4506,7 +4898,7 @@ mod tests {
         let mut failed_out: Vec<u8> = Vec::new();
         let (printed_any, _) = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(rx, &mut failed_out, None, "test-session"),
+            consume_print_events(&mut rx, &mut failed_out, None, "test-session", 1),
         )
         .await
         .expect("RunFailed 是终局事件，应即返回")
@@ -4518,7 +4910,7 @@ mod tests {
         assert!(failed_out.is_empty(), "失败回合必须零输出");
 
         // ② 作废后重放：只留重放的那一份。
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(delta("工"))).await.unwrap();
         tx.send(env(AgentEvent::ModelStreamDiscarded {
             reason: "provider stream error".into(),
@@ -4531,7 +4923,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let (printed_any, _) = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(rx, &mut out, None, "test-session"),
+            consume_print_events(&mut rx, &mut out, None, "test-session", 1),
         )
         .await
         .expect("应收到终局事件即返回")
@@ -4553,7 +4945,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_text("hello");
 
-        let (sink, rx) = ChannelSink::new(
+        let (sink, mut rx) = ChannelSink::new(
             DEFAULT_CHANNEL_CAPACITY,
             LifecyclePolicy::StopWhenConsumerGone,
         );
@@ -4578,9 +4970,10 @@ mod tests {
                     subagent: None,
                     debug: None,
                     session_id: "test-session",
+                    turn: 1,
                 }
             ),
-            consume_events(rx, &mut out, write_json_envelope, None, 1),
+            consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
         );
         run_result.expect("run_turn 应成功");
         consume_result.expect("consume 应成功");
@@ -4679,7 +5072,7 @@ mod tests {
             "预算时长必须来自 config.json（max_turn_duration_secs）"
         );
 
-        let (sink, rx) = ChannelSink::new(
+        let (sink, mut rx) = ChannelSink::new(
             DEFAULT_CHANNEL_CAPACITY,
             LifecyclePolicy::StopWhenConsumerGone,
         );
@@ -4706,9 +5099,10 @@ mod tests {
                         subagent: None,
                         debug: None,
                         session_id: "test-session",
+                        turn: 1,
                     }
                 ),
-                consume_events(rx, &mut out, write_json_envelope, None, 1),
+                consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
             )
         })
         .await;
@@ -5229,7 +5623,7 @@ mod tests {
     /// 变异：把读数行也写进 `w` ⇒ stdout 断言变红；`turn` 不取自入参 ⇒ 首段变红。
     #[tokio::test]
     async fn consume_events_returns_run_reading_and_keeps_stdout_clean() {
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(AgentEvent::RoundStarted { round: 1 }))
             .await
             .unwrap();
@@ -5237,7 +5631,7 @@ mod tests {
         tx.send(env(finished())).await.unwrap();
 
         let mut out: Vec<u8> = Vec::new();
-        let consumed = consume_events(rx, &mut out, write_json_envelope, None, 7)
+        let consumed = consume_events(&mut rx, &mut out, write_json_envelope, None, 7)
             .await
             .unwrap();
 
@@ -5266,7 +5660,7 @@ mod tests {
         let model = MockModel::new("m");
         model.push_error("provider boom");
 
-        let (sink, rx) = ChannelSink::new(
+        let (sink, mut rx) = ChannelSink::new(
             DEFAULT_CHANNEL_CAPACITY,
             LifecyclePolicy::StopWhenConsumerGone,
         );
@@ -5292,9 +5686,10 @@ mod tests {
                         subagent: None,
                         debug: None,
                         session_id: "test-session",
+                        turn: 1,
                     }
                 ),
-                consume_print_events(rx, &mut stdout, None, "test-session"),
+                consume_print_events(&mut rx, &mut stdout, None, "test-session", 1),
             )
         })
         .await
@@ -6695,11 +7090,11 @@ mod tests {
             debug_log::open_enabled(false, Some(&dir.join("session.jsonl")), Some(&log_dir));
         assert!(debug.is_none(), "debug 关时不得创建 sink");
 
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(8);
         tx.send(env(delta("a"))).await.unwrap();
         tx.send(env(finished())).await.unwrap();
         let mut out: Vec<u8> = Vec::new();
-        consume_events(rx, &mut out, write_json_envelope, None, 1)
+        consume_events(&mut rx, &mut out, write_json_envelope, None, 1)
             .await
             .unwrap();
 
@@ -6771,13 +7166,13 @@ mod tests {
         ];
 
         let capture = |events: Vec<AgentEvent>| async move {
-            let (tx, rx) = mpsc::channel(16);
+            let (tx, mut rx) = mpsc::channel(16);
             for event in events {
                 tx.send(env(event)).await.unwrap();
             }
             drop(tx);
             let mut out: Vec<u8> = Vec::new();
-            consume_events(rx, &mut out, write_json_envelope, None, 1)
+            consume_events(&mut rx, &mut out, write_json_envelope, None, 1)
                 .await
                 .unwrap();
             out
@@ -6820,11 +7215,11 @@ mod tests {
         );
 
         // `RunFinished` 的 usage 不含 `reasoning_tokens`（`None` 不序列化）。
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         tx.send(env(finished())).await.unwrap();
         drop(tx);
         let mut out: Vec<u8> = Vec::new();
-        consume_events(rx, &mut out, write_json_envelope, None, 1)
+        consume_events(&mut rx, &mut out, write_json_envelope, None, 1)
             .await
             .unwrap();
         let finished_line = String::from_utf8(out)

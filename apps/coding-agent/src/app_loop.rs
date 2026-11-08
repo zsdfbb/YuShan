@@ -460,6 +460,18 @@ pub async fn run(
     // 以为自己只是接着读历史，实际上回来就持续烧钱。UI 侧会给一次性提示。
     let mut loop_state: Option<LoopState> = None;
 
+    // 上一次注入清单时的 `revision`（`None` = 本进程还没注入过）。
+    //
+    // **必须活过 `Request::Prompt` 臂**：臂每进一次都是新的局部作用域，而这个量描述的是
+    // 「会话历史里那份注入对应哪个版本」，跨回合才有意义。
+    // `/new` / `/resume` 换会话时不重置 —— 新历史里找不到标记，注入判据的自愈分支会兜住；
+    // 重置它只是同一结果。
+    let mut last_injected_rev: Option<u64> = None;
+
+    // 清单真值的句柄（与 `todo` 工具持的是**同一个 `Arc`**）。
+    // `/new` / `/resume` 改的是它内部的指向（`retarget`），这里不需要重新取。
+    let todo_store = factory.todo();
+
     loop {
         // 等一条 UI 请求；后台模型目录若尚未返回，则与之赛跑。目录**一次性**到达，
         // 收到后把 `models_rx` 置 `None`，此后主循环只等 `Request`。
@@ -757,6 +769,30 @@ pub async fn run(
                 // **只作用于用户原文** —— 复核消息由 `should_review` 直接产出、不再展开。
                 let message = expand_skill_invocation(message, &config.skills);
 
+                // **回合边界 · 清单注入**（`docs/arch/long-horizon-todo/design.md` §7.3）：
+                // 在**回合之前**把当前清单推进上下文，使本回合的每一轮都看得见它。
+                //
+                // 角色是 `Role::Harness` 而非 `Role::User`：用户没说过这些话（出站时两者
+                // 都映射成 user，模型可见效果相同，但 TUI 不会把它画成用户发言）。
+                // **直接 append、不发事件** ⇒ UI 不显示 —— 与 `Boundary::Steer` 的区别就在此。
+                //
+                // 判据是纯函数（见 [`crate::todo_inject`]）：状态变了 **或** 历史里已找不到
+                // 标记 ⇒ 注入。后一条让压缩（含不发事件的手敲 `/compact`）之后自动补回。
+                if crate::todo_inject::should_inject(
+                    &todo_store,
+                    last_injected_rev,
+                    wiring.session_messages(),
+                ) {
+                    let text = crate::todo_inject::injection_text(&todo_store);
+                    wiring
+                        .append_message(Message {
+                            role: Role::Harness,
+                            content: vec![ContentBlock::Text { text }],
+                        })
+                        .await?;
+                    last_injected_rev = Some(todo_store.revision());
+                }
+
                 // 回合**前**记 HEAD。
                 //
                 // 取点用 `config.cwd`（回合真正的工作目录），**不用** `worktree.get()`：
@@ -791,22 +827,76 @@ pub async fn run(
                 )
                 .await?;
 
-                // **追问至多一次，由结构保证**：这里只有一个顺序 `if`，
-                // 没有计数器也没有循环 ⇒ 追问回合里即便又提交，也不可能触发第二次。
-                // 判据只看外部可观测事实（`git HEAD` 前后不等），与 ADR-0041
-                // 撤回的「模型自述完工」不是一回事。
+                // ── 跨回合推进（`docs/arch/cross-turn-advance/design.md` §5.8）──
                 //
-                // 开关关时 `workspace` 是 `None` ⇒ 不必再 spawn git（判据必为假）。
-                let head_after = crate::post_turn::git_head(workspace.as_deref());
-                if crate::post_turn::should_follow_up(
-                    &outcome,
-                    head_before.as_deref(),
-                    head_after,
-                    enabled,
-                ) {
-                    // 追问回合的 `TurnOutcome` **有意丢弃**：追问不再递归追问，
-                    // 至多一次由本 `if` 的结构保证。
-                    let _ = run_turn_chain(
+                // 跑完首个回合后进这个循环：每轮问一次「要不要再来一轮」，
+                // 判据由 [`crate::turn_advance::advance`] 给出。
+                //
+                // **一期的 git 追问行为原样保留**：没有清单时 `decide` 返回
+                // `Stop(NoPlan)`，`advance` 退回 `should_follow_up` 的等价判据
+                // （HEAD 前后不等 ∧ 开关开 ∧ 正常收场），结果与接线前完全一致。
+                //
+                // 每个追问回合**之前**重新注入清单（与首个回合同一个注入点）：
+                // 追问回合的模型必须看得见本回合结束时的清单状态。
+                let mut advance_state = crate::turn_advance::AdvanceState::new();
+                let mut last_outcome = outcome;
+                // 每个追问回合的**起点**：判官事实里的「耗时」指这一轮花了多久，
+                // 不是整个请求的总时长 —— 后者会把前几轮的成本算到后一轮头上。
+                let mut advance_turn_started = std::time::Instant::now();
+                loop {
+                    // ── 判官（二档判据）──
+                    //
+                    // 只在**本回合写过清单**时调用（判据在 `judge_failure_delta` 里）。
+                    // 调用失败 / 解析不可靠 ⇒ `judge_failures += 1`，可用结论 ⇒ 归零。
+                    let head_after = crate::post_turn::git_head(workspace.as_deref());
+                    let model = wiring.model_arc();
+                    let delta = crate::turn_advance::judge_failure_delta(
+                        model.as_deref(),
+                        wiring.session_messages(),
+                        &todo_store,
+                        head_before.as_deref(),
+                        &head_after,
+                        &last_outcome,
+                        Some(advance_turn_started.elapsed()),
+                    )
+                    .await;
+                    if delta == 0 {
+                        advance_state.judge_failures = 0;
+                    } else {
+                        advance_state.judge_failures =
+                            advance_state.judge_failures.saturating_add(delta);
+                    }
+
+                    let step = crate::turn_advance::advance(
+                        &todo_store,
+                        &mut advance_state,
+                        &last_outcome,
+                        enabled,
+                        head_before.as_deref(),
+                        head_after,
+                    );
+                    let crate::turn_advance::Advance::Push = step else {
+                        break;
+                    };
+
+                    // 追问回合**之前**再注入一次清单（与首个回合同一个注入点、同一判据）。
+                    if crate::todo_inject::should_inject(
+                        &todo_store,
+                        last_injected_rev,
+                        wiring.session_messages(),
+                    ) {
+                        let text = crate::todo_inject::injection_text(&todo_store);
+                        wiring
+                            .append_message(Message {
+                                role: Role::Harness,
+                                content: vec![ContentBlock::Text { text }],
+                            })
+                            .await?;
+                        last_injected_rev = Some(todo_store.revision());
+                    }
+
+                    advance_turn_started = std::time::Instant::now();
+                    last_outcome = run_turn_chain(
                         &mut agent,
                         &mut wiring,
                         &config,
@@ -826,6 +916,7 @@ pub async fn run(
                         None,
                     )
                     .await?;
+                    advance_state.used = advance_state.used.saturating_add(1);
                 }
             }
 
@@ -1056,6 +1147,9 @@ pub async fn run(
                 session_started = Instant::now();
                 // 换会话也换了文件 —— 刷新给 `main` 的退出提示快照。
                 session_path.record(wiring.session_path());
+                // 清单真值跟随会话文件：`/new` 后清单从空开始，旧会话的清单留在旧文件里。
+                // 只换内部路径，`todo` 工具持有的 `Arc` 不变 ⇒ 不需要重建工具表。
+                factory.todo().retarget(wiring.session_path());
                 // `/new` **切新 debug 文件**（旧文件自然结束），并开一个新的 run。
                 if let Some(sink) = debug.as_mut() {
                     if let Some(path) = sink.path_for_session(wiring.session_path()) {
@@ -1093,6 +1187,8 @@ pub async fn run(
                 session_started = Instant::now();
                 // 换会话也换了文件 —— 刷新给 `main` 的退出提示快照。
                 session_path.record(wiring.session_path());
+                // `/clear` 同理：清理后的会话清单从空开始。
+                factory.todo().retarget(wiring.session_path());
                 // 与 `/new` 一样切新 debug 文件（旧文件自然结束）并开一个新的 run。
                 if let Some(sink) = debug.as_mut() {
                     if let Some(path) = sink.path_for_session(wiring.session_path()) {
@@ -1228,6 +1324,8 @@ pub async fn run(
                     session_started = Instant::now();
                     // **I3：会话路径快照必须刷新** —— 否则退出提示仍指向旧会话。
                     session_path.record(wiring.session_path());
+                    // 清单真值跟随目标会话文件（`/resume` 把清单也一起恢复）。
+                    factory.todo().retarget(wiring.session_path());
                     // **工作区**：按目标 meta 记录重建 agent（工具表 + working_dir +
                     // system prompt 一起换），并刷新工作区句柄。四情形见 helper 文档。
                     if let Some(msg) = apply_resumed_workspace(
@@ -2621,6 +2719,7 @@ mod tests {
                 tmp.join("subagents"),
                 false,
             )),
+            ys_tools_todo::TodoStore::open(None),
         );
         // 共享工作区 = harness 临时目录（生产侧是进程启动目录）。
         let default_workspace = tmp.0.clone();

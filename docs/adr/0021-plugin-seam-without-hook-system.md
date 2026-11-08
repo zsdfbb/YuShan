@@ -1,6 +1,9 @@
 # 0021 — Plugin 缝开在装配层（`ToolPlugin`），不建 hook 系统、不引入 `details`
 
-给「第三方 crate 怎样加一个功能（如 todo 清单）」这条需求定下**缝的位置** —— ① **不建 hook 系统**（维持 ADR-0014；含 todo 在内七个用例**仍零个**需要 Hook）；② **不引入 `ToolResult.details`**（判据是「UI 需要但模型不需要」，todo 不满足，却要付 JSONL 契约的破坏性变更）；③ 新增 `ys-tool::ToolPlugin { order, tools, prompts }`，把「加一个工具」的 **6 处连锁点收敛为 1 处登记**，插件自带 snippet/guidelines；④ 显示走 **`CodingView` 产品字段**（先例：`skills`），**不做**通用渲染注册表；⑤ todo 状态 = **最后一次调用的 `arguments`**（照 Claude Code TodoWrite 的「每次传完整列表」语义）。前置条件是补一条 **prefix 指纹测试**（今天没有任何测试锁工具面前缀字节）。
+给「第三方 crate 怎样加一个功能（如 todo 清单）」这条需求定下**缝的位置** —— ① **不建 hook 系统**（维持 ADR-0014；含 todo 在内七个用例**仍零个**需要 Hook）；② **不引入 `ToolResult.details`**（判据是「UI 需要但模型不需要」，todo 不满足，却要付 JSONL 契约的破坏性变更）；③ 新增 `ys-tool::ToolPlugin { order, tools, prompts }`，把「加一个工具」的 **6 处连锁点收敛为 1 处登记**，插件自带 snippet/guidelines；④ 显示走 **`CodingView` 产品字段**（先例：`skills`），**不做**通用渲染注册表；⑤ ~~todo 状态 = **最后一次调用的 `arguments`**~~（**已被 ADR-0024 取代** —— todo 真值落 `<stem>.todo.json`）。前置条件是补一条 **prefix 指纹测试**。
+
+> **2026-11-06 状态**：①–④、⑥ **仍有效且尚未实现**（`grep ToolPlugin` = 0）；
+> ⑤ **已作废**。todo 的后续设计见 ADR-0024（清单层）与 ADR-0072（验收层）。
 
 ## Status
 
@@ -53,17 +56,21 @@ pub struct ToolPlugin {
 
 **代价如实记录**：第三方工具若要不塌成 transcript 一行，仍需有人给它加 `CodingView` 字段 + 写 `draw.rs`。在本仓，**显示是一等产品决策，不是插件的权利** —— 这与 pi 的哲学**恰好相反**，是有意的。
 
-### 5. todo 状态 = 最后一次调用的 `arguments`
+### 5. todo 状态模型 —— **已被 ADR-0024 取代**
 
-照 Claude Code `TodoWrite` 的「**每次调用传完整列表**」语义 ⇒ **最后一次调用的 `ToolUse.arguments.todos` 就是当前状态**。UI 侧 `latest_todos()` 反向扫 `session_messages()` 即得。
+真值已移出会话，落在 `<sessions_dir>/<stem>.todo.json`（`TodoStore` 为唯一真值），
+UI 侧改从 `TodoStore::snapshot()` 取，不再反向扫 `arguments`。
+完整的后续设计见 **ADR-0024**（清单层）与 **ADR-0072**（验收层）。
 
-零 `details`、零重放、零新事件、零核心改动。副产品：`/new` 换 `Wiring` ⇒ 列表自然归零；重启恢复会话 ⇒ 列表自然恢复。
+### 6. 前置条件：prefix 指纹测试 —— **已实现**
 
-### 6. 前置条件：prefix 指纹测试
+把 snippet/guidelines 表搬进 `ToolPlugin` 时，一处空格/一次 `trim` 都会改变所有用户的前缀 ⇒ 缓存全废 ⇒ 每轮多付 ~9,000 token，**而 832 条测试依然全绿**。
 
-**今天 `prompt.rs` 没有任何测试锁「9 工具产出的前缀总字节」**（现有守卫只锁形状与部分文案）。把 snippet/guidelines 表搬进 `ToolPlugin` 时，一处空格/一次 `trim` 都会改变所有用户的前缀 ⇒ 缓存全废 ⇒ 每轮多付 ~9,000 token，**而 832 条测试依然全绿**。
+故先钉字节锚点、再做搬家。这不是可选项。
 
-故 **P0 先钉 `sha256(tools_json)` + `sha256(system_prompt)` 双锚点，再做搬家**。这不是可选项。
+> ✅ **2026-11-06：已落地为 `toolset.rs:635` 的 `prefix_fingerprint_is_anchored_and_stable`**。
+> 实际形态与本 ADR 原写不同：用 **`fnv1a64`**（非 `sha256`，省 9 个依赖包）、
+> 且是**子/父双锚点**（`fp_tools` 11 元 + `fp_parent` 14 元）。详见 `design.md` §6 P0 的对照表。
 
 ## Considered Options
 
@@ -80,7 +87,12 @@ pub struct ToolPlugin {
 - **`design.md` §6 保持推迟状态**（`:291-293` 的状态注继续有效）。
 - **插件缝的上限被明确写死**：**「不改 `ys-*` 核心 crate，但改 `apps/coding-agent` 的 `Cargo.toml` + 一行登记」**。零改动装配需要运行期工具面 ⇒ 每轮 9,000 token —— 那是**产品决策**，不该由插件机制替用户做。这个边界写进文档，避免后人误以为「已经支持插件了」。
 - **加一个工具的连锁点从 6 处降到 1 处**，且 snippet/guidelines 不再散落在 `prompt.rs` 的两张手抄表里（`EXPECTED_ORDER` 与 `vec!` 的「改一处必须改两处」随之消失）。测试侧保留一份**独立硬编码**的名字序列，维持装配端/测试端两份真值的交叉校验。
-- **补记（2026-09-23，`/arch-validate` → `design.md` §5.2）**：决策 3 的 `ToolPlugin` / `ToolPrompt` 需要**两条独立的序** —— `ToolPlugin.order` 定**工具**序（`read, write, edit, …`），`ToolPrompt.order` 定 **guideline** 序（`edit, write, read, …`）。两者今天确实不同（`toolset.rs:40-50` vs `prompt.rs:143-189`）。并成一条 = 一次全局前缀漂移，会毁掉「P1 搬完家指纹测试仍绿」这个唯一机械证明。
+- **补记（2026-11-06 重写）**：决策 3 的 `ToolPlugin` / `ToolPrompt` 里，**guideline 的渲染序不能由插件序派生**。实测 `render_guidelines`（`prompt.rs:305-599`）是 **13 个门控块 + 3 条无条件**：
+  - **块序是全局量** —— `read` 的三块（`:357` / `:383` / `:394`）被 `grep` 的块（`:376`，嵌在 `:357` 的 `if` 体内）**插在中间**；
+  - **门控不都是单工具** —— `edit\|\|write`（`:328`）、`read/grep/find/ls`（`:357`）、`read\|\|grep`（`:394`）、narrate 块的 7 工具（`:426`）；
+  - **narrate 维度** —— `:298` 传 `true`（主 agent）、`:154` 传 `false`（探索子 agent），后者只删 `:426` 那一块。
+
+  ⇒ 每块必须自带 `GuidelineBlock { slot, gate, scope, lines }`（见 `design.md` §5.2）。任何「按工具 order 或插件 order 遍历、每插件吐出自己全部 guideline」的简化都会静默重排字节，毁掉「P1 搬完家指纹测试仍绿」这个唯一机械证明。
 - **`fixed_prompt_tokens` 账本自动正确** —— 插件只要走「工具 + snippet + guideline」这条既有通路，`main.rs` 的计算自动把它算进去。
 - **已知缺口（明确接受）**：todo 会被压缩摘要掉（与 `docs/design-final/skills.md` 的 R6 同型）；本轮不做「todo 免疫压缩」（那需要给 session 加保留标记，是新的核心契约）。
 - **本轮顺带订正两处既有失真**（与本决策正交，建议单独修）：

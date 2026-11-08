@@ -17,9 +17,9 @@
 | **D1** | **真值搬出会话**：`<sessions_dir>/<stem>.todo.json` | 推翻 ADR-0021 决策 5（真值 = 最后一次调用的 `arguments`）。会话同级、同 stem ⇒ 复用 `latest_session_path()` 的重启恢复，**零新目录、零新环境变量** |
 | **D2** | **注入 = 回合边界一条 `Role::User` 消息，进 `messages` 尾部** | 内容是**会变**的 ⇒ 尾部注入是其唯一正当形态（ADR-0021 决策 1 / `prompt-delivery/notes.md:50-56`）。**绝不改 `system`** |
 | **D3** | **注入判据 = `状态变了 ∨ 会话里找不到标记`**（纯函数） | 前者堵住「上下文堆 N 份矛盾副本」；后者是**自愈**：压缩把块吃掉后自动补回，**不需要**监听 `ContextCompacted` 事件 |
-| **D4** | **推进 = follow-up 纯函数判据「有未完成项」** + **五道护栏** | 替换 `design-plans/2026-09-15-follow-up.md` 的 git HEAD 判据。**不需要开关** —— 开关就是「有没有计划」 |
+| **D4** | **推进 = follow-up 纯函数判据「有未完成项」** + **五道护栏** | 与一期已上线的 git HEAD 判据（`post_turn.rs:66`）**并存**，同一循环两个判据。**不需要开关** —— 开关就是「有没有计划」 |
 | **D5** | **加终止态 `Cancelled`；删除判据 = 「无 open 项」而非「全部 Completed」** | 后者会让「放弃某项」永远卡住 ⇒ 永不删除。执行者是**代码**（`save` 收口），不是模型自觉 |
-| **D6** | **`todo` 与 `subagent` 都排工具表末两位** | 子表 = 父表 − 这两项，**必须仍是父表的字节前缀**（ADR-0022 D3 的缓存理由）。需求「只有主 agent 有 todo」由此**结构保证**，零运行时检查 |
+| **D6** | **`todo` 排父表追加段末位** | 子表 = `build_tools()` 的 11 元基础表；父表 = 子表 + `bash_bg` / `subagent_async` / `subagent_send` / **`todo`**。**必须仍是父表的字节前缀**（ADR-0022 D3 的缓存理由）。需求「只有主 agent 有 todo」由此**结构保证**，零运行时检查 |
 | **D7** | **不引 hook / 不引依赖图 / 不引共享列表 / 不引 trait 列表** | 四条都是零消费者抽象。判断链走下来：写计划 = **Tool**、推动 = **Follow-up**，两个机制，**不需要第三个** |
 
 **一句话**：不改机制，只加**一份外部状态** + **两个纯函数**（一个决定注入、一个决定续跑）。
@@ -125,7 +125,7 @@
 | 2 | 注入 = **`messages` 尾部一条合成消息**，回合边界，**不碰 `system`** |
 | 3 | 加终止态 **`Cancelled`** |
 | 4 | 删除判据 = **「无 open 项」**，不是「全部 Completed」 |
-| 5 | follow-up 判据 = **「有未完成项」**（替换 git HEAD） |
+| 5 | follow-up 判据 = **「有未完成项」**（与 git HEAD 判据**并存**，各管一种触发源） |
 | 6 | `todo` 与 `subagent` **都排末位**（字节前缀） |
 | 7 | **不做**依赖图 / 不做共享列表 / 不做 ownership |
 | 8 | 压缩问题用**「真值在外」**解决，而不是让计划免疫压缩 |
@@ -199,14 +199,14 @@
 | **甲** | 注入判据 `状态变 ∨ 标记丢失`（纯函数、自愈、**无事件依赖**、最省）；`Arc` 持有而非三跳注入 |
 | **丙** | 工具落点 = **adapter crate**；**防逃逸**（拒绝丢弃非终态项）；`StopCause` 显式枚举 |
 | **乙** | **停滞护栏**（「零进展」⇒ 停）—— 这是甲缺的、也是真正的防套娃 |
-| 三家共有 | 外部文件真值、回合边界尾部注入、`Cancelled`、「无 open 项」删除判据、「有未完成项」推进判据、末两位顺序 |
+| 三家共有 | 外部文件真值、回合边界尾部注入、`Cancelled`、「无 open 项」删除判据、「有未完成项」推进判据、父表追加段末位 |
 
 ### 7.1 模块划分与职责
 
 | 模块 | 归属 | 职责 | 改动 |
 |---|---|---|---|
 | `adapters/tools-todo/` | **新 crate** | `TodoItem` / `TodoStatus` / `TodoStore`（唯一真值 + 落盘 + 归一化）+ `render_block()`（纯函数，字节稳定）+ `TodoTool` | 新增 ~420 行 + ~120 测试 |
-| `toolset` | `apps/coding-agent` | `EXPECTED_ORDER` 与 `vec!` 加 `todo`（**末两位之倒数第二**）；`build_tools` 多一个 `Arc<TodoStore>` 参数；3 处 `assert_eq!(len, 9)` 改 10 | 改 ~20 行 |
+| `assembly` | `apps/coding-agent` | 父表追加段加 `todo`（**末位**）；`build_tools` **不变**（子表无 `todo`）；父表 `assert_eq!(len, 15)` | 改 ~10 行 |
 | `prompt` | `apps/coding-agent` | `tool_snippet("todo")` + **门控**的 guideline（`if tools.contains(&"todo")`）⇒ 子 agent 的提示词里两样都没有 | 改 ~14 行 |
 | `follow_up` | `apps/coding-agent` | `decide()` 纯函数（返回 `StopCause`）+ 五道护栏 + 追问提示词渲染 | 新增 ~150 行 |
 | `app_loop` | `apps/coding-agent` | `Prompt` 臂包 follow-up 循环；回合边界注入；`NewSession` 臂 retarget store；**用户输入抢占** | 改 ~70 行 |
@@ -377,14 +377,22 @@ Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上�
 
 ## 8. 分阶段落地
 
-按 `context.md` §8.5 已定顺序，**本设计插在 subagent 之后**：
+> ⚠️ **2026-11-06：阶段编号已重编。** 本文原用 P0–P3，但 `hooks-and-plugins/design.md` 也用 P0–P3
+> 而**指的是不同东西**（那里 P2 = todo，这里 P2 = subagent）。为避免误读，
+> **实现波次统一以 [`exec-plans/2026-11-06-toolplugin-todo-verification.md`](../../exec-plans/2026-11-06-toolplugin-todo-verification.md)
+> 的 W0–W9 为准**。下表保留 P 编号仅作历史对照。
 
-| 阶段 | 内容 | 验收锚点（机械的） |
-|---|---|---|
-| **P0** | `sha256(tools_json)` + `sha256(system_prompt)` 双锚点 | 搬任何东西前后指纹不变 |
-| **P1** | `ToolPlugin` 装配缝（零行为变化） | **指纹保持绿** = 搬家忠实的证明 |
-| **P2** | `subagent`（第 10 个工具，`prompt.rs:107` 条件式派生） | 重新锚定，漂移**显式** |
-| **P3（本设计）** | `todo`（第 11 个）+ store + 注入 + follow-up 闭环 | 见下 |
+**代码实际状态（2026-11-06 核实）**：P0 **已完成**（`toolset.rs:635` `prefix_fingerprint_is_anchored_and_stable`，
+用 `fnv1a64` 而非 `sha256`，且是子/父双锚点）；P2（subagent）**已完成**（`assembly.rs:218-219`，父表 14 元）；
+**P1（装配缝）与 P3（本设计）均未实现**（`grep ToolPlugin` = 0、`todo.json` = 0）。
+
+| 阶段 | 内容 | 代码状态 | 对应波次 |
+|---|---|---|---|
+| **P0** | prefix 指纹测试（子/父双锚点） | ✅ **已实现** | — |
+| **P1** | `ToolPlugin` 装配缝（零行为变化） | ❌ 未实现 | **W1–W3** |
+| **P2** | `subagent`（父表第 12–14 元） | ✅ **已实现** | — |
+| **P3（本设计）** | `todo` + store + 注入 + 推进闭环 | ❌ 未实现 | **W4–W6** |
+| — | 验收层（ADR-0072） | ❌ 未实现 | **W7–W8** |
 
 **本设计新增的四类锚点**（§8.5 已指出 P0 的字节指纹**盖不住前两类**）：
 
@@ -393,7 +401,7 @@ Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上�
 3. **控制流类**（变异测试）：删掉停滞护栏 ⇒ 「原地打转」用例必须变红；删掉计数上限 ⇒ 「无限套娃」必须变红；`Cancelled` 时不追问。
 4. **状态机类**：全部终态 ⇒ 落盘空表 + 删文件；拒绝丢弃非终态项；`/new` ⇒ 新文件且计划为空；重启 ⇒ 计划随会话恢复。
 
-**⚠️ 既有测试的回归风险**（必须盯）：`app_loop.rs:854` 的 `every_request_variant_is_handled` 与 `basic.rs` Step 4b 的用例都依赖「`MockModel` 响应队列不被意外消费」。本设计给 `Prompt` 臂包 `while`、并在回合前 `load()` store —— **两者都不调模型**，且测试里计划为空（`MemoryTodoStore`）⇒ 不注入、不追问、包循环只跑一次 ⇒ **逐字节不变**。
+**⚠️ 既有测试的回归风险**（必须盯）：`app_loop.rs:854` 的 `every_request_variant_is_handled` 与 `basic.rs` Step 4b 的用例都依赖「`MockModel` 响应队列不被意外消费」。本设计给 `Prompt` 臂包 `while`、并在回合前 `load()` store —— **两者都不调模型**，且测试里计划为空（`TodoStore::open(None)`，纯内存）⇒ 不注入、不追问、包循环只跑一次 ⇒ **逐字节不变**。
 
 > **甲提了一个替代顺序**（`P0 → todo → P1 → subagent`）：理由是 todo 的消费者今天是刚需，而 P1 是重构、晚做不产生错误。
 > **不采纳，但记账**：§8.5 的理由（P1 在加工具之前做完，`指纹保持绿` 才是可用的验收信号）更强；且 P1 先做能让 todo 的加入从「6 处手工」变成「1 行」。甲的担心（P1 的消费者是纸上的）**是对的**，但那影响的是**要不要做 P1**，不是**它的顺序**。
@@ -404,7 +412,7 @@ Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上�
 
 | # | 退化 / 风险 | 量化 / 缓解 |
 |---|---|---|
-| 1 | **`-p` / `--json` 拿不到闭环** | 这两个入口**根本不走 `app_loop`**（`main.rs:488 run_single_turn` 直调 `agent.run_turn`），且消费循环以**终局事件**为终止条件 ⇒ 多回合会让消费提前收尾。`MemoryTodoStore` 保证不写盘。**脚本化长任务仍会烂尾** —— 本设计最大的功能缺口 |
+| 1 | **`-p` / `--json` 拿不到闭环** | 这两个入口**根本不走 `app_loop`**（`main.rs:2059 run_single_turn` 直调 `agent.run_turn`），且消费循环以**终局事件**为终止条件 ⇒ 多回合会让消费提前收尾。`TodoStore::open(None)`（纯内存）保证不写盘。⚠️ **本缺口已移交三期（ADR-0072 / `cross-turn-advance/design.md` §5.9）** —— 那里在 `run_single_turn` 外建循环，同时修掉一期只在 TUI 生效的问题（ADR-0041 的硬要求）。本设计**不单独修它** |
 | 2 | **子 agent 无计划、也看不到父的计划** | Q5′ 的直接后果。派发的子任务必须自包含；子 agent 撞 `max_rounds` 后**无法续** |
 | 3 | **注入副本累积** | 每次状态变追加一份，长任务 ~10–20 份 × 190 token ≈ 3k，旧副本与新副本可能矛盾。缓解：块带 `revision` + 前言行写明「以 revision 最大的一份为准」；**不删旧块**（删了会废掉删除点之后的缓存） |
 | 4 | **长回合内新鲜度不足** | 一个 R=10 的回合里，计划若在第 1 轮后变了，模型最多 9 轮看到旧 revision。**逃生门**：轮级注入经 `Boundary::Steer`（`push(&self)`，`boundary.rs:74`）⇒ **零 `BasicLoop` 改动**即可拿到轮级粒度，价钱 ×R。⚠️ 但 `Steer` **会 emit `UserMessage`**（`basic.rs:222`）⇒ 块会显示成用户消息。**默认关**，触发条件：实测出现「长回合里明显丢失计划」 |
@@ -431,7 +439,7 @@ Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上�
 | **ADR-0021 决策 3 / 4**（`ToolPlugin`；显示走 `CodingView`） | **遵守** | 侧栏 = `CodingView.todos`；工具放 adapter crate ⇒ **今天就是**插件缝要的形态 |
 | **ADR-0022 D3**（子表 = 父表 − 派发工具） | **扩展为** − {`subagent`, `todo`} | 增加「被摘的必须都在**后缀**」+ 字节前缀测试 |
 | **ADR-0022 D17**（并行派发） | **不冲突** | 子表无 `todo` ⇒ 无并发写。**写下**：将来若给子表加回 `todo`，会**同时**打破字节前缀与单写者两个不变量 |
-| **`design-plans/2026-09-15-follow-up.md`** | **判据替换、seam 复用** | HEAD 对比整体不再使用；`while let Some(msg) = pending.take()` 循环正是本设计的落点，将来 commit-doc 追问只是**同一循环里的第二个判据**（加法） |
+| **`design-plans/2026-09-15-follow-up.md`** | **新增判据、seam 复用** | 一期 HEAD 判据已上线并保留（`post_turn.rs:66`，`follow_up_on_commit` 开关）；本设计只是**同一 `while let Some(msg) = pending.take()` 循环里的第二个判据**（加法） |
 | **`design-plans` §3.3 护栏上限默认 1** | 改为 **8** + 停滞护栏 + 抢占 | 上限 1 对长程显然太小 |
 | **动 `BasicLoop`** | **零** | 开新路记账：本设计全部新机制在 `apps/coding-agent` + 一个新 adapter crate |
 

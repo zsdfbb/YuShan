@@ -1,6 +1,6 @@
 # 0024 — 长程闭环：todo 真值落外部文件、回合边界注入、follow-up 按「有未完成项」推进
 
-给「长程任务的成功率与闭环」定下**状态、可见性、推进**三件事的落点：① **todo 真值搬出会话**，落在会话同级的 `<stem>.todo.json`（**supersede 0021 决策 5**，并**推翻** 0021 的「否决落盘持久化 todo」）；② 可见性靠 **`app_loop` 在回合边界追加一条 `Role::User` 消息到 `messages` 尾部**，判据是「**状态变了 ∨ 会话里找不到标记**」—— 绝不改 `system`；③ 推进靠 **follow-up 的纯函数判据「有未完成项」**（替换 HEAD 对比），配**五道护栏**。新增终止态 **`Cancelled`**，「全部完成后删除」的判据是「**无 open 项**」而非「全部 Completed」。`todo` 与 `subagent` **都排工具表末两位**（子表须仍是父表的字节前缀）。**零核心 crate 改动、零改 `BasicLoop`。**
+给「长程任务的成功率与闭环」定下**状态、可见性、推进**三件事的落点：① **todo 真值搬出会话**，落在会话同级的 `<stem>.todo.json`（**supersede 0021 决策 5**，并**推翻** 0021 的「否决落盘持久化 todo」）；② 可见性靠 **`app_loop` 在回合边界追加一条 `Role::User` 消息到 `messages` 尾部**，判据是「**状态变了 ∨ 会话里找不到标记**」—— 绝不改 `system`；③ 推进靠 **follow-up 的纯函数判据「有未完成项」**（与一期已上线的 HEAD 判据**并存**，同一循环两个判据），配**五道护栏**。新增终止态 **`Cancelled`**，「全部完成后删除」的判据是「**无 open 项**」而非「全部 Completed」。`todo` **排父表追加段末位**（子表须仍是父表的字节前缀）。**零核心 crate 改动、零改 `BasicLoop`。**
 
 ## Status
 
@@ -32,7 +32,16 @@ accepted（2026-09-23）
 
 ### 3. 推进：follow-up 判据换成「有未完成项」，五道护栏
 
-- **判据**：`store.has_open_items()`。替换 [`design-plans/2026-09-15-follow-up.md`](../design-plans/2026-09-15-follow-up.md) §3.2 的 git HEAD 对比 —— 后者是为「commit 后同步文档」设的，与 todo 无关，且需要 fork。**seam 复用**：该文件的 `while let Some(msg) = pending.take()` 循环正是本设计的落点；将来 commit-doc 追问只是**同一循环里的第二个判据**（加法）。
+- **判据**：`store.has_open_items()`。它**取代** [`design-plans/2026-09-15-follow-up.md`](../design-plans/2026-09-15-follow-up.md) §3.2 的 git HEAD 对比作为**todo 的推进判据** —— 后者是为「commit 后同步文档」设的，与 todo 无关。
+
+  ⚠️ **与已上线的一期是并存，不是替换**：一期的 HEAD 判据已实现并生效（`apps/coding-agent/src/post_turn.rs:66` 的 `should_follow_up`，`app_loop.rs:801` 调用，受 `follow_up_on_commit` 开关控制）。本 ADR 的 `has_open_items()` 是**同一循环里的第二个判据**，两者各管一种触发源：
+
+  | 判据 | 触发源 | 开关 |
+  |---|---|---|
+  | `should_follow_up`（HEAD 不等） | commit 后同步文档 | `follow_up_on_commit`（默认关） |
+  | `has_open_items()`（有未完成项） | 用户自己的计划 | **无开关**（计划的有无就是开关） |
+
+  **seam 复用**：两者共用 `while let Some(msg) = pending.take()` 这条循环，各贡献一个 `Option<Message>`。
 - **五道护栏**，缺一不可：
   1. **计数上限**（`MAX_FOLLOW_UPS = 8`，替换原默认 1）—— 防「跑太久」；
   2. **停滞护栏**（本轮 `revision` 未变 **且** 模型自称收尾 ⇒ 停）—— 防「**原地打转**」。这是**真正的防套娃**：上限只防量，它防质；
@@ -49,10 +58,13 @@ accepted（2026-09-23）
 - **回喂显式**：工具结果里明说「计划已完成并清空」，否则模型会困惑于「我的列表去哪了」。
 - **诚实的天花板**：todo 是模型的**自陈**，不是**验收**。本 ADR 只能强制「再问一次」，不能强制「真的做完」—— 模型可以把全部项标成 `completed` 然后收工，代码照约删除。**真正的保证来自可验证的验收**（测试绿、构建过），不来自清单。
 
-### 5. `todo` 与 `subagent` 都排工具表末两位；子表须仍是父表的**字节前缀**
+### 5. `todo` 排**父表追加段末位**；子表须仍是父表的**字节前缀**
 
-- **扩展 0022 D3**（原：子表 = 父表 − 派发工具）为 **− {`subagent`, `todo`}**，并加一条更强的硬规则：**被摘的两项必须都在后缀区**，否则子 `tools` JSON 不再是父的**字节前缀**，0022 D3 的缓存理由（每次派发省 ~1.6k + 其后 system 命中）失效。
-- 顺序定为 `…, webfetch, todo, subagent`：`subagent` 保持末位可让 0022 D18/§6 的措辞继续成立，`todo` 插在它之前 ⇒ **改动面最小**。
+- **扩展 0022 D3**（原：子表 = 父表 − 派发工具）为 **− {`subagent_async`, `subagent_send`, `todo`}**，并加一条更强的硬规则：**被摘的项必须都在后缀区**，否则子 `tools` JSON 不再是父的**字节前缀**，0022 D3 的缓存理由（每次派发省 ~1.6k + 其后 system 命中）失效。
+- **实际顺序**：`… webfetch, bash_bg, subagent_async, subagent_send, todo`。
+  子表 = `build_tools()` 的 11 元基础表（`assembly.rs:149-150`）；父表在它之后追加四项（`assembly.rs:199-219`）。
+  ⚠️ **`todo` 只能进父表追加段**，不能进基础表 —— 否则子 agent 也会有 `todo`，违反决策 e。
+  代价：`subagent_send` 让出末位（0022 D18/§6 的措辞需相应更新）。
 - **「只有主 agent 有 todo」由结构保证，零运行时检查**：子 registry 里没有 `todo` ⇒ `registry.get("todo")` 返回 `None` ⇒ 走既有的「tool not found」分支。提示词层同步门控（`if tools.contains(&"todo")`）⇒ 子 agent 的 system prompt 里**既无清单行、也无纪律句**（0022 D15 的「one visibility」：看不见 + 执行拒绝）。
 - **`todo` 永不声明 `is_concurrency_safe()`**（默认 `false`）⇒ 0022 D17 的条件并行路径永远不会并发两个 `todo` 调用。这是「共享状态 + 并行」的唯一防线。
 - **将来若给子表加回 `todo`（共享列表）**：会**同时**打破字节前缀与单写者两个不变量 ⇒ 那时本节结论要**重算**，且需引入锁/仲裁/冲突合并。
@@ -81,7 +93,7 @@ accepted（2026-09-23）
 
 - **`apps/coding-agent` 的 `wiring` / `app_loop` 各增一份生命周期责任**：`Wiring` 持 `Arc<TodoStore>` 并在 `/new` 时 retarget（同一 `Arc`，身份不变）；`app_loop` 多一层 `while` 循环与一次回合边界注入。
 - **`build_tools(workspace, web)` 签名多一个 `Arc<TodoStore>` 参数**（app 内部函数）。
-- **`EXPECTED_ORDER` 从 9 项变 10 项（todo）→ 11 项（subagent）**，并新增一条注释把「末两位都必须可摘」写成不变量。
+- **`EXPECTED_ORDER` 不变（11 项，全是基础表）**，`todo` 不进它 —— 它描述的是**子表**。父表的顺序由 `assembly.rs` 的追加段决定，已由 `fp_parent` 钉住。
 - **`prompt.rs` 的 `tool_snippet` / `tool_guidelines` 各加一支**（门控），且有既有测试 `every_real_toolset_tool_has_non_fallback_snippet` 强制这一点。
 - **`-p` / `--json` 无闭环**（不走 `app_loop`）—— 明确接受的功能退化，也是本设计最大的缺口。
 - **`/export` 不带走活计划**（导出的仍是对话），但**注入过的快照会跟着走**（它们本就是普通消息）。

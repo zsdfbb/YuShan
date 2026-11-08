@@ -135,9 +135,9 @@ static COMMANDS: [CommandSpec; 18] = [
     },
     CommandSpec {
         name: "loop",
-        // 「仅 git 仓库生效」必须写在说明里：判据是 `git HEAD` 变化，非 git
-        // 工作区下 `/loop` 会被拒绝登记（不然状态行会显示一个永不会触发的循环）。
-        description: "定时唤醒（仅 git 仓库；靠 HEAD 变化判断）",
+        // 描述只讲「它做什么」：到点起一个回合。不提判据 —— 判据属于实现细节，
+        // 用户在 `/help` 里要的是「这条命令干什么、会看到什么」。
+        description: "定时唤醒：按间隔起一个回合",
         arg_hint: Some("<间隔> <提示词> | off"),
     },
     CommandSpec {

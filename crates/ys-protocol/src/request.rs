@@ -95,7 +95,7 @@ pub enum Request {
     ListSessions,
     /// 恢复既有会话。`target` 交给 app 侧 `sessions::resolve` 解析（id 或路径）。
     ResumeSession { target: String },
-    /// 设一个定时循环：每 `interval_secs` 秒醒来一次，有活就起一个回合。
+    /// 设一个定时循环：每 `interval_secs` 秒起**一个**回合。
     ///
     /// **单条语义**：一个 session 只能有一个循环，再敲一次即**覆盖**（不叠加、
     /// 不报错）。多条排序要处理「同时到点怎么办」，需求比看上去少。

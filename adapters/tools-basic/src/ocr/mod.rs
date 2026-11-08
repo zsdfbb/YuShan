@@ -33,14 +33,14 @@ pub mod tsv;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use ys_core::ToolResult;
 use ys_tool::{Tool, ToolContext, ToolError, ToolSpec};
 
 use self::engine::{Kind, OcrEngine, Spill};
 use self::tsv::{FilterStats, Granularity, Header};
-use crate::exec::{run_bounded, Bounded, Stop};
-use ys_tool::{head, Truncation, MAX_BYTES, MAX_LINES, SOFT_RESULT_BYTES};
+use crate::exec::{Bounded, Stop, run_bounded};
+use ys_tool::{MAX_BYTES, MAX_LINES, SOFT_RESULT_BYTES, Truncation, head};
 
 /// `lang` 的默认值（design §2.4：7 图逐图 CER 实测，`chi_sim+eng` 7/7 不劣于 `eng`）。
 const DEFAULT_LANG: &str = "chi_sim+eng";

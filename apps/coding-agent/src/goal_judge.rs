@@ -27,7 +27,6 @@
 //! 靠判官自己引用自己而通关 —— 本模块的引用校验正是为了堵住这条路。
 //! 本模块对被给到的 `evidence` 只做归一化与子串匹配，不区分来源。
 
-
 use ys_tools_todo::TodoItem;
 
 /// 引用长度的下限（字符数，按 `char` 计）。
@@ -312,7 +311,8 @@ Finished dev profile in 3.42s";
 
     /// 三条件齐全：`VERDICT: MET` + 逐条 `OK` + 引用逐字命中 ⇒ `Met`。
     #[test]
-    fn met_with_hitting_quotes() {        let raw = "\
+    fn met_with_hitting_quotes() {
+        let raw = "\
 VERDICT: MET
 ITEMS:
 - 跑通全量测试 | OK | test result: ok. 41 passed; 0 failed; 0 ignored
@@ -375,8 +375,14 @@ EVIDENCE: \"test result: ok. 999 passed; 0 failed\"";
     #[test]
     fn missing_verdict_marker_is_unparseable() {
         let raw = "看起来差不多了，我认为可以收工。";
-        assert_eq!(parse_judge_output(raw, EVIDENCE, &[]), JudgeParse::Unparseable);
-        assert_eq!(parse_judge_output("", EVIDENCE, &[]), JudgeParse::Unparseable);
+        assert_eq!(
+            parse_judge_output(raw, EVIDENCE, &[]),
+            JudgeParse::Unparseable
+        );
+        assert_eq!(
+            parse_judge_output("", EVIDENCE, &[]),
+            JudgeParse::Unparseable
+        );
     }
 
     /// `MET` 只做**整词**比较：`METRICALLY` / `MET.` 都不得被读成 `MET`。
@@ -389,9 +395,7 @@ EVIDENCE: \"test result: ok. 999 passed; 0 failed\"";
         // 不带证据的用例区分不了「值没认出来」与「认出来了但没凭据」—— 两者都是
         // `Unparseable`，前缀匹配的变异会因此蒙混过关。
         let raw_with_evidence = |verdict: &str| {
-            format!(
-                "VERDICT: {verdict}\nITEMS:\n- 跑通测试 | OK | Finished dev profile in 3.42s"
-            )
+            format!("VERDICT: {verdict}\nITEMS:\n- 跑通测试 | OK | Finished dev profile in 3.42s")
         };
 
         for verdict in ["METRICALLY", "MET.", "META"] {
@@ -406,7 +410,10 @@ EVIDENCE: \"test result: ok. 999 passed; 0 failed\"";
         // 对照：同一份证据 + 合法值 ⇒ 必须放行。证明上面那三条失败**只**因为值不合法。
         let ok = raw_with_evidence("MET");
         assert!(
-            matches!(parse_judge_output(&ok, EVIDENCE, &[]), JudgeParse::Met { .. }),
+            matches!(
+                parse_judge_output(&ok, EVIDENCE, &[]),
+                JudgeParse::Met { .. }
+            ),
             "对照组：合法值与同一份证据必须放行"
         );
     }
@@ -478,7 +485,10 @@ ITEMS:
     #[test]
     fn too_short_quote_is_unparseable() {
         let raw = "VERDICT: MET\nITEMS:\n- 跑通测试 | OK | ok. 41";
-        assert_eq!(parse_judge_output(raw, EVIDENCE, &[]), JudgeParse::Unparseable);
+        assert_eq!(
+            parse_judge_output(raw, EVIDENCE, &[]),
+            JudgeParse::Unparseable
+        );
     }
 
     /// 引用的空白与证据不同（换行 / 多空格）⇒ 归一化后仍命中 ⇒ `Met`。
@@ -488,7 +498,10 @@ ITEMS:
     fn quote_matching_ignores_whitespace() {
         let raw = "VERDICT: MET\nITEMS:\n- 跑通测试 | OK | test result: ok.   41 passed;\n0 failed; 0 ignored";
         assert!(
-            matches!(parse_judge_output(raw, EVIDENCE, &[]), JudgeParse::Met { .. }),
+            matches!(
+                parse_judge_output(raw, EVIDENCE, &[]),
+                JudgeParse::Met { .. }
+            ),
             "空白差异不该让逐字引用失配"
         );
     }

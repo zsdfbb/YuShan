@@ -20,7 +20,6 @@
 //! 判官输入因此是 **O(1)**，与总轮数无关。代价是跨轮证据不可见 —— 判官只能核对
 //! 本轮可验的项，这是设计接受的取舍（§5.5）。
 
-
 use std::sync::Arc;
 
 use ys_core::{ContentBlock, Message, Role, ThinkingOverride};
@@ -116,7 +115,10 @@ pub(crate) fn evidence_window(messages: &[Message]) -> String {
             name, arguments, ..
         } = block
         {
-            out.push_str(&format!("[tool_call] {name} {}\n", render_arguments(arguments)));
+            out.push_str(&format!(
+                "[tool_call] {name} {}\n",
+                render_arguments(arguments)
+            ));
         }
     }
     // 只扫**最后一条 ToolUse 消息之后**的块：更早的轮次不属于本窗口。
@@ -299,11 +301,11 @@ mod tests {
             !window.contains("我已全部完成"),
             "助手正文不得进证据窗口（ADR-0072 D4）：{window}"
         );
-        assert!(window.contains("cargo test"), "工具调用应在窗口里：{window}");
         assert!(
-            window.contains("12 passed"),
-            "工具输出应在窗口里：{window}"
+            window.contains("cargo test"),
+            "工具调用应在窗口里：{window}"
         );
+        assert!(window.contains("12 passed"), "工具输出应在窗口里：{window}");
     }
 
     /// 只取**最后一轮**：更早轮次的调用与输出都不进窗口。
@@ -328,7 +330,10 @@ mod tests {
             !window.contains("echo first"),
             "上一轮的调用不属于本窗口：{window}"
         );
-        assert!(window.contains("cargo test"), "本轮调用应在窗口里：{window}");
+        assert!(
+            window.contains("cargo test"),
+            "本轮调用应在窗口里：{window}"
+        );
         assert!(
             window.contains("last-round-output"),
             "本轮输出应在窗口里：{window}"
@@ -363,7 +368,8 @@ mod tests {
             body.len()
         );
         assert!(
-            body.chars().all(|c| c == '测' || c == '试' || c == '输' || c == '出'),
+            body.chars()
+                .all(|c| c == '测' || c == '试' || c == '输' || c == '出'),
             "截断不得切坏多字节字符：{body}"
         );
     }

@@ -1435,7 +1435,10 @@ mod tests {
         drop(snapshot);
 
         // 快照已释放 ⇒ append 应原地修改
-        session.append(text_msg(Role::Assistant, "second")).await.unwrap();
+        session
+            .append(text_msg(Role::Assistant, "second"))
+            .await
+            .unwrap();
         let after = session.shared_messages();
         assert_eq!(after.len(), 2, "两条消息都在");
         assert_eq!(

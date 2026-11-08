@@ -347,9 +347,10 @@ mod tests {
         assert_eq!(stem, "shot");
         let hash = rest.strip_suffix(SUFFIX).expect("必有扩展名");
         assert_eq!(hash.len(), HASH_HEX_LEN);
-        assert!(hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert!(
+            hash.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
     }
 
     #[test]

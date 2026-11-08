@@ -1,6 +1,5 @@
 use ys_core::{EventError, Message};
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("event sink error: {0}")]

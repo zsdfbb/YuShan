@@ -134,7 +134,10 @@ pub(crate) fn harness_facts(
         _ => "git_head: unavailable".to_string(),
     };
     let (rounds, stop) = match outcome {
-        Ok(result) => (result.rounds.to_string(), format!("{:?}", result.stop_reason)),
+        Ok(result) => (
+            result.rounds.to_string(),
+            format!("{:?}", result.stop_reason),
+        ),
         Err(_) => ("?".to_string(), "Failed".to_string()),
     };
     // 耗时与工具调用数都是 **harness 观测到的事实**（不是模型自述）：
@@ -370,11 +373,7 @@ mod tests {
             Some("a"),
             Some("c".into()),
         );
-        assert_eq!(
-            second,
-            Advance::Stop(StopCause::NoPlan),
-            "一期追问至多一次"
-        );
+        assert_eq!(second, Advance::Stop(StopCause::NoPlan), "一期追问至多一次");
     }
 
     /// 用户取消永远赢：清单还有 open 项也不续跑。
@@ -420,14 +419,7 @@ mod tests {
     /// 耗时未知时写 `unavailable` 而不是 `0ms`：后者是假事实，会让判官以为「瞬间完成」。
     #[test]
     fn harness_facts_never_fabricate_elapsed() {
-        let facts = harness_facts(
-            None,
-            &None,
-            &ok_result(StopReason::Completed),
-            0,
-            None,
-            0,
-        );
+        let facts = harness_facts(None, &None, &ok_result(StopReason::Completed), 0, None, 0);
         assert!(facts.contains("elapsed: unavailable"), "{facts}");
         assert!(!facts.contains("elapsed: 0ms"), "不得编造零耗时：{facts}");
         assert!(facts.contains("git_head: unavailable"), "{facts}");

@@ -26,7 +26,6 @@
 //! 命令时输出带不同耗时（`3 failed (2.1s)` / `(2.3s)`）⇒ 哈希输出会漏检，而清单是
 //! 离散集合，不受日志噪声影响。
 
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 

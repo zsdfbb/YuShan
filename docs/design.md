@@ -297,8 +297,9 @@ Loop：按什么规则推进
 
 > **状态（2026-10-22 更新）**：Hook 系统**有意推迟** —— 见 [ADR-0014](adr/0014-follow-up-without-hook-system.md)。
 > `app_loop` 层的 **follow-up（追问）**（设计见 `docs/design-plans/2026-09-15-follow-up.md`）
-> **代码尚未落地**（全仓 grep `follow_up` / `FollowUp` = 0）⇒
-> 本节规范保持有效，待第二个真实消费者出现再落地。
+> **已落地**：一期判据在 `apps/coding-agent/src/post_turn.rs:66`（`should_follow_up`），
+> 三期清单 + 证据验收在 `apps/coding-agent/src/turn_advance.rs:59`（`advance`），两条入口共用。
+> 本节规范（Hook 系统）仍保持有效，待第二个真实消费者出现再落地。
 > **其协议格（跨回合投递队列）已由 [ADR-0047](adr/0047-input-delivery-target-and-queue.md) 备好**
 > —— `Delivery{origin: System}`，队列住在 app 侧且跨回合存活。
 
@@ -385,6 +386,8 @@ agent/
 │   ├── model-openai-compatible/
 │   ├── model-deepseek/
 │   ├── tools-basic/
+│   ├── tools-todo/           # 计划清单：TodoStore + todo 工具（ADR-0024）
+│   ├── tools-web/            # 联网工具（ADR-0016）
 │   └── session-jsonl/
 └── apps/
     └── coding-agent/
@@ -423,7 +426,7 @@ flowchart TB
 | --- | --- |
 | Model、Tool、Session 接口 | Coding Prompt 和默认配置 |
 | BasicLoop、Event、Hook | 项目上下文发现 |
-| Registry 和插件加载 | 10 个默认工具（见下「默认工具」） |
+| Registry 和插件加载 | 15 个工具（父表；基础 11 元 + 追加段，见下「默认工具」） |
 | 通用消息和运行状态 | CLI、TUI 和 coding session |
 
 第一版优先使用 `BasicLoop + Coding Tools + Coding Hooks + Coding Prompt`。只有在需要自动验证、失败修复、特殊压缩或任务阶段管理时，才增加独立的 `CodingLoop`。
@@ -503,6 +506,11 @@ ys-coding-agent --rpc           RPC 集成模式
 ```
 
 第一版必须支持交互式 CLI、Print 模式和 JSON 事件模式；TUI、RPC、会话分支和上下文压缩可以后续增加。
+
+**`-p` / `--json` 的回合数**：两条入口都有跨回合推进的外层 `loop`（`apps/coding-agent/src/main.rs:2410`、`:2558`）。
+继续条件只有一份（`turn_advance::advance`）：有未完成清单项则再起一轮，清单为空时退回一期 `git HEAD` 判据
+（`follow_up_on_commit` 开关，至多一次）。模型不写清单且开关关 ⇒ 跑完即退出，与单回合行为一致。
+`Envelope.turn` 逐轮递增，多回合输出可区分。详见 `docs/design-final/todo.md` §1.10。
 
 **会话归属（ADR-0010）**：会话由接线器持有，不由 Agent 持有。`/new` 是**换一条会话日志**（agent 不知情）；队列即该日志「处理到哪了」游标之后的视图。详见 `docs/arch/gap-closure/context.md`。
 

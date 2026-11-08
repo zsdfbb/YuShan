@@ -248,8 +248,7 @@ pub(crate) const SUBAGENT_SEND_DESCRIPTION: &str =
 /// 名字没有声明时回退到 `"Custom tool"`：第三方工具不声明 snippet 也必须能列进清单
 /// 而不报错。内置工具的 snippet 全部在 `tool_prompts` 里声明，故兜底只对第三方生效。
 fn tool_snippet(name: &str) -> &str {
-    crate::tool_prompts::prompt_for(name)
-        .map_or("Custom tool", |prompt| prompt.snippet.as_str())
+    crate::tool_prompts::prompt_for(name).map_or("Custom tool", |prompt| prompt.snippet.as_str())
 }
 
 fn tool_guidelines(tools: &[&str]) -> String {

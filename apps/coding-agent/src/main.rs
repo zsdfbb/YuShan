@@ -49,7 +49,6 @@ mod debug_log;
 mod goal;
 mod goal_judge;
 mod goal_judge_call;
-mod turn_advance;
 mod help;
 mod logging;
 mod post_turn;
@@ -64,6 +63,7 @@ mod subagent;
 mod todo_inject;
 mod tool_prompts;
 mod toolset;
+mod turn_advance;
 mod view;
 mod wiring;
 mod worktree;
@@ -2538,7 +2538,11 @@ async fn run_print_mode(
 
         // 追问回合**之前**注入清单（与 TUI 同形、同一判据）：模型必须看得见
         // 本回合结束时的清单状态。清单为空 ⇒ 注入的是 harness 追问句。
-        input = follow_up_input(todo_store, &mut last_injected_rev, wiring.session_messages());
+        input = follow_up_input(
+            todo_store,
+            &mut last_injected_rev,
+            wiring.session_messages(),
+        );
     }
 }
 
@@ -2674,7 +2678,11 @@ async fn run_json_mode(
         advance_state.used = advance_state.used.saturating_add(1);
         turn = turn.saturating_add(1);
 
-        input = follow_up_input(todo_store, &mut last_injected_rev, wiring.session_messages());
+        input = follow_up_input(
+            todo_store,
+            &mut last_injected_rev,
+            wiring.session_messages(),
+        );
     }
 }
 

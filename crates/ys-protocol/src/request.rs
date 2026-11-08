@@ -109,6 +109,11 @@ pub enum Request {
         /// 间隔秒数。钳制在 `[10, 86_400]`（见 `ys-tui-coding` 的解析处）。
         interval_secs: u64,
         prompt: String,
+        /// 登记后**立刻**起第一个回合（`/loop now …`），而不是等满一个间隔。
+        ///
+        /// 用途是当场验证提示词的执行效果；默认 `false`（设完就走的人不必等两回）。
+        #[serde(default)]
+        run_now: bool,
     },
     /// 清掉定时循环。已在跑的回合**不中断** —— 取消定时器 ≠ 取消当前工作。
     LoopOff,

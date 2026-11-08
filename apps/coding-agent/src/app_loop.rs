@@ -894,18 +894,27 @@ pub async fn run(
             Request::Loop {
                 interval_secs,
                 prompt,
+                run_now,
             } => {
-                // **只登记，不起回合**：本臂返回时屏幕上一件事都没发生，
-                // 第一个回合要等到下一次定时器到点（`Wake::TimerFired`）。
-                // 理由：用户敲 `/loop 5m 检查 CI` 时人在屏前，没有必要立即花一次
-                // 模型调用；而“立即跑一次”会让「设完就走」的人等两回。
+                // **只登记，不起回合**：本臂不调 `run_turn_chain`、不刷视图，跑回合的
+                // 唯一入口是 `Wake::TimerFired`（它自带「正在跑」视图与 `advance()` 防忙转）。
+                // 但 `run_now` 会把首次唤醒时刻设成**现在** ⇒ 下一次 `select!` 立即就绪
+                // ⇒ 首个回合当场起来；`advance()` 随即把下一次推到 `now + interval`，
+                // 「跑一次、然后按间隔继续」自动成立。缺省 `false` 则等满一个间隔
+                // —— 用户敲 `/loop 5m 检查 CI` 时人在屏前，没有必要立即花一次模型调用；
+                // 而“立即跑一次”会让「设完就走」的人等两回，故它需要显式 `/loop now`。
                 //
                 // **单条语义**：再敲一次即覆盖（不叠加、不排队）。
                 //
                 // **无条件登记**：不预检工作区形态 —— 循环只认时间，任何目录都能跑。
                 let interval = std::time::Duration::from_secs(interval_secs);
+                let first = if run_now {
+                    Instant::now()
+                } else {
+                    Instant::now() + interval
+                };
                 loop_state = Some(LoopState {
-                    next_at: Instant::now() + interval,
+                    next_at: first,
                     interval,
                     prompt,
                 });
@@ -7081,6 +7090,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7114,6 +7124,65 @@ mod tests {
         let _ = h.requests.send(Request::LoopOff).await;
     }
 
+    /// **`/loop now` ⇒ 登记后首个回合立刻起**，不必等满一个间隔。
+    ///
+    /// 间隔取 3600s（远大于用例窗口）：若首个回合仍在等间隔，1s 窗口内调用数恒为 0
+    /// —— 大间隔同时排除了「间隔太短所以看起来像立刻到点」这种解释。
+    /// 工作区是普通目录（不是 git 仓库）：本形态同样只认时间。
+    /// 结尾 `loop_state` 仍是 `Some`：`run_now` 只把**首次**唤醒提前，登记本身
+    /// 不是一次性执行。
+    ///
+    /// 变异：把 `first` 恒取 `Instant::now() + interval`（忽略 `run_now`）⇒
+    /// 下面的零调用断言变红。
+    #[tokio::test]
+    async fn loop_run_now_fires_immediately() {
+        let dir = TempDir::new("loop-now");
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let log = Arc::new(CallLog {
+            calls: AtomicU32::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut h = loop_harness(Box::new(CountingModel(Arc::clone(&log))), &plain).await;
+
+        h.requests
+            .send(Request::Loop {
+                interval_secs: 3600,
+                prompt: "查 CI".into(),
+                run_now: true,
+            })
+            .await
+            .expect("投 /loop now");
+        collect_until_view(&mut h).await; // 登记本身刷一次视图
+
+        // 1s 窗口 ≈ 间隔的 1/3600：窗口内落地就只能是「登记后立刻跑」。
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            log.count() >= 1,
+            "`/loop now` 必须在登记后立刻起首回合（间隔 3600s，1s 内零调用 ⇒ 仍在等间隔）"
+        );
+
+        // **先排空积压**：定时回合会发两帧视图（「正在跑」→「空闲」），
+        // 直接再投请求会把它们误当成自己的应答。
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_millis(50), h.outbound.recv()).await
+        {}
+        h.requests
+            .send(Request::SetThinking { visible: false })
+            .await
+            .expect("投一个无副作用请求以取一帧视图");
+        let msgs = collect_until_view(&mut h).await;
+        let state = msgs.iter().rev().find_map(|m| match m {
+            Outbound::View(v) => Some(v.loop_state.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(state, Some(Some(_))),
+            "`/loop now` 之后循环必须仍处于登记状态（提前首回合 ≠ 一次性执行）：{state:?}"
+        );
+        let _ = h.requests.send(Request::LoopOff).await;
+    }
+
     /// **工作区一点变化都没有 ⇒ 到点照样起回合**。
     ///
     /// 本用例的前提是**不再有任何外部判据**：普通目录（非 git）、不提交、无外部信号，
@@ -7133,6 +7202,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7170,6 +7240,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7230,6 +7301,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7274,6 +7346,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7347,6 +7420,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7381,6 +7455,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 1,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7416,6 +7491,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 3600,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7477,6 +7553,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 3600,
                 prompt: "查 CI".into(),
+                run_now: false,
             })
             .await
             .expect("投 /loop");
@@ -7528,6 +7605,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 60,
                 prompt: "第一条".into(),
+                run_now: false,
             })
             .await
             .expect("投第一条");
@@ -7536,6 +7614,7 @@ mod tests {
             .send(Request::Loop {
                 interval_secs: 120,
                 prompt: "第二条".into(),
+                run_now: false,
             })
             .await
             .expect("投第二条");

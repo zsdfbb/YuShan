@@ -118,7 +118,7 @@ mod tests {
         for needle in [
             "/clear  ",
             "清空对话上下文并清屏",
-            "/loop <间隔> <提示词> | off",
+            "/loop [now] <间隔> <提示词> | off",
             "定时唤醒",
         ] {
             assert!(text.contains(needle), "缺 {needle:?}：\n{text}");

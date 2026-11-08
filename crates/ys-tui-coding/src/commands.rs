@@ -138,7 +138,7 @@ static COMMANDS: [CommandSpec; 18] = [
         // 描述只讲「它做什么」：到点起一个回合。不提判据 —— 判据属于实现细节，
         // 用户在 `/help` 里要的是「这条命令干什么、会看到什么」。
         description: "定时唤醒：按间隔起一个回合",
-        arg_hint: Some("<间隔> <提示词> | off"),
+        arg_hint: Some("[now] <间隔> <提示词> | off"),
     },
     CommandSpec {
         name: "export",
@@ -360,7 +360,7 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
             }
         }
         "compact" => Action::Request(Request::Compact),
-        // `/loop <间隔> <提示词>` 设定时循环，`/loop off` 清掉，无参/非法间隔只本地提示。
+        // `/loop [now] <间隔> <提示词>` 设定时循环，`/loop off` 清掉，无参/非法间隔只本地提示。
         //
         // **单条语义**：一个 session 一个循环，再敲一次即覆盖（不叠加、不报错）。
         // 间隔下限 10s（再低就是在烧钱）、上限 24h；没有上限配置就只有这两道钳。
@@ -387,7 +387,11 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
 /// `view::build_view`**，不可被用户调用的 skill 根本不会进这份快照。TUI 侧只
 /// 消费已过滤的结果，`SkillEntry` 也刻意不携带 `user_invocable`（数据/显示分离，
 /// UI 不做准入决策）。
-/// `/loop` 的解析：`<间隔> <提示词>` 设一个，`off` 清掉。
+/// `/loop` 的解析：`[now] <间隔> <提示词>` 设一个，`off` 清掉。
+///
+/// `now` 是**首个位置参数的关键词**（与 `off` 同形，大小写敏感、精确匹配）：
+/// 登记后立刻起第一个回合，用于当场看提示词的执行效果。缺省形态**只登记**——
+/// 「设完就走」的人不必为一个自己看不到的回合等两回。
 ///
 /// **单条语义**：一个 session 只能有一个循环，再敲一次即**覆盖** ——
 /// 不叠加、不报错。多条排序要额外设计「同时到点怎么办」，而那三件事本来就
@@ -401,19 +405,29 @@ fn parse_loop(args: &[&str]) -> Action {
     match args.first().copied() {
         None => Action::Local(LocalAction::Hint(LOOP_USAGE.to_string())),
         Some("off") => Action::Request(Request::LoopOff),
-        Some(spec) => {
+        Some(first) => {
+            // `now` 让首回合立刻到点；其后的 `<间隔> <提示词>` 与缺省形态同一套规则。
+            let (run_now, rest) = if first == "now" {
+                (true, &args[1..])
+            } else {
+                (false, args)
+            };
+            let Some(spec) = rest.first().copied() else {
+                return Action::Local(LocalAction::Hint(LOOP_USAGE.to_string()));
+            };
             let Some(interval_secs) = parse_interval_secs(spec) else {
                 return Action::Local(LocalAction::Hint(format!(
                     "{LOOP_USAGE}（`{spec}` 不是有效间隔）"
                 )));
             };
-            let prompt = args[1..].join(" ");
+            let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
                 return Action::Local(LocalAction::Hint(LOOP_USAGE.to_string()));
             }
             Action::Request(Request::Loop {
                 interval_secs,
                 prompt,
+                run_now,
             })
         }
     }
@@ -423,8 +437,8 @@ fn parse_loop(args: &[&str]) -> Action {
 const LOOP_MIN_SECS: u64 = 10;
 const LOOP_MAX_SECS: u64 = 24 * 60 * 60;
 
-const LOOP_USAGE: &str =
-    "用法：/loop <间隔> <提示词>\n  间隔如 30s / 5m / 2h（限 10s – 24h）\n  /loop off 停止";
+const LOOP_USAGE: &str = "用法：/loop [now] <间隔> <提示词>\n  间隔如 30s / 5m / 2h（限 10s – 24h）\n  \
+     now：登记后立刻跑一次\n  /loop off 停止";
 
 /// `5m` / `90s` / `2h` → 秒。越界或格式非法 → `None`。
 ///
@@ -825,10 +839,10 @@ pub fn command_list_text() -> String {
             (head, spec.description)
         })
         .collect();
-    // 对齐列**封顶**：`/effort` 的枚举式提示有 47 列，按它对齐会把其余 17 行的描述
-    // 推到 50 列外 —— 表看着是齐的，读起来却是「逐行找描述」。28 列容得下常规
-    // 提示（最宽的是 `/loop <间隔> <提示词> | off`，27 列），超长的那一行让描述
-    // 直接跟在两格之后。
+    // 对齐列**封顶**：`/effort` 的枚举式提示有 55 列，按它对齐会把其余 17 行的描述
+    // 推到 57 列外 —— 表看着是齐的，读起来却是「逐行找描述」。28 列容得下常规
+    // 提示（最宽的是 `/loop [now] <间隔> <提示词> | off`，33 列），超长的那两行让
+    // 描述直接跟在两格之后。
     const ALIGN_CAP: usize = 28;
     let width = rows
         .iter()
@@ -1124,6 +1138,7 @@ mod tests {
                 Action::Request(Request::Loop {
                     interval_secs: 300,
                     prompt: "查 CI".into(),
+                    run_now: false,
                 }),
             ),
             ("/loop off", Action::Request(Request::LoopOff)),
@@ -2301,7 +2316,7 @@ mod tests {
         assert_eq!(parse_interval_secs("2h"), parse_interval_secs("120m"));
     }
 
-    /// `/loop` 的四种分派形态，逐条钉住。
+    /// `/loop` 的分派形态，逐条钉住。
     #[test]
     fn test_loop_dispatch() {
         // 1. 合法：间隔 + 提示词（多词提示词按空格拼回）。
@@ -2310,6 +2325,7 @@ mod tests {
             Action::Request(Request::Loop {
                 interval_secs: 300,
                 prompt: "检查 CI 状态".into(),
+                run_now: false,
             })
         );
         // 2. `off` ⇒ 取消请求（不是提示）。
@@ -2333,6 +2349,35 @@ mod tests {
         assert!(matches!(
             parse("/loop 5m    "),
             Action::Local(LocalAction::Hint(_))
+        ));
+        // 7. `now` 前缀 ⇒ 同一套规则，只是登记后立刻跑一次（`run_now: true`）。
+        assert_eq!(
+            parse("/loop now 5m 检查 CI 状态"),
+            Action::Request(Request::Loop {
+                interval_secs: 300,
+                prompt: "检查 CI 状态".into(),
+                run_now: true,
+            })
+        );
+        // 8. `now` 后缺间隔 ⇒ 用法提示（不得把 `now` 当间隔解析失败报出去）。
+        assert!(matches!(
+            parse("/loop now"),
+            Action::Local(LocalAction::Hint(ref h)) if h == LOOP_USAGE
+        ));
+        // 9. `now` 后有间隔无提示词 ⇒ 同为用法提示。
+        assert!(matches!(
+            parse("/loop now 5m"),
+            Action::Local(LocalAction::Hint(ref h)) if h == LOOP_USAGE
+        ));
+        // 10. `now` 只是首个位置参数的关键词（与 `off` 同形）：大小写敏感、
+        //     在其它位置无特殊含义。
+        assert!(matches!(
+            parse("/loop 5m now"),
+            Action::Request(Request::Loop { run_now: false, .. })
+        ));
+        assert!(matches!(
+            parse("/loop NOW 5m 干活"),
+            Action::Local(LocalAction::Hint(ref h)) if h.contains("NOW")
         ));
     }
 }

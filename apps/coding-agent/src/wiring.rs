@@ -296,6 +296,15 @@ impl Wiring {
         self.session.messages()
     }
 
+    /// 往当前会话尾部追加一条消息（**不发任何事件**）。
+    ///
+    /// 用途是「模型该看见、但用户没说过」的输入（回合边界的清单注入）：不经
+    /// `Boundary::Steer`，因为那条路径会 emit `UserMessage` —— 注入块会显示成
+    /// 用户自己敲的话。
+    pub async fn append_message(&mut self, message: Message) -> Result<(), SessionError> {
+        self.session.append(message).await
+    }
+
     /// 当前会话文件路径（一次性会话为 `None`）。
     ///
     /// 消费者：`CodingView.session_path` 与 `/export` 的默认落点。

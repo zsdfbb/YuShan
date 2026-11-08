@@ -24,6 +24,8 @@ ys-tools-basic = { path = "../../adapters/tools-basic" }
 # 带网络的工具适配器（`websearch` / `webfetch`）：与 `tools-basic` **刻意分开**，
 # 使「只要本机能力」的装配在类型上拿不到网络（见 tools-web crate 文档）。
 ys-tools-web = { path = "../../adapters/tools-web" }
+# todo 清单的唯一真值 + 落盘（`adapters/tools-todo`）：与 `tools-basic` / `tools-web` 同形。
+ys-tools-todo = { path = "../../adapters/tools-todo" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "sync", "time"] }
 # `AbortOnDropHandle`（subagent watchdog 防孤儿任务）。已在 Cargo.lock，无新下载。
 tokio-util = { version = "0.7", features = ["rt"] }

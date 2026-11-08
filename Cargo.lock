@@ -2350,6 +2350,7 @@ dependencies = [
  "ys-session",
  "ys-tool",
  "ys-tools-basic",
+ "ys-tools-todo",
  "ys-tools-web",
  "ys-tui-coding",
 ]
@@ -2504,6 +2505,18 @@ dependencies = [
  "unicode-normalization",
  "ys-core",
  "ys-protocol",
+ "ys-tool",
+]
+
+[[package]]
+name = "ys-tools-todo"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ys-core",
  "ys-tool",
 ]
 

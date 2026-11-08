@@ -102,12 +102,12 @@ pub struct BuiltAgent {
     pub tool_specs: Vec<(String, usize)>,
     /// 真实**父表**的 spec（装配产物）—— assembly 级断言用。
     ///
-    /// 父表 = 基础 10 元 + `bash_bg` + `subagent_async` + `subagent_send`（后三者追加末位）。
+    /// 父表 = 基础 11 元 + `bash_bg` + `subagent_async` + `subagent_send` + `todo`（后四者追加末位）。
     #[cfg(test)]
     pub parent_specs: Vec<ys_tool::ToolSpec>,
     /// 真实**子表**的 spec（装配产物）—— assembly 级断言用。
     ///
-    /// 子表 = 基础 10 元（**无后台能力**）。
+    /// 子表 = 基础 11 元（**无后台能力、无清单**）。
     #[cfg(test)]
     pub child_specs: Vec<ys_tool::ToolSpec>,
 }
@@ -160,7 +160,7 @@ impl AgentFactory {
     /// 顺序照设计 §1.2「启动期」：**先探测装工具**（`toolset` 是唯一装配接缝），
     /// **再由工具表派生提示词的工具清单** —— 同一份表，清单顺序 == 注册顺序。
     pub fn build(&self, workspace: &Path) -> Result<BuiltAgent, BuildError> {
-        // 子 agent 的工具表 = 基础 10 元表（**去掉派发工具**）—— 结构上不可能递归。
+        // 子 agent 的工具表 = 基础 11 元表（**去掉派发工具**）—— 结构上不可能递归。
         let (base_tools, hint) = toolset::build_tools(workspace, self.web.clone());
         let child_specs: Vec<_> = base_tools.iter().map(|t| t.spec()).collect();
         let child_prompt = prompt::build_system_prompt(workspace, &child_specs, &self.catalogue);
@@ -202,7 +202,7 @@ impl AgentFactory {
         .with_explore_prompt(explore_prompt)
         .with_handles(self.subagent_handles.clone());
 
-        // 父表 = 基础 10 元 + `bash_bg` + 派发工具**追加末位**
+        // 父表 = 基础 11 元 + `bash_bg` + 派发工具 + `todo` **追加末位**
         // （子 tools JSON 仍是父的字节前缀 ⇒ 命中缓存）。
         //
         // **插入位置是契约**：追加段只能长在子表之后（`bash_bg` 先、派发工具后） ⇒
@@ -228,7 +228,7 @@ impl AgentFactory {
             )));
         }
         // **追加顺序是契约**：`subagent_async` 必须排在 `bash_bg` **之后**，且追加段只能往后长 ——
-        // 子表（= 基础 10 元）仍是父表 JSON 的**字节前缀**（`toolset.rs` 的
+        // 子表（= 基础 11 元）仍是父表 JSON 的**字节前缀**（`toolset.rs` 的
         // `prefix_fingerprint_is_anchored_and_stable` 钉住这条）。
         tools.push(Box::new(crate::subagent::SubagentAsyncTool::new()));
         tools.push(Box::new(SubagentSendTool::new()));

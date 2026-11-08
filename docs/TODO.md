@@ -107,16 +107,6 @@ ADR-0022（accepted）`:132-133` 同文）。
 | 项 | ADR（accepted） | 全仓源码证据 | 计划 |
 |---|---|---|---|
 | **Follow-up（追问）** | ADR-0014（`0014-...md:11`，2026-09-15） | grep `follow_up` / `FollowUp` = **0**；`DeliveryTarget` 也是 **0**（ADR-0047 的协议格**并未**落地） | `docs/design-plans/2026-09-15-follow-up.md`；协议见 `docs/adr/0047` |
-| **长程 todo + `ToolPlugin` 装配缝** | ADR-0024（`:7`）supersede 0021 决策 5；ADR-0021（`:7`）决策 ③ | grep `ToolPlugin` = **0**、`todo.json` = **0**、`should_inject` = **0**；`adapters/tools-basic/src/` 只有 7 个文件工具，无 `todo.rs` | `docs/arch/long-horizon-todo/design.md`、`docs/arch/hooks-and-plugins/design.md` |
-| **目标验收层（三期）** | ADR-0072 | grep `GoalSpec` / `Verdict` / `goal_judge` = **0**；`Request` 无 `Goal` 变体；`toolset.rs:42` 的 `EXPECTED_ORDER` 是 11 项、无 `todo` | `docs/arch/cross-turn-advance/design.md` §5 |
-
-**ADR-0072 建立在 ADR-0024 之上，不是并行方案**：清单层回答「还剩什么」（零成本），
-验收层回答「声称干完的那条真干了吗」（一次判官调用）。两者缺一不可 ——
-只有清单 ⇒ 勾选是自陈（ADR-0024 决策 4 自陈的天花板）；只有验收 ⇒ 判官没有核对对象。
-⇒ 实现顺序：**todo 清单（= 实现 ADR-0024）→ 验收层**。
-
-**这两项相互咬合**（0024 的推动判据「有未完成项」依赖 0014 的 follow-up 机制），
-宜按 **follow-up → todo** 的顺序推进。
 
 **Follow-up 的根因（已查明）**：「排到下一回合」这一路**不是缺实现，是缺协议格**——
 ADR-0013 删掉了旧 `Inbox` 的 `follow_up` 路（`docs/adr/0013-cancel-token-removal-boundary-source.md:37`），

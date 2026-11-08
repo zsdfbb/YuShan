@@ -319,7 +319,7 @@ debug 日志的 `command_fp` 对 `ocr` 取
 | 1 | `toolset.rs::build_tools` 在 `base_tools` **段内**追加 `OcrTool::new().with_workspace(...)` | ✅ 位置 `ls` 之后、`websearch` 之前（`EXPECTED_ORDER` 同序） |
 | 2 | `EXPECTED_ORDER` 9 元 → **10 元** | ✅ 第 8 项是 `"ocr"` |
 | 3 | 4 处 `assert_eq!(…, 9)` → **`10`** | ✅ `:234` / `:324` / `:501` / `:636`（原计划的行号是 `228/318/495/630`，`ocr` 插入后整体下移 6 行） |
-| 4 | `fp_tools` 锚重算 | ✅ 只覆盖基础 10 元 |
+| 4 | `fp_tools` 锚重算 | ✅ 只覆盖基础 11 元 |
 | 5 | `fp_parent` 锚重算 | ✅ 现 `0x0ca1d7f2e96de67d`，覆盖 10 + 3 = **13 元** |
 | 6 | `assembly.rs` explore 准入 | ✅ 子表 10 元按 `write`/`edit` 过滤 ⇒ **8 元**；`ocr` 有意留（注释写明承重理由：explore 的典型任务就是「这张截图里的错误是什么」） |
 | 7 | `prompt.rs::tool_snippet` 加 `"ocr" => …` | ✅ 加在 `ls` 与派发工具之间，两句承重语义逐字钉死 |

@@ -1,5 +1,8 @@
 # 长程任务的闭环（todo）— 架构设计
 
+> ✅ **已实现**（2026-11-06，W4–W6）。as-built 见 [`../../design-final/todo.md`](../../design-final/todo.md)
+> —— 那里记录实际形态、与本文的偏差与已知取舍。
+>
 > 产出：`/arch-design`（2026-09-23）。输入：[`context.md`](./context.md)（arch-explore，含用户已澄清的 7 条 + 五条新约束）。
 > 证据均带 `文件:行号`，基线 `master` @ `8b03895`。**本文 token 数字均为量级估算**，算式见 §6。
 > 决策记录：[ADR-0024](../../adr/0024-long-horizon-todo.md)。
@@ -404,16 +407,16 @@ Manus 明知扰动 KV cache 仍每次重写，因为它 (i) 没有压缩做上�
 > 的 W0–W9 为准**。下表保留 P 编号仅作历史对照。
 
 **代码实际状态（2026-11-06 核实）**：P0 **已完成**（`toolset.rs:635` `prefix_fingerprint_is_anchored_and_stable`，
-用 `fnv1a64` 而非 `sha256`，且是子/父双锚点）；P2（subagent）**已完成**（`assembly.rs:218-219`，父表 14 元）；
-**P1（装配缝）与 P3（本设计）均未实现**（`grep ToolPlugin` = 0、`todo.json` = 0）。
+用 `fnv1a64` 而非 `sha256`，且是子/父双锚点）；P2（subagent）**已完成**（`assembly.rs:233-234`）；
+**P1（装配缝）、P3（本设计）与验收层全部已完成**（W1–W8）。
 
 | 阶段 | 内容 | 代码状态 | 对应波次 |
 |---|---|---|---|
 | **P0** | prefix 指纹测试（子/父双锚点） | ✅ **已实现** | — |
-| **P1** | `ToolPlugin` 装配缝（零行为变化） | ❌ 未实现 | **W1–W3** |
+| **P1** | `ToolPlugin` 装配缝（零行为变化） | ✅ **已实现**（`crates/ys-tool/src/plugin.rs:27`） | **W1–W3** |
 | **P2** | `subagent`（父表第 12–14 元） | ✅ **已实现** | — |
-| **P3（本设计）** | `todo` + store + 注入 + 推进闭环 | ❌ 未实现 | **W4–W6** |
-| — | 验收层（ADR-0072） | ❌ 未实现 | **W7–W8** |
+| **P3（本设计）** | `todo` + store + 注入 + 推进闭环 | ✅ **已实现**（`adapters/tools-todo/`） | **W4–W6** |
+| — | 验收层（ADR-0072） | ✅ **已实现**（`apps/coding-agent/src/goal.rs`） | **W7–W8** |
 
 **本设计新增的四类锚点**（§8.5 已指出 P0 的字节指纹**盖不住前两类**）：
 

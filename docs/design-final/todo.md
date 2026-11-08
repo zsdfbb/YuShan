@@ -41,7 +41,7 @@
 
 **声明期不变量**由 `sort_plugins` / `expand_guidelines` 校验（违反即 `Err`）：工具名跨插件唯一、
 插件 `order` 唯一、guideline `slot` 全局唯一。`expand_guidelines` 的 `slot` 校验在门控过滤**之前**
-做 —— 被门控掉的块今天不渲染，门控条件一变就会暴露（`plugin.rs:245-251`）。
+做 —— 被门控掉的块今天不渲染，门控条件一变就会暴露（`plugin.rs:249-251`）。
 
 ### 1.2 `adapters/tools-todo/`（清单层，6 文件）
 
@@ -111,10 +111,10 @@
 八条判据**按顺序短路**（`goal.rs:7-21` 的模块头即规范）：①用户取消（`Aborted`）→ ②收场形态不可续
 （`Truncated`/`Failed`/`MaxRounds`/`NoOutput` 及未知变体 ⇒ `NotContinuable`）→ ③判官连续不可靠
 （`JudgeUnreliable`）→ ④无 open 项且 `revision > 0`（`AllDone`）→ ⑤清单为空（`NoPlan`）→ ⑥轮数用尽
-（`CapReached`）→ ⑦集合指纹连续不变 **且** 模型自称收尾（`Stalled`）→ ⑧`Push`。逐条落点 `:146-198`。
+（`CapReached`）→ ⑦集合指纹连续不变 **且** 模型自称收尾（`Stalled`）→ ⑧`Push`。逐条落点 `:142-198`。
 
 `model_claims_done` 取 `last_stop == Completed`（**结构事实**，不扫正文：正文里「还没完成」随时会出现，
-`goal.rs:121-124`）；它与 stall 取 **AND**，避免误杀「一轮里干了活但还没更新状态」。
+`goal.rs:122-125`）；它与 stall 取 **AND**，避免误杀「一轮里干了活但还没更新状态」。
 
 ### 1.7 `apps/coding-agent/src/goal_judge.rs`（611 行）
 
@@ -124,10 +124,10 @@
 | `JudgeParse` | `Met{quote}` / `NotMet{reason}` / `Unparseable` | `:47` |
 | `parse_judge_output` | `fn(raw: &str, evidence: &str, open_items: &[TodoItem]) -> JudgeParse` | `:67` |
 
-`MET` 需三个条件齐备：整词 `VERDICT: MET`（`VERDICT_SCAN_LINES = 8` 行内找，`:41`）、每个 `OK` 项都带
+`MET` 需三个条件齐备：整词 `VERDICT: MET`（`VERDICT_SCAN_LINES = 8` 行内找，`:40`）、每个 `OK` 项都带
 ≥12 字符逐字引用、引用归一化空白后能在证据窗口里子串命中且至少命中一条。任一不满足 ⇒ `Unparseable`
 （判官不可靠，**不是**「未达成」，`:14`）。`BLOCKED` 归入 `NotMet` 并带 `blocked:` 前缀 —— 它是判官的合法
-判断，计入可靠性会把「任务被阻塞」误记成「判官坏了」（`:57-61`）。
+判断，计入可靠性会把「任务被阻塞」误记成「判官坏了」（`:63-66`）。
 
 ### 1.8 `apps/coding-agent/src/goal_judge_call.rs`（382 行）
 
@@ -144,7 +144,7 @@
 
 窗口 = 最后一条 assistant 的 `ToolUse` + 其后全部 `ToolResult` + harness 事实，**不含**助手 `Text`
 （`:11-13`）。按 `ContentBlock` 变体切，不按 `Role` —— 工具结果以 `Role::User` 进 session（`:15-16`）。
-截断按 `char` 边界退让，避免切坏中文（`:79-83`）。
+截断按 `char` 边界退让，避免切坏中文（`:69-80`）。
 
 ### 1.9 `apps/coding-agent/src/turn_advance.rs`（435 行）
 
@@ -163,16 +163,16 @@
 
 | 入口 | 落点 |
 |---|---|
-| TUI | `app_loop.rs` 的 `Request::Prompt` 臂内循环：注入点 `:782-793`、`advance_state` `:841`、`advance_after_turn` `:856-876`、追问前再注入 `:884-895`、`used += 1` `:919` |
-| `-p` | `main.rs` 的 `run_print_mode`（`:2410`）外层 `loop`：`advance_state` `:2433`、`turn` 从 1 起逐轮递增 `:2437`、`advance_after_turn` `:2521`、`used += 1` 与 `turn += 1` `:2536-2537`、`follow_up_input` `:2540` |
-| `--json` | `run_json_mode`（`:2558`）逐行同形：`advance_state` `:2579`、`advance_after_turn` `:2660`、`:2674-2675`、`:2676` |
+| TUI | `app_loop.rs` 的 `Request::Prompt` 臂内循环：首个回合注入点 `:781-793`、`advance_state` `:841`、判官 + `advance` `:853-877`、追问前再注入 `:883-895`、`used += 1` `:919` |
+| `-p` | `main.rs` 的 `run_print_mode`（`:2410`）外层 `loop`：`advance_state` `:2433`、`turn` 从 1 起逐轮递增 `:2437`、`advance_after_turn` `:2518`、`used += 1` 与 `turn += 1` `:2536-2537`、`follow_up_input` `:2541` |
+| `--json` | `run_json_mode`（`:2558`）逐行同形：`advance_state` `:2581`、`advance_after_turn` `:2657`、`used += 1` 与 `turn += 1` `:2674-2675`、`follow_up_input` `:2677` |
 
-`advance_after_turn`（`main.rs:2310`）与 `follow_up_input`（`main.rs:2355`）是两条入口共用的两份函数 ——
-推进判据只允许有一份实现，否则「同一任务在 `-p` 与 `--json` 上跑出不同轮数」这种漂移无从发现（`main.rs:2551-2554`）。
+`advance_after_turn`（`main.rs:2310`）与 `follow_up_input`（`main.rs:2356`）是两条入口共用的两份函数 ——
+推进判据只允许有一份实现，否则「同一任务在 `-p` 与 `--json` 上跑出不同轮数」这种漂移无从发现（`main.rs:2550-2553`）。
 
-`rx` 是按引用的 `&mut mpsc::Receiver<Envelope>`（`run_print_mode` 签名 `main.rs:2414`、`run_json_mode` 同形），
+`rx` 是按引用的 `&mut mpsc::Receiver<Envelope>`（`run_print_mode` 签名 `main.rs:2413`、`run_json_mode` 同形），
 消费循环在 `tokio::join!` **之内** ⇒ 多回合不死锁。守它的用例是
-`print_mode_two_turns_do_not_deadlock_at_small_capacity`（`main.rs:4648`，容量 2、10 秒超时、断言 `main_calls == 4`）。
+`print_mode_two_turns_do_not_deadlock_at_small_capacity`（`main.rs:4649`，容量 2、10 秒超时、断言 `main_calls == 4`）。
 
 ### 1.11 工具表位次
 
@@ -194,15 +194,15 @@
 ### 2.1 `decide` 接管 `stall.observe` 与 `judge_failures` 归零
 
 **实际签名**（`goal.rs:130`）：`decide(store, used, &StopReason, model_claims_done, &mut StallTracker, &mut u32)`。
-`stall.observe(stall_digest(&store.snapshot()))` 在函数**第一行**执行（`:139`），`judge_failures` 是 `&mut u32` 入参（判据 3 读它）。
+`stall.observe(stall_digest(&store.snapshot()))` 在函数**第一行**执行（`:140`），`judge_failures` 是 `&mut u32` 入参（判据 3 读它）。
 
 理由：两条入口（TUI 与 `-p`/`--json`）各写一遍「观察指纹 + 维护失败计数」必然漂移，而漂移的表现是
 「同一任务在两条入口上停机时机不同」—— 这种 bug 在单入口测试里不可见。放进 `decide` 后，
 **每回合恰好观察一次**由函数自身保证；`observe` 放在最前面，是为了让计数与「本回合结束时的清单」
-严格一一对应（闸门短路后不再观察，`:136-138`）。
+严格一一对应（闸门短路后不再观察，`:138-139`）。
 
-归零仍在调用点（`app_loop.rs:864-867`、`main.rs:2325-2329`）：判官成功即 `judge_failures = 0`，
-失败则 `saturating_add(delta)` —— 归零需要「判官结论」，而 `decide` 刻意不问判官（`goal.rs:4-5`）。
+归零仍在调用点（`app_loop.rs:863-867`、`main.rs:2331-2335`）：判官成功即 `judge_failures = 0`，
+失败则 `saturating_add(delta)`（`main.rs:2331-2335`）—— 归零需要「判官结论」，而 `decide` 刻意不问判官（`goal.rs:4-5`）。
 
 ### 2.2 `GoalVerdict` 已删除
 
@@ -233,7 +233,7 @@
 
 守护者因此不在 `decide`，而在 `store.rs`：`all_terminal_clears_and_deletes_file`（`:522`）、
 `single_shot_all_terminal_clears`（`:554`）、`dropping_terminal_items_is_allowed`（`:484`）。
-`revision > 0` 用来区分「刚干完」与「根本没计划」—— 后者归判据 5（`goal.rs:170-174`）。
+`revision > 0` 用来区分「刚干完」与「根本没计划」—— 后者归判据 5（`goal.rs:173-174`）。
 
 ### 2.5 `contains_marker` 同时扫 `ToolResult`
 
@@ -247,7 +247,7 @@
 
 ### 2.6 `follow_up_input`：输入由推进理由决定
 
-**实际形态**（`main.rs:2355-2378`），三条分支：
+**实际形态**（`main.rs:2356-2378`），三条分支：
 
 1. 清单为空 ⇒ 回落一期的 `post_turn::harness_input()` 文案（它说的是「git 历史变了」，**不能**用于
    清单驱动的情形，否则模型会去查一个不存在的提交）；
@@ -256,7 +256,7 @@
 3. 清单非空但版本未变 ⇒ 只发一句短推进句「继续推进清单里的未完成项；全部完成后收尾。」
 
 理由：避免把**同一份**清单在尾部堆成 N 份副本。三条分支都是 `Role::Harness` —— 用户没说过这些话，
-记成用户说的会污染「我是谁、我说过什么」（`main.rs:2351-2354`）。
+记成用户说的会污染「我是谁、我说过什么」（`main.rs:2342-2344`）。
 
 ### 2.7 `-p`/`--json` 的 `turn` 号逐轮递增
 
@@ -278,11 +278,11 @@
 |---|---|---|---|
 | 判官只读最后一轮 | `evidence_window` 取最后一条 assistant 的 `ToolUse` 及其后的 `ToolResult` | 判官输入 **O(1)**，与总轮数无关；**跨轮证据不可见**，只能核本轮可验的项 | `goal_judge_call.rs:18-21` |
 | `elapsed` 未知 | `harness_facts` 写 `unavailable`，不写 `0ms` | 判官看到的是「不知道」，不是「零耗时」—— 后者会让他采信「一秒内完成五项」 | `turn_advance.rs:142-145` |
-| 判官调用不落盘 | `call_judge` 只返回原始串，不写 session、不写 debug 事件 | 判官输出事后不可回溯；换取的是判官不污染会话、不占上下文 | ADR-0072 D8、`goal_judge_call.rs:4` |
+| 判官调用不落盘 | `call_judge` 只返回原始串，不写 session、不写 debug 事件 | 判官输出事后不可回溯；换取的是判官不污染会话、不占上下文 | ADR-0072 D8、`goal_judge_call.rs:4`、`:6-7` |
 | 落盘尽力而为 | `apply` 写失败不回滚内存 | 重启后可能少一份清单；换取「一次写失败不丢模型刚写好的计划」 | `store.rs:18-22` |
 | 降级提示不打印 | `take_degraded_hint` 只**产出**，去处由接线器决定 | crate 边界强制（`tools-todo` 绝不 `print`） | `lib.rs:29-31` |
 | stall 只看清单集合 | `stall_digest` 哈希非终态项的 `(内容, 状态)`，排序 + 大小写折叠 | 反复跑同一条命令但清单不变 ⇒ 判为打转；换取「不受日志噪声影响」（`3 failed (2.1s)` 与 `(2.3s)` 会让哈希输出漏检） | `goal.rs:23-27` |
-| `stall` 需 AND 模型自陈 | `unchanged_turns() >= STALL_LIMIT && model_claims_done` | 模型还在干活时不误杀；代价是「模型死不承认收尾」时靠判据 6 兜底 | `goal.rs:190-193` |
+| `stall` 需 AND 模型自陈 | `unchanged_turns() >= STALL_LIMIT && model_claims_done` | 模型还在干活时不误杀；代价是「模型死不承认收尾」时靠判据 6 兜底 | `goal.rs:191-194` |
 
 ## 4. 指针索引
 
@@ -295,7 +295,7 @@
 | 判官解析与引用校验 | `apps/coding-agent/src/goal_judge.rs:37-67` |
 | 证据窗口与判官调用 | `apps/coding-agent/src/goal_judge_call.rs:103-210` |
 | 两条判据合并 | `apps/coding-agent/src/turn_advance.rs:59-113` |
-| 两条入口接线 | `apps/coding-agent/src/app_loop.rs:782-919`、`apps/coding-agent/src/main.rs:2310-2680` |
-| 工具表位次（15 / 11 / 9） | `apps/coding-agent/src/toolset.rs:802-859`、`apps/coding-agent/src/assembly.rs:199-239` |
-| 多回合不死锁 | `apps/coding-agent/src/main.rs:4648` |
+| 两条入口接线 | `apps/coding-agent/src/app_loop.rs:781-919`、`apps/coding-agent/src/main.rs:2310-2677` |
+| 工具表位次（15 / 11） | `apps/coding-agent/src/toolset.rs:802-859`、`apps/coding-agent/src/assembly.rs:224-239` |
+| 多回合不死锁 | `apps/coding-agent/src/main.rs:4649` |
 | 变异测试清单 | `scripts/goal-mutation.py:60-310` |

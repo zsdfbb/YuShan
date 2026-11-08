@@ -474,7 +474,7 @@ impl KeyGroup {
 ///
 /// **不列 `⌘` 组合**：macOS 终端自己消费 `⌘`，字节到不了应用（见 `events.rs`
 /// 模块头）。**不列 `⌥+↓`**：Terminal.app 发 `ESC[B`，与普通 `↓` 同形。
-static KEYBINDINGS: [KeyBinding; 22] = [
+static KEYBINDINGS: [KeyBinding; 23] = [
     KeyBinding {
         keys: "← / →",
         action: "移动输入光标（Ctrl 或 ⌥ + ←/→ 按词移动；⌥b / ⌥f 同义）",
@@ -558,6 +558,12 @@ static KEYBINDINGS: [KeyBinding; 22] = [
         action: "退出",
         group: KeyGroup::Submit,
         note: None,
+    },
+    KeyBinding {
+        keys: "Ctrl+Z",
+        action: "退回后台（`fg` 回前台）",
+        group: KeyGroup::Submit,
+        note: Some("回合中也可挂起：回合由 app 线程推进，回前台后接上"),
     },
     KeyBinding {
         keys: "PageUp / PageDown",
@@ -683,6 +689,7 @@ const KEY_HELP_BRIEF: &str = "键位（完整表：/keybind）：
   Enter              提交（Shift/Alt+Enter 或 Ctrl+J 换行）
   Ctrl+C             有选区时复制；否则取消回合，再按一次退出
   Ctrl+D             退出；Esc 取消回合 / 清空输入
+  Ctrl+Z             退回后台（fg 回前台）
   Tab                补全浮层";
 
 /// `/help` 的正文（**含 skill 段**）—— 内置命令表之后追加一段 skill 名清单。

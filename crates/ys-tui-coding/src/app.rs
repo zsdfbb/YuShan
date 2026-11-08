@@ -82,6 +82,12 @@ pub struct App {
     /// 末尾读出来插进缓冲；读不到（无工具 / SSH）就什么都不发生
     /// —— 那时用终端自己的粘贴键（`Ctrl+Shift+V` / `⌘V`，走 bracketed paste）。
     pub pending_paste: bool,
+    /// 请求**挂起本进程**（`Ctrl+Z`）—— **由 `run.rs` 消费**。
+    ///
+    /// 与 [`Self::pending_paste`] 同一条纪律：恢复终端、发 `SIGTSTP` 都是 IO / 系统调用，
+    /// 而 `events.rs` 只认键与缓冲。置位后由事件循环在**画完当前帧**之后挂起，回到
+    /// 前台时重进 alt-screen 并重画。
+    pub pending_suspend: bool,
     /// `/resume` 的候选会话（`Outbound::SessionList` 送来）。
     ///
     /// 与 `pending_prompt` **同 take 同清**：`run.rs` 在开 `/resume` 浮层时把它
@@ -233,6 +239,7 @@ impl App {
             pending_clipboard: None,
             status_note: None,
             pending_paste: false,
+            pending_suspend: false,
             pending_sessions: None,
             command_in_flight: false,
             is_turning: false,

@@ -1450,6 +1450,7 @@ debug JSONL**（按 `run_start.pid` 选中，避免模型自起子进程的文�
 | `Enter` / `Shift`·`Alt+Enter` / `Ctrl+J` | 提交 / 换行 / 换行（终端无关的换行键） |
 | `Tab` | 补全浮层（`/` 开头时） |
 | `Esc` | 取消回合（或命令在飞）→ 否则清空输入 |
+| `Ctrl+Z` | **退回后台**（恢复终端后向整个进程组发 `SIGTSTP`；`fg` 回前台，回合照跑） |
 | 左键拖选 | **应用内选区**（高亮用 `Modifier::REVERSED`）；**松手即复制** |
 | 右键 | **再拷一次**（补救：主路径是松手）；**不清高亮**，再点一下左键才消失 |
 
@@ -1475,6 +1476,15 @@ readline 的 `beginning-of-line` 没了，行首走 `Home`（`Ctrl+E` 仍保留�
 
 **不绑 `⌘` 组合**（macOS 终端自己消费 `⌘`，字节到不了应用）；**不绑 `⌥+↓`**
 （Terminal.app 发 `ESC[B`，与普通 `↓` 同形）。`Ctrl+↑/↓`、`Ctrl+Home/End` 终端无关。
+
+**`Ctrl+Z` 退回后台**（`run.rs::suspend_and_resume`）：raw mode 关掉了 `ISIG`，
+终端不再把 `0x1a` 译成 `SIGTSTP` ⇒ 字节直接到应用，必须**自己发信号**。步骤承重：
+先写 `restore_sequence()` 并关 raw mode（否则 shell 提示符前无回显）→
+`kill(0, SIGTSTP)` 发给**整个进程组**（不是 `getpid()`：只停本线程会留下 app 线程与 tty
+看守线程继续跑，且 shell 的作业控制认的是整个作业）→ `kill` 返回即已收到 `SIGCONT`，
+重进 alt-screen 并 `terminal.clear()`（`?1049l` 会把旧 alt-screen 存档，`?1049h` 会吐回来）。
+**不装 `SIGCONT` 处理器**：默认处置就是继续。回合中与模态浮层里都生效 —— 回合由 app 线程
+推进，挂起期间照跑；浮层状态在栈上，回前台后从当前画面继续。
 
 **接管鼠标：拖选 + 松手复制 + 滚轮**：`run::setup_terminal` 开 **`?1000h` +
 `?1002h` + `?1006h`**（按键 / 滚轮 + 拖拽上报 + SGR 编码），**不开** `?1003h`

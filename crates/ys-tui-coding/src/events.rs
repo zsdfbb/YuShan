@@ -1,7 +1,7 @@
 //! crossterm 事件 → [`App`] 状态迁移 + 对 app 线程的请求（`Request` / `Boundary`）。
 //!
 //! 键位集：**Enter 提交或填入补全（`Shift`/`Alt` + Enter 换行，`Ctrl-J` 亦可，见下）/
-//! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / Esc 取消或清空输入 /
+//! Ctrl-C 两段式（取消 → 退出）· Ctrl-D 退出 / **Ctrl-Z 退回后台** / Esc 取消或清空输入 /
 //! `↑` 取会话内历史（`↓` 往新还原草稿）/ `PageUp`·`PageDown` 与 `Ctrl+↑`·`Ctrl+↓` 滚聊天 /
 //! 左右与 Home·Delete 归输入光标（`Ctrl`·`⌥` + 左右 = 按词移动）/ `Home`·`End`·Ctrl-E
 //! 输入行首·行尾 / **Ctrl-A 全选、Ctrl-V 粘贴** / Tab 开补全浮层**。
@@ -22,6 +22,13 @@
 //! 并插入**。读要起子进程，本模块不做 IO，故只置位 [`App::pending_paste`]，由 `run.rs`
 //! 在本轮末尾读出来插进缓冲。读不到的场合（无本机剪贴板工具、SSH / 容器）什么都不发生
 //! —— 那时用终端自己的粘贴键。
+//!
+//! # `Ctrl+Z`：为什么需要应用自己发信号
+//!
+//! raw mode 关掉了终端的 `ISIG`，`0x1a` 不再被译成 `SIGTSTP` —— 字节直接到应用，不接就
+//! 是「按了没反应」。而一旦接了，就不能只把字节当成「退出」或「取消」：用户按 `Ctrl-Z`
+//! 的预期是**回到 shell**。故这里只置位 [`App::pending_suspend`]，由 `run.rs` 恢复终端
+//! 后向**整个进程组**发 `SIGTSTP`（`kill(0, …)`），回到前台时重进 alt-screen。
 //!
 //! # 换行键：为什么除了 `Shift`/`Alt` + Enter 还要 `Ctrl-J`
 //!
@@ -605,6 +612,15 @@ pub fn handle_key(
             }
             KeyCode::Char('d') => {
                 app.should_quit = true;
+                return;
+            }
+            // `Ctrl+Z` = **退回后台**。raw 模式下终端不再解释 `0x1a`，这个键到得了应用；
+            // 若不管它，按下去毫无反应（与 shell 里 Ctrl-Z 的肌肉记忆冲突）。
+            // 这里只置位：恢复终端与发 `SIGTSTP` 都是 IO，本模块不做（见
+            // `App::pending_suspend`）。**回合中也可以挂起** —— 回合由 app 线程推进，
+            // 挂起期间照常跑，回前台时接上。
+            KeyCode::Char('z') => {
+                app.pending_suspend = true;
                 return;
             }
             // `Ctrl+A` = **全选输入框**。行首 / 行尾完全交给 `Home` / `End`
@@ -1725,6 +1741,50 @@ mod tests {
             40,
         );
         assert!(a.should_quit);
+    }
+
+    /// `Ctrl+Z` = **退回后台**：只置位挂起意图（恢复终端与发 `SIGTSTP` 是 IO，归
+    /// `run.rs`），既不退出也不取消回合。
+    ///
+    /// 变异：
+    /// - 删 `Char('z')` 那一臂 ⇒ 本用例红（`Ctrl+Z` 变 no-op）；
+    /// - 写成 `should_quit = true` ⇒ 第二个断言红（挂起不是退出）；
+    /// - 写成 `request_abort` ⇒ 第三个断言红（回合中挂起不该丢掉这一回合）。
+    #[test]
+    fn test_ctrl_z_requests_suspend_not_quit() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        handle_key(
+            with_mod(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(a.pending_suspend, "必须置位挂起意图");
+        assert!(!a.should_quit, "挂起不是退出");
+        assert!(ch.next_boundary().is_none(), "挂起不是取消回合");
+        assert!(a.is_turning, "回合照旧跑，回前台接上");
+    }
+
+    /// 挂起意图只能消费一次：`run.rs` 用 `take()` 取它，取完即清 —— 否则一次 `Ctrl+Z`
+    /// 会让每一轮都重新挂起。
+    #[test]
+    fn test_ctrl_z_intent_is_one_shot() {
+        let ch = channels();
+        let mut a = app();
+        handle_key(
+            with_mod(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            &mut a,
+            &ch.req_tx,
+            &ch.bnd_tx,
+            120,
+            40,
+        );
+        assert!(std::mem::take(&mut a.pending_suspend));
+        assert!(!a.pending_suspend, "take 之后必须为假");
     }
 
     /// **滚轮滚的是聊天，不是输入历史** —— 这正是接管滚轮的理由（ADR-0050）。
@@ -4153,10 +4213,7 @@ mod tests {
             w,
             h,
         );
-        assert!(
-            a.input_drag.is_some(),
-            "前置：拖选中应冻结滚动偏移"
-        );
+        assert!(a.input_drag.is_some(), "前置：拖选中应冻结滚动偏移");
 
         handle_event(Event::Resize(80, 24), &mut a, &ch.req_tx, &ch.bnd_tx, w, h);
         assert!(

@@ -53,6 +53,12 @@ impl From<std::io::Error> for PromptError {
     }
 }
 
+impl From<crate::run::TuiError> for PromptError {
+    fn from(e: crate::run::TuiError) -> Self {
+        PromptError::Other(e.to_string())
+    }
+}
+
 /// 向用户提问的最小接口。
 ///
 /// **同步**且 `&self`：UI 线程在这里阻塞跑模态循环；实现要内可变（TUI 侧是

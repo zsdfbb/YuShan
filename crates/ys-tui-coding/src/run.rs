@@ -245,6 +245,15 @@ fn setup_sequence() -> String {
 }
 
 fn setup_terminal() -> Result<Term, TuiError> {
+    let terminal = Terminal::new(CrosstermBackend::new(enter_terminal()?))?;
+    Ok(terminal)
+}
+
+/// 把终端切进「本应用占用它」的状态（raw mode + alt-screen + 鼠标…），返回 stdout。
+///
+/// 与 [`setup_terminal`] 拆开：挂起后回前台要的只是**这一半**（模式位），而
+/// `Terminal` 的屏幕缓冲在挂起时没有变化，不必重建。
+fn enter_terminal() -> Result<std::io::Stdout, TuiError> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
     // **接管鼠标**（见 [`setup_sequence`]）：滚轮由应用解释成「滚聊天」，
@@ -264,8 +273,10 @@ fn setup_terminal() -> Result<Term, TuiError> {
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
     );
-    let terminal = Terminal::new(CrosstermBackend::new(out))?;
-    Ok(terminal)
+    // **必须 flush**：`Stdout` 是行缓冲/块缓冲的，下面若有路径不写满一行（如挂起后回前台
+    // 重进 alt-screen），字节会滞在用户态缓冲里 ⇒ 终端停在主屏，而重画全画进了主屏。
+    out.flush()?;
+    Ok(out)
 }
 
 /// 消费**一个**事件，并在同一个轮次里收口剪贴板的两条路（写 / 读）。
@@ -559,6 +570,16 @@ fn event_loop<B: Backend<Error = std::io::Error> + Write + Send>(
             }
             // 任何 crossterm 事件（含被推迟消费的异类事件）都可能改状态 ⇒ 必须重画。
             frames.mark();
+            // `Ctrl+Z`：**先画完当前帧再挂起**，否则回到前台时重画的还是挂起前的旧画面
+            // （输入框里刚敲的字会丢一帧）。
+            if std::mem::take(&mut app.pending_suspend) {
+                if frames.frame_due(now_secs()) {
+                    app.compute_max_scroll(size.width, size.height);
+                    terminal.draw(|frame| draw::ui(frame, app))?;
+                }
+                suspend_and_resume(terminal)?;
+                frames.mark();
+            }
             // `/login`、`/model` 无参、`/resume`（选会话）要开模态浮层 —— 画屏需要
             // Terminal，而 `events.rs` 没有，于是它只留下意图，这里跑循环（设计 §3）。
             if let Some(kind) = app.pending_prompt.take() {
@@ -838,6 +859,12 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
             }
             match crossterm::event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    // `Ctrl+Z` 在浮层里也生效：不接的话它会落到下面的通配臂（被当成筛选
+                    // 字符串），而用户的预期是「回到 shell」。浮层没有输入可丢 —— 循环状态在
+                    // 栈上，回前台后从当前画面继续。
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        suspend_and_resume(self.terminal)?;
+                    }
                     KeyCode::Up => selected = modal_move(selected, filtered.len(), true),
                     KeyCode::Down => selected = modal_move(selected, filtered.len(), false),
                     KeyCode::Enter if !filtered.is_empty() => {
@@ -936,6 +963,14 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                         self.app.set_theme(state.opened_with);
                         return Err(PromptError::Quit);
                     }
+                    // Ctrl-Z 在浮层里也挂起（同 `select_modal`）。主题预览已经是本地量，
+                    // 回前台后从当前选中项继续。
+                    if key.code == KeyCode::Char('z')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        suspend_and_resume(self.terminal)?;
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Up => ThemeKey::Up,
                         KeyCode::Down => ThemeKey::Down,
@@ -990,6 +1025,10 @@ impl<B: Backend<Error = std::io::Error> + Write> ModalHost<'_, B> {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Err(PromptError::Quit);
                     }
+                    // Ctrl-Z 挂起：输入缓冲在栈上，回前台后照旧（不丢已敲的字）。
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        suspend_and_resume(self.terminal)?;
+                    }
                     KeyCode::Backspace => buf.backspace(),
                     KeyCode::Delete => buf.delete_forward(),
                     KeyCode::Left => buf.cursor_left(),
@@ -1035,6 +1074,64 @@ fn restore_terminal<B: Backend<Error = std::io::Error> + Write>(
 
     let _ = disable_raw_mode();
     let _ = terminal.show_cursor();
+}
+
+/// `Ctrl+Z`：退回后台，直到 `SIGCONT` 把本进程拉回前台。
+///
+/// 步骤是承重的，颠倒任一步都会在 shell 里留下烂摊子：
+///
+/// 1. **先把终端模式还回去**（[`restore_sequence`] + 关 raw mode）：raw mode + alt-screen 下
+///    shell 收不到回显，用户在提示符前敲什么都看不见；
+/// 2. **`SIGTSTP` 必须发给整个进程组**（`0`），不是 `getpid()`：发给自身只会暂停本线程，
+///    app 线程与 tty 看守线程照旧跑；且 shell 的 job control 认的是**整个作业**停没停。
+/// 3. `SIGTSTP` 的默认处置是暂停，`SIGCONT` 到达时 `kill` 才返回 —— 它返回就说明已经回到
+///    前台，此时重新进 alt-screen 并重画。
+///
+/// **`SIGTSTP` 必须在这里自己发**：crossterm 的 raw mode 关掉了 `ISIG`，
+/// 终端根本不产生 `SIGTSTP`，不自己发就只是「屏幕闪一下又回来」。
+///
+/// **`SIGCONT` 不装处理器**：默认处置就是继续运行，装上处理器只会给自己多一条出错路径。
+///
+/// 写屏 / 切模式全部 best-effort：挂起失败也不该把用户踢出程序（与 [`restore_terminal`]
+/// 同一条纪律）；只有**回前台后重进终端**失败才向上报错 —— 那时终端确实不可用了。
+#[cfg(unix)]
+fn suspend_and_resume<B: Backend<Error = std::io::Error> + Write>(
+    terminal: &mut Terminal<B>,
+) -> Result<(), TuiError> {
+    // 只把终端模式还回去：`restore_terminal` 还会回放对话到主屏，那是**退出**的行为，
+    // 挂起不需要 —— 回前台后 alt-screen 整片重画。
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{}", restore_sequence());
+    let _ = out.flush();
+    let _ = disable_raw_mode();
+    let _ = terminal.show_cursor();
+
+    // SAFETY: 无参数、无返回值；`kill(2)` 对进程组 0 = 本进程组，不碰内存。
+    unsafe {
+        libc::kill(0, libc::SIGTSTP);
+    }
+    // 回到这里 = 已收到 `SIGCONT`（暂停期间本线程不执行任何代码）。
+    // 重进 alt-screen（连同鼠标 / 括号粘贴 / 键盘增强）—— 挂起时那一串全被
+    // `restore_sequence()` 关掉了，不重开就没有滚轮、没有拖选、没有 `Shift+Enter`。
+    let _ = enter_terminal()?;
+    // 重进 alt-screen 后**必须整片清屏**：恢复时发出的 `?1049l` 让终端把它自己那份 alt-screen
+    // 存了起来，`?1049h` 会原样吐回来 —— 不清的话回前台第一帧会叠在旧画面上。
+    //
+    // 用 `resize` 而不是 `Terminal::clear()`：后者靠**向终端查询光标位置**（写 `CSI 6n` 再读
+    // stdin）来决定恢复点，而 stdin 的读者是 crossterm 的事件源，这里读会抢字节并在无应答
+    // 时阻塞数秒后报错。`resize` 对全屏视口只做 `clear_region(ClearType::All)` + 重置背面
+    // 缓冲，不读 stdin；顺带把两个缓冲区的尺寸刷新到挂起后的真实大小。
+    let size = terminal.size()?;
+    terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
+    Ok(())
+}
+
+/// 非 unix 平台没有作业控制（本仓只支持 Linux/macOS，保留空实现保证可编译）。
+#[cfg(not(unix))]
+fn suspend_and_resume<B: Backend<Error = std::io::Error> + Write>(
+    _terminal: &mut Terminal<B>,
+) -> Result<(), TuiError> {
+    Ok(())
 }
 
 /// `/copy` 的载荷：OSC 52 剪贴板转义序列（终端无关，无新依赖）。
@@ -1380,38 +1477,40 @@ fn spawn_tty_hangup_watchdog() {
     };
     let _ = std::thread::Builder::new()
         .name("yushan-tty-watchdog".into())
-        .spawn(move || loop {
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&watch);
-            let mut pfd = libc::pollfd {
-                fd,
-                // 必须请求 `POLLIN`：Darwin 的 `poll(2)` 在未请求 `POLLIN` 时
-                // **不会**上报 `POLLHUP`（实测：pty 关闭 master / pipe 关闭写端，
-                // `events = 0` 只超时返回 0，`events = POLLIN` 才返回
-                // `POLLIN | POLLHUP`）。本仓主平台是 macOS，以实测为准。
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: `pfd` 指向本栈上有效的 `pollfd`，`nfds = 1`，超时 1000ms。
-            let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
-            if n < 0 {
-                // EINTR 直接重试；其余持续性错误（EINVAL / ENOMEM…）限速，
-                // 否则会退化成 100% 自旋。
-                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        .spawn(move || {
+            loop {
+                let fd = std::os::fd::AsRawFd::as_raw_fd(&watch);
+                let mut pfd = libc::pollfd {
+                    fd,
+                    // 必须请求 `POLLIN`：Darwin 的 `poll(2)` 在未请求 `POLLIN` 时
+                    // **不会**上报 `POLLHUP`（实测：pty 关闭 master / pipe 关闭写端，
+                    // `events = 0` 只超时返回 0，`events = POLLIN` 才返回
+                    // `POLLIN | POLLHUP`）。本仓主平台是 macOS，以实测为准。
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: `pfd` 指向本栈上有效的 `pollfd`，`nfds = 1`，超时 1000ms。
+                let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                if n < 0 {
+                    // EINTR 直接重试；其余持续性错误（EINVAL / ENOMEM…）限速，
+                    // 否则会退化成 100% 自旋。
+                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    continue;
+                }
+                if n > 0 {
+                    if tty_hung_up(pfd.revents) {
+                        // 终端已消失：恢复是 best-effort（写向死 tty 无害），然后退出。
+                        restore_terminal_on_panic();
+                        std::process::exit(0);
+                    }
+                    // 普通输入（`POLLIN`）醒来：本线程不读 stdin，不能立即重试 —— 否则
+                    // 输入突发 / 粘贴 / 鼠标事件期间会空转。睡 50ms 把唤醒上限压到
+                    // 20 次/秒，成本可忽略；挂断仍由下一次 poll 的 `POLLHUP` 捕获
+                    // （最坏多等 50ms）。
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                continue;
-            }
-            if n > 0 {
-                if tty_hung_up(pfd.revents) {
-                    // 终端已消失：恢复是 best-effort（写向死 tty 无害），然后退出。
-                    restore_terminal_on_panic();
-                    std::process::exit(0);
-                }
-                // 普通输入（`POLLIN`）醒来：本线程不读 stdin，不能立即重试 —— 否则
-                // 输入突发 / 粘贴 / 鼠标事件期间会空转。睡 50ms 把唤醒上限压到
-                // 20 次/秒，成本可忽略；挂断仍由下一次 poll 的 `POLLHUP` 捕获
-                // （最坏多等 50ms）。
-                std::thread::sleep(Duration::from_millis(50));
             }
         });
 }
@@ -2456,10 +2555,7 @@ mod tests {
         let mut sched = FrameSchedule::new(1000);
         assert!(sched.frame_due(1000), "首帧");
         for _ in 0..20 {
-            assert!(
-                !sched.frame_due(1000),
-                "同一秒内无状态变化时不得重绘"
-            );
+            assert!(!sched.frame_due(1000), "同一秒内无状态变化时不得重绘");
         }
     }
 

@@ -19,6 +19,7 @@
 //!   （`Steer` 插话 + `Abort` 取消），取代旧的 `CancelToken`
 //! - [`Envelope`] / [`Source`]：事件在信道上的传输单位（谁发的、哪一轮、什么事）
 //! - [`LifecyclePolicy`]：消费者消失后的生命周期策略
+//! - [`FollowUp`] / [`StopCause`]：回合结束后的推进决定（纯词汇）
 //!
 //! **信道拓扑（设计 §8）**：① `Request`（回合边界）/ ② `Boundary`（轮边界）/
 //! ③ `Outbound<V>`（app → UI）。② 必须独立于 ① —— 回合跑动时 app 线程阻塞在
@@ -26,12 +27,14 @@
 
 mod boundary;
 mod envelope;
+mod goal;
 mod lifecycle;
 mod request;
 mod session;
 
 pub use boundary::*;
 pub use envelope::*;
+pub use goal::*;
 pub use lifecycle::*;
 pub use request::*;
 pub use session::*;

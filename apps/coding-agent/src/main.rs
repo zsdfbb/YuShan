@@ -3115,6 +3115,10 @@ fn run_interactive(
     //    app 循环唯一的失败是「UI 侧收摊」，不该惊动用户 —— 落日志即可。
     let app_session_path = session_path.clone();
     let app_worktree = worktree.clone();
+    // 启动期视图要交给**两方**：app 循环拿它当侧栏推送的起始基线（首个回合内
+    // 就能推侧栏），TUI 拿它画首屏。`async move` 会把 `view0` 整份移进去，
+    // 故在 spawn **之前** clone。
+    let view0_for_app = view0.clone();
     rt.spawn(async move {
         if let Err(e) = app_loop::run(
             agent,
@@ -3123,6 +3127,7 @@ fn run_interactive(
             state_store,
             stats,
             session_started,
+            view0_for_app,
             request_rx,
             boundary_rx,
             out_tx,

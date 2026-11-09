@@ -2174,7 +2174,7 @@ todo 行的截断预算是 `width.saturating_sub(2)` —— 字形占 1 列 + 1 
 ### 21.8 回合中推送（§5 的唯一出站例外）
 
 `app_loop` 原本「每请求刷一次」`Outbound::View`。todo 与「谁在跑」都在**回合内**变，
-不推则用户要等到回合收场才看见。故新增 `push_panel_if_changed`（`app_loop.rs:2121`）：
+不推则用户要等到回合收场才看见。故新增 `push_panel_if_changed`（`app_loop.rs` 的 `push_panel_if_changed`）：
 
 ```rust
 let Some(base) = last_view.as_mut() else { return Ok(()) };
@@ -2188,7 +2188,7 @@ send(out_tx, Outbound::View(base.clone())).await
 
 | 判据 | 防什么 |
 |---|---|
-| `last_view` 为 `None` ⇒ 跳过 | 没有 Chat / 输入框上下文的残次视图（首份完整视图由回合末刷新点发出） |
+| `last_view` 为 `None` ⇒ 跳过 | 没有 Chat / 输入框上下文的残次视图。**防御性分支**：`last_view` 以 `Some(view0)` 起步（`view0` = `main` 起屏时已交给 TUI 的那一份），本文件内没有任何一处写回 `None` ⇒ 正常路径恒命中 `Some` |
 | `last_panel == next` ⇒ 跳过 | 一次批量 `apply` 连跳多次 `revision`，每次都推整份快照会淹没信道 |
 | `elapsed() < PANEL_THROTTLE` ⇒ 跳过 | 同上；**只是丢弃、不安排下一次**（不新增定时器） |
 
@@ -2205,6 +2205,17 @@ send(out_tx, Outbound::View(base.clone())).await
 
 **形参逐字段传入而不收 `&mut TurnCtx`**：回合执行期 `ctx.wiring` 被 `ports()` 借住，
 整包借 `ctx` 会 E0499；要碰的几个字段与它互不相交。
+
+**基线以 `Some(view0)` 起步**：`view0` 是 `main` 起屏时**直接**交给 TUI 的那一份
+（`ys_tui_coding::run(view0, …)` 不过 `app_loop`）⇒ `app_loop::run` 新增 `view0: CodingView`
+形参把它接进来。若基线从 `None` 起步，它要到**第一个请求处理完**才被赋值 ⇒ 进程启动后 /
+`/resume` 后的**首个回合内**侧栏一条推送都发不出去（恢复长会话后首回合跑很久时侧栏整段空白）。
+
+**`last_panel` 也必须以屏上那份 `panel` 起步**（`last_view.as_ref().map(|v| v.panel.clone())`）：
+否则首个回合里每条事件都与 `None` 比一次不等 ⇒ 推出一份内容其实没变的空侧栏。
+
+**G7 的用例走真实 run loop**（`app_loop_pushes_panel_during_turn_when_todos_change`），
+不是直接调 `push_panel_if_changed` 的单测 —— 后者对两个生产调用点零覆盖，整段删掉推送也全绿。
 
 ### 21.9 label 贯通：`description` → 侧栏
 
@@ -2224,9 +2235,9 @@ send(out_tx, Outbound::View(base.clone())).await
 | G2 窄屏不塌 | `frame_areas_degrades_cleanly_on_narrow_screens`（W∈{0,4,9,10,11,20,21,22,31,40,80}） | `draw.rs` |
 | G3 50/50 奇数高 | `sidebar_halves_share_height_exactly` | `draw.rs` |
 | G4 入口封顶 | `panel_view_caps_todos_and_reports_hidden` / `..._running_...` / `..._exactly_at_limits_...` | `view.rs` |
-| G5 UTF-8 截断 | `sidebar_truncates_cjk_without_panicking` / `sidebar_lines_fit_within_inner_width` / `panel_view_truncates_todo_content_by_chars_not_bytes` | 两处 |
+| G5 UTF-8 截断 | `sidebar_truncates_cjk_without_panicking` / `sidebar_lines_fit_within_inner_width` / `sidebar_running_line_fits_when_handle_is_wide` / `panel_view_truncates_todo_content_by_chars_not_bytes` | 两处 |
 | G6 空态不塌 | `sidebar_renders_empty_state_boxes` | `draw.rs` |
-| G7 回合中可见性 | `push_panel_if_changed_matches_snapshot_without_rebuilding` | `app_loop.rs` |
+| G7 回合中可见性 | `app_loop_pushes_panel_during_turn_when_todos_change`（**走真实 run loop**，非直调函数的单测） | `app_loop.rs` |
 | G8 零冗余推送 | `push_panel_if_changed_is_silent_when_panel_unchanged` / `..._sends_nothing_without_baseline` | `app_loop.rs` |
 | G9 label 贯通 + 生命周期 | `live_labels_reports_handle_and_label` / `live_labels_drops_finished_subagent` / `subagent_async_tool_passes_description_as_label` | `subagent.rs` |
 | G10 开关语义 | `panel_command_without_arg_toggles` / `panel_apply_local_flips_and_sets_explicitly` / `panel_visibility_is_not_overwritten_by_view_snapshots` | `commands.rs` |
@@ -2246,3 +2257,15 @@ send(out_tx, Outbound::View(base.clone())).await
 |---|---|---|
 | `PANEL_TODO_MAX` 的推导口径 | §4 说 24 =「一屏可见上限的 2 倍」 | 可视高度由 `sidebar_visible` 在 UI 侧裁断（21.5），入口上限只影响「数据能带多长」；两个常量的推导口径不必一致 |
 | 「24 条」的实际可见性 | 隐含 24 条都能看见 | 受内区高限制（终端 40 行 ≈ 16 条），其余折进 `+N` |
+
+**评审后已消解的三处**（`docs/arch/tui-right-panel/review.md` 的实现评审跟进）：
+
+| 项 | 曾经 | 现在 |
+|---|---|---|
+| `truncate_to_width` 的零预算 | `max == 0` 时返回宽 1 的 `…`，违反「结果宽 ≤`max`」契约 | 返回空串，契约已写进设计 §3.4，由 `truncate_to_width_respects_contract_at_zero_budget` 盯住 |
+| running 行的 handle 预算 | 取满内区宽 ⇒ label 预算归 0 ⇒ 整行 `width + 2` 列、盖掉右边框 | 留 2 列（1 列分隔空格 + 至少 1 列 label），由 `sidebar_running_line_fits_when_handle_is_wide` 盯住 |
+| 首回合内侧栏无推送 | `last_view` 从 `None` 起步，要到首个请求处理完才被赋值 | `app_loop::run` 收 `view0` 形参，`last_view` 以 `Some(view0)` 起步 ⇒ 首回合内即可推 |
+
+**一条仍存在的取舍**：回合中推送的视图里，`turn_count` / token 数是**上一回合末**的值
+（回合中的增量只在回合末由 `build_view` 带入）。这是设计接受的——UI 的 `view` 唯一写者是
+`Outbound::View`，所以推出去的只会是「上一回合末的一致快照」，不会出现新旧字段混合。

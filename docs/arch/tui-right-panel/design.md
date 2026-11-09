@@ -344,13 +344,23 @@ todo 工具在回合内被调用 → TodoStore.apply → revision += 1
 
 | 位置 | 变化 |
 |---|---|
-| `TurnCtx` 字段 | 加 `todo: &TodoStore`、`last_view: &mut CodingView`、`last_panel: &mut Option<PanelView>`、`last_push: &mut Instant` |
+| `TurnCtx` 字段 | 加 `todo: &TodoStore`、`last_view: &mut Option<CodingView>`、`last_panel: &mut Option<PanelView>`、`last_push: &mut Instant` |
+| `run()` 形参 | 加 `view0: CodingView`（启动期视图，与 `stats` / `session_started` 同组——都是启动期状态） |
 | `run_turn_chain` 形参 | 同名四项（形参已 16 个，但保持与 `ctx` 一致的转递惯例） |
 | 六个调用点（`:526`/`:586`/`:664`/`:822`/`:934`/`:970`） | 传 `&factory.todo()`（`:473` 已持有）与四个 `&mut` 循环局部量 |
 
-`last_view` 在 `run()` 里声明一次，**每次发出 `Outbound::View` 时同步写入**
-（包括已有的六处 `build_view_with_loop` 调用点）—— 否则回合中复用的是陈旧基线。
-这是本设计唯一需要改**顺序语义**（非纯形参穿透）的地方。
+`last_view` 在 `run()` 里声明一次、以 `Some(view0)` **起步**，**每次发出
+`Outbound::View` 时同步写入**（包括已有的六处 `build_view_with_loop` 调用点）——
+否则回合中复用的是陈旧基线。这是本设计唯一需要改**顺序语义**（非纯形参穿透）的地方。
+
+> **为何以 `Some(view0)` 起步**：`view0` 就是 `main` 起屏时直接交给 TUI 的那一份
+> （`ys_tui_coding::run(view0, …)` 不过 `app_loop`）。基线从 `None` 起步的话，它要到
+> **第一个请求处理完**才被赋值 ⇒ 进程启动后 / `/resume` 后的首个回合内，侧栏一条推送都
+> 发不出去 —— 恢复长会话后首回合跑很久时，侧栏整段空白。
+>
+> **为何仍是 `Option`**：它把「基线不可用就不推」写成类型（`push_panel_if_changed` 里
+> `let Some(base) = … else { return }`），而不是靠调用方自律。正常路径上它恒为 `Some`
+> （本文件内没有任何一处写回 `None`），该分支因此是**防御性**的。
 
 事件臂内推送（`app_loop.rs:2203` 旁，紧跟 `send(Event)` 之后）：
 
@@ -485,7 +495,7 @@ pub fn live_labels(&self) -> Vec<(String, Arc<str>)>;   // 同样先 retain 清�
 | G4 | **入口封顶**：`panel_view` 对 30 项 todo、20 个 running 的输入 ⇒ 输出恰好 24 / 8 行 | 去掉封顶 ⇒ 红 |
 | G5 | **UTF-8 截断**：200 字符 CJK 内容 + 120 字符 CJK description ⇒ 每条渲染行 `display_width() ≤ 内区宽`，且**不 panic** | 改用 `split_at` ⇒ panic |
 | G6 | **空态不塌**：两栏都空 ⇒ 两个带标题的框仍在、内区空白 | 空态跳过 `render_widget(block)` ⇒ 红 |
-| G7 | **回合中可见性**（S2/S3）：回合内 todo `apply` 一次 ⇒ 至少一条带新 `panel` 的 `View` 抵达 | 去掉 §5 的推送 ⇒ 红（这是本设计最容易被删掉的一行） |
+| G7 | **回合中可见性**（S2/S3）：回合内 todo `apply` 一次 ⇒ 至少一条带新 `panel` 的 `View` 抵达，且它比该回合的 `RunFinished` **更早**、`turn_count` 仍是**推送前**的基线值（回合中推送只替换 `panel`、不重拍快照）。用例走**真实 run loop**（`app_loop_pushes_panel_during_turn_when_todos_change`），不是直接调 `push_panel_if_changed` 的单测 | ① 去掉事件臂里的推送 ⇒ 红；② `last_view` 从 `None` 起步 ⇒ 红（首个回合内无处可推） |
 | G8 | **零冗余推送**：回合内无状态变化 ⇒ `View` 条数与「不推」时相等 | 去掉 `next != last` ⇒ 红 |
 | G9 | **label 贯通 + 生命周期**：`spawn(desc)` ⇒ `live_labels()` 含它；子 agent 收尾 ⇒ 立刻消失 | value 存 `Arc<QueueBoundarySource>`（强引用）⇒ 收尾后仍在，红 |
 | G10 | **开关语义**：`/panel` → on；再 `/panel` → off；收到 `Outbound::View` 后**仍**是 off | `App::new` 从 `view` 取初值（照抄 theme）⇒ 红 |

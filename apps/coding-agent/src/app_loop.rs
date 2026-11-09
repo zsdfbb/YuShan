@@ -393,6 +393,9 @@ pub async fn run(
     state_store: StateStore,
     mut stats: TurnStats,
     mut session_started: Instant,
+    // 启动期视图（`main` 起屏时交给 TUI 的那一份）。侧栏推送的**起始基线** ——
+    // 有了它，进程启动后的**第一个回合内**就能推侧栏，不必等首个请求处理完。
+    view0: CodingView,
     mut request_rx: mpsc::Receiver<Request>,
     mut boundary_rx: mpsc::Receiver<Boundary>,
     out_tx: mpsc::Sender<Outbound<CodingView>>,
@@ -481,15 +484,21 @@ pub async fn run(
     // 侧栏推送的复用基线：**每次发出 `Outbound::View` 时都要同步写**，
     // 否则回合中复用的是陈旧视图（状态行/token 数会回退）。
     //
-    // `None` = 本进程还没发过任何整份视图。此时回合中的推送**直接跳过**：没有基线就
-    // 无从「只替换 `panel` 一个字段」，而重新造一份完整视图要再调一次 `build_view` ——
-    // 那正是本设计拒绝的事。第一份完整视图总会在回合末的刷新点发出，回合中的推送只服务
-    // 「回合很长、用户要提前看见」；它迟到一次不影响任何正确性。
-    let mut last_view: Option<CodingView> = None;
-    // 上次推给 UI 的侧栏投影（`None` = 还没推过）：变更检测的唯一判据，靠
-    // `PanelView: PartialEq`（无变化零流量，**包括侧栏关着时** —— 开关是 UI 本地状态，
-    // app 侧不知道）。
-    let mut last_panel: Option<PanelView> = None;
+    // 以 `Some(view0)` 起步（`view0` = `main` 起屏时已交给 TUI 的那一份）⇒ 基线恒与
+    // UI 屏上看到的一致，**回合中与首个回合内都能推**侧栏。若从 `None` 起步，基线要到
+    // 第一个请求处理完才存在 ⇒ 启动后 / `/resume` 后的首个回合内，再长的回合也推不出
+    // 一条侧栏更新。
+    //
+    // 仍是 `Option` 而非裸 `CodingView`：`push_panel_if_changed` 的「基线不可用就不推」
+    // 由类型表达。正常路径下它恒为 `Some`（本文件内没有任何一处写回 `None`），
+    // 因此那个 `else` 分支是**防御性**的。
+    let mut last_view: Option<CodingView> = Some(view0);
+    // 上次推给 UI 的侧栏投影：变更检测的唯一判据，靠 `PanelView: PartialEq`（无变化
+    // 零流量，**包括侧栏关着时** —— 开关是 UI 本地状态，app 侧不知道）。
+    //
+    // **必须与 `last_view` 同进**：它以屏上那份视图的 `panel` 起步，否则首个回合里
+    // 每条事件都会与「`None`」比一次不等 ⇒ 推出一份内容其实没变的空侧栏。
+    let mut last_panel: Option<PanelView> = last_view.as_ref().map(|v| v.panel.clone());
     // 上次推送的时刻（节流判据）：首次立即允许推送（否则开局 300ms 内的变化会被无谓吞掉）。
     let mut last_push = Instant::now() - PANEL_THROTTLE;
 
@@ -1773,7 +1782,8 @@ struct TurnCtx<'a> {
     /// 侧栏投影的输入（todo store 活在 `run()` 里，按引用传下来）。
     todo: &'a ys_tools_todo::TodoStore,
     /// 侧栏推送的复用基线 —— **每次整份 `View` 发出后都要同步更新**。
-    /// `None` = 本进程还没发过整份视图 ⇒ 回合中的推送没有可替换的基线，直接跳过。
+    /// 由 `run()` 以启动期视图 `Some(view0)` 起步 ⇒ 首个回合内即可推送；`None` 是
+    /// 「基线不可用」的防御表达，正常路径不会出现。
     last_view: &'a mut Option<CodingView>,
     /// 上次推给 UI 的侧栏投影（`None` = 还没推过）。
     last_panel: &'a mut Option<PanelView>,
@@ -2151,8 +2161,9 @@ async fn push_panel_if_changed(
     last_push: &mut Instant,
     out_tx: &mpsc::Sender<Outbound<CodingView>>,
 ) -> Result<(), AppLoopError> {
-    // 基线还没有 ⇒ 无从「只替换一个字段」。首份完整视图由回合末的刷新点发出，
-    // 回合中的推送只服务「回合很长、用户要提前看见」—— 迟到一次不影响正确性。
+    // 基线不可用 ⇒ 无从「只替换 `panel` 一个字段」（重造整份视图要再调一次
+    // `build_view`，那正是本设计拒绝的事）。**防御性分支**：调用方以 `Some(view0)`
+    // 起步、此后只会被整份 `View` 的发出点写回 `Some`，正常路径不会命中。
     let Some(base) = last_view.as_mut() else {
         return Ok(());
     };
@@ -2703,6 +2714,9 @@ mod tests {
         /// 注册表与**会话槽**（槽与接线器共享同一份 ⇒ 清理点与工具看到的
         /// 会话 id 必然一致）。
         backgrounds: Option<(Arc<BackgroundTasks>, ys_tools_basic::SessionSlot)>,
+        /// 与 app 循环**同一个 `Arc`** 的清单真值：用例可在回合进行中直接 `apply`
+        /// 一次，从而验证「回合中的侧栏推送真能到 UI」。
+        todo: Arc<ys_tools_todo::TodoStore>,
     }
 
     impl Harness {
@@ -2990,6 +3004,8 @@ mod tests {
         let worktree = WorktreeHandle::new(worktree);
         let app_worktree = worktree.clone();
 
+        let todo = ys_tools_todo::TodoStore::open(None);
+
         // 装配工厂（换工作区时重建 agent 用）：确定性 offline web、空 skill 目录、
         // 临时产物目录 —— 绝不碰真实 `~/.yushan`。
         let factory = crate::assembly::AgentFactory::new(
@@ -3001,7 +3017,7 @@ mod tests {
                 tmp.join("subagents"),
                 false,
             )),
-            ys_tools_todo::TodoStore::open(None),
+            todo.clone(),
         );
         // 共享工作区 = harness 临时目录（生产侧是进程启动目录）。
         let default_workspace = tmp.0.clone();
@@ -3017,6 +3033,9 @@ mod tests {
             state_store,
             TurnStats::default(),
             Instant::now(),
+            // 启动期视图：生产侧由 `main` 构造并交给 TUI；harness 用默认值，
+            // `turn_count` / `executed` 等「每回合才变」的字段一律为初始值。
+            CodingView::default(),
             request_rx,
             boundary_rx,
             out_tx,
@@ -3042,6 +3061,7 @@ mod tests {
             worktree,
             tmp,
             backgrounds,
+            todo,
         }
     }
 
@@ -3079,6 +3099,43 @@ mod tests {
             if is_view {
                 return msgs;
             }
+        }
+    }
+
+    /// 收出站消息直到**本回合的终局事件**（`RunFinished` / `RunFailed`）之后的第一个
+    /// `View` —— 即「该请求处理完后的那一份整快照」。
+    ///
+    /// 与 [`collect_until_view`] 的区别：首个回合内就会推侧栏，所以「碰到的第一条
+    /// `View`」不再是回合末那一份。要取证「回合内某件事发生过」，就必须先跳过那些
+    /// 回合中的推送。
+    async fn collect_until_turn_end_view(h: &mut Harness) -> Vec<Outbound<CodingView>> {
+        let mut msgs = Vec::new();
+        let mut seen_end = false;
+        loop {
+            let m = recv_out(&mut h.outbound).await;
+            match &m {
+                Outbound::Event(env)
+                    if matches!(
+                        env.event,
+                        AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. }
+                    ) =>
+                {
+                    seen_end = true
+                }
+                // 信道上可能还有**本项目自己的**追问回合 ⇒ 只在**最后一回合**之后取。
+                Outbound::Event(_) => {}
+                Outbound::View(_) if seen_end => {
+                    msgs.push(m);
+                    return msgs;
+                }
+                _ => {}
+            }
+            msgs.push(m);
+            assert!(
+                msgs.len() < MAX_OUTBOUND,
+                "一个请求已出站 {} 条仍未收场（疑似追问套娃/重试风暴）",
+                msgs.len()
+            );
         }
     }
 
@@ -4688,6 +4745,7 @@ mod tests {
             worktree: _,
             tmp,
             backgrounds: _,
+            todo: _,
         } = h;
         drop(requests);
         drop(boundaries);
@@ -5452,7 +5510,9 @@ mod tests {
 
         // **只跑一个回合** —— 结果必须在这一个回合内进会话。
         h.requests.send(prompt("hi")).await.unwrap();
-        let mut msgs = collect_until_view(&mut h).await;
+        // 收到**回合终局之后**的那份整快照：首个回合内就会推侧栏，碰到的第一条
+        // `View` 不再是回合末那一份（而终局事件与 `DeferredResult` 都在其之前）。
+        let mut msgs = collect_until_turn_end_view(&mut h).await;
         let _ = take_view(&mut msgs);
 
         let requests = inner.requests.lock().unwrap().clone();
@@ -8999,5 +9059,218 @@ mod tests {
 
         let view = take_pushed_view(&mut rx);
         assert_eq!(view.panel.todos.len(), 1, "窗口过后必须补推这次变化");
+    }
+
+    // ── G7：回合中可见性（设计 `tui-right-panel` §8）────────────────────
+    //
+    // 本节是这一组里**唯一走真实 run loop** 的用例：上面那些单测都不能证明
+    // `run_turn_once` 里的两处调用点还挂着（把它们整段删掉，那些单测照样全绿）。
+
+    /// 一个**脏工具**：唯一作用是 `TodoStore::apply` 改清单 —— 模拟模型在回合中调
+    /// `todo`。
+    ///
+    /// 不用真实的 `todo` 工具：它还要解析 JSON 参数、渲染回喂文本 —— 本用例要钉的是
+    /// 「清单在**回合进行中**变了 ⇒ 侧栏推送从真实调用点发出」，工具怎么改的清单无关。
+    ///
+    /// 清单句柄用 `OnceLock` 延后填：工具表必须在起循环**之前**装配（`build_agent`），
+    /// 而循环里的那份清单（与工厂/工具同一个 `Arc`）要等 harness 建好才拿得到。
+    struct TodoWritingTool {
+        store: Arc<OnceLock<Arc<ys_tools_todo::TodoStore>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ys_tool::Tool for TodoWritingTool {
+        fn spec(&self) -> ys_tool::ToolSpec {
+            ys_tool::ToolSpec::new(
+                "write_todo",
+                "测试用：写一份清单",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+        }
+
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: ys_tool::ToolContext<'_>,
+        ) -> Result<ys_core::ToolResult, ys_tool::ToolError> {
+            let store = self.store.get().expect("测试必须在起回合之前注入清单句柄");
+            store
+                .apply(panel_one_todo())
+                .expect("纯 `Pending` 清单必然被接受");
+            Ok(ys_core::ToolResult::text("清单已写", false))
+        }
+    }
+
+    /// 两轮模型：第 1 轮回一个调 `write_todo` 的 tool call，第 2 轮**等门**再回文本。
+    ///
+    /// 门控的存在理由：`run_turn_once` 的侧栏推送发生在**事件转发**那一刻，而工具与
+    /// 下一轮模型调用都在同一个回合内 ⇒ 测试必须先看到那条 `View`，才能保证它落的
+    /// 是「回合中」而不是回合末。等待期间回合真的挂在那里。
+    ///
+    /// 门只等一次（`gate` 是 `Option`，取走即为 `None`）：它只用来把「回合进行中」
+    /// 这个窗口攥在测试手里，不参与后续任何一轮 —— 否则追问回合会一条条排着队等。
+    struct ToolThenGatedModel {
+        calls: Mutex<u32>,
+        gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ToolThenGatedModel {
+        fn model_id(&self) -> &str {
+            "tool-then-gated"
+        }
+
+        async fn complete(
+            &self,
+            _request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            let n = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if n == 1 {
+                return Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ToolCallId("call-write-todo".into()),
+                            name: "write_todo".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                });
+            }
+            // 后续轮（含第 2 轮与任何补跑轮）：取一次门，然后收尾。
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.await;
+            }
+            Ok(ModelResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                },
+                usage: Usage::default(),
+                finish_reason: FinishReason::Stop,
+            })
+        }
+    }
+
+    /// G7：**回合中**改清单 ⇒ 至少一条带新 `panel` 的 `View` 抵达 UI。
+    ///
+    /// 三条断言各自钉一条契约：
+    /// 1. 存在一份**回合中**的 `View` 且 `panel.todos` 非空（推送真的发生了）；
+    /// 2. 它的 `turn_count` 等于推送**前**的基线值（0）—— 回合中推送只替换 `panel`、
+    ///    **不重拍快照**（重拍会把刚跑这个回合的 1 写进去）；
+    /// 3. 它比该回合的终局事件（`RunFinished`）**更早**抵达 —— 这才是「回合中可见」。
+    ///
+    /// **真实 run loop**：`spawn_app_loop_full` 起的就是生产那个 `run()`，工具是模型
+    /// 在第一轮真调出来的 ⇒ 清单在回合**进行中**变化，而不是测试线程直接调函数。
+    ///
+    /// 变异：删掉 `run_turn_once` 事件臂（心跳 ①）里那处 `push_panel_if_changed` 调用
+    /// ⇒ 本用例红。删回合末排空循环（心跳 ②）那处 ⇒ 本用例**仍绿**（心跳 ① 已推到了），
+    /// 那是另一道防线，本用例不为它背书。
+    #[tokio::test]
+    async fn app_loop_pushes_panel_during_turn_when_todos_change() {
+        let store_slot = Arc::new(OnceLock::new());
+        let tool = TodoWritingTool {
+            store: Arc::clone(&store_slot),
+        };
+
+        // 带一个门控的模型：第 1 轮调工具（改清单），第 2 轮**等测试发话**才收尾。
+        // 门控让「回合进行中」这个窗口在测试侧可观测 —— 不必靠时序赌博。
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let model = ToolThenGatedModel {
+            calls: Mutex::new(0),
+            gate: Mutex::new(Some(gate_rx)),
+        };
+
+        let mut h = spawn_app_loop_full(
+            Box::new(model),
+            false,
+            Vec::new(),
+            |_, _| {},
+            |b| b.tools(vec![Box::new(tool)]),
+            |_| None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        // 清单与 app 循环是**同一个 `Arc`**（工厂交给工具的也是它）⇒ 工具写进去的
+        // 条目就是 `push_panel_if_changed` 读的那一份。
+        assert!(
+            store_slot.set(Arc::clone(&h.todo)).is_ok(),
+            "此处只注入一次"
+        );
+
+        h.requests.send(prompt("hi")).await.unwrap();
+
+        // 守住「回合仍在进行」这个窗口（模型正卡在门控上），收集这期间抵达的 `View`。
+        let mut during_turn = Vec::new();
+        loop {
+            let m = tokio::time::timeout(TIMEOUT, h.outbound.recv())
+                .await
+                .expect(
+                    "首个回合内没收到带 todo 的 View（且回合仍卡在门控上）：\
+                     回合中的侧栏推送缺失 —— 两种原因会造成它：\
+                     ① 事件臂里那处 push_panel_if_changed 不在了；\
+                     ② 基线不是以 Some(view0) 起步（首个回合内无处可推）",
+                )
+                .expect("app 循环不应提前收摊");
+            match &m {
+                Outbound::View(v) if !v.panel.todos.is_empty() => {
+                    during_turn.push(v.clone());
+                    break;
+                }
+                Outbound::View(_) => {}
+                // 回合已终局 —— 不能放过：那就不是「回合中可见」了。
+                Outbound::Event(env)
+                    if matches!(
+                        env.event,
+                        AgentEvent::RunFinished { .. } | AgentEvent::RunFailed { .. }
+                    ) =>
+                {
+                    panic!("终局事件已到，期间的出站里仍没有带 todo 的 View：回合中推送缺失")
+                }
+                _ => {}
+            }
+        }
+
+        let pushed = during_turn.pop().expect("上方循环已保证有一条");
+        assert_eq!(pushed.panel.todos.len(), 1, "侧栏必须反映回合中新写的清单");
+        assert_eq!(
+            pushed.turn_count, 0,
+            "回合中推送只替换 `panel`，不得重拍快照（重拍会带上本回合的 1）"
+        );
+
+        // 放行模型收尾。**先清清单**：`decide` 的判据 5 是「还有 open 项 ⇒ 再起一轮」，
+        // 留着那一条 open 项会叫 `Request::Prompt` 的追问循环一直跑下去（本用例只关心
+        // 回合中的那一次推送）。写一份全终态清单 ⇒ `apply` 的硬规则 2 清空列表，
+        // 判据 3 随即收场。
+        h.todo
+            .apply(vec![ys_tools_todo::TodoItem::new(
+                "改掉 flaky 断言",
+                ys_tools_todo::TodoStatus::Completed,
+            )])
+            .expect("把既有项标为完成必然被接受");
+        gate_tx.send(()).ok();
+        let rest = collect_until_view(&mut h).await;
+        assert!(
+            rest.iter().any(|m| matches!(
+                m,
+                Outbound::Event(env) if matches!(env.event, AgentEvent::RunFinished { .. })
+            )),
+            "放行后本回合必须以 `RunFinished` 收场"
+        );
+        shutdown(h).await;
     }
 }

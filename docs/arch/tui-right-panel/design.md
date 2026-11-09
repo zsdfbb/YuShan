@@ -270,10 +270,14 @@ context.md 要求「不能靠手算假设」，我实测了 ratatui 0.30（`prob
 | 常量 | 值 | 位置 | 理由 |
 |---|---|---|---|
 | `SIDE_WIDTH` | 30 | `draw.rs` | 内区 28 ≈ 14 汉字 |
-| `PANEL_TODO_MAX` | 24 | `view.rs`（app 侧截） | 2× 一个 40 行屏的可见上限 |
-| `PANEL_RUNNING_MAX` | 8 | 同上 | 单回合派发上限 16（`subagent.rs:37`）的一半，配 `+N 在跑` |
+| `PANEL_TODO_MAX` | 24 | `view.rs` | 一屏（~40 行）可见上限的 2 倍；更长时靠 `+N` 提示（§3.3） |
+| `PANEL_RUNNING_MAX` | 8 | 同上 | 与侧栏内区高匹配：40 行屏 ⇒ 每栏 ~19 行，扣标题与 `+N` 后 8 条能完整显示（不挂派发上限） |
 | `MAX_TODO_CONTENT_CHARS` | 96 | `apps/coding-agent/view.rs` | ≤288 B/项（CJK 3 B） |
 | `MAX_DESCRIPTION_CHARS` | 120 | 同上 | 8 只在跑 × 120 = 960 B |
+| `PANEL_THROTTLE` | 300 ms | `app_loop.rs` | 合并一次批量 `apply` 的连跳 `revision`（不是「与心跳对齐」—— 本设计不新增定时器） |
+
+前两个是**两条上界**（条数），后两个是**每条的长度**（字符数）—— 两维正交：
+前者管「能进多少行」，后者管「一行能有多重」。两者都必须在 `panel_view()` 入口封顶。
 
 **入口封顶原则**：`panel_view()` 封**条数**与**每条的字符数**；UI 侧封**显示列**（`truncate_to_width`）。
 两者是正交的：字符数管「一个中文字算几个」，显示列管「屏幕上占多宽」。这样 UI 每帧的成本
@@ -335,7 +339,8 @@ todo 工具在回合内被调用 → TodoStore.apply → revision += 1
 事件臂内推送（`app_loop.rs:2203` 旁，紧跟 `send(Event)` 之后）：
 
 ```rust
-let next = crate::view::panel_view(todo, subagent, theme);
+// app 侧只做**数据投影**，不涉渲染：主题是渲染参数，不进投影结果。
+let next = crate::view::panel_view(todo, subagent);
 if ctx.last_panel.as_ref() != Some(&next) && ctx.last_push.elapsed() >= PANEL_THROTTLE {
     ctx.last_view.panel = next.clone();
     *ctx.last_panel = Some(next);

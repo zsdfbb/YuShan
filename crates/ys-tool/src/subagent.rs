@@ -49,6 +49,10 @@ pub struct SubagentOutcome {
 pub trait SubagentRunner: Send + Sync {
     /// **后台派发**：立刻返回句柄，子 agent 在后台跑；**结果会自动注入会话**。
     ///
+    /// `label` = 模型给出的**人类可读主题**（工具 schema 里是 `required`），用于 UI 展示
+    /// 「现在在跑什么」。类型是 `&str` 而非 `Option<&str>`：schema 已要求必填，缺失即
+    /// `InvalidInput`；若在此给默认值，UI 就会出现「无标题项」这类静默。
+    ///
     /// `model = None` ⇒ 用**当前**模型（缓存最暖、零额外配置）。
     /// `mode` 只决定子 agent 的系统提示与工具集（见 [`SubagentMode`]），不改父回合语义。
     /// `boundary` = 父回合的边界源；实现方**只透传 `is_aborted`，绝不 `take`**。
@@ -76,6 +80,7 @@ pub trait SubagentRunner: Send + Sync {
     fn spawn(
         &self,
         _prompt: &str,
+        _label: &str,
         _model: Option<&str>,
         _mode: SubagentMode,
         _boundary: Option<&dyn BoundarySource>,
@@ -92,5 +97,42 @@ pub trait SubagentRunner: Send + Sync {
     /// 一条它永远看不到的话）。
     fn send(&self, _handle: &str, _message: &str) -> Result<(), String> {
         Err("本实现不支持向子 agent 发送消息".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空实现：只写 `impl SubagentRunner for ... {}`，全部方法走默认实现。
+    /// 它同时是「没有派发能力的实现方」这一最常见形态的代表。
+    struct NoDispatch;
+
+    impl SubagentRunner for NoDispatch {}
+
+    /// 防的是「给 `spawn` 加形参时顺手改了默认实现或漏改签名」这类回归：
+    /// 没有派发能力的实现方必须仍能按**完整 6 形参**调用并拿到 `Err`，而不是编译失败
+    /// 或静默 `Ok`（后者会让模型以为子 agent 真的跑起来了）。
+    #[test]
+    fn default_spawn_reports_unsupported_for_all_six_params() {
+        let result = NoDispatch.spawn("任务", "标题", None, SubagentMode::General, None);
+        let err = result.expect_err("默认实现必须报不支持，绝不静默 Ok");
+        assert!(
+            err.contains("不支持"),
+            "错误正文应说明本实现不支持后台派发，实际为：{err}"
+        );
+    }
+
+    /// 防的是「新增 `&str` 形参把 trait 变成 non-object-safe」这类回归：
+    /// `ToolContext.subagent` 以 `&dyn SubagentRunner`（实为 `Option<&dyn ...>`）持有它，
+    /// 一旦 object-safety 被破坏，整个工具层的装配缝就编不过。
+    #[test]
+    fn subagent_runner_is_object_safe_with_label_param() {
+        let runner: Box<dyn SubagentRunner> = Box::new(NoDispatch);
+        let result = runner.spawn("任务", "标题", None, SubagentMode::Explore, None);
+        assert!(
+            result.is_err(),
+            "经 trait object 调用默认 spawn 仍应返回 Err，实际为：{result:?}"
+        );
     }
 }

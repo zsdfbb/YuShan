@@ -157,6 +157,13 @@ pub struct CodingView {
     /// 跨回合目标的显示投影（`/goal`）。`None` = 当前没有活动目标
     /// （状态行不出现 `[goal]` 段）。
     pub goal: Option<GoalView>,
+    /// 右侧栏的内容投影（todo 清单 + subagent 运行状态），**非 `Option`**。
+    ///
+    /// 它是 app 线程推来的 `Outbound::View` 快照的一部分：随整份视图一起**整表替换**，
+    /// 渲染层不做字段合并。侧栏的**开关**不在本字段里（那是 UI 本地状态
+    /// `App.panel_visible`，不落盘、不进协议），故本字段只回答「打开时画什么」，
+    /// 不表达「栏此刻是否可见」。
+    pub panel: PanelView,
 }
 
 /// 定时循环的**显示投影**（不含任何时刻真值，那在 app 侧）。
@@ -183,6 +190,91 @@ pub struct GoalView {
     pub turns: u32,
     /// 上限（`GOAL_TURN_CAP`，由 app 侧填，本 crate 不定义常量）。
     pub cap: u32,
+}
+
+/// 侧栏 todo 栏的**条数**上界。
+///
+/// 24 = 一屏（~40 行）可见上限的 2 倍：屏幕能画的部分有限，更长的清单由
+/// [`PanelView::todos_hidden`] 折算成末行 `+N` 提示，渲染成本不再随清单长度增长。
+///
+/// **这是「最多几条」，不是「每条多长」** —— 单项内容的字符上界由 app 侧的投影
+/// （`panel_view`）另行封顶。两个维度**正交**，谁也替代不了谁。
+pub const PANEL_TODO_MAX: usize = 24;
+
+/// 侧栏「在跑」栏的**条数**上界。
+///
+/// 8 = **与侧栏内区高匹配**：40 行屏 ⇒ 每栏约 19 行，扣掉标题行与 `+N` 行后
+/// 剩 8 条可**完整显示**（不被纵向切掉）。它**不是**「派发上限的一半」——
+/// 派发上限是能力约束，本常量是显示约束，两者没有比例关系。
+///
+/// 与 [`PANEL_TODO_MAX`] 一样，这是「最多几条」；每条 label 的字符上界由 app 侧的
+/// 投影另行封顶，两个维度**正交**。
+pub const PANEL_RUNNING_MAX: usize = 8;
+
+/// 右侧栏的内容投影：上栏 todo 清单 + 下栏 subagent 运行状态。
+///
+/// **空态是两个空 `Vec`，不是 `None`**：侧栏打开时框常驻（固定宽 + 固定 50/50 高），
+/// 内容可以空。换成 `Option` 会诱使渲染层多写一条「没数据就不画框」的分支，
+/// 与「框常驻」的要求直接相反。
+///
+/// 字段全是 owned `String` 的自建类型：本 crate 不依赖 todo / subagent 的实现类型
+/// （`ys-tools-todo` 等），显示用的一切都在 app 侧投影时拍平。
+///
+/// 它参与 [`CodingView`] 的 `PartialEq` ⇒ app 侧据「变没变」决定要不要再推一份快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelView {
+    /// 已封顶（[`PANEL_TODO_MAX`]）的 todo 行，按 store 的原顺序。
+    pub todos: Vec<TodoLine>,
+    /// 超出 [`PANEL_TODO_MAX`] 的条数（0 = 没省略）；UI 据此画 `+N`。
+    pub todos_hidden: usize,
+    /// 已封顶（[`PANEL_RUNNING_MAX`]）的在跑行。
+    pub running: Vec<RunningLine>,
+    /// 超出 [`PANEL_RUNNING_MAX`] 的在跑数（0 = 没省略）。
+    pub running_hidden: usize,
+}
+
+impl Default for PanelView {
+    /// 空态 —— **两个空 `Vec` + 两个 `0`**，不是 `None`（见 [`PanelView`] 的类型注释）。
+    fn default() -> Self {
+        Self {
+            todos: Vec::new(),
+            todos_hidden: 0,
+            running: Vec::new(),
+            running_hidden: 0,
+        }
+    }
+}
+
+/// 侧栏 todo 栏的一行：已封顶的文本 + 状态字形。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoLine {
+    /// 单项内容 —— app 侧已按**字符数**封顶；**显示列**截断由渲染层自己做
+    /// （CJK 一字算 2 列，只有 UI 知道内区宽）。
+    pub text: String,
+    /// 状态字形。渲染层**只认这个**，不自己判断 todo 的语义。
+    pub mark: RowMark,
+}
+
+/// 侧栏「在跑」栏的一行：谁在跑 + 在做什么。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningLine {
+    /// 派发句柄 —— 子任务的可辨标识。
+    pub handle: String,
+    /// 工作主题 —— 取派发入参 `description` 的开头一段，app 侧已按字符数封顶。
+    pub label: String,
+}
+
+/// 状态字形。UI 侧**唯一认这个枚举** —— 不认 todo 实现里的状态类型
+/// （`ys-tui-coding` 不依赖 `ys-tools-todo`）。状态到字形的映射在 app 侧投影时完成，
+/// 本 crate 只按字形画。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMark {
+    /// 普通项（含 app 侧映射不出的任何状态）。
+    Plain,
+    /// 正在进行的那一项。
+    Active,
+    /// 已完成。
+    Done,
 }
 
 impl Default for CodingView {
@@ -216,6 +308,7 @@ impl Default for CodingView {
             version: "0.0.0".to_string(),
             loop_state: None,
             goal: None,
+            panel: PanelView::default(),
         }
     }
 }
@@ -316,6 +409,8 @@ impl CodingView {
             loop_state: None,
             // 中性值：测试默认不带活动目标，需要时用例自己填。
             goal: None,
+            // 中性值：侧栏空态（两个空 Vec），用例需要内容时自己填。
+            panel: PanelView::default(),
         }
     }
 }
@@ -517,5 +612,93 @@ mod tests {
         assert_eq!(g.text, "修好 flaky test");
         assert_eq!(g.turns, 7);
         assert_eq!(g.cap, 200, "cap 由 app 侧填，本 crate 不定义常量");
+    }
+
+    /// 侧栏的默认态必须是**空态**：两个空 `Vec` + 两个 `0`。
+    ///
+    /// 防的回归：把 `panel` 改成 `Option<PanelView>` 默认 `None`，或在 `Default` 里
+    /// 塞进假数据（占位 todo / 假 handle）。前者会让渲染层多出「没数据就不画框」的
+    /// 分支，与「侧栏框常驻」的要求相反；后者会让空会话一开场就显示不存在的进度。
+    #[test]
+    fn default_coding_view_has_empty_panel() {
+        let panel = CodingView::default().panel;
+        assert_eq!(
+            panel,
+            PanelView::default(),
+            "默认 panel 即 PanelView::default"
+        );
+        assert!(panel.todos.is_empty(), "默认无 todo 行");
+        assert!(panel.running.is_empty(), "默认无在跑行");
+        assert_eq!(panel.todos_hidden, 0, "默认没有被省略的 todo");
+        assert_eq!(panel.running_hidden, 0, "默认没有被省略的在跑项");
+    }
+
+    /// `panel` 必须**真参与** `CodingView` 的 `PartialEq` —— app 侧靠它判断
+    /// 「视图变了没有」，从而决定这一轮要不要再推一份快照（回合中零冗余推送的地基）。
+    ///
+    /// 防的回归：`CodingView` 的 `PartialEq` 对 `panel` 不敏感（手写 `eq` 漏字段，
+    /// 或 `PanelView` 的 `eq` 恒真）。那时 todo / 在跑状态的每一次变化都被判成
+    /// 「视图没变」⇒ 变更检测是假的：侧栏永远停在旧内容上，且没有任何报错。
+    ///
+    /// 两个差异点各钉一遍：`todos` 的行内容、以及 `todos_hidden` 这个纯计数 ——
+    /// 后者没有 `Vec` 可比，最容易在自定义 `eq` 里被漏掉。
+    #[test]
+    fn coding_view_partial_eq_is_sensitive_to_panel() {
+        let a = CodingView::default();
+        let mut b = a.clone();
+        assert_eq!(a, b, "除 panel 外全同（同一份克隆）⇒ 相等");
+
+        b.panel.todos.push(TodoLine {
+            text: "x".into(),
+            mark: RowMark::Plain,
+        });
+        assert_ne!(a, b, "只多一条 todo ⇒ 必须判「变了」");
+
+        // 把差异收敛回单个字段：先抹掉上面那条 todo，再只动 `todos_hidden`。
+        b.panel.todos.clear();
+        assert_eq!(
+            a, b,
+            "清回空清单后应恢复相等（否则下面的断言测不到 hidden）"
+        );
+        let mut c = a.clone();
+        c.panel.todos_hidden = 1;
+        assert_ne!(a, c, "其余全同、只改 todos_hidden ⇒ 仍需判「变了」");
+    }
+
+    /// `RowMark` 的三个变体两两可辨，且是 `Copy`。
+    ///
+    /// 防的回归：两件事各钉一遍 ——（1）变体被合并或某一对意外相等 ⇒ 渲染层
+    /// 画出的字形无法区分类别，用户看不出「哪条在做、哪些做完了」；（2）`Copy`
+    /// 被去掉 ⇒ 侧栏投影里按值传 `RowMark` 的现有调用点成片编译失败（`TodoLine`
+    /// 逐行取 `mark` 时不该产生移动语义）。
+    #[test]
+    fn row_mark_states_are_distinct_and_copyable() {
+        assert_ne!(RowMark::Plain, RowMark::Active, "Plain ≠ Active");
+        assert_ne!(RowMark::Plain, RowMark::Done, "Plain ≠ Done");
+        assert_ne!(RowMark::Active, RowMark::Done, "Active ≠ Done");
+
+        // Copy 证明：`m` 被赋给 `n` 之后仍能再用一次。
+        let m = RowMark::Active;
+        let n = m;
+        let _ = m;
+        assert_eq!(n, RowMark::Active);
+
+        // `matches!` 正向：每个变体都认得自己。
+        assert!(matches!(RowMark::Plain, RowMark::Plain));
+        assert!(matches!(RowMark::Active, RowMark::Active));
+        assert!(matches!(RowMark::Done, RowMark::Done));
+        // `matches!` 负向：一个变体不该落进另一个变体的分支。
+        assert!(!matches!(RowMark::Plain, RowMark::Active));
+        assert!(!matches!(RowMark::Active, RowMark::Done));
+
+        // `match` 全覆盖（穷尽性由编译器保证：将来加变体而不补分支即编译失败）。
+        for mark in [RowMark::Plain, RowMark::Active, RowMark::Done] {
+            let glyph = match mark {
+                RowMark::Plain => "plain",
+                RowMark::Active => "active",
+                RowMark::Done => "done",
+            };
+            assert!(!glyph.is_empty(), "每个变体都有字形");
+        }
     }
 }

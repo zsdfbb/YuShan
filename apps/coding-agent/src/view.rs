@@ -13,7 +13,11 @@ use std::time::Instant;
 
 use ys_runtime::Agent;
 
-use ys_tui_coding::{CodingView, ModelEntry, ProviderEntry, ThemeKind};
+use ys_tools_todo::TodoStatus;
+use ys_tui_coding::{
+    CodingView, ModelEntry, PANEL_RUNNING_MAX, PANEL_TODO_MAX, PanelView, ProviderEntry, RowMark,
+    RunningLine, ThemeKind, TodoLine,
+};
 
 use crate::config::Config;
 use crate::provider::ProviderRegistry;
@@ -34,9 +38,10 @@ use crate::wiring::Wiring;
 /// 视图（回合路径直接用局部量）；主题**必须**进视图（UI 要它上色），故只能走参数
 /// 或读盘 —— 参数是正确选择。
 ///
-/// 形参已达 8 个。**不再加参数**：若将来还有「每请求都要刷新的单个偏好」，
-/// 应连同 `stats` / `session_started` / `theme` 一起收进一个 `ViewInputs` 结构体，
-/// 而不是继续拉长签名。
+/// 形参已达 8 个，[`build_view_with_loop`] 更是到了 11 个。**仍走形参而不收进结构体**：
+/// `panel` 与 `stats` / `theme` 同属「每请求都要刷新」的一类值 —— 它们都由 `app_loop`
+/// 的局部状态现算，每次请求处理完都得重拍一遍。把这一整类收进一个 `ViewInputs`
+/// 结构体是一次横跨全部调用点与用例的重构，与侧栏这个需求无关，故本次不做。
 #[allow(clippy::too_many_arguments)]
 pub fn build_view(
     cfg: &Config,
@@ -182,10 +187,80 @@ pub fn build_view(
         loop_state: None,
         // 目标同上：`build_view` 只给中性初值，真值由 [`build_view_with_loop`] 覆盖。
         goal: None,
+        // 侧栏同上：本函数不接触 todo / subagent，给空态（两个空 `Vec`）；
+        // 真值由 [`panel_view`] 投影后经 [`build_view_with_loop`] 覆盖。
+        panel: PanelView::default(),
     }
 }
 
-/// [`build_view`] 的变体：额外带上定时循环与跨回合目标的状态投影。
+/// 侧栏 todo 单项内容的**字符数**上界。
+///
+/// 这是「**每条多长**」（字符数），与 `ys-tui-coding` 里的 [`PANEL_TODO_MAX`]
+/// （「**最多几条**」）是两个**正交**维度：前者管一行的内容量，后者管栏内可容纳的
+/// 行数。谁也替代不了谁 —— 只封条数则单条可以长到把行撑爆，只封字符数则条数随
+/// 清单长度线性增长。
+const MAX_TODO_CONTENT_CHARS: usize = 96;
+
+/// 侧栏「在跑」栏每行 label 的**字符数**上界。
+///
+/// 与 [`MAX_TODO_CONTENT_CHARS`] 同理，这是「每条多长」，与 [`PANEL_RUNNING_MAX`]
+/// 的「最多几条」正交。
+const MAX_DESCRIPTION_CHARS: usize = 120;
+
+/// 侧栏的**投影**：app 侧只做数据挑选与封顶，不碰显示列（那是 UI 的事）。
+///
+/// **主题不是形参**：主题是渲染参数，不进投影结果 —— 进了会让「数据」与「怎么画」
+/// 混成一个值，而 `PanelView` 要参与 `PartialEq` 变更检测（主题一变就整份快照变，
+/// 与「侧栏内容动没动」无关）。
+///
+/// 两处封顶都按**字符数**（`chars().take(n)`），绝不用 `&s[..n]` —— 后者会切在
+/// 多字节序列中间，产出无效 UTF-8。显示列宽（CJK 算 2 列）只能在渲染层算，
+/// 因为只有它知道内区宽。
+pub fn panel_view(
+    todo: &ys_tools_todo::TodoStore,
+    subagent: Option<&crate::subagent::SubagentSetup>,
+) -> PanelView {
+    // **保持 store 的原顺序**：清单的顺序是模型表达的计划次序，排序会篡改语义。
+    let items = todo.snapshot();
+    let todos: Vec<TodoLine> = items
+        .iter()
+        .take(PANEL_TODO_MAX)
+        .map(|item| TodoLine {
+            text: item.content.chars().take(MAX_TODO_CONTENT_CHARS).collect(),
+            mark: match item.status {
+                TodoStatus::Pending => RowMark::Plain,
+                TodoStatus::InProgress => RowMark::Active,
+                // 放弃也是「不用再做了」：字形与完成同档。
+                TodoStatus::Completed | TodoStatus::Cancelled => RowMark::Done,
+                // `TodoStatus` 是 `#[non_exhaustive]`：新增状态会静默显示为 Plain
+                // （不编译报错）—— 兜底在此，字形选择不会阻断编译。
+                _ => RowMark::Plain,
+            },
+        })
+        .collect();
+
+    // `live_labels()` 已按 handle 升序，且只含仍在跑的；这里不再排、不再筛。
+    let labels = subagent.map(|s| s.live_labels()).unwrap_or_default();
+    let running: Vec<RunningLine> = labels
+        .iter()
+        .take(PANEL_RUNNING_MAX)
+        .map(|(handle, label)| RunningLine {
+            // handle 是派发方的可辨标识，**不截断** —— 截了就对不上话。
+            handle: handle.clone(),
+            label: label.chars().take(MAX_DESCRIPTION_CHARS).collect(),
+        })
+        .collect();
+
+    PanelView {
+        // 溢出只计数、不留文本：UI 据此画 `+N` / `+N 在跑`。
+        todos_hidden: items.len().saturating_sub(todos.len()),
+        todos,
+        running_hidden: labels.len().saturating_sub(running.len()),
+        running,
+    }
+}
+
+/// [`build_view`] 的变体：额外带上定时循环、跨回合目标与侧栏的状态投影。
 ///
 /// 单独开一个入口而不是改 `build_view` 的签名：后者有十余处调用点，其中绝大多数
 /// 与定时器无关。循环状态只存在于 `app_loop::run` 的局部变量里，只有它的几个
@@ -202,6 +277,7 @@ pub fn build_view_with_loop(
     theme: ThemeKind,
     loop_state: Option<ys_tui_coding::LoopView>,
     goal: Option<ys_tui_coding::GoalView>,
+    panel: PanelView,
 ) -> CodingView {
     let mut view = build_view(
         cfg,
@@ -215,6 +291,7 @@ pub fn build_view_with_loop(
     );
     view.loop_state = loop_state;
     view.goal = goal;
+    view.panel = panel;
     view
 }
 
@@ -1260,6 +1337,7 @@ mod tests {
             ThemeKind::default(),
             Some(loop_view.clone()),
             Some(goal_view.clone()),
+            PanelView::default(),
         );
 
         assert_eq!(view.loop_state, Some(loop_view), "loop_state 必须原样透传");
@@ -1292,6 +1370,7 @@ mod tests {
             ThemeKind::default(),
             None,
             None,
+            PanelView::default(),
         );
 
         assert_eq!(view.loop_state, None, "没循环时 loop_state 必须是 None");

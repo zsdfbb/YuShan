@@ -63,7 +63,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use ys_core::{ContentBlock, Message, Role, StopReason};
@@ -72,7 +72,7 @@ use ys_loop::{AgentInput, LoopError, RunResult};
 use ys_protocol::{Boundary, Envelope, Outbound, QueueBoundarySource, Request};
 use ys_runtime::{Agent, AgentPorts};
 use ys_tools_basic::{BackgroundTasks, render_completion};
-use ys_tui_coding::{CodingView, ThemeKind};
+use ys_tui_coding::{CodingView, PanelView, ThemeKind};
 
 use crate::capabilities::{self, CompactOpening};
 use crate::config::Config;
@@ -81,11 +81,17 @@ use crate::logging;
 use crate::provider::{ApiModel, FetchModelsResult, ModelCache, ProviderRegistry};
 use crate::state::StateStore;
 use crate::status::TurnStats;
-use crate::view::build_view_with_loop;
+use crate::view::{build_view_with_loop, panel_view};
 use crate::wiring::Wiring;
 
 /// 共享 sweeper 的 tick 间隔 —— 100ms。
 const BG_SWEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 回合中侧栏推送的节流窗口。
+///
+/// 存在的理由不是「省带宽」而是「合并批量 apply 的连跳」：模型一次可能连续调
+/// 3~4 次 todo 工具（每项一次 apply），不节流的话每次都要整份快照重传。
+const PANEL_THROTTLE: Duration = Duration::from_millis(300);
 
 /// 共享 sweeper 的进程级条目 —— (注册表的弱引用, sweeper 任务句柄)。
 type BgSweeperEntry = (Weak<BackgroundTasks>, tokio::task::JoinHandle<()>);
@@ -472,6 +478,21 @@ pub async fn run(
     // `/new` / `/resume` 改的是它内部的指向（`retarget`），这里不需要重新取。
     let todo_store = factory.todo();
 
+    // 侧栏推送的复用基线：**每次发出 `Outbound::View` 时都要同步写**，
+    // 否则回合中复用的是陈旧视图（状态行/token 数会回退）。
+    //
+    // `None` = 本进程还没发过任何整份视图。此时回合中的推送**直接跳过**：没有基线就
+    // 无从「只替换 `panel` 一个字段」，而重新造一份完整视图要再调一次 `build_view` ——
+    // 那正是本设计拒绝的事。第一份完整视图总会在回合末的刷新点发出，回合中的推送只服务
+    // 「回合很长、用户要提前看见」；它迟到一次不影响任何正确性。
+    let mut last_view: Option<CodingView> = None;
+    // 上次推给 UI 的侧栏投影（`None` = 还没推过）：变更检测的唯一判据，靠
+    // `PanelView: PartialEq`（无变化零流量，**包括侧栏关着时** —— 开关是 UI 本地状态，
+    // app 侧不知道）。
+    let mut last_panel: Option<PanelView> = None;
+    // 上次推送的时刻（节流判据）：首次立即允许推送（否则开局 300ms 内的变化会被无谓吞掉）。
+    let mut last_push = Instant::now() - PANEL_THROTTLE;
+
     loop {
         // 等一条 UI 请求；后台模型目录若尚未返回，则与之赛跑。目录**一次性**到达，
         // 收到后把 `models_rx` 置 `None`，此后主循环只等 `Request`。
@@ -541,6 +562,10 @@ pub async fn run(
                     message,
                     // 占位消息不是用户说的话 ⇒ 不贡献标题素材。
                     None,
+                    &todo_store,
+                    &mut last_view,
+                    &mut last_panel,
+                    &mut last_push,
                 )
                 .await?;
                 // 回合收场后刷新视图（本臂 `continue`，走不到循环尾部那次刷新）——
@@ -556,7 +581,9 @@ pub async fn run(
                     theme,
                     loop_state.as_ref().map(|s| s.view(false)),
                     None,
+                    panel_view(&todo_store, subagent.as_ref()),
                 );
+                last_view = Some(view.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -601,6 +628,10 @@ pub async fn run(
                     message,
                     // 占位消息不是用户说的话 ⇒ 不贡献标题素材。
                     None,
+                    &todo_store,
+                    &mut last_view,
+                    &mut last_panel,
+                    &mut last_push,
                 )
                 .await?;
                 // 回合收场的快照刷新与其它请求同规（本臂 `continue`，走不到循环尾部
@@ -616,7 +647,9 @@ pub async fn run(
                     theme,
                     loop_state.as_ref().map(|s| s.view(false)),
                     None,
+                    panel_view(&todo_store, subagent.as_ref()),
                 );
+                last_view = Some(view.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -641,20 +674,23 @@ pub async fn run(
 
                 // 标记「正在跑」：状态行要能看到 `正在跑` 而不是一个过期的「几分钟后」。
                 let turning_view = loop_state.as_ref().map(|s| s.view(true));
+                let view = build_view_with_loop(
+                    &config,
+                    &agent,
+                    &wiring,
+                    &config.registry,
+                    &state_store,
+                    &stats,
+                    session_started,
+                    theme,
+                    turning_view.clone(),
+                    None,
+                    panel_view(&todo_store, subagent.as_ref()),
+                );
+                last_view = Some(view.clone());
                 send_or_flush(
                     &out_tx,
-                    Outbound::View(build_view_with_loop(
-                        &config,
-                        &agent,
-                        &wiring,
-                        &config.registry,
-                        &state_store,
-                        &stats,
-                        session_started,
-                        theme,
-                        turning_view.clone(),
-                        None,
-                    )),
+                    Outbound::View(view),
                     &mut debug,
                     &stats,
                     run_rounds,
@@ -679,6 +715,10 @@ pub async fn run(
                     loop_placeholder(&prompt),
                     // 定时消息不是用户说的话 ⇒ 不贡献标题素材。
                     None,
+                    &todo_store,
+                    &mut last_view,
+                    &mut last_panel,
+                    &mut last_push,
                 )
                 .await;
 
@@ -695,7 +735,9 @@ pub async fn run(
                     theme,
                     idle_view,
                     None,
+                    panel_view(&todo_store, subagent.as_ref()),
                 );
+                last_view = Some(view.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -721,7 +763,9 @@ pub async fn run(
                         theme,
                         loop_state.as_ref().map(|s| s.view(false)),
                         None,
+                        panel_view(&todo_store, subagent.as_ref()),
                     );
+                    last_view = Some(view.clone());
                     send_or_flush(
                         &out_tx,
                         Outbound::View(view),
@@ -836,6 +880,10 @@ pub async fn run(
                     &worktree,
                     message,
                     raw_user_text,
+                    &todo_store,
+                    &mut last_view,
+                    &mut last_panel,
+                    &mut last_push,
                 )
                 .await?;
 
@@ -949,6 +997,10 @@ pub async fn run(
                         follow_up,
                         // 占位输入没有用户原文 ⇒ 标题素材传 `None`（不能拿它当标题）。
                         None,
+                        &todo_store,
+                        &mut last_view,
+                        &mut last_panel,
+                        &mut last_push,
                     )
                     .await?;
                     advance_state.used = advance_state.used.saturating_add(1);
@@ -985,6 +1037,10 @@ pub async fn run(
                         wrap,
                         // 占位输入没有用户原文 ⇒ 标题素材传 `None`。
                         None,
+                        &todo_store,
+                        &mut last_view,
+                        &mut last_panel,
+                        &mut last_push,
                     )
                     .await?;
                     // 这里的回合数就是**收卷之后**的计数：它若被 consume，这里会是 201。
@@ -1506,7 +1562,9 @@ pub async fn run(
             theme,
             loop_state.as_ref().map(|s| s.view(false)),
             None,
+            panel_view(&todo_store, subagent.as_ref()),
         );
+        last_view = Some(view.clone());
         send_or_flush(
             &out_tx,
             Outbound::View(view),
@@ -1699,6 +1757,15 @@ struct TurnCtx<'a> {
     /// `YUSHAN_LOG_DIR` 的时间窗 —— 路径取自 `Config` 而不是现读环境变量，
     /// 所以无论何时落，写的都是自己那份。
     log_path: Option<PathBuf>,
+    /// 侧栏投影的输入（todo store 活在 `run()` 里，按引用传下来）。
+    todo: &'a ys_tools_todo::TodoStore,
+    /// 侧栏推送的复用基线 —— **每次整份 `View` 发出后都要同步更新**。
+    /// `None` = 本进程还没发过整份视图 ⇒ 回合中的推送没有可替换的基线，直接跳过。
+    last_view: &'a mut Option<CodingView>,
+    /// 上次推给 UI 的侧栏投影（`None` = 还没推过）。
+    last_panel: &'a mut Option<PanelView>,
+    /// 上次推送的时刻（节流判据）。
+    last_push: &'a mut Instant,
 }
 
 /// 一个回合的结局：`Ok` 是本回合的 `RunResult`，`Err` 是模型 / 工具失败
@@ -1873,6 +1940,10 @@ async fn run_turn_chain(
     worktree: &WorktreeHandle,
     message: Message,
     raw_user_text: Option<String>,
+    todo: &ys_tools_todo::TodoStore,
+    last_view: &mut Option<CodingView>,
+    last_panel: &mut Option<PanelView>,
+    last_push: &mut Instant,
 ) -> Result<TurnOutcome, AppLoopError> {
     let request_started = Instant::now();
     let deadline = request_started + config.max_turn_duration();
@@ -1896,6 +1967,10 @@ async fn run_turn_chain(
         debug,
         debug_session_id,
         log_path: config.log_path().map(Path::to_path_buf),
+        todo,
+        last_view,
+        last_panel,
+        last_push,
     };
     // 外层 `Err` = UI 已收摊（出站失败）：先收尾 debug 再退出；
     // 内层 `TurnOutcome` 的 `Err` 只是本回合模型/工具失败，app 继续。
@@ -2038,6 +2113,46 @@ fn subagent_placeholder() -> Message {
 
 /// 逐轮计时状态机 —— 定义在 [`crate::round_clock`]（两条入口共用同一套口径）。
 use crate::round_clock::{RoundClock, turn_cache, turn_line};
+
+/// 回合中把侧栏投影推给 UI —— **只在内容变了且过了节流窗口时**才发。
+///
+/// todo 与「谁在跑」都在回合**内**变，不推则用户要等到回合收场才看见。
+///
+/// **不调 `build_view_with_loop`**：它要 `&Agent`（此刻已被 `&mut` 借走），且会读
+/// `Instant` / `state_store` —— 那些字段的语义是「整份视图刷新」，不是「侧栏内容变了」。
+/// 这里只替换上次已发视图的 `panel` 一个字段。
+///
+/// 两条判据（缺一条都会错）：
+/// - **变更检测** `last_panel != Some(&next)`：无变化零流量（包括侧栏关着时 —— 开关
+///   是 UI 本地状态，app 不知道）；
+/// - **节流** `elapsed() >= PANEL_THROTTLE`：合并一次批量 apply 的连跳 `revision`。
+///   它只是**丢弃**，不安排下一次（不新增定时器）。
+///
+/// **逐字段传入而不收 `&mut TurnCtx`**：回合执行期 `ctx.wiring` 被 `ports()` 借住，
+/// 整包借 `ctx` 与它冲突；这里要碰的几个字段与它互不相交。
+async fn push_panel(
+    todo: &ys_tools_todo::TodoStore,
+    subagent: Option<&crate::subagent::SubagentSetup>,
+    last_view: &mut Option<CodingView>,
+    last_panel: &mut Option<PanelView>,
+    last_push: &mut Instant,
+    out_tx: &mpsc::Sender<Outbound<CodingView>>,
+) -> Result<(), AppLoopError> {
+    // 基线还没有 ⇒ 无从「只替换一个字段」。首份完整视图由回合末的刷新点发出，
+    // 回合中的推送只服务「回合很长、用户要提前看见」—— 迟到一次不影响正确性。
+    let Some(base) = last_view.as_mut() else {
+        return Ok(());
+    };
+    let next = panel_view(todo, subagent);
+    if last_panel.as_ref() == Some(&next) || last_push.elapsed() < PANEL_THROTTLE {
+        return Ok(());
+    }
+    base.panel = next.clone();
+    *last_panel = Some(next);
+    *last_push = Instant::now();
+    let view = base.clone();
+    send(out_tx, Outbound::View(view)).await
+}
 
 /// 跑**一个回合**：排空残留边界 → `begin_turn` → 新建边界源 → `run_turn` 与事件
 /// 转发交错 → 回合末排空事件信道。**记账 / 写穿 meta 不在此处** —— 由调用方拿到
@@ -2227,6 +2342,15 @@ async fn run_turn_once(
                         ctx.log_path.as_deref(),
                     );
                     send(ctx.out_tx, Outbound::Event(env)).await?;
+                    push_panel(
+                        ctx.todo,
+                        ctx.subagent,
+                        &mut *ctx.last_view,
+                        &mut *ctx.last_panel,
+                        &mut *ctx.last_push,
+                        ctx.out_tx,
+                    )
+                    .await?;
                 }
                 // 轮边界中途插话 / 中止：UI 写信道 ②，这里泵进
                 // `BoundarySource`，由 `BasicLoop` 在轮边界拉取。
@@ -2313,6 +2437,15 @@ async fn run_turn_once(
             ctx.log_path.as_deref(),
         );
         send(ctx.out_tx, Outbound::Event(env)).await?;
+        push_panel(
+            ctx.todo,
+            ctx.subagent,
+            &mut *ctx.last_view,
+            &mut *ctx.last_panel,
+            &mut *ctx.last_push,
+            ctx.out_tx,
+        )
+        .await?;
     }
     // 兜底：`RoundStarted` 已开轮、终局事件却没跟到（失败路径理论上会发生）时，
     // 仍为那一轮落一行 —— 排障时「跑了但没读数」比「读数为 0」更难查。

@@ -157,12 +157,23 @@ graph LR
 /// 120 列下 120 → 90，+39%。这是「静态大小」这一已定取舍的代价上界。
 const SIDE_WIDTH: u16 = 30;
 
-/// 栏宽：`saturating_sub` 保 Chat 优先。屏宽 ≤ `MIN_WIDTH`（`draw.rs:91`）⇒ 0 ⇒ 不画栏。
+/// 侧栏的**最小可用宽度**。低于它就干脆不画 —— 宁可整屏归主列，也不产出无意义的碎条。
+///
+/// 12 列 = 内区 10 列（`Block::bordered` 左右各占 1）≈ 5 个汉字。实测 ratatui 0.30：
+/// 栏宽 1–2 列时 `Block::inner` 的内区宽为 **0**，侧栏只剩一根边框、`truncate_to_width`
+/// 只吐出 `…` —— 既占位置又什么都不说。
+const SIDE_MIN_WIDTH: u16 = 12;
+
+/// 栏宽：`saturating_sub` 保 Chat 优先；不足 [`SIDE_MIN_WIDTH`] 则归 0（不画栏）。
 ///
 /// **不用** `Layout::horizontal([Min(1), Length(30)])`：实测 ratatui 0.30 会优先满足
 /// `Length`，把 Chat 压到 1 列（W=20 ⇒ chat 宽 1 / 栏宽 19）。保 Chat 才是意图。
+///
+/// 两个下界各管一件事：`total_width - MIN_WIDTH` 保 Chat 有 10 列可用，
+/// `SIDE_MIN_WIDTH` 保侧栏自己不低于可读下限。W < 22 时两条都不满足 ⇒ 不画栏。
 fn side_width(total_width: u16) -> u16 {
-    SIDE_WIDTH.min(total_width.saturating_sub(MIN_WIDTH))
+    let w = SIDE_WIDTH.min(total_width.saturating_sub(MIN_WIDTH));
+    if w < SIDE_MIN_WIDTH { 0 } else { w }
 }
 
 /// 一帧全部几何的**唯一来源**。纯算术、零分配，同一帧内可多次调用（结果恒等）。
@@ -270,6 +281,7 @@ context.md 要求「不能靠手算假设」，我实测了 ratatui 0.30（`prob
 | 常量 | 值 | 位置 | 理由 |
 |---|---|---|---|
 | `SIDE_WIDTH` | 30 | `draw.rs` | 内区 28 ≈ 14 汉字 |
+| `SIDE_MIN_WIDTH` | 12 | 同上 | 内区 10 列 ≈ 5 汉字；栏宽低于此 ⇒ 不画栏（1–2 列时 `Block::inner` 内区为 0，只剩边框） |
 | `PANEL_TODO_MAX` | 24 | `view.rs` | 一屏（~40 行）可见上限的 2 倍；更长时靠 `+N` 提示（§3.3） |
 | `PANEL_RUNNING_MAX` | 8 | 同上 | 与侧栏内区高匹配：40 行屏 ⇒ 每栏 ~19 行，扣标题与 `+N` 后 8 条能完整显示（不挂派发上限） |
 | `MAX_TODO_CONTENT_CHARS` | 96 | `apps/coding-agent/view.rs` | ≤288 B/项（CJK 3 B） |
@@ -293,7 +305,7 @@ todo 工具在回合内被调用 → TodoStore.apply → revision += 1
 回合中事件转发臂（app_loop.rs:2203 旁）─────────┤
   next = panel_view(&todo_store, subagent)    │
   if next != last_panel { 发 Outbound::View } │
-  （300ms 节流，与 TICK_INTERVAL 同阶）         │
+  （300ms 节流，合并批量 apply 的连跳）         │
                                               ▼
 回合收尾（app_loop.rs:1486）→ build_view_with_loop(..., panel)
                                               │
@@ -464,7 +476,7 @@ pub fn live_labels(&self) -> Vec<(String, Arc<str>)>;   // 同样先 retain 清�
 | # | 用例 | 变异注入 ⇒ 应变红 |
 |---|---|---|
 | G1 | **几何同源**：开栏后 `chat_inner_rect.width + side_width == total_w` 且 `x == 0`；关栏时逐字节回到基线 | `frame_areas` 里 `input_geom` 忘了走主列 ⇒ 宽不同源 |
-| G2 | **窄屏不塌**：`total_w ∈ {10, 11, 20, 31, 40}` × 开关两态，恒有 `chat_w ≥ MIN_WIDTH` 或 `side_w == 0` | 把 `saturating_sub` 换成减法（或改用 `Layout::horizontal([Min(1), Length(30)])`）⇒ W=20 时 chat_w=1，红 |
+| G2 | **窄屏不塌**：`total_w ∈ {10, 11, 20, 21, 22, 31, 40, 80}` × 开关两态，恒有 `chat_w ≥ MIN_WIDTH`；且 `side_w == 0` **或** `side_w ≥ SIDE_MIN_WIDTH`（两态之间无「1–11 列的碎条」） | ① 把 `saturating_sub` 换成减法 ⇒ W=10 下溢；② 改用 `Layout::horizontal([Min(1), Length(30)])` ⇒ W=20 时 chat_w=1；③ 去掉 `SIDE_MIN_WIDTH` 判据 ⇒ W=11/12 出现内区宽 0 的碎条 |
 | G3 | **50/50 奇数高**：H=25 ⇒ 13/12，H=7 ⇒ 4/3；两半的外框字符都在 | 改成 `H/2` 各算一次 ⇒ 和 ≠ H，红 |
 | G4 | **入口封顶**：`panel_view` 对 30 项 todo、20 个 running 的输入 ⇒ 输出恰好 24 / 8 行 | 去掉封顶 ⇒ 红 |
 | G5 | **UTF-8 截断**：200 字符 CJK 内容 + 120 字符 CJK description ⇒ 每条渲染行 `display_width() ≤ 内区宽`，且**不 panic** | 改用 `split_at` ⇒ panic |

@@ -128,6 +128,11 @@ pub struct App {
     /// 改动**只能**经 [`Self::set_theme`] —— 它一并作废 markdown 缓存与布局记忆；
     /// 直接赋值会让屏上留着旧配色的已渲染产物。
     pub(crate) theme: ThemeKind,
+    /// 右侧栏（todo + subagent 运行状态）是否可见 —— 纯 UI 本地开关。
+    ///
+    /// 与 `view.panel`（**数据**）方向相反：那是 app 侧推来的快照内容，这是 UI 的显示意愿；
+    /// 默认隐藏，不落盘、不进 `Outbound::View`。
+    pub(crate) panel_visible: bool,
     /// 测试专用：是否把引言作为布局的第 0 块（生产恒为真）。
     ///
     /// 关掉后 `intro_lines` 返回空 ⇒ 不占块、不进总行数。既有的大量用例断言的是
@@ -246,6 +251,7 @@ impl App {
             abort_requested: false,
             thinking_visible,
             theme,
+            panel_visible: false,
             should_quit: false,
             turn_started_at: None,
             working_dot: 0,

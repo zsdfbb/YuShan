@@ -39,6 +39,7 @@ use crate::input::InputBuffer;
 use crate::selection::Highlight;
 use crate::theme::Palette;
 use crate::transcript::TranscriptLine;
+use crate::view::{PanelView, RowMark};
 
 /// 输入区最多显示的内容行数（不含边框）。
 const INPUT_MAX_LINES: usize = 5;
@@ -90,6 +91,29 @@ const TOOL_MARK_GAP: usize = 2;
 /// 窗口小于此尺寸直接不渲染（留给「终端太小」）。
 const MIN_WIDTH: u16 = 10;
 const MIN_HEIGHT: u16 = 5;
+
+/// 侧栏宽度。30 列的**内区**约 28 列 ≈ 14 个汉字 —— 够放下 `☐ 重构 panel_view` 这类条目。
+const SIDE_WIDTH: u16 = 30;
+
+/// 侧栏的**最小可用宽度**。低于它就干脆不画 —— 宁可整屏归主列，也不产出无意义的碎条。
+///
+/// 12 列 = 内区 10 列（`Block::bordered` 左右各占 1）≈ 5 个汉字。实测 ratatui 0.30：
+/// 栏宽 1–2 列时 `Block::inner` 的内区宽为 **0**，侧栏只剩一根边框、`truncate_to_width`
+/// 只吐出 `…` —— 既占位置又什么都不说。
+const SIDE_MIN_WIDTH: u16 = 12;
+
+/// 侧栏**实际**宽度：总宽扣掉 Chat 的最小宽度后的余额，且不超过 [`SIDE_WIDTH`]。
+///
+/// **不能靠 `Layout::horizontal([Min(1), Length(SIDE_WIDTH)])`**：实测它会优先满足
+/// `Length`、把 Chat 压到 1 列（W=20 ⇒ chat 1 / 栏 19），窄屏下 Chat 直接不可用。
+/// 故手写钳制：余额不足时宁可收窄侧栏，也不夺 Chat 的空间。
+///
+/// 两个下界各管一件事：`total_width - MIN_WIDTH` 保 Chat 有 [`MIN_WIDTH`] 列可用，
+/// [`SIDE_MIN_WIDTH`] 保侧栏自己不低于可读下限。W < 22 时两条都不满足 ⇒ 不画栏（归 0）。
+fn side_width(total_width: u16) -> u16 {
+    let w = SIDE_WIDTH.min(total_width.saturating_sub(MIN_WIDTH));
+    if w < SIDE_MIN_WIDTH { 0 } else { w }
+}
 
 /// 筛选无命中时占位的那行（有候选但都不匹配）。中文全角括号，与既有提示同风格。
 const NO_MATCH: &str = "（无匹配）";
@@ -166,31 +190,31 @@ fn ui_with(frame: &mut Frame, app: &mut App, palette: Palette) {
     // 滚动数学与画面读**同一份**布局，故不会出现「滚动按新、画面按旧」。
     let scroll = app.sync_scroll_state(area.width, area.height, now);
 
-    let chunks = Layout::vertical([
-        Constraint::Min(3),                                // Chat
-        Constraint::Length(input_height(app, area.width)), // Input（1..=N 自适应）
-        Constraint::Length(1),                             // Status（最底，常驻）
-    ])
-    .split(area);
+    let a = frame_areas(app, area);
 
     // 输入框宽度的**唯一写入处**：方向键的「按视觉行上下」需要与屏幕相同的折行宽度，
     // 而缓冲层拿不到终端尺寸。写在这里（每帧、每个渲染入口都经过）⇒ 只要画过一帧就已知。
     app.input.wrap_width = Some(input_inner_width(area.width));
 
-    draw_transcript(frame, chunks[0], app, scroll.top_row, palette);
+    draw_transcript(frame, a.chat, app, scroll.top_row, palette);
     // 选区高亮**独立一层**：它需要 `&mut app`（写字形缓存），不能塞进 `draw_transcript`。
-    // 内区几何在**整屏** `area` 上算好再传下去 —— 高亮层不得再从 `chunks[0]` 推一遍：
+    // 内区几何在**整屏** `area` 上算好再传下去 —— 高亮层不得再从 `a.chat` 推一遍：
     // 那是二次切分，会把内区多扣掉「Input 高度 + 状态行」。
     if let Some(inner) = chat_inner(app, area) {
         draw_selection(frame, inner, scroll.top_row, app);
     }
-    draw_input(frame, chunks[1], app);
-    draw_status(frame, chunks[2], app, palette);
+    draw_input(frame, a.input, app);
+    draw_status(frame, a.status, app, palette);
 
     // 补全浮层**最后画**：Clear 后盖在 Chat 区域上（设计 §1「独立于三个 pane」）。
     // 它不参与上面的布局计算 —— 开合时三个 pane 的位置一个像素都不动。
     if let Some(state) = &app.completion {
-        draw_completion(frame, chunks[0], state, palette);
+        draw_completion(frame, a.chat, state, palette);
+    }
+
+    // 侧栏**最后画**（与补全浮层同规：不参与上面的布局计算）。
+    if let Some(side) = a.side {
+        draw_sidebar(frame, side, &app.view.panel, palette);
     }
 }
 
@@ -210,6 +234,44 @@ fn input_inner_width(total_width: u16) -> usize {
     total_width.saturating_sub(2).max(1) as usize
 }
 
+/// 一帧的四个区域。**唯一来源** —— [`ui_with`] / [`chat_area`] / [`input_geom`] 全经这里，
+/// 不允许任何一处自己再 `Layout::vertical` 一遍（那会漂移成「滚动按 A、画面按 B」）。
+struct FrameAreas {
+    chat: Rect,
+    input: Rect,
+    status: Rect,
+    /// 侧栏；宽度余额不足时为 `None`（整屏退化为改造前的三段切分）。
+    side: Option<Rect>,
+}
+
+fn frame_areas(app: &App, total: Rect) -> FrameAreas {
+    // **顺序不可反**：先在**整屏宽**上纵向切分，再只把 Chat 带横向让位给侧栏。
+    //
+    // 反过来（先横切整屏、再竖切 Chat 带）会让 `input_height` 拿到被侧栏压窄后的宽度，
+    // 于是「开关 → 输入框宽 → 折行行数 → 输入框高 → Chat 高 → 栏高」形成反馈环：
+    // 栏高反过来影响开关是否值得打开。先竖后横打断这个环。
+    let v = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(input_height(app, total.width)),
+        Constraint::Length(1),
+    ])
+    .split(total);
+
+    let side_w = side_width(total.width);
+    let (chat, side) = if side_w == 0 || !app.panel_visible {
+        (v[0], None)
+    } else {
+        let h = Layout::horizontal([Constraint::Min(1), Constraint::Length(side_w)]).split(v[0]);
+        (h[0], Some(h[1]))
+    };
+    FrameAreas {
+        chat,
+        input: v[1],
+        status: v[2],
+        side,
+    }
+}
+
 /// 输入区的几何 + 可视窗口：`(内区矩形, 折行宽度, 滚动偏移, 可视行数)`。
 ///
 /// **渲染与鼠标命中共用这一个来源** —— 否则「高亮按 A 算、命中按 B 算」，
@@ -225,12 +287,7 @@ pub(crate) fn input_geom(
     if width < MIN_WIDTH || height < MIN_HEIGHT {
         return None;
     }
-    let area = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(input_height(app, width)),
-        Constraint::Length(1),
-    ])
-    .split(Rect::new(0, 0, width, height))[1];
+    let area = frame_areas(app, Rect::new(0, 0, width, height)).input;
     let block = Block::bordered().title(" Input ");
     let inner = block.inner(area);
     let inner_w = input_inner_width(width);
@@ -244,12 +301,7 @@ pub(crate) fn input_geom(
 
 /// Chat 区（含边框）—— 与 [`ui`] 的布局同源，供滚动算术复用。
 fn chat_area(app: &App, area: Rect) -> Rect {
-    Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(input_height(app, area.width)),
-        Constraint::Length(1),
-    ])
-    .split(area)[0]
+    frame_areas(app, area).chat
 }
 
 /// Chat 窗格的外框：**只留顶部标题线**（去掉左右竖线，拷贝友好，设计 §2.8），
@@ -657,6 +709,123 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, palette: Palette) {
     let text = status_text(app, area.width as usize);
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(palette.muted)),
+        area,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 右侧栏（todo 清单 / subagent 运行状态）
+// ---------------------------------------------------------------------------
+
+/// 右侧栏：上下两个等高的框（todo 清单 / subagent 在跑状态）。
+///
+/// 两栏用 `Percentage(50) × 2`：实测 `Percentage(50)`、`Fill(1)`、`Ratio(1,2)` 三种
+/// 写法逐格相同，且两格之和恒等于总高（奇数高时上栏多 1 行）⇒ **不需要奇偶补偿**。
+fn draw_sidebar(frame: &mut Frame, area: Rect, panel: &PanelView, palette: Palette) {
+    let rows =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    draw_todo_section(frame, rows[0], panel, palette);
+    draw_running_section(frame, rows[1], panel, palette);
+}
+
+/// 侧栏上栏：todo 清单。
+///
+/// 只读 [`PanelView`] —— 不认 todo 的实现类型，也不读任何 app 侧 store。
+/// 每行先按**显示列**截断（CJK 算 2 列，只有 UI 知道内区宽）；纵向溢出由 `Paragraph`
+/// 自然裁掉，不自己算可见行 —— 末行的 `+N` 保留，否则用户会以为清单只有 N 项。
+fn draw_todo_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: Palette) {
+    let block = Block::bordered()
+        .border_style(Style::default().fg(palette.muted))
+        .title(" Todo ");
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(panel.todos.len() + 2);
+
+    if panel.todos.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "（无 todo）",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        for todo in &panel.todos {
+            // 三种状态字形给三种样式：进行中高亮、完成变暗，未开始保持正文色。
+            let (glyph, style) = match todo.mark {
+                RowMark::Plain => ("☐", Style::default().fg(palette.fg)),
+                RowMark::Active => ("▶", Style::default().fg(palette.accent)),
+                RowMark::Done => (
+                    "☑",
+                    Style::default().fg(palette.ok).add_modifier(Modifier::DIM),
+                ),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(glyph, style),
+                Span::raw(" "),
+                // 字形占 1 列 + 1 列空格 = 2 列，正文的截断预算要扣掉。
+                Span::styled(
+                    truncate_to_width(&todo.text, width.saturating_sub(2)),
+                    style,
+                ),
+            ]));
+        }
+    }
+
+    if panel.todos_hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("+{} 项未显示", panel.todos_hidden),
+            Style::default().fg(palette.muted),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(palette.bg)),
+        area,
+    );
+}
+
+/// 侧栏下栏：subagent 在跑状态。与 [`draw_todo_section`] 同构：
+/// handle 是标识（暗色），label 是工作主题（正文色）。
+fn draw_running_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: Palette) {
+    let block = Block::bordered()
+        .border_style(Style::default().fg(palette.muted))
+        .title(" Running ");
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(panel.running.len() + 2);
+
+    if panel.running.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "（无在跑的子任务）",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        for running in &panel.running {
+            // handle 是机器标识，用暗色退到背景；label 才是人要看的那一列。
+            let handle = truncate_to_width(&running.handle, width);
+            let used = display_width(&handle) + 1;
+            lines.push(Line::from(vec![
+                Span::styled(handle, Style::default().fg(palette.muted)),
+                Span::raw(" "),
+                Span::styled(
+                    truncate_to_width(&running.label, width.saturating_sub(used)),
+                    Style::default().fg(palette.fg),
+                ),
+            ]));
+        }
+    }
+
+    if panel.running_hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("+{} 个未显示", panel.running_hidden),
+            Style::default().fg(palette.muted),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .style(Style::default().bg(palette.bg)),
         area,
     );
 }

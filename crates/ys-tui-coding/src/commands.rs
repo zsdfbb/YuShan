@@ -50,7 +50,7 @@ const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|
 /// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
 const EFFORT_DEFAULT_TOKEN: &str = "default";
 
-static COMMANDS: [CommandSpec; 19] = [
+static COMMANDS: [CommandSpec; 20] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -84,6 +84,11 @@ static COMMANDS: [CommandSpec; 19] = [
     CommandSpec {
         name: "thinking",
         description: "开关思考内容的显示",
+        arg_hint: Some("[on|off]"),
+    },
+    CommandSpec {
+        name: "panel",
+        description: "开关右侧栏（todo 清单 + subagent 运行状态）",
         arg_hint: Some("[on|off]"),
     },
     CommandSpec {
@@ -197,6 +202,8 @@ pub enum LocalAction {
     Copy,
     /// `Some(on)` 显式设置，`None` 为 toggle。
     Thinking(Option<bool>),
+    /// `/panel` —— 右侧栏开关。`None` = 翻转，`Some(b)` = 显式设置。
+    Panel(Option<bool>),
     /// 无参 `/effort`：显示当前档位与用法（**不发请求**；真值在 `CodingView.effort`）。
     Effort,
     /// 无参 `/goal`：打印当前目标与进度（**不发请求**；真值在 `CodingView.goal`）。
@@ -299,6 +306,14 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
             Some("off") => Action::Local(LocalAction::Thinking(Some(false))),
             Some(other) => Action::Local(LocalAction::Hint(format!(
                 "用法：/thinking [on|off]（`{other}` 不是有效取值）"
+            ))),
+        },
+        "panel" => match args.first().copied() {
+            None => Action::Local(LocalAction::Panel(None)),
+            Some("on") => Action::Local(LocalAction::Panel(Some(true))),
+            Some("off") => Action::Local(LocalAction::Panel(Some(false))),
+            Some(other) => Action::Local(LocalAction::Hint(format!(
+                "用法：/panel [on|off]（`{other}` 不是有效取值）"
             ))),
         },
         // 无参 = 本地显示当前档位（真值在视图里，TUI 不持有第二份）；
@@ -1098,6 +1113,15 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
                 if app.thinking_visible { "on" } else { "off" }
             )
         }
+        // 侧栏开关**只有一份真值**（`App.panel_visible`）：`view.panel` 是数据，
+        // 不随开关变化，也不回读它。
+        LocalAction::Panel(explicit) => {
+            app.panel_visible = explicit.unwrap_or(!app.panel_visible);
+            // 侧栏开合改变 Chat 宽度 ⇒ 全局重折行 ⇒ 视觉行号空间整体作废。
+            // 残留锚点会高亮到无关文字，故必须清。
+            app.selection.clear();
+            format!("panel: {}", if app.panel_visible { "on" } else { "off" })
+        }
         // **只读视图**：档位的真值归 app 侧（`/effort <level>` 发请求后由下一份
         // 快照推回来），这里不写 `app.view.effort` —— 否则 UI 会先于 app 显示
         // 一个尚未落盘的状态。
@@ -1318,7 +1342,7 @@ mod tests {
         assert!(has(|r| matches!(r, Request::Export { .. })), "缺 Export");
     }
 
-    /// `all_commands()` 恰好 19 条（= `COMMANDS` 的声明长度）。
+    /// `all_commands()` 恰好 20 条（= `COMMANDS` 的声明长度）。
     ///
     /// 长度写死是有意的：**表变长就是行为变更**，要在一个地方被看见（`--help`
     /// 命令段、补全浮层、`/help` 全表三者同时变宽）。只断言「不为空」会让
@@ -1327,10 +1351,10 @@ mod tests {
     /// 变异：`COMMANDS` 的声明长度与实际条目数不一致（如声明 19、实写 18）⇒
     /// 根本编不过；把一条条目注释掉而改声明长度 ⇒ 本用例变红。
     #[test]
-    fn all_commands_len_is_19() {
+    fn all_commands_len_is_20() {
         assert_eq!(
             all_commands().len(),
-            19,
+            20,
             "命令表增删必须同步本断言与 `&[CommandSpec; N]` 的 N"
         );
     }
@@ -1788,9 +1812,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "keybind", "status", "skills", "copy", "quit", "thinking", "effort",
-                "theme", "model", "login", "logout", "new", "clear", "resume", "compact", "loop",
-                "goal", "export",
+                "help", "keybind", "status", "skills", "copy", "quit", "thinking", "panel",
+                "effort", "theme", "model", "login", "logout", "new", "clear", "resume", "compact",
+                "loop", "goal", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );

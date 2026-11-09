@@ -405,7 +405,7 @@ impl Drop for PendingResultsBinding {
     }
 }
 
-/// handle → 子 agent 自己那份边界源（`subagent_send` 的投递目标）。
+/// handle → 在跑的子 agent 的注册项（[`HandleEntry`]：投递目标 + 人类可读主题）。
 ///
 /// # 为何用 `Weak`
 ///
@@ -416,9 +416,24 @@ impl Drop for PendingResultsBinding {
 ///
 /// 与 [`PendingResults`] / [`LiveSubagents`] 同一条理由：`/resume` 重建 agent，
 /// 但已在后台跑着的子 agent 不随之重建 ⇒ 注册表必须与工具持有的是**同一份**。
+///
+/// # 为何 label 与 target 同一张表
+///
+/// 「谁在跑」必须只有一个真值：分两张表（句柄表 + 主题表）会有一张先过期，
+/// 于是 UI 上出现「活着的 handle 配着已收尾的主题」这类拼接错。同一项里放
+/// `target` 与 `label`，生死判据只有 `target`。
 #[derive(Default)]
 pub struct SubagentHandles {
-    inner: Mutex<HashMap<String, Weak<QueueBoundarySource>>>,
+    inner: Mutex<HashMap<String, HandleEntry>>,
+}
+
+/// 一个在跑的子 agent 的注册项。
+///
+/// `target` 是投递目标（`Weak` ⇒ 子 agent 收尾即自动失效），`label` 是模型给的
+/// 人类可读主题，供 UI 的「在跑」栏展示。`Arc<str>` ⇒ 每次取快照只复制指针。
+struct HandleEntry {
+    target: Weak<QueueBoundarySource>,
+    label: Arc<str>,
 }
 
 impl SubagentHandles {
@@ -426,8 +441,19 @@ impl SubagentHandles {
     ///
     /// 必须在子 agent 的 `tokio::spawn` **之前**调用：父侧 `spawn` 返回句柄后可以立刻
     /// `send`，晚注册会让那条消息落空。
-    pub fn register(&self, handle: impl Into<String>, own: Arc<QueueBoundarySource>) {
-        self.lock().insert(handle.into(), Arc::downgrade(&own));
+    pub fn register(
+        &self,
+        handle: impl Into<String>,
+        own: Arc<QueueBoundarySource>,
+        label: Arc<str>,
+    ) {
+        self.lock().insert(
+            handle.into(),
+            HandleEntry {
+                target: Arc::downgrade(&own),
+                label,
+            },
+        );
     }
 
     /// 投递一条消息给**仍在跑**的子 agent（它在子的下一个轮边界被看到）。
@@ -440,10 +466,10 @@ impl SubagentHandles {
         // 先取目标、放锁，再 `push`：持锁调外部代码是坏习惯（`push` 会唤醒等待者）。
         let own = {
             let mut inner = self.lock();
-            let own = inner.get(handle).and_then(Weak::upgrade);
+            let own = inner.get(handle).and_then(|e| e.target.upgrade());
             if own.is_none() {
                 // 顺手清理已失效项，让错误正文里的列表就是当下真在跑的那批。
-                inner.retain(|_, weak| weak.strong_count() > 0);
+                inner.retain(|_, e| e.target.strong_count() > 0);
             }
             own
         };
@@ -467,10 +493,25 @@ impl SubagentHandles {
     /// 当前**仍在跑**的 handle（升序）—— 已收尾的条目顺手清理掉。
     pub fn live_handles(&self) -> Vec<String> {
         let mut inner = self.lock();
-        inner.retain(|_, weak| weak.strong_count() > 0);
+        inner.retain(|_, e| e.target.strong_count() > 0);
         let mut handles: Vec<String> = inner.keys().cloned().collect();
         handles.sort();
         handles
+    }
+
+    /// 当前**仍在跑**的子 agent 及其人类可读主题（按 handle 升序）。
+    ///
+    /// 与 [`Self::live_handles`] 同规：先清理死项再收集。两者键集合恒等 ——
+    /// 同一张表，不会分叉。`label` 是 `Arc<str>`，克隆零拷贝。
+    pub fn live_labels(&self) -> Vec<(String, Arc<str>)> {
+        let mut inner = self.lock();
+        inner.retain(|_, e| e.target.strong_count() > 0);
+        let mut rows: Vec<(String, Arc<str>)> = inner
+            .iter()
+            .map(|(handle, e)| (handle.clone(), e.label.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
     }
 
     /// 错误正文里的「有效 handle」一句话（锁内不留悬垂引用）。
@@ -483,7 +524,7 @@ impl SubagentHandles {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Weak<QueueBoundarySource>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, HandleEntry>> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -903,7 +944,7 @@ pub struct AppSubagentRunner<'a> {
     results: Arc<PendingResults>,
     /// 进程级的「仍在跑」计数（ADR-0055）—— 父回合的收场判据经它读出。
     live: Arc<LiveSubagents>,
-    /// handle → 子 agent 自己那份边界源（`subagent_send` 的投递目标）。
+    /// handle → 在跑的子 agent 的注册项（投递目标 + 主题）。
     ///
     /// 与 `results` / `live` 同一条共享路径：已在后台跑着的子 agent 不随 `/resume`
     /// 重建，它们的 handle 必须汇入**同一份**注册表。
@@ -1011,7 +1052,7 @@ pub struct SubagentSetup {
     /// 与 `results` / `live` 同样跨重建共享：写入方在回合开头，读方是每回合新建的
     /// [`AppSubagentRunner`]（经 [`make_runner`](Self::make_runner) 转递）。
     turn: Arc<AtomicU32>,
-    /// handle → 子 agent 自己那份边界源（`subagent_send` 的投递目标）。
+    /// handle → 在跑的子 agent 的注册项（投递目标 + 主题）。
     ///
     /// 与 `results` / `live` 同一条理由共享所有权：已在后台跑着的子 agent 不随
     /// `/resume` 重建，它们的 handle 必须汇入**同一份**注册表。
@@ -1146,6 +1187,14 @@ impl SubagentSetup {
     pub fn pending_results(&self) -> &Arc<PendingResults> {
         &self.results
     }
+
+    /// 在跑的子 agent 与主题的**当下快照**（供侧栏投影取用）。
+    ///
+    /// 与 [`Self::pending_results`] 不同：那边返回共享引用（写入方在别处），这边要现取
+    /// 快照 —— 快照的生死判据（`Weak` 是否还能 `upgrade`）只能在使用的那一刻成立。
+    pub fn live_labels(&self) -> Vec<(String, Arc<str>)> {
+        self.handles.live_labels()
+    }
 }
 
 impl SubagentRunner for AppSubagentRunner<'_> {
@@ -1171,6 +1220,7 @@ impl SubagentRunner for AppSubagentRunner<'_> {
     fn spawn(
         &self,
         prompt: &str,
+        label: &str,
         model: Option<&str>,
         mode: SubagentMode,
         _boundary: Option<&dyn BoundarySource>,
@@ -1190,7 +1240,8 @@ impl SubagentRunner for AppSubagentRunner<'_> {
         // 子 agent 自己那份边界源在**这里**建：必须在 `tokio::spawn` **之前**登记，
         // 否则从拿到句柄到 `execute` 建边界之间有一窗口，父的 `subagent_send` 会落空。
         let own = Arc::new(QueueBoundarySource::new());
-        self.handles.register(handle.clone(), own.clone());
+        self.handles
+            .register(handle.clone(), own.clone(), Arc::from(label));
         // **先占额、再 spawn**：`ChildTask` 持有守卫 ⇒ `execute` 的每条退出路径
         // （组装失败 / Ok / Err / future 被 drop）都由 `Drop` 回归。
         let task = self.child_task(resolved, child_limits, self.live.enter(), mode, own);
@@ -2033,13 +2084,19 @@ impl Tool for SubagentAsyncTool {
             .get("prompt")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("`prompt` 必填".into()))?;
+        // 主题是 schema 里的必填项，缺了就报错 —— 给个空串会让侧栏出现「无标题项」
+        // 这种静默降级（用户看不出是模型没给，还是 UI 丢了）。
+        let label = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("`description` 必填".into()))?;
         let model = input.get("model").and_then(|v| v.as_str());
         let mode = parse_subagent_mode(&input)?;
         let runner = ctx
             .subagent
             .ok_or_else(|| ToolError::Execution("本回合未挂载 subagent 能力".into()))?;
         let handle = runner
-            .spawn(prompt, model, mode, ctx.boundary)
+            .spawn(prompt, label, model, mode, ctx.boundary)
             .map_err(ToolError::Execution)?;
         Ok(ToolResult::text(
             format!(
@@ -2189,7 +2246,7 @@ mod tests {
         let handles = SubagentHandles::default();
         let own = Arc::new(QueueBoundarySource::new());
         let parent = Arc::new(QueueBoundarySource::new());
-        handles.register("sa1.1", own.clone());
+        handles.register("sa1.1", own.clone(), Arc::from("查日志"));
 
         handles
             .send("sa1.1", "收敛")
@@ -2222,8 +2279,8 @@ mod tests {
         let handles = SubagentHandles::default();
         let own = Arc::new(QueueBoundarySource::new());
         let other = Arc::new(QueueBoundarySource::new());
-        handles.register("sa1.2", own.clone());
-        handles.register("sa1.1", other.clone());
+        handles.register("sa1.2", own.clone(), Arc::from("查日志"));
+        handles.register("sa1.1", other.clone(), Arc::from("读配置"));
         assert_eq!(
             handles.live_handles(),
             vec!["sa1.1".to_string(), "sa1.2".to_string()],
@@ -4367,7 +4424,7 @@ mod tests {
         // ① `spawn` 立刻返回（不等子 agent 跑完）。
         let started = Instant::now();
         let handle = runner
-            .spawn("查一下", None, SubagentMode::General, None)
+            .spawn("查一下", "探查", None, SubagentMode::General, None)
             .expect("应能启动");
         assert!(
             started.elapsed() < Duration::from_millis(150),
@@ -4787,6 +4844,140 @@ mod tests {
         assert!(
             rescued.contains("FINDING: a.rs:1 — x"),
             "无正文时必须从工具结果抢救；实际 {rescued:?}"
+        );
+    }
+
+    /// 防的是「label 存错位置 / 取快照时丢 label / 返回空」这类回归：
+    /// 在跑的子 agent 必须能带上**模型给的那句主题**出现在「谁在跑」快照里。
+    #[test]
+    fn live_labels_reports_handle_and_label() {
+        let handles = SubagentHandles::default();
+        let own = Arc::new(QueueBoundarySource::new());
+        handles.register("sa1.1", own.clone(), Arc::from("查日志"));
+
+        assert_eq!(
+            handles.live_labels(),
+            vec![("sa1.1".to_string(), Arc::from("查日志"))],
+            "快照必须同时给出 handle 与它登记时的 label"
+        );
+    }
+
+    /// 防的是「把 `Weak` 改回 `Arc`（强引用 ⇒ 收尾的子 agent 永远『在跑』）」
+    /// 与「`retain` 判据写错」这两类回归：生死判据只有 `target` 能否 upgrade。
+    #[test]
+    fn live_labels_drops_finished_subagent() {
+        let handles = SubagentHandles::default();
+        let first = Arc::new(QueueBoundarySource::new());
+        let second = Arc::new(QueueBoundarySource::new());
+        handles.register("sa1.1", first.clone(), Arc::from("读配置"));
+        handles.register("sa1.2", second.clone(), Arc::from("查日志"));
+
+        // ① 一个子 agent 收尾（它的边界源被 drop）⇒ 只剩另一个。
+        drop(first);
+        assert_eq!(
+            handles.live_labels(),
+            vec![("sa1.2".to_string(), Arc::from("查日志"))],
+            "已收尾的子 agent 不得出现在快照里"
+        );
+
+        // ② 全部收尾 ⇒ 快照为空，而不是留下挂着旧 label 的幽灵条目。
+        drop(second);
+        assert!(
+            handles.live_labels().is_empty(),
+            "全部收尾后快照必须为空；实际 {:?}",
+            handles.live_labels()
+        );
+    }
+
+    /// 防的是「label 表与 handle 表分叉」这类回归 —— 设计要求「谁在跑」只有一个真值，
+    /// 两张表各算各的就会拼出「活着的 handle 配着已收尾的主题」。
+    #[test]
+    fn live_labels_and_live_handles_agree_on_keys() {
+        let handles = SubagentHandles::default();
+        let first = Arc::new(QueueBoundarySource::new());
+        let second = Arc::new(QueueBoundarySource::new());
+        let third = Arc::new(QueueBoundarySource::new());
+        handles.register("sa1.1", first.clone(), Arc::from("读配置"));
+        handles.register("sa1.2", second.clone(), Arc::from("查日志"));
+        handles.register("sa1.3", third.clone(), Arc::from("看测试"));
+
+        // 中间那个先收尾：既测「都还在」以外的情形，也测键集合而非位置对齐。
+        drop(second);
+        let from_labels: Vec<String> = handles
+            .live_labels()
+            .iter()
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        assert_eq!(
+            from_labels,
+            handles.live_handles(),
+            "两张快照的键集合必须恒等（同一张表）"
+        );
+        assert_eq!(
+            from_labels,
+            vec!["sa1.1".to_string(), "sa1.3".to_string()],
+            "已收尾的 sa1.2 两边都不得出现"
+        );
+    }
+
+    /// 只记录 `spawn` 收到的 `label` 的假派发器 —— 验证接线，不跑子 agent。
+    struct SpyRunner {
+        seen_label: Arc<Mutex<Option<String>>>,
+    }
+
+    impl SubagentRunner for SpyRunner {
+        fn spawn(
+            &self,
+            _prompt: &str,
+            label: &str,
+            _model: Option<&str>,
+            _mode: SubagentMode,
+            _boundary: Option<&dyn BoundarySource>,
+        ) -> Result<String, String> {
+            *self.seen_label.lock().unwrap() = Some(label.to_string());
+            Ok("sa1.1".to_string())
+        }
+
+        fn send(&self, _handle: &str, _message: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// 防的是「`description` 没接到 `spawn`（侧栏全是空 label）」与
+    /// 「缺字段时静默用空串」这两类回归：入参主题必须**逐字**交给 runner，缺失即报错。
+    #[tokio::test]
+    async fn subagent_async_tool_passes_description_as_label() {
+        let seen_label = Arc::new(Mutex::new(None));
+        let runner = SpyRunner {
+            seen_label: seen_label.clone(),
+        };
+        let ctx =
+            ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_subagent(&runner);
+        let tool = SubagentAsyncTool::new();
+
+        let result = tool
+            .call(
+                serde_json::json!({"description": "探索认证流程", "prompt": "看 auth.rs"}),
+                ctx,
+            )
+            .await;
+        assert!(result.is_ok(), "带齐字段的调用必须成功：{result:?}");
+        assert_eq!(
+            seen_label.lock().unwrap().as_deref(),
+            Some("探索认证流程"),
+            "description 必须逐字透传给 spawn 的 label 形参"
+        );
+
+        // 缺 `description` ⇒ `InvalidInput`，绝不静默降级成空 label（侧栏「无标题项」）。
+        let ctx =
+            ToolContext::new(None, PathBuf::from("."), PathBuf::from(".")).with_subagent(&runner);
+        let err = tool
+            .call(serde_json::json!({"prompt": "看 auth.rs"}), ctx)
+            .await
+            .expect_err("缺 description 必须 Err");
+        assert!(
+            matches!(err, ToolError::InvalidInput(_)),
+            "缺必填主题应是 InvalidInput；实际 {err:?}"
         );
     }
 }

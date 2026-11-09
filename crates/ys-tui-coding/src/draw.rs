@@ -834,7 +834,10 @@ fn draw_running_section(frame: &mut Frame, area: Rect, panel: &PanelView, palett
         );
         for running in panel.running.iter().take(shown) {
             // handle 是机器标识，用暗色退到背景；label 才是人要看的那一列。
-            let handle = truncate_to_width(&running.handle, width);
+            // handle 的预算要扣掉 2 列（1 列分隔空格 + 至少 1 列 label）：
+            // 否则 handle 吃满 `width` 时 `used = width + 1`，label 预算归 0，
+            // 拼出的行会挤出内区、盖掉右边框。
+            let handle = truncate_to_width(&running.handle, width.saturating_sub(2));
             let used = display_width(&handle) + 1;
             lines.push(Line::from(vec![
                 Span::styled(handle, Style::default().fg(palette.muted)),
@@ -1808,7 +1811,14 @@ pub(crate) fn display_width(s: &str) -> usize {
 }
 
 /// 按显示宽度截断到 `max` 列（超长补 `…`，仍按 char 边界）。
+///
+/// **契约**：返回值满足 `display_width(&result) <= max` 恒成立 —— 含边界
+/// `max == 0`（返回空串，不吐 `…`）与「恰好等宽」（原样返回，不补省略号）。
+/// 调用方拼行时只需保证各行预算之和 ≤ 内区宽，拼出的行宽即不会超出。
 fn truncate_to_width(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     if display_width(s) <= max {
         return s.to_string();
     }
@@ -5674,6 +5684,84 @@ mod tests {
             shown,
             BUDGET - 1,
             "running 正文只能画满 `内区高 - 1` 行：\n{text}"
+        );
+    }
+
+    /// [`truncate_to_width`] 的契约：返回值显示宽度**恒 ≤ `max`**（含 `max == 0`）。
+    ///
+    /// 防的回归：`max == 0` 时走「截断到 `max - 1` 列 + 补 `…`」⇒ 返回宽 1 的 `…`。
+    /// 调用方按 `max` 记账拼行，实际多出 1 列 ⇒ 行宽超出预算、挤出内区。
+    #[test]
+    fn truncate_to_width_respects_contract_at_zero_budget() {
+        // 零预算 ⇒ 空串，与输入是否为空、是否为宽字符无关。
+        assert!(truncate_to_width("abc", 0).is_empty());
+        assert!(truncate_to_width("", 0).is_empty());
+        assert!(truncate_to_width("字字字", 0).is_empty());
+
+        // 契约的通用形式：任意预算 × 任意输入，返回值都不超预算。
+        for s in ["abc", "字字字", "a字b"] {
+            for max in [0usize, 1, 2, 3, 10] {
+                let out = truncate_to_width(s, max);
+                let got = display_width(&out);
+                assert!(
+                    got <= max,
+                    "truncate_to_width({s:?}, {max}) = {out:?} 宽 {got}，超出预算"
+                );
+            }
+        }
+    }
+
+    /// **P1-1 的可达路径回归防护**：handle 吃满行预算时，label 仍须分到 ≥ 1 列，
+    /// 拼出的行不得挤出内区、盖掉右边框。
+    ///
+    /// 造法：handle 长 40 列（远超 [`SIDE_MIN_WIDTH`] 的内区宽），label 是 50 个汉字。
+    /// handle 预算若取整段内区宽 ⇒ `used = width + 1`，label 预算归 0 且旧实现会吐出
+    /// 宽 1 的 `…` ⇒ 整行 `width + 2` 列。
+    #[test]
+    fn sidebar_running_line_fits_when_handle_is_wide() {
+        const H: u16 = 20;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let panel = crate::view::PanelView {
+            todos: Vec::new(),
+            todos_hidden: 0,
+            running: vec![crate::view::RunningLine {
+                handle: "h".repeat(40),
+                label: "字".repeat(50),
+            }],
+            running_hidden: 0,
+        };
+
+        let w = SIDE_MIN_WIDTH;
+        let buf = sidebar_buffer(w, H, Rect::new(0, 0, w, H), &panel, palette);
+        let rows = buffer_rows(&buf);
+
+        // ① 每行的显示宽度不得超过侧栏宽 —— 「预算算错就挤出内区」的护栏。
+        for (y, line) in rows.iter().enumerate() {
+            assert!(
+                display_width(line) <= w as usize,
+                "第 {y} 行占用 {} 列，超过侧栏宽 {w}：{line:?}",
+                display_width(line)
+            );
+        }
+
+        // ② 右边框列必须仍是边框字符 —— 正文不得盖上去。
+        const BORDER: [&str; 10] = ["│", "┃", "┌", "┐", "└", "┘", "┏", "┓", "┗", "┛"];
+        for y in 0..H {
+            let sym = buf[(w - 1, y)].symbol();
+            assert!(BORDER.contains(&sym), "第 {y} 行右边框被盖掉：{sym:?}");
+        }
+
+        // ③ running 行必须同时留下「1 列分隔空格 + 至少 1 列 label」⇒ `…` 紧跟空格。
+        //    handle 预算取满内区宽时 handle 把行吃光，label（连同它的 `…`）被整段裁掉；
+        //    缓冲区行宽恒等于侧栏宽，只断言 ① 看不出这一点，必须看行内容。
+        let line = rows
+            .iter()
+            .find(|r| r.contains('h'))
+            .expect("running 行必须画出来");
+        assert!(
+            line.contains(" …"),
+            "handle 吃满预算、label 一列都没分到：{line:?}"
         );
     }
 }

@@ -256,9 +256,13 @@ context.md 要求「不能靠手算假设」，我实测了 ratatui 0.30（`prob
 ### 3.4 截断必须按显示列
 
 侧栏必然要截断（todo 内容最长 240 字符 `MAX_CONTENT_CHARS`，description 可能是整句）。
-**唯一允许的路径**是 `draw.rs:1610` 的 `truncate_to_width`（CJK 算 2 列、落在字符边界）。
+**唯一允许的路径**是 `draw.rs` 的 `truncate_to_width`（CJK 算 2 列、落在字符边界）。
 
-⚠️ **它是私有 `fn`**（`draw.rs:1610`），`display_width` 也只是 `pub(crate)`（`:1605`）——
+契约：返回值显示宽度**恒 ≤ `max`**（含 `max == 0` ⇒ 空串）。调用方拼行时只需保证各行预算
+之和 ≤ 内区宽。
+
+⚠️ **它是私有 `fn`**（`draw.rs` 的 `truncate_to_width`），`display_width` 也只是 `pub(crate)`
+（`draw.rs` 的 `display_width`）——
 `apps/coding-agent` **用不了**。两个选项，**选后者**：
 
 1. 提升可见性 ⇒ 新增公开 API，需 doc 与稳定性考虑；
@@ -488,8 +492,9 @@ pub fn live_labels(&self) -> Vec<(String, Arc<str>)>;   // 同样先 retain 清�
 | G11 | **输入框不受影响**：开/关前后 `input_height` 与 `wrap_width` 逐值不变 | 纵向切分挪到整屏上 ⇒ 红 |
 | G12 | **补全浮层不越界**：开栏 + 弹补全 ⇒ 浮层右边界 ≤ `a.chat.right()` | 仍盖 `chunks[0]` ⇒ 红 |
 
-**扩展用例（G1 的变体）**：既有 `chat_inner_rect_agrees_with_viewport`（`draw.rs:4569`）是多条
-「两条路径必须同源」守卫之一 —— 把它扩成跑 `panel_visible ∈ {false, true} × 4 组尺寸`。
+**扩展用例（G1 的变体）**：既有 `chat_inner_rect_agrees_with_viewport`
+（`draw.rs` 的 `chat_inner_rect_agrees_with_viewport`）是多条「两条路径必须同源」守卫之一
+—— 把它扩成跑 `panel_visible ∈ {false, true} × 4 组尺寸`。
 
 ---
 

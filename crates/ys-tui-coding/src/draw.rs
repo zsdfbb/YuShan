@@ -5290,4 +5290,290 @@ mod tests {
         // 真渲染一帧，确认开关两态都能画出来（不 panic、不越界写缓冲）。
         let _ = rows_of(&mut app, W, H);
     }
+
+    // ── 侧栏内容（设计 §8：G5 截断 / G6 空态） ────────────────────────────────
+
+    /// 测试辅助：把 [`draw_sidebar`] 画到 `area` 上并回读**整块**缓冲区。
+    ///
+    /// 后端可以比 `area` 宽 —— 超出 `area` 的列留在缓冲区里，正好用来断言
+    /// 「有没有东西画到侧栏右边界之外」。
+    fn sidebar_buffer(
+        backend_w: u16,
+        backend_h: u16,
+        area: Rect,
+        panel: &PanelView,
+        palette: Palette,
+    ) -> Buffer {
+        let backend = TestBackend::new(backend_w, backend_h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_sidebar(f, area, panel, palette))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// 测试辅助：把整个缓冲区逐行拼成**屏上看到的字符序列**。
+    ///
+    /// 得跳过宽字符的续格：`Cell::symbol()` 对空格返回 `" "`（不是 `""`），
+    /// 逐格直拼会得到 `（ 无  todo）` 这种插了空位的假文本。故按 ratatui
+    /// `buffer_view` 的同一口径用「前一个字符的宽度」推算哪些格是续格。
+    fn buffer_rows(buf: &Buffer) -> Vec<String> {
+        let width = buf.area().width as usize;
+        buf.content()
+            .chunks(width)
+            .map(|row| {
+                let mut out = String::new();
+                let mut skip = 0usize;
+                for cell in row {
+                    if skip == 0 {
+                        out.push_str(cell.symbol());
+                    }
+                    skip = display_width(cell.symbol()).max(skip).saturating_sub(1);
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// 空态**不塌**：两栏都空时，两个带标题、带完整边框的框仍要画出来，内区给占位文字。
+    ///
+    /// 防的回归：空态走「提前 return」或跳过 `render_widget(block)` —— 那样侧栏整块
+    /// 消失，用户分不清「没有 todo」与「侧栏坏了」。
+    #[test]
+    fn sidebar_renders_empty_state_boxes() {
+        const H: u16 = 20;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        const W: u16 = 40;
+        let panel = crate::view::PanelView::default();
+        assert!(
+            panel.todos.is_empty() && panel.running.is_empty(),
+            "本例专测空态"
+        );
+
+        let buf = sidebar_buffer(W, H, Rect::new(0, 0, W, H), &panel, palette);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+
+        // ① 两个标题都在（框还在，不是整块消失）。
+        assert!(text.contains(" Todo "), "todo 栏标题不得丢：\n{text}");
+        assert!(text.contains(" Running "), "running 栏标题不得丢：\n{text}");
+
+        // ② 两个框各有一整圈边框：顶 `┌ ┐`、底 `└ ┘` 各两次。
+        let count = |s: &str| rows.iter().filter(|r| r.contains(s)).count();
+        for corner in ["┌", "┐", "└", "┘"] {
+            assert_eq!(
+                count(corner),
+                2,
+                "应恰好两个带边框的框（缺 {corner}）：\n{text}"
+            );
+        }
+
+        // ③ 空态占位文字落在各自内区首行。
+        let tops: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.starts_with('┌'))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(tops.len(), 2, "两个框的顶边框行：{tops:?}");
+        assert!(
+            rows[tops[0] + 1].contains("（无 todo）"),
+            "todo 空态占位文字：{:?}",
+            rows[tops[0] + 1]
+        );
+        assert!(
+            rows[tops[1] + 1].contains("（无在跑的子任务）"),
+            "running 空态占位文字：{:?}",
+            rows[tops[1] + 1]
+        );
+
+        // ④ 占位行之外的内区保持空白（不是画了别的东西撑起来的）。
+        let bottoms: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.starts_with('└'))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(bottoms.len(), 2, "两个框的底边框行：{bottoms:?}");
+        for (top, bottom) in tops.iter().zip(bottoms.iter()) {
+            // 内区必须全空 —— 空态下除占位行外不得有任何内容（含错位的 `+N`）。
+            for (y, row) in rows
+                .iter()
+                .enumerate()
+                .skip(top + 2)
+                .take(bottom.saturating_sub(top + 2))
+            {
+                let inner_text = row.trim().trim_matches('│').trim();
+                assert!(inner_text.is_empty(), "空态内区第 {y} 行应为空白：{row:?}");
+            }
+            // 每行都占满侧栏宽（框不得缩成半根边）。
+            assert_eq!(
+                row_used_cols(
+                    &buf.content()
+                        [top * buf.area().width as usize..(top + 1) * buf.area().width as usize]
+                ),
+                W as usize,
+                "第 {top} 行的框宽必须铺满侧栏：{:?}",
+                rows[*top]
+            );
+        }
+    }
+
+    /// 超长 CJK（200 字 todo / 120 字 running label）**不得 panic**、不得产出损坏字符。
+    ///
+    /// 防的回归：按字节截断（`&s[..96]` / `s.split_at(n)`）切在多字节序列中间 ⇒
+    /// panic（或产出无效 UTF-8）。几何取真值：80 列终端下 [`side_width`] 给出的侧栏宽。
+    #[test]
+    fn sidebar_truncates_cjk_without_panicking() {
+        const H: u16 = 20;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let w = side_width(80);
+        let panel = crate::view::PanelView {
+            todos: vec![crate::view::TodoLine {
+                text: "字".repeat(200),
+                mark: crate::view::RowMark::Plain,
+            }],
+            todos_hidden: 0,
+            running: vec![crate::view::RunningLine {
+                handle: "a".to_string(),
+                label: "字".repeat(120),
+            }],
+            running_hidden: 0,
+        };
+
+        // 后端给足余量：超出侧栏宽的列留在缓冲区里，用来验「没画到栏外」。
+        let buf = sidebar_buffer(w + 8, H, Rect::new(0, 0, w, H), &panel, palette);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+
+        // 能跑到这里就说明**没 panic**；再确认内容真的画出来了。
+        assert!(
+            text.contains(" Todo ") && text.contains(" Running "),
+            "两栏都得画出来：\n{text}"
+        );
+        assert!(text.contains('☐'), "todo 行必须出现：\n{text}");
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "不得出现替换字符（UTF-8 被切坏）：\n{text}"
+        );
+        assert!(text.contains('…'), "超宽内容必须留下省略号：\n{text}");
+
+        // 右边框列（x = w-1）必须还是边框字符 —— 内容溢出会先吃掉它。
+        for y in 0..H {
+            let sym = buf[(w - 1, y)].symbol();
+            assert!(
+                ["┌", "┐", "│", "└", "┘"].contains(&sym),
+                "第 {y} 行 x={} 应是边框、实际 {sym:?}：{:?}",
+                w - 1,
+                rows[y as usize]
+            );
+        }
+        // 侧栏之外（x ≥ w）必须原样空白。
+        for y in 0..H {
+            for x in w..w + 8 {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    " ",
+                    "画到侧栏之外：({x}, {y}) = {:?}",
+                    buf[(x, y)].symbol()
+                );
+            }
+        }
+        // 每行实际占用列数不超过侧栏宽。
+        let bw = buf.area().width as usize;
+        for (y, row) in buf.content().chunks(bw).enumerate() {
+            let used = row_used_cols(row);
+            assert!(
+                used <= w as usize,
+                "第 {y} 行用了 {used} 列，超过侧栏宽 {w}"
+            );
+        }
+    }
+
+    /// G5 的核心：每条渲染行的**显示宽度 ≤ 内区宽**，被截断的行必须留下 `…`、不得压右边框。
+    ///
+    /// 防的回归：`truncate_to_width(&todo.text, width.saturating_sub(2))` 的预算漏算
+    /// 「字形 1 列 + 1 列空格」，正文按 `width` 截 ⇒ 拼出的行多 1 个字形宽；`Paragraph`
+    /// 裁掉的正是行尾的 `…` —— 屏幕上于是看不出还有没显示的内容。
+    /// 故断言分两层：**行宽不越内区**（几何）与**截断标记仍在**（语义）。
+    #[test]
+    fn sidebar_lines_fit_within_inner_width() {
+        const H: u16 = 20;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let long = "字".repeat(200);
+        let panel = crate::view::PanelView {
+            todos: vec![crate::view::TodoLine {
+                text: long.clone(),
+                mark: crate::view::RowMark::Plain,
+            }],
+            todos_hidden: 0,
+            running: vec![crate::view::RunningLine {
+                handle: "abcde".to_string(),
+                label: long,
+            }],
+            running_hidden: 0,
+        };
+
+        // 从最小可用宽（内区仅 10 列）到常规侧栏宽，逐档验。
+        for w in [SIDE_MIN_WIDTH, 13, 20, 30] {
+            let bw = w + 6;
+            let buf = sidebar_buffer(bw, H, Rect::new(0, 0, w, H), &panel, palette);
+            let rows = buffer_rows(&buf);
+
+            // ① 右边框列完好：内容多占 1 列就会把它盖掉（本用例的核心几何断言）。
+            for y in 0..H {
+                let sym = buf[(w - 1, y)].symbol();
+                assert!(
+                    ["┌", "┐", "│", "└", "┘"].contains(&sym),
+                    "w={w}：第 {y} 行右边框被覆盖（{sym:?}）：{:?}",
+                    rows[y as usize]
+                );
+            }
+            // ② 侧栏之外必须空白（Paragraph 会裁，但预算算错时先吃掉的是 `…`）。
+            for y in 0..H {
+                for x in w..bw {
+                    assert_eq!(buf[(x, y)].symbol(), " ", "w={w}：画到侧栏之外 ({x}, {y})");
+                }
+            }
+
+            let width = buf.area().width as usize;
+            let inner_w = w as usize - 2;
+            let mut todo_rows = 0usize;
+            let mut running_rows = 0usize;
+            for (y, row) in buf.content().chunks(width).enumerate() {
+                let text = rows[y].clone();
+                let text = &text;
+
+                // ③ **内区文字占用**：只量左右边框之间的格（不含边框本身）。
+                //    字形 1 列 + 1 列空格 + 正文 ≤ 内区宽 —— 多 1 列就会把 `…` 挤给
+                //    `Paragraph` 裁掉（末字与省略号不可见）。
+                let inner_cols = &row[1..(w as usize - 1)];
+                assert!(
+                    row_used_cols(inner_cols) <= inner_w,
+                    "w={w}：第 {y} 行内区超出 {inner_w} 列（实际 {}）：{text:?}",
+                    row_used_cols(inner_cols)
+                );
+                if text.contains('☐') {
+                    todo_rows += 1;
+                    // 截断标记必须还在屏上（预算漏算时被裁掉的正是它）。
+                    assert!(
+                        text.contains('…'),
+                        "w={w}：todo 行缺省略号 —— 正文预算多占了一格：{text:?}（内区宽 {inner_w}）"
+                    );
+                }
+                if text.contains("abcde") {
+                    running_rows += 1;
+                    assert!(
+                        text.contains('…'),
+                        "w={w}：running label 缺省略号：{text:?}（内区宽 {inner_w}）"
+                    );
+                }
+            }
+            assert_eq!(todo_rows, 1, "w={w}：应恰好一行 todo：{:?}", rows);
+            assert_eq!(running_rows, 1, "w={w}：应恰好一行 running：{:?}", rows);
+        }
+    }
 }

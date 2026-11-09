@@ -584,6 +584,9 @@ pub async fn run(
                     panel_view(&todo_store, subagent.as_ref()),
                 );
                 last_view = Some(view.clone());
+                // 基线必须与 UI 实际看到的一致：只写 `last_view` 不写 `last_panel` 会让
+                // 回合中推送认为「从没推过」⇒ 回合开头立刻推一份陈旧视图。
+                last_panel = Some(view.panel.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -650,6 +653,8 @@ pub async fn run(
                     panel_view(&todo_store, subagent.as_ref()),
                 );
                 last_view = Some(view.clone());
+                // 侧栏基线同上（`last_view` / `last_panel` 必须同进）。
+                last_panel = Some(view.panel.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -688,6 +693,8 @@ pub async fn run(
                     panel_view(&todo_store, subagent.as_ref()),
                 );
                 last_view = Some(view.clone());
+                // 侧栏基线同上（`last_view` / `last_panel` 必须同进）。
+                last_panel = Some(view.panel.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -738,6 +745,8 @@ pub async fn run(
                     panel_view(&todo_store, subagent.as_ref()),
                 );
                 last_view = Some(view.clone());
+                // 侧栏基线同上（`last_view` / `last_panel` 必须同进）。
+                last_panel = Some(view.panel.clone());
                 send_or_flush(
                     &out_tx,
                     Outbound::View(view),
@@ -766,6 +775,8 @@ pub async fn run(
                         panel_view(&todo_store, subagent.as_ref()),
                     );
                     last_view = Some(view.clone());
+                    // 侧栏基线同上（`last_view` / `last_panel` 必须同进）。
+                    last_panel = Some(view.panel.clone());
                     send_or_flush(
                         &out_tx,
                         Outbound::View(view),
@@ -1565,6 +1576,8 @@ pub async fn run(
             panel_view(&todo_store, subagent.as_ref()),
         );
         last_view = Some(view.clone());
+        // 侧栏基线同上（`last_view` / `last_panel` 必须同进）。
+        last_panel = Some(view.panel.clone());
         send_or_flush(
             &out_tx,
             Outbound::View(view),
@@ -2130,7 +2143,7 @@ use crate::round_clock::{RoundClock, turn_cache, turn_line};
 ///
 /// **逐字段传入而不收 `&mut TurnCtx`**：回合执行期 `ctx.wiring` 被 `ports()` 借住，
 /// 整包借 `ctx` 与它冲突；这里要碰的几个字段与它互不相交。
-async fn push_panel(
+async fn push_panel_if_changed(
     todo: &ys_tools_todo::TodoStore,
     subagent: Option<&crate::subagent::SubagentSetup>,
     last_view: &mut Option<CodingView>,
@@ -2342,7 +2355,7 @@ async fn run_turn_once(
                         ctx.log_path.as_deref(),
                     );
                     send(ctx.out_tx, Outbound::Event(env)).await?;
-                    push_panel(
+                    push_panel_if_changed(
                         ctx.todo,
                         ctx.subagent,
                         &mut *ctx.last_view,
@@ -2437,7 +2450,7 @@ async fn run_turn_once(
             ctx.log_path.as_deref(),
         );
         send(ctx.out_tx, Outbound::Event(env)).await?;
-        push_panel(
+        push_panel_if_changed(
             ctx.todo,
             ctx.subagent,
             &mut *ctx.last_view,

@@ -2593,4 +2593,126 @@ mod tests {
             Action::Local(LocalAction::Hint(ref h)) if h.contains("NOW")
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // `/panel`：右侧栏开关
+    // -----------------------------------------------------------------------
+
+    /// `/panel` 的三分解析各就各位：无参 ⇒ `None`（翻转），`on` / `off` ⇒ 显式值。
+    ///
+    /// 防的回归：三分解析错位 —— 无参被解析成 `Some(true)`（用户按一下栏就永远
+    /// 打开、再也翻不回去），或显式值被解析成 `None`（`/panel on` 变成翻转）。
+    #[test]
+    fn panel_command_without_arg_toggles() {
+        use LocalAction as L;
+        assert_eq!(parse("/panel"), Action::Local(L::Panel(None)));
+        assert_eq!(
+            parse("/panel on"),
+            Action::Local(L::Panel(Some(true))),
+            "`on` 是显式设真，不是翻转"
+        );
+        assert_eq!(
+            parse("/panel off"),
+            Action::Local(L::Panel(Some(false))),
+            "`off` 是显式设假，不是翻转"
+        );
+    }
+
+    /// 非法取值只本地提示（正文含 `on|off`），且**不改** `panel_visible`。
+    ///
+    /// 防的回归：非法取值被静默当成 toggle —— `/panel xx` 手滑一次就翻转侧栏，
+    /// 而用户看到的唯一反馈是提示行，屏幕上却少了一半宽度。
+    #[test]
+    fn panel_command_with_invalid_arg_hints_and_does_not_toggle() {
+        let action = parse("/panel xx");
+        match action {
+            Action::Local(LocalAction::Hint(ref t)) => {
+                assert!(t.contains("on|off"), "提示须给出合法取值：{t}");
+            }
+            other => panic!("非法参数应本地提示，得到 {other:?}"),
+        }
+
+        // 拿到 Hint 之后走 `apply_local`：可见性必须原地不动。
+        let mut a = app();
+        let before = a.panel_visible;
+        let Action::Local(hint) = action else {
+            unreachable!("上面已断言是 Local")
+        };
+        apply_local(&mut a, hint);
+        assert_eq!(a.panel_visible, before, "提示分支不得改可见性");
+    }
+
+    /// `App::new` 默认隐藏；`None` 翻转、`Some(b)` 显式设定（含幂等）。
+    ///
+    /// 防的回归：toggle 语义写成「恒设 true」（第二下翻不回去）或「恒翻转而忽略
+    /// 显式值」（`/panel off` 在关闭态反而打开）。
+    #[test]
+    fn panel_apply_local_flips_and_sets_explicitly() {
+        let mut a = app();
+        assert!(!a.panel_visible, "`App::new` 默认隐藏侧栏");
+
+        apply_local(&mut a, LocalAction::Panel(None));
+        assert!(a.panel_visible, "无参 = 翻转成开");
+        apply_local(&mut a, LocalAction::Panel(None));
+        assert!(!a.panel_visible, "再翻一下必须回关");
+
+        apply_local(&mut a, LocalAction::Panel(Some(true)));
+        assert!(a.panel_visible, "显式 on");
+        apply_local(&mut a, LocalAction::Panel(Some(true)));
+        assert!(a.panel_visible, "显式 on 幂等（不是翻转）");
+        apply_local(&mut a, LocalAction::Panel(Some(false)));
+        assert!(!a.panel_visible, "显式 off");
+    }
+
+    /// 侧栏开关**必须**清选区。
+    ///
+    /// 防的回归（关键）：侧栏开合改变 Chat 宽度 ⇒ 全局重折行 ⇒ 视觉行号空间整体
+    /// 作废。残留的锚点会按新行号高亮到**无关文字**上，而屏上看起来完全正常。
+    #[test]
+    fn panel_toggle_clears_selection() {
+        let mut a = app();
+        a.selection.begin(7, 3, std::time::Instant::now());
+        a.selection.extend(9, 12, 0, std::time::Instant::now());
+        assert!(a.selection.is_active(), "前置：应有非空选区");
+
+        apply_local(&mut a, LocalAction::Panel(None));
+        assert!(
+            !a.selection.is_active(),
+            "侧栏开合后旧选区的行号已无意义，必须清掉"
+        );
+    }
+
+    /// 侧栏可见性是**纯 UI 本地状态**：`Outbound::View` 快照不得覆盖它。
+    ///
+    /// 这是设计不变量 —— `view.panel` 是**数据**（侧栏里画什么），不表达「栏是否
+    /// 可见」。防的回归：把初值改成从 `view` 读，或 `apply_outbound` 的 `View` 臂
+    /// 顺手同步一下 —— 那样用户每次收到快照，手动打开的栏就会被关回去。
+    #[test]
+    fn panel_visibility_is_not_overwritten_by_view_snapshots() {
+        let mut a = app();
+        assert!(!a.panel_visible, "`App::new` 默认隐藏");
+        apply_local(&mut a, LocalAction::Panel(Some(true)));
+        assert!(a.panel_visible);
+
+        // 快照里带**非空** panel 数据：证明 View 臂本身确实被应用了，
+        // 只是它不该影响可见性。
+        let with_todos = || {
+            let mut snapshot = CodingView::for_test();
+            snapshot.panel.todos.push(crate::view::TodoLine {
+                text: "写测试".into(),
+                mark: crate::view::RowMark::Active,
+            });
+            snapshot
+        };
+        a.apply_outbound(ys_protocol::Outbound::View(with_todos()));
+        assert_eq!(a.view.panel.todos.len(), 1, "快照内容应被应用");
+        assert!(a.panel_visible, "快照不得覆盖运行期开关（开态）");
+
+        // 关态下再收一份**带数据**的快照：可见性不能由 panel 数据派生
+        // （「有 todo 就开栏」是典型的偷懒写法，会把用户的关闭动作废掉）。
+        apply_local(&mut a, LocalAction::Panel(Some(false)));
+        assert!(!a.panel_visible);
+        a.apply_outbound(ys_protocol::Outbound::View(with_todos()));
+        assert!(!a.panel_visible, "快照不得覆盖运行期开关（关态）");
+    }
 }

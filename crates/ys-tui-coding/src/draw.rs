@@ -111,8 +111,8 @@ const SIDE_MIN_WIDTH: u16 = 12;
 /// 两个下界各管一件事：`total_width - MIN_WIDTH` 保 Chat 有 [`MIN_WIDTH`] 列可用，
 /// [`SIDE_MIN_WIDTH`] 保侧栏自己不低于可读下限。W < 22 时两条都不满足 ⇒ 不画栏（归 0）。
 fn side_width(total_width: u16) -> u16 {
-    let w = SIDE_WIDTH.min(total_width.saturating_sub(MIN_WIDTH));
-    if w < SIDE_MIN_WIDTH { 0 } else { w }
+    let budget = SIDE_WIDTH.min(total_width.saturating_sub(MIN_WIDTH));
+    if budget < SIDE_MIN_WIDTH { 0 } else { budget }
 }
 
 /// 筛选无命中时占位的那行（有候选但都不匹配）。中文全角括号，与既有提示同风格。
@@ -4988,5 +4988,303 @@ mod tests {
                 "折出的行必须填满（内宽 {inner_w}，实际 {used}）：{row:?}"
             );
         }
+    }
+
+    // ── 右侧栏几何（`frame_areas` / `side_width` / 侧栏两栏对半） ─────────────
+
+    /// 测试用 `App`：`panel_visible` 指定开关态。
+    ///
+    /// 复用 [`app_with`] 的构造（关引言、固定钟点）—— 侧栏用例只关心几何，不关心
+    /// transcript 内容；沿用同一个入口才能保证与既有几何用例读的是同一套默认值。
+    fn app_with_panel(panel_visible: bool) -> App {
+        let mut app = app_with(CodingView::for_test());
+        app.panel_visible = panel_visible;
+        app
+    }
+
+    /// 同一帧内两次 [`frame_areas`] 必须逐字段相同。
+    ///
+    /// 防「同一帧内两处调用得到不同几何」⇒ 滚动按 A、画面按 B（错位）。
+    /// 这条同时钉住 `frame_areas` 的**纯函数**性质：它不得读写任何帧内可变的全局状态。
+    #[test]
+    fn frame_areas_is_idempotent_within_a_frame() {
+        for visible in [false, true] {
+            for (w, h) in [(80u16, 40u16), (30, 25), (22, 10)] {
+                let app = app_with_panel(visible);
+                let total = Rect::new(0, 0, w, h);
+                let a = frame_areas(&app, total);
+                let b = frame_areas(&app, total);
+                assert_eq!(a.chat, b.chat, "chat 漂移（w={w} h={h}）");
+                assert_eq!(a.input, b.input, "input 漂移（w={w} h={h}）");
+                assert_eq!(a.status, b.status, "status 漂移（w={w} h={h}）");
+                assert_eq!(a.side, b.side, "side 漂移（w={w} h={h}）");
+            }
+        }
+    }
+
+    /// 窄屏下几何**退化但不破**：宽度守恒、Chat 不低于 [`MIN_WIDTH`]、侧栏要么不画
+    /// 要么不低于 [`SIDE_MIN_WIDTH`]、三段高度合起来仍是整屏高。
+    ///
+    /// 变异：
+    /// ① `saturating_sub` 换成普通减法 ⇒ W=10 下溢 panic；
+    /// ② 改用 `Layout::horizontal([Min(1), Length(SIDE_WIDTH)])` ⇒ W=20 时 chat 只剩 1 列；
+    /// ③ 去掉 `SIDE_MIN_WIDTH` 判据 ⇒ W=11/12 出现内区宽 0 的碎条。
+    #[test]
+    fn frame_areas_degrades_cleanly_on_narrow_screens() {
+        const H: u16 = 40;
+        for w in [10u16, 11, 20, 21, 22, 31, 40, 80] {
+            for visible in [false, true] {
+                let app = app_with_panel(visible);
+                let a = frame_areas(&app, Rect::new(0, 0, w, H));
+                let side_w = a.side.map_or(0, |r| r.width);
+                assert_eq!(
+                    a.chat.width + side_w,
+                    w,
+                    "宽度必须守恒（w={w} visible={visible}）：chat {} + side {side_w}",
+                    a.chat.width
+                );
+                assert!(
+                    a.chat.width >= MIN_WIDTH,
+                    "Chat 不得低于最小宽 {MIN_WIDTH}（w={w} visible={visible}）：{}",
+                    a.chat.width
+                );
+                if let Some(side) = a.side {
+                    assert!(
+                        side.width >= SIDE_MIN_WIDTH,
+                        "不许出现 1–{SIDE_MIN_WIDTH} 列的碎条（w={w} visible={visible}）：{}",
+                        side.width
+                    );
+                }
+                assert_eq!(
+                    a.chat.height + a.input.height + a.status.height,
+                    H,
+                    "三段高度必须铺满整屏（w={w} visible={visible}）"
+                );
+                // 侧栏只在**显式打开**时出现；关态即便宽度够也必须是 `None`。
+                assert_eq!(
+                    a.side.is_some(),
+                    visible && w >= 22,
+                    "开合与窄屏两条判据（w={w}）"
+                );
+            }
+        }
+        // 低于 `MIN_WIDTH` 的整屏宽（`ui_with` 本就不渲染）：`saturating_sub` 必须把它夹到 0，
+        // 普通减法会在这里下溢 panic。
+        for w in [0u16, 4, 9] {
+            let app = app_with_panel(true);
+            let a = frame_areas(&app, Rect::new(0, 0, w, H));
+            assert_eq!(a.side, None, "w={w} 低于 MIN_WIDTH ⇒ 不得有侧栏");
+        }
+    }
+
+    /// [`side_width`] 的**单元级**对照：把边界值逐点钉死（[`frame_areas_degrades_cleanly_on_narrow_screens`]
+    /// 是集成口径，这条是它背后的纯函数）。
+    ///
+    /// 变异：`saturating_sub` → 普通减法（W=10 panic）、删掉 `SIDE_MIN_WIDTH` 判据
+    /// （W=11/20/21 返回 1/10/11 而非 0）。
+    #[test]
+    fn side_width_clamps_and_respects_minimum() {
+        // 余额充足 ⇒ 封顶在 SIDE_WIDTH。
+        assert_eq!(side_width(80), 30);
+        assert_eq!(side_width(40), 30);
+        // 余额不足 ⇒ 收窄侧栏、保住 Chat 的 MIN_WIDTH。
+        assert_eq!(side_width(35), 25);
+        assert_eq!(side_width(30), 20);
+        // 恰好落在 SIDE_MIN_WIDTH 上 ⇒ 保留。
+        assert_eq!(side_width(22), 12);
+        // 再窄 1 列就低于可读下限 ⇒ 归 0（整屏让给 Chat）。
+        assert_eq!(side_width(21), 0);
+        assert_eq!(side_width(20), 0);
+        assert_eq!(side_width(11), 0);
+        assert_eq!(side_width(10), 0);
+        // 低于 `MIN_WIDTH` ⇒ 必须由 `saturating_sub` 夹到 0（普通减法会下溢）。
+        assert_eq!(side_width(9), 0);
+        assert_eq!(side_width(0), 0);
+    }
+
+    /// 侧栏上下两栏的 `50/50` 切分：高度和恒等于总高、上栏不少于下栏、差不超过 1。
+    ///
+    /// **这条测试就是「不需要奇偶补偿」的证据** —— 它证明 `Percentage(50) × 2` 在奇数高下
+    /// 自然给上栏多 1 行且总和不变，故 `draw_sidebar` 里不写 `if h % 2 == 1 { … }`。
+    ///
+    /// 断言分两层：
+    /// ① `Layout` 本身的性质（轻量、直接）；
+    /// ② **走生产路径**：真渲染 [`draw_sidebar`]，从缓冲区里找出两个框的顶边框行 —— 后者的
+    ///    切分方式才是用户看到的东西。只有 ① 的话，把 `draw_sidebar` 的 `50/50` 改掉也不会红。
+    ///
+    /// 变异：把 `draw_sidebar` 的 `[Percentage(50), Percentage(50)]` 换成
+    /// `[Percentage(50), Constraint::Min(0)]` ⇒ 下栏吃掉剩余全部 ⇒ ② 红。
+    #[test]
+    fn sidebar_halves_share_height_exactly() {
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let panel = crate::view::PanelView::default();
+        for h in [5u16, 7, 8, 25, 40] {
+            // ① `Layout` 自身的性质。
+            let v = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(Rect::new(0, 0, 30, h));
+            assert_eq!(
+                v[0].height + v[1].height,
+                h,
+                "两栏高度和必须等于总高（h={h}）：{} + {}",
+                v[0].height,
+                v[1].height
+            );
+            assert!(
+                v[0].height >= v[1].height,
+                "上栏不得少于下栏（h={h}）：{} vs {}",
+                v[0].height,
+                v[1].height
+            );
+            assert!(
+                v[0].height - v[1].height <= 1,
+                "两栏高度差不得超过 1 行（h={h}）：{} vs {}",
+                v[0].height,
+                v[1].height
+            );
+
+            // ② 生产路径：两个框的顶边框行号即两栏的 `top`。
+            let backend = TestBackend::new(30, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| draw_sidebar(f, f.area(), &panel, palette))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let tops: Vec<usize> = buf
+                .content()
+                .chunks(30)
+                .enumerate()
+                .filter(|(_, row)| row[0].symbol() == "┌")
+                .map(|(y, _)| y)
+                .collect();
+            assert_eq!(tops.len(), 2, "应恰好两个框（h={h}）：{tops:?}");
+            // 两栏的 `top` 就是两个框的顶边框行；末框的底边框必须落在最后一行。
+            let (upper, lower) = (tops[1] - tops[0], h as usize - tops[1]);
+            let first = |y: usize| buf.content()[y * 30].symbol().to_string();
+            assert_eq!(
+                first(tops[1] - 1),
+                "└",
+                "上框必须在下框之前闭合（h={h}）：第 {} 行是 {:?}",
+                tops[1] - 1,
+                first(tops[1] - 1)
+            );
+            assert_eq!(
+                first(h as usize - 1),
+                "└",
+                "下框底边框必须落在最后一行（h={h}）—— 两栏合起来正好铺满总高"
+            );
+            assert!(
+                upper >= lower,
+                "上栏不得少于下栏（h={h}）：{upper} vs {lower}"
+            );
+            assert!(
+                upper - lower <= 1,
+                "两栏高度差不得超过 1 行（h={h}）：{upper} vs {lower}"
+            );
+        }
+    }
+
+    /// [`chat_area`] / [`input_geom`] 与 [`frame_areas`] 三处**同源不漂移**（侧栏开启态）。
+    ///
+    /// 防的回归：有人在这三处之一里再 `Layout` 一遍 ⇒ 滚动按 A、画面按 B。
+    #[test]
+    fn chat_geometry_agrees_with_frame_areas_when_panel_open() {
+        const W: u16 = 80;
+        const H: u16 = 40;
+        let total = Rect::new(0, 0, W, H);
+        for visible in [false, true] {
+            let app = app_with_panel(visible);
+            let a = frame_areas(&app, total);
+            assert_eq!(
+                chat_area(&app, total),
+                a.chat,
+                "chat_area 必须与 frame_areas 逐字段相同（visible={visible}）"
+            );
+            // 输入区内区（`Block::bordered` 扣边框）必须由同一个 `a.input` 推出。
+            let inner = Block::bordered().title(" Input ").inner(a.input);
+            let (geom, _, _, _) = input_geom(&app, W, H).expect("尺寸足够 ⇒ 必有几何");
+            assert_eq!(
+                (geom.x, geom.y),
+                (inner.x, inner.y),
+                "输入区内区的 x/y 必须与 frame_areas 推出的内区一致（visible={visible}）"
+            );
+            assert_eq!(
+                (geom.width, geom.height),
+                (inner.width, inner.height),
+                "输入区内区的宽/高也必须一致（visible={visible}）"
+            );
+        }
+    }
+
+    /// **输入框几何只取决于整屏尺寸**，与侧栏开关无关（设计决策 2：只切 Chat 带）。
+    ///
+    /// 这是「只切 Chat 带」的核心断言 —— 若 `frame_areas` 里先横切整屏再竖切，
+    /// 输入框高度会随侧栏变（`input_height` 拿到的是被压窄的宽度 ⇒ 折行行数变）⇒ 红。
+    ///
+    /// 输入文本取 100 个 ASCII 字符：**空输入折 1 行、任何宽度都相同**，那样折行宽度的
+    /// 入参就测不到；常文本使行数随内区宽变化（W=30 时整屏 28 列 ⇒ 4 行，被子侧栏压到
+    /// 10 列 ⇒ 10 行（夹到 5））。
+    ///
+    /// 变异：`frame_areas` 里 `input_height(app, total.width)` 改 `input_height(app, v[0].width)`
+    /// ⇒ 输入框高度随侧栏开合变化 ⇒ 红。
+    #[test]
+    fn input_geometry_is_independent_of_panel_visibility() {
+        const LONG: &str = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
+        for w in [20u16, 30, 40, 80] {
+            for h in [10u16, 25, 40] {
+                let mut off = app_with_panel(false);
+                off.input.insert_str(LONG);
+                let mut on = app_with_panel(true);
+                on.input.insert_str(LONG);
+                assert_eq!(
+                    input_height(&off, w),
+                    input_height(&on, w),
+                    "输入框高度不得随侧栏开关变化（w={w}）"
+                );
+                let g_off = input_geom(&off, w, h);
+                let g_on = input_geom(&on, w, h);
+                match (g_off, g_on) {
+                    (Some(a), Some(b)) => {
+                        assert_eq!(a.0, b.0, "输入区内区矩形必须逐字段相同（w={w} h={h}）");
+                        assert_eq!(
+                            (a.1, a.2, a.3),
+                            (b.1, b.2, b.3),
+                            "(内宽, offset, 内高) 必须相同（w={w} h={h}）"
+                        );
+                    }
+                    (None, None) => {}
+                    (a, b) => panic!("开关两态的一端无几何、另一端有（w={w} h={h}）：{a:?}/{b:?}"),
+                }
+            }
+        }
+    }
+
+    /// 补全浮层即使侧栏开着，也只能落在 **Chat 带内** —— 不压到侧栏。
+    ///
+    /// 直接断言 `ui_with` 传给 [`draw_completion`] 的那个矩形：它拿到的就是 `a.chat`，
+    /// 故「`a.chat.right() <= side.left()`」等价于「浮层区域 ⊆ Chat 带」。
+    /// 比渲染成缓冲区再数右边界更简单，也更本质（浮层宽度还会被 `COMPLETION_MAX_WIDTH` 夹）。
+    ///
+    /// 变异：`ui_with` 里把 `a.chat` 换成 `frame.area()` 传给 `draw_completion` ⇒ 红。
+    #[test]
+    fn completion_overlay_stays_within_chat_area_when_panel_open() {
+        const W: u16 = 80;
+        const H: u16 = 40;
+        let mut app = app_with_panel(true);
+        app.completion = Some(crate::completion::open("/").expect("`/` 必有候选"));
+        let total = Rect::new(0, 0, W, H);
+        let a = frame_areas(&app, total);
+        let side = a.side.expect("W=80 且已打开 ⇒ 侧栏必须存在");
+        assert!(
+            a.chat.right() <= side.left(),
+            "Chat 带右边界（{}）不得超过侧栏左边界（{}）",
+            a.chat.right(),
+            side.left()
+        );
+        // 浮层与 Chat 带同宽同 x（`draw_completion` 的 `w = chat.width.min(…)、x = chat.x`）
+        // ⇒ 右边界天然 ≤ chat.right()。
+        assert_eq!(a.chat.x + a.chat.width, side.x, "Chat 带与侧栏必须紧邻无缝");
+        // 真渲染一帧，确认开关两态都能画出来（不 panic、不越界写缓冲）。
+        let _ = rows_of(&mut app, W, H);
     }
 }

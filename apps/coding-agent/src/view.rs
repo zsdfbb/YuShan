@@ -1378,4 +1378,168 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── 侧栏投影（`panel_view`）──────────────────────────────────────────
+
+    /// 造一个纯内存清单（`open(None)` ⇒ 不落盘），灌入给定项。
+    ///
+    /// 全 `Pending` 项满足 `apply` 的两条硬规则（不丢弃旧项、非全终态不清理），
+    /// 因此灌进去的顺序就是 `snapshot()` 的顺序。
+    fn todo_store(items: Vec<ys_tools_todo::TodoItem>) -> std::sync::Arc<ys_tools_todo::TodoStore> {
+        let store = ys_tools_todo::TodoStore::open(None);
+        store.apply(items).expect("纯 Pending 清单必然被接受");
+        store
+    }
+
+    /// 造 `n` 条 `Pending` 清单项，内容为 `任务{i}`。
+    fn pending_items(n: usize) -> Vec<ys_tools_todo::TodoItem> {
+        (0..n)
+            .map(|i| ys_tools_todo::TodoItem::new(format!("任务{i}"), TodoStatus::Pending))
+            .collect()
+    }
+
+    /// 造一份 `SubagentSetup`，并把 `n` 个**仍在跑**的子 agent 登记进它共享的句柄表。
+    ///
+    /// 返回的 `Vec<Arc<QueueBoundarySource>>` 必须由调用方活到断言之后：句柄的生死
+    /// 判据是 `Weak` 能否 `upgrade`，drop 掉就等于「子 agent 已收尾」。
+    fn subagent_with_live(
+        n: usize,
+    ) -> (
+        crate::subagent::SubagentSetup,
+        Vec<std::sync::Arc<ys_protocol::QueueBoundarySource>>,
+    ) {
+        use std::sync::Arc;
+
+        use ys_protocol::QueueBoundarySource;
+        use ys_tools_web::FetchedDir;
+
+        use crate::subagent::{LiveSubagents, PendingResults, SubagentHandles, SubagentsDir};
+
+        let dir = temp_dir("panel_running");
+        let handles = Arc::new(SubagentHandles::default());
+        let setup = crate::subagent::SubagentSetup::shared(
+            "child prompt".to_string(),
+            ys_component::RunLimits::new(3),
+            std::time::Duration::from_secs(30),
+            dir.clone(),
+            ys_tools_web::WebConfig::offline(FetchedDir::Temp(dir.join("fetched"))),
+            Arc::new(SubagentsDir::at(dir.join("subagents"), false)),
+            Arc::new(PendingResults::default()),
+            Arc::new(LiveSubagents::default()),
+        )
+        .with_handles(handles.clone());
+
+        let mut keeps = Vec::with_capacity(n);
+        for i in 0..n {
+            let own = Arc::new(QueueBoundarySource::new());
+            handles.register(
+                format!("sa1.{i}"),
+                own.clone(),
+                Arc::from(format!("主题{i}").as_str()),
+            );
+            keeps.push(own);
+        }
+        (setup, keeps)
+    }
+
+    /// 防的是「入口不限条数」这类回归：长清单会把每帧绘制成本摊成任意值。
+    ///
+    /// 条目数封顶为 [`PANEL_TODO_MAX`]，溢出的条数只报数（UI 画 `+N`）；
+    /// **前 24 条必须按灌入顺序原样保留**（清单顺序是模型表达的计划次序）。
+    #[test]
+    fn panel_view_caps_todos_and_reports_hidden() {
+        let store = todo_store(pending_items(25));
+        let panel = panel_view(&store, None);
+
+        assert_eq!(panel.todos.len(), PANEL_TODO_MAX, "条目数必须封顶");
+        assert_eq!(panel.todos_hidden, 1, "溢出条数只留下计数");
+        let texts: Vec<&str> = panel.todos.iter().map(|t| t.text.as_str()).collect();
+        let expected: Vec<String> = (0..PANEL_TODO_MAX).map(|i| format!("任务{i}")).collect();
+        assert_eq!(
+            texts,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "前 24 条必须与灌入顺序逐一相同（不排序、不跳条）"
+        );
+    }
+
+    /// 防的是「在跑栏不限条数」这类回归：理由同 todo 侧，溢出只计数。
+    #[test]
+    fn panel_view_caps_running_and_reports_hidden() {
+        let store = todo_store(Vec::new());
+        let (setup, _keeps) = subagent_with_live(9);
+        let panel = panel_view(&store, Some(&setup));
+
+        assert_eq!(panel.running.len(), PANEL_RUNNING_MAX, "在跑栏必须封顶");
+        assert_eq!(panel.running_hidden, 1, "溢出的在跑项只留下计数");
+    }
+
+    /// 防的是 `&s[..96]` 这类**字节**截断：切在多字节序列中间会 panic 或产出无效 UTF-8。
+    #[test]
+    fn panel_view_truncates_todo_content_by_chars_not_bytes() {
+        let store = todo_store(vec![ys_tools_todo::TodoItem::new(
+            "字".repeat(200),
+            TodoStatus::Pending,
+        )]);
+        let panel = panel_view(&store, None);
+
+        assert_eq!(
+            panel.todos[0].text.chars().count(),
+            MAX_TODO_CONTENT_CHARS,
+            "截断按字符数，不是字节数、也不是显示列宽"
+        );
+    }
+
+    /// 防的是状态映射错位 —— 尤其 `Cancelled` 该落 `Done` 而不是 `Plain`。
+    #[test]
+    fn panel_view_maps_todo_status_to_row_mark() {
+        let store = todo_store(vec![
+            ys_tools_todo::TodoItem::new("①", TodoStatus::Pending),
+            ys_tools_todo::TodoItem::new("②", TodoStatus::InProgress),
+            ys_tools_todo::TodoItem::new("③", TodoStatus::Completed),
+            ys_tools_todo::TodoItem::new("④", TodoStatus::Cancelled),
+            ys_tools_todo::TodoItem::new("⑤", TodoStatus::Pending),
+        ]);
+        let panel = panel_view(&store, None);
+
+        let marks: Vec<RowMark> = panel.todos.iter().map(|t| t.mark).collect();
+        assert_eq!(
+            marks,
+            vec![
+                RowMark::Plain,
+                RowMark::Active,
+                RowMark::Done,
+                // 放弃也是「不用再做了」：与完成同档。
+                RowMark::Done,
+                RowMark::Plain,
+            ],
+            "`Cancelled` 必须落 `Done`（落 `Plain` 会让放弃项显示成待办）"
+        );
+    }
+
+    /// 防的是「没数据就不画框」这类分支被引入：空态是**两个空 `Vec` + 两个 0**，
+    /// 不是 `None` —— 侧栏恒有一个框，内容为空而已。
+    #[test]
+    fn panel_view_returns_empty_panel_for_empty_inputs() {
+        let store = todo_store(Vec::new());
+        let panel = panel_view(&store, None);
+
+        assert!(panel.todos.is_empty(), "无清单时 todo 栏是空 Vec");
+        assert!(panel.running.is_empty(), "无子 agent 时在跑栏是空 Vec");
+        assert_eq!(panel.todos_hidden, 0, "空态不得报溢出");
+        assert_eq!(panel.running_hidden, 0, "空态不得报溢出");
+    }
+
+    /// 防的是「把 `saturating_sub` 写成普通减法」（恰好取满时 `len - taken == 0`，
+    /// 不该下溢）：这是封顶的**边界外一侧**。
+    #[test]
+    fn panel_view_exactly_at_limits_reports_no_hidden() {
+        let store = todo_store(pending_items(PANEL_TODO_MAX));
+        let (setup, _keeps) = subagent_with_live(PANEL_RUNNING_MAX);
+        let panel = panel_view(&store, Some(&setup));
+
+        assert_eq!(panel.todos.len(), PANEL_TODO_MAX);
+        assert_eq!(panel.todos_hidden, 0, "恰好取满不得报溢出");
+        assert_eq!(panel.running.len(), PANEL_RUNNING_MAX);
+        assert_eq!(panel.running_hidden, 0, "恰好取满不得报溢出");
+    }
 }

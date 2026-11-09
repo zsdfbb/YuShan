@@ -5026,9 +5026,9 @@ mod tests {
     /// 要么不低于 [`SIDE_MIN_WIDTH`]、三段高度合起来仍是整屏高。
     ///
     /// 变异：
-    /// ① `saturating_sub` 换成普通减法 ⇒ W=10 下溢 panic；
+    /// ① `saturating_sub` 换成普通减法 ⇒ `w < MIN_WIDTH`（本用例的 0/4/9）下溢 panic；
     /// ② 改用 `Layout::horizontal([Min(1), Length(SIDE_WIDTH)])` ⇒ W=20 时 chat 只剩 1 列；
-    /// ③ 去掉 `SIDE_MIN_WIDTH` 判据 ⇒ W=11/12 出现内区宽 0 的碎条。
+    /// ③ 去掉 `SIDE_MIN_WIDTH` 判据 ⇒ W=20/21 出现 10/11 列（内区几乎无）的碎条。
     #[test]
     fn frame_areas_degrades_cleanly_on_narrow_screens() {
         const H: u16 = 40;
@@ -5080,8 +5080,8 @@ mod tests {
     /// [`side_width`] 的**单元级**对照：把边界值逐点钉死（[`frame_areas_degrades_cleanly_on_narrow_screens`]
     /// 是集成口径，这条是它背后的纯函数）。
     ///
-    /// 变异：`saturating_sub` → 普通减法（W=10 panic）、删掉 `SIDE_MIN_WIDTH` 判据
-    /// （W=11/20/21 返回 1/10/11 而非 0）。
+    /// 变异：`saturating_sub` → 普通减法（W=0/9 panic）、删掉 `SIDE_MIN_WIDTH` 判据
+    /// （W=21 返回 11、W=20 返回 10，而非 0）。
     #[test]
     fn side_width_clamps_and_respects_minimum() {
         // 余额充足 ⇒ 封顶在 SIDE_WIDTH。
@@ -5109,11 +5109,14 @@ mod tests {
     ///
     /// 断言分两层：
     /// ① `Layout` 本身的性质（轻量、直接）；
-    /// ② **走生产路径**：真渲染 [`draw_sidebar`]，从缓冲区里找出两个框的顶边框行 —— 后者的
-    ///    切分方式才是用户看到的东西。只有 ① 的话，把 `draw_sidebar` 的 `50/50` 改掉也不会红。
+    /// ② **走生产路径**：真渲染 [`draw_sidebar`]，从缓冲区里找出两个框的顶/底边框行 —— 后者的
+    ///    切分方式才是用户看到的东西。只有 ① 的话，把 `draw_sidebar` 的切分改掉不会红。
     ///
-    /// 变异：把 `draw_sidebar` 的 `[Percentage(50), Percentage(50)]` 换成
-    /// `[Percentage(50), Constraint::Min(0)]` ⇒ 下栏吃掉剩余全部 ⇒ ② 红。
+    /// 变异：`[Percentage(50), Percentage(50)]` → `[Percentage(30), Constraint::Min(0)]`
+    /// ⇒ 上栏变矮、下栏吃掉剩余 ⇒ ② 红。
+    ///
+    /// **已实测**：`[Percentage(50), Constraint::Min(0)]` 在 ratatui 0.30 下**逐格等同**于
+    /// `50/50`（h=5/7/8/25/40 全部同值）⇒ 它不是一个有效变异，别拿它当反例。
     #[test]
     fn sidebar_halves_share_height_exactly() {
         let app = app_with_panel(true);

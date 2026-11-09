@@ -1,6 +1,6 @@
 # 执行计划：TUI 右侧双栏（todo + subagent 状态）
 
-> 对应设计：`docs/arch/tui-right-panel/design.md`（权威）、`docs/design-plans/tui-right-panel.md`
+> 对应设计：`docs/arch/tui-right-panel/design.md`（权威）、`docs/design-plans/completed/2026-11-10-tui-right-panel.md`
 > 决策记录：`docs/adr/0075-tui-right-panel.md`
 > 基线（review 用）：`1b27d3c`
 > 纪律：每个 `impl` 与它的 `test` 成对；同波文件集**互不相交**；单单元 ≤5 文件 / ≤10 分钟。

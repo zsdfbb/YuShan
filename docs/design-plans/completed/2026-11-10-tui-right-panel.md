@@ -4,7 +4,7 @@
 > 需求上下文：[`context.md`](../arch/tui-right-panel/context.md)（Q1/Q1b/Q2/Q2b/Q3/Q3b/Q4/Q4b/Q6/Q6b/Q8 已定）。
 > 决策记录：[ADR-0075](../adr/0075-tui-right-panel.md)（五条决策，本文**不复述论证**，只引用）。
 > 评审：[`review.md`](../arch/tui-right-panel/review.md)（两条 P0 已修进设计，本文按修正后的 §3.1 / §5.1 落地）。
-> 执行计划：[`docs/exec-plans/tui-right-panel.md`](../exec-plans/tui-right-panel.md)。
+> 执行计划：[`docs/exec-plans/completed/2026-11-10-tui-right-panel.md`](../exec-plans/completed/2026-11-10-tui-right-panel.md)。
 > 核实基线：工作区 HEAD（`design.md` 修正版；本文所有行号经 `rg`/`read` 逐个核对，与设计不符处见 §8）。
 
 ---
@@ -349,6 +349,6 @@ G9（去掉 `elapsed` 判据）、G10（改字节截断）、G12（`retain` 前�
 - [`docs/arch/tui-right-panel/context.md`](../arch/tui-right-panel/context.md) —— 需求上下文
 - [`docs/arch/tui-right-panel/review.md`](../arch/tui-right-panel/review.md) —— 质量分析（F1/F2/F3 已修）
 - [`docs/adr/0075-tui-right-panel.md`](../adr/0075-tui-right-panel.md) —— 五条决策
-- [`docs/exec-plans/tui-right-panel.md`](../exec-plans/tui-right-panel.md) —— 执行计划（波次与任务表）
+- [`docs/exec-plans/completed/2026-11-10-tui-right-panel.md`](../exec-plans/completed/2026-11-10-tui-right-panel.md) —— 执行计划（波次与任务表）
 - `docs/arch/long-horizon-todo/design.md` §7.1 —— todo 真值层（`TodoStore`）
 - `docs/adr/0054` —— 未落地的 subagent 可观测层（本设计是其严格子集）

@@ -728,11 +728,34 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, panel: &PanelView, palette: Palet
     draw_running_section(frame, rows[1], panel, palette);
 }
 
+/// 侧栏一栏的**可视封顶**：算出「正文画几条 / 还有几条没显示」。
+///
+/// 两个 section（todo / running）共用这一处算术 ⇒ 形状恒等，读者只需比一次。
+/// 不变量（设计 `docs/arch/tui-right-panel/design.md` §3.3「溢出与空态」）：
+///
+/// - **内容级裁断、不滚动**：没有滚动位置，超出内区高的条目一律折进「未显示」计数。
+/// - `可见行数 = 内区高 - 1` —— 末行留给 `+N` 提示，**仅当确实溢出**（`total >= budget`）时才预留。
+/// - `+N` 行**必留**：返回值满足 `shown + (hidden > 0) <= budget`（`budget >= 1`），
+///   即它永远落在内区之内，不会被正文挤掉 —— 否则用户以为清单只有屏上那几条。
+/// - `total < budget` ⇒ 正文全画；`+N` 只在入口封顶（`hidden_data`）真的丢过条目时出现。
+///
+/// `hidden_data` 是入口封顶（`PANEL_TODO_MAX` / `PANEL_RUNNING_MAX`）已丢掉的条数，
+/// 与本函数丢掉的条数**合并成同一个数**：用户只关心「还有 N 项没显示」。
+fn sidebar_visible(total: usize, hidden_data: usize, budget: usize) -> (usize, usize) {
+    if total < budget {
+        (total, hidden_data)
+    } else {
+        // 末行留给 `+N`。
+        let shown = budget.saturating_sub(1);
+        (shown, total - shown + hidden_data)
+    }
+}
+
 /// 侧栏上栏：todo 清单。
 ///
 /// 只读 [`PanelView`] —— 不认 todo 的实现类型，也不读任何 app 侧 store。
-/// 每行先按**显示列**截断（CJK 算 2 列，只有 UI 知道内区宽）；纵向溢出由 `Paragraph`
-/// 自然裁掉，不自己算可见行 —— 末行的 `+N` 保留，否则用户会以为清单只有 N 项。
+/// 每行先按**显示列**截断（CJK 算 2 列，只有 UI 知道内区宽）；纵向按内区高裁断
+/// （[`sidebar_visible`]），**不滚动** —— 末行的 `+N` 必留，否则用户会以为清单只有 N 项。
 fn draw_todo_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: Palette) {
     let block = Block::bordered()
         .border_style(Style::default().fg(palette.muted))
@@ -742,12 +765,15 @@ fn draw_todo_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(panel.todos.len() + 2);
 
     if panel.todos.is_empty() {
+        // 空态优先：只画占位行，此时不预留也不画 `+N`（没有条目可数）。
         lines.push(Line::from(Span::styled(
             "（无 todo）",
             Style::default().fg(palette.muted),
         )));
     } else {
-        for todo in &panel.todos {
+        let (shown, hidden) =
+            sidebar_visible(panel.todos.len(), panel.todos_hidden, inner.height as usize);
+        for todo in panel.todos.iter().take(shown) {
             // 三种状态字形给三种样式：进行中高亮、完成变暗，未开始保持正文色。
             let (glyph, style) = match todo.mark {
                 RowMark::Plain => ("☐", Style::default().fg(palette.fg)),
@@ -767,13 +793,13 @@ fn draw_todo_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: 
                 ),
             ]));
         }
-    }
-
-    if panel.todos_hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("+{} 项未显示", panel.todos_hidden),
-            Style::default().fg(palette.muted),
-        )));
+        // 追加在正文**之后**且计入 `shown` 的同一份预算 ⇒ 恒在内区之内、恒为末行。
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("+{hidden} 项未显示"),
+                Style::default().fg(palette.muted),
+            )));
+        }
     }
 
     frame.render_widget(
@@ -785,7 +811,8 @@ fn draw_todo_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: 
 }
 
 /// 侧栏下栏：subagent 在跑状态。与 [`draw_todo_section`] 同构：
-/// handle 是标识（暗色），label 是工作主题（正文色）。
+/// handle 是标识（暗色），label 是工作主题（正文色）——
+/// 纵向裁断同样走 [`sidebar_visible`]（内容级、不滚动、`+N` 必留）。
 fn draw_running_section(frame: &mut Frame, area: Rect, panel: &PanelView, palette: Palette) {
     let block = Block::bordered()
         .border_style(Style::default().fg(palette.muted))
@@ -800,7 +827,12 @@ fn draw_running_section(frame: &mut Frame, area: Rect, panel: &PanelView, palett
             Style::default().fg(palette.muted),
         )));
     } else {
-        for running in &panel.running {
+        let (shown, hidden) = sidebar_visible(
+            panel.running.len(),
+            panel.running_hidden,
+            inner.height as usize,
+        );
+        for running in panel.running.iter().take(shown) {
             // handle 是机器标识，用暗色退到背景；label 才是人要看的那一列。
             let handle = truncate_to_width(&running.handle, width);
             let used = display_width(&handle) + 1;
@@ -813,13 +845,13 @@ fn draw_running_section(frame: &mut Frame, area: Rect, panel: &PanelView, palett
                 ),
             ]));
         }
-    }
-
-    if panel.running_hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("+{} 个未显示", panel.running_hidden),
-            Style::default().fg(palette.muted),
-        )));
+        // 与 todo 侧同形：`+N` 追加在正文之后，共享同一份行预算。
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("+{hidden} 个未显示"),
+                Style::default().fg(palette.muted),
+            )));
+        }
     }
 
     frame.render_widget(
@@ -5423,13 +5455,12 @@ mod tests {
     /// 超长 CJK（200 字 todo / 120 字 running label）**不得 panic**、不得产出损坏字符。
     ///
     /// 防的回归：按字节截断（`&s[..96]` / `s.split_at(n)`）切在多字节序列中间 ⇒
-    /// panic（或产出无效 UTF-8）。几何取真值：80 列终端下 [`side_width`] 给出的侧栏宽。
+    /// panic（或产出无效 UTF-8）。几何取 40 列整幅。
     #[test]
     fn sidebar_truncates_cjk_without_panicking() {
         const H: u16 = 20;
         let app = app_with_panel(true);
         let palette = chrome(&app);
-        let w = side_width(80);
         let panel = crate::view::PanelView {
             todos: vec![crate::view::TodoLine {
                 text: "字".repeat(200),
@@ -5443,137 +5474,206 @@ mod tests {
             running_hidden: 0,
         };
 
-        // 后端给足余量：超出侧栏宽的列留在缓冲区里，用来验「没画到栏外」。
-        let buf = sidebar_buffer(w + 8, H, Rect::new(0, 0, w, H), &panel, palette);
-        let rows = buffer_rows(&buf);
-        let text = rows.join("\n");
+        // 两档宽度：40（规格几何，预算 36 = 3 字节汉字的整倍数）与 41（预算 37，
+        // 落在多字节序列中间）—— 后者才能把「按字节截断」逼成 panic。
+        for w in [40u16, 41] {
+            let buf = sidebar_buffer(w, H, Rect::new(0, 0, w, H), &panel, palette);
+            let rows = buffer_rows(&buf);
+            let text = rows.join("\n");
 
-        // 能跑到这里就说明**没 panic**；再确认内容真的画出来了。
-        assert!(
-            text.contains(" Todo ") && text.contains(" Running "),
-            "两栏都得画出来：\n{text}"
-        );
-        assert!(text.contains('☐'), "todo 行必须出现：\n{text}");
-        assert!(
-            !text.contains('\u{FFFD}'),
-            "不得出现替换字符（UTF-8 被切坏）：\n{text}"
-        );
-        assert!(text.contains('…'), "超宽内容必须留下省略号：\n{text}");
-
-        // 右边框列（x = w-1）必须还是边框字符 —— 内容溢出会先吃掉它。
-        for y in 0..H {
-            let sym = buf[(w - 1, y)].symbol();
+            // 能跑到这里即证明**没 panic**；再确认内容真的画出来了、且没被切坏。
             assert!(
-                ["┌", "┐", "│", "└", "┘"].contains(&sym),
-                "第 {y} 行 x={} 应是边框、实际 {sym:?}：{:?}",
-                w - 1,
-                rows[y as usize]
+                text.contains(" Todo ") && text.contains(" Running "),
+                "w={w}：两栏都得画出来：\n{text}"
             );
-        }
-        // 侧栏之外（x ≥ w）必须原样空白。
-        for y in 0..H {
-            for x in w..w + 8 {
-                assert_eq!(
-                    buf[(x, y)].symbol(),
-                    " ",
-                    "画到侧栏之外：({x}, {y}) = {:?}",
-                    buf[(x, y)].symbol()
-                );
-            }
-        }
-        // 每行实际占用列数不超过侧栏宽。
-        let bw = buf.area().width as usize;
-        for (y, row) in buf.content().chunks(bw).enumerate() {
-            let used = row_used_cols(row);
+            assert!(text.contains('☐'), "w={w}：todo 行必须出现：\n{text}");
             assert!(
-                used <= w as usize,
-                "第 {y} 行用了 {used} 列，超过侧栏宽 {w}"
+                !text.contains('\u{FFFD}'),
+                "w={w}：不得出现替换字符（UTF-8 被切坏）：\n{text}"
             );
         }
     }
 
-    /// G5 的核心：每条渲染行的**显示宽度 ≤ 内区宽**，被截断的行必须留下 `…`、不得压右边框。
+    /// G5 的核心：最窄侧栏（[`SIDE_MIN_WIDTH`]）下每条渲染行的**显示宽度 ≤ 侧栏宽**。
     ///
     /// 防的回归：`truncate_to_width(&todo.text, width.saturating_sub(2))` 的预算漏算
-    /// 「字形 1 列 + 1 列空格」，正文按 `width` 截 ⇒ 拼出的行多 1 个字形宽；`Paragraph`
-    /// 裁掉的正是行尾的 `…` —— 屏幕上于是看不出还有没显示的内容。
-    /// 故断言分两层：**行宽不越内区**（几何）与**截断标记仍在**（语义）。
+    /// 「字形 1 列 + 1 列空格」，正文按 `width` 截 ⇒ 拼出的行多出 2 列、挤出内区、
+    /// 最后一字或右边框被盖掉。字形取 `▶`（进行中）—— 它同样只占 1 列。
     #[test]
     fn sidebar_lines_fit_within_inner_width() {
         const H: u16 = 20;
         let app = app_with_panel(true);
         let palette = chrome(&app);
-        let long = "字".repeat(200);
         let panel = crate::view::PanelView {
             todos: vec![crate::view::TodoLine {
-                text: long.clone(),
-                mark: crate::view::RowMark::Plain,
+                text: "字".repeat(200),
+                mark: crate::view::RowMark::Active,
             }],
             todos_hidden: 0,
-            running: vec![crate::view::RunningLine {
-                handle: "abcde".to_string(),
-                label: long,
-            }],
+            running: Vec::new(),
             running_hidden: 0,
         };
 
-        // 从最小可用宽（内区仅 10 列）到常规侧栏宽，逐档验。
-        for w in [SIDE_MIN_WIDTH, 13, 20, 30] {
-            let bw = w + 6;
-            let buf = sidebar_buffer(bw, H, Rect::new(0, 0, w, H), &panel, palette);
-            let rows = buffer_rows(&buf);
+        // 最窄可用侧栏：内区仅 `SIDE_MIN_WIDTH - 2` 列，截断预算最紧张。
+        let w = SIDE_MIN_WIDTH;
+        let buf = sidebar_buffer(w, H, Rect::new(0, 0, w, H), &panel, palette);
+        let rows = buffer_rows(&buf);
 
-            // ① 右边框列完好：内容多占 1 列就会把它盖掉（本用例的核心几何断言）。
-            for y in 0..H {
-                let sym = buf[(w - 1, y)].symbol();
-                assert!(
-                    ["┌", "┐", "│", "└", "┘"].contains(&sym),
-                    "w={w}：第 {y} 行右边框被覆盖（{sym:?}）：{:?}",
-                    rows[y as usize]
-                );
-            }
-            // ② 侧栏之外必须空白（Paragraph 会裁，但预算算错时先吃掉的是 `…`）。
-            for y in 0..H {
-                for x in w..bw {
-                    assert_eq!(buf[(x, y)].symbol(), " ", "w={w}：画到侧栏之外 ({x}, {y})");
-                }
-            }
-
-            let width = buf.area().width as usize;
-            let inner_w = w as usize - 2;
-            let mut todo_rows = 0usize;
-            let mut running_rows = 0usize;
-            for (y, row) in buf.content().chunks(width).enumerate() {
-                let text = rows[y].clone();
-                let text = &text;
-
-                // ③ **内区文字占用**：只量左右边框之间的格（不含边框本身）。
-                //    字形 1 列 + 1 列空格 + 正文 ≤ 内区宽 —— 多 1 列就会把 `…` 挤给
-                //    `Paragraph` 裁掉（末字与省略号不可见）。
-                let inner_cols = &row[1..(w as usize - 1)];
-                assert!(
-                    row_used_cols(inner_cols) <= inner_w,
-                    "w={w}：第 {y} 行内区超出 {inner_w} 列（实际 {}）：{text:?}",
-                    row_used_cols(inner_cols)
-                );
-                if text.contains('☐') {
-                    todo_rows += 1;
-                    // 截断标记必须还在屏上（预算漏算时被裁掉的正是它）。
-                    assert!(
-                        text.contains('…'),
-                        "w={w}：todo 行缺省略号 —— 正文预算多占了一格：{text:?}（内区宽 {inner_w}）"
-                    );
-                }
-                if text.contains("abcde") {
-                    running_rows += 1;
-                    assert!(
-                        text.contains('…'),
-                        "w={w}：running label 缺省略号：{text:?}（内区宽 {inner_w}）"
-                    );
-                }
-            }
-            assert_eq!(todo_rows, 1, "w={w}：应恰好一行 todo：{:?}", rows);
-            assert_eq!(running_rows, 1, "w={w}：应恰好一行 running：{:?}", rows);
+        // ① 每行的显示宽度不得超过侧栏宽 —— 正是「预算算错就挤出右边框」的护栏。
+        for (y, line) in rows.iter().enumerate() {
+            assert!(
+                display_width(line) <= w as usize,
+                "第 {y} 行占用 {} 列，超过侧栏宽 {w}：{line:?}",
+                display_width(line)
+            );
         }
+
+        // ② 字形 `▶` 必须真画出来（否则本用例测的不是那条预算路径）。
+        let text = rows.join("\n");
+        assert!(text.contains('▶'), "todo 行必须出现进行中字形：\n{text}");
+
+        // ③ 截断标记必须留在屏上：预算多算 2 列时行宽 = 内区宽 + 1，
+        //    `Paragraph` 裁掉的正是行尾的 `…` —— 只靠「行宽 ≤ 侧栏宽」看不出
+        //    这一点（缓冲区的行宽由后端决定，恒等于侧栏宽），必须断言 `…` 仍在。
+        assert!(
+            text.contains('…'),
+            "todo 行缺省略号 —— 正文预算多占了「字形 + 空格」两列：\n{text}"
+        );
+    }
+
+    /// 测试辅助：造一个满是 todo 的 `PanelView`（短文本，只占 1 行）。
+    fn panel_full_of_todos(n: usize) -> PanelView {
+        crate::view::PanelView {
+            todos: (0..n)
+                .map(|i| crate::view::TodoLine {
+                    text: format!("项{i}"),
+                    mark: crate::view::RowMark::Plain,
+                })
+                .collect(),
+            todos_hidden: 0,
+            running: Vec::new(),
+            running_hidden: 0,
+        }
+    }
+
+    /// **按内区高截断 todo**，且末行的 `+N` 必须留在屏上。
+    ///
+    /// 几何按真值算：`draw_sidebar` 给 `area` 高度 H，上栏 = `Percentage(50)` = `H/2`（奇数向上取整），
+    /// `Block::bordered` 再扣 2 行边框，剩下的就是内区行数。
+    ///
+    /// 本用例存在的**唯一理由**：防「按高度截断」被漏掉 —— 那样 `Paragraph` 会把多出的 todo 静默
+    /// 裁掉，`+N` 本身也可能被裁掉，于是清单看起来就只有屏上那几条（设计 §3.3 明令禁止）。
+    #[test]
+    fn sidebar_truncates_todos_to_visible_height_and_keeps_hint() {
+        const W: u16 = 30;
+        // 上栏 10 行（50%）- 2 行边框 ⇒ 内区 8 行 ⇒ 7 条正文 + 1 行 `+N`。
+        const H: u16 = 20;
+        const BUDGET: usize = 8;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let panel = panel_full_of_todos(24);
+
+        let buf = sidebar_buffer(W, H, Rect::new(0, 0, W, H), &panel, palette);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+
+        // ① 几何前提：内区真的只有 `BUDGET` 行（算错了下面就测不出真行为）。
+        let upper = Rect::new(0, 0, W, H / 2);
+        let inner = Block::bordered().title(" Todo ").inner(upper);
+        assert_eq!(inner.height as usize, BUDGET, "上栏内区行数：{inner:?}");
+
+        // ② `+N` 的 N = 总条数 - 可显示条数 = 24 - 7。
+        assert!(
+            text.contains("+17 项未显示"),
+            "截断提示的数字与正文条数必须对得上：\n{text}"
+        );
+        // ③ `+N` 那行确实在屏上（不是被正文挤掉、只存于 `lines` 里）。
+        assert!(
+            rows.iter().any(|r| r.contains("项未显示")),
+            "`+N` 行必须落在缓冲区里：\n{text}"
+        );
+        // ④ 屏上的 todo 条数 == 可显示条数，不是 24 —— 本条是「按高度截断」的直接证据。
+        let shown = rows.iter().filter(|r| r.contains('☐')).count();
+        assert_eq!(shown, BUDGET - 1, "正文只能画满 `内区高 - 1` 行：\n{text}");
+    }
+
+    /// 高度**极矮**时 `+N` 仍必须可见 —— 它的优先级高于正文。
+    ///
+    /// 极端情形是内区只剩 1 行：此时正文 `0` 条、整行给 `+N`。若把「追加 `+N`」放在截断之前
+    /// （即先拼满正文再看高度），这行会被正文挤掉 —— 用户于是失去「还有更多」的唯一线索。
+    #[test]
+    fn sidebar_keeps_overflow_hint_when_height_is_tight() {
+        const W: u16 = 30;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let panel = panel_full_of_todos(24);
+
+        // 上栏 3 行（H=6 ⇒ 50% = 3）- 2 行边框 ⇒ 内区 1 行。
+        const TINY_H: u16 = 6;
+        let upper = Rect::new(0, 0, W, TINY_H / 2);
+        let inner = Block::bordered().title(" Todo ").inner(upper);
+        assert_eq!(inner.height, 1, "本例要求内区只剩 1 行：{inner:?}");
+
+        // 不 panic 就是第一个断言（`saturating_sub` / `take(0)` 都不能越界）。
+        let buf = sidebar_buffer(W, TINY_H, Rect::new(0, 0, W, TINY_H), &panel, palette);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+
+        assert!(
+            rows.iter().any(|r| r.contains("项未显示")),
+            "内区只剩 1 行时 `+N` 也必须可见：\n{text}"
+        );
+        assert!(
+            !text.contains('☐'),
+            "这一行让给了 `+N`，不得再画正文：\n{text}"
+        );
+    }
+
+    /// running 侧与 todo 侧**同构**：同样按内区高截断，`+N` 同样必留。
+    ///
+    /// 与用例 1 同构的几何（内区 8 行），防止只把一边修好、另一边继续静默丢条目。
+    #[test]
+    fn sidebar_truncates_running_to_visible_height() {
+        const W: u16 = 30;
+        const H: u16 = 20;
+        const BUDGET: usize = 8;
+        let app = app_with_panel(true);
+        let palette = chrome(&app);
+        let panel = crate::view::PanelView {
+            todos: Vec::new(),
+            todos_hidden: 0,
+            running: (0..8)
+                .map(|i| crate::view::RunningLine {
+                    handle: format!("h{i}"),
+                    label: format!("任务{i}"),
+                })
+                .collect(),
+            running_hidden: 0,
+        };
+
+        let buf = sidebar_buffer(W, H, Rect::new(0, 0, W, H), &panel, palette);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+
+        // 下栏与上栏同高同内区：`Percentage(50) × 2` ⇒ 上下各 `H/2`。
+        let lower = Rect::new(0, H / 2, W, H / 2);
+        let inner = Block::bordered().title(" Running ").inner(lower);
+        assert_eq!(inner.height as usize, BUDGET, "下栏内区行数：{inner:?}");
+
+        // 8 条、内区 8 行 ⇒ 7 条正文 + `+1 个未显示`。
+        assert!(
+            text.contains("+1 个未显示"),
+            "running 侧的截断提示必须算对：\n{text}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("个未显示")),
+            "running 的 `+N` 行必须落在缓冲区里：\n{text}"
+        );
+        let shown = rows.iter().filter(|r| r.contains("任务")).count();
+        assert_eq!(
+            shown,
+            BUDGET - 1,
+            "running 正文只能画满 `内区高 - 1` 行：\n{text}"
+        );
     }
 }

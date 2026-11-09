@@ -2036,3 +2036,213 @@ beta
 `Boundary::Deferred` 注入的那几条结果。它不贡献标题素材（`run_turn_chain` 的
 `raw_user_text` 传 `None`），但它会落盘、会在回放里画成一行 —— 那是「回合开始」的标记，
 不是用户输入。
+
+## 21. 右侧窄边栏：todo 清单 + subagent 运行状态 — as-built
+
+**ADR**：[`0075`](../adr/0075-tui-right-panel.md)（状态 accepted）。
+**设计**：[`docs/arch/tui-right-panel/design.md`](../arch/tui-right-panel/design.md)。
+**本节补充 §5 的 UI 形态** —— §5 描述的三 pane 固定分区在侧栏打开时收窄，而非新增一个 pane。
+
+### 21.1 形态
+
+侧栏只切 **Chat 带**，垂直方向仍是三段（Chat / Input / Status）。栏高 = Chat 高，
+栏内上下两栏等分（todo 清单 / subagent 在跑状态）。
+
+| 项 | 值 | 位置 |
+|---|---|---|
+| 栏宽 | `SIDE_WIDTH = 30`（内区 28 列 ≈ 14 汉字） | `draw.rs:96` |
+| 栏宽下限 | `SIDE_MIN_WIDTH = 12`；低于此 **不画栏** | `draw.rs:103` |
+| 上栏条数上限 | `PANEL_TODO_MAX = 24` | `crates/ys-tui-coding/src/view.rs:202` |
+| 下栏条数上限 | `PANEL_RUNNING_MAX = 8` | `crates/ys-tui-coding/src/view.rs:212` |
+| 单项字符上限 | `MAX_TODO_CONTENT_CHARS = 96` | `apps/coding-agent/src/view.rs:202` |
+| 在跑 label 上限 | `MAX_DESCRIPTION_CHARS = 120` | `apps/coding-agent/src/view.rs:208` |
+| 回合中推送节流 | `PANEL_THROTTLE = 300 ms` | `app_loop.rs:94` |
+
+**开关默认关**（`App.panel_visible = false`），纯 UI 本地状态：不落盘、不进 `Outbound::View`、
+不改 `ys-protocol`。命令是 `/panel [on|off]`（无参 = 翻转）。
+
+### 21.2 几何单源：`frame_areas`
+
+[`FrameAreas`](crates/ys-tui-coding/src/draw.rs)（`draw.rs:239`）是一帧四个区域（chat / input /
+status / side）的**唯一来源**，`ui_with` / `chat_area` / `input_geom` 全部经它，不允许任何一处
+自己再 `Layout::vertical` 一遍 —— 否则会漂移成「滚动按 A、画面按 B」。
+
+**切分顺序不可反**（`draw.rs:247`）：
+
+```text
+先在整屏宽上 Layout::vertical([Min(3), Length(input_height(app, total.width)), Length(1)])
+再只把 v[0] 横向让位给侧栏：Layout::horizontal([Min(1), Length(side_w)]).split(v[0])
+```
+
+反过来（先横切整屏、再竖切 Chat 带）会让 `input_height` 拿到被侧栏压窄后的宽度，
+于是「开关 → 输入框宽 → 折行行数 → 输入框高 → Chat 高 → 栏高」形成**闭合反馈环**：
+栏高反过来影响开关是否值得打开。**先竖后横打断这个环**。
+
+因此 `input_height` / `input_inner_width` 的入参恒为**整屏宽** —— 这是 §5 所述
+「Input 高度随内容自适应」在侧栏打开时仍然逐值不变的原因（G11）。
+
+### 21.3 栏宽手写钳制：`side_width`
+
+`draw.rs:113`：
+
+```rust
+let budget = SIDE_WIDTH.min(total_width.saturating_sub(MIN_WIDTH));
+if budget < SIDE_MIN_WIDTH { 0 } else { budget }
+```
+
+**不能靠** `Layout::horizontal([Min(1), Length(SIDE_WIDTH)])`：实测它优先满足 `Length`、
+把 Chat 压到 1 列（W=20 ⇒ chat 1 / 栏 19），窄屏下 Chat 直接不可用。故手写钳制：
+余额不足时宁可收窄侧栏，也不夺 Chat 的空间。
+
+两个下界各管一件事：`total_width - MIN_WIDTH` 保 Chat 有 `MIN_WIDTH` 列可用；
+`SIDE_MIN_WIDTH` 保侧栏自己不低于可读下限。**W < 22 时两条都不满足 ⇒ 不画栏**（归 0）：
+
+| 总宽 W | 80 | 40 | 35 | 30 | 22 | 21 | ≤21 |
+|---|---|---|---|---|---|---|---|
+| 栏宽 | 30 | 30 | 25 | 20 | 12 | 0 | 0 |
+
+`SIDE_MIN_WIDTH` 的存在理由是实测：栏宽 1–2 列时 `Block::inner` 的内区宽为 **0**，
+侧栏只剩一根边框、`truncate_to_width` 只吐出 `…` —— 既占位置又什么都不说。
+
+### 21.4 栏内上下等分
+
+`Layout::vertical([Percentage(50), Percentage(50)])`。实测 `Percentage(50)` / `Fill(1)` /
+`Ratio(1,2)` 三种写法逐格相同，且两格之和恒等于总高；奇数高时上栏多 1 行。
+**不写奇偶补偿、不写 `H/2` 各算一次** —— 后者才会漏行。
+
+### 21.5 纵向裁断：`+N` 提示必留（设计 §3.3）
+
+`draw.rs:744` 的 `sidebar_visible(total, hidden_data, budget)` 是两个 section 共用的
+**唯一一处**算术，保证形状恒等：
+
+```rust
+if total < budget { (total, hidden_data) }
+else { let shown = budget.saturating_sub(1); (shown, total - shown + hidden_data) }
+```
+
+不变量：`shown + (hidden > 0) <= budget`。即 `+N` 提示行**永远落在内区之内、永远是末行**，
+不会被正文挤掉 —— 否则用户会以为清单只有屏上那几条。
+
+**入口封顶与可视裁断是两个正交的封顶**：
+
+| 封顶 | 位置 | 管什么 |
+|---|---|---|
+| 条数（`hidden_data`） | `panel_view()`，app 侧 | 数据量：`todo.snapshot()` 可能任意长 |
+| 可视行（`budget`） | `draw_sidebar()`，UI 侧 | 屏幕：内区高随终端高度变 |
+
+两者丢掉的条数**合并成同一个数**显示 —— 用户只关心「还有 N 项没显示」。
+实测后果（修前只做数据封顶）：终端 40 行时 24 条里只能看见 16 条、其余被 `Paragraph`
+静默裁掉，且 `+N` 那行本身也可能一起被裁。
+
+**空态优先**：无条目时只画占位行，不预留也不画 `+N`（没有条目可数）。
+框**常驻**（G6）—— 空态跳过 `render_widget(block)` 会让侧栏整块消失，
+用户分不清「没有 todo」和「侧栏坏了」。
+
+### 21.6 横向截断：显示列由 UI 封
+
+职责两分（设计 §3.4）：
+
+| 层 | 封什么 | 理由 |
+|---|---|---|
+| app 侧 `panel_view()` | **字符数**（`chars().take(n)`） | 字符数与显示列是两个量（CJK 一字 = 2 列） |
+| UI 侧 `draw_sidebar()` | **显示列**（`truncate_to_width`） | 只有 UI 知道内区宽 |
+
+**绝不** `&s[..n]` / `split_at`：落在多字节字符内部会 panic，而 TUI 的 `install_panic_hook`
+有意不 `catch_unwind` ⇒ 丢全部会话现场。
+
+todo 行的截断预算是 `width.saturating_sub(2)` —— 字形占 1 列 + 1 列空格要扣掉；
+少扣会让最末一字挤出内区、把 `…` 或右边框盖掉。
+
+### 21.7 投影：`panel_view(todo, subagent)` → `PanelView`
+
+`apps/coding-agent/src/view.rs:219`，**两参**（无 `theme`）：主题是渲染参数，不进投影结果，
+否则会污染 `PartialEq` 变更检测。
+
+`PanelView`（`crates/ys-tui-coding/src/view.rs:225`）是 UI 唯一认识的侧栏类型，
+字段全是 owned `String` —— `ys-tui-coding` **不依赖** `ys-tools-todo` / subagent 的实现类型。
+状态到字形（`RowMark`）的映射在 app 侧投影时完成：
+
+| `TodoStatus` | `RowMark` | 理由 |
+|---|---|---|
+| `Pending` | `Plain` | |
+| `InProgress` | `Active` | |
+| `Completed` / `Cancelled` | `Done` | 放弃也是「不用再做了」，字形与完成同档 |
+| 其它（`#[non_exhaustive]`） | `Plain` | 新增状态静默显示为 `Plain`，不阻断编译 |
+
+**todo 保持 store 原顺序**（不排序）：清单顺序是模型表达的计划次序，排序会篡改语义。
+
+### 21.8 回合中推送（§5 的唯一出站例外）
+
+`app_loop` 原本「每请求刷一次」`Outbound::View`。todo 与「谁在跑」都在**回合内**变，
+不推则用户要等到回合收场才看见。故新增 `push_panel_if_changed`（`app_loop.rs:2121`）：
+
+```rust
+let Some(base) = last_view.as_mut() else { return Ok(()) };
+let next = panel_view(todo, subagent);
+if last_panel.as_ref() == Some(&next) || last_push.elapsed() < PANEL_THROTTLE { return Ok(()) }
+base.panel = next.clone();  *last_panel = Some(next);  *last_push = Instant::now();
+send(out_tx, Outbound::View(base.clone())).await
+```
+
+三条判据与它们各自防的事：
+
+| 判据 | 防什么 |
+|---|---|
+| `last_view` 为 `None` ⇒ 跳过 | 没有 Chat / 输入框上下文的残次视图（首份完整视图由回合末刷新点发出） |
+| `last_panel == next` ⇒ 跳过 | 一次批量 `apply` 连跳多次 `revision`，每次都推整份快照会淹没信道 |
+| `elapsed() < PANEL_THROTTLE` ⇒ 跳过 | 同上；**只是丢弃、不安排下一次**（不新增定时器） |
+
+**不调 `build_view_with_loop`**：它要 `&Agent`（此刻已被 `&mut` 借走），且会读 `Instant` /
+`state_store` —— 那些字段的语义是「整份视图刷新」，不是「侧栏内容变了」。这里只替换上次
+已发视图的 `panel` 一个字段，因此 `turn_count` / `executed` 等与推送前**逐字相同**。
+
+**不丢变化**：被节流时不更新 `last_panel`，下次调用重试；即使之后再无事件，
+回合末刷新点会用 `panel_view` 重新投影整份视图并同步双基线。
+
+**`last_view` / `last_panel` 必须同进**：六处 `build_view_with_loop` 调用点都要同步写两者。
+只写 `last_view` 会让 `push_panel_if_changed` 认为「从没推过」⇒ 回合开头立刻推一份
+**陈旧视图**（带着上一回合的 `turn_count`），UI 与测试都会把它当成本回合的快照。
+
+**形参逐字段传入而不收 `&mut TurnCtx`**：回合执行期 `ctx.wiring` 被 `ports()` 借住，
+整包借 `ctx` 会 E0499；要碰的几个字段与它互不相交。
+
+### 21.9 label 贯通：`description` → 侧栏
+
+`SubagentRunner::spawn` 新增 `label: &str` 形参（`ys-tool`），值取派发工具入参里**已有**的
+`description`（schema 里是 `required`，原文「3-5 word label for the user」）。
+
+`apps/coding-agent/src/subagent.rs` 的 `SubagentHandles` 表 **value 从 `Weak<...>` 改成
+`HandleEntry { target: Weak<...>, label: Arc<str> }`** —— 不新开第二张表，否则两张会有一张先过期。
+`live_labels()`（`:506`）按 handle 升序返回 `(handle, label)`，且只含**仍在跑**的：
+生死判据是 `Weak::upgrade`，子 agent 收尾即从列表消失。
+
+### 21.10 测试合同 G1–G12 的落地
+
+| 条目 | 用例 | 位置 |
+|---|---|---|
+| G1 几何同源 | `frame_areas_is_idempotent_within_a_frame` / `chat_geometry_agrees_with_frame_areas_when_panel_open` | `draw.rs` |
+| G2 窄屏不塌 | `frame_areas_degrades_cleanly_on_narrow_screens`（W∈{0,4,9,10,11,20,21,22,31,40,80}） | `draw.rs` |
+| G3 50/50 奇数高 | `sidebar_halves_share_height_exactly` | `draw.rs` |
+| G4 入口封顶 | `panel_view_caps_todos_and_reports_hidden` / `..._running_...` / `..._exactly_at_limits_...` | `view.rs` |
+| G5 UTF-8 截断 | `sidebar_truncates_cjk_without_panicking` / `sidebar_lines_fit_within_inner_width` / `panel_view_truncates_todo_content_by_chars_not_bytes` | 两处 |
+| G6 空态不塌 | `sidebar_renders_empty_state_boxes` | `draw.rs` |
+| G7 回合中可见性 | `push_panel_if_changed_matches_snapshot_without_rebuilding` | `app_loop.rs` |
+| G8 零冗余推送 | `push_panel_if_changed_is_silent_when_panel_unchanged` / `..._sends_nothing_without_baseline` | `app_loop.rs` |
+| G9 label 贯通 + 生命周期 | `live_labels_reports_handle_and_label` / `live_labels_drops_finished_subagent` / `subagent_async_tool_passes_description_as_label` | `subagent.rs` |
+| G10 开关语义 | `panel_command_without_arg_toggles` / `panel_apply_local_flips_and_sets_explicitly` / `panel_visibility_is_not_overwritten_by_view_snapshots` | `commands.rs` |
+| G11 输入框不受影响 | `input_geometry_is_independent_of_panel_visibility` | `draw.rs` |
+| G12 补全浮层不越界 | `completion_overlay_stays_within_chat_area_when_panel_open` | `draw.rs` |
+
+**设计 §8 之外补的两条**（实现时发现 §3.3 漏做，见 21.5）：
+`sidebar_truncates_todos_to_visible_height_and_keeps_hint`、`sidebar_keeps_overflow_hint_when_height_is_tight`、
+`sidebar_truncates_running_to_visible_height`。
+
+**开关必清选区**：`panel_toggle_clears_selection`。侧栏开合改变 Chat 宽度 ⇒ 全局重折行 ⇒
+视觉行号空间整体作废；残留锚点会按新行号高亮到**无关文字**上，而屏上看起来完全正常。
+
+### 21.11 与设计的分歧
+
+| 项 | 设计 | 实现 |
+|---|---|---|
+| `PANEL_TODO_MAX` 的推导口径 | §4 说 24 =「一屏可见上限的 2 倍」 | 可视高度由 `sidebar_visible` 在 UI 侧裁断（21.5），入口上限只影响「数据能带多长」；两个常量的推导口径不必一致 |
+| 「24 条」的实际可见性 | 隐含 24 条都能看见 | 受内区高限制（终端 40 行 ≈ 16 条），其余折进 `+N` |

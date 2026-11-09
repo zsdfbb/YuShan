@@ -850,21 +850,24 @@ pub async fn run(
                         break;
                     };
 
-                    // 追问回合**之前**再注入一次清单（与首个回合同一个注入点、同一判据）。
-                    if crate::todo_inject::should_inject(
-                        &todo_store,
-                        last_injected_rev,
-                        wiring.session_messages(),
-                    ) {
-                        let text = crate::todo_inject::injection_text(&todo_store);
-                        wiring
-                            .append_message(Message {
-                                role: Role::Harness,
-                                content: vec![ContentBlock::Text { text }],
-                            })
-                            .await?;
-                        last_injected_rev = Some(todo_store.revision());
-                    }
+                    // 追问回合的占位输入 —— **与 `-p` / `--json` 共用同一份判据**
+                    // （[`crate::todo_inject::follow_up_text`]），三个分支对应三种真实的
+                    // 推进理由：清单变了 ⇒ 注入块本身就是输入；清单未变 ⇒ 一句推进句；
+                    // 清单为空 ⇒ git 兜底文案。
+                    //
+                    // **不再「先 append 一块、再另传一份占位输入」**：那会让模型同时
+                    // 看到清单块与「git 历史变了」两句互相矛盾的话，而后一句在清单驱动
+                    // 的情形下是**假前提** —— 追问由清单推动，`HEAD` 根本未变。
+                    let follow_up = Message {
+                        role: Role::Harness,
+                        content: vec![ContentBlock::Text {
+                            text: crate::todo_inject::follow_up_text(
+                                &todo_store,
+                                &mut last_injected_rev,
+                                wiring.session_messages(),
+                            ),
+                        }],
+                    };
 
                     advance_turn_started = std::time::Instant::now();
                     last_outcome = run_turn_chain(
@@ -882,7 +885,7 @@ pub async fn run(
                         debug.as_mut(),
                         &debug_session_id,
                         &worktree,
-                        crate::post_turn::harness_input(),
+                        follow_up,
                         // 占位输入没有用户原文 ⇒ 标题素材传 `None`（不能拿它当标题）。
                         None,
                     )
@@ -7888,8 +7891,8 @@ mod tests {
     /// 事件流的 `UserMessage.role`，以及**模型实际收到的**请求里的消息角色。
     ///
     /// 前者决定 TUI 画成 System 行（不是用户行），后者决定模型看到的内容。
-    /// 变异：把 `harness_input()` 换成 `Message { role: Role::User, .. }`（或干脆复用
-    /// 上一条用户消息）⇒ 两条断言同时红。
+    /// 变异：把追问输入的 `Role::Harness` 换成 `Role::User`（或干脆复用上一条用户消息）
+    /// ⇒ 两条断言同时红。
     #[tokio::test]
     async fn app_loop_follow_up_uses_harness_role() {
         let _env = FollowUpEnv::unset();

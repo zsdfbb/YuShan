@@ -2337,42 +2337,24 @@ async fn advance_after_turn(
     crate::turn_advance::advance(todo_store, state, outcome, enabled, head_before, head_after)
 }
 
-/// 追问回合的输入。
+/// 追问回合的输入 —— [`crate::todo_inject::follow_up_text`] 的薄包装。
 ///
-/// 优先注入**清单**（模型必须看得见本回合结束时的清单状态）；清单为空或不需重注时
-/// 退回一期的追问句。两种都是 `Role::Harness` —— 用户没说过这些话，记成用户说的
-/// 会污染「我是谁、我说过什么」（设计 §3.1a）。
-/// 追问回合的输入：**由推进理由决定**，两条入口共用。
+/// 判据本身住在 `todo_inject`，因为 **TUI 与 `-p` / `--json` 必须共用同一份**；
+/// 两个入口各自一份实现正是曾经出现过的缺陷形态（同一个任务在两条入口上会
+/// 得到不同的追问输入）。
 ///
-/// - 清单驱动（有 open 项）：注入块本身就是输入 —— 它已经把「未完成项优先」摆在末尾，
-///   再叠一句「请继续」只是重复计费。清单版本变了才重注；没变时用一句短的推进句，
-///   避免把**同一份**清单在尾部堆成 N 份副本（`prompt-delivery/notes.md` 的结论：
-///   内容不变却注入 = 纯浪费）。
-/// - 无清单（一期的 `HEAD` 判据）：用 [`crate::post_turn::harness_input`] 的文案，
-///   它说的是「git 历史变了」—— **不能**用于清单驱动的情形，否则模型会去查一个
-///   不存在的提交。
-///
-/// 两者都是 `Role::Harness`：用户没说过这些话。
+/// 角色恒为 `Role::Harness`：用户没说过这些话，记成用户说的会污染
+/// 「我是谁、我说过什么」（设计 §3.1a）。
 fn follow_up_input(
     todo_store: &ys_tools_todo::TodoStore,
     last_injected_rev: &mut Option<u64>,
     session: &[ys_core::Message],
 ) -> AgentInput {
-    let text = if todo_store.snapshot().is_empty() {
-        match &crate::post_turn::harness_input().content[0] {
-            ys_core::ContentBlock::Text { text } => text.clone(),
-            _ => String::new(),
-        }
-    } else if crate::todo_inject::should_inject(todo_store, *last_injected_rev, session) {
-        *last_injected_rev = Some(todo_store.revision());
-        crate::todo_inject::injection_text(todo_store)
-    } else {
-        // 清单已在上下文里且版本未变：只给推进句，不重复整块。
-        "继续推进清单里的未完成项；全部完成后收尾。".to_string()
-    };
     AgentInput::new(ys_core::Message {
         role: ys_core::Role::Harness,
-        content: vec![ys_core::ContentBlock::Text { text }],
+        content: vec![ys_core::ContentBlock::Text {
+            text: crate::todo_inject::follow_up_text(todo_store, last_injected_rev, session),
+        }],
     })
 }
 
@@ -2398,8 +2380,8 @@ fn input_bytes(input: &AgentInput) -> usize {
 ///
 /// 外层 `loop` 每轮跑**一个** turn，跑完经 [`advance_after_turn`] 问一次「要不要
 /// 再来一轮」；判据与 TUI 侧**同一份实现**（`turn_advance::advance`）。
-/// 追问回合的输入由 [`crate::post_turn::harness_input`] 或清单注入给出，
-/// 与 TUI 的 `Request::Prompt` 臂同形。
+/// 追问回合的输入由 [`crate::todo_inject::follow_up_text`] 给出，
+/// 与 TUI 的 `Request::Prompt` 臂**同一份判据**。
 ///
 /// **`rx` 是 `&mut`**：每轮 `join!` 各调一次消费，信道与消费方**一一对应**；
 /// 按值传会在第二个回合拿不到 `rx`。

@@ -201,7 +201,7 @@
 **每回合恰好观察一次**由函数自身保证；`observe` 放在最前面，是为了让计数与「本回合结束时的清单」
 严格一一对应（闸门短路后不再观察，`:138-139`）。
 
-归零仍在调用点（`app_loop.rs:863-867`、`main.rs:2331-2335`）：判官成功即 `judge_failures = 0`，
+归零仍在调用点（`app_loop.rs:835`、`main.rs:2331-2335`）：判官成功即 `judge_failures = 0`，
 失败则 `saturating_add(delta)`（`main.rs:2331-2335`）—— 归零需要「判官结论」，而 `decide` 刻意不问判官（`goal.rs:4-5`）。
 
 ### 2.2 `GoalVerdict` 已删除
@@ -237,7 +237,7 @@
 
 ### 2.5 `contains_marker` 同时扫 `ToolResult`
 
-**实际形态**（`todo_inject.rs:60-66`）：`ContentBlock::Text` 与 `ContentBlock::ToolResult` 都查 `TODO_MARKER`；
+**实际形态**（`todo_inject.rs:93-99`）：`ContentBlock::Text` 与 `ContentBlock::ToolResult` 都查 `TODO_MARKER`；
 其余变体返回 `false`。
 
 理由：`todo` 工具的回喂块与 `injection_text` 里的渲染**同源**（同 `items`、同 `revision`），
@@ -245,18 +245,26 @@
 多注一份完全相同的块。变异测试「去掉 revision 检查」（`scripts/goal-mutation.py:282`）与
 「空清单也注入」（`:297`）守这条判据的两个方向。
 
-### 2.6 `follow_up_input`：输入由推进理由决定
+### 2.6 `follow_up_text`：输入由推进理由决定，两个入口共用
 
-**实际形态**（`main.rs:2356-2378`），三条分支：
+**实际形态**（`todo_inject.rs:72-86`），三条分支：
 
-1. 清单为空 ⇒ 回落一期的 `post_turn::harness_input()` 文案（它说的是「git 历史变了」，**不能**用于
+1. 清单为空 ⇒ 回落一期的 `post_turn::harness_input_text()` 文案（它说的是「git 历史变了」，**不能**用于
    清单驱动的情形，否则模型会去查一个不存在的提交）；
 2. 清单非空且 `should_inject` 为真 ⇒ 注入块**本身就是**输入（它已把「未完成项优先」摆在末尾，
    再叠一句「请继续」只是重复计费），并更新 `last_injected_rev`；
 3. 清单非空但版本未变 ⇒ 只发一句短推进句「继续推进清单里的未完成项；全部完成后收尾。」
 
 理由：避免把**同一份**清单在尾部堆成 N 份副本。三条分支都是 `Role::Harness` —— 用户没说过这些话，
-记成用户说的会污染「我是谁、我说过什么」（`main.rs:2342-2344`）。
+记成用户说的会污染「我是谁、我说过什么」。
+
+**判据只此一份，两个入口都调它**：`-p`/`--json` 经 `main.rs:2348` 的 `follow_up_input()`（薄包装），
+TUI 在 `app_loop.rs:861-870` 直接构造 `Message`。追问回合**不再**「先 append 一块清单、再另传一份
+占位输入」—— 那会让模型同时看到清单块与「git 历史变了」两句互相矛盾的话，而后一句在清单驱动的
+情形下是**假前提**（追问由清单推动，`HEAD` 根本未变）。守护用例
+`follow_up_text_never_mentions_git_when_plan_exists`（`todo_inject.rs:246`）与
+`follow_up_text_uses_git_wording_only_without_plan`（`todo_inject.rs:270`）；变异「第一支无条件返回 git 文案」
+必须让它变红。
 
 ### 2.7 `-p`/`--json` 的 `turn` 号逐轮递增
 

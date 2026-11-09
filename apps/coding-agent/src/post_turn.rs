@@ -2,11 +2,11 @@
 //! `docs/arch/cross-turn-advance/design.md` §3）。
 //!
 //! 三个纯函数按「回合前记 `HEAD` → 跑回合 → 判据 → 至多一次追问」的顺序被
-//! `app_loop` 的 `Request::Prompt` 臂串起来：
+//! 调用点串起来：
 //!
 //! - [`git_head`] 读取外部可观测事实（`git rev-parse HEAD`）
 //! - [`should_follow_up`] 决定要不要再来一轮
-//! - [`harness_input`] 给出追问回合的占位输入
+//! - [`harness_input_text`] 给出追问回合的占位正文
 //!
 //! # 判据只认外部事实
 //!
@@ -102,25 +102,20 @@ pub fn should_follow_up(
 /// **措辞只说「历史变了」而不说「产生了提交」**：判据是 `HEAD` 前后不等，
 /// 而 `git reset --hard`、`git checkout` 同样改 `HEAD` 却未必产生提交。
 /// 写死「提交」会让模型去核查一个不存在的提交。
-pub fn harness_input() -> ys_core::Message {
-    ys_core::Message {
-        role: ys_core::Role::Harness,
-        content: vec![ys_core::ContentBlock::Text {
-            text: "[harness] 本回合的 git 历史发生了变化，请检查文档（AGENTS.md 等）\
-                   是否需同步更新；无需改动则直接说明。"
-                .to_string(),
-        }],
-    }
+pub fn harness_input_text() -> String {
+    "[harness] 本回合的 git 历史发生了变化，请检查文档（AGENTS.md 等）\
+     是否需同步更新；无需改动则直接说明。"
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use ys_core::{ContentBlock, Role, StopReason, Usage};
+    use ys_core::{StopReason, Usage};
     use ys_loop::{LoopError, RunResult};
 
-    use super::{git_head, harness_input, should_follow_up};
+    use super::{git_head, harness_input_text, should_follow_up};
 
     /// 进程内原子序号：`SystemTime::as_nanos()` 在 macOS 只到微秒级，并行测试会撞名。
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -214,17 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn harness_input_role_is_harness() {
-        let msg = harness_input();
-        assert_eq!(msg.role, Role::Harness);
-        assert_eq!(msg.content.len(), 1);
+    fn harness_input_text_names_source_and_exit() {
+        let text = harness_input_text();
         // 正文标明来源，且给出「无需改动」的出口。
-        let text = match &msg.content[0] {
-            ContentBlock::Text { text } => text.clone(),
-            other => panic!("占位输入应是单个 Text 块，实际 {:?}", other),
-        };
         assert!(text.starts_with("[harness]"), "正文应标出来源：{text}");
         assert!(text.contains("AGENTS.md"), "正文应点名要检查的文档：{text}");
+        assert!(
+            text.contains("无需改动则直接说明"),
+            "正文应给出不做时的出口：{text}"
+        );
     }
 
     #[test]

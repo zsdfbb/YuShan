@@ -41,7 +41,7 @@ YuShan/
 │   ├── architecture.md           # 架构全貌（15 节：分层 / 信道 / 时序 / 数据流 / 输出三分 / TUI 形态 / 测试分层）
 │   ├── design.md                 # 架构规范、核心 trait、Hook/Event 边界、测试矩阵
 │   ├── extension-points.md       # 新需求归类（Event / Tool / Follow-up / 还是真需要 Hook）
-│   ├── CONTEXT.md                # 术语表（Turn / Round / StopReason / 错误结果 vs 基础设施失败…）
+│   ├── CONTEXT.md                # 术语表（轮 / 回合 / 追问 / 任务 四层计数 + 禁歧义词；StopReason / 错误结果 vs 基础设施失败…）
 │   ├── TODO.md                   # 未完成工作台账（完成即删条目；按**已有设计**组织）
 │   ├── goals.md                  # 能力目标台账（按**目标场景**倒推缺口，与 TODO.md 互补）
 │   ├── adr/                      # 决策记录，**文件名即摘要**
@@ -139,7 +139,10 @@ YuShan/
   - **去处**：设计的 why → `docs/adr/`；跨产品取舍对照 → `docs/arch/**/research.md`；变更过程 → `git log` 与 commit message。
 - 实现顺序遵循路线图：最小闭环 → 可用适配器 → 静态组件生态 → 动态插件 → Coding Agent MVP。
   **当前**：前三级与 Coding Agent MVP 已落地；**动态插件有意推迟** —— ADR-0021 只留 `ToolPlugin` 装配缝、不建 hook 系统（ADR-0014 同）。剩余项见 `docs/TODO.md`。
-- 新模块和接口改动须能对应上 `docs/design.md` §12 测试矩阵中的条目
+- **轮次必须写明是哪一层**：**轮**（round，一次模型调用）/ **回合**（turn，一次 `run_turn_chain`）/
+  **追问**（系统追加的下一个回合）/ **任务**（一个预算生命周期，`/loop` 每个 tick 各是一个）。
+  **「跨轮」是禁用词**（可指三者任一）；「链级」同样不用，说「任务级」。权威定义见 `docs/CONTEXT.md`。
+- **新模块和接口改动须能对应上 `docs/design.md` §12 测试矩阵中的条目**
 - **测试隔离（并行安全，血的教训）**：
   - 临时目录名必须含**进程内原子序号 + `process::id()`**（`SystemTime::as_nanos()` 在 macOS 只到微秒级，并行测试会撞名 → 互删文件）
   - **进程级 env 改写必须走 `crate::test_env::env_lock()` + `EnvRestore`**（RAII 恢复）；直接把 `set_var` 散在测试里会造成 getenv/unsetenv 数据竞争

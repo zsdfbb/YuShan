@@ -52,6 +52,39 @@ pub(crate) fn injection_text(store: &TodoStore) -> String {
     )
 }
 
+/// 追问回合的占位输入 —— **由推进理由决定**，TUI 与 `-p` / `--json` 共用。
+///
+/// 两个入口必须用**同一份**判据：否则同一个任务在 TUI 与 `-p` 上会得到不同的
+/// 追问输入，而这类漂移无从发现。
+///
+/// 三条分支对应三种真实的推进理由：
+///
+/// - 清单变了（或压缩把上一份吃掉了）⇒ 注入块**本身就是输入**：它已经把
+///   「未完成项优先」摆在末尾，再叠一句「请继续」只是重复计费。
+/// - 清单在上下文里且版本未变 ⇒ 一句短推进句。重注同一份清单会把它在尾部
+///   堆成 N 份副本（`docs/arch/prompt-delivery/notes.md`：内容不变却注入 = 纯浪费）。
+/// - 清单为空 ⇒ **确实**是 git 兜底那一支：[`crate::post_turn::harness_input_text`]
+///   的文案说的是「git 历史变了」。**不能**把它用在清单驱动的情形，否则模型
+///   会去查一个不存在的提交。
+///
+/// 角色恒为 `Role::Harness`：用户没说过这些话。出站时它映射成 user（模型可见
+/// 效果与用户发言相同），但本地记录与 TUI 都不把它当用户自己敲的话。
+pub(crate) fn follow_up_text(
+    store: &TodoStore,
+    last_injected_rev: &mut Option<u64>,
+    session: &[Message],
+) -> String {
+    if store.snapshot().is_empty() {
+        return crate::post_turn::harness_input_text();
+    }
+    if should_inject(store, *last_injected_rev, session) {
+        *last_injected_rev = Some(store.revision());
+        return injection_text(store);
+    }
+    // 清单已在上下文里且版本未变：只给推进句，不重复整块。
+    "继续推进清单里的未完成项；全部完成后收尾。".to_string()
+}
+
 /// 该消息是否已经带着清单。
 ///
 /// 正文块与工具结果块**都算**：`todo` 工具回喂的块与 [`injection_text`] 里的渲染同源
@@ -201,5 +234,45 @@ mod tests {
             "正文必须是 render_block 的原样产物"
         );
         assert_eq!(text, injection_text(&store), "同内容两次渲染必须逐字节相同");
+    }
+
+    /// **清单非空时，追问输入绝不能是 git 文案**。
+    ///
+    /// 这是两条入口共用的核心契约：追问由清单推动时，`HEAD` 根本没变 ——
+    /// 再告诉模型「git 历史变了」就是假前提，它会去查一个不存在的提交。
+    /// 变异：把 `follow_up_text` 的第一支改成无条件返回 `harness_input_text()`
+    /// ⇒ 本用例红。
+    #[test]
+    fn follow_up_text_never_mentions_git_when_plan_exists() {
+        let store = store_with(vec![item("跑测试", TodoStatus::Pending)]);
+
+        // 第一支：清单变了 ⇒ 注入块。
+        let first = follow_up_text(&store, &mut None, &[]);
+        assert!(first.contains(TODO_MARKER), "应注入清单块：{first}");
+        assert!(!first.contains("git 历史"), "清单驱动时不得提 git：{first}");
+
+        // 第二支：清单在历史里、版本未变 ⇒ 推进句。
+        let mut rev = Some(store.revision());
+        let session = vec![injected(&store)];
+        let second = follow_up_text(&store, &mut rev, &session);
+        assert!(
+            !second.contains("git 历史") && !second.contains(TODO_MARKER),
+            "清单未变时应只给短推进句：{second}"
+        );
+        assert!(
+            second.contains("未完成项"),
+            "推进句应点名未完成项：{second}"
+        );
+    }
+
+    /// 清单为空 ⇒ **确实**是 git 兜底那一支，才允许用 git 文案。
+    #[test]
+    fn follow_up_text_uses_git_wording_only_without_plan() {
+        let store = TodoStore::open(None);
+        let text = follow_up_text(&store, &mut None, &[]);
+        assert!(
+            text.starts_with("[harness]") && text.contains("git 历史"),
+            "无清单时应回到一期的 git 追问句：{text}"
+        );
     }
 }

@@ -8791,4 +8791,213 @@ mod tests {
             "没有清单就不该凭空多一行标题"
         );
     }
+
+    // ── 回合中侧栏推送（`push_panel_if_changed`）──────────────────────────
+    //
+    // 这一组是**单元**测试：直接调函数，不启动 run loop —— 起循环能验证的是「回合内
+    // 推了几条」，这里要验证的是**三条判据本身**（基线 / 变更 / 节流）。
+
+    /// 造一个纯内存清单（`open(None)` ⇒ 不落盘）并灌入给定项。
+    ///
+    /// 全 `Pending` 项满足 `apply` 的两条硬规则（不丢弃旧项、非全终态不清理），
+    /// 因此灌进去的顺序就是 `snapshot()` 的顺序。
+    fn panel_todo_store(
+        items: Vec<ys_tools_todo::TodoItem>,
+    ) -> std::sync::Arc<ys_tools_todo::TodoStore> {
+        let store = ys_tools_todo::TodoStore::open(None);
+        store.apply(items).expect("纯 `Pending` 清单必然被接受");
+        store
+    }
+
+    /// 一条待办 —— 保证 `panel_view` 的投影与「空清单」逐字不同。
+    fn panel_one_todo() -> Vec<ys_tools_todo::TodoItem> {
+        vec![ys_tools_todo::TodoItem::new(
+            "改掉 flaky 断言",
+            ys_tools_todo::TodoStatus::Pending,
+        )]
+    }
+
+    /// 侧栏测试的基线视图：「**每回合才变**」的字段取独特值（活检 `turn_count == 7`），
+    /// 用来证明推送是「替换已发视图的一个字段」而不是重拍整份快照。
+    fn panel_base_view() -> CodingView {
+        CodingView {
+            turn_count: 7,
+            executed: Duration::from_secs(42),
+            message_count: 7,
+            ..CodingView::default()
+        }
+    }
+
+    /// 断言信道当前**零推送**（`Empty`）。
+    fn assert_no_push(rx: &mut mpsc::Receiver<Outbound<CodingView>>) {
+        match rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            other => panic!("此处不应推送，得到 {other:?}"),
+        }
+    }
+
+    /// 取回唯一那条被推的 `Outbound::View`。
+    fn take_pushed_view(rx: &mut mpsc::Receiver<Outbound<CodingView>>) -> CodingView {
+        match rx.try_recv() {
+            Ok(Outbound::View(view)) => view,
+            other => panic!("应推出一条 View，得到 {other:?}"),
+        }
+    }
+
+    /// 防的是「没有基线也硬推」：`last_view` 为 `None` 时必须零推送。
+    ///
+    /// 硬推出来的是**没有 Chat / 输入框上下文**的残次视图 —— 那份基线只能由
+    /// `build_view` 产出，而回合中不调它。
+    #[tokio::test]
+    async fn push_panel_if_changed_sends_nothing_without_baseline() {
+        let store = panel_todo_store(panel_one_todo());
+        let (tx, mut rx) = mpsc::channel::<Outbound<CodingView>>(8);
+
+        let mut last_view: Option<CodingView> = None;
+        let mut last_panel: Option<PanelView> = None;
+        // 节流窗口已过 ⇒ 唯一能挡住推送的只剩「没有基线」这一条。
+        let mut last_push = Instant::now() - PANEL_THROTTLE;
+
+        push_panel_if_changed(
+            &store,
+            None,
+            &mut last_view,
+            &mut last_panel,
+            &mut last_push,
+            &tx,
+        )
+        .await
+        .expect("UI 未收摊，不应失败");
+
+        assert_no_push(&mut rx);
+        assert!(
+            last_panel.is_none(),
+            "没推送就不得写基线（写了下次会拿它当「已发内容」而静默丢弃）"
+        );
+    }
+
+    /// 防的是「回合中调 `build_view_with_loop` 重拍整份快照」。
+    ///
+    /// 推送的含义是**替换已发视图的一个字段**：若实现改成重拍，`turn_count` /
+    /// `executed` 会变成当前真实值（0 / 0）而不是基线里的 7 / 42s。
+    #[tokio::test]
+    async fn push_panel_if_changed_matches_snapshot_without_rebuilding() {
+        let store = panel_todo_store(panel_one_todo());
+        let (tx, mut rx) = mpsc::channel::<Outbound<CodingView>>(8);
+
+        let base = panel_base_view();
+        let mut last_view = Some(base.clone());
+        let mut last_panel: Option<PanelView> = None;
+        let mut last_push = Instant::now() - PANEL_THROTTLE;
+
+        push_panel_if_changed(
+            &store,
+            None,
+            &mut last_view,
+            &mut last_panel,
+            &mut last_push,
+            &tx,
+        )
+        .await
+        .expect("UI 未收摊，不应失败");
+
+        let view = take_pushed_view(&mut rx);
+        assert_eq!(view.panel.todos.len(), 1, "侧栏必须反映新增的那条 todo");
+        assert_eq!(view.turn_count, 7, "推送不得重跑快照构建（回合数会归零）");
+        assert_eq!(view.executed, base.executed, "执行时长必须与基线逐字相同");
+        assert_eq!(view.message_count, base.message_count, "历史条数同理");
+    }
+
+    /// 防的是「无变化也推」：一次批量 todo apply 会连跳多次 `revision`，每次都推
+    /// 整份快照会淹没 UI 信道。
+    #[tokio::test]
+    async fn push_panel_if_changed_is_silent_when_panel_unchanged() {
+        // 空清单 ⇒ 投影恒为空 panel，两次调用逐字相同。
+        let store = panel_todo_store(Vec::new());
+        let (tx, mut rx) = mpsc::channel::<Outbound<CodingView>>(8);
+
+        let base = panel_base_view();
+        let mut last_view = Some(base);
+        let mut last_panel: Option<PanelView> = None;
+        let mut last_push = Instant::now() - PANEL_THROTTLE;
+
+        // 第一次：`last_panel` 从 `None` 变 `Some(空 panel)` ⇒ 应当推一条。
+        push_panel_if_changed(
+            &store,
+            None,
+            &mut last_view,
+            &mut last_panel,
+            &mut last_push,
+            &tx,
+        )
+        .await
+        .expect("UI 未收摊，不应失败");
+        let first = take_pushed_view(&mut rx);
+        assert!(first.panel.todos.is_empty(), "空清单的首次推送仍是空侧栏");
+        assert!(last_panel.is_some(), "推过之后基线必须建立");
+
+        // **手工推进 `last_push`**：把「无变化」从「被节流」里剥出来 —— 否则两条判据
+        // 都会挡住推送，删掉变更检测那半边也照样绿。
+        last_push = Instant::now() - PANEL_THROTTLE;
+        push_panel_if_changed(
+            &store,
+            None,
+            &mut last_view,
+            &mut last_panel,
+            &mut last_push,
+            &tx,
+        )
+        .await
+        .expect("UI 未收摊，不应失败");
+
+        assert_no_push(&mut rx);
+    }
+
+    /// 防的是「节流窗口内也推」，以及**更隐蔽的一条**：被节流时顺手更新 `last_panel`
+    /// —— 那样这次变化再也不会被推（下回比较时「看起来没变」）。
+    #[tokio::test]
+    async fn push_panel_if_changed_respects_throttle() {
+        let store = panel_todo_store(panel_one_todo());
+        let (tx, mut rx) = mpsc::channel::<Outbound<CodingView>>(8);
+
+        let base = panel_base_view();
+        let mut last_view = Some(base);
+        let mut last_panel: Option<PanelView> = None;
+        // 刚推过整份视图 ⇒ 落在节流窗口内。
+        let mut last_push = Instant::now();
+
+        push_panel_if_changed(
+            &store,
+            None,
+            &mut last_view,
+            &mut last_panel,
+            &mut last_push,
+            &tx,
+        )
+        .await
+        .expect("UI 未收摊，不应失败");
+
+        assert_no_push(&mut rx);
+        assert!(
+            last_panel.is_none(),
+            "被节流时不得更新基线 —— 否则这次变化永久丢失"
+        );
+
+        // 节流只是**丢弃**、不安排下一次 ⇒ 手工把时刻推回窗口外（`sleep` 300ms
+        // 会让用例又慢又不稳）。
+        last_push = Instant::now() - PANEL_THROTTLE;
+        push_panel_if_changed(
+            &store,
+            None,
+            &mut last_view,
+            &mut last_panel,
+            &mut last_push,
+            &tx,
+        )
+        .await
+        .expect("UI 未收摊，不应失败");
+
+        let view = take_pushed_view(&mut rx);
+        assert_eq!(view.panel.todos.len(), 1, "窗口过后必须补推这次变化");
+    }
 }

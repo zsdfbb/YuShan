@@ -92,150 +92,154 @@
 重启后靠「找不到标记就补」兜底（`:24-28`）。自愈覆盖压缩：压缩吃掉块后标记随之消失，下个回合边界自动补，
 因此**不监听** `ContextCompacted`（手敲 `/compact` 不发那条事件，`:5-9`）。
 
-### 1.5 `crates/ys-protocol/src/goal.rs`（66 行，零 tokio）
+### 1.5 `crates/ys-protocol/src/goal.rs`（107 行，零 tokio）
 
-`FollowUp{Push, Stop(StopCause)}`（`:16`）与 `StopCause{Aborted, NotContinuable, JudgeUnreliable, AllDone, NoPlan, CapReached, Stalled}`（`:27`）。
-只有词汇，没有判定逻辑 —— 判定在 `goal.rs`、判官在 `goal_judge.rs`（`:5-8`）。
+`FollowUp{Push, Stop(StopCause)}`（`:20`）与
+`StopCause{NoPlan, AllDone, GoalReached, Aborted, NotContinuable}`（`:28`）。
+`StopCause::text()`（`:48`）给出面向 UI 的中文文案；它是穷尽 `match`、**不留 `_` 兜底臂**，
+新增变体即编译失败。只有词汇，没有判定逻辑 —— 判定在 `goal.rs`。
 
-### 1.6 `apps/coding-agent/src/goal.rs`（554 行）
+`Request::SetGoal { text: Option<String> }`（`crates/ys-protocol/src/request.rs:134`）是 harness 的
+**配置动作**：只改 app 侧的目标状态，**不起回合**（与 `Prompt` 的根本区别，`:129`）。
 
-| 项 | 形态 | 行 |
-|---|---|---|
-| `MAX_FOLLOW_UPS` | `const u32 = 8` | `:40` |
-| `STALL_LIMIT` | `const u32 = 3` | `:46` |
-| `JUDGE_FAILURE_LIMIT` | `const u32 = 2` | `:49` |
-| `stall_digest` | `fn(items: &[TodoItem]) -> u64` | `:62` |
-| `StallTracker` | `new()` / `observe(digest) -> u32` / `unchanged_turns() -> u32` | `:89`、`:95`、`:102`、`:114` |
-| `decide` | `fn(store, used: u32, last_stop: &StopReason, model_claims_done: bool, stall: &mut StallTracker, judge_failures: &mut u32) -> FollowUp` | `:130` |
-
-八条判据**按顺序短路**（`goal.rs:7-21` 的模块头即规范）：①用户取消（`Aborted`）→ ②收场形态不可续
-（`Truncated`/`Failed`/`MaxRounds`/`NoOutput` 及未知变体 ⇒ `NotContinuable`）→ ③判官连续不可靠
-（`JudgeUnreliable`）→ ④无 open 项且 `revision > 0`（`AllDone`）→ ⑤清单为空（`NoPlan`）→ ⑥轮数用尽
-（`CapReached`）→ ⑦集合指纹连续不变 **且** 模型自称收尾（`Stalled`）→ ⑧`Push`。逐条落点 `:142-198`。
-
-`model_claims_done` 取 `last_stop == Completed`（**结构事实**，不扫正文：正文里「还没完成」随时会出现，
-`goal.rs:122-125`）；它与 stall 取 **AND**，避免误杀「一轮里干了活但还没更新状态」。
-
-### 1.7 `apps/coding-agent/src/goal_judge.rs`（611 行）
+### 1.6 `apps/coding-agent/src/goal.rs`（321 行）
 
 | 项 | 形态 | 行 |
 |---|---|---|
-| `MIN_QUOTE_CHARS` | `const usize = 12` | `:37` |
-| `JudgeParse` | `Met{quote}` / `NotMet{reason}` / `Unparseable` | `:47` |
-| `parse_judge_output` | `fn(raw: &str, evidence: &str, open_items: &[TodoItem]) -> JudgeParse` | `:67` |
+| `decide` | `fn(store: &TodoStore, used: u32, last_stop: &StopReason, goal: Option<&GoalState>) -> FollowUp` | `:49` |
 
-`MET` 需三个条件齐备：整词 `VERDICT: MET`（`VERDICT_SCAN_LINES = 8` 行内找，`:40`）、每个 `OK` 项都带
-≥12 字符逐字引用、引用归一化空白后能在证据窗口里子串命中且至少命中一条。任一不满足 ⇒ `Unparseable`
-（判官不可靠，**不是**「未达成」，`:14`）。`BLOCKED` 归入 `NotMet` 并带 `blocked:` 前缀 —— 它是判官的合法
-判断，计入可靠性会把「任务被阻塞」误记成「判官坏了」（`:63-66`）。
+五条判据**按顺序短路**（模块头 `:7-35` 即规范）：
+①用户取消（`Aborted`，`:58`）→ ②收场形态不可续（`Truncated`/`Failed`/`MaxRounds`/`NoOutput`
+及未知变体 ⇒ `NotContinuable`，`:64`）→ ③无 open 项且 `revision > 0`：有目标报 `GoalReached`、
+无目标报 `AllDone`（`:79`）→ ④清单从未写过：有目标 ⇒ `Push`、无目标 ⇒ `NoPlan`（`:88`）→ ⑤其余 `Push`。
 
-### 1.8 `apps/coding-agent/src/goal_judge_call.rs`（382 行）
+`used` 是**诊断计数，不参与任何闸门**（`:47-54` 的 `let _ = used;`）：结论与它无关。
+守护这一点的反向用例是 `used_never_changes_the_verdict`（`:297`）。
 
-| 项 | 形态 | 行 |
-|---|---|---|
-| `ARG_LIMIT` / `OUTPUT_LIMIT` | `200` / `1200` 字节 | `:32` / `:34` |
-| `JUDGE_MAX_TOKENS` | `1024` | `:38` |
-| `JUDGE_SYSTEM` | 判官系统提示词（输出契约三条硬要求） | `:44` |
-| `evidence_window` | `fn(&[Message]) -> String` | `:103` |
-| `evidence_text` | `fn(window: &str, harness_facts: &str) -> String` | `:144` |
-| `todo_text` | `fn(open_items: &[TodoItem]) -> String` | `:152` |
-| `judge_request` | `fn(evidence: &str, open_items: &[TodoItem]) -> ModelRequest`（`tools: []` + `thinking: off` + `max_tokens`） | `:172` |
-| `call_judge` | `async fn(..)`，失败重试一次，返回**原始串** | `:200` |
+判据 3 的「无 open 项」不是「全部 `Completed`」：被放弃（`cancelled`）的项同样终结。
+`revision > 0` 用来区分「刚干完」与「根本没计划」—— `TodoStore::apply` 在无 open 项时清空列表，
+两种情形在快照上长得一样，只能靠「写过没有」分辨。
 
-窗口 = 最后一条 assistant 的 `ToolUse` + 其后全部 `ToolResult` + harness 事实，**不含**助手 `Text`
-（`:11-13`）。按 `ContentBlock` 变体切，不按 `Role` —— 工具结果以 `Role::User` 进 session（`:15-16`）。
-截断按 `char` 边界退让，避免切坏中文（`:69-80`）。
+判据 4 是本设计唯一的「目标不会白设」保证：无清单时把它报成 `NoPlan` 会让目标被**静默忽略**，
+因此有目标时走 `Push`，代价是模型若坚持不拆清单会一路跑到回合预算耗尽。
 
-### 1.9 `apps/coding-agent/src/turn_advance.rs`（435 行）
+### 1.7 `apps/coding-agent/src/goal_state.rs`（215 行）
 
 | 项 | 形态 | 行 |
 |---|---|---|
-| `AdvanceState` | `{used: u32, stall: StallTracker, judge_failures: u32, git_follow_up_used: bool}` + `new()` | `:29`、`:43` |
-| `advance` | `fn(store, state: &mut AdvanceState, outcome: &Result<RunResult, LoopError>, follow_up_on_commit: bool, head_before: Option<&str>, head_after: Option<String>) -> Advance` | `:59` |
-| `harness_facts` | `fn(head_before, head_after, outcome, open_items: usize, elapsed: Option<Duration>, tool_calls: usize) -> String` | `:116` |
-| `judge_failure_delta` | `async fn(..) -> u32`（`0` = 可用结论或无 open 项；`1` = 调用失败 / 解析不可靠 / 无模型） | `:163` |
-| `Advance` | `Push` / `Stop(StopCause)` | `:211` |
+| `GOAL_TURN_CAP` | `const u32 = 200` —— 唯一上限（D-J/D-K），常量、不读配置（D-D） | `:22` |
+| `NO_PLAN_REMIND_LIMIT` | `const u32 = 5` —— 连续无清单提醒的上限 | `:25` |
+| `GoalState` | `{ text: String, turns: u32, plan_reminders: u32 }` | `:29` |
+| `new` / `turns` / `consume` / `exhausted` | 生命周期与预算 | `:35` / `:43` / `:48` / `:53` |
+| `marker_text` | 注入块的 `Role::Harness` 文本 | `:65` |
+| `wrap_up_text` | 收卷回合的输入文本 | `:85` |
+| `plan_remind` | 无清单提醒，超过上限返 `None` | `:106` |
+
+三条契约（模块头 `:1-16` 即规范）：
+
+- **生命周期 = 一个任务**（D-O）：「`/goal` 设下、`/goal clear` 作废，**不落盘** —— `/resume` 之后
+  目标是新任务的空白起点。
+- **回合计数不含收卷回合**（D-N）：`consume` 只由追问循环推进；收卷回合在循环之外跑，跑完不再 `consume`。
+- **注入块字节只由目标原文决定**：`marker_text()` 不含回合序号、也不含剩余预算。每回合都变的话
+  每回合都是一笔全价尾字节（破前缀缓存），而模型知道这些也**不能**改变行为 —— 结局由 harness 判定。
+
+达成判定靠「清单清空」⇒ 目标块必须把「先拆成可验收的清单项、每完成一项就更新清单」写进去：
+这是 R1（“达成”退化为“清单清空”）唯一的非技术缓解。
+
+### 1.8 `apps/coding-agent/src/turn_advance.rs`（478 行）
+
+| 项 | 形态 | 行 |
+|---|---|---|
+| `AdvanceState` | `{used: u32, git_follow_up_used: bool}` + `new()` | `:28`、`:41` |
+| `advance` | `fn(store, state, outcome, follow_up_on_commit, head_before, head_after, goal: Option<&GoalState>) -> Advance` | `:58` |
+| `Advance` | `Push` / `Stop(StopCause)` / `FinalReport` | `:111` |
+
+`Advance::FinalReport` 与 `Advance::Stop` **互斥**，调用方必须当不同动作处理：`Stop` = 直接收场；
+`FinalReport` = 再跑一个**不计入预算**的回合后再收场。它只在 `FollowUp::Push` 分支内部判定 ——
+放在 `match decision` 之前会把 `Esc` 与清单清空也改写成 `FinalReport`。
 
 `advance` 是**两条判据的唯一合并处**：`NoPlan` 时退回一期 `git HEAD` 判据（至多一次，靠
-`git_follow_up_used`），有计划时一期不参与（`turn_advance.rs:3-16`）。
+`git_follow_up_used`），有计划时一期不参与（`turn_advance.rs:7-16`）。
 
-### 1.10 接线（两条入口）
+`used` 与 `AdvanceState.used` 都是**诊断计数**：上限判据在 `goal.exhausted()`，不在这里。
+
+### 1.9 接线（两条入口）
 
 | 入口 | 落点 |
 |---|---|
-| TUI | `app_loop.rs` 的 `Request::Prompt` 臂内循环：首个回合注入点 `:781-793`、`advance_state` `:841`、判官 + `advance` `:853-877`、追问前再注入 `:883-895`、`used += 1` `:919` |
-| `-p` | `main.rs` 的 `run_print_mode`（`:2410`）外层 `loop`：`advance_state` `:2433`、`turn` 从 1 起逐轮递增 `:2437`、`advance_after_turn` `:2518`、`used += 1` 与 `turn += 1` `:2536-2537`、`follow_up_input` `:2541` |
-| `--json` | `run_json_mode`（`:2558`）逐行同形：`advance_state` `:2581`、`advance_after_turn` `:2657`、`used += 1` 与 `turn += 1` `:2674-2675`、`follow_up_input` `:2677` |
+| TUI | `app_loop.rs` 的 `Request::Prompt` 臂内循环：目标块注入 `:783-790`、`advance` `:862-870`、`GoalReached` 快照 `:876-878`、`consume()` 单点 `:888-890`、无清单提醒 `:894-902`；收卷回合在 `loop` **之外** `:961` |
+| `Request::SetGoal` | `app_loop.rs:1004`：只改 `goal` 变量、**不起回合**（确认行走 `Outbound::Output`） |
+| `-p` | `main.rs` 的 `run_print_mode` 外层 `loop`：`advance` 调用 `:2320`，`goal` 传 `None` |
+| `--json` | `run_json_mode` 逐行同形，同样传 `None` |
 
-`advance_after_turn`（`main.rs:2310`）与 `follow_up_input`（`main.rs:2356`）是两条入口共用的两份函数 ——
-推进判据只允许有一份实现，否则「同一任务在 `-p` 与 `--json` 上跑出不同轮数」这种漂移无从发现（`main.rs:2550-2553`）。
+`advance_after_turn` 与 `follow_up_input` 是两条入口共用的两份函数 —— 推进判据只允许有
+一份实现，否则「同一任务在 `-p` 与 `--json` 上跑出不同轮数」这种漂移无从发现。
 
-`rx` 是按引用的 `&mut mpsc::Receiver<Envelope>`（`run_print_mode` 签名 `main.rs:2413`、`run_json_mode` 同形），
-消费循环在 `tokio::join!` **之内** ⇒ 多回合不死锁。守它的用例是
+**`/goal` 只接 TUI**：`-p` / `--json` 把 `goal` 位置传 `None`，行为逐字不变（没有 200 上限、不会收卷）。
+
+`rx` 是按引用的 `&mut mpsc::Receiver<Envelope>`，消费循环在 `tokio::join!` **之内** ⇒ 多回合不死锁。守它的用例是
 `print_mode_two_turns_do_not_deadlock_at_small_capacity`（`main.rs:4649`，容量 2、10 秒超时、断言 `main_calls == 4`）。
 
-### 1.11 工具表位次
+### 1.10 工具表位次
 
 父表 **15 元** = 基础 11 元（`read` `write` `edit` `bash` `grep` `find` `ls` `ocr` `view_image` `websearch` `webfetch`）
 + 追加段 `bash_bg` → `subagent_async` → `subagent_send` → `todo`；子表 **11 元**（general）/ **9 元**（explore，去掉 `write` / `edit`）。
 `todo` 排在追加段**末位**：父 JSON 仍以子 JSON 去掉末尾 `]` 开头 ⇒ 子表命中父的前缀缓存。
 锚点与位次断言在 `apps/coding-agent/src/toolset.rs:802-859`（`parent_specs.len() == 15` 在 `:838`，追加段顺序在 `:854-859`）。
 
-### 1.12 变异测试
+### 1.11 变异测试
 
-`scripts/goal-mutation.py` 共 **15** 条，覆盖判据顺序（1 / 2 / 3 / 6 / 7）、集合指纹（含终态项 / 大小写折叠 / 排序）、
-判官（引用未命中 / 前缀匹配 / 覆盖面 / MISSING 归类）、注入（自愈分支 / revision 检查 / 空清单）。全部能被现有用例抓住。
+`scripts/goal-mutation.py` 共 **11** 条：判据（空清单反转 / `GoalReached` 错报 `AllDone`）、
+预算（收卷前先 `consume` / 无目标也设上限 / 目标块含回合序号）、提醒（去掉上限）、
+注入（自愈分支 / revision / 空清单）。**11/11 全红**。
+
+其中两条与设计 §8 的原文**不是一一对应**，归档时如实标注：
+
+| 设计 §8 条目 | 实际注入 | 为何不同 |
+|---|---|---|
+| ⑥ stall 残留 | `used >= 4` 且清单无 open 项 ⇒ `Stop(NotContinuable)` | stall 检测（集合指纹 + 连续 N 回合不变）已整层删除，**无逐字可复原的注入点**。注入了它最危险的形态：用回合数误杀正常收场 |
+| ⑧ 收卷削工具 | 收卷输入丢掉目标原文（`text = ""`） | 工具表由 `agent` 内部持有，`run_turn_chain` 参数里没有工具表，追问与收卷传的是同一个 `agent` —— **从调用点改不动工具面**。故换成同一目的下可执行的变异 |
+
+另外三条（自愈分支 / revision / 空清单）守的是注入判据本身，不在设计 §8 的 8 条里。
 
 ## 2. 与设计的偏差
 
 > 本节是本文档的主要价值：**实际是这样，理由是 X**。设计原文见
 > `docs/arch/long-horizon-todo/design.md` 与 `docs/arch/cross-turn-advance/design.md` §5。
 
-### 2.1 `decide` 接管 `stall.observe` 与 `judge_failures` 归零
+### 2.1 判据 3「无 open 项」与「全部 Completed」在 `apply` 硬规则下语义等价
 
-**实际签名**（`goal.rs:130`）：`decide(store, used, &StopReason, model_claims_done, &mut StallTracker, &mut u32)`。
-`stall.observe(stall_digest(&store.snapshot()))` 在函数**第一行**执行（`:140`），`judge_failures` 是 `&mut u32` 入参（判据 3 读它）。
+**实际形态**：判据 3 写的是 `!store.has_open_items() && store.revision() > 0`（`goal.rs:81`）。
 
-理由：两条入口（TUI 与 `-p`/`--json`）各写一遍「观察指纹 + 维护失败计数」必然漂移，而漂移的表现是
-「同一任务在两条入口上停机时机不同」—— 这种 bug 在单入口测试里不可见。放进 `decide` 后，
-**每回合恰好观察一次**由函数自身保证；`observe` 放在最前面，是为了让计数与「本回合结束时的清单」
-严格一一对应（闸门短路后不再观察，`:138-139`）。
-
-归零仍在调用点（`app_loop.rs:835`、`main.rs:2331-2335`）：判官成功即 `judge_failures = 0`，
-失败则 `saturating_add(delta)`（`main.rs:2331-2335`）—— 归零需要「判官结论」，而 `decide` 刻意不问判官（`goal.rs:4-5`）。
-
-### 2.2 `GoalVerdict` 已删除
-
-**实际形态**：不存在 `GoalVerdict` 类型（全仓零命中）。判官结论的唯一载体是
-`goal_judge::JudgeParse{Met{quote}, NotMet{reason}, Unparseable}`（`goal_judge.rs:47`），
-推进结论的唯一载体是 `ys_protocol::FollowUp`（`goal.rs:16`）。
-
-理由：`GoalVerdict` 零消费者，且与 `JudgeParse` 表达同一件事 —— 两个类型并存时，转换函数会成为
-第三处需要维护的语义映射。
-
-### 2.3 `parse_judge_output` 多了 `open_items` 参数
-
-**实际签名**（`goal_judge.rs:67`）：`parse_judge_output(raw, evidence, open_items: &[TodoItem])`。
-
-第三参数落地 §5.7 的**覆盖面检查**：每个非终态项都要在 `ITEMS` 段标 `OK`，只靠 `EVIDENCE` 段的
-一条总引用不能通关。守护用例 `met_must_cover_every_open_item`（`goal_judge.rs:555`）与
-`overall_evidence_does_not_skip_coverage`（`:593`）；变异测试「漏核未完成项也放行」抓这一条
-（`scripts/goal-mutation.py:235`）。
-
-### 2.4 判据 4「无 open 项」与「全部 Completed」在 `apply` 硬规则下语义等价
-
-**实际形态**：判据 4 写的是 `!store.has_open_items() && store.revision() > 0`（`goal.rs:175-177`）。
-
-`TodoStore::apply` 的第二条硬规则是「非空且**全部终态** ⇒ 清空 + 删文件」（`store.rs:11-13`），
-而 `Cancelled` 是终止态（`item.rs:10-15`）。于是「清单非空且无 open 项」这个状态在 store 里
+`TodoStore::apply` 的第二条硬规则是「非空且**全部终态** ⇒ 清空 + 删文件」（`store.rs:12`），
+而 `Cancelled` 是终止态。于是「清单非空且无 open 项」这个状态在 store 里
 **不可能存在** —— 快照要么有 open 项，要么为空。所以「无 open 项」与「全部 `Completed`」在
 `decide` 看到的输入上无法区分，**这一条做不出变异测试**。
 
-守护者因此不在 `decide`，而在 `store.rs`：`all_terminal_clears_and_deletes_file`（`:522`）、
-`single_shot_all_terminal_clears`（`:554`）、`dropping_terminal_items_is_allowed`（`:484`）。
-`revision > 0` 用来区分「刚干完」与「根本没计划」—— 后者归判据 5（`goal.rs:173-174`）。
+`revision > 0` 用来区分「刚干完」与「根本没计划」—— 后者归判据 4（`goal.rs:84`）。
 
-### 2.5 `contains_marker` 同时扫 `ToolResult`
+### 2.2 判官与 stall 整层不存在
+
+**实际形态**：全仓没有 `goal_judge` / `goal_judge_call` / `JudgeParse` / `JudgeUnreliable` /
+`stall_digest` / `StallTracker` / `Stalled` / `MAX_FOLLOW_UPS` / `CapReached`（零命中）。
+
+推进结论的唯一载体是 `ys_protocol::FollowUp`（`goal.rs:20`）；停机分类的唯一载体是
+`StopCause` 的五个变体（`crates/ys-protocol/src/goal.rs:28`）。
+
+理由与取舍见 [ADR-0074](../../adr/0074-goal-drop-judge-and-stall.md)：判官的比例从未测过，
+`Verdict` 除 `Unparseable` 外无人消费；stall 的 `model_claims_done` 恒真、空清单指纹恒等
+⇒ 第 3 轮必然误杀。
+
+### 2.3 回合数上限从 `decide` 移出
+
+**实际形态**：`decide` 没有 `CapReached` 判据；唯一上限是 `advance` 里的
+`goal.exhausted()`（`turn_advance.rs:58-110`），且**只在 `FollowUp::Push` 分支内部判**。
+
+理由：`FollowUp` 只有两态，而预算耗尽需要表达第三种动作（「停下，但先收一个卷」）。
+把上限放进 `decide` 会让 `Esc` 与清单清空也被改写成收卷 —— 所以 `Advance` 是
+三态（`turn_advance.rs:111`）。守护用例 `stop_wins_over_exhausted`（`:412`）。
+
+### 2.4 `contains_marker` 同时扫 `ToolResult`
 
 **实际形态**（`todo_inject.rs:93-99`）：`ContentBlock::Text` 与 `ContentBlock::ToolResult` 都查 `TODO_MARKER`；
 其余变体返回 `false`。
@@ -245,7 +249,7 @@
 多注一份完全相同的块。变异测试「去掉 revision 检查」（`scripts/goal-mutation.py:282`）与
 「空清单也注入」（`:297`）守这条判据的两个方向。
 
-### 2.6 `follow_up_text`：输入由推进理由决定，两个入口共用
+### 2.5 `follow_up_text`：输入由推进理由决定，两个入口共用
 
 **实际形态**（`todo_inject.rs:72-86`），三条分支：
 
@@ -266,7 +270,7 @@ TUI 在 `app_loop.rs:861-870` 直接构造 `Message`。追问回合**不再**「
 `follow_up_text_uses_git_wording_only_without_plan`（`todo_inject.rs:270`）；变异「第一支无条件返回 git 文案」
 必须让它变红。
 
-### 2.7 `-p`/`--json` 的 `turn` 号逐轮递增
+### 2.6 `-p`/`--json` 的 `turn` 号逐轮递增
 
 **实际形态**：`run_print_mode` 里 `let mut turn: u32 = 1;`（`main.rs:2437`），每轮 `turn = turn.saturating_add(1)`
 （`:2537`）；`run_json_mode` 同形（`:2675`）。`Envelope.turn` 与 debug 的 `turn=` 都取它。
@@ -274,23 +278,23 @@ TUI 在 `app_loop.rs:861-870` 直接构造 `Message`。追问回合**不再**「
 理由：多回合链里两个回合的事件必须可区分 —— `--json` 的每行都带 `turn` 号，消费方据此切分回合；
 恒为 1 会让多回合输出看起来像一个超长回合。
 
-### 2.8 一期判据在 `-p`/`--json` 上按开关生效，清单判据无开关
+### 2.7 一期判据在 `-p`/`--json` 上按开关生效，清单判据无开关
 
-`advance` 的 `follow_up_on_commit` 入参只管一期 `git HEAD` 判据（`turn_advance.rs:59-65`）；
-清单判据**没有开关** —— 开关就是「有没有计划」（`NoPlan` 即退回一期）。这条与设计一致，列在此处是因为
-它决定了 `-p` 的默认行为：模型不写清单 + 开关关 ⇒ 跑完即退出。
+`advance` 的 `follow_up_on_commit` 入参只管一期 `git HEAD` 判据；
+清单判据**没有开关** —— 开关就是「有没有计划」（`NoPlan` 即退回一期）。这条决定了 `-p` 的默认行为：
+模型不写清单 + 开关关 ⇒ 跑完即退出。
 
 ## 3. 已知取舍与退化
 
 | 项 | 现状 | 代价 | 依据 |
 |---|---|---|---|
-| 判官只读最后一轮 | `evidence_window` 取最后一条 assistant 的 `ToolUse` 及其后的 `ToolResult` | 判官输入 **O(1)**，与总轮数无关；**跨轮证据不可见**，只能核本轮可验的项 | `goal_judge_call.rs:18-21` |
-| `elapsed` 未知 | `harness_facts` 写 `unavailable`，不写 `0ms` | 判官看到的是「不知道」，不是「零耗时」—— 后者会让他采信「一秒内完成五项」 | `turn_advance.rs:142-145` |
-| 判官调用不落盘 | `call_judge` 只返回原始串，不写 session、不写 debug 事件 | 判官输出事后不可回溯；换取的是判官不污染会话、不占上下文 | ADR-0072 D8、`goal_judge_call.rs:4`、`:6-7` |
+| 达成靠模型自陈 | 判据是「清单清空」，模型只要写三行简陋清单就能宣告完成 | 无技术手段区分「真干完」与「把清单划掉」；缓解只有目标块里那句「写到指着它就能说做完了」+ 达成时的清单快照 | `goal.rs:23-28`、`app_loop.rs:1561-1581` |
+| 无清单时一路跑到底 | 有目标 + 模型坚持不拆清单 ⇒ `Push` 直到 200 回合耗尽 | 换取「目标不会因为模型没调 `todo` 就被静默忽略」；代价是可能白烧一整份预算 | `goal.rs:23-28` |
+| 无清单提醒只有 5 次 | `plan_remind` 超上限返 `None` | 第 6 次起不再提，模型可能一直不拆清单；换取「同一句话不重复进上下文」 | `goal_state.rs:25`、`:106` |
+| 目标不落盘 | `/resume` 后目标是空白起点 | 重启后要重设；换取「生命周期 = 一个任务」的简单契约 | `goal_state.rs:1-16` |
+| `/goal` 只接 TUI | `-p` / `--json` 传 `None` | 批量模式没有目标与 200 上限；换取「两条入口行为逐字不变」 | `main.rs:2320` |
 | 落盘尽力而为 | `apply` 写失败不回滚内存 | 重启后可能少一份清单；换取「一次写失败不丢模型刚写好的计划」 | `store.rs:18-22` |
 | 降级提示不打印 | `take_degraded_hint` 只**产出**，去处由接线器决定 | crate 边界强制（`tools-todo` 绝不 `print`） | `lib.rs:29-31` |
-| stall 只看清单集合 | `stall_digest` 哈希非终态项的 `(内容, 状态)`，排序 + 大小写折叠 | 反复跑同一条命令但清单不变 ⇒ 判为打转；换取「不受日志噪声影响」（`3 failed (2.1s)` 与 `(2.3s)` 会让哈希输出漏检） | `goal.rs:23-27` |
-| `stall` 需 AND 模型自陈 | `unchanged_turns() >= STALL_LIMIT && model_claims_done` | 模型还在干活时不误杀；代价是「模型死不承认收尾」时靠判据 6 兜底 | `goal.rs:191-194` |
 
 ## 4. 指针索引
 
@@ -299,11 +303,12 @@ TUI 在 `app_loop.rs:861-870` 直接构造 `Message`。追问回合**不再**「
 | 装配缝类型与排序 | `crates/ys-tool/src/plugin.rs:27-300` |
 | 清单真值与两条硬规则 | `adapters/tools-todo/src/store.rs:114-291` |
 | 注入判据与渲染 | `apps/coding-agent/src/todo_inject.rs:22-66`、`adapters/tools-todo/src/render.rs:35` |
-| 推进八条判据 | `apps/coding-agent/src/goal.rs:130-198` |
-| 判官解析与引用校验 | `apps/coding-agent/src/goal_judge.rs:37-67` |
-| 证据窗口与判官调用 | `apps/coding-agent/src/goal_judge_call.rs:103-210` |
-| 两条判据合并 | `apps/coding-agent/src/turn_advance.rs:59-113` |
-| 两条入口接线 | `apps/coding-agent/src/app_loop.rs:781-919`、`apps/coding-agent/src/main.rs:2310-2677` |
+| 推进五条判据 | `apps/coding-agent/src/goal.rs:49-105` |
+| 目标状态与三段文案 | `apps/coding-agent/src/goal_state.rs:22-115` |
+| 停机分类与文案 | `crates/ys-protocol/src/goal.rs:28-57` |
+| 三态推进 | `apps/coding-agent/src/turn_advance.rs:58-125` |
+| `/goal` 命令解析 | `crates/ys-tui-coding/src/commands.rs` |
+| 两条入口接线 | `apps/coding-agent/src/app_loop.rs:783-1004`、`apps/coding-agent/src/main.rs:2320` |
 | 工具表位次（15 / 11） | `apps/coding-agent/src/toolset.rs:802-859`、`apps/coding-agent/src/assembly.rs:224-239` |
 | 多回合不死锁 | `apps/coding-agent/src/main.rs:4649` |
-| 变异测试清单 | `scripts/goal-mutation.py:60-310` |
+| 变异测试清单 | `scripts/goal-mutation.py` |

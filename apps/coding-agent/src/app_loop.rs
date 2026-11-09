@@ -460,6 +460,14 @@ pub async fn run(
     // 重置它只是同一结果。
     let mut last_injected_rev: Option<u64> = None;
 
+    // 跨回合目标（`/goal`）。`None` = 没有活动目标。
+    //
+    // **必须活过 `Request::Prompt` 臂**：与 `last_injected_rev` 同理 —— 追问循环
+    // 在臂内，而目标要跨多个 `Prompt` 存活（用户设完目标后可能隔几条消息才说"开始"）。
+    // `/new` / `/resume` 不重置它：目标是用户对"这个会话要做什么"的声明，换会话
+    // 不该静默丢弃用户的意图；要作废走 `/goal clear`。
+    let mut goal: Option<crate::goal_state::GoalState> = None;
+
     // 清单真值的句柄（与 `todo` 工具持的是**同一个 `Arc`**）。
     // `/new` / `/resume` 改的是它内部的指向（`retarget`），这里不需要重新取。
     let todo_store = factory.todo();
@@ -547,6 +555,7 @@ pub async fn run(
                     session_started,
                     theme,
                     loop_state.as_ref().map(|s| s.view(false)),
+                    None,
                 );
                 send_or_flush(
                     &out_tx,
@@ -606,6 +615,7 @@ pub async fn run(
                     session_started,
                     theme,
                     loop_state.as_ref().map(|s| s.view(false)),
+                    None,
                 );
                 send_or_flush(
                     &out_tx,
@@ -643,6 +653,7 @@ pub async fn run(
                         session_started,
                         theme,
                         turning_view.clone(),
+                        None,
                     )),
                     &mut debug,
                     &stats,
@@ -683,6 +694,7 @@ pub async fn run(
                     session_started,
                     theme,
                     idle_view,
+                    None,
                 );
                 send_or_flush(
                     &out_tx,
@@ -708,6 +720,7 @@ pub async fn run(
                         session_started,
                         theme,
                         loop_state.as_ref().map(|s| s.view(false)),
+                        None,
                     );
                     send_or_flush(
                         &out_tx,
@@ -764,6 +777,34 @@ pub async fn run(
                     last_injected_rev = Some(todo_store.revision());
                 }
 
+                // **回合边界 · 目标块注入**：把目标推进上下文，使本回合每一轮都看得见它。
+                // 与清单注入同规（`Role::Harness`、直接 append 不发事件、靠标记自愈）。
+                //
+                // 判据与清单不同：目标块的**字节恒定**（`marker_text()` 不含回合序号），
+                // 所以不需要 `revision` 比对 —— 只要历史里找不到标记就补一份。
+                // 两处共用一个名字（`<goal_brief`）是刻意的：压缩把块摘要掉之后，下一个
+                // 回合边界会自动补回，本处**不监听** `ContextCompacted`。
+                if let Some(g) = &goal {
+                    let goal_text = g.marker_text();
+                    let already = wiring.session_messages().iter().any(|m| {
+                        m.content.iter().any(|b| match b {
+                            ContentBlock::Text { text } => text.contains("<goal_brief"),
+                            ContentBlock::ToolResult { content, .. } => {
+                                content.contains("<goal_brief")
+                            }
+                            _ => false,
+                        })
+                    });
+                    if !already {
+                        wiring
+                            .append_message(Message {
+                                role: Role::Harness,
+                                content: vec![ContentBlock::Text { text: goal_text }],
+                            })
+                            .await?;
+                    }
+                }
+
                 // 回合**前**记 HEAD。
                 //
                 // 取点用 `config.cwd`（回合真正的工作目录），**不用** `worktree.get()`：
@@ -811,32 +852,12 @@ pub async fn run(
                 // 追问回合的模型必须看得见本回合结束时的清单状态。
                 let mut advance_state = crate::turn_advance::AdvanceState::new();
                 let mut last_outcome = outcome;
-                // 每个追问回合的**起点**：判官事实里的「耗时」指这一轮花了多久，
-                // 不是整个请求的总时长 —— 后者会把前几轮的成本算到后一轮头上。
-                let mut advance_turn_started = std::time::Instant::now();
+                // 预算耗尽 ⇒ `advance` 返回 `FinalReport`，循环退出后在**循环外**跑收卷回合。
+                let mut need_wrap_up = false;
+                // 达成时留下的清单快照（R1）：必须在那里当场取（见下方 `lines.extend`）。
+                let mut final_plan_lines: Vec<String> = Vec::new();
                 loop {
-                    // ── 判官（二档判据）──
-                    //
-                    // 只在**本回合写过清单**时调用（判据在 `judge_failure_delta` 里）。
-                    // 调用失败 / 解析不可靠 ⇒ `judge_failures += 1`，可用结论 ⇒ 归零。
                     let head_after = crate::post_turn::git_head(workspace.as_deref());
-                    let model = wiring.model_arc();
-                    let delta = crate::turn_advance::judge_failure_delta(
-                        model.as_deref(),
-                        wiring.session_messages(),
-                        &todo_store,
-                        head_before.as_deref(),
-                        &head_after,
-                        &last_outcome,
-                        Some(advance_turn_started.elapsed()),
-                    )
-                    .await;
-                    if delta == 0 {
-                        advance_state.judge_failures = 0;
-                    } else {
-                        advance_state.judge_failures =
-                            advance_state.judge_failures.saturating_add(delta);
-                    }
 
                     let step = crate::turn_advance::advance(
                         &todo_store,
@@ -845,9 +866,39 @@ pub async fn run(
                         enabled,
                         head_before.as_deref(),
                         head_after,
+                        goal.as_ref(),
                     );
-                    let crate::turn_advance::Advance::Push = step else {
-                        break;
+                    match step {
+                        crate::turn_advance::Advance::Push => {}
+                        crate::turn_advance::Advance::Stop(cause) => {
+                            // 达成时把最终清单快照留在 transcript 里（R1）：
+                            // 清单被 `apply` 清空后，用户再也看不到“完成了哪些项”。
+                            if cause == ys_protocol::StopCause::GoalReached {
+                                final_plan_lines = final_plan_snapshot(&todo_store);
+                            }
+                            break;
+                        }
+                        crate::turn_advance::Advance::FinalReport => {
+                            need_wrap_up = true;
+                            break;
+                        }
+                    }
+
+                    // 回合记账：只有**真正要起的回合**才计入预算（收卷回合不在循环内，故不计）。
+                    if let Some(g) = goal.as_mut() {
+                        g.consume();
+                    }
+
+                    // 无清单提醒（§5.2）：只在「有目标 且 清单从未写过」时取前缀。
+                    // 它**不放行也不叫停**，只改输入文案；次数封顶在 `GoalState` 内部。
+                    let plan_prefix = if let Some(g) = goal.as_mut() {
+                        if todo_store.snapshot().is_empty() {
+                            g.plan_remind()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     };
 
                     // 追问回合的占位输入 —— **与 `-p` / `--json` 共用同一份判据**
@@ -865,11 +916,21 @@ pub async fn run(
                                 &todo_store,
                                 &mut last_injected_rev,
                                 wiring.session_messages(),
+                                plan_prefix,
                             ),
                         }],
                     };
 
-                    advance_turn_started = std::time::Instant::now();
+                    // 每回合一条进展报账（D-B）：只走 transcript 的 `lines`，不直接发
+                    // `Outbound` —— 那个信道是**有界**的，而本处没有并发消费者。
+                    if let Some(g) = goal.as_ref() {
+                        lines.push(format!(
+                            "目标推进中：已用 {}/{} 回合",
+                            g.turns(),
+                            crate::goal_state::GOAL_TURN_CAP
+                        ));
+                    }
+
                     last_outcome = run_turn_chain(
                         &mut agent,
                         &mut wiring,
@@ -892,6 +953,73 @@ pub async fn run(
                     .await?;
                     advance_state.used = advance_state.used.saturating_add(1);
                 }
+
+                // ★ 收卷回合：**循环外**独立调用点。
+                //
+                // 「不计入 200」由**结构**保证（它根本不经过 `consume()`），不靠计数时记得跳过。
+                // 工具表原样（D-N）：收卷回合要能调工具讲清账。
+                if let Some(g) = goal.as_ref().filter(|_| need_wrap_up) {
+                    let wrap = Message {
+                        role: Role::Harness,
+                        content: vec![ContentBlock::Text {
+                            text: g.wrap_up_text(),
+                        }],
+                    };
+                    // 结果不参与任何判据（收卷之后不再推进）：`?` 仍守住「UI 已收摊」
+                    // 这一条，回合自身的成败只落日志（`run_turn_chain` 内部已记）。
+                    let _settled = run_turn_chain(
+                        &mut agent,
+                        &mut wiring,
+                        &config,
+                        &mut turns,
+                        &mut stats,
+                        thinking_visible,
+                        &mut run_rounds,
+                        &out_tx,
+                        &mut sink_rx,
+                        &mut boundary_rx,
+                        subagent.as_ref(),
+                        debug.as_mut(),
+                        &debug_session_id,
+                        &worktree,
+                        wrap,
+                        // 占位输入没有用户原文 ⇒ 标题素材传 `None`。
+                        None,
+                    )
+                    .await?;
+                    // 这里的回合数就是**收卷之后**的计数：它若被 consume，这里会是 201。
+                    lines.push(format!("目标未达成：已用 {} 回合，已请求收尾", g.turns()));
+                }
+                // **收卷后目标保留**：用户可能想 `/goal clear` 或接着干。清不清由用户决定。
+
+                // 达成时的清单快照必须**在追问循环之后**落到 transcript —— 那时清单
+                // 已被 `apply` 的硬规则清空，`snapshot()` 里已经什么都不剩，只能在
+                // `advance` 判定时当场取。
+                lines.append(&mut final_plan_lines);
+            }
+
+            // 设在 `Request::Prompt` **之后**（`match` 臂的顺序无关语义，这里只为读起来
+            // 顺着"发话 → 配置"：用户先说话，说的话后来才对目标生效）：`SetGoal` 只改
+            // app 侧的目标状态，不产生任何 `Message`，也不起回合（见下）。
+            Request::SetGoal { text } => {
+                match text {
+                    Some(t) => {
+                        let note = format!(
+                            "目标已设：{t}（上限 {} 回合；Esc 中断当前回合，/goal clear 作废）",
+                            crate::goal_state::GOAL_TURN_CAP
+                        );
+                        goal = Some(crate::goal_state::GoalState::new(t));
+                        lines.push(note);
+                    }
+                    None => {
+                        goal = None;
+                        lines.push("目标已作废".to_string());
+                    }
+                }
+                // **不起回合**：设目标只是登记一个验收对象，什么时候开始干活由用户下一条
+                // 输入决定（D-A）。设完就起回合会让用户没法先看一眼再决定开始。
+                // 也**不动历史**：目标块由下个回合边界的注入块送达模型（`marker_text` 的
+                // 字节只由原文决定 ⇒ 不在这里 append，免得同一份块重复计费）。
             }
 
             Request::Loop {
@@ -1365,6 +1493,7 @@ pub async fn run(
             session_started,
             theme,
             loop_state.as_ref().map(|s| s.view(false)),
+            None,
         );
         send_or_flush(
             &out_tx,
@@ -1427,6 +1556,28 @@ async fn cancel_on_abort<F: std::future::Future>(
             },
         }
     }
+}
+
+/// 达成时的清单快照（R1 的缓解，设计 §7.2）。
+///
+/// “目标达成” 的判据是**清单清空**（D-P），所以模型只要写三行简陋清单就能宣告完成。
+/// 这一段把“它认为干完的是哪几件”落进 transcript，至少让用户看得见退化的程度。
+///
+/// **调用时机只能是 `advance` 判定 `GoalReached` 的那一刻**：`TodoStore::apply` 的
+/// 硬规则在无 open 项时把列表清空并删文件，晚一步就什么都读不到了。
+///
+/// 空清单返回空 `Vec`（调用方 `extend` 即可）：没有内容就不应该凭空多一行标题。
+fn final_plan_snapshot(store: &ys_tools_todo::TodoStore) -> Vec<String> {
+    let items = store.snapshot();
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("目标达成，最终清单（共 {} 项）：", items.len())];
+    for item in items {
+        // 状态名用 `as_str()`（与落盘 / 渲染同源），不在本处另列一份映射。
+        lines.push(format!("  - [{}] {}", item.status.as_str(), item.content));
+    }
+    lines
 }
 
 /// 会话内 `/resume` 之后，按目标 meta 的 `workspace` 决定是否**重建 agent** 切工作区。
@@ -7947,5 +8098,444 @@ mod tests {
         );
 
         shutdown(h).await;
+    }
+
+    // ------------------------------------------------- 目标（`/goal`）的集成用例
+
+    /// 收卷块的特征串 —— 只可能来自 [`crate::goal_state::GoalState::wrap_up_text`]。
+    const WRAP_UP_NEEDLE: &str = "本任务的回合预算已耗尽，现在收尾";
+
+    /// 一条消息是否是带某段文本的 harness 消息。
+    fn harness_block(message: &Message, needle: &str) -> bool {
+        message.role == Role::Harness && has_text_in(message, needle)
+    }
+
+    /// 记下每次模型调用的**请求**，并按脚本回 `todo` 调用或结束文本。
+    ///
+    /// 「问模型要的是哪一次请求」比看出站事件更直接：目标块、追问文案、报账行
+    /// 都是**输入**，而事件流看不见它们（注入走 `append_message`、不发事件）。
+    struct ScriptedModel {
+        /// `plans[i]` = 第 i 次调用的 `todos` 数组；超出范围 ⇒ 回结束文本。
+        plans: Mutex<Vec<serde_json::Value>>,
+        log: Arc<CallLog>,
+    }
+
+    impl ScriptedModel {
+        fn new(plans: Vec<serde_json::Value>, log: Arc<CallLog>) -> Self {
+            Self {
+                plans: Mutex::new(plans),
+                log,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ScriptedModel {
+        fn model_id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _sink: &mut dyn ModelEventSink,
+        ) -> Result<ModelResponse, ModelError> {
+            self.log.calls.fetch_add(1, Ordering::Relaxed);
+            self.log.requests.lock().unwrap().push(request);
+            let next = {
+                let mut plans = self.plans.lock().unwrap();
+                if plans.is_empty() {
+                    None
+                } else {
+                    Some(plans.remove(0))
+                }
+            };
+            match next {
+                Some(arguments) => Ok(ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: ToolCallId("plan".into()),
+                            name: "todo".into(),
+                            arguments,
+                        }],
+                    },
+                    usage: Usage::default(),
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+                None => Ok(text_response("ok")),
+            }
+        }
+    }
+
+    /// 把目标推到预算耗尽 —— 200 次 `consume` 是纯内存操作，直接推即可。
+    fn exhaust_goal(text: &str) -> crate::goal_state::GoalState {
+        let mut g = crate::goal_state::GoalState::new(text.to_string());
+        while !g.exhausted() {
+            g.consume();
+        }
+        g
+    }
+
+    /// `SetGoal` **不起回合**：它只登记一个验收对象（D-A）。
+    ///
+    /// 变异：把 `SetGoal` 臂写成起回合（末尾跑一次 `run_turn_chain`）⇒ 这里会先收到
+    /// `Outbound::Event`，且模型调用数变 1 ⇒ 两条断言同时红。
+    #[tokio::test]
+    async fn set_goal_does_not_start_turn() {
+        let log = Arc::new(CallLog::default());
+        let model = MockModel::new("m");
+        model.push_text("不该被用到");
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests
+            .send(Request::SetGoal {
+                text: Some("把测试跑绿".into()),
+            })
+            .await
+            .unwrap();
+        let msgs = collect_until_view(&mut h).await;
+
+        // ① 唯一一条出站是确认行（第二条是本请求末尾的 `View`）。
+        let [Outbound::Output(note), Outbound::View(_)] = msgs.as_slice() else {
+            panic!("设目标只应产出一条确认行，得到 {msgs:?}");
+        };
+        assert!(
+            note.contains("目标已设") && note.contains("200 回合"),
+            "确认行必须说明上限：{note}"
+        );
+        // ② 不得有任何事件信封（有信封 = 回合真的起了）。
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Outbound::Event(_))),
+            "设目标不得起回合：{msgs:?}"
+        );
+        let _ = &log;
+
+        shutdown(h).await;
+    }
+
+    /// 目标块在**回合边界**注入：`Role::Harness`、含 `<goal_brief`、且不重复堆叠。
+    ///
+    /// 变异：去掉注入块 ⇒ 那次请求里找不到 `<goal_brief` ⇒ 红；
+    /// 把判据改成「每次边界都注入」⇒ 第二个 `Prompt` 的请求里出现两份 ⇒ 红。
+    #[tokio::test]
+    async fn goal_marker_injected_before_prompt_turn() {
+        let log = Arc::new(CallLog::default());
+        let model = ScriptedModel::new(Vec::new(), Arc::clone(&log));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests
+            .send(Request::SetGoal {
+                text: Some("把测试跑绿".into()),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+        h.requests.send(prompt("开始")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+        h.requests.send(prompt("再来")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        let requests = log.requests();
+        // 有目标 + 清单**从未写过** ⇒ `goal::decide` 判据 4 走 `Push`（无清单 ≠ 达成），
+        // 于是这条 `Prompt` 会一路追到回合预算耗尽 —— 那是设计行为，不是本用例要测的。
+        // 这里只需要「第一次请求就看得见目标块」，故只断言前两次。
+        assert!(
+            requests.len() >= 2,
+            "两条 `Prompt` 至少各起一个回合：{} 次调用",
+            requests.len()
+        );
+        for (i, request) in requests.iter().take(2).enumerate() {
+            let hits = request
+                .messages
+                .iter()
+                .filter(|m| harness_block(m, "<goal_brief"))
+                .count();
+            assert_eq!(
+                hits,
+                1,
+                "第 {} 次请求应恰好带一份目标块（`Role::Harness`）：{:?}",
+                i + 1,
+                request.messages
+            );
+        }
+
+        shutdown(h).await;
+    }
+
+    /// `/goal clear` ⇒ 此后起回合**不再**注入目标块。
+    ///
+    /// 变异：`None` 臂不清 `goal` ⇒ 下一个回合仍注入 ⇒ 红。
+    #[tokio::test]
+    async fn goal_cleared_removes_marker() {
+        let log = Arc::new(CallLog::default());
+        let model = ScriptedModel::new(Vec::new(), Arc::clone(&log));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests
+            .send(Request::SetGoal {
+                text: Some("把测试跑绿".into()),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+        h.requests
+            .send(Request::SetGoal { text: None })
+            .await
+            .unwrap();
+        let cleared = collect_until_view(&mut h).await;
+        assert!(
+            matches!(cleared.as_slice(), [Outbound::Output(t), ..] if t.contains("目标已作废")),
+            "作废必须回一句确认：{cleared:?}"
+        );
+
+        h.requests.send(prompt("继续")).await.unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        let requests = log.requests();
+        assert_eq!(requests.len(), 1, "只有 `Prompt` 起回合");
+        assert!(
+            !requests[0]
+                .messages
+                .iter()
+                .any(|m| has_text_in(m, "<goal_brief")),
+            "作废之后不得再注入目标块：{:?}",
+            requests[0].messages
+        );
+
+        shutdown(h).await;
+    }
+
+    /// 预算耗尽 ⇒ **再跑一个收卷回合，且不再计数**（端到端）。
+    ///
+    /// 走的是真实的预算路径：目标设好 + 清单**从未写过** ⇒ 判据 4 一路 `Push`（无清单
+    /// ≠ 达成）⇒ 恰好跑满 [`crate::goal_state::GOAL_TURN_CAP`] 个追问回合 ⇒ 下一个
+    /// 判据是 `Push` 但预算已尽 ⇒ `FinalReport` ⇒ 循环外起收卷回合。
+    ///
+    /// 三条断言各自钉一件事：
+    /// ① 收卷回合**真的跑了**：收卷块进了模型请求（`WRAP_UP_NEEDLE` 只来自它）；
+    /// ② 收卷回合**不计入预算**：它之前的最后一次报账必须是「已用 200/200」，
+    ///    绝不能出现「已用 201/200」；
+    /// ③ 收卷**之后就停**：不再有第 202 次调用。
+    ///
+    /// 变异：把收卷回合搬进 `loop`（于是它前面会再 `consume()` 一次）⇒ ② 红；
+    /// 删掉循环外的收卷调用点 ⇒ ① 红。
+    #[tokio::test]
+    async fn wrap_up_turn_runs_and_does_not_consume() {
+        const CAP: u32 = crate::goal_state::GOAL_TURN_CAP;
+        // 前提：探测串确实来自收卷块，且它不带任何预算读数。
+        let probe = exhaust_goal("把测试跑绿");
+        assert!(probe.wrap_up_text().contains(WRAP_UP_NEEDLE));
+        assert_eq!(probe.turns(), CAP, "前提：预算已耗尽");
+
+        let log = Arc::new(CallLog::default());
+        let model = ScriptedModel::new(Vec::new(), Arc::clone(&log));
+        let mut h = spawn_app_loop(Box::new(model), false, Vec::new()).await;
+
+        h.requests
+            .send(Request::SetGoal {
+                text: Some("把测试跑绿".into()),
+            })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+        // 这一条 `Prompt` 会一直跑到收卷回合结束才刷 View。
+        //
+        // 报账（D-B）走 `lines` ⇒ `Outbound::Output`，**不进 `ModelRequest`**：它是给
+        // 用户看的进展，不是喂给模型的输入。观察面必须是出站流。
+        h.requests.send(prompt("开始")).await.unwrap();
+        let turn = collect_until_view(&mut h).await;
+        // 收卷之后目标仍保留 ⇒ 再问一句就会起**新**任务（又跑满一整轮），故用
+        // `/goal clear` 结束追踪。
+        h.requests
+            .send(Request::SetGoal { text: None })
+            .await
+            .unwrap();
+        let _ = collect_until_view(&mut h).await;
+
+        let requests = log.requests();
+        let wrap_at = requests
+            .iter()
+            .position(|r| has_text(r, WRAP_UP_NEEDLE))
+            .expect("收卷回合必须真的作为输入发出（请求里应有收卷块）");
+        // ① 收卷在最末：它之后不得再有调用。
+        assert_eq!(
+            wrap_at,
+            requests.len() - 1,
+            "收卷回合之后不得再起回合：共 {} 次调用",
+            requests.len()
+        );
+        // ② 首回合 + 200 个追问回合 + 1 个收卷回合。
+        assert_eq!(
+            requests.len() as u32,
+            CAP + 2,
+            "应为 1 首回合 + {CAP} 追问 + 1 收卷"
+        );
+        // ③ 报账只在 `Outbound::Output` 里：收卷前逐回合报到 `CAP/CAP`，收卷之后
+        // 的报账是 `目标未达成：已用 200 回合`，**不得**出现 201（那意味着收卷回合也
+        // 走了一次 `consume()`）。
+        let outputs: Vec<&str> = turn
+            .iter()
+            .filter_map(|m| match m {
+                Outbound::Output(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outputs
+                .iter()
+                .any(|t| t.contains(&format!("已用 {CAP}/{CAP} 回合"))),
+            "追问回合必须逐回合报账到 {CAP}/{CAP}：{outputs:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|t| t.contains(&format!("已用 {CAP} 回合，已请求收尾"))),
+            "收卷回合收场时必须报一次「已请求收尾」：{outputs:?}"
+        );
+        assert!(
+            !outputs.iter().any(|t| t.contains("已用 201")),
+            "收卷回合不得计入预算：{outputs:?}"
+        );
+
+        shutdown(h).await;
+    }
+
+    /// 预算耗尽时收卷回合的**输入形态**：带目标原文、带独立标记、不含任何预算读数。
+    ///
+    /// 端到端版（真跑满 200 回合）在测试台上做不出：`FinalReport` 依赖 `GoalState`
+    /// 已耗尽，而它是 app 循环的内部状态，`SetGoal` 只能从 0 起算。故「收卷回合真的
+    /// 被请求」由 `advance` 层的 `exhausted_goal_asks_for_wrap_up_only_on_push` 钉住，
+    /// 「收卷回合不 consume」由调用点在 `loop` **之外**保证（结构，不靠计数）。
+    #[test]
+    fn wrap_up_input_shape() {
+        let goal = exhaust_goal("把测试跑绿");
+        let text = goal.wrap_up_text();
+
+        assert!(
+            text.contains("把测试跑绿"),
+            "收卷块必须逐字引用目标原文：{text}"
+        );
+        assert!(
+            !text.contains("<goal_brief"),
+            "收卷块不得冒用目标块的标记（注入判据靠它判『历史里已经有』）：{text}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_ascii_digit()),
+            "收卷块不得含数字（回合序号 / 剩余预算）：{text}"
+        );
+        assert_eq!(goal.turns(), 200, "生成收卷块不得改变计数");
+    }
+
+    /// 预算耗尽 + 清单仍有 open 项 ⇒ 请求收卷；用户取消 ⇒ **不**请求收卷。
+    ///
+    /// 变异：把 `exhausted()` 判断提到 `match` 之前 ⇒ 取消也会被改写成 `FinalReport`
+    /// ⇒ 第二条断言红（本该直接收场的回合多跑一个）。
+    #[test]
+    fn exhausted_goal_asks_for_wrap_up_only_on_push() {
+        let store = ys_tools_todo::TodoStore::open(None);
+        store
+            .apply(vec![ys_tools_todo::TodoItem::new(
+                "还在做",
+                ys_tools_todo::TodoStatus::InProgress,
+            )])
+            .unwrap();
+        let goal = exhaust_goal("把测试跑绿");
+        let result = |stop_reason| {
+            Ok(ys_loop::RunResult {
+                stop_reason,
+                usage: ys_core::Usage::default(),
+                cache_reading: None,
+                compaction_usage: ys_core::Usage::default(),
+                rounds: 1,
+                final_message: None,
+            })
+        };
+
+        let mut state = crate::turn_advance::AdvanceState::new();
+        assert_eq!(
+            crate::turn_advance::advance(
+                &store,
+                &mut state,
+                &result(StopReason::Completed),
+                false,
+                None,
+                None,
+                Some(&goal)
+            ),
+            crate::turn_advance::Advance::FinalReport,
+            "预算耗尽 + 清单仍有 open 项 ⇒ 先收卷"
+        );
+
+        let mut state = crate::turn_advance::AdvanceState::new();
+        assert!(
+            matches!(
+                crate::turn_advance::advance(
+                    &store,
+                    &mut state,
+                    &result(StopReason::Cancelled),
+                    false,
+                    None,
+                    None,
+                    Some(&goal)
+                ),
+                crate::turn_advance::Advance::Stop(ys_protocol::StopCause::Aborted)
+            ),
+            "用户取消直接收场，不得改写成收卷"
+        );
+    }
+
+    /// 达成时的清单快照：**在清单被清空之前**把「干完的是哪几件」落到 transcript。
+    ///
+    /// 这是 R1 的缓解（设计 §7.2）：达成判据是「清单清空」，故模型只要写三行简陋清单
+    /// 就能宣告完成。快照至少让用户看得见退化的程度。
+    ///
+    /// **构造上只能用「仍有 open 项」的清单**：`TodoStore::apply` 的硬规则在全终态时
+    /// 把列表清空，那时 `snapshot()` 已经什么都不剩（快照必须在判定成立**之前**取）。
+    ///
+    /// 变异：把 `final_plan_snapshot` 改成恒返 `Vec::new()` ⇒ 第一条断言变红；
+    /// 把 `item.status.as_str()` 改成硬编码 `"done"` ⇒ 状态名断言变红。
+    #[test]
+    fn final_plan_snapshot_lists_items_with_status() {
+        let store = ys_tools_todo::TodoStore::open(None);
+        store
+            .apply(vec![
+                ys_tools_todo::TodoItem::new(
+                    "改掉 flaky 断言",
+                    ys_tools_todo::TodoStatus::Completed,
+                ),
+                ys_tools_todo::TodoItem::new("补回归用例", ys_tools_todo::TodoStatus::Pending),
+            ])
+            .expect("测试用的清单应被接受");
+
+        let lines = final_plan_snapshot(&store);
+
+        assert_eq!(lines.len(), 3, "标题 + 两项：{lines:?}");
+        assert!(
+            lines[0].contains("共 2 项"),
+            "首行要报总数（用户一眼看得出退化程度）：{lines:?}"
+        );
+        assert!(
+            lines[1].contains("改掉 flaky 断言")
+                && lines[1].contains(ys_tools_todo::TodoStatus::Completed.as_str()),
+            "每项要带状态名（与落盘同源）：{lines:?}"
+        );
+        assert!(
+            lines[2].contains("补回归用例")
+                && lines[2].contains(ys_tools_todo::TodoStatus::Pending.as_str()),
+            "未完成的项同样落进快照 —— 它是「还剩什么」的交代：{lines:?}"
+        );
+    }
+
+    /// 空清单不凭空多一行标题（调用方直接 `extend`，无内容就不该有输出）。
+    ///
+    /// 变异：去掉提前 `return Vec::new()` ⇒ 会多出「共 0 项」一行 ⇒ 本用例变红。
+    #[test]
+    fn final_plan_snapshot_empty_leaves_no_trace() {
+        let store = ys_tools_todo::TodoStore::open(None);
+        assert!(
+            final_plan_snapshot(&store).is_empty(),
+            "没有清单就不该凭空多一行标题"
+        );
     }
 }

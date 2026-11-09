@@ -63,4 +63,4 @@ pub use prompter::{FakePrompter, PromptError, Prompter};
 pub use run::{TuiError, run};
 pub use theme::{Palette, ThemeKind};
 pub use transcript::{TranscriptLine, replay_lines, summarize_tool_args};
-pub use view::{CodingView, LoopView, ModelEntry, ProviderEntry, SkillEntry};
+pub use view::{CodingView, GoalView, LoopView, ModelEntry, ProviderEntry, SkillEntry};

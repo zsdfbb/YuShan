@@ -3,11 +3,9 @@
 //! 纯数据、零 IO、**零 tokio**（直接与间接都不含）：这些类型要能被任意运行时与任意产品
 //! TUI crate 引用，因此不能带任何执行器类型。
 //!
-//! 本模块**只承载词汇**：判定怎么算出来（判官调用、引用校验）在 app 层
-//! （`apps/coding-agent/src/goal_judge.rs`，那里产出 [`JudgeParse`]），闸门怎么排序在
-//! `apps/coding-agent/src/goal.rs`。
-//!
-//! [`JudgeParse`]: ../../ys_coding_agent/goal_judge/enum.JudgeParse.html
+//! 本模块**只承载词汇**：判据怎么排序在 app 层（`apps/coding-agent/src/goal.rs` 的
+//! `decide` 与 `apps/coding-agent/src/turn_advance.rs` 的 `advance`），文案由
+//! [`StopCause::text`] 给出。
 
 /// 回合结束后的推进决定。
 ///
@@ -24,23 +22,38 @@ pub enum FollowUp {
 
 /// 停下来的原因（用于 UI 提示与统计）。
 ///
-/// 变体即**停机分类**：正常收场只有 [`StopCause::AllDone`] 一个。
+/// 变体即**停机分类**：正常收场有 [`StopCause::AllDone`] 与 [`StopCause::GoalReached`]
+/// 两个，按「本任务有没有活动目标」区分。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopCause {
     /// 没有计划（本回合从未写过清单）⇒ 按普通回合处理。
     NoPlan,
-    /// 清单刚被清空（曾经有项、现在无 open 项）—— **唯一的正常收场**。
+    /// **无目标**时清单被清空（曾经有项、现在无 open 项）⇒ 正常收场。
     AllDone,
-    /// 追问轮数用尽（`used >= MAX_FOLLOW_UPS`）。
-    CapReached,
-    /// 连续多轮剩余集合指纹不变，且模型自称收尾 —— 原地打转。
-    Stalled,
+    /// **有目标**时清单被清空 ⇒ 目标达成，正常收场。
+    ///
+    /// 与 [`StopCause::AllDone`] 分开，是为了让 UI 能分辨「这轮活干完了」与
+    /// 「用户设的目标达成了」—— 两者对用户的含义不同。
+    GoalReached,
     /// 回合被取消（用户 Ctrl+C）。**用户意图永远优先于任何判据**。
     Aborted,
     /// 回合收场形态不可续（截断 / 失败 / 轮数用尽 / 无产出）。
     NotContinuable,
-    /// 判官连续多次不可靠（解析失败 / 引用未命中）⇒ 没有判据就没有停止条件。
-    JudgeUnreliable,
+}
+
+impl StopCause {
+    /// 面向 UI 的一句中文文案（非空，且各变体互不相同）。
+    ///
+    /// 穷尽 `match`、**不留 `_` 兜底臂**：新增变体即编译失败，迫使补一句文案。
+    pub fn text(self) -> &'static str {
+        match self {
+            StopCause::NoPlan => "没有计划：本回合未写过清单",
+            StopCause::AllDone => "清单已清空，工作收尾",
+            StopCause::GoalReached => "目标达成：清单已清空",
+            StopCause::Aborted => "回合被用户中断",
+            StopCause::NotContinuable => "收场形态不可续（截断 / 失败 / 无产出）",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -55,12 +68,40 @@ mod tests {
         assert_ne!(FollowUp::Push, FollowUp::Stop(StopCause::AllDone));
         assert_ne!(
             FollowUp::Stop(StopCause::AllDone),
-            FollowUp::Stop(StopCause::CapReached),
+            FollowUp::Stop(StopCause::GoalReached),
             "不同停机原因不得相等 —— UI 与统计靠它区分"
         );
         assert_eq!(
             FollowUp::Stop(StopCause::Aborted),
             FollowUp::Stop(StopCause::Aborted)
+        );
+    }
+
+    /// 每个 `StopCause` 都有一句非空文案，且 5 句两两不同。
+    ///
+    /// 变异：把 `text()` 的某个臂改成 `""`（或让两个臂返回同一句）⇒ 本用例变红。
+    #[test]
+    fn every_stop_cause_has_text() {
+        let causes = [
+            StopCause::NoPlan,
+            StopCause::AllDone,
+            StopCause::GoalReached,
+            StopCause::Aborted,
+            StopCause::NotContinuable,
+        ];
+        for cause in causes {
+            assert!(
+                !cause.text().trim().is_empty(),
+                "{cause:?} 必须有非空文案 —— UI 要直接显示它"
+            );
+        }
+
+        let texts: std::collections::HashSet<&'static str> =
+            causes.iter().map(|c| c.text()).collect();
+        assert_eq!(
+            texts.len(),
+            causes.len(),
+            "停机文案不得重复 —— 否则 UI 无法区分不同停机原因"
         );
     }
 }

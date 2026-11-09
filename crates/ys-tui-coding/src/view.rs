@@ -79,7 +79,7 @@ impl ModelEntry {
 }
 
 /// coding agent 的显示快照。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CodingView {
     pub cwd: PathBuf,
     pub provider: Option<String>,
@@ -154,6 +154,9 @@ pub struct CodingView {
     /// **已投影的显示值**：「间隔怎么格式化」「还有多久」都由 app 侧算好 ——
     /// 渲染层不做时间格式判断，只把两段文字拼进状态行。
     pub loop_state: Option<LoopView>,
+    /// 跨回合目标的显示投影（`/goal`）。`None` = 当前没有活动目标
+    /// （状态行不出现 `[goal]` 段）。
+    pub goal: Option<GoalView>,
 }
 
 /// 定时循环的**显示投影**（不含任何时刻真值，那在 app 侧）。
@@ -167,6 +170,19 @@ pub struct LoopView {
     /// `ys-tui-coding::clock` 里是 `pub(crate)`、app 侧拿不到。相对时长与机器
     /// 时区无关且永远正确。
     pub next_label: Option<String>,
+}
+
+/// 目标（`/goal`）的**显示投影**：纯显示数据，不含任何行为。
+///
+/// 目标的真值（是否达成、何时收卷）在 app 侧，本 crate 只把这份快照渲染进状态行。
+#[derive(Clone, Debug, PartialEq)]
+pub struct GoalView {
+    /// 用户原话（状态行显示时自行截断）。
+    pub text: String,
+    /// 已消耗回合数。
+    pub turns: u32,
+    /// 上限（`GOAL_TURN_CAP`，由 app 侧填，本 crate 不定义常量）。
+    pub cap: u32,
 }
 
 impl Default for CodingView {
@@ -199,6 +215,7 @@ impl Default for CodingView {
             theme: ThemeKind::default(),
             version: "0.0.0".to_string(),
             loop_state: None,
+            goal: None,
         }
     }
 }
@@ -297,6 +314,8 @@ impl CodingView {
             theme: ThemeKind::default(),
             version: "0.0.0".to_string(),
             loop_state: None,
+            // 中性值：测试默认不带活动目标，需要时用例自己填。
+            goal: None,
         }
     }
 }
@@ -429,5 +448,74 @@ mod tests {
         };
         assert_eq!(current.label(), "deepseek/deepseek-chat [current]");
         assert_ne!(current.label(), with_provider.label(), "[current] 必须可辨");
+    }
+
+    /// 没有目标时状态行不该出现 `[goal]` 段 —— `Default` 必须是 `None`。
+    ///
+    /// 变异：`Default` 里写成 `goal: Some(GoalView::default())` ⇒ 本用例变红。
+    #[test]
+    fn coding_view_default_has_no_goal() {
+        assert!(
+            CodingView::default().goal.is_none(),
+            "无条件目标 ⇒ 无 [goal] 段"
+        );
+    }
+
+    /// `goal` 字段必须**真参与** `PartialEq`，否则「目标变了」会被误判成「视图没变」。
+    ///
+    /// 变异：把 `GoalView` 的 `PartialEq` 手写成恒真 ⇒ 本用例变红。
+    ///
+    /// 注意 `Option` 的 `PartialEq` 在 `None` vs `Some` 时**短路**（不动内层 `eq`），
+    /// 所以只断言这一对抓不到恒真的 `GoalView::eq` —— 必须再钉一对「两侧都是
+    /// `Some` 但内容不同」。
+    #[test]
+    fn goal_field_participates_in_eq() {
+        // 必须从**同一份** base 克隆：`for_test()` 每次现取 `session_started`，
+        // 两个独立构造的视图本就因该字段不等，断言就测不到 `goal`。
+        let base = CodingView::for_test();
+        let goal = |turns: u32| GoalView {
+            text: "修好 flaky test".into(),
+            turns,
+            cap: 200,
+        };
+
+        let no_goal = CodingView {
+            goal: None,
+            ..base.clone()
+        };
+        let with_goal = CodingView {
+            goal: Some(goal(3)),
+            ..base.clone()
+        };
+        assert_eq!(
+            no_goal,
+            CodingView {
+                goal: None,
+                ..base.clone()
+            },
+            "除 goal 外全同 ⇒ 相等（`goal: None` 不破坏比较）"
+        );
+        assert_ne!(no_goal, with_goal, "除 goal 外相同 ⇒ 不等只因 goal");
+        assert_eq!(with_goal, with_goal.clone(), "自反");
+
+        // 两侧都是 `Some`：差异只能由内层 `GoalView::eq` 报出来。
+        let other_goal = CodingView {
+            goal: Some(goal(4)),
+            ..base
+        };
+        assert_ne!(with_goal, other_goal, "turns 不同 ⇒ 不等");
+    }
+
+    /// `GoalView` 三个字段都是可读的显示数据，原样带过去。
+    #[test]
+    fn goal_view_carries_display_data() {
+        let g = GoalView {
+            text: "修好 flaky test".into(),
+            turns: 7,
+            cap: 200,
+        };
+        assert_eq!(g.text, "修好 flaky test");
+        assert_eq!(g.turns, 7);
+        assert_eq!(g.cap, 200, "cap 由 app 侧填，本 crate 不定义常量");
     }
 }

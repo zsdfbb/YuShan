@@ -117,6 +117,21 @@ pub enum Request {
     },
     /// 清掉定时循环。已在跑的回合**不中断** —— 取消定时器 ≠ 取消当前工作。
     LoopOff,
+    /// 设 / 作废一个跨回合目标：`Some(t)` = 设目标（用户原话逐字保留），
+    /// `None` = `/goal clear`（作废当前目标）。
+    ///
+    /// **不起回合**：设目标只是登记一个验收对象，什么时候开始干活由用户的**下一条
+    /// 输入**决定（D-A 把目标定为独立验收对象，而非首回合的提示词）—— 若设置即起
+    /// 回合，用户无法在设完之后先看一眼再决定开始。作废同理：只清状态，不打断
+    /// 已在跑的回合（打断走 [`Boundary::Abort`]）。
+    ///
+    /// 与 [`Request::Prompt`] 的区别：`Prompt` 是**用户说的话**（一条消息，进上下文、
+    /// 起回合），`SetGoal` 是 **harness 的配置动作**（只改 app 侧的目标状态，不产生
+    /// 任何 `Message`）。故目标原文由注入块在下个回合边界送达模型，而不经本变体。
+    ///
+    /// 无 `#[serde(default)]`：本变体是**纯追加**，不存在缺 `text` 键的旧 JSON；
+    /// 缺键报错比静默落成 `None`（= 意外作废目标）安全。`None` 显式写作 `null`。
+    SetGoal { text: Option<String> },
 }
 
 /// app → UI 的出站消息（设计 §6）。
@@ -345,6 +360,52 @@ mod tests {
             path: Some(PathBuf::from("/tmp/out.jsonl")),
         });
         assert_roundtrip(&Request::Export { path: None });
+    }
+
+    /// `SetGoal` 的两种形态都要能过 serde：`Some` = 设目标，`None` = `/goal clear`。
+    /// 二者编码不同（字符串 vs `null`），漏测任一种都会让 app 侧消费端在真实信道上炸。
+    ///
+    /// 变异：给 `text` 加 `#[serde(skip)]`（或把 `None` 序列化成缺键）⇒ 往返丢载荷 ⇒
+    /// 本用例变红 —— 作废与设置将无法区分，`/goal clear` 会被读成「设了个空目标」。
+    #[test]
+    fn set_goal_roundtrips_through_json() {
+        assert_roundtrip(&Request::SetGoal {
+            text: Some("修好 flaky test".into()),
+        });
+        assert_roundtrip(&Request::SetGoal { text: None });
+    }
+
+    /// `Option` 必须真参与比较：设目标与作废目标是**两个不同的请求**。
+    ///
+    /// 变异：手写 `PartialEq` 时忽略 `text`（或把变体退化成单元变体 `SetGoal`）⇒
+    /// 两者变相等 ⇒ 本用例变红。这条守着「误把 clear 当成 set 处理」的上游前提。
+    #[test]
+    fn set_goal_variants_differ() {
+        assert_ne!(
+            Request::SetGoal {
+                text: Some("修好 flaky test".into()),
+            },
+            Request::SetGoal { text: None },
+        );
+    }
+
+    /// 消费端按 `Request::SetGoal { .. }` 一次接住两个臂（一个 `match` 臂覆盖
+    /// 设目标与作废，两者差别只在 `text` 上）—— 穷尽匹配才不会被新形态漏掉。
+    ///
+    /// 变异：把 `..` 改成具体绑定 `{ text: Some(_) }` ⇒ `None` 形态不再命中 ⇒
+    /// `matches!` 第二条断言变红。
+    #[test]
+    fn set_goal_matches_both_arms() {
+        assert!(matches!(
+            Request::SetGoal {
+                text: Some("修好 flaky test".into())
+            },
+            Request::SetGoal { .. }
+        ));
+        assert!(matches!(
+            Request::SetGoal { text: None },
+            Request::SetGoal { .. }
+        ));
     }
 
     #[test]

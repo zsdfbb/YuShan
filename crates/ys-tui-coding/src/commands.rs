@@ -50,7 +50,7 @@ const EFFORT_USAGE: &str = "用法：/effort [off|minimal|low|medium|high|xhigh|
 /// `/effort` 的「清除设置」令牌 —— 对应 `Option<EffortLevel>` 的 `None`。
 const EFFORT_DEFAULT_TOKEN: &str = "default";
 
-static COMMANDS: [CommandSpec; 18] = [
+static COMMANDS: [CommandSpec; 19] = [
     CommandSpec {
         name: "help",
         description: "显示可用命令",
@@ -141,6 +141,13 @@ static COMMANDS: [CommandSpec; 18] = [
         arg_hint: Some("[now] <间隔> <提示词> | off"),
     },
     CommandSpec {
+        // 与 `/loop` 相邻：两者是**同一族**（管 harness 跨回合的自主性），
+        // 一个是按时间起回合、一个是按验收目标推进。
+        name: "goal",
+        description: "设一句目标，之后自动跨回合推进直到达成",
+        arg_hint: Some("[目标] / clear"),
+    },
+    CommandSpec {
         name: "export",
         description: "导出会话到文件",
         arg_hint: Some("[path]"),
@@ -192,6 +199,8 @@ pub enum LocalAction {
     Thinking(Option<bool>),
     /// 无参 `/effort`：显示当前档位与用法（**不发请求**；真值在 `CodingView.effort`）。
     Effort,
+    /// 无参 `/goal`：打印当前目标与进度（**不发请求**；真值在 `CodingView.goal`）。
+    GoalStatus,
     /// `/theme <name>`：**已解析**的主题。
     ///
     /// 携带 [`ThemeKind`] 而不是原始 `String`：非法输入必须在进入本地应用**之前**
@@ -365,6 +374,11 @@ pub fn parse_with_skills(input: &str, skills: &[SkillEntry]) -> Action {
         // **单条语义**：一个 session 一个循环，再敲一次即覆盖（不叠加、不报错）。
         // 间隔下限 10s（再低就是在烧钱）、上限 24h；没有上限配置就只有这两道钳。
         "loop" => parse_loop(&args),
+        // `/goal [目标] | clear`。目标原文**从原始输入切出**（`text` 在 `/` 之后即命令名，
+        // 故 `1 + name.len()` 是参数起点）：`args` 那条路经 `split_whitespace` 重拼，
+        // 会把内部的连续空白折叠成一个空格。目标是用户原话、会原样送达模型，
+        // 故只裁首尾空白、不重排内部。
+        "goal" => parse_goal(text[1 + name.len()..].trim()),
         // 无参 → `None`：**默认落点由 app 侧按会话文件决定**（设计 §6「会话文件
         // 在 app 侧」）。TUI 不替 app 猜一个相对 cwd 的路径（那样会静默覆盖同名文件）。
         "export" => Action::Request(Request::Export {
@@ -431,6 +445,27 @@ fn parse_loop(args: &[&str]) -> Action {
             })
         }
     }
+}
+
+/// `/goal` 的解析：空 ⇒ 本地查状态，`clear` ⇒ 作废，其余 ⇒ 设目标。
+///
+/// **目标原文逐字保留**：不折大小写、不重排内部空白（只裁首尾，调用点已做）。
+/// 它是用户原话，会被注入块在下个回合边界原样交给模型 —— 在这里做任何「规整」
+/// 都会让模型看到与用户敲的不一样的一句话。
+///
+/// `clear` 精确匹配（大小写敏感）：目标本身可能就以 `clear` 开头（`/goal clear 掉旧缓存`
+/// 是一句合法的目标），若做前缀/大小写模糊匹配，这句目标就再也设不进去了。
+/// 要作废就只能敲光秃秃的 `clear` —— 这是**唯一**的歧义消解办法。
+fn parse_goal(args: &str) -> Action {
+    if args.is_empty() {
+        return Action::Local(LocalAction::GoalStatus);
+    }
+    if args == "clear" {
+        return Action::Request(Request::SetGoal { text: None });
+    }
+    Action::Request(Request::SetGoal {
+        text: Some(args.to_string()),
+    })
 }
 
 /// 间隔的下限与上限（秒）。
@@ -996,6 +1031,25 @@ pub fn status_text(view: &CodingView) -> String {
     .join("\n")
 }
 
+/// `/goal` 的正文（数据全部来自 [`CodingView`]）。
+///
+/// **不截断目标原文**：状态行的 `[goal]` 段是窄显示（只需认得出是哪件事），
+/// 而这里用户是主动来查详情 —— 截断会让他看不到自己写的确切措辞，
+/// 也就无法判断模型接手的是不是本意。
+pub fn goal_status_text(view: &CodingView) -> String {
+    const USAGE: &str = "用法：/goal <目标> 设定，/goal clear 作废";
+    match &view.goal {
+        None => {
+            format!("当前没有目标。\n设一句目标后，harness 会在回合约末自动推进直到达成。\n{USAGE}")
+        }
+        Some(goal) => format!(
+            "目标：{}\n已用 {}/{} 回合\n\
+             Esc 只中断当前回合（目标保留）；要作废请用 `/goal clear`。",
+            goal.text, goal.turns, goal.cap
+        ),
+    }
+}
+
 /// `/copy` 的正文：最后一条非空 assistant 文本。
 ///
 /// 返回 `None` = 没有可复制的回复。
@@ -1054,6 +1108,9 @@ pub fn apply_local(app: &mut App, action: LocalAction) {
                 .map(|level| level.to_string())
                 .unwrap_or_else(|| EFFORT_DEFAULT_TOKEN.to_string())
         ),
+        // **只读视图**：目标的真值在 app 侧（`/goal <目标>` 发请求后由下一份快照
+        // 推回来），这里不写 `app.view.goal`。
+        LocalAction::GoalStatus => goal_status_text(&app.view),
         // 主题**只有一份真值**（`App.theme`）—— 与 `/effort` 的「只读视图」不同：
         // 主题是纯 UI 状态，本地改完就是最终值，app 侧只是持久化镜像。落盘由
         // `events.rs` 单向同步（本函数只拿 `&mut App`，不做 IO）。
@@ -1142,6 +1199,17 @@ mod tests {
                 }),
             ),
             ("/loop off", Action::Request(Request::LoopOff)),
+            ("/goal", Action::Local(L::GoalStatus)),
+            (
+                "/goal 修好 flaky test",
+                Action::Request(Request::SetGoal {
+                    text: Some("修好 flaky test".into()),
+                }),
+            ),
+            (
+                "/goal clear",
+                Action::Request(Request::SetGoal { text: None }),
+            ),
             ("/export", Action::Request(Request::Export { path: None })),
             (
                 "/export a.jsonl",
@@ -1248,6 +1316,127 @@ mod tests {
         );
         assert!(has(|r| matches!(r, Request::Compact)), "缺 Compact");
         assert!(has(|r| matches!(r, Request::Export { .. })), "缺 Export");
+    }
+
+    /// `all_commands()` 恰好 19 条（= `COMMANDS` 的声明长度）。
+    ///
+    /// 长度写死是有意的：**表变长就是行为变更**，要在一个地方被看见（`--help`
+    /// 命令段、补全浮层、`/help` 全表三者同时变宽）。只断言「不为空」会让
+    /// 「新加了条目」与「老条目被误删」都静默通过。
+    ///
+    /// 变异：`COMMANDS` 的声明长度与实际条目数不一致（如声明 19、实写 18）⇒
+    /// 根本编不过；把一条条目注释掉而改声明长度 ⇒ 本用例变红。
+    #[test]
+    fn all_commands_len_is_19() {
+        assert_eq!(
+            all_commands().len(),
+            19,
+            "命令表增删必须同步本断言与 `&[CommandSpec; N]` 的 N"
+        );
+    }
+
+    /// `/goal <目标>` ⇒ `SetGoal { text: Some(原话) }`。
+    ///
+    /// **目标原文逐字保留**：内部连续空白也不折（从原始输入切片，不经
+    /// `split_whitespace` 重拼），首尾空白由既有的 `trim` 惯例裁掉。
+    ///
+    /// 变异：把 `parse_goal` 改成对 `arg()` 的结果再 `trim` / `replace("  ", " ")`
+    /// ⇒ 含双空格的断言变红；把 `Some(args.to_string())` 写成 `Some(args.trim().
+    /// to_string())` 则本用例仍绿（首尾裁切属预期），但 `text: None` 一侧的
+    /// [`parse_goal_clear`] 不受影响。
+    #[test]
+    fn parse_goal_with_text() {
+        assert_eq!(
+            parse("/goal 修好 flaky test"),
+            Action::Request(Request::SetGoal {
+                text: Some("修好 flaky test".into()),
+            })
+        );
+        // 内部空白**不被折叠**：用户怎么敲，模型就怎么看到。
+        assert_eq!(
+            parse("/goal 甲   乙"),
+            Action::Request(Request::SetGoal {
+                text: Some("甲   乙".into()),
+            }),
+            "内部连续空白必须原样保留"
+        );
+        // 首尾多余空白被裁（与其它命令一致），大小写不折。
+        assert_eq!(
+            parse("/goal   修好 Flaky 测试   "),
+            Action::Request(Request::SetGoal {
+                text: Some("修好 Flaky 测试".into()),
+            })
+        );
+        // 以 `clear` **开头**但不是光秃秃的 `clear` ⇒ 仍是一句目标（精确匹配）。
+        assert_eq!(
+            parse("/goal clear 掉旧缓存"),
+            Action::Request(Request::SetGoal {
+                text: Some("clear 掉旧缓存".into()),
+            }),
+            "`clear` 只在独占参数位置时才是作废令牌"
+        );
+    }
+
+    /// `/goal clear` ⇒ `SetGoal { text: None }`（作废，不是「设了个空目标」）。
+    ///
+    /// 变异：把 `parse_goal` 的 `clear` 分支删掉 ⇒ 本用例变红，且该输入会落成
+    /// `text: Some("clear")` ——目标成了一句话 `clear`，旧目标永远清不掉。
+    #[test]
+    fn parse_goal_clear() {
+        assert_eq!(
+            parse("/goal clear"),
+            Action::Request(Request::SetGoal { text: None }),
+            "clear = 作废，不是设目标"
+        );
+        // 大小写敏感：`CLEAR` 是一句**目标**（与 `off` / `now` 的令牌惯例一致）。
+        assert_eq!(
+            parse("/goal CLEAR"),
+            Action::Request(Request::SetGoal {
+                text: Some("CLEAR".into()),
+            })
+        );
+    }
+
+    /// 无参 `/goal` ⇒ `Local(GoalStatus)`（**不发请求**：真值只在 app 侧）。
+    ///
+    /// 变异：把空分支改成 `SetGoal { text: None }` ⇒ 无参 `/goal` 会静默作废目标，
+    /// 本用例与 [`test_every_command_maps_to_the_designed_action`] 同时变红。
+    #[test]
+    fn parse_goal_bare() {
+        assert_eq!(parse("/goal"), Action::Local(LocalAction::GoalStatus));
+        // 纯空白等同无参（`text.trim()` 后切片为空）。
+        assert_eq!(parse("/goal    "), Action::Local(LocalAction::GoalStatus));
+    }
+
+    /// `goal_status_text` 的两态：无目标 ⇒ 说「没有」+ 用法；有目标 ⇒ 原文 +
+    /// `已用 n/cap 回合` + 两条出路（Esc 保留 / `/goal clear` 作废）。
+    ///
+    /// **原文不截断**：长目标逐字出现（状态行才做窄显示）。
+    ///
+    /// 变异：把 `None` 分支也渲染成「目标：…」⇒ 第一条断言变红；把 `Some` 分支的
+    /// `goal.text` 换成 `format!("{}…", &goal.text[..8])`（截断）⇒ 末尾的长原文断言变红。
+    #[test]
+    fn goal_status_text_two_states() {
+        // ① 无目标。
+        let none = goal_status_text(&CodingView::for_test());
+        assert!(none.contains("没有目标"), "无目标要说明：{none}");
+        assert!(none.contains("/goal clear"), "要给用法：{none}");
+
+        // ② 有目标。
+        let long = "把 commands.rs 的目标分支补完并让全部用例转绿，顺便检查 completion 守护";
+        let view = CodingView {
+            goal: Some(crate::view::GoalView {
+                text: long.into(),
+                turns: 3,
+                cap: 12,
+            }),
+            ..CodingView::for_test()
+        };
+        let some = goal_status_text(&view);
+        assert!(some.contains(long), "目标原文必须不截断地出现：{some}");
+        assert!(some.contains("已用 3/12 回合"), "要报进度：{some}");
+        assert!(some.contains("Esc"), "要提示中断语义：{some}");
+        assert!(some.contains("/goal clear"), "要提示作废方式：{some}");
     }
 
     #[test]
@@ -1601,7 +1790,7 @@ mod tests {
             vec![
                 "help", "keybind", "status", "skills", "copy", "quit", "thinking", "effort",
                 "theme", "model", "login", "logout", "new", "clear", "resume", "compact", "loop",
-                "export",
+                "goal", "export",
             ],
             "命令表与设计 §6 逐条对应（顺序即显示顺序）"
         );

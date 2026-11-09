@@ -107,6 +107,12 @@ const IDLE_MARKER: &str = "⏸ Ready";
 /// 标题里塞「输入筛选」会把整框撑到 60+ 列（原有标题约 40 列），窄终端下反而被裁掉；
 /// 而提示放在输入框里，位置更对：正是用户要敲字的地方。
 const FILTER_PLACEHOLDER: &str = "输入以筛选…";
+/// 状态行 `[goal]` 段里目标文字的截断宽度（**显示列**，CJK 算 2）。
+///
+/// 取 24 列 ≈ 12 个汉字 ≈ 桌面终端里一行状态行的三分之一：状态行还有首段、model、
+/// tokens 等常驻段，`[goal]` 是新增段，不该按「能放多长放多长」占宽。
+/// 目标原文的全文由 transcript 与 `/goal` 负责，状态行只需要「在追哪个目标」的辨识度。
+const GOAL_TEXT_MAX_WIDTH: usize = 24;
 /// 补全浮层的最大宽度（再宽也只是空荡荡的一行）。
 const COMPLETION_MAX_WIDTH: u16 = 64;
 /// 模态浮层的宽度夹取区间。
@@ -983,6 +989,22 @@ fn status_text(app: &App, width: usize) -> String {
         };
         segs.push(format!("[loop] {} · {phase}", loop_state.interval));
     }
+    // 目标段与 `[loop]` 段同排（首段之后、model 之前），故它同样比 model / tokens /
+    // 轮数 / 时长更晚被剥 —— 剥离顺序上二者都排在常驻读数**之前**。
+    //
+    // 两者之间 `[loop]` 在前、`[goal]` 在后，即极窄时**先丢 goal、再丢 loop**：
+    // loop 的「间隔 + 下次触发」是「何时会自己动」的读数，transcript 里读不到；
+    // 而 goal 的原文与进度在 transcript 与该命令的回显里都能回看，故它比 loop 更可剥。
+    // 目标文字本身按**字符**截断（`truncate_to_width` 走 char 边界），
+    // 绝不按字节切 —— 多字节字符被切断会 panic。
+    if let Some(goal) = &app.view.goal {
+        segs.push(format!(
+            "[goal] {}/{} {}",
+            goal.turns,
+            goal.cap,
+            truncate_to_width(&goal.text, GOAL_TEXT_MAX_WIDTH),
+        ));
+    }
     segs.push(app.view.model_label());
     // 「下方有新内容」提示：脱离底部时才有 —— 排在 model 之后、其余段之前，
     // 于是窄终端下先被剥掉的是 tokens / 轮数 / 时长，提示与 model 都留得住。
@@ -1784,7 +1806,7 @@ fn wrap_input(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, u
 mod tests {
     use super::*;
     use crate::theme::ThemeKind;
-    use crate::view::CodingView;
+    use crate::view::{CodingView, GoalView};
     use ratatui::Terminal;
     use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
@@ -3150,6 +3172,87 @@ mod tests {
         let app = app_with(CodingView::for_test());
         let text = status_text(&app, 120);
         assert!(!text.contains('✓'), "无提示时不得画勾：{text}");
+    }
+
+    // ── `[goal]` 段 ────────────────────────────────────────────────────────
+
+    /// 没有目标时状态行**完全不出现** `[goal]`（不得 push 空串留个悬空的段号）。
+    ///
+    /// 变异：把 `if let Some(goal)` 改成无条件 push ⇒ 本用例变红。
+    #[test]
+    fn goal_segment_absent_without_goal() {
+        let app = app_with(CodingView::for_test());
+        let text = status_text(&app, 200);
+        assert!(!text.contains("[goal]"), "无目标时不得有 [goal] 段：{text}");
+        // 分隔符也不得多出一个（无条件 push 空串会留下 ` · ` 尾巴）。
+        assert!(!text.contains(" ·  · "), "不得留下空段：{text}");
+        assert!(!text.ends_with(" · "), "不得留下空尾段：{text}");
+    }
+
+    /// 有目标时显示 `[goal] 已用/上限 文字`，且位置在 model 之前（故比读数晚剥）。
+    ///
+    /// 变异：把 `goal.turns` / `goal.cap` 写反（或写成常量）⇒ 首条断言变红。
+    #[test]
+    fn goal_segment_shows_progress() {
+        let view = CodingView {
+            goal: Some(GoalView {
+                text: "修好 flaky 测试".to_string(),
+                turns: 3,
+                cap: 200,
+            }),
+            ..CodingView::for_test()
+        };
+        let app = app_with(view);
+        let text = status_text(&app, 200);
+        assert!(text.contains("[goal] 3/200"), "要显示已用/上限：{text}");
+        assert!(text.contains("修好 flaky 测试"), "要显示目标文字：{text}");
+        // 剥尾顺序：`[goal]` 在 model 之前 ⇒ 窄屏先丢 model，goal 还留着。
+        let goal_only = "⏸ Ready · [goal] 3/200 修好 flaky 测试";
+        let narrow = status_text(&app, display_width(goal_only));
+        assert_eq!(narrow, goal_only, "goal 比 model 晚被剥：{narrow}");
+    }
+
+    /// 超长且含多字节中文的目标文字按**显示列**（字符边界）截断，末尾补 `…`。
+    ///
+    /// 样本刻意用 `1 个 ASCII 前缀 + 中文`（而不是纯中文）：前缀让「第 24 个**字节**」
+    /// 恰好落在汉字中间，于是按字节切一定 panic；纯中文样本里 24 字节正好是 8 个汉字、
+    /// 恰好是 char 边界，那种变异会**悄悄漏过**。
+    ///
+    /// 变异：把 `truncate_to_width` 换成 `&t[..GOAL_TEXT_MAX_WIDTH]` ⇒ 本用例 panic 变红。
+    #[test]
+    fn goal_segment_truncates_by_chars() {
+        let long = format!(
+            "x{}",
+            "修复这个总是间歇性失败而且很难复现的端到端集成测试并找到根本原因".repeat(2)
+        );
+        assert!(long.chars().count() > 40, "样本要够长：{long}");
+        let view = CodingView {
+            goal: Some(GoalView {
+                text: long.clone(),
+                turns: 1,
+                cap: 50,
+            }),
+            ..CodingView::for_test()
+        };
+        let app = app_with(view);
+        // 不 panic 本身就是断言（按字节切会在这里炸）。
+        let text = status_text(&app, 300);
+        assert!(text.contains("[goal] 1/50"), "{text}");
+        let shown = text.split("[goal] 1/50 ").nth(1).unwrap_or_default();
+        let shown = shown.split(" · ").next().unwrap_or_default();
+        assert!(shown.ends_with('…'), "截断要补省略号：{shown}");
+        assert!(
+            display_width(shown) <= GOAL_TEXT_MAX_WIDTH,
+            "截断后不超宽：{} 列 {shown}",
+            display_width(shown)
+        );
+        // 按 char 计数（不是 `len()`）：`…` 占 1 个 char、2 列，故 char 数比列数小。
+        assert!(
+            shown.chars().count() <= GOAL_TEXT_MAX_WIDTH,
+            "按字符数同样受控：{} 个字符 {shown}",
+            shown.chars().count()
+        );
+        assert!(!shown.contains('\u{FFFD}'), "不得出现替换字符：{shown}");
     }
 
     /// 回合进行中：`⏳ Working…` 与 model 之后补两个**进度段**（本回合轮号、本回合已用秒数）。

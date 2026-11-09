@@ -47,8 +47,7 @@ mod channel;
 mod config;
 mod debug_log;
 mod goal;
-mod goal_judge;
-mod goal_judge_call;
+mod goal_state;
 mod help;
 mod logging;
 mod post_turn;
@@ -2299,42 +2298,34 @@ where
     Ok((result, consumed))
 }
 
-/// 跨回合推进的**判官 + 判据**组合（`docs/arch/cross-turn-advance/design.md` §5.9）。
+/// 跨回合推进的**判据**（`docs/arch/cross-turn-advance/design.md` §5.9）。
 ///
 /// TUI（`app_loop`）与 `-p` / `--json` **共用这一份**：两条入口的判据必须逐字同源，
 /// 否则「同一个任务在两条入口上跑出不同轮数」这种漂移无从发现。
 ///
-/// 判官失败计数的归零规则在 `decide` 内部（它按 `judge_failures` 判停机），
-/// 故这里只做增量累加：可用结论（`0`）即归零。
+/// 末位 `goal` 恒为 `None`：`-p` / `--json` 没有收卷回合、也没有目标，
+/// 因而**永不**得到 [`crate::turn_advance::Advance::FinalReport`]
+/// （D-K：不给一次性模式设目标上限）。
 #[allow(clippy::too_many_arguments)]
 async fn advance_after_turn(
-    wiring: &mut Wiring,
+    _wiring: &mut Wiring,
     todo_store: &ys_tools_todo::TodoStore,
     state: &mut crate::turn_advance::AdvanceState,
     outcome: &Result<RunResult, LoopError>,
     enabled: bool,
     head_before: Option<&str>,
     head_after: Option<String>,
-    elapsed: Option<Duration>,
+    _elapsed: Option<Duration>,
 ) -> crate::turn_advance::Advance {
-    let model = wiring.model_arc();
-    let delta = crate::turn_advance::judge_failure_delta(
-        model.as_deref(),
-        wiring.session_messages(),
+    crate::turn_advance::advance(
         todo_store,
-        head_before,
-        &head_after,
+        state,
         outcome,
-        elapsed,
+        enabled,
+        head_before,
+        head_after,
+        None,
     )
-    .await;
-    if delta == 0 {
-        state.judge_failures = 0;
-    } else {
-        state.judge_failures = state.judge_failures.saturating_add(delta);
-    }
-
-    crate::turn_advance::advance(todo_store, state, outcome, enabled, head_before, head_after)
 }
 
 /// 追问回合的输入 —— [`crate::todo_inject::follow_up_text`] 的薄包装。
@@ -2353,7 +2344,7 @@ fn follow_up_input(
     AgentInput::new(ys_core::Message {
         role: ys_core::Role::Harness,
         content: vec![ys_core::ContentBlock::Text {
-            text: crate::todo_inject::follow_up_text(todo_store, last_injected_rev, session),
+            text: crate::todo_inject::follow_up_text(todo_store, last_injected_rev, session, None),
         }],
     })
 }
@@ -2508,13 +2499,24 @@ async fn run_print_mode(
             Some(turn_started.elapsed()),
         )
         .await;
-        let crate::turn_advance::Advance::Push = step else {
-            // 终止：返回**最后**一个回合的结果（退出码反映最终收场）。
-            return match outcome {
-                Ok(result) => Ok(result),
-                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-            };
-        };
+        match step {
+            crate::turn_advance::Advance::Push => {}
+            // **`-p` 不接收卷回合** —— 与 TUI 有意不等价。
+            //
+            // TUI 在预算耗尽（`FinalReport`）时会跑一个不计入预算的收卷回合：那是交互形态，
+            // 用户人在屏前、看得到收尾。`-p` 是一次性输出，多跑一个回合只会拉长墙钟并往
+            // stdout 多塞一段文字，对调用方没有价值。故 `Stop` 与 `FinalReport` 在此**同处理**：
+            // 都走原来的终止路径 —— 返回**最后**一个回合的结果（退出码反映最终收场）。
+            // 目标判据面也是空的（`advance_after_turn` 传 `None`）⇒ 实际永不出现 `FinalReport`。
+            crate::turn_advance::Advance::Stop(_) | crate::turn_advance::Advance::FinalReport => {
+                return match outcome {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+                };
+            }
+        }
+        // 诊断计数（不含首个回合），**不参与任何闸门** —— `-p` / `--json` 没有目标，
+        // 上限判据只存在于 `goal.exhausted()`。
         advance_state.used = advance_state.used.saturating_add(1);
         turn = turn.saturating_add(1);
 
@@ -2651,12 +2653,20 @@ async fn run_json_mode(
             Some(turn_started.elapsed()),
         )
         .await;
-        let crate::turn_advance::Advance::Push = step else {
-            return match outcome {
-                Ok(result) => Ok(result),
-                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-            };
-        };
+        match step {
+            crate::turn_advance::Advance::Push => {}
+            // **`--json` 不接收卷回合**，理由与 `-p` 同（见 `run_print_mode`）：
+            // `Stop` 与 `FinalReport` 在此**同处理**，都走原来的 `return` 终止路径。
+            // 目标判据面同样是 `None`（`advance_after_turn` 传 `None`）⇒ 永不出现 `FinalReport`。
+            crate::turn_advance::Advance::Stop(_) | crate::turn_advance::Advance::FinalReport => {
+                return match outcome {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
+                };
+            }
+        }
+        // 诊断计数（不含首个回合），**不参与任何闸门** —— `-p` / `--json` 没有目标，
+        // 上限判据只存在于 `goal.exhausted()`。
         advance_state.used = advance_state.used.saturating_add(1);
         turn = turn.saturating_add(1);
 
@@ -3854,11 +3864,7 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    /// 按**调用序**应答的模型替身（主回合与判官共用同一份）。
-    ///
-    /// 两条区分依据是 `request.tools`：判官请求**不带工具表**
-    /// （`goal_judge_call::judge_request`），主回合总是带 ⇒ 按这个分岔，
-    /// 两条路各用自己的计数器，不会互相消耗脚本。
+    /// 按**调用序**应答的模型替身。
     ///
     /// 主回合脚本（按**回合**分岔，不按调用序 —— 一个回合内会有多轮调用）：
     ///
@@ -3871,7 +3877,6 @@ mod tests {
     #[derive(Default, Clone)]
     struct ScriptedModel {
         main_calls: Arc<AtomicUsize>,
-        judge_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -3889,17 +3894,6 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text { text: s.into() }],
             };
-            // 判官：不带工具表。回一份**可解析**的 `NOT_MET` —— 不可解析会计入
-            // `judge_failures`，连续两次就把循环按「判官不可靠」停掉，那就测不到多回合了。
-            if request.tools.is_empty() {
-                self.judge_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(ys_model::ModelResponse {
-                    message: text("VERDICT: NOT_MET\nITEMS:\n- 写文档 | MISSING | -"),
-                    usage: Usage::default(),
-                    finish_reason: ys_model::FinishReason::Stop,
-                });
-            }
-
             let n = self.main_calls.fetch_add(1, Ordering::SeqCst);
             // 追问回合的输入是清单注入（`Role::Harness`），它在会话末尾。
             let follow_up = matches!(
@@ -4634,7 +4628,7 @@ mod tests {
     /// 同时钉住「`advance` 真的让循环进第二轮」与「第二轮的消费不挂死」。
     ///
     /// 模型替身按**调用序**应答：第 1 次写清单（一项 `pending`），第 2 次收尾正文。
-    /// ⇒ 首回合结束时有 open 项 ⇒ `decide` 判据 8 放行 ⇒ 第二个回合必然发生。
+    /// ⇒ 首回合结束时有 open 项 ⇒ `decide` 判据 5 放行 ⇒ 第二个回合必然发生。
     #[tokio::test]
     async fn print_mode_two_turns_do_not_deadlock_at_small_capacity() {
         let model = ScriptedModel::default();
@@ -4697,20 +4691,101 @@ mod tests {
 
         // 两个回合确实都跑了：主模型共 4 次调用 = **两回合 × 每回合 2 轮**
         // （写清单 + 收尾正文）。只跑一回合会是 2 次 —— 这个差值就是「循环真的进了第二轮」的证据。
-        // 判官调用单独计数，不混入这里。
         assert_eq!(
             main_calls.load(Ordering::SeqCst),
             4,
             "首回合留 open 项 ⇒ 必须再跑一个追问回合（2 回合 × 2 轮）"
         );
-        // 首回合 1 轮；追问回合在第 1 轮里就把项标成 completed ⇒ 清单清空 ⇒
-        // 判据 `AllDone` 收场，也不再多跑一轮。故两回合合计 2 轮。
+        // 首回合 1 轮已经写完清单（有 open 项 ⇒ 放行）；追问回合在第 1 轮里就把项标成
+        // completed ⇒ 清单清空 ⇒ 判据 `AllDone` 收场，也不再多跑一轮。故两回合合计 2 轮。
         assert_eq!(observed_rounds, 2, "两回合各一轮");
         // 两回合各有一轮 `RoundStarted` ⇒ `Envelope.turn` 必须区分它们。
         // 这由 `run_print_mode` 的 `turn` 递增保证（每轮传给 `begin_turn`）。
         assert!(
             !todo_store.has_open_items(),
             "第二回合应把清单核完（AllDone 收场，而不是撞上限）"
+        );
+    }
+
+    /// **`-p` / `--json` 不看 `used`**：追问回合计数再大也走清单判据。
+    ///
+    /// 两条入口的 `advance_after_turn` 都把 `goal` 传 `None` ⇒ 永不 `FinalReport`
+    /// （D-K：不给一次性模式设目标上限）。本用例从 `main.rs` 这一侧锁定它：
+    /// 同一个函数、同一个 `used = 999` 的 `AdvanceState`，结论只随**清单**变。
+    ///
+    /// 变异：在 [`advance_after_turn`] 里加 `if state.used >= N { return
+    /// Advance::Stop(..) }`（或把 `used` 当上限传给 `advance`）⇒ 第一段从
+    /// `Push` 变成 `Stop`，本用例变红。
+    #[tokio::test]
+    async fn print_mode_ignores_goal_budget() {
+        let store = ys_tools_todo::TodoStore::open(None);
+        let todo = |status: &str| {
+            vec![ys_tools_todo::TodoItem {
+                content: "写文档".into(),
+                status: match status {
+                    "pending" => ys_tools_todo::TodoStatus::Pending,
+                    _ => ys_tools_todo::TodoStatus::Completed,
+                },
+            }]
+        };
+        store.apply(todo("pending")).unwrap();
+        assert!(store.has_open_items(), "前置：清单有 open 项");
+
+        // 判据不需要模型，也不需要事件；`wiring` 只是函数签名的一部分。
+        // `rx` 绑在名字上（不是 `_`）⇒ 活到用例结束，sink 不会因消费者消失而失配。
+        let (sink, _rx) =
+            ChannelSink::new(MIN_CHANNEL_CAPACITY, LifecyclePolicy::StopWhenConsumerGone);
+        let mut wiring = Wiring::ephemeral(None, Box::new(sink));
+        // 一个「已经跑了 999 个追问回合」的推进状态。
+        let mut state = crate::turn_advance::AdvanceState::new();
+        state.used = 999;
+        // 收场形态可续；追问开关关 + HEAD 未变 ⇒ `Stop`/`FinalReport` 只可能
+        // 来自目标预算，而目标面是 `None`。
+        let outcome: Result<RunResult, LoopError> = Ok(RunResult {
+            stop_reason: StopReason::Completed,
+            usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: Usage::default(),
+            rounds: 1,
+            final_message: None,
+        });
+        let step = advance_after_turn(
+            &mut wiring,
+            &store,
+            &mut state,
+            &outcome,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(step, crate::turn_advance::Advance::Push),
+            "`used = 999` 不得止住 `-p`：有 open 项就继续推，实际 {step:?}"
+        );
+
+        // 清单清空 ⇒ 同一条路径改成按清单收场（`AllDone`，不是 `FinalReport`）：
+        // `used` 再大也只影响诊断读数。
+        store.apply(todo("completed")).unwrap();
+        assert!(!store.has_open_items(), "前置：清单已清空");
+        let step = advance_after_turn(
+            &mut wiring,
+            &store,
+            &mut state,
+            &outcome,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                step,
+                crate::turn_advance::Advance::Stop(ys_protocol::StopCause::AllDone)
+            ),
+            "清单清空 ⇒ `AllDone`（无目标 ⇒ 永不 `FinalReport`），实际 {step:?}"
         );
     }
 

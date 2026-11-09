@@ -933,6 +933,28 @@ fn dispatch(
                 send_boundary(boundaries, Boundary::Compact);
                 return;
             }
+            // `/goal clear` 是**双信道**动作：两条都**无条件**投，不看是否在回合中。
+            //
+            // 目标状态只在 `request_rx` 上被消费，而它在**回合之间**才被读 ⇒ 回合中
+            // 投出的作废请求要等整个回合跑完（可能上百轮）才生效，这期间追问会按旧目标
+            // 一直继续。故同时投一条 `Boundary::Abort`：它在**轮边界**被消费，当回合立刻
+            // 收尾。倒过来，回合之间投 `Abort` 是无害的（新回合开头的残留 `Abort` 会被
+            // 排空丢弃），回合中投 `Request` 也是无害的（排队，等到回合之间再清状态）。
+            //
+            // **顺序固定：先边界、后请求。** 边界立刻打断，请求随后排队等回合之间被读；
+            // 反过来则边界可能先于请求被读到 —— 状态机看到「还在跑但没有目标」，收卷
+            // 逻辑会读到半截状态。
+            if matches!(req, Request::SetGoal { text: None }) {
+                // 当场反馈：两条消息都要等各自的消费点，用户此刻需要知道「敲进去了」。
+                app.transcript
+                    .push(crate::transcript::TranscriptLine::System(
+                        "已请求作废目标：当前回合将收尾，目标随后清空…".into(),
+                    ));
+                app.follow = true;
+                send_boundary(boundaries, Boundary::Abort);
+                send_request(app, requests, req);
+                return;
+            }
             // **回合中的 `/clear` 请求照常投出**，但不当场清屏。
             //
             // 不静默丢弃：`request_rx` 只在**回合之间**被消费 ⇒ 请求天然排到下一回合
@@ -1683,6 +1705,111 @@ mod tests {
             a.transcript
         );
         assert!(!a.is_turning, "命令不是回合");
+    }
+
+    /// `/goal clear` 是**双信道**动作：边界（回合内立刻收尾）+ 请求（回合之间清目标）。
+    ///
+    /// 承重的三点：
+    ///  1. 边界信道收到 `Boundary::Abort` —— 回合内下一个轮边界立即打断；
+    ///  2. 请求信道收到 `SetGoal { text: None }` —— 回合之间把目标状态清掉；
+    ///  3. **各恰好一条**，不多不少。
+    ///
+    /// 两条**无条件**投（不看 `is_turning`），故本用例把「空闲」与「回合中」两种状态
+    /// 各验一遍。
+    ///
+    /// 变异：
+    /// - 把 `matches!(req, Request::SetGoal { text: None })` 那一支加回
+    ///   `&& app.is_turning` 守卫（照搬 `/compact` 的形状）⇒ 空闲那一段变红（只剩请求）；
+    /// - 删掉整支、让它走普通投递 ⇒ 两段的边界断言都红。
+    ///
+    /// ⓘ 投递**先后**（先边界、后请求）本用例抓不到：两条是独立信道，接收端天然
+    /// 观测不到跳信道的先后。那条契约由 `dispatch` 里的注释与回合内的实际行为守着。
+    #[test]
+    fn goal_clear_sends_both_channels_boundary_first() {
+        let ch = channels();
+        let mut a = app();
+
+        // ① 空闲（回合之间）：仍要投两条。
+        a.input.insert_str("/goal clear");
+        key(&mut a, &ch, KeyCode::Enter);
+        assert_eq!(
+            ch.next_boundary().expect("空闲时 /goal clear 也要投 Abort"),
+            Boundary::Abort,
+            "边界信道必须先拿到 Abort"
+        );
+        assert_eq!(
+            ch.next_request().expect("必须投 SetGoal 清目标状态"),
+            Request::SetGoal { text: None }
+        );
+        assert!(ch.next_boundary().is_none(), "边界恰好一条");
+        assert!(ch.next_request().is_none(), "请求恰好一条");
+
+        // ② 回合中：同样两条，一条不少。
+        a.is_turning = true;
+        a.input.insert_str("/goal clear");
+        key(&mut a, &ch, KeyCode::Enter);
+        assert_eq!(
+            ch.next_boundary().expect("回合中 /goal clear 必须投 Abort"),
+            Boundary::Abort,
+            "回合内靠轮边界立刻打断"
+        );
+        assert_eq!(
+            ch.next_request().expect("请求照样排队，等回合之间清目标"),
+            Request::SetGoal { text: None }
+        );
+        assert!(ch.next_boundary().is_none(), "边界恰好一条");
+        assert!(ch.next_request().is_none(), "请求恰好一条");
+    }
+
+    /// `SetGoal { text: Some(_) }`（设定目标）只走命令信道：目标是回合之间的状态，
+    /// 定目标**不该**打断正在跑的回合。
+    ///
+    /// 变异：把 `matches!` 写成 `Request::SetGoal { .. }`（不看 `text`）⇒ 本用例红
+    /// （边界信道会多出一条 `Abort`，正在跑的回合被误杀）。
+    #[test]
+    fn goal_set_sends_request_only() {
+        let ch = channels();
+        let mut a = app();
+        a.is_turning = true;
+        a.input.insert_str("/goal 修好 flaky test");
+
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(
+            ch.next_request().expect("设定目标要投请求"),
+            Request::SetGoal {
+                text: Some("修好 flaky test".into()),
+            }
+        );
+        assert!(
+            ch.next_boundary().is_none(),
+            "设目标不是打断动作，不得投 Boundary"
+        );
+    }
+
+    /// `/goal clear` 投出去就当场给一行反馈：两条消息都要等各自的消费点（轮边界 /
+    /// 回合之间），用户此刻需要知道「敲进去了」。文案说「作废」（目标作废），
+    /// 不是「取消」（那会被读成取消回合）。
+    ///
+    /// 变异：删掉 `dispatch` 里那一行 `transcript.push` ⇒ 本用例红。
+    #[test]
+    fn goal_clear_shows_feedback() {
+        let ch = channels();
+        let mut a = app();
+        a.transcript.push(TranscriptLine::System("回合输出".into()));
+        a.input.insert_str("/goal clear");
+
+        key(&mut a, &ch, KeyCode::Enter);
+
+        assert_eq!(a.transcript.len(), 2, "当场只多一条提示行");
+        let Some(TranscriptLine::System(text)) = a.transcript.last() else {
+            panic!("末行应是 System 提示：{:?}", a.transcript);
+        };
+        assert!(
+            text.contains("作废"),
+            "文案要说清是「作废」而不是「取消」：{text}"
+        );
+        assert!(a.follow, "提示行落下后贴底");
     }
 
     /// 空闲时提交**仍是** `Request::Prompt`（既有行为逐字节不变）。

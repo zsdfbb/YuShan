@@ -180,10 +180,12 @@ pub fn build_view(
         // 定时循环的状态：由调用方传入（`build_view` 不持有它 —— 它是 app 主循环
         // 的局部变量，不属于 `Config` / `Agent` / `Wiring` 任何一方）。
         loop_state: None,
+        // 目标同上：`build_view` 只给中性初值，真值由 [`build_view_with_loop`] 覆盖。
+        goal: None,
     }
 }
 
-/// [`build_view`] 的变体：额外带上定时循环的状态投影。
+/// [`build_view`] 的变体：额外带上定时循环与跨回合目标的状态投影。
 ///
 /// 单独开一个入口而不是改 `build_view` 的签名：后者有十余处调用点，其中绝大多数
 /// 与定时器无关。循环状态只存在于 `app_loop::run` 的局部变量里，只有它的几个
@@ -199,6 +201,7 @@ pub fn build_view_with_loop(
     session_started: Instant,
     theme: ThemeKind,
     loop_state: Option<ys_tui_coding::LoopView>,
+    goal: Option<ys_tui_coding::GoalView>,
 ) -> CodingView {
     let mut view = build_view(
         cfg,
@@ -211,6 +214,7 @@ pub fn build_view_with_loop(
         theme,
     );
     view.loop_state = loop_state;
+    view.goal = goal;
     view
 }
 
@@ -1216,6 +1220,82 @@ mod tests {
             2,
             "config.skills 必须保留全部条目（不过滤）"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `loop_state` 与 `goal` 两个投影同时传 `Some` 时都进快照。
+    ///
+    /// 这是**串位 / 丢失守护**：两个形参类型不同且位置相邻，写反了编译器会抓；
+    /// 但把 `view.goal = goal` 写成 `view.goal = None` 编译器抓不到。
+    ///
+    /// 变异：把 `view.goal = goal` 改成 `view.goal = None` ⇒ 本用例变红。
+    #[test]
+    fn build_view_with_loop_keeps_both_options() {
+        let dir = temp_dir("both_options");
+        let cfg = Config::from_env().unwrap();
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+
+        let loop_view = ys_tui_coding::LoopView {
+            interval: "5m".into(),
+            next_label: Some("14 分后".into()),
+        };
+        let goal_view = ys_tui_coding::GoalView {
+            text: "把测试跑绿".into(),
+            turns: 3,
+            cap: 20,
+        };
+
+        let view = build_view_with_loop(
+            &cfg,
+            &agent,
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+            ThemeKind::default(),
+            Some(loop_view.clone()),
+            Some(goal_view.clone()),
+        );
+
+        assert_eq!(view.loop_state, Some(loop_view), "loop_state 必须原样透传");
+        assert_eq!(view.goal, Some(goal_view), "goal 必须原样透传");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个投影都传 `None` 时快照里也是 `None`（不凭空造出空投影）。
+    ///
+    /// 变异：把 `view.loop_state = loop_state` / `view.goal = goal` 写成
+    /// 硬编码的 `Some(...)` ⇒ 本用例变红。
+    #[test]
+    fn build_view_with_loop_accepts_none_goal() {
+        let dir = temp_dir("none_goal");
+        let cfg = Config::from_env().unwrap();
+        let wiring = Wiring::ephemeral(None, Box::new(CollectingSink::new()));
+        let agent = test_agent();
+        let mut state = StateStore::new();
+        state.set_override(dir.join("state.json"));
+
+        let view = build_view_with_loop(
+            &cfg,
+            &agent,
+            &wiring,
+            &cfg.registry,
+            &state,
+            &TurnStats::default(),
+            Instant::now(),
+            ThemeKind::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(view.loop_state, None, "没循环时 loop_state 必须是 None");
+        assert_eq!(view.goal, None, "没目标时 goal 必须是 None");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

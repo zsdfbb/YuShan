@@ -136,7 +136,7 @@
 
 | 文件 | 职责 | 改 / 新建 | 量级 |
 |---|---|---|---|
-| `apps/coding-agent/src/goal.rs` | 只留 `decide()` 6 条判据；`MAX_FOLLOW_UPS` 保留但**仅对无目标生效** | 改（净删） | −180 行 |
+| `apps/coding-agent/src/goal.rs` | 只留 `decide()` 5 条判据；删 `MAX_FOLLOW_UPS` / `STALL_LIMIT` / 判官常量 | 改（净删） | −200 行 |
 | `apps/coding-agent/src/goal_judge.rs` | 判官解析 | **删** | −622 行 |
 | `apps/coding-agent/src/goal_judge_call.rs` | 判官调用 | **删** | −388 行 |
 | `apps/coding-agent/src/turn_advance.rs` | `AdvanceState` 瘦成 `used` + `git_follow_up_used`；删 `judge_failure_delta` / `harness_facts` | 改（净删） | −200 行 |
@@ -144,7 +144,7 @@
 | `apps/coding-agent/src/app_loop.rs` | 持有 `Option<GoalState>`；追问循环加 turn 记账；`Request::SetGoal` 臂；收卷回合 | 改 | +120 / −40 |
 | `apps/coding-agent/src/main.rs` | 删判官模块声明；`advance` 调用点适配签名 | 改 | +15 / −30 |
 | `crates/ys-protocol/src/request.rs` | 新增 `SetGoal { text: Option<String> }` | 改 | +25 |
-| `crates/ys-protocol/src/goal.rs` | `StopCause` 删 2（`Stalled` / `JudgeUnreliable`）不增 2 个中的 `TurnCapReached` | 改 | +2 / −6 |
+| `crates/ys-protocol/src/goal.rs` | `StopCause` 删 3（`Stalled` / `JudgeUnreliable` / `CapReached`），增 1（`GoalReached`） | 改 | +2 / −9 |
 | `crates/ys-tui-coding/src/commands.rs` | `COMMANDS` 加一行；`parse_goal` | 改 | +40 |
 | `crates/ys-tui-coding/src/view.rs` | `CodingView.goal: Option<GoalView>` | 改 | +18 |
 | `crates/ys-tui-coding/src/draw.rs` | 状态行 `[goal]` 段（照 `[loop]` 同规） | 改 | +10 |
@@ -248,10 +248,9 @@ pub enum StopCause {
     NoPlan,          // 无目标且从未写清单 ⇒ 退回一期 git 追问
     AllDone,         // 无目标时的清单清空（唯一正常收场）
     GoalReached,     // 新：有目标时清单清空 ⇒ 目标达成
-    CapReached,      // 保留：git 追问的至多一次
     Aborted,
     NotContinuable,
-    // 删除：Stalled（D-F）/ JudgeUnreliable（D-P）
+    // 删除：Stalled（D-F）/ JudgeUnreliable（D-P）/ CapReached（MAX_FOLLOW_UPS 已废弃）
     // **不新增 TurnCapReached**：200 上限是「停下但先收卷」，用 `Advance::FinalReport`
     // 表达（它是动作，不是停机原因）。`Stop(..)` 的语义恒为「到此为止，不再跑」。
 }
@@ -281,12 +280,13 @@ impl GoalState {
 }
 
 // ── apps/coding-agent/src/goal.rs（改后）──────────────────────────
-/// 6 条判据，**只管清单与回合形态**，返回两态 [`FollowUp`]。
+/// 5 条判据，**只管清单与回合形态**，返回两态 [`FollowUp`]。
 ///
-/// `goal` 只影响三个走向：无清单时是 `Push` 还是 `Stop(NoPlan)`（判据 4）、
-/// 无 open 项时报 `GoalReached` 还是 `AllDone`（判据 3），以及
-/// `MAX_FOLLOW_UPS` 闸门是否生效（判据 5：**有目标时失效**，上限改由
-/// [`turn_advance::advance`] 的 200 回合判据 6 给出）。
+/// `goal` 只影响两个走向：无清单时是 `Push` 还是 `Stop(NoPlan)`（判据 4），
+/// 以及无 open 项时报 `GoalReached` 还是 `AllDone`（判据 3）。
+///
+/// **唯一的回合数上限是 200（[`GOAL_TURN_CAP`]），在 [`turn_advance::advance`] 里判。**
+/// `used` 形参只作诊断计数，不参与任何闸门。
 ///
 /// **200 上限不在这里** —— `FollowUp` 只有 `Push` / `Stop` 两态，表达不了「停下但先收卷」
 /// 这个第三种动作。把上限抬进 `decide` 就得改 `ys-protocol` 的 `FollowUp`，而那是三模式
@@ -333,21 +333,22 @@ pub(crate) fn advance(
 | 2 | `stop_reason ∈ {Truncated, Failed, MaxRounds, NoOutput}` | `Stop(NotContinuable)` | `Stop(NotContinuable)` | `decide` |
 | 3 | 清单无 open 项 **且** `revision > 0` | `Stop(GoalReached)` | `Stop(AllDone)` | `decide` |
 | 4 | 清单从未写过（空且 `revision == 0`） | **`Push`**（D-A 修补：无清单 ≠ 完成） | `Stop(NoPlan)` → git 兜底至多一次 | `decide` |
-| 5 | `used >= MAX_FOLLOW_UPS`（现为 8） | **不适用** | `Stop(CapReached)` | `decide` |
-| 6 | `goal.exhausted()`（`turns >= GOAL_TURN_CAP`） | `Advance::FinalReport` | 不适用（D-K：不设上限） | **`advance`** |
-| 7 | 其余 | `Push` | `Push` | `decide` |
+| 5 | `goal.exhausted()`（`turns >= GOAL_TURN_CAP`） | `Advance::FinalReport` | 不适用（D-K：不设上限） | **`advance`** |
+| 6 | 其余 | `Push` | `Push` | `decide` |
 
-**判据 5 必须对目标路径失效，否则 `/goal` 形同虚设**：`MAX_FOLLOW_UPS` 是
-一期为无目标追问设的硬闸门（`goal.rs:39`，值 8），它数的是**同一个回合内的追问次数**。
-有目标时，唯一上限是 `GOAL_TURN_CAP = 200`（判据 6）—— 若两条同时生效，任务在第 8 个
-回合就停，永远到不了 200。**两条上限互斥，不是取小**：它们回答的是不同问题
-（「这次追问该收手了吗」vs「这个任务预算用完了吗」）。
+**判据总数 6**：`decide` 里 5 条（1-4、6），`advance` 里 1 条（5）。
 
-**判据 6 为什么在 `advance` 而不在 `decide`**：`decide` 返回 `FollowUp`（两态），
+**`MAX_FOLLOW_UPS` 与 `StopCause::CapReached` 一并删除**（原判据 5）。它是一期无目标追问的
+硬闸门（8 次），与「有目标」直接冲突：两条同时生效则任务在第 8 个回合就停，永远到不了 200。
+保两条只会让人反复遮蔽其中一条，不如只留一条：**200 回合是唯一上限**。
+
+代价：无目标追问失去那个 8 次闸门。可接受 —— 无目标追问的收场本来就不靠计数兜底：
+判据 2（收场形态不可续）/ 判据 3（清单清空）/ 判据 4（git 兜底至多一次）三条都在它之前。
+
+**判据 5 为什么在 `advance` 而不在 `decide`**：`decide` 返回 `FollowUp`（两态），
 而这一条要的是第三种动作「停下但先收卷」。把它抬进 `decide` 就得扩 `ys-protocol` 的
 `FollowUp`，而那是三模式共用的词汇层；`advance` 已返回三态的 `Advance`，
-`FinalReport` 天然属于它。**判据总数是 7** —— `decide` 里 6 条（1-5、7），
-`advance` 里 1 条（6）。
+`FinalReport` 天然属于它。
 
 ### 5.2 两条为了 D-A 必须改的判据
 
@@ -457,11 +458,10 @@ pub(crate) fn advance(
 
 | 层 | 用例 | 对应 |
 |---|---|---|
-| 纯函数 | `decide` 6 条判据 × 有/无目标 = 12 例 | §5.1 |
+| 纯函数 | `decide` 5 条判据 × 有/无目标 = 10 例 | §5.1 |
 | 纯函数 | 有目标 + 空清单 ⇒ `Push`（不是 `NoPlan`） | §5.2 D-A 核心 |
-| 纯函数 | `advance`：`turns == 200` ⇒ `FinalReport`；`199` ⇒ `Push` | §5.1 第 6 条（在 `advance`） |
-| 纯函数 | 有目标时 `used >= MAX_FOLLOW_UPS` **不**触发 `CapReached`（200 上限优先） | §5.1 第 5 条 |
-| 纯函数 | 无目标时 `used >= MAX_FOLLOW_UPS` 仍触发 `CapReached`（一期行为不变） | §5.1 第 5 条 |
+| 纯函数 | `advance`：`turns == 200` ⇒ `FinalReport`；`199` ⇒ `Push` | §5.1 第 5 条（在 `advance`） |
+| 纯函数 | `used` 不参与闸门：`used = 999` 时仍按清单逻辑走，`CapReached` 已不存在 | §5.1（`MAX_FOLLOW_UPS` 已废） |
 | 纯函数 | 无目标时 `turns` 再大也 **不会** `FinalReport`（D-K） | §5.1 / D-K |
 | 纯函数 | `marker_text()` 两次渲染逐字节相同；**不含回合序号 / 剩余预算** | §4 |
 | 纯函数 | 无清单提醒：前 5 次输入含「拆成清单」，第 6 次起不再含；`Push` 结论不变 | §5.2 |

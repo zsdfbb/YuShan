@@ -17,10 +17,9 @@
 
 use ys_protocol::{FollowUp, StopCause};
 
-use crate::goal::StallTracker;
 use crate::goal::decide;
-use ys_core::{Message, StopReason};
-use ys_model::Model;
+use crate::goal_state::GoalState;
+use ys_core::StopReason;
 use ys_tools_todo::TodoStore;
 
 /// 一条回合链的推进状态（跨回合存活，故由调用方持有）。
@@ -28,10 +27,9 @@ use ys_tools_todo::TodoStore;
 /// **不是** `Default` 之外的可选项：一期与三期共用同一条回合链，状态必须一次建好。
 pub(crate) struct AdvanceState {
     /// 已追加的追问回合数（**不含**首个回合）。
+    ///
+    /// 诊断计数，**不参与任何闸门**——上限判据在 `goal.exhausted()`。
     pub(crate) used: u32,
-    pub(crate) stall: StallTracker,
-    /// 判官连续不可靠的次数。
-    pub(crate) judge_failures: u32,
     /// 一期的 `HEAD` 追问是否已用过。
     ///
     /// **一期是「至多一次」**，而本循环每轮都拿同一个 `head_before` 重新比 ——
@@ -43,8 +41,6 @@ impl AdvanceState {
     pub(crate) fn new() -> Self {
         Self {
             used: 0,
-            stall: StallTracker::new(),
-            judge_failures: 0,
             git_follow_up_used: false,
         }
     }
@@ -56,6 +52,9 @@ impl AdvanceState {
 /// 不追问」同一语义）。
 ///
 /// 返回 [`Advance`] 而不是裸 `FollowUp`：调用方需要知道「这一轮该喂什么输入」。
+///
+/// `goal` 只在**判据给出「再跑一轮」之后**参与判断：预算耗尽时把它改写成
+/// [`Advance::FinalReport`]（停下，但先跑一个收卷回合）。
 pub(crate) fn advance(
     store: &TodoStore,
     state: &mut AdvanceState,
@@ -63,31 +62,30 @@ pub(crate) fn advance(
     follow_up_on_commit: bool,
     head_before: Option<&str>,
     head_after: Option<String>,
+    goal: Option<&GoalState>,
 ) -> Advance {
-    // `model_claims_done` 取 `last_stop == Completed`：模型主动停下（不再调工具、
-    // 给出收尾正文）就是它的自陈。取结构事实而不是扫正文 —— 正文里「还没完成」
-    // 随时会出现，而 `Completed` 不受措辞影响。
     let last_stop = match outcome {
         Ok(result) => result.stop_reason.clone(),
         // 失败回合：收场形态不可续，交给 `decide` 的第 2 条判据。
         Err(_) => StopReason::Failed,
     };
-    let model_claims_done = matches!(last_stop, StopReason::Completed);
-    let decision = decide(
-        store,
-        state.used,
-        &last_stop,
-        model_claims_done,
-        &mut state.stall,
-        &mut state.judge_failures,
-    );
+    let decision = decide(store, state.used, &last_stop, goal);
     match decision {
-        FollowUp::Push => Advance::Push,
+        // 预算耗尽的判定**必须留在 `Push` 分支内部**：`Stop` 是「已经决定收场」，
+        // 若在 `match` 之前先判 `exhausted()`，「用户按 Esc」与「清单已清空」也会被
+        // 改写成 `FinalReport` —— 本该直接收场的回合反而多跑一个回合。
+        FollowUp::Push => match goal {
+            Some(g) if g.exhausted() => Advance::FinalReport,
+            _ => Advance::Push,
+        },
         // **一期兜底**：没有清单 ⇒ 交给一期的 HEAD 判据（**同一份实现**，
         // 不在这里重写一遍条件 —— 两份条件必然漂移）。
         //
         // 与一期一致**至多一次**：追问回合自己也可能推进 `HEAD`，而 `head_before`
-        // 是首个回合之前的取值 ⇒ 不记标记就会每轮都放行，退化成「跑到上限为止」。
+        // 是首个回合之前的取值 ⇒ 不记标记就会每轮都放行，退化成「一直追问」。
+        //
+        // 这里返回的 `Push` **不参与**预算判定：一期追问不属于三期的回合预算，
+        // 且它至多一次。
         FollowUp::Stop(StopCause::NoPlan) => {
             if state.git_follow_up_used {
                 return Advance::Stop(StopCause::NoPlan);
@@ -108,107 +106,6 @@ pub(crate) fn advance(
     }
 }
 
-/// 判官证据段里的 **harness 事实**。
-///
-/// 这一段是 harness **自己观测到的**（不是模型产出的）：`HEAD` 前后、回合轮数、
-/// 收场形态、剩余项数。它们是判官可以直接采信的前提 —— 比工具输出更硬，
-/// 因为工具输出仍可能被模型伪造（它自己写了一份假日志）。
-pub(crate) fn harness_facts(
-    head_before: Option<&str>,
-    head_after: &Option<String>,
-    outcome: &Result<ys_loop::RunResult, ys_loop::LoopError>,
-    open_items: usize,
-    elapsed: Option<std::time::Duration>,
-    tool_calls: usize,
-) -> String {
-    let head = match (head_before, head_after.as_deref()) {
-        (Some(before), Some(after)) if before != after => {
-            format!(
-                "git_head: changed ({} -> {})",
-                short_sha(before),
-                short_sha(after)
-            )
-        }
-        (Some(_), Some(_)) => "git_head: unchanged".to_string(),
-        // 检测不可用（非 git 仓库 / 未装 git）—— 静默，不报错。
-        _ => "git_head: unavailable".to_string(),
-    };
-    let (rounds, stop) = match outcome {
-        Ok(result) => (
-            result.rounds.to_string(),
-            format!("{:?}", result.stop_reason),
-        ),
-        Err(_) => ("?".to_string(), "Failed".to_string()),
-    };
-    // 耗时与工具调用数都是 **harness 观测到的事实**（不是模型自述）：
-    // 前者能揭穿「一秒内完成了五项」这类断言，后者能揭穿「只调了一次就宣称全做完」。
-    let elapsed = match elapsed {
-        Some(d) => format!("{}ms", d.as_millis()),
-        None => "unavailable".to_string(),
-    };
-    format!(
-        "open_items: {open_items}\n{head}\nrounds: {rounds}\nstop_reason: {stop}\n\
-         elapsed: {elapsed}\ntool_calls: {tool_calls}"
-    )
-}
-
-/// `HEAD` 的短形式（前 12 字符）—— 判官不需要完整 sha，只需认出「变了」。
-fn short_sha(sha: &str) -> &str {
-    &sha[..sha.len().min(12)]
-}
-
-/// 跑一次判官，把结论折算成 `judge_failures` 的**增量**。
-///
-/// - `0`：判官给出了可用结论（达成 / 未达成 / 阻塞），或**没有 open 项**（无需核对）；
-/// - `1`：调用失败（重试后仍失败）、解析不可靠（含引用未命中），或无可用模型。
-///
-/// 两条入口（TUI 与 `-p` / `--json`）都调它 —— 判官接线只有这一份。
-pub(crate) async fn judge_failure_delta(
-    model: Option<&dyn Model>,
-    session: &[Message],
-    todo: &TodoStore,
-    head_before: Option<&str>,
-    head_after: &Option<String>,
-    outcome: &Result<ys_loop::RunResult, ys_loop::LoopError>,
-    elapsed: Option<std::time::Duration>,
-) -> u32 {
-    let open_items: Vec<_> = todo
-        .snapshot()
-        .into_iter()
-        .filter(|item| !item.status.is_terminal())
-        .collect();
-    // 没清单 ⇒ 没有「要核对什么」，一次模型调用只会白花钱。
-    if open_items.is_empty() {
-        return 0;
-    }
-    let Some(model) = model else {
-        return 1;
-    };
-
-    let window = crate::goal_judge_call::evidence_window(session);
-    // 工具调用数从证据窗口里数：它就是「本回合真的调了几次工具」的直接读数，
-    // 不另开一条统计通路（否则两份计数必然漂移）。
-    let tool_calls = window.matches("[tool_call]").count();
-    let facts = harness_facts(
-        head_before,
-        head_after,
-        outcome,
-        open_items.len(),
-        elapsed,
-        tool_calls,
-    );
-    let evidence = crate::goal_judge_call::evidence_text(&window, &facts);
-
-    match crate::goal_judge_call::call_judge(model, &evidence, &open_items).await {
-        Ok(raw) => match crate::goal_judge::parse_judge_output(&raw, &evidence, &open_items) {
-            // 不可靠解析与调用失败同属「判据没给出可用结论」：连续两次即停。
-            crate::goal_judge::JudgeParse::Unparseable => 1,
-            _ => 0,
-        },
-        Err(_) => 1,
-    }
-}
-
 /// [`advance`] 的结论。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Advance {
@@ -216,6 +113,11 @@ pub(crate) enum Advance {
     Push,
     /// 停下，理由见载荷。
     Stop(StopCause),
+    /// 预算耗尽 ⇒ 停下，但**先跑一个收卷回合**。
+    ///
+    /// 与 [`Advance::Stop`] **互斥**，调用方必须把两者当不同动作处理：
+    /// `Stop` = 直接收场；`FinalReport` = 再跑一个**不计入预算**的回合后再收场。
+    FinalReport,
 }
 
 #[cfg(test)]
@@ -260,7 +162,8 @@ mod tests {
                 &ok_result(StopReason::Completed),
                 true,
                 Some("a"),
-                Some("b".into())
+                Some("b".into()),
+                None
             ),
             Advance::Push
         );
@@ -278,7 +181,8 @@ mod tests {
                 &ok_result(StopReason::Completed),
                 true,
                 Some("a"),
-                Some("a".into())
+                Some("a".into()),
+                None
             ),
             Advance::Stop(StopCause::NoPlan)
         );
@@ -296,7 +200,8 @@ mod tests {
                 &ok_result(StopReason::Completed),
                 false,
                 Some("a"),
-                Some("b".into())
+                Some("b".into()),
+                None
             ),
             Advance::Stop(StopCause::NoPlan)
         );
@@ -313,6 +218,7 @@ mod tests {
                 &mut state,
                 &ok_result(StopReason::Completed),
                 false,
+                None,
                 None,
                 None
             ),
@@ -344,7 +250,8 @@ mod tests {
                 &ok_result(StopReason::Completed),
                 true,
                 Some("a"),
-                Some("b".into())
+                Some("b".into()),
+                None
             ),
             Advance::Stop(StopCause::AllDone)
         );
@@ -363,6 +270,7 @@ mod tests {
             true,
             Some("a"),
             Some("b".into()),
+            None,
         );
         assert_eq!(first, Advance::Push);
         let second = advance(
@@ -372,6 +280,7 @@ mod tests {
             true,
             Some("a"),
             Some("c".into()),
+            None,
         );
         assert_eq!(second, Advance::Stop(StopCause::NoPlan), "一期追问至多一次");
     }
@@ -388,40 +297,182 @@ mod tests {
                 &ok_result(StopReason::Cancelled),
                 true,
                 Some("a"),
-                Some("b".into())
+                Some("b".into()),
+                None
             ),
             Advance::Stop(StopCause::Aborted)
         );
     }
 
-    /// harness 事实必须含**耗时**与**工具调用数** —— 设计 §5.5 列的四项之二。
+    /// 预算未耗尽（`turns = 199`）⇒ 照常继续推。
     ///
-    /// 这两项是揭穿「模型自称完成」的硬事实：
-    /// 耗时揭穿「一秒内做完了五项」，工具调用数揭穿「只调一次就宣称全做完」。
+    /// 变异：把上限判据写成 `>= GOAL_TURN_CAP - 1` ⇒ 本用例变红（`FinalReport`）。
     #[test]
-    fn harness_facts_carry_elapsed_and_tool_calls() {
-        let facts = harness_facts(
-            Some("aaaa"),
-            &Some("bbbb".into()),
-            &ok_result(StopReason::Completed),
-            2,
-            Some(std::time::Duration::from_millis(1500)),
-            7,
+    fn goal_under_cap_pushes() {
+        let store = store_with(vec![item("修好登录超时", TodoStatus::InProgress)]);
+        let mut goal = GoalState::new("修好 flaky 测试".into());
+        for _ in 0..(crate::goal_state::GOAL_TURN_CAP - 1) {
+            goal.consume();
+        }
+        assert!(!goal.exhausted(), "前置：预算还有一回合");
+
+        let mut state = AdvanceState::new();
+        assert_eq!(
+            advance(
+                &store,
+                &mut state,
+                &ok_result(StopReason::Completed),
+                false,
+                None,
+                None,
+                Some(&goal)
+            ),
+            Advance::Push
         );
-        assert!(facts.contains("open_items: 2"), "{facts}");
-        assert!(facts.contains("git_head: changed"), "{facts}");
-        assert!(facts.contains("rounds: "), "{facts}");
-        assert!(facts.contains("stop_reason: Completed"), "{facts}");
-        assert!(facts.contains("elapsed: 1500ms"), "{facts}");
-        assert!(facts.contains("tool_calls: 7"), "{facts}");
     }
 
-    /// 耗时未知时写 `unavailable` 而不是 `0ms`：后者是假事实，会让判官以为「瞬间完成」。
+    /// 预算耗尽（`turns = 200`）⇒ 停下，但先收卷。
+    ///
+    /// 变异：去掉 `Push` 分支里的 `exhausted()` 判定 ⇒ 本用例得到 `Push` 而变红。
     #[test]
-    fn harness_facts_never_fabricate_elapsed() {
-        let facts = harness_facts(None, &None, &ok_result(StopReason::Completed), 0, None, 0);
-        assert!(facts.contains("elapsed: unavailable"), "{facts}");
-        assert!(!facts.contains("elapsed: 0ms"), "不得编造零耗时：{facts}");
-        assert!(facts.contains("git_head: unavailable"), "{facts}");
+    fn goal_at_cap_final_reports() {
+        let store = store_with(vec![item("修好登录超时", TodoStatus::InProgress)]);
+        let mut goal = GoalState::new("修好 flaky 测试".into());
+        for _ in 0..crate::goal_state::GOAL_TURN_CAP {
+            goal.consume();
+        }
+        assert!(goal.exhausted(), "前置：预算已耗尽");
+
+        let mut state = AdvanceState::new();
+        assert_eq!(
+            advance(
+                &store,
+                &mut state,
+                &ok_result(StopReason::Completed),
+                false,
+                None,
+                None,
+                Some(&goal)
+            ),
+            Advance::FinalReport
+        );
+    }
+
+    /// **无目标 ⇒ 绝不收卷**：`used` 再大也走清单逻辑（上限判据只在 `goal.exhausted()`）。
+    ///
+    /// 变异：把 `exhausted()` 判定挪到 `match decision` 之前、并改用 `used` 判上限 ⇒
+    /// 本用例会看到 `FinalReport` 而变红。
+    #[test]
+    fn no_goal_never_final_reports() {
+        let open = store_with(vec![item("修好登录超时", TodoStatus::InProgress)]);
+        let mut state = AdvanceState::new();
+        state.used = 999;
+        assert_eq!(
+            advance(
+                &open,
+                &mut state,
+                &ok_result(StopReason::Completed),
+                false,
+                None,
+                None,
+                None
+            ),
+            Advance::Push,
+            "无目标 ⇒ 有 open 项就继续推"
+        );
+
+        // 全终态 ⇒ `Stop(AllDone)`，同样不是 `FinalReport`。
+        let done = TodoStore::open(None);
+        done.apply(vec![item("修好登录超时", TodoStatus::InProgress)])
+            .unwrap();
+        done.apply(vec![item("修好登录超时", TodoStatus::Completed)])
+            .unwrap();
+        let mut state = AdvanceState::new();
+        state.used = 999;
+        assert_eq!(
+            advance(
+                &done,
+                &mut state,
+                &ok_result(StopReason::Completed),
+                false,
+                None,
+                None,
+                None
+            ),
+            Advance::Stop(StopCause::AllDone),
+            "无目标 ⇒ 清单收场就是 AllDone"
+        );
+    }
+
+    /// **`Stop` 赢过预算耗尽**：已决定收场（用户 Esc）就不该再起收卷回合。
+    ///
+    /// 变异：把上限判定挪到 `decide` 之前（`exhausted()` 先返回 `FinalReport`）⇒
+    /// 本用例得到 `FinalReport` 而变红。
+    #[test]
+    fn stop_wins_over_exhausted() {
+        let store = store_with(vec![item("修好登录超时", TodoStatus::InProgress)]);
+        let mut goal = GoalState::new("修好 flaky 测试".into());
+        for _ in 0..crate::goal_state::GOAL_TURN_CAP {
+            goal.consume();
+        }
+        assert!(goal.exhausted(), "前置：预算已耗尽");
+
+        let mut state = AdvanceState::new();
+        assert_eq!(
+            advance(
+                &store,
+                &mut state,
+                &ok_result(StopReason::Cancelled),
+                true,
+                Some("a"),
+                Some("b".into()),
+                Some(&goal)
+            ),
+            Advance::Stop(StopCause::Aborted),
+            "用户取消 ⇒ 直接收场，不再跑收卷回合"
+        );
+    }
+
+    /// **取消不动账**：`Esc` 停下后目标仍在那儿，下一回合能接着干。
+    ///
+    /// “停下当前回合”与“作废目标”是两件事（只有 `/goal clear` 做后者）；本用例锁住
+    /// 前者不会顺手把后者也做了。
+    ///
+    /// **守护的是接线契约，不是可注入的变异**：`advance` 收的是 `Option<&GoalState>`，
+    /// 类型系统已经让它无法改预算（把形参改成 `&mut` 时本用例会先编译失败）。本用例
+    /// 锁住的是**调用方的读法**：取消分支返回后，`turns()` 与 `marker_text()` 都没变。
+    #[test]
+    fn aborted_leaves_goal_state_untouched() {
+        let store = store_with(vec![item("修好登录超时", TodoStatus::InProgress)]);
+        let mut goal = GoalState::new("修好 flaky 测试".into());
+        goal.consume();
+        goal.consume();
+        let turns_before = goal.turns();
+
+        let mut state = AdvanceState::new();
+        assert_eq!(
+            advance(
+                &store,
+                &mut state,
+                &ok_result(StopReason::Cancelled),
+                true,
+                Some("a"),
+                Some("b".into()),
+                Some(&goal)
+            ),
+            Advance::Stop(StopCause::Aborted),
+            "前置：取消即收场"
+        );
+
+        assert_eq!(
+            goal.turns(),
+            turns_before,
+            "取消不得消耗预算 —— 它是「停下这一回合」，不是「烧掉一个回合」"
+        );
+        assert_eq!(
+            goal.marker_text(),
+            GoalState::new("修好 flaky 测试".into()).marker_text(),
+            "取消不得改动目标的注入块 —— 下个回合注入的还是同一份"
+        );
     }
 }

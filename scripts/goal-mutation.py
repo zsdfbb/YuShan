@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""目标推进与验收层（ADR-0072）的**变异测试**：注入 bug ⇒ 期望测试变红 ⇒ 还原。
+"""`/goal` 推进判据的**变异测试**：注入 bug ⇒ 期望用例变红 ⇒ 还原。
 
-为什么要有它：验收层是「模型自称完成」这条路的唯一结构防线。它的每条判据
-（取消优先 / 无 open 项收场 / 计数上限 / 停滞护栏 / 引用校验）都是**一行 if**，
-删掉任何一行都不会让别的测试失败 —— 全绿的套件仍可能对它们零覆盖。
-AGENTS.md 约定「关键逻辑要做变异测试」，这把尺子就是那把尺子。
+为什么要有它：本层的不变量全是「看代码一眼觉得对」的那一类 ——
+判据 4 的反转（有目标 + 空清单 ⇒ `Push`）、收卷回合不计入 200、上限只对有目标生效、
+注入块字节恒定。删掉任何一处都不会让别的用例失败。AGENTS.md 约定「关键逻辑要做变异测试」，
+这把尺子就是那把尺子。设计条目见 `docs/arch/goal-command/design.md` §8。
 
 形态对齐 `scripts/cancellation-mutation.py`（同一套机制，便于维护）：
 
-  - **一次跑完全部 mutant**，跑完给一张汇总表。
+  - **一次跑完全部 mutant**，跑完给一张汇总表（红 / 逃逸 / 锚点未命中 / 编译失败）。
   - 每个 mutant 跑**包级**测试（`cargo test -p <pkg>`）而非单个具名用例 ——
-    覆盖更强，且能报出「哪些用例抓到了它」。
-  - 注入用**精确文本替换**（不是行号/正则），改不动就**报错退出**，
-    绝不允许「注入没生效 ⇒ 测试绿 ⇒ 假通过」。
-  - 每个 mutant 前**快照**、跑完**还原**；`finally` 兜底，异常也不留脏工作区。
+    覆盖更强，且能报出「哪些用例抓到了它」。`expect_red` 是**必须命中**的子串：
+    变红了但不是它 ⇒ 记「抓错人」，仍算逃逸。
+  - 注入用**精确文本替换**（不是行号/正则），`old` 必须恰好命中一次；
+    找不到（**锚点未命中**）或命中多次 ⇒ 直接报错退出 —— 这是脚本随代码漂移的唯一信号。
+  - 每个 mutant 前后**快照/还原**；`finally` 兜底，异常也不留脏工作区。
 
 用法：
     python3 scripts/goal-mutation.py            # 跑全部
@@ -31,245 +32,201 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+GOAL = "apps/coding-agent/src/goal.rs"
+GOAL_STATE = "apps/coding-agent/src/goal_state.rs"
+ADVANCE = "apps/coding-agent/src/turn_advance.rs"
+APP_LOOP = "apps/coding-agent/src/app_loop.rs"
+INJECT = "apps/coding-agent/src/todo_inject.rs"
+
+# 全部待注入文件（跑前快照、跑完统一还原）。
+#
+# 只在**本层自己的实现文件**里注入。`app_loop.rs` 由同波另一个人在并行编辑：
+# 本脚本会临时改写它，故跑之前先看它的 mtime / md5 是否稳定（见 `_preflight`）。
+TARGETS = [GOAL, GOAL_STATE, ADVANCE, APP_LOOP, INJECT]
+
 
 @dataclass
 class Mutant:
     """一处注入。
 
-    `old`/`new` 必须是**精确**文本；`old` 在目标文件里不唯一或不存在时，
-    注入直接失败（不算「测试通过」）。
+    `edits` 是 `(文件, 原文, 替换)` 三元组；`old` 必须是**精确**文本，在目标文件里
+    必须恰好出现一次，否则注入直接失败（不算「测试通过」）。
+
+    `expect_red` 是期望变红的用例名子串（如 `goal::tests::foo`）。
     """
 
     name: str
     package: str
     desc: str
+    expect_red: str
     edits: list[tuple[str, str, str]] = field(default_factory=list)
-    #: 期望至少有一个测试变红；为空表示「该 mutant 只要求整包不绿」。
-    expect_red: str = ""
-
-
-GOAL = "apps/coding-agent/src/goal.rs"
-JUDGE = "apps/coding-agent/src/goal_judge.rs"
-INJECT = "apps/coding-agent/src/todo_inject.rs"
-
-# 全部待注入文件（跑完统一还原）。
-TARGETS = [GOAL, JUDGE, INJECT]
 
 
 MUTANTS: list[Mutant] = [
-    # ── 判据顺序 ──────────────────────────────────────────────────────
+    # ── ① 判据 4：没有清单 ≠ 达成（D-A 的核心修补） ────────────────────
     Mutant(
-        name="判据 1：用户取消不再优先（挪到「无 open 项」之后）",
+        name="① 判据 4 反转失效：有目标 + 从未写过清单也报 NoPlan",
         package="ys-coding-agent",
-        desc="清单恰好清空时，用户的 Ctrl+C 被覆盖成「干完了」⇒ 用户意图失效",
-        expect_red="cancelled_wins_over_all_done",
+        desc="用户设了目标、模型还没拆清单 ⇒ 运行时当场 Stop(NoPlan) 收场，"
+        "目标被静默忽略（退回成立即放弃）。这条判据是本设计唯一的『目标不会白设』保证。",
+        expect_red="goal::tests::never_written_plan_pushes_only_with_goal",
         edits=[
             (
                 GOAL,
-                """    if matches!(last_stop, StopReason::Cancelled) {
-        return FollowUp::Stop(StopCause::Aborted);
-    }""",
-                """    // MUTATION: 取消优先被移除""",
-            ),
+                """        return match goal {
+            Some(_) => FollowUp::Push,
+            None => FollowUp::Stop(StopCause::NoPlan),
+        };""",
+                """        // MUTATION: 有目标也报 NoPlan（判据 4 反转失效）
+        return FollowUp::Stop(StopCause::NoPlan);""",
+            )
+        ],
+    ),
+    # ── ② 收卷回合不计入 200（D-M / D-N） ──────────────────────────────
+    Mutant(
+        name="② 收卷回合计入 200：收卷之前先 consume()",
+        package="ys-coding-agent",
+        desc="收卷回合记账 ⇒ 收尾报账变成「已用 201 回合」，任务级 200 上限被自己突破一次；"
+        "此后任何按 `turns()` 算的读数都偏移一格。",
+        expect_red="app_loop::tests::wrap_up_turn_runs_and_does_not_consume",
+        edits=[
+            (
+                APP_LOOP,
+                """                if let Some(g) = goal.as_ref().filter(|_| need_wrap_up) {
+                    let wrap = Message {""",
+                """                if let Some(g) = goal.as_mut().filter(|_| need_wrap_up) {
+                    // MUTATION: 收卷回合也走一次 consume（设计：它不计入 200）
+                    g.consume();
+                    let wrap = Message {""",
+            )
+        ],
+    ),
+    # ── ③ 上限只对有目标生效（D-K） ───────────────────────────────────
+    Mutant(
+        name="③ 无目标也设 200：`advance` 里 `used` 到了上限也判耗尽",
+        package="ys-coding-agent",
+        desc="无目标追问（一期的 HEAD 追问）被加上 200 回合阀 ⇒ 与 D-K 直接冲突；"
+        "而它本来靠判据 2/3/4 收场，多这一条只会让人反复遮蔽其中一条。",
+        expect_red="turn_advance::tests::no_goal_never_final_reports",
+        edits=[
+            (
+                ADVANCE,
+                """        FollowUp::Push => match goal {
+            Some(g) if g.exhausted() => Advance::FinalReport,
+            _ => Advance::Push,
+        },""",
+                """        FollowUp::Push => match goal {
+            Some(g) if g.exhausted() => Advance::FinalReport,
+            // MUTATION: 无目标也按回合数判上限（D-K 只对有目标生效）
+            None if state.used >= crate::goal_state::GOAL_TURN_CAP => Advance::FinalReport,
+            _ => Advance::Push,
+        },""",
+            )
+        ],
+    ),
+    # ── ④ 注入块字节恒定（前缀缓存前提） ──────────────────────────────
+    Mutant(
+        name="④ 目标块含回合序号：`marker_text()` 里带上回合数",
+        package="ys-coding-agent",
+        desc="注入块每回合都变 ⇒ 每回合都是一笔全价尾字节（前缀缓存全破），"
+        "而模型知道回合序号也不能改变行为（结局由 harness 判定）。",
+        expect_red="goal_state::tests::marker_text_is_byte_identical_across_calls",
+        edits=[
+            (
+                GOAL_STATE,
+                """             </goal_brief>",
+            text = self.text""",
+                """             </goal_brief>
+             （第 {turns} 回合）",
+            text = self.text,
+            turns = self.turns""",
+            )
+        ],
+    ),
+    # ── ⑤ 判据 3：两种收场必须可区分（R1 的可观测面） ─────────────────
+    Mutant(
+        name="⑤ `GoalReached` 错报 `AllDone`",
+        package="ys-coding-agent",
+        desc="有目标的达成被报成普通回合收尾 ⇒ UI 无法区分「目标达成」与「清单清空」，"
+        "`/goal` 的结果对用户不可见。",
+        expect_red="goal::tests::no_open_items_reports_goal_reached_or_all_done",
+        edits=[
             (
                 GOAL,
-                """    if !store.has_open_items() && store.revision() > 0 {
-        return FollowUp::Stop(StopCause::AllDone);
-    }""",
-                """    if !store.has_open_items() && store.revision() > 0 {
-        return FollowUp::Stop(StopCause::AllDone);
+                """        return FollowUp::Stop(match goal {
+            Some(_) => StopCause::GoalReached,
+            None => StopCause::AllDone,
+        });""",
+                """        // MUTATION: 有目标也错报 AllDone
+        return FollowUp::Stop(StopCause::AllDone);""",
+            )
+        ],
+    ),
+    # ── ⑥ stall 残留（等价注入，不是逐字复现） ────────────────────────
+    Mutant(
+        name="⑥ stall 残留：把 `stall_digest` / `StallTracker` 判据加回 `decide`",
+        package="ys-coding-agent",
+        desc="【等价注入】stall 检测（集合指纹 + 连续 N 回合不变 ⇒ 停机）已随 T21 整体删除，"
+        "当前没有可逐字复原的注入点。设计 §8 要验的是『有人把它加回来时测试会不会红』，"
+        "故此处注入它**最危险的形态**：`used >= 4` 且清单无 open 项就直接 Stop(NotContinuable)，"
+        "即用回合数误杀正常收场（stall 判据当年正是这样绕过判据 3/4 的）。",
+        expect_red="goal::tests::used_never_changes_the_verdict",
+        edits=[
+            (
+                GOAL,
+                """    // ── 判据 3：无 open 项且曾经写过 ⇒ 正常收场 ───────────────────────""",
+                """    // MUTATION: stall 残留 —— 用回合数误杀正常收场（等价注入，非逐字复现）
+    if used >= 4 && !store.has_open_items() {
+        return FollowUp::Stop(StopCause::NotContinuable);
     }
-    if matches!(last_stop, StopReason::Cancelled) {
-        return FollowUp::Stop(StopCause::Aborted);
-    }""",
+
+    // ── 判据 3：无 open 项且曾经写过 ⇒ 正常收场 ───────────────────────""",
+            )
+        ],
+    ),
+    # ── ⑦ 无清单提醒封顶 ─────────────────────────────────────────────
+    Mutant(
+        name="⑦ 提醒不封顶：`plan_remind()` 去掉上限判断",
+        package="ys-coding-agent",
+        desc="同一句「还没写清单」无限重复进上下文 ⇒ 每回合白烧 token 且稀释真正的追问文案；"
+        "它不改变判据，只会污染长任务的前缀。",
+        expect_red="goal_state::tests::plan_remind_caps_at_limit",
+        edits=[
+            (
+                GOAL_STATE,
+                """        if self.plan_reminders >= NO_PLAN_REMIND_LIMIT {
+            return None;
+        }""",
+                """        // MUTATION: 提醒不封顶""",
+            )
+        ],
+    ),
+    # ── ⑧ 收卷回合丢目标原文（等价替换，不是「削工具」） ──────────────
+    Mutant(
+        name="⑧ 收卷回合丢目标原文（替换设计 §8 的『收卷回合被削工具』）",
+        package="ys-coding-agent",
+        desc="【等价替换】设计 §8 第 8 条要的是「收卷回合工具被削」。当前结构下**无法注入**："
+        "工具表由 `agent` 内部持有，`run_turn_chain` 的参数里没有工具表，追问与收卷两个"
+        "调用点传的是同一个 `agent` —— 从调用点改不动工具面（D-N 因此由结构保证，"
+        "`request.tools` 直取 registry）。故换成同一 D-N 目的下可执行的变异："
+        "收卷输入丢掉目标原文 ⇒ 收卷回合看不到原话，只能凭记忆汇报，正是 D-N 要防的。",
+        expect_red="goal_state::tests::wrap_up_text_quotes_goal",
+        edits=[
+            (
+                GOAL_STATE,
+                """             清单里仍未完成的项要逐项点到，不要含糊带过。",
+            text = self.text""",
+                """             清单里仍未完成的项要逐项点到，不要含糊带过。",
+            text = "",""",
             ),
         ],
     ),
-    Mutant(
-        name="判据 2：不可续的收场形态被放行",
-        package="ys-coding-agent",
-        desc="Truncated / Failed / MaxRounds / NoOutput 仍会再起一轮 ⇒ 对失败回合继续烧钱",
-        expect_red="non_continuable_stop_reasons_stop",
-        edits=[
-            (
-                GOAL,
-                """        StopReason::Truncated
-        | StopReason::Failed
-        | StopReason::MaxRounds
-        | StopReason::NoOutput => {
-            return FollowUp::Stop(StopCause::NotContinuable);
-        }""",
-                """        StopReason::Truncated
-        | StopReason::Failed
-        | StopReason::MaxRounds
-        | StopReason::NoOutput => {}""",
-            )
-        ],
-    ),
-    Mutant(
-        name="判据 3：判官不可靠不再停机",
-        package="ys-coding-agent",
-        desc="没有判据就没有停止条件 ⇒ 判官连续坏掉时仍无限推进（跑飞）",
-        expect_red="judge_failures_reaching_limit_stop",
-        edits=[
-            (
-                GOAL,
-                """    if *judge_failures >= JUDGE_FAILURE_LIMIT {
-        return FollowUp::Stop(StopCause::JudgeUnreliable);
-    }""",
-                """    // MUTATION: 判官可靠性闸门被移除""",
-            )
-        ],
-    ),
-    # 判据 4（收场 = 「无 open 项」而非「全部 Completed」）**没有变异条目**：
-    #
-    # 这两个判据在 `TodoStore` 的不变量下**语义等价**，无法用变异区分。
-    # `apply` 的硬规则 2 保证「无 open 项 ⇒ 清空清单」，因此 `snapshot()` 里
-    # **不可能**出现「有项但全部终态」——「全部 Completed」在空集上恒为真。
-    # 用变异去抓它只会得到一个假缺口（实测确实如此）。
-    #
-    # 真正的守护是 `apply` 自己的两条硬规则（`adapters/tools-todo/src/store.rs`）
-    # 与它们的 40 条测试，不在本层。
-    Mutant(
-        name="判据 6：追问计数上限去掉",
-        package="ys-coding-agent",
-        desc="used 无上限 ⇒ 一直推下去，直到墙钟兜底（48h）",
-        expect_red="used_up_to_cap_stops",
-        edits=[
-            (
-                GOAL,
-                """    if used >= MAX_FOLLOW_UPS {
-        return FollowUp::Stop(StopCause::CapReached);
-    }""",
-                """    // MUTATION: 计数上限被移除""",
-            )
-        ],
-    ),
-    Mutant(
-        name="判据 7：停滞护栏去掉「模型自称收尾」的 AND",
-        package="ys-coding-agent",
-        desc="只靠集合不变判定 ⇒ 误杀「一轮里干了活但还没更新状态」的情形",
-        expect_red="stalled_requires_unchanged_set_and_model_claims_done",
-        edits=[
-            (
-                GOAL,
-                """    if stall.unchanged_turns() >= STALL_LIMIT && model_claims_done {""",
-                """    if stall.unchanged_turns() >= STALL_LIMIT {""",
-            )
-        ],
-    ),
-    # ── 集合指纹 ──────────────────────────────────────────────────────
-    Mutant(
-        name="集合指纹把已完成的项也算进去",
-        package="ys-coding-agent",
-        desc="模型把已完成项重述一遍就重置了 stall ⇒ 停滞永远检不出来",
-        expect_red="digest_ignores_terminal_items",
-        edits=[
-            (
-                GOAL,
-                """        .filter(|item| !item.status.is_terminal())""",
-                """        .filter(|_| true)""",
-            )
-        ],
-    ),
-    Mutant(
-        name="集合指纹去掉大小写折叠",
-        package="ys-coding-agent",
-        desc="模型换个大小写就重置 stall ⇒ 停滞漏检",
-        expect_red="digest_ignores_case",
-        edits=[
-            (
-                GOAL,
-                """                normalize_content(&item.content).to_lowercase(),""",
-                """                normalize_content(&item.content),""",
-            )
-        ],
-    ),
-    Mutant(
-        name="集合指纹不排序（依赖声明顺序）",
-        package="ys-coding-agent",
-        desc="模型调整项的顺序就重置 stall ⇒ 停滞漏检",
-        expect_red="digest_is_order_insensitive",
-        edits=[
-            (
-                GOAL,
-                """    keys.sort_unstable();
-    keys.dedup();""",
-                """    keys.dedup();""",
-            )
-        ],
-    ),
-    # ── 判官引用校验 ──────────────────────────────────────────────────
-    Mutant(
-        name="判官：有 MET 就放行，不校验引用是否命中",
-        package="ys-coding-agent",
-        desc="判官编造引用也能通关 ⇒ 「模型自称完成」靠判官幻觉通过，核心防线失效",
-        expect_red="met_with_fabricated_quote_is_unparseable",
-        edits=[
-            (
-                JUDGE,
-                """                if !quote_is_valid(&quote) || !haystack.contains(&normalize(&quote)) {
-                    // 引用为空 / 过短 / 找不到 —— 判官不可靠，绝不采信「达成」。
-                    return JudgeParse::Unparseable;
-                }""",
-                """                // MUTATION: 引用校验被移除""",
-            )
-        ],
-    ),
-    Mutant(
-        name="判官：VERDICT 改成前缀匹配",
-        package="ys-coding-agent",
-        desc="`METRICALLY` 被读成 `MET` ⇒ 最危险的假阳性方向",
-        expect_red="verdict_requires_whole_word",
-        edits=[
-            (
-                JUDGE,
-                """        return match token.to_ascii_uppercase().as_str() {
-            "MET" => Some(Verdict::Met),""",
-                """        return match token.to_ascii_uppercase().as_str() {
-            v if v.starts_with("MET") => Some(Verdict::Met),""",
-            )
-        ],
-    ),
-    Mutant(
-        name="判官：漏核未完成项也放行（覆盖面检查去掉）",
-        package="ys-coding-agent",
-        desc="判官只核一项就放行整份清单 ⇒ 「标 completed 但没凭据」的项蒙混过关",
-        expect_red="met_must_cover_every_open_item",
-        edits=[
-            (
-                JUDGE,
-                """    if !missing.is_empty() {""",
-                """    if false && !missing.is_empty() {""",
-            )
-        ],
-    ),
-    Mutant(
-        name="判官：MISSING 被当成「不可靠」而非「未达成」",
-        package="ys-coding-agent",
-        desc="判官合法报告「某项没凭据」被记成判官坏了 ⇒ 连续两次即误停机",
-        expect_red="met_with_missing_item_downgrades_to_not_met",
-        edits=[
-            (
-                JUDGE,
-                """            "MISSING" => {
-                let label = parts[0];
-                return JudgeParse::NotMet {
-                    reason: format!("判官报告该项缺少凭据：{label}"),
-                };
-            }""",
-                """            "MISSING" => {
-                return JudgeParse::Unparseable;
-            }""",
-            )
-        ],
-    ),
-    # ── 注入判据 ──────────────────────────────────────────────────────
+    # ── 注入判据（todo 块） —— 跟进 `follow_up_text` 的第 4 形参 ───────
     Mutant(
         name="注入：去掉「历史里找不到标记」的自愈分支",
         package="ys-coding-agent",
         desc="压缩（含手敲 /compact）吃掉注入块后永不补回 ⇒ 长任务中途失明",
-        expect_red="lost_marker_reinjects",
+        expect_red="todo_inject::tests::lost_marker_reinjects",
         edits=[
             (
                 INJECT,
@@ -282,7 +239,7 @@ MUTANTS: list[Mutant] = [
         name="注入：去掉 revision 检查",
         package="ys-coding-agent",
         desc="清单变了也不重注 ⇒ 模型一直看着旧版本，按已作废的计划干活",
-        expect_red="revision_change_injects_even_if_marker_present",
+        expect_red="todo_inject::tests::revision_change_injects_even_if_marker_present",
         edits=[
             (
                 INJECT,
@@ -297,7 +254,7 @@ MUTANTS: list[Mutant] = [
         name="注入：空清单也注入",
         package="ys-coding-agent",
         desc="没有计划时白注一份空块 ⇒ 每回合多花 token 且暗示「有计划」",
-        expect_red="empty_plan_never_injects",
+        expect_red="todo_inject::tests::empty_plan_never_injects",
         edits=[
             (
                 INJECT,
@@ -312,7 +269,7 @@ MUTANTS: list[Mutant] = [
 
 
 class InjectionError(RuntimeError):
-    """注入本身失败（文本不匹配 / 不唯一）—— 绝不能当成「测试通过」。"""
+    """注入本身失败（锚点找不到 / 不唯一）—— 绝不能当成「测试通过」。"""
 
 
 def apply_edits(edits: list[tuple[str, str, str]]) -> None:
@@ -322,14 +279,20 @@ def apply_edits(edits: list[tuple[str, str, str]]) -> None:
         src = path.read_text(encoding="utf-8")
         count = src.count(old)
         if count == 0:
-            raise InjectionError(f"{rel}: 找不到待替换文本（源码已变？）\n---\n{old[:200]}")
+            raise InjectionError(
+                f"{rel}: 锚点未命中（找不到待替换文本，源码已变？）\n---\n{old[:200]}"
+            )
         if count > 1:
-            raise InjectionError(f"{rel}: 待替换文本命中 {count} 次（须唯一）")
+            raise InjectionError(f"{rel}: 锚点命中 {count} 次（须唯一）\n---\n{old[:200]}")
         path.write_text(src.replace(old, new), encoding="utf-8")
 
 
-def restore(snapshot: dict[str, str]) -> None:
-    for rel, content in snapshot.items():
+def snapshot() -> dict[str, str]:
+    return {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in TARGETS}
+
+
+def restore(snap: dict[str, str]) -> None:
+    for rel, content in snap.items():
         (ROOT / rel).write_text(content, encoding="utf-8")
 
 
@@ -364,15 +327,51 @@ def run_package_tests(package: str) -> tuple[str, list[str]]:
     return "green", []
 
 
+def _preflight() -> bool:
+    """跑之前的并发写入检查：被别处改着的文件不该由本脚本临时改写（会互相覆盖）。
+
+    取两次 mtime + md5 采样（间隔 3 s），有变化即视为「正在被写」。
+    """
+    import hashlib
+    import time
+
+    def stamp() -> dict[str, tuple[int, str]]:
+        out = {}
+        for rel in TARGETS:
+            path = ROOT / rel
+            if not path.exists():
+                out[rel] = (-1, "")
+                continue
+            st = path.stat()
+            digest = hashlib.md5(path.read_bytes()).hexdigest()
+            out[rel] = (st.st_mtime_ns, digest)
+        return out
+
+    first = stamp()
+    time.sleep(3)
+    second = stamp()
+    busy = [rel for rel in TARGETS if first[rel] != second[rel]]
+    if busy:
+        print(
+            "！以下文件正在被写入，先等它稳定再跑（本脚本会临时改写它们）：\n  "
+            + "\n  ".join(busy),
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("ids", nargs="*", help="只跑指定编号（1 起）")
     ap.add_argument("--list", action="store_true", help="只列清单")
+    ap.add_argument("--force", action="store_true", help="跳过并发写入预检")
     args = ap.parse_args()
 
     if args.list:
         for i, m in enumerate(MUTANTS, 1):
             print(f"{i:2}. [{m.package}] {m.name}")
+            print(f"    期望变红：{m.expect_red or '（不要求具名用例，只要求整包不绿）'}")
             print(f"    {m.desc}")
         return 0
 
@@ -388,7 +387,10 @@ def main() -> int:
             print("没有匹配的编号", file=sys.stderr)
             return 2
 
-    snapshot = {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in TARGETS}
+    if not args.force and not _preflight():
+        return 2
+
+    snap = snapshot()
     results: list[tuple[Mutant, str, list[str]]] = []
 
     try:
@@ -399,12 +401,12 @@ def main() -> int:
             try:
                 apply_edits(m.edits)
             except InjectionError as err:
-                restore(snapshot)
-                print(f"  注入失败：{err}", file=sys.stderr)
-                results.append((m, "injection-failed", []))
+                restore(snap)
+                print(f"  ✗ 锚点未命中：{err}", file=sys.stderr)
+                results.append((m, "anchor-missed", []))
                 continue
             status, failed = run_package_tests(m.package)
-            restore(snapshot)
+            restore(snap)
             if status == "red":
                 hit = [f for f in failed if m.expect_red in f] if m.expect_red else failed
                 if m.expect_red and not hit:
@@ -423,29 +425,31 @@ def main() -> int:
                 print("  ✗ 未被抓住 —— 覆盖缺口！")
             results.append((m, status, failed))
     finally:
-        restore(snapshot)
+        restore(snap)
 
     print("\n" + "=" * 72)
     print("变异测试汇总")
     print("=" * 72)
     caught = 0
     for m, status, failed in results:
-        mark = {"red": "✓"}.get(status, "✗")
         if status == "red":
             caught += 1
-        print(f"{mark} [{m.package}] {m.name}")
+        mark = {"red": "✓ 红", "green": "✗ 逃逸"}.get(status, "✗ " + status)
+        print(f"{mark}  {m.name}")
         if failed:
-            print(f"    抓住它的用例：{', '.join(failed[:3])}")
-        elif status == "injection-failed":
-            print("    注入失败（源码已变，需更新本脚本）")
+            print(f"        抓住它的用例：{', '.join(failed[:3])}")
+        elif status == "anchor-missed":
+            print("        锚点未命中（源码已变，需更新本脚本）")
         elif status == "build-failed":
-            print("    编译失败（注入写法有问题，不算被抓住）")
+            print("        编译失败（注入写法有问题，不算被抓住）")
+        elif status == "wrong-catcher":
+            print("        红了但不是期望的用例（抓错人）")
         elif status == "errored":
-            print("    测试非零退出但无 FAILED 行（崩溃/挂住）—— 需人工看")
-        else:
-            print("    无用例变红 —— 这条逻辑没有被测试罩住")
+            print("        测试非零退出但无 FAILED 行（崩溃/挂住）—— 需人工看")
+        elif status == "green":
+            print("        无用例变红 —— 这条逻辑没有被测试罩住")
     print("=" * 72)
-    print(f"{caught}/{len(results)} 处变异被测试抓住")
+    print(f"{caught}/{len(results)} 变红")
     return 0 if caught == len(results) else 1
 
 

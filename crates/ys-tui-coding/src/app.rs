@@ -373,14 +373,19 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    /// 记一条「已投出的请求」：`Prompt` 之外的请求进入**在飞态**
+    /// 记一条「已投出的请求」：`Prompt` / `SetGoal` 之外的请求进入**在飞态**
     /// （见 [`App::command_in_flight`]）。
     ///
     /// 投放方有两处：主循环的 `send_request`（`/model`、`/resume` 等直发命令）与
     /// 模态浮层的 `apply_prompt_outcome`（`/login`、`/model` 无参选完之后的请求）。
     /// 两条路径都得记 —— 否则浮层发出去的 `/login` 拿不到 Esc 取消。
+    ///
+    /// 两个被排除的变体的共同点是**没有在飞阶段**：`Prompt` 起回合，回合的取消走
+    /// `Boundary::Abort`（`is_turning` 管）；`SetGoal` 不起回合，只改 app 侧的目标
+    /// 状态，投出即生效、不存在等待回报的窗口。把后者计入在飞态，Esc 就会去取消
+    /// 一个不存在的操作（`command_in_flight` 的读者只有 Esc 的取消分支）。
     pub(crate) fn note_request_sent(&mut self, req: &Request) {
-        if !matches!(req, Request::Prompt(_)) {
+        if !matches!(req, Request::Prompt(_) | Request::SetGoal { .. }) {
             self.command_in_flight = true;
         }
     }
@@ -2999,6 +3004,41 @@ mod tests {
             a.theme,
             ThemeKind::Nord,
             "换会话不得重置主题（`reset_for_replay` 只清 transcript 同源状态）"
+        );
+    }
+
+    /// `/goal <text>` 只改 app 侧的目标状态，没有在飞阶段 ⇒ 不得进入在飞态。
+    ///
+    /// 变异：守卫退回只排除 `Prompt` ⇒ 本用例变红。
+    #[test]
+    fn set_goal_does_not_mark_in_flight() {
+        let mut a = app();
+        a.note_request_sent(&Request::SetGoal {
+            text: Some("x".into()),
+        });
+        assert!(!a.command_in_flight, "设目标不是在飞请求");
+    }
+
+    /// `/goal clear` 与 `/goal <text>` 同属一个变体（守卫用 `{ .. }` 同时覆盖两臂）。
+    ///
+    /// 变异：守卫退回只排除 `Prompt` ⇒ 本用例变红。
+    #[test]
+    fn set_goal_clear_does_not_mark_in_flight() {
+        let mut a = app();
+        a.note_request_sent(&Request::SetGoal { text: None });
+        assert!(!a.command_in_flight, "作废目标不是在飞请求");
+    }
+
+    /// 反向守护：守卫只是多排除了 `SetGoal`，别的直发命令照样进在飞态。
+    ///
+    /// 变异：把 `note_request_sent` 里整个 `if` 删掉 ⇒ 本用例变红。
+    #[test]
+    fn compact_still_marks_in_flight() {
+        let mut a = app();
+        a.note_request_sent(&Request::Compact);
+        assert!(
+            a.command_in_flight,
+            "压缩请求没有独立的在飞态，Esc 靠它取消"
         );
     }
 }

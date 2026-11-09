@@ -69,20 +69,36 @@ pub(crate) fn injection_text(store: &TodoStore) -> String {
 ///
 /// 角色恒为 `Role::Harness`：用户没说过这些话。出站时它映射成 user（模型可见
 /// 效果与用户发言相同），但本地记录与 TUI 都不把它当用户自己敲的话。
+///
+/// # `goal_prefix`
+///
+/// `Some(p)` ⇒ 返回值**以 `p` 开头**，其后空一行接上面三条分支之一的正文；
+/// `None` ⇒ 返回值与不带这个形参时**逐字节相同**。
+///
+/// prefix 在**三条分支都加**，不是只加第一支：清单为空正是「还没拆清单」的时刻，
+/// 而这恰是 prefix 要提醒的事；只在注入块前加会漏掉最需要它的那一支。
+///
+/// prefix 只由调用方在有目标、且清单从未写过时给出；本函数**不判断**该不该给 ——
+/// 「清单要不要提醒」是调用方的状态（目标是否存在），不在本函数可见范围内。
 pub(crate) fn follow_up_text(
     store: &TodoStore,
     last_injected_rev: &mut Option<u64>,
     session: &[Message],
+    goal_prefix: Option<&str>,
 ) -> String {
-    if store.snapshot().is_empty() {
-        return crate::post_turn::harness_input_text();
-    }
-    if should_inject(store, *last_injected_rev, session) {
+    let body = if store.snapshot().is_empty() {
+        crate::post_turn::harness_input_text()
+    } else if should_inject(store, *last_injected_rev, session) {
         *last_injected_rev = Some(store.revision());
-        return injection_text(store);
+        injection_text(store)
+    } else {
+        // 清单已在上下文里且版本未变：只给推进句，不重复整块。
+        "继续推进清单里的未完成项；全部完成后收尾。".to_string()
+    };
+    match goal_prefix {
+        Some(prefix) => format!("{prefix}\n\n{body}"),
+        None => body,
     }
-    // 清单已在上下文里且版本未变：只给推进句，不重复整块。
-    "继续推进清单里的未完成项；全部完成后收尾。".to_string()
 }
 
 /// 该消息是否已经带着清单。
@@ -247,14 +263,14 @@ mod tests {
         let store = store_with(vec![item("跑测试", TodoStatus::Pending)]);
 
         // 第一支：清单变了 ⇒ 注入块。
-        let first = follow_up_text(&store, &mut None, &[]);
+        let first = follow_up_text(&store, &mut None, &[], None);
         assert!(first.contains(TODO_MARKER), "应注入清单块：{first}");
         assert!(!first.contains("git 历史"), "清单驱动时不得提 git：{first}");
 
         // 第二支：清单在历史里、版本未变 ⇒ 推进句。
         let mut rev = Some(store.revision());
         let session = vec![injected(&store)];
-        let second = follow_up_text(&store, &mut rev, &session);
+        let second = follow_up_text(&store, &mut rev, &session, None);
         assert!(
             !second.contains("git 历史") && !second.contains(TODO_MARKER),
             "清单未变时应只给短推进句：{second}"
@@ -269,10 +285,97 @@ mod tests {
     #[test]
     fn follow_up_text_uses_git_wording_only_without_plan() {
         let store = TodoStore::open(None);
-        let text = follow_up_text(&store, &mut None, &[]);
+        let text = follow_up_text(&store, &mut None, &[], None);
         assert!(
             text.starts_with("[harness]") && text.contains("git 历史"),
             "无清单时应回到一期的 git 追问句：{text}"
+        );
+    }
+
+    /// `Some(p)` ⇒ **三条分支都**以 `p` 开头，中间空一行再接正文。
+    ///
+    /// 清单为空那一支同样要加：它正是「还没拆清单」的时刻，最需要这句提醒。
+    /// 变异：把 prefix 拼到**末尾**（`format!("{body}\n\n{prefix}")`），
+    /// 或只在注入块那一支加 ⇒ 本用例变红。
+    #[test]
+    fn goal_prefix_precedes_every_branch() {
+        const PREFIX: &str = "目标已设：先把目标拆成清单再动手。";
+
+        // 第一支：清单为空 ⇒ git 兜底文案。
+        let empty = TodoStore::open(None);
+        let first = follow_up_text(&empty, &mut None, &[], Some(PREFIX));
+        assert!(
+            first.starts_with(PREFIX),
+            "清单为空时 prefix 也必须排在最前：{first}"
+        );
+        assert_eq!(
+            first,
+            format!("{PREFIX}\n\n{}", crate::post_turn::harness_input_text()),
+            "prefix 之后空一行接未改动的 git 文案：{first}"
+        );
+
+        // 第二支：清单变了 ⇒ 注入块。
+        let store = store_with(vec![item("跑测试", TodoStatus::Pending)]);
+        let second = follow_up_text(&store, &mut None, &[], Some(PREFIX));
+        assert!(
+            second.starts_with(PREFIX),
+            "注入块本身是输入，prefix 仍要排在最前：{second}"
+        );
+        assert_eq!(
+            second,
+            format!("{PREFIX}\n\n{}", injection_text(&store)),
+            "prefix 之后空一行接原样的注入块：{second}"
+        );
+
+        // 第三支：清单未变且在历史里 ⇒ 短推进句。
+        let mut rev = Some(store.revision());
+        let session = vec![injected(&store)];
+        let third = follow_up_text(&store, &mut rev, &session, Some(PREFIX));
+        assert!(
+            third.starts_with(PREFIX),
+            "短推进句前也要有 prefix：{third}"
+        );
+        assert_eq!(
+            third,
+            format!("{PREFIX}\n\n继续推进清单里的未完成项；全部完成后收尾。"),
+            "prefix 之后空一行接原样的推进句：{third}"
+        );
+    }
+
+    /// `goal_prefix: None` ⇒ 三条分支的输出与加形参之前**逐字节相同**。
+    ///
+    /// 基线用改动前那三句的字面量（含空清单用的 `harness_input_text` 原样产物），
+    /// 不用「再调一次本函数」自比 —— 那样任何统一的格式改动都测不出来。
+    /// 变异：`None` 时也补一个空行 / 拼空串（`format!("{body}\n")`、
+    /// `Some("") => format!("\n\n{body}")`）⇒ 本用例变红。
+    #[test]
+    fn none_prefix_is_byte_identical() {
+        // 第一支：清单为空。
+        let empty = TodoStore::open(None);
+        assert_eq!(
+            follow_up_text(&empty, &mut None, &[], None),
+            crate::post_turn::harness_input_text(),
+            "None 时清单空分支必须逐字节不变"
+        );
+
+        // 第二支：清单变了 ⇒ 注入块原样（顺带验证 None 仍会推进 last_injected_rev）。
+        let store = store_with(vec![item("跑测试", TodoStatus::Pending)]);
+        let mut rev = None;
+        let injected_text = follow_up_text(&store, &mut rev, &[], None);
+        assert_eq!(
+            injected_text,
+            injection_text(&store),
+            "None 时注入分支必须逐字节不变"
+        );
+        assert_eq!(rev, Some(store.revision()), "None 仍要记录本次注入版本");
+
+        // 第三支：清单未变且在历史里 ⇒ 短推进句原样。
+        let session = vec![injected(&store)];
+        let mut rev = Some(store.revision());
+        assert_eq!(
+            follow_up_text(&store, &mut rev, &session, None),
+            "继续推进清单里的未完成项；全部完成后收尾。",
+            "None 时短推进句分支必须逐字节不变"
         );
     }
 }

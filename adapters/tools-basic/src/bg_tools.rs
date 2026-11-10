@@ -460,8 +460,11 @@ mod tests {
     /// **A**：正常写大文件的命令**不被内核的文件大小限额杀掉** ——
     /// 后台命令的主要用途就是这类活（构建、打包、落盘）。
     ///
-    /// 内核限额是**进程级**的 ⇒ 它一旦被设成输出上限，正常写 4 MiB 文件的命令
+    /// 内核限额是**进程级**的 ⇒ 它一旦被设成输出上限，正常写大文件的命令
     /// 就会吃 `SIGXFSZ` 被杀掉 ⇒ 功能被打断。故内核限额必须**高于**输出上限。
+    ///
+    /// 写盘量取 **100 MiB**：旧阈值 64 MiB 下本用例必红 —— 它必须高于「本仓
+    /// 带调试符号的构建产物」（实测 65–134 MiB），否则改为小量会测不出回退。
     #[tokio::test]
     async fn a_command_writing_a_large_file_is_not_killed_by_the_kernel_limit() {
         let root = test_dir("bg_big_file");
@@ -472,12 +475,12 @@ mod tests {
         let bg = BashBgTool::new(tasks.clone(), workspace.clone(), session);
 
         bg.call(
-            json!({ "command": "dd if=/dev/zero of=big.bin bs=1048576 count=4 2>/dev/null" }),
+            json!({ "command": "dd if=/dev/zero of=big.bin bs=1048576 count=100 2>/dev/null" }),
             ctx(),
         )
         .await
         .unwrap();
-        let snapshot = wait_until_done(&tasks, BgHandle(1), Duration::from_secs(15)).await;
+        let snapshot = wait_until_done(&tasks, BgHandle(1), Duration::from_secs(60)).await;
 
         assert_eq!(
             snapshot.state,
@@ -488,7 +491,7 @@ mod tests {
         let size = fs::metadata(&big).map(|meta| meta.len()).unwrap_or(0);
         assert_eq!(
             size,
-            4 * 1024 * 1024,
+            100 * 1024 * 1024,
             "文件必须完整写完（内核限额不得打断正常写盘）"
         );
 

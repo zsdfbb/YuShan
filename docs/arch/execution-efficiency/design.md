@@ -394,8 +394,10 @@ round 10 工具 31.3s、round 11 工具 27.1s（**同一条命令跑两遍**，�
      命中即 `SIGXFSZ` ⇒ 归因措辞是「内核 SIGXFSZ」。
    ⚠ **`ulimit -f` 是进程级上限，不是「本命令的输出上限」** ⇒ 它的取值**不能**取
      2 MiB（那会连正常构建（`cargo build` 写 target/）一起杀掉）。
-     ⇒ 取 `max(2 MiB, 64 MiB)`：既拦住「单条命令写出百 MiB 垃圾」这种真失控，
+     ⇒ 取 `max(2 MiB, 2 GiB)`：既拦住「单条命令写出百 MiB 垃圾」这种真失控，
      又不误杀正常构建。**它不是精确闸门** —— 精确的 2 MiB 由 sweeper 的 `stat` 闸门负责。
+     （下限取 **2 GiB** 而非 64 MiB：本仓带调试符号的测试二进制实测 65–134 MiB，
+     64 MiB 会在 `cargo build` / `cargo test --no-run` 上直接 `SIGXFSZ` 误杀。）
 
 ③ 模型发 bash_poll(handle="bgN")（**与其它调用同一条消息** ⇒ 不占额外轮次）
    └─ BashPollTool::call
@@ -764,7 +766,7 @@ Collect it with bash_poll(handle="bg7"). The command is killed when this session
 |---|---|---|
 | **并发在跑的后台命令** | **4** | 与 `DEFAULT_MAX_PARALLEL_TOOLS = 4`（`crates/ys-component/src/limits.rs:8`）同量级。超限 ⇒ `bash_bg` **同步报错**（不排队、不静默）。 |
 | **句柄表条目** | **8**（在跑 + 已完成未取走） | 满了 ⇒ 淘汰**最旧的已完成**条目（删文件）；若全在跑 ⇒ 报错。 |
-| **单命令输出（磁盘）** | **2 MiB** | 超出 ⇒ 杀进程组 + 记 `failed`。`cargo test --workspace` 1295 个用例 ≈ 90 KiB 输出，2 MiB ≈ 20× 余量。**精确闸门** = sweeper 的 `stat`（2 MiB，harness 语义）；**粗闸门** = 启动时的 `ulimit -f`（进程级，取 `max(2 MiB, 64 MiB)`，内核语义）⇒ 轮询间隙的瞬时超限由内核兜住，而正常构建不会被误杀（`ulimit -f` 是进程级上限，取 2 MiB 会杀掉 `cargo build`）。 |
+| **单命令输出（磁盘）** | **2 MiB** | 超出 ⇒ 杀进程组 + 记 `failed`。`cargo test --workspace` 1295 个用例 ≈ 90 KiB 输出，2 MiB ≈ 20× 余量。**精确闸门** = sweeper 的 `stat`（2 MiB，harness 语义）；**粗闸门** = 启动时的 `ulimit -f`（进程级，取 `max(2 MiB, 2 GiB)`，内核语义）⇒ 轮询间隙的瞬时超限由内核兜住，而正常构建不会被误杀（`ulimit -f` 是进程级上限，取 2 MiB 会杀掉 `cargo build`；本仓带调试符号的测试二进制实测 65–134 MiB，故下限不能取 64 MiB）。 |
 | **磁盘总量** | ≤ 8 × 2 MiB = **16 MiB** | 会话结束删目录 ⇒ 稳态更低。 |
 | **父进程 fd（稳态）** | **0 / 条** | 子进程持有 stdout/stderr；父侧随 `spawn` 关闭。 |
 | **父进程 fd（轮询瞬时）** | **+1** | 读完即关。 |

@@ -113,12 +113,21 @@ fn probe_ulimit_block() -> u64 {
 /// 把它设成输出上限 ⇒ 正常写大文件的命令（构建产物、打包、落盘日志）会被内核
 /// 以 `SIGXFSZ` 杀掉 ⇒ 后台命令的主要用途被内核限额打断。
 ///
-/// 故内核侧的职责收窄为「**兜住失控写盘**」：限额取 `max(输出上限, 64 MiB)`，
+/// 故内核侧的职责收窄为「**兜住失控写盘**」：限额取 `max(输出上限, 2 GiB)`，
 /// 对齐到 `ulimit -f` 的块大小 ⇒ 正常工作的命令不受影响，疯狂往磁盘灌数据的
 /// 进程仍会被内核杀掉。
-pub const KERNEL_WRITE_BACKSTOP_BYTES: u64 = 64 * 1024 * 1024;
+///
+/// 取值依据 —— **普通后台命令（含重型构建）一律不得被这个闸门打断**：
+/// 本仓带调试符号的测试二进制实测 65–134 MiB，故任何小于它的阈值都会在
+/// `cargo build` / `cargo test --no-run` 上误杀。2 GiB 相对该实测值有 15× 余量，
+/// 仍能拦住「往磁盘灌无上限数据」这种真失控。
+///
+/// 实际兜住失控写盘的主力是 [`SWEEP_TICK`]（100 ms）轮询的 `stat` 闸门：
+/// 输出上限（默认 2 MiB）在**一个 tick 内**就命中并杀进程组；本阈值只兜住
+/// 「不往输出文件写、而往别处狂写」那一类。
+pub const KERNEL_WRITE_BACKSTOP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// 内核侧写盘兜底（粗闸门）的**生效**字节数 —— 取 `max(输出上限, 64 MiB)`。
+/// 内核侧写盘兜底（粗闸门）的**生效**字节数 —— 取 `max(输出上限, 2 GiB)`。
 pub fn kernel_write_backstop_bytes(max_output_bytes: u64) -> u64 {
     max_output_bytes.max(KERNEL_WRITE_BACKSTOP_BYTES)
 }
@@ -1388,6 +1397,43 @@ mod tests {
             max_entries,
             ..BgLimits::default()
         }
+    }
+
+    /// **内核粗闸门不得误杀正常构建**：本仓带调试符号的测试二进制实测 65–134 MiB，
+    /// 故阈值必须**显著高于**它，且不随输出上限（默认 2 MiB）联动。
+    ///
+    /// 变异：把 `KERNEL_WRITE_BACKSTOP_BYTES` 改回 `64 * 1024 * 1024` ⇒ 首条断言红。
+    #[test]
+    fn kernel_backstop_leaves_room_for_debug_builds() {
+        // 实测最大产物 134 MiB；2 GiB 留给它 15× 余量。
+        const LARGEST_MEASURED_ARTIFACT: u64 = 134 * 1024 * 1024;
+        // 经 `max` 绕一道，免得在编译期被折叠成常量断言（clippy 会报 constant value）。
+        let backstop = kernel_write_backstop_bytes(0);
+        assert!(
+            backstop >= LARGEST_MEASURED_ARTIFACT * 8,
+            "粗闸门 {backstop} 对实测最大构建产物 \
+             {LARGEST_MEASURED_ARTIFACT} 余量不足 8× ⇒ 重型构建会被 SIGXFSZ 误杀"
+        );
+
+        // 输出上限取默认值 2 MiB 时，粗闸门仍取 2 GiB（不被小值拖低）。
+        assert_eq!(
+            kernel_write_backstop_bytes(BgLimits::default().max_output_bytes),
+            KERNEL_WRITE_BACKSTOP_BYTES,
+            "粗闸门不得跟随输出上限缩小"
+        );
+
+        // 输出上限**反超**粗闸门时才跟随（两者量纲不同，取大者即可）。
+        assert_eq!(
+            kernel_write_backstop_bytes(4 * 1024 * 1024 * 1024),
+            4 * 1024 * 1024 * 1024,
+            "输出上限更大时应取其自身"
+        );
+
+        // 换算成块数后**不得为 0**（`ulimit -f 0` 的语义是「不许写任何文件」）。
+        assert!(
+            kernel_write_backstop_blocks(BgLimits::default().max_output_bytes) > 0,
+            "块数不得为 0"
+        );
     }
 
     /// 等一条目离开 `Running`（最多 6s）—— 子进程退出有竞态，不能假设立即可见。

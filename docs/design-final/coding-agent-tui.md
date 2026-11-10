@@ -1813,10 +1813,10 @@ beta
 | 闸门 | 值 | 归因措辞 | 落点 |
 |---|---|---|---|
 | **精确闸门** | **2 MiB** | 「harness 的输出上限」 | sweeper 的 `stat`（`BackgroundTasks::sweep`）⇒ 命中即**杀进程组 + 记失败** |
-| **粗闸门** | `max(2 MiB, 64 MiB)` | 「内核 SIGXFSZ」 | 启动命令时的 `ulimit -f`（内核侧文件写入上限） |
+| **粗闸门** | `max(2 MiB, 2 GiB)` | 「内核 SIGXFSZ」 | 启动命令时的 `ulimit -f`（内核侧文件写入上限） |
 
 ⚠ **`ulimit -f` 是进程级上限，不是「本命令的输出上限」** ⇒ 取 2 MiB 会把
-`cargo build` 写 `target/` 的正常构建一起杀掉 ⇒ 粗闸门取 `max(2 MiB, 64 MiB)`，
+`cargo build` 写 `target/` 的正常构建一起杀掉 ⇒ 粗闸门取 `max(2 MiB, 2 GiB)`，
 精确的 2 MiB 由 sweeper 的 `stat` 闸门负责。
 
 ### 19.7 展示裁剪（`ys_tool::head_tail`）

@@ -71,9 +71,13 @@ pub fn default_log_path() -> Option<PathBuf> {
     Some(log_dir()?.join("yushan.log"))
 }
 
-/// 追加一条日志到默认路径。
+/// 穿通默认路径追加一条日志。
 ///
-/// 路径不可得（无 HOME）时静默返回 —— 日志永远不该成为失败的来源。
+/// 路径不可得（无 `HOME`）时静默返回 —— 日志永远不该成为失败的来源。
+///
+/// **每次调用都会解析一次路径**，故**不可**用在并发写入者共享进程环境变量的场合
+/// （测试里多个 harness 各自改写 `YUSHAN_LOG_DIR`）。回合内的写入点一律走
+/// [`log_to`] 配 [`Config::log_path`] 冻结下来的路径，不读环境变量。
 pub fn log(msg: &str) {
     if let Some(path) = default_log_path() {
         log_to(&path, msg);

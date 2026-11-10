@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use ys_component::{
@@ -250,6 +250,19 @@ pub struct Config {
     /// 由 [`Config::load_user_config`] 写入，经 [`Config::context_window`] /
     /// [`Config::compact_policy`] 读出（`main.rs` 装配进 `RunLimits`）。
     user_config: UserConfig,
+    /// 诊断日志文件路径，在**装配期解析一次**后随 `Config` 传递。
+    ///
+    /// # 为什么不是写入时再解析
+    ///
+    /// `YUSHAN_LOG_DIR` 是**进程级可变状态**：写入点若每次 `getenv`，两条并发的
+    /// 回合（测试里由 harness 各自改写该变量）就会互相错位 —— 一方按自己的配置
+    /// 放锁、另一方仍在写，日志于是落进**别人的**目录。
+    ///
+    /// 冻结到 `Config` 之后，日志落点只取决于「谁装配了这个 `Config`」，写入点
+    /// 不再读任何环境变量；持有它的回合无论何时写，都写回自己的目录。
+    ///
+    /// `None` = 解析不出目录（无 `HOME` 且无覆盖）⇒ 静默不落盘。
+    log_path: Option<PathBuf>,
     model_factory: Option<ModelFactory>,
     model_factory_for: Option<ModelFactoryFor>,
 }
@@ -268,9 +281,13 @@ impl Config {
         // （`YUSHAN_API_BASE` + `YUSHAN_API_KEY` 直连时）。
         let model = std::env::var("YUSHAN_MODEL").unwrap_or_default();
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-        let reasoning_effort =
-            parse_reasoning_effort(std::env::var("YUSHAN_REASONING_EFFORT").ok().as_deref())
-                .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_string()));
+        // 日志落点先定：下面的 `reasoning_effort` 校验可能要落一行诊断（理由见 `log_path` 字段）。
+        let log_path = crate::logging::default_log_path();
+        let reasoning_effort = parse_reasoning_effort(
+            std::env::var("YUSHAN_REASONING_EFFORT").ok().as_deref(),
+            log_path.as_deref(),
+        )
+        .or_else(|| Some(DEFAULT_REASONING_EFFORT.to_string()));
 
         Ok(Self {
             api_base,
@@ -284,9 +301,21 @@ impl Config {
             skills_omitted: 0,
             reasoning_effort,
             user_config: UserConfig::default(),
+            log_path,
             model_factory: None,
             model_factory_for: None,
         })
+    }
+
+    /// 诊断日志文件的落点（装配期冻结，见 `log_path` 字段）。
+    pub(crate) fn log_path(&self) -> Option<&Path> {
+        self.log_path.as_deref()
+    }
+
+    /// 只改日志落点 —— 仅测试与恢复路径需要（生产落点由 [`Config::from_env`] 一次定死）。
+    #[cfg(test)]
+    pub(crate) fn set_log_path(&mut self, path: Option<PathBuf>) {
+        self.log_path = path;
     }
 
     pub fn is_configured(&self) -> bool {
@@ -455,10 +484,13 @@ impl Config {
                 "1" | "true" | "yes" | "on" => return true,
                 "0" | "false" | "no" | "off" => return false,
                 other => {
-                    crate::logging::log(&format!(
-                        "ignoring {FOLLOW_UP_ON_COMMIT_ENV}={other}: \
+                    crate::log_line(
+                        self.log_path.as_deref(),
+                        &format!(
+                            "ignoring {FOLLOW_UP_ON_COMMIT_ENV}={other}: \
                          expected 1/true/yes/on or 0/false/no/off"
-                    ));
+                        ),
+                    );
                 }
             }
         }
@@ -533,11 +565,14 @@ impl Config {
             Ok(data) => data,
             Err(_) => return,
         };
-        match parse_user_config(&data) {
+        match parse_user_config(&data, self.log_path.as_deref()) {
             Ok(user) => self.user_config = user,
             // 库内部诊断 → 日志文件（设计 §5）：启动期 TUI 可能已起屏，
             // stderr 会冲掉整屏，而这里没有「历史输出」可看。
-            Err(e) => crate::logging::log(&format!("failed to parse config.json: {e}")),
+            Err(e) => crate::log_line(
+                self.log_path.as_deref(),
+                &format!("failed to parse config.json: {e}"),
+            ),
         }
     }
 
@@ -661,7 +696,7 @@ impl Config {
 /// 它不经 `reasoning_effort` 下发（那是强度字段，`off` 在多数端点上是非法值），
 /// 而是经 `Config::disable_thinking` 落到 `thinking` 开关。
 /// 若这里不收 `off`，该变量就无法表达关闭思考 —— 而 `/effort off` 能，两者会不一致。
-fn parse_reasoning_effort(value: Option<&str>) -> Option<String> {
+fn parse_reasoning_effort(value: Option<&str>, log_path: Option<&Path>) -> Option<String> {
     let value = value?.trim().to_ascii_lowercase();
     if value.is_empty() {
         return None;
@@ -672,16 +707,22 @@ fn parse_reasoning_effort(value: Option<&str>) -> Option<String> {
     ) {
         Some(value)
     } else {
-        crate::logging::log(&format!(
-            "ignoring YUSHAN_REASONING_EFFORT: expected off|minimal|low|medium|high|xhigh|max, got {value}"
-        ));
+        crate::log_line(
+            log_path,
+            &format!(
+                "ignoring YUSHAN_REASONING_EFFORT: expected off|minimal|low|medium|high|xhigh|max, got {value}"
+            ),
+        );
         None
     }
 }
 
 /// 解析 + 校验 `config.json` 文本。`Err` 仅表示**整份** JSON 畸形；
 /// 单条非法由本函数**就地丢弃 + 落日志**，不进 `Err`。
-fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
+///
+/// `log_path` = 该 `Config` 装配期冻结的日志落点（见 [`Config::log_path`]）；
+/// 单条非法的诊断属于这份 `Config`，**不**回退到现读环境变量。
+fn parse_user_config(data: &str, log_path: Option<&Path>) -> Result<UserConfig, serde_json::Error> {
     let raw: RawUserConfig = serde_json::from_str(data)?;
     let mut user = UserConfig::default();
 
@@ -692,45 +733,66 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
             Some(window) if window > 0 => {
                 user.windows.insert(model, window);
             }
-            _ => crate::logging::log(&format!(
-                "ignoring config.json context_window[\"{model}\"]: \
+            _ => crate::log_line(
+                log_path,
+                &format!(
+                    "ignoring config.json context_window[\"{model}\"]: \
                  expected a positive integer, got {value}"
-            )),
+                ),
+            ),
         }
     }
 
-    user.trigger_ratio = sanitize_ratio("trigger_ratio", raw.compaction.trigger_ratio);
-    user.keep_ratio = sanitize_ratio("keep_ratio", raw.compaction.keep_ratio);
+    user.trigger_ratio = sanitize_ratio("trigger_ratio", raw.compaction.trigger_ratio, log_path);
+    user.keep_ratio = sanitize_ratio("keep_ratio", raw.compaction.keep_ratio, log_path);
 
     // 标量：正整数（0 会让轮数上限立刻到顶 / 预算立刻到点，一并按非法处理）。
-    user.max_rounds = sanitize_uint("max_rounds", raw.max_rounds, 1u32);
-    user.max_turn_duration_secs =
-        sanitize_uint("max_turn_duration_secs", raw.max_turn_duration_secs, 1u64);
+    user.max_rounds = sanitize_uint("max_rounds", raw.max_rounds, 1u32, log_path);
+    user.max_turn_duration_secs = sanitize_uint(
+        "max_turn_duration_secs",
+        raw.max_turn_duration_secs,
+        1u64,
+        log_path,
+    );
 
     // 三项都允许 0：`context_cap_tokens = 0` 表示不封顶，两个提醒阈值 0 表示关闭，
     // 都是显式语义而非「非法值」。故下限传 0，不沿用上面「0 立即到顶」的判据。
-    user.context_cap_tokens = sanitize_uint("context_cap_tokens", raw.context_cap_tokens, 0usize);
+    user.context_cap_tokens = sanitize_uint(
+        "context_cap_tokens",
+        raw.context_cap_tokens,
+        0usize,
+        log_path,
+    );
     user.batch_nudge_at_tool_calls = sanitize_uint(
         "batch_nudge_at_tool_calls",
         raw.batch_nudge_at_tool_calls,
         0usize,
+        log_path,
     );
-    user.soft_round_advice_at =
-        sanitize_uint("soft_round_advice_at", raw.soft_round_advice_at, 0usize);
+    user.soft_round_advice_at = sanitize_uint(
+        "soft_round_advice_at",
+        raw.soft_round_advice_at,
+        0usize,
+        log_path,
+    );
     user.stream_interrupt_retries = sanitize_uint(
         "stream_interrupt_retries",
         raw.stream_interrupt_retries,
         0u32,
+        log_path,
     );
 
     // 布尔开关：`as_bool` 挡下字符串（`"yes"` 不等于 `true`）、数字与 null。
     user.follow_up_on_commit = raw.follow_up_on_commit.and_then(|v| match v.as_bool() {
         Some(flag) => Some(flag),
         None => {
-            crate::logging::log(&format!(
-                "ignoring config.json follow_up_on_commit: \
+            crate::log_line(
+                log_path,
+                &format!(
+                    "ignoring config.json follow_up_on_commit: \
                  expected a boolean, got {v}"
-            ));
+                ),
+            );
             None
         }
     });
@@ -743,6 +805,7 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
         "model_retry.max_attempts",
         raw.model_retry.max_attempts,
         0u32,
+        log_path,
     ) {
         retry.max_attempts = n;
     }
@@ -750,6 +813,7 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
         "model_retry.base_delay_ms",
         raw.model_retry.base_delay_ms,
         0u64,
+        log_path,
     ) {
         retry.base_delay_ms = n;
     }
@@ -757,6 +821,7 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
         "model_retry.max_delay_ms",
         raw.model_retry.max_delay_ms,
         0u64,
+        log_path,
     ) {
         retry.max_delay_ms = n;
     }
@@ -767,10 +832,16 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
         "model_timeout.connect_secs",
         raw.model_timeout.connect_secs,
         1u64,
+        log_path,
     ) {
         timeout.connect_secs = n;
     }
-    if let Some(n) = sanitize_uint("model_timeout.idle_secs", raw.model_timeout.idle_secs, 1u64) {
+    if let Some(n) = sanitize_uint(
+        "model_timeout.idle_secs",
+        raw.model_timeout.idle_secs,
+        1u64,
+        log_path,
+    ) {
         timeout.idle_secs = n;
     }
     user.model_timeout = timeout;
@@ -786,7 +857,12 @@ fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
 /// `as_u64()` 同时挡下负值、浮点、字符串、布尔、对象、数组；再与 `min` 比较。
 /// `None` 入参（未给）**静默**返回 `None`；给了值但非法则落一行日志并返回 `None`，
 /// 于是**只丢该条**，同文件其余条目照常生效（照 [`sanitize_ratio`] 的宽容语义）。
-fn sanitize_uint<T>(path: &str, value: Option<serde_json::Value>, min: T) -> Option<T>
+fn sanitize_uint<T>(
+    path: &str,
+    value: Option<serde_json::Value>,
+    min: T,
+    log_path: Option<&Path>,
+) -> Option<T>
 where
     T: TryFrom<u64> + PartialOrd + std::fmt::Display,
 {
@@ -794,10 +870,13 @@ where
     match value.as_u64().and_then(|n| T::try_from(n).ok()) {
         Some(n) if n >= min => Some(n),
         _ => {
-            crate::logging::log(&format!(
-                "ignoring config.json {path}: \
+            crate::log_line(
+                log_path,
+                &format!(
+                    "ignoring config.json {path}: \
                  expected an integer >= {min}, got {value}"
-            ));
+                ),
+            );
             None
         }
     }
@@ -807,15 +886,22 @@ where
 ///
 /// 上界取 1.0 而非 `< 1.0`：`trigger_ratio = 1.0`（用满窗口才压）是合法意图，
 /// 且 `CompactPolicy::trigger_at` 自己会用 `output_reserve` 钳住，不会溢出。
-fn sanitize_ratio(key: &str, value: Option<serde_json::Value>) -> Option<f64> {
+fn sanitize_ratio(
+    key: &str,
+    value: Option<serde_json::Value>,
+    log_path: Option<&Path>,
+) -> Option<f64> {
     let value = value?;
     match value.as_f64() {
         Some(ratio) if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 => Some(ratio),
         _ => {
-            crate::logging::log(&format!(
-                "ignoring config.json compaction.{key}: \
+            crate::log_line(
+                log_path,
+                &format!(
+                    "ignoring config.json compaction.{key}: \
                  expected a ratio in (0, 1], got {value}"
-            ));
+                ),
+            );
             None
         }
     }
@@ -827,6 +913,13 @@ mod tests {
     use crate::provider::ApiModel;
     use crate::test_env::{EnvRestore, env_lock};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 测试侧入口：本模块只验**解析结果**，诊断行不该落盘（`None` = 不落）。
+    ///
+    /// 生产侧一律显式传 [`Config::log_path`]，因此这条包装只在 `cfg(test)` 下存在。
+    fn parse_user_config(data: &str) -> Result<UserConfig, serde_json::Error> {
+        super::parse_user_config(data, None)
+    }
 
     /// 直接构造 `Config`（不经 `from_env`）：本模块的配置解析测试**不读环境变量**，
     /// 因而不必持 `env_lock` —— 与改写 env 的测试零竞争。
@@ -843,6 +936,7 @@ mod tests {
             skills_omitted: 0,
             reasoning_effort: None,
             user_config: UserConfig::default(),
+            log_path: None,
             model_factory: None,
             model_factory_for: None,
         }
@@ -887,6 +981,22 @@ mod tests {
                 std::env::remove_var(key);
             }
         }
+        env
+    }
+
+    /// 把 `YUSHAN_LOG_DIR` 钉在本次调用专属的临时目录（须在 env_lock 下调用）。
+    ///
+    /// `Config::from_env` 在装配期就定死日志落点，而这些用例故意喂非法值以验证
+    /// 回落 —— 诊断行会真的落盘。不钉住就会污染开发机的 `~/.yushan/logs`。
+    fn pin_log_dir() -> EnvRestore {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("yushan_cfg_logs_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV]);
+        // SAFETY: 调用方持有 env_lock。
+        unsafe { std::env::set_var(crate::logging::LOG_DIR_ENV, &dir) };
         env
     }
 
@@ -944,6 +1054,7 @@ mod tests {
     fn reasoning_effort_is_optional_and_validated() {
         let _guard = env_lock();
         let _env = clear_api_env();
+        let _log = pin_log_dir();
 
         // SAFETY: 持有 env_lock。
         unsafe { std::env::set_var("YUSHAN_REASONING_EFFORT", " LoW ") };

@@ -752,10 +752,11 @@ pub(crate) fn emit_observation(
     session_id: &str,
     turn: Option<u32>,
     observation: round_clock::RoundObservation,
+    log_path: Option<&Path>,
 ) {
     let round_clock::RoundObservation { lines, records } = observation;
     for line in lines {
-        logging::log(&line);
+        log_line(log_path, &line);
     }
     for record in records {
         let DebugRecord {
@@ -783,18 +784,29 @@ pub(crate) fn observe_event(
     clock: &mut RoundClock,
     env: &Envelope,
     session_id: &str,
+    log_path: Option<&Path>,
 ) {
     match debug {
         Some(sink) => {
             let observation = clock.observe_debug(env, Instant::now());
-            emit_observation(sink, session_id, Some(env.turn), observation);
+            emit_observation(sink, session_id, Some(env.turn), observation, log_path);
             record_special_event(sink, session_id, env);
         }
         None => {
             for line in clock.observe(env, Instant::now()) {
-                logging::log(&line);
+                log_line(log_path, &line);
             }
         }
+    }
+}
+
+/// 落一行诊断日志到**装配期冻结**的路径。
+///
+/// 路径不可得时静默跳过 —— 与 [`logging::log_to`] 的 best-effort 语义一致；
+/// **不**回退到环境变量：那样会退回「谁现改环境、日志就落进谁家」的错位。
+pub(crate) fn log_line(log_path: Option<&Path>, line: &str) {
+    if let Some(path) = log_path {
+        logging::log_to(path, line);
     }
 }
 
@@ -1153,6 +1165,7 @@ async fn consume_events<W, F>(
     mut on_event: F,
     mut debug: Option<DebugTap<'_>>,
     turn: u32,
+    log_path: Option<&Path>,
 ) -> io::Result<ConsumeOutcome>
 where
     W: Write,
@@ -1177,12 +1190,18 @@ where
         match debug.as_mut() {
             Some(tap) => {
                 let observation = clock.observe_debug(&env, Instant::now());
-                emit_observation(tap.sink, tap.session_id, Some(env.turn), observation);
+                emit_observation(
+                    tap.sink,
+                    tap.session_id,
+                    Some(env.turn),
+                    observation,
+                    log_path,
+                );
                 record_special_event(tap.sink, tap.session_id, &env);
             }
             None => {
                 for line in clock.observe(&env, Instant::now()) {
-                    logging::log(&line);
+                    log_line(log_path, &line);
                 }
             }
         }
@@ -1192,7 +1211,7 @@ where
         if is_terminal(&env.event) {
             // 兜底：终局事件没能关闭某轮（理论上不会）时仍落一行。
             for line in clock.take_lines() {
-                logging::log(&line);
+                log_line(log_path, &line);
             }
             return Ok(ConsumeOutcome {
                 rounds: observed_rounds,
@@ -1203,7 +1222,7 @@ where
         }
     }
     for line in clock.take_lines() {
-        logging::log(&line);
+        log_line(log_path, &line);
     }
     // 信道关闭前没见到终局事件 ⇒ 事件流被截断。仍正常返回（由调用方决定如何
     // 降级），但 `terminal = false` 必须带出去 —— 默认当“已收全”会让调用方
@@ -2241,14 +2260,15 @@ async fn run_single_turn(
     // **只在成功路径落**：失败回合拿不到 `RunResult`，写 `rounds=0` 会把「没跑到」与
     // 「跑了 N 轮才失败」混同 —— 那一回合的轮数由逐轮行给出（见 `crate::round_clock`）。
     if let Ok(r) = &outcome {
-        logging::log(&round_clock::turn_line(
+        let line = round_clock::turn_line(
             1,
             r.rounds,
             started.elapsed(),
             r.rounds,
             deadline.saturating_duration_since(Instant::now()),
             round_clock::turn_cache(&outcome),
-        ));
+        );
+        log_line(config.and_then(|c| c.log_path()), &line);
     }
     outcome
 }
@@ -2270,6 +2290,7 @@ async fn consume_print_events<W: Write>(
     debug: Option<&mut DebugSink>,
     session_id: &str,
     turn: u32,
+    log_path: Option<&Path>,
 ) -> io::Result<(bool, ConsumeOutcome)> {
     let mut buf = PrintBuffer::default();
     let tap = debug.map(|sink| DebugTap { sink, session_id });
@@ -2292,6 +2313,7 @@ async fn consume_print_events<W: Write>(
         },
         tap,
         turn,
+        log_path,
     )
     .await?;
     if !consumed.terminal {
@@ -2508,7 +2530,14 @@ async fn run_print_mode(
                     signal: sigterm.as_mut(),
                 },
             ),
-            consume_print_events(rx, io::stdout(), debug.as_deref_mut(), session_id, turn),
+            consume_print_events(
+                rx,
+                io::stdout(),
+                debug.as_deref_mut(),
+                session_id,
+                turn,
+                config.log_path(),
+            ),
         );
 
         // 失败回合没有 `RunResult` ⇒ 轮数取事件流累计（成功时仍以 `RunResult` 为准）。
@@ -2691,6 +2720,7 @@ async fn run_json_mode(
                     .as_deref_mut()
                     .map(|sink| DebugTap { sink, session_id }),
                 turn,
+                config.log_path(),
             ),
         );
 
@@ -3964,6 +3994,63 @@ mod tests {
         dir
     }
 
+    /// `log_line` 只写**传入的**路径，绝不回头读 `YUSHAN_LOG_DIR`。
+    ///
+    /// 钉住的是并发错位：调用方对环境的独占只覆盖装配那一小段，写入往往发生在之后
+    /// （回合末、后台回收、延迟唤醒）。若写入点自己 `getenv`，那时环境可能已被别的
+    /// 线程改掉 ⇒ 本会话的诊断行落进别人的目录。本用例把环境指向 `bait`、把冻结路径
+    /// 给 `frozen`，两个目录里应该只出现 `frozen` 那一行。
+    ///
+    /// 变异：`log_line` 改回 `logging::log(line)` ⇒ `bait` 多出一行，首条断言变红。
+    #[test]
+    fn log_line_writes_only_the_frozen_path() {
+        let _guard = env_lock();
+        let frozen = unique_tmp_dir("log_frozen");
+        let bait = unique_tmp_dir("log_bait");
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var(crate::logging::LOG_DIR_ENV, &bait) };
+
+        let target = frozen.join("yushan.log");
+        log_line(Some(&target), "frozen-line");
+
+        let written = std::fs::read_to_string(&target).unwrap_or_default();
+        assert!(
+            written.contains("frozen-line"),
+            "冻结路径应收到这一行：{written}"
+        );
+        let leaked = std::fs::read_to_string(bait.join("yushan.log")).unwrap_or_default();
+        assert!(
+            !leaked.contains("frozen-line"),
+            "写入点不得回头读环境变量（泄漏进了 {bait:?}）：{leaked}"
+        );
+
+        let _ = std::fs::remove_dir_all(&frozen);
+        let _ = std::fs::remove_dir_all(&bait);
+    }
+
+    /// `log_line(None, ..)` 静默跳过：不从环境变量兜底（否则「不落诊断」这个
+    /// 契约就无法表达，测试也就无法真正隔离日志）。
+    ///
+    /// 变异：`None` 分支改成 `logging::log(line)` ⇒ `None` 也写进 `YUSHAN_LOG_DIR`，变红。
+    #[test]
+    fn log_line_none_writes_nothing() {
+        let _guard = env_lock();
+        let bait = unique_tmp_dir("log_none");
+        let _env = EnvRestore::capture(&[crate::logging::LOG_DIR_ENV]);
+        // SAFETY: 持有 env_lock。
+        unsafe { std::env::set_var(crate::logging::LOG_DIR_ENV, &bait) };
+
+        log_line(None, "should-not-appear");
+
+        let leaked = std::fs::read_to_string(bait.join("yushan.log")).unwrap_or_default();
+        assert!(
+            !leaked.contains("should-not-appear"),
+            "`None` 表示不落诊断，不得回退到环境变量：{leaked}"
+        );
+        let _ = std::fs::remove_dir_all(&bait);
+    }
+
     /// 在 `dir` 下写一个**超龄**（mtime = 8 天前）且名字**符合落盘命名形状**
     /// （`<slug>-<16hex>.md`）的文件，返回其路径。
     ///
@@ -4668,7 +4755,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
+            consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None),
         )
         .await;
 
@@ -4724,7 +4811,7 @@ mod tests {
                         signal: None,
                     }
                 ),
-                consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
+                consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None),
             )
         })
         .await;
@@ -4775,11 +4862,16 @@ mod tests {
         let mut wiring = Wiring::ephemeral(Some(Box::new(model)), Box::new(sink));
 
         let mut observed_rounds = 0u32;
+        // 诊断日志钉在临时目录：`Config::from_env` 会按开发机的 `$HOME`
+        // 解出真实 `yushan.log`，不改就会把本用例的逐轮读数写进开发者日志。
+        let log_dir = unique_tmp_dir("print_two_turns");
         // `from_env` 会 `getenv` 凭证 key，须与并发改写 env 的测试串行。
         // 追问开关默认**关** ⇒ 本用例的第二回合只可能来自清单判据。
         let config = {
             let _guard = crate::test_env::env_lock();
-            config::Config::from_env().unwrap()
+            let mut c = config::Config::from_env().unwrap();
+            c.set_log_path(Some(log_dir.join("yushan.log")));
+            c
         };
 
         // 超时即失败：真挂死时不要等到 CI 杀进程（那样看不出是哪一步挂的）。
@@ -5001,7 +5093,7 @@ mod tests {
         let mut out = CountingWriter::default();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(&mut rx, &mut out, None, "test-session", 1),
+            consume_print_events(&mut rx, &mut out, None, "test-session", 1, None),
         )
         .await;
 
@@ -5043,7 +5135,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(&mut rx, &mut out, None, "test-session", 1),
+            consume_print_events(&mut rx, &mut out, None, "test-session", 1, None),
         )
         .await
         .expect("信道关闭 ⇒ 应立即返回，不得挂起")
@@ -5085,7 +5177,7 @@ mod tests {
         let mut failed_out: Vec<u8> = Vec::new();
         let (printed_any, _) = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(&mut rx, &mut failed_out, None, "test-session", 1),
+            consume_print_events(&mut rx, &mut failed_out, None, "test-session", 1, None),
         )
         .await
         .expect("RunFailed 是终局事件，应即返回")
@@ -5110,7 +5202,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let (printed_any, _) = tokio::time::timeout(
             Duration::from_secs(5),
-            consume_print_events(&mut rx, &mut out, None, "test-session", 1),
+            consume_print_events(&mut rx, &mut out, None, "test-session", 1, None),
         )
         .await
         .expect("应收到终局事件即返回")
@@ -5162,7 +5254,7 @@ mod tests {
                     signal: None,
                 }
             ),
-            consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
+            consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None),
         );
         run_result.expect("run_turn 应成功");
         consume_result.expect("consume 应成功");
@@ -5293,7 +5385,7 @@ mod tests {
                         signal: None,
                     }
                 ),
-                consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
+                consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None),
             )
         })
         .await;
@@ -5863,7 +5955,7 @@ mod tests {
         tx.send(env(finished())).await.unwrap();
 
         let mut out: Vec<u8> = Vec::new();
-        let consumed = consume_events(&mut rx, &mut out, write_json_envelope, None, 7)
+        let consumed = consume_events(&mut rx, &mut out, write_json_envelope, None, 7, None)
             .await
             .unwrap();
 
@@ -5923,7 +6015,7 @@ mod tests {
                         signal: None,
                     }
                 ),
-                consume_print_events(&mut rx, &mut stdout, None, "test-session", 1),
+                consume_print_events(&mut rx, &mut stdout, None, "test-session", 1, None),
             )
         })
         .await
@@ -7328,7 +7420,7 @@ mod tests {
         tx.send(env(delta("a"))).await.unwrap();
         tx.send(env(finished())).await.unwrap();
         let mut out: Vec<u8> = Vec::new();
-        consume_events(&mut rx, &mut out, write_json_envelope, None, 1)
+        consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None)
             .await
             .unwrap();
 
@@ -7406,7 +7498,7 @@ mod tests {
             }
             drop(tx);
             let mut out: Vec<u8> = Vec::new();
-            consume_events(&mut rx, &mut out, write_json_envelope, None, 1)
+            consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None)
                 .await
                 .unwrap();
             out
@@ -7453,7 +7545,7 @@ mod tests {
         tx.send(env(finished())).await.unwrap();
         drop(tx);
         let mut out: Vec<u8> = Vec::new();
-        consume_events(&mut rx, &mut out, write_json_envelope, None, 1)
+        consume_events(&mut rx, &mut out, write_json_envelope, None, 1, None)
             .await
             .unwrap();
         let finished_line = String::from_utf8(out)

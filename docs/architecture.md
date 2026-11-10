@@ -705,7 +705,7 @@ TUI 起屏后 stderr/stdout 会冲掉整屏，故按**时机**三分（解 revie
 | **启动期**（TUI 未起） | 容量 clamp 警告、`No model configured` | **stderr**（照旧） |
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
 | **退出时** | `session: <id>`（TUI 退出**摘要写回主屏之后**写 stderr；`-p` / `--json` 收尾） | **stderr**，但**仅当 stdout 是终端** |
-| **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
+| **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log`（落点在**装配期**冻结进 `Config::log_path`，写入点不再读环境变量） |
 | **debug 运行期间（默认开启）** | 结构化执行记录（`run_start` / `turn_*` / `round_*` / 工具元数据 / 逐轮 usage / 回合读数） | **独立 JSONL 文件** `~/.yushan/logs/debug-<session>.jsonl`（或 `YUSHAN_LOG_DIR`）；**不占 stdout / stderr** |
 
 **异常是唯一的例外**：一次性模式（`-p` / `--json`）的 stderr 正常路径**完全为空**；

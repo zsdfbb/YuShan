@@ -423,6 +423,19 @@ turn 进行中照常显示输入缓冲与光标（键入立即可见，`Enter` �
 | **命令期间**（有 TUI） | `/login` 的 "✓ Logged in…"、"Warning: Could not persist credentials" 等 | **`Outbound::Output`** → transcript |
 | **库内部 / 随时** | `auth.json` / `state.json` 解析失败 | **日志文件** `~/.yushan/logs/yushan.log` |
 
+> **日志落点在装配期冻结**：`Config::from_env` 调一次 `logging::default_log_path()`
+> （读 `YUSHAN_LOG_DIR`），结果存进 `Config::log_path`；此后所有写入点收的是这条
+> **已定下的路径**（`crate::log_line(..)` / `logging::log_to(..)`），没有任何写入点在
+> 追加时才去 `getenv`。
+>
+> 理由是并发安全：`getenv` 读的是**进程级可变状态**，而调用方对它的独占往往只覆盖
+> 「装配」这一小段。若写入发生在装配之后（回合末、后台回收、延迟唤醒），那时环境可能
+> 已被别的线程改写 ⇒ 本会话的诊断行落进**别人的**目录。冻结路径把这个时间窗彻底删掉：
+> 一架 `Config` 对应一条路径，与「谁先跑、谁后跑」无关。
+>
+> 推论：`Config::log_path == None` 表示**这份配置不落诊断**（安静语义，不回头读环境
+> 兜底）。测试要隔离日志只需给自己那份 `Config` 换一条临时路径。
+
 > **降级提示在 TUI 模式下为什么不走 stderr**：起屏**之前**写到 stderr 的行会留在终端的主屏
 > 缓冲区里；TUI 用 alt-screen 盖住它们，退出时主屏还原 —— 于是它们又回到屏幕上，成为**退出后的
 > 残渣**（与「对话回放到 scrollback」叠加，看起来像 app 又打了一遍启动横幅）。故 TUI 模式改投
@@ -1239,6 +1252,8 @@ span 级 `fg` 覆写成 `palette.fg`，那样判据对代码行与正文同样�
   `/new` / `/resume` 的后续路径都消费同一结果；路径为 `path/debug-<session stem>.jsonl`
   （`YUSHAN_LOG_DIR` 一次覆盖日志与 debug 两个产物）；会话尚未落盘时为
   `debug-<pid>-<unix_ms>.jsonl`。追加写。
+  同一次启动里 `yushan.log` 的落点走**同一套冻结规则**（`Config::log_path`，见 §7）：
+  debug 产物与文本行必然同目录，不会因两次 `getenv` 之间环境变化而分家。
 - 显式关闭时 `open_enabled` 返回 `None`：**不创建 debug 文件、writer 线程或 sink**。
   正常启动仍会在 help / 进程级 worktree 早退之后解析一次 `LogDir`，并对 `Default` 目录
   执行启动期 sweep；`help` 与进程级 `worktree create/list/remove` 在创建 sink 前早退，

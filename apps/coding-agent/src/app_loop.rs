@@ -751,7 +751,7 @@ pub async fn run(
                 // `set_context_window` / `run_turn` 一字未动）。位置必须在
                 // `run_turn_once` 之前：展开后的正文才是本回合真正的输入。
                 // **只作用于用户原文** —— 复核消息由 `should_review` 直接产出、不再展开。
-                let message = expand_skill_invocation(message, &config.skills);
+                let message = expand_skill_invocation(message, &config.skills, config.log_path());
 
                 // **回合边界 · 清单注入**（`docs/arch/long-horizon-todo/design.md` §7.3）：
                 // 在**回合之前**把当前清单推进上下文，使本回合的每一轮都看得见它。
@@ -1148,7 +1148,10 @@ pub async fn run(
                         .await
                         {
                             None => {
-                                logging::log(&format!("login {base}: cancelled by user (Esc)"));
+                                crate::log_line(
+                                    config.log_path(),
+                                    "Login cancelled by user (Esc) — nothing changed",
+                                );
                                 lines = vec!["Login cancelled. Nothing was changed.".to_string()];
                             }
                             Some(fetched) => {
@@ -1161,15 +1164,24 @@ pub async fn run(
                                         Some(config.registry.filter_catalog(&base, models))
                                     }
                                     FetchModelsResult::Success(_) => {
-                                        logging::log(&format!("login {base}: empty model list"));
+                                        crate::log_line(
+                                            config.log_path(),
+                                            &format!("login {base}: empty model list"),
+                                        );
                                         None
                                     }
                                     FetchModelsResult::AuthError(e) => {
-                                        logging::log(&format!("login {base}: auth error: {e}"));
+                                        crate::log_line(
+                                            config.log_path(),
+                                            &format!("login {base}: auth error: {e}"),
+                                        );
                                         None
                                     }
                                     FetchModelsResult::NetworkError(e) => {
-                                        logging::log(&format!("login {base}: network error: {e}"));
+                                        crate::log_line(
+                                            config.log_path(),
+                                            &format!("login {base}: network error: {e}"),
+                                        );
                                         None
                                     }
                                 };
@@ -1681,6 +1693,12 @@ struct TurnCtx<'a> {
     debug: Option<&'a mut DebugSink>,
     /// 当前会话 id（debug 记录的 `session_id`；`/new` / `/resume` 后由外层刷新）。
     debug_session_id: &'a str,
+    /// 本请求的诊断日志落点（**装配期冻结**，见 [`Config::log_path`]）。
+    ///
+    /// 回合末要落两行读数，而回合的寿命可能跨越测试里别的 harness 改写
+    /// `YUSHAN_LOG_DIR` 的时间窗 —— 路径取自 `Config` 而不是现读环境变量，
+    /// 所以无论何时落，写的都是自己那份。
+    log_path: Option<PathBuf>,
 }
 
 /// 一个回合的结局：`Ok` 是本回合的 `RunResult`，`Err` 是模型 / 工具失败
@@ -1877,6 +1895,7 @@ async fn run_turn_chain(
         subagent_totals,
         debug,
         debug_session_id,
+        log_path: config.log_path().map(Path::to_path_buf),
     };
     // 外层 `Err` = UI 已收摊（出站失败）：先收尾 debug 再退出；
     // 内层 `TurnOutcome` 的 `Err` 只是本回合模型/工具失败，app 继续。
@@ -1910,7 +1929,10 @@ async fn run_turn_chain(
                     )
                     .await
                     {
-                        logging::log(&format!("failed to persist session meta: {e}"));
+                        crate::log_line(
+                            ctx.config.log_path(),
+                            &format!("failed to persist session meta: {e}"),
+                        );
                     }
                 }
                 // `BasicLoop` 在返回错误前已发 `RunFailed` —— UI 已经看到
@@ -1920,7 +1942,10 @@ async fn run_turn_chain(
                 // 执行口径必须包含失败回合，否则「跑失败的时长」凭空消失。
                 Err(e) => {
                     ctx.stats.record_elapsed(ctx.request_started.elapsed());
-                    logging::log(&format!("turn {} failed: {e}", ctx.turns));
+                    crate::log_line(
+                        ctx.config.log_path(),
+                        &format!("turn {} failed: {e}", ctx.turns),
+                    );
                 }
             }
             Ok(outcome)
@@ -2199,6 +2224,7 @@ async fn run_turn_once(
                         &mut clock,
                         &env,
                         ctx.debug_session_id,
+                        ctx.log_path.as_deref(),
                     );
                     send(ctx.out_tx, Outbound::Event(env)).await?;
                 }
@@ -2284,13 +2310,17 @@ async fn run_turn_once(
             &mut clock,
             &env,
             ctx.debug_session_id,
+            ctx.log_path.as_deref(),
         );
         send(ctx.out_tx, Outbound::Event(env)).await?;
     }
     // 兜底：`RoundStarted` 已开轮、终局事件却没跟到（失败路径理论上会发生）时，
     // 仍为那一轮落一行 —— 排障时「跑了但没读数」比「读数为 0」更难查。
-    for line in clock.take_lines() {
-        logging::log(&line);
+    // 落点取**装配期冻结**的路径：此时进程环境可能已被别的 harness 改写。
+    if let Some(path) = ctx.log_path.as_deref() {
+        for line in clock.take_lines() {
+            logging::log_to(path, &line);
+        }
     }
     // 回合级读数：**只进 debug / 日志**（供 bench 与事后分析）；
     // 不占 transcript —— TUI 用户要的是对话，读数在状态栏与 `/status` 里。
@@ -2304,14 +2334,17 @@ async fn run_turn_once(
     *ctx.run_rounds = ctx.run_rounds.saturating_add(rounds);
     ctx.cumulative_rounds = ctx.cumulative_rounds.saturating_add(rounds);
     let remaining = ctx.deadline.saturating_duration_since(Instant::now());
-    logging::log(&turn_line(
+    let line = turn_line(
         *ctx.turns,
         rounds,
         ctx.request_started.elapsed(),
         ctx.cumulative_rounds,
         remaining,
         turn_cache(&outcome),
-    ));
+    );
+    if let Some(path) = ctx.log_path.as_deref() {
+        logging::log_to(path, &line);
+    }
     // 回合末读数行**不经 `Outbound::Output`**：transcript 只装对话与命令输出。
 
     // debug 侧的回合收尾（只进文件，绝不影响上面的文本行）。
@@ -2386,7 +2419,12 @@ async fn run_turn_once(
 /// （`[Text(…), Image, Text(尾巴)]` ⇒ `[Text(信封), Image, Text(尾巴)]`）。
 /// 绝不可把消息重建成「只有展开结果一个 `Text` 块」—— 那会**静默丢图**：用户发
 /// 「`/skill` + 一张截图」时图片在无编译错误、无运行时告警的情况下从上下文里消失。
-fn expand_skill_invocation(message: Message, skills: &[crate::skills::SkillEntry]) -> Message {
+/// `log_path` = 装配期冻结的诊断日志落点（`None` = 不落盘）。
+fn expand_skill_invocation(
+    message: Message,
+    skills: &[crate::skills::SkillEntry],
+    log_path: Option<&Path>,
+) -> Message {
     // skill 调用是**用户输入**的概念：只有 `Role::User` 才展开。harness 注入的输入
     // （后台命令结果等）与用户原文可以长得一样，但它不是用户在敲命令 —— 展开路径
     // 写的是 `Role::User` 的用户发言语义。
@@ -2398,10 +2436,13 @@ fn expand_skill_invocation(message: Message, skills: &[crate::skills::SkillEntry
     };
     match crate::skills::expand_invocation(&text, skills) {
         Some(expanded) => {
-            logging::log(&format!(
-                "skill invocation expanded ({} bytes) for this turn",
-                expanded.len()
-            ));
+            crate::log_line(
+                log_path,
+                &format!(
+                    "skill invocation expanded ({} bytes) for this turn",
+                    expanded.len()
+                ),
+            );
             let mut message = message;
             // 首个 `Text` 块换成展开结果，其余块（图片等）**保持原位**。
             // `first_text` 已确认首块是 `Text`，所以这个循环必然在第一轮命中并 `break`；
@@ -2750,8 +2791,29 @@ mod tests {
         // 并由「启动期一方」写第一条 `run_start`。关闭时 `open_enabled` 早退。
         // 两条路径都必须持锁：`resolve_log_dir` 与 `debug_enabled` 都读环境变量。
         // `env_prelocked` 的调用方**已**持锁（同一把），这里直接取用。
+        //
+        // **诊断输出的落点不看调用方环境**，只有显式占住 `YUSHAN_LOG_DIR` 的
+        // debug 用例除外（它断言文本行与 debug 文件同处，逐字节口径便于对照）。
+        // 其余情况下路径钉在 harness 临时目录：`env_prelocked` 的调用者只锁
+        // 自己的专用变量，不锁 `YUSHAN_LOG_DIR`，且 harness 返回后锁就放开 ——
+        // 写时再 `getenv` 会把本用例的读数行落进**开发机**或别的用例的目录。
+        let log_path = if env_prelocked && debug_flag {
+            crate::logging::log_dir().map(|dir| dir.join("yushan.log"))
+        } else {
+            Some(tmp.0.join("yushan.log"))
+        };
+        config.set_log_path(log_path);
+        let harness_log_dir = crate::logging::LogDir {
+            path: tmp.0.clone(),
+            source: crate::logging::LogDirSource::Override,
+        };
         let mut debug = if env_prelocked {
-            let log_dir = crate::logging::resolve_log_dir();
+            let log_dir = if debug_flag {
+                // debug 开 = 调用方已用 `YUSHAN_LOG_DIR` 占住目录：沿用（与文本行同处）。
+                crate::logging::resolve_log_dir()
+            } else {
+                Some(harness_log_dir)
+            };
             crate::debug_log::open_enabled(debug_flag, wiring.session_path(), log_dir.as_ref())
         } else {
             debug_assert!(!debug_flag, "debug-on 用例必须自行隔离 YUSHAN_LOG_DIR");
@@ -2759,8 +2821,7 @@ mod tests {
             let _env = crate::test_env::EnvRestore::capture(&[crate::debug_log::DEBUG_ENV]);
             // SAFETY: 持有 env_lock；默认关闭 debug 的 harness 不继承开发机环境。
             unsafe { std::env::set_var(crate::debug_log::DEBUG_ENV, "0") };
-            let log_dir = crate::logging::resolve_log_dir();
-            crate::debug_log::open_enabled(false, wiring.session_path(), log_dir.as_ref())
+            crate::debug_log::open_enabled(false, wiring.session_path(), Some(&harness_log_dir))
         };
         if let Some(sink) = debug.as_mut() {
             let session_id = crate::session_id_for(wiring.session_path());
@@ -4817,7 +4878,7 @@ mod tests {
         ] {
             let msg = user_message(text);
             assert_eq!(
-                expand_skill_invocation(msg.clone(), &skills),
+                expand_skill_invocation(msg.clone(), &skills, None),
                 msg,
                 "非 skill 调用必须逐字节不变：{text:?}"
             );
@@ -4825,7 +4886,7 @@ mod tests {
 
         // 有 skill 表但**没有任何 skill**（启动期扫描为空）⇒ 同样不变。
         let msg = user_message("/git-status");
-        assert_eq!(expand_skill_invocation(msg.clone(), &[]), msg);
+        assert_eq!(expand_skill_invocation(msg.clone(), &[], None), msg);
 
         // 首块不是 `Text` ⇒ 不展开（只认纯文本首块的 `/` 命名空间）。
         let tool_first = Message {
@@ -4837,7 +4898,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            expand_skill_invocation(tool_first.clone(), &skills),
+            expand_skill_invocation(tool_first.clone(), &skills, None),
             tool_first
         );
 
@@ -4852,7 +4913,10 @@ mod tests {
             user_invocable: false,
         };
         let msg = user_message("/model-only");
-        assert_eq!(expand_skill_invocation(msg.clone(), &[model_only]), msg);
+        assert_eq!(
+            expand_skill_invocation(msg.clone(), &[model_only], None),
+            msg
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4878,7 +4942,7 @@ mod tests {
         // 与「这个调用本来就没命中」。
         let as_user = user_message("/foo");
         assert_ne!(
-            expand_skill_invocation(as_user.clone(), &skills),
+            expand_skill_invocation(as_user.clone(), &skills, None),
             as_user,
             "测试前提：`/foo` 在 `Role::User` 下确实会被展开"
         );
@@ -4889,7 +4953,7 @@ mod tests {
                 text: "/foo".to_string(),
             }],
         };
-        let out = expand_skill_invocation(harness.clone(), &skills);
+        let out = expand_skill_invocation(harness.clone(), &skills, None);
         assert_eq!(out, harness, "harness 输入必须逐字节原样返回");
         assert_eq!(out.role, Role::Harness, "角色不得被改写成 `User`");
 
@@ -4936,7 +5000,7 @@ mod tests {
             ],
         };
 
-        let out = expand_skill_invocation(msg, &skills);
+        let out = expand_skill_invocation(msg, &skills, None);
         assert_eq!(out.role, Role::User, "展开后仍是用户发言");
         assert_eq!(out.content.len(), 2, "块数不得变化：{:?}", out.content);
         match &out.content[0] {
@@ -4960,13 +5024,16 @@ mod tests {
     fn plain_message_is_untouched_by_expansion() {
         let (root, skills) = demo_skill_table("expand_plain");
         let msg = user_message("普通消息，不是命令");
-        let out = expand_skill_invocation(msg.clone(), &skills);
+        let out = expand_skill_invocation(msg.clone(), &skills, None);
         assert_eq!(out, msg, "不命中的消息必须逐字段不变");
         assert_eq!(out.content.len(), 1, "块数不得变化");
 
         // 未知命令同样不变。
         let unknown = user_message("/nope 参数");
-        assert_eq!(expand_skill_invocation(unknown.clone(), &skills), unknown);
+        assert_eq!(
+            expand_skill_invocation(unknown.clone(), &skills, None),
+            unknown
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4996,7 +5063,7 @@ mod tests {
             ],
         };
 
-        let out = expand_skill_invocation(msg, &skills);
+        let out = expand_skill_invocation(msg, &skills, None);
         assert_eq!(out.content.len(), 3, "块数不得变化：{:?}", out.content);
         match &out.content[0] {
             ContentBlock::Text { text } => {
@@ -5026,7 +5093,7 @@ mod tests {
         // 前置：同样的调用在纯文本下确实会展开，否则本用例分不出「首块门控」与
         // 「这个命令本来就没命中」。
         assert_ne!(
-            expand_skill_invocation(user_message("/demo"), &skills),
+            expand_skill_invocation(user_message("/demo"), &skills, None),
             user_message("/demo"),
             "测试前提：纯文本 `/demo` 会展开"
         );
@@ -5043,7 +5110,7 @@ mod tests {
                 },
             ],
         };
-        let out = expand_skill_invocation(image_first.clone(), &skills);
+        let out = expand_skill_invocation(image_first.clone(), &skills, None);
         assert_eq!(out, image_first, "首块非 `Text` ⇒ 整条逐字段不变");
         assert!(
             matches!(out.content.first(), Some(ContentBlock::Image { .. })),
@@ -6842,9 +6909,13 @@ mod tests {
     /// 钉的是原缺陷：限流 2 条时「第三条留在 `Pending`、而唤醒只在**新终态**时发」
     /// 会变成死角 —— 再也没人唤醒它，用户得再发言两次才收得全。
     ///
-    /// 三条命令都是 `sleep 0.2; echo …`：退出时刻相差几毫秒 ⇒ 同一个 100ms tick 里
-    /// 一起进终态 ⇒ 一次唤醒、一个回合。任何「每回合 2 条」的限流都会让第三条永远
-    /// 留在表里（此后不再有新终态，也就不会再有唤醒）。
+    /// 三条命令先**卡在同一个文件上**，待三条全部就位后再一次性放行：它们随后几乎
+    /// 同时退出（远小于 100ms tick），必然一起进终态 ⇒ 一次唤醒、一个回合。任何
+    /// 「每回合 2 条」的限流都会让第三条永远留在表里（此后不再有新终态，也就不会
+    /// 再有唤醒）。
+    ///
+    /// 不用「各自 `sleep` 固定时长」：并行负载下 fork/调度可能把退出时刻拉开到
+    /// 跨过 tick 边界，那就是用例自身的前提先破了，而不是被测逻辑出错。
     ///
     /// 变异：把 `take_completions(..)` 接回 `.take(2)` ⇒ 第三个标记不在该回合的
     /// `ModelRequest` 里、且 `has_pending` 仍为真 ⇒ 两条断言都变红。
@@ -6853,6 +6924,7 @@ mod tests {
         const MARKERS: [&str; 3] = ["BG-SWEEP-ALPHA", "BG-SWEEP-BETA", "BG-SWEEP-GAMMA"];
 
         let logs = TempDir::new("bg_sweep_logs");
+        let go = logs.0.join("go.flag");
         let _env = BgEnv::set(&logs.0);
         let calls = Arc::new(CallLog::default());
         let mut h =
@@ -6864,24 +6936,59 @@ mod tests {
             .clone();
         let session = slot.get();
         let mut cleanup = BgCleanup::new(&tasks);
+        // 最多等 30s（含负载极高的场景）：正常情形下三条脚本几毫秒内就位。
+        let gate = format!(
+            "i=0; while [ ! -f '{}' ]; do i=$((i+1)); [ $i -gt 3000 ] && exit 99; sleep 0.01; done",
+            go.display()
+        );
+        let mut handles = Vec::new();
         for marker in MARKERS {
-            let _ = cleanup.start_with(&session, &format!("sleep 0.2; echo {marker} >&2"));
+            let (handle, _) = cleanup.start_with(&session, &format!("{gate}; echo {marker} >&2"));
+            handles.push(handle);
         }
+
+        // 三条都已经卡在同一个门上 ⇒ 放行后它们同时退出，不会跨 tick 边界。
+        std::fs::write(&go, b"").expect("放行触发文件");
+        let _ = handles;
 
         // **不发任何请求** —— 唤醒必须自己起一轮，并在**同一个回合**里取完三条。
         let first = collect_until_view(&mut h).await;
         assert!(!first.is_empty(), "自动回合必须产生出站消息");
 
-        let request = calls.requests().pop().expect("应有模型调用记录");
+        // 不发任何请求 ⇒ 每个自动回合只能来自唤醒；三条结果**必须全部**在某个回合
+        // 里到达（允许分几个回合：子进程退出时刻只保证「几乎」同时，不保证落在
+        // 同一个 100ms tick 内）。
+        //
+        // 先前这里只取**第一个**回合的 `ModelRequest` 并要求三条齐全 —— 可行的前提是
+        // 「三个 shell 在同一 tick 前都退出」，而 tick 相位与并行负载共同决定了这是
+        // 掷骰子。契约本身不含「同一 tick」，故断言按契约写。
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut delivered = std::collections::HashSet::new();
+        while Instant::now() < deadline && delivered.len() < MARKERS.len() {
+            // 每收到一条出站消息就看一眼已记录的请求；超时 / 信道收摊也照样看一遍。
+            // 起回合与回复是异步，不能假定「收到一个 `View` 就齐了」。
+            let _ = tokio::time::timeout(Duration::from_secs(10), h.outbound.recv()).await;
+            for request in calls.requests() {
+                for marker in MARKERS {
+                    if has_text(&request, marker) {
+                        delivered.insert(marker);
+                    }
+                }
+            }
+            if delivered.len() == MARKERS.len() {
+                break;
+            }
+        }
         let missing: Vec<&str> = MARKERS
             .iter()
             .copied()
-            .filter(|m| !has_text(&request, m))
+            .filter(|m| !delivered.contains(m))
             .collect();
         assert!(
             missing.is_empty(),
-            "同一个回合必须把三条结果全部带进上下文，缺 {missing:?}：{request:?}"
+            "三条结果必须在不让用户开口的前提下全部送入上下文，缺 {missing:?}"
         );
+        // 取完之后不得再有 `Pending` —— 那正是原缺陷的死角：没人会再唤醒它。
         assert!(
             !tasks.has_pending(&session),
             "取完之后不得再有 `Pending`（否则没人会再唤醒它）"

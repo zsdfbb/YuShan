@@ -39,7 +39,7 @@ $ ./target/release/ys-coding-agent             # 交互式 TUI（默认）
 |---|---|---|---|
 | **TUI** | `ys-coding-agent` | 无（画面走 alt-screen） | 交互干活、看过程、翻历史 |
 | **Print** | `ys-coding-agent -p "<任务>"` | 模型正文（整回合结束后一次写出） | 一次性任务、管道、跑脚本 |
-| **JSON** | `ys-coding-agent --json "<任务>"` | 每行一个 `Envelope` JSON | 给别的程序吃事件流 |
+| **JSON** | `ys-coding-agent --json "<任务>"` | 首行会话记录 + 每行一个 `Envelope` JSON | 给别的程序吃事件流 |
 
 ```console
 $ ys-coding-agent                                   # 交互
@@ -266,19 +266,33 @@ worktree: feat-a
 
 ## 退出码与输出约定
 
-`-p` / `--json` 一次性模式的退出码按「**有没有产出能交差**」判：
+`-p` / `--json` 一次性模式的退出码分三档（`single_turn_exit_code`）：
 
-| stop reason | 退出码 |
-|---|---|
-| `Cancelled`（墙钟预算用尽）、`NoOutput`（模型没给出可见内容） | `1` |
-| `Completed` / `MaxRounds` / `Truncated`（至少有输出） | `0` |
+| stop reason | 退出码 | 含义 |
+|---|---|---|
+| `Completed` / `MaxRounds` / `Truncated` | `0` | 有可交差的输出 |
+| `Cancelled`（墙钟预算用尽或 `SIGTERM`）、`NoOutput`（模型没给出可见内容） | `75` | 被中断 / 无所出 —— **可重试** |
+| `Failed`（provider 侧故障） | `1` | **不可重试**，直接重试只会重现 |
+
+`75` 取 `EX_TEMPFAIL`：调用方可据此把「重试」与「报警」分开；只按 `!= 0` 判断的
+调用方不受影响。
+
+**`--json` 的首行是会话记录**，先于任何 `Envelope`：
+
+```json
+{"type":"session","id":"2026-10-10-abc"}
+```
+
+拿到 id 就能用 `--resume <id>` 续跑；该行只在 `--json` 出现（`-p` 的 stdout 只放正文），
+且内存会话（不落盘）不输出。`SIGTERM` 不会直接杀进程：它等同一次预算到点，
+回合在轮边界以 `Cancelled` 收场，随后照常收尾（后台进程组、debug 尾部）并退出 `75`。
 
 **stdout 只放数据**：`-p` 放正文（`RunFinished` 时一次写出，失败回合零输出），
-`--json` 放逐行 `Envelope`。
+`--json` 放首行会话记录 + 逐行 `Envelope`。
 启动提示、最后一条回复的排版、背压统计、错误说明**全部走 stderr**，所以
 `ys-coding-agent --json "..." > events.jsonl` 是干净的。
 
-`--json` 的每一行是 `{"source","turn","event"}`，`event` 是 `AgentEvent`
+`--json` 除首行会话记录外，每一行是 `{"source","turn","event"}`，`event` 是 `AgentEvent`
 （`RoundStarted` / `ModelTextDelta` / `ToolCall` / `ToolResult` / `RoundUsage` /
 `RunFinished` / `RunFailed` / `ContextCompacted` …）。
 

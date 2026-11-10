@@ -550,11 +550,30 @@ fn current_bin() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// 逐行解析 `--json` 输出。
+///
+/// 只留 `Envelope` 行：首行的会话记录（`{"type":"session",…}`，无 `event` 字段）
+/// 不是事件，断言事件的用例不该看见它。
+///
+/// 除了那一行，**其余任何行都必须是合法 JSON 且带 `event`** —— 否则直接 panic。
+/// 若改用 `filter` 默默丢非法行，往 stdout 混一行人读文本时 `t2` / `t7` 会静默通过。
 fn envelopes(stdout: &str) -> Vec<Value> {
     stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("--json 每行必须是合法 JSON"))
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("--json 每行必须是合法 JSON：{e}: {line}"));
+            if value.get("event").is_some() {
+                return Some(value);
+            }
+            // 唯一允许的非 Envelope 行：首行的会话记录。
+            assert_eq!(
+                value.get("type").and_then(|t| t.as_str()),
+                Some("session"),
+                "--json stdout 只允许首行会话记录这一种非 Envelope 行：{line}"
+            );
+            None
+        })
         .collect()
 }
 
@@ -563,18 +582,24 @@ fn event<'a>(envelope: &'a Value, name: &str) -> Option<&'a Value> {
     envelope.get("event")?.get(name)
 }
 
-/// 过滤掉 `RoundUsage` 行，保留原始字节行序列（T2 的加法契约）。
+/// 过滤掉**非 `Envelope` 行**（`--json` 首行的 `{"type":"session",…}`）与 `RoundUsage`
+/// 行，保留原始字节行序列（T2 的加法契约）。
+///
+/// 基线 golden 是**基线二进制**的产物，恒为 4 行 `Envelope`：既无 session 行也无
+/// `RoundUsage`。故 golden **不随**输出格式的加法演进跟着改 —— 比较前在这里把两类
+/// 「加法」滤掉，「既有行的字节不变」才是被钉住的东西。
 fn without_round_usage(stdout: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for line in stdout.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
         }
-        let is_round_usage = serde_json::from_slice::<Value>(line)
-            .ok()
-            .and_then(|value| value.get("event").cloned())
-            .is_some_and(|event| event.get("RoundUsage").is_some());
-        if is_round_usage {
+        let value = serde_json::from_slice::<Value>(line).ok();
+        // 没有 `event` 字段 = 非 `Envelope` 行（首行会话记录）⇒ 不属于事件流。
+        let Some(event) = value.as_ref().and_then(|value| value.get("event")) else {
+            continue;
+        };
+        if event.get("RoundUsage").is_some() {
             continue;
         }
         out.extend_from_slice(line);
@@ -1035,13 +1060,29 @@ fn t5_debug_file_is_complete_and_structured() {
     );
     assert_eq!(server.remaining_steps(), 0, "stub 脚本必须被完整消费");
 
-    // Task 13：debug 只进文件 —— stdout 仍是逐行 Envelope，stderr 无 debug 内容。
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+    // Task 13：debug 只进文件 —— stdout 仍是逐行 JSON，stderr 无 debug 内容。
+    // 首行是**会话记录**（`{"type":"session",…}`），其后每行都是 `Envelope`。
+    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("stdout 不得为空\nstderr:\n{stderr}"));
+    let head: Value = serde_json::from_str(first)
+        .unwrap_or_else(|e| panic!("`--json` stdout 首行必须是合法 JSON：{e}: {first}"));
+    assert_eq!(head["type"], "session", "首行必须是会话记录：{first}");
+    assert!(
+        head["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "会话记录必须带非空 id：{first}"
+    );
+    assert!(
+        !first.contains("yushan.debug/1"),
+        "debug 记录不得混入 stdout：{first}"
+    );
+    for line in lines {
         let value: Value = serde_json::from_str(line)
             .unwrap_or_else(|e| panic!("`--json` stdout 必须是合法 JSON：{e}: {line}"));
         assert!(
             value.get("event").is_some(),
-            "stdout 只应有 Envelope：{line}"
+            "首行之后 stdout 只应有 Envelope：{line}"
         );
         assert!(
             !line.contains("yushan.debug/1"),
@@ -1241,8 +1282,8 @@ fn budget_abort_records_enqueued_and_observed() {
     );
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "预算到点 ⇒ 退出码 1\nstdout:\n{}\nstderr:\n{}",
+        Some(75),
+        "预算到点 ⇒ 退出码 75（可重试档）\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1285,7 +1326,9 @@ fn budget_abort_records_enqueued_and_observed() {
     let run_end = records.last().unwrap();
     assert_eq!(run_end["ev"], json!("run_end"));
     assert_eq!(run_end["stop_reason"], json!("RunFinished"));
-    assert_eq!(run_end["exit_code"], json!(1));
+    // debug 里的 `exit_code` 与实际退出码同源（`exit_with_run_end` 的 `code`）
+    // ⇒ `Cancelled` 在 debug 尾部也必须落 75。
+    assert_eq!(run_end["exit_code"], json!(75));
 }
 
 /// 跨进程 `--resume` 追加同一 debug 文件时，`run` 必须递增（不能两条 `run=0`）。

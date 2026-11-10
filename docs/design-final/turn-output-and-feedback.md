@@ -22,7 +22,7 @@ adapters/tools-basic/src/read.rs           大结果软阈值提示（与「Show
 crates/ys-loop/src/basic.rs                空分支：text.trim().is_empty() ⇒ NoOutput
 crates/ys-tui-coding/src/draw.rs           stop_symbol(NoOutput) = "∅"
 crates/ys-tui-coding/src/app.rs            RunFinished{NoOutput} ⇒ 一行 System 提示
-apps/coding-agent/src/main.rs              single_turn_exit_code：NoOutput ⇒ 1 + stderr 一行
+apps/coding-agent/src/main.rs              single_turn_exit_code：NoOutput ⇒ 75 + stderr 一行
 apps/coding-agent/src/prompt.rs            guideline「先窄后宽」（read/grep 在场时）
 ```
 
@@ -46,7 +46,8 @@ apps/coding-agent/src/prompt.rs            guideline「先窄后宽」（read/gr
 
 **⑤ 空产出三处可见，缺一不可。** 单靠 `Summary` 行的 `∅` 符号用户看不懂（实测会继续追问），故：
 TUI 一行 `System` 提示 + `-p`/`--json` 的非零退出码 + stderr 一行。退出码由 `single_turn_exit_code`
-决定（`-p` 与 `--json` 两处都经 `exit_with_code` 落地）。
+决定（三档：`Failed ⇒ 1`、`Cancelled` / `NoOutput ⇒ 75`（`EX_TEMPFAIL`，可重试）、
+其余 `⇒ 0`；`-p` 与 `--json` 两处都经 `exit_with_run_end` 落地）。
 
 **⑥ 「先窄后宽」是产品内置 guideline，随 `read`/`grep` 在场而出现。** 它进 `fixed_prompt_tokens`
 （随 system prompt 缓存前缀），故措辞只加一句、不加一段。
@@ -56,7 +57,8 @@ TUI 一行 `System` 提示 + `-p`/`--json` 的非零退出码 + stderr 一行。
 1. **`size_notice` 签名由 `matches: usize` 改为 `matches: Option<usize>`** —— 设计对 `read`（无命中数）
    不适用现签名；`None` 走「read a narrower range with `offset` / `limit`」措辞。功能等价、更诚实。
    `design.md` 接口概要已同步。
-2. **无其它偏差。** 阈值（16 KiB / 8 KiB / 5）、退出码（1）、命名（`NoOutput`）均按设计执行。
+2. **无其它偏差。** 阈值（16 KiB / 8 KiB / 5）、命名（`NoOutput`）均按设计执行。退出码由
+   本批次的 `headless-worker-api` 改为三档（`NoOutput` 从 `1` 改为 `75`），见 `apps/coding-agent/README.md`。
 
 ## 量化验收（实测）
 
@@ -64,7 +66,7 @@ TUI 一行 `System` 提示 + `-p`/`--json` 的非零退出码 + stderr 一行。
 |---|---|---|
 | 单条工具结果字节（max） | `grep` ≤ 16 KiB | ✅ 单测断言正文 ≤ `GREP_MAX_RESULT_BYTES` |
 | 空 assistant 回合 | 0（改 `NoOutput`） | ✅ `""` / `"   "` 均 `NoOutput` |
-| `-p` / `--json` 空响应 | 退出码 1 + stderr | ✅ 单测 `NoOutput ⇒ 1`；进程级 e2e 待凭证（见审查 P2） |
+| `-p` / `--json` 空响应 | 退出码 75 + stderr | ✅ 单测 `NoOutput ⇒ 75`；进程级 e2e 待凭证（见审查 P2） |
 | 全量测试 | 不降级 | ✅ **1120 passed / 0 failed / 9 ignored** |
 
 ## 测试（新增，各自带变异点）
@@ -76,7 +78,7 @@ TUI 一行 `System` 提示 + `-p`/`--json` 的非零退出码 + stderr 一行。
   `test_read_large_range_gets_soft_size_notice`
 - `ys-loop`：`empty_response_ends_with_no_output_not_completed`
 - `ys-tui-coding`：`test_no_output_turn_pushes_visible_system_note`（+ 反向 `completed_turn_does_not_push_no_output_note`）
-- `coding-agent`：`single_turn_exit_code_is_nonzero_on_budget_cancellation`（扩写）、
+- `coding-agent`：`single_turn_exit_code_has_three_tiers`（扩写）、
   `narrow_before_broad_guideline_appears_only_with_read_or_grep`
 
 ## 相关文档

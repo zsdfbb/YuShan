@@ -26,7 +26,7 @@ ys-tools-basic = { path = "../../adapters/tools-basic" }
 ys-tools-web = { path = "../../adapters/tools-web" }
 # todo 清单的唯一真值 + 落盘（`adapters/tools-todo`）：与 `tools-basic` / `tools-web` 同形。
 ys-tools-todo = { path = "../../adapters/tools-todo" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "sync", "time", "signal"] }
 # `AbortOnDropHandle`（subagent watchdog 防孤儿任务）。已在 Cargo.lock，无新下载。
 tokio-util = { version = "0.7", features = ["rt"] }
 serde_json = "1"

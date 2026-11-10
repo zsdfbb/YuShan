@@ -2052,6 +2052,42 @@ struct SingleTurnInputs<'a> {
     /// 回合号（从 1 起）。`Envelope.turn` 与 debug 记录的 `turn=` 都取它 ——
     /// 多回合链里两个回合的事件必须可区分，否则事后无法把事件归到具体回合。
     turn: u32,
+    /// 承载 `SIGTERM` 的监听器（`None` = 测试路径，不参与信号处理）。
+    ///
+    /// 由调用方在**回合循环之前**建好、每回合 `reborrow` 传入：若每回合新建，
+    /// 回合之间的 `SIGTERM` 会落进没人 `recv` 的窗口而丢失。
+    #[cfg(unix)]
+    signal: Option<&'a mut tokio::signal::unix::Signal>,
+}
+
+/// 建 `SIGTERM` 监听器。
+///
+/// 只在 `-p` / `--json` 的**回合循环之前**调一次：监听器必须活过整条链，
+/// 每回合只 reborrow 传下去。注册失败时返回 `None` 并说明到 stderr —— 那是
+/// 环境问题（信号资源耗尽），不应影响回合本身。
+#[cfg(unix)]
+fn sigterm_listener() -> Option<tokio::signal::unix::Signal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(sig) => Some(sig),
+        Err(e) => {
+            eprintln!("failed to install SIGTERM handler: {e}");
+            None
+        }
+    }
+}
+
+/// 等一个 `SIGTERM`；没有监听器（测试路径）时**永不就绪**。
+///
+/// `Signal::recv` 是可取消的（cancel safe）：`select!` 丢弃它不会丢信号，
+/// 该信号仍留在监听器里等下一次 `recv`。
+#[cfg(unix)]
+async fn recv_sigterm(signal: &mut Option<&mut tokio::signal::unix::Signal>) {
+    match signal {
+        Some(sig) => {
+            sig.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// `-p` / `--json` 的驱动：跑**一个** turn。
@@ -2077,6 +2113,8 @@ async fn run_single_turn(
         debug,
         session_id,
         turn,
+        #[cfg(unix)]
+        signal,
     } = params;
     // 预算计时原点与本回合耗时原点**同一个** —— 两个 `Instant::now()` 会让
     // `elapsed` 与 `budget_remaining` 对不上账。
@@ -2121,10 +2159,18 @@ async fn run_single_turn(
 
     let turn = agent.run_turn(input, agent_ports);
     tokio::pin!(turn);
+    // 信号监听器要能被 `select!` 逐回合 reborrow，故此处拿可变绑定。
+    #[cfg(unix)]
+    let mut signal = signal;
     // 预算计时器**只允许触发一次**：到点后置位，`select!` 的 `if` 前置条件随即
     // 禁用该分支（`sleep_until` 对已过去的 deadline 会持续 Ready ⇒ 否则忙等 +
     // 重复发说明行 + 重复 push `Abort`）。
     let mut budget_exhausted = false;
+    // 信号分支与预算分支**同样**只允许触发一次并置位。`Signal::recv` 消费掉一个
+    // 信号后不会自行再次就绪，且 `QueueBoundarySource::push(Abort)` 本身幂等（重复
+    // push 只多入队一条 `Abort`），故重复触发并无副作用；守卫的作用是让「一次性」
+    // 这条不变量在两个分支上**对称**成立，不必依赖上述实现细节未来不变。
+    let mut signal_aborted = false;
     let outcome = loop {
         tokio::select! {
             result = &mut turn => break result,
@@ -2149,6 +2195,24 @@ async fn run_single_turn(
                     );
                 }
             }
+            // `SIGTERM` 与预算到点**同一个收场方式**：只向本回合的边界源投
+            // `Abort`，让回合自己在轮边界收手（ADR-0013「取消即消息」）。
+            // 这里**不**退进程、**不**改退出码 —— 进程怎么退由 [`exit_with_run_end`]
+            // 统一给出（那里顺手收 debug 尾部与后台进程组）。
+            //
+            // `tokio::select!` 的分支规则不接受属性（以 `$p:pat = $f:expr` 开头），
+            // 故平台门控放在分支的未来表达式内：非 unix 没有 `SIGTERM` 监听器，
+            // 这一分支恒不就绪。
+            _ = async {
+                #[cfg(unix)]
+                recv_sigterm(&mut signal).await;
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            }, if !signal_aborted => {
+                signal_aborted = true;
+                eprintln!("SIGTERM received — aborting this turn");
+                boundary.push(Boundary::Abort);
+            }
         }
     };
     // 子 agent 的 usage **上卷**：预算独立、记账上卷（ADR-0029 决策）。
@@ -2163,7 +2227,7 @@ async fn run_single_turn(
             }
             r.usage = r.usage + subagent;
             // 空产出在**一次性模式**下必须留一行可见说明（`-p` 只打文本增量，否则 stderr
-            // 与 stdout 都为空 = 静默）。退出码由 [`single_turn_exit_code`] 给 `1`。
+            // 与 stdout 都为空 = 静默）。退出码由 [`single_turn_exit_code`] 给 `75`（可重试档）。
             if r.stop_reason == StopReason::NoOutput {
                 eprintln!(
                     "model returned no visible output this turn (nothing to print) — retry or rephrase"
@@ -2409,6 +2473,10 @@ async fn run_print_mode(
     // 多回合链里两个回合的事件必须可区分。
     let mut turn: u32 = 1;
     let mut input = AgentInput::text(task.as_str());
+    // `SIGTERM` 监听器建在**循环之前**：每回合 reborrow 传下去。若每回合新建，
+    // 回合之间的 `SIGTERM` 会落进没人 `recv` 的窗口而丢失。
+    #[cfg(unix)]
+    let mut sigterm = sigterm_listener();
 
     loop {
         // 回合边界记录在 `join` **之前 / 之后**写：`consume_events` 与跑回合必须并发，
@@ -2436,6 +2504,8 @@ async fn run_print_mode(
                     debug: debug_handle.as_ref(),
                     session_id,
                     turn,
+                    #[cfg(unix)]
+                    signal: sigterm.as_mut(),
                 },
             ),
             consume_print_events(rx, io::stdout(), debug.as_deref_mut(), session_id, turn),
@@ -2534,6 +2604,20 @@ async fn run_print_mode(
 ///
 /// 背压读数走 stderr（[`report_channel_stats`]），不混入 stdout 的 JSON 流。
 ///
+/// # 首行：会话记录
+///
+/// `ensure_configured` 通过后，**先于任何 `Envelope`** 往 stdout 写一行
+/// `{"type":"session","id":"<id>"}`（ADR-001 决策 1）：会话 id 是「进程 ↔ 调用方」
+/// 的握手信息，不属于「回合内发生了什么」，故不进 `AgentEvent` / `Envelope`。
+/// 调用方拿到它就能用 `--resume <id>` 续跑。
+///
+/// **只在 `--json`**：`-p` 的 stdout 是正文，不能多出一行；故写在本函数体内，
+/// 不写两条入口共用的 `consume_events`。
+///
+/// **在 `ensure_configured` 之后**：无配置早退时不能报出一个不会被落盘的假 id。
+/// **只在本会话有落盘路径时**：内存会话（`session_path == None`）没有可 `--resume` 的 id，
+/// 不输出该行。
+///
 /// # 跨回合推进
 ///
 /// 结构与 [`run_print_mode`] **逐行同形**（同一个 `advance_after_turn`、同一个
@@ -2559,6 +2643,7 @@ async fn run_json_mode(
     observed_rounds: &mut u32,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
     ensure_configured(wiring, debug.as_deref_mut())?;
+    emit_session_line(wiring.session_path());
 
     // `head_before` 只取一次，理由同 `run_print_mode`（一期判据是「相对首次取值」。）
     let enabled = config.follow_up_on_commit();
@@ -2568,6 +2653,9 @@ async fn run_json_mode(
     let mut last_injected_rev = None;
     let mut turn: u32 = 1;
     let mut input = AgentInput::text(task.as_str());
+    // 同 `run_print_mode`：`SIGTERM` 监听器建在循环之前，逐回合 reborrow。
+    #[cfg(unix)]
+    let mut sigterm = sigterm_listener();
 
     loop {
         // 同 `run_print_mode`：sink 在 join 期间归消费者，回合执行侧只拿可克隆句柄。
@@ -2591,6 +2679,8 @@ async fn run_json_mode(
                     debug: debug_handle.as_ref(),
                     session_id,
                     turn,
+                    #[cfg(unix)]
+                    signal: sigterm.as_mut(),
                 },
             ),
             consume_events(
@@ -2678,19 +2768,49 @@ async fn run_json_mode(
     }
 }
 
-/// 一次性模式的退出码：**没有可用产出**或**预算用尽** ⇒ `1`，否则 `0`。
+/// `--json` 首行的会话记录（ADR-001 决策 1）。
 ///
-/// - `Cancelled`（wall-clock 预算到点）、`NoOutput`（模型没给出可见内容）⇒ `1`；
-/// - `Completed` / `MaxRounds` / `Truncated`（有可交差的输出，或正常收尾）⇒ `0`。
+/// 形如 `{"type":"session","id":"2026-10-10-abc"}`，先于任何 `Envelope`。
+/// `path == None`（内存会话）时不输出 —— 那种会话没有可 `--resume` 的 id，
+/// 报一个编造值只会让调用方后续失败。
 ///
-/// 判据是「**有没有输出能交差**」：`Truncated` 至少有一段（可能不完整的）输出，故为 `0`；
-/// `NoOutput` 什么都没有 —— 若报 `0` 就是**静默装作成功**。
-/// `Cancelled` 是这条路径上「预算用尽」的唯一信号（一次性模式没有别的 `Abort` 来源）。
+/// id 取文件名 stem（与 `exit_line_for` 的 `session: <id>` 同一个来源），
+/// 不是在调用时去读文件：`Wiring` 在构造期就已算定落盘路径。
+fn emit_session_line(path: Option<&Path>) {
+    if let Some(record) = session_record(path) {
+        println!("{record}");
+    }
+}
+
+/// [`emit_session_line`] 的可测内核：给出**这一行**的 JSON 文本，`None` = 不输出。
+///
+/// 与 `exit_line_for` 同一个理由：把「有没有 id」与「往哪儿写」分开，断言才能钉在
+/// 记录形状（`type` / `id` 两个键）上，而不依赖捕获 stdout。
+fn session_record(path: Option<&Path>) -> Option<String> {
+    let id = path.and_then(session_id_of)?;
+    Some(json!({ "type": "session", "id": id }).to_string())
+}
+
+/// 一次性模式的退出码三档（ADR-001 决策 3）。
+///
+/// | 收场形态 | 退出码 | 含义 |
+/// |---|---|---|
+/// | `Completed` / `MaxRounds` / `Truncated` | `0` | 有可交差的输出（`Truncated` 至少有一段不完整的正文） |
+/// | `Cancelled` / `NoOutput` | `75` | 被中断（预算 / `SIGTERM`）或模型没给出可见内容 —— **可重试** |
+/// | `Failed` | `1` | provider 侧故障 —— **不可重试**（直接重试只会重现） |
+///
+/// `75` 取 `EX_TEMPFAIL`：调用方据此把「重试」与「报警」分开；只按 `!= 0` 判断的
+/// 调用方不受影响。
 fn single_turn_exit_code(result: &RunResult) -> i32 {
     match result.stop_reason {
-        StopReason::Cancelled | StopReason::NoOutput => 1,
+        StopReason::Completed | StopReason::MaxRounds | StopReason::Truncated => 0,
+        // 被中断或无所出：重试可能成功。`Cancelled` 是预算 / `SIGTERM` 的唯一信号。
+        StopReason::Cancelled | StopReason::NoOutput => 75,
         // 故障（provider 错误）：本回合**没跑完**，不能报 0 静默装作成功。
         StopReason::Failed => 1,
+        // `StopReason` 是 `#[non_exhaustive]`：新增变体应在上方**显式归类**，
+        // 不要落到这里 —— 默认 `0` 会把一种未知收场形态静默报成成功。
+        #[allow(unreachable_patterns)]
         _ => 0,
     }
 }
@@ -4600,6 +4720,8 @@ mod tests {
                         debug: None,
                         session_id: "test-session",
                         turn: 1,
+                        #[cfg(unix)]
+                        signal: None,
                     }
                 ),
                 consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
@@ -5036,6 +5158,8 @@ mod tests {
                     debug: None,
                     session_id: "test-session",
                     turn: 1,
+                    #[cfg(unix)]
+                    signal: None,
                 }
             ),
             consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
@@ -5165,6 +5289,8 @@ mod tests {
                         debug: None,
                         session_id: "test-session",
                         turn: 1,
+                        #[cfg(unix)]
+                        signal: None,
                     }
                 ),
                 consume_events(&mut rx, &mut out, write_json_envelope, None, 1),
@@ -5185,13 +5311,14 @@ mod tests {
         );
     }
 
-    /// 13c. **预算到点 ⇒ 非零退出码**（`-p` / `--json` 的退出契约）。
+    /// 13c. **退出码三档**（`-p` / `--json` 的退出契约，ADR-001 决策 3）。
     ///
-    /// 钉住退出码**判定**：`Cancelled` ⇒ 1，正常完成 ⇒ 0。进程退出原语本身
-    /// 只能在进程级验证（留给 T10），但「按什么退出」由 [`single_turn_exit_code`]
-    /// 决定，故此处直接覆盖：变异「去掉 `Cancelled` 判定 ⇒ 恒 0」会让第一条断言变红。
+    /// 钉住退出码**判定**：`Cancelled` / `NoOutput` ⇒ `75`（可重试）、`Failed` ⇒ `1`
+    /// （不可重试）、其余 ⇒ `0`。进程退出原语本身只能在进程级验证，但「按什么退出」
+    /// 由 [`single_turn_exit_code`] 决定，故此处直接覆盖：变异「`Cancelled` 与 `Failed`
+    /// 同码」会让第一条断言变红。
     #[test]
-    fn single_turn_exit_code_is_nonzero_on_budget_cancellation() {
+    fn single_turn_exit_code_has_three_tiers() {
         let cancelled = RunResult {
             stop_reason: StopReason::Cancelled,
             usage: Usage::default(),
@@ -5216,22 +5343,62 @@ mod tests {
             rounds: 1,
             final_message: None,
         };
+        // `Failed` 必须与 `Cancelled` **不同码**：调用方靠这个差别决定「重试」还是「报警」。
+        let failed = RunResult {
+            stop_reason: StopReason::Failed,
+            usage: Usage::default(),
+            cache_reading: None,
+            compaction_usage: ys_core::Usage::default(),
+            rounds: 0,
+            final_message: None,
+        };
         assert_eq!(
             single_turn_exit_code(&cancelled),
-            1,
-            "预算到点（Cancelled）须非零退出"
+            75,
+            "被中断（Cancelled）应报可重试档 75"
         );
         assert_eq!(
             single_turn_exit_code(&completed),
             0,
             "正常完成路径退出码不变（回归护栏）"
         );
-        // 空产出**没有可交差的输出**，与预算到点同档 ⇒ 非零退出（不可静默装作成功）。
-        // 变异：把 `StopReason::NoOutput` 从匹配臂里删掉 ⇒ 本断言变红。
+        // 空产出没有可交差的输出 ⇒ 与中断同档（重试可能拿到输出）。
+        // 变异：把 `StopReason::NoOutput` 从 75 档摘掉 ⇒ 本断言变红。
         assert_eq!(
             single_turn_exit_code(&no_output),
+            75,
+            "空产出（NoOutput）应报可重试档 75"
+        );
+        // 故障不可重试，必须与 75 区分。
+        // 变异：把 `StopReason::Failed` 并进 75 档 ⇒ 本断言变红。
+        assert_eq!(
+            single_turn_exit_code(&failed),
             1,
-            "空产出（NoOutput）须非零退出"
+            "故障（Failed）须报不可重试档 1"
+        );
+    }
+
+    /// 13d. **`--json` 首行是会话记录**（ADR-001 决策 1）：`ensure_configured` 之后
+    /// 先于任何 `Envelope` 写一行 `{"type":"session","id":…}`，id 非空且取文件名 stem。
+    ///
+    /// 变异：把输出挪到 `ensure_configured` 之前 ⇒ 无配置早退那条用例变红；
+    /// 把 `emit_session_line` 挪进共用的 `consume_events` ⇒ `-p` 污染用例变红。
+    #[test]
+    fn session_record_prints_id_from_file_stem() {
+        let line = session_record(Some(Path::new("/tmp/sessions/2026-11-10-abc.jsonl")))
+            .expect("有落盘路径时必须输出 session 行");
+        let value: Value = serde_json::from_str(&line).expect("session 行必须是合法 JSON");
+        assert_eq!(value["type"], "session", "首行 type 必须是 session：{line}");
+        assert_eq!(value["id"], "2026-11-10-abc", "id 取文件名 stem：{line}");
+        assert!(
+            !value["id"].as_str().unwrap_or("").is_empty(),
+            "id 不得为空：{line}"
+        );
+
+        // 内存会话：没有可 `--resume` 的 id ⇒ 不输出该行（不造一个编造值）。
+        assert!(
+            session_record(None).is_none(),
+            "内存会话（无 session_path）不得输出 session 行"
         );
     }
 
@@ -5752,6 +5919,8 @@ mod tests {
                         debug: None,
                         session_id: "test-session",
                         turn: 1,
+                        #[cfg(unix)]
+                        signal: None,
                     }
                 ),
                 consume_print_events(&mut rx, &mut stdout, None, "test-session", 1),

@@ -180,6 +180,7 @@ ys-coding-agent --json [flags] <任务>     JSON 事件
 ys-coding-agent --resume [<id>]          恢复会话（裸 --resume = 列表选择）
 ys-coding-agent worktree <动词> …        见下一节
 ys-coding-agent --help | -h | help       打印帮助后退出（不读凭证、不建运行时）
+ys-coding-agent --version                打印版本后退出（不读凭证、不建运行时）
 ```
 
 公共 flag：
@@ -190,6 +191,8 @@ ys-coding-agent --help | -h | help       打印帮助后退出（不读凭证、
 | `--stats` | 把背压统计摘要写到 stderr（有背压时本来也会打；`--stats` 是无条件打） |
 | `--resume <id>` | 恢复指定会话，`<id>` 是会话文件名 stem 或 **文件路径**；`--resume=<id>` 已移除 |
 | `-h` | `--help` 别名 |
+| `--version` | 打印 `ys-coding-agent <version>` 一行后退出；无 `-V` 别名 |
+| `--` | 终止 flag 解析：自身不进任务文本，其后的全部 token 逐字当任务文本。**只在 `-p` / `--json` 的 flag 区生效**（`worktree create\|attach` 带 `-p` / `--json` 时同权），见下方位置规则 |
 
 **flag 的位置规则**：
 
@@ -197,6 +200,9 @@ ys-coding-agent --help | -h | help       打印帮助后退出（不读凭证、
   碰到第一个非 flag 裸词就停止剥离，后面的内容不参与解析。
 - **`-p` / `--json`**：flag 必须紧跟在模式 flag 之后、任务文本之前。任务文本一旦开始，
   后面的 `--stats` / `--debug` 就是文本的一部分（`-p "任务 --debug"` 原样发给模型）。
+- `--` 结束 flag 剥离且自身不进任务文本：`-p --stats -- x` 是「开 stats + 任务 `x`」，
+  `-p -- --stats` 是「不开 stats + 任务 `--stats`」。`--` 之后为空（`-p --`）按缺任务报错。
+  **`worktree create|attach` 的名字参数位置不接受 `--`**（`worktree create -- x` 报未知参数 `--`）。
 - `--resume` 取**紧随其后**的 token 作为 id，但仅当它后面**还留着任务文本**；
   否则它是裸 `--resume`（列表选择），紧跟的 token 归任务。
 

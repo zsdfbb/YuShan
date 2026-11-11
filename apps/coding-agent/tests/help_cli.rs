@@ -467,12 +467,17 @@ fn help_output_contains_the_documented_anchors() {
         );
     }
     // 公共 flag
-    for flag in ["--debug", "--stats", "--resume"] {
+    for flag in ["--debug", "--stats", "--resume", "--version"] {
         assert!(
             stdout.contains(flag),
             "帮助应记录公共 flag {flag:?}\n--- stdout ---\n{stdout}"
         );
     }
+    // `--` 终止符：文案里必须有它自己的说明（`--` 本身太短，只能配语义锚点一起查）
+    assert!(
+        stdout.contains("终止 flag 解析"),
+        "帮助应说明 `--` 的作用\n--- stdout ---\n{stdout}"
+    );
     // 环境变量
     for var in ["YUSHAN_API_BASE", "YUSHAN_API_KEY", "YUSHAN_MODEL"] {
         assert!(

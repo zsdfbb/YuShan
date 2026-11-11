@@ -62,16 +62,23 @@ crates/ys-tui-coding/src/events.rs（改）      /thinking 本地生效后单向
 ## CLI 契约
 
 ```text
-ys-coding-agent [--resume [<id>]]                          # TUI
-ys-coding-agent -p     [--stats] [--resume [<id>]] <task>  # Print
-ys-coding-agent --json [--stats] [--resume [<id>]] <task>  # JSON
+ys-coding-agent [--debug] [--resume [<id>]]                                      # TUI
+ys-coding-agent -p     [--stats] [--debug] [--resume [<id>]] [--] <task>        # Print
+ys-coding-agent --json [--stats] [--debug] [--resume [<id>]] [--] <task>        # JSON
+ys-coding-agent worktree <create|attach> [name] [-p|--json …] | list | remove <name>
+ys-coding-agent --help | -h | help | --version                                  # 纯打印，不读凭证
 ```
 
 - 裸 `--resume` = 列表选择；`--resume <id>` = 指定会话（id 或路径，**空格形态**）；`--resume=<id>`
   （`=` 形态）**已移除** ⇒ 报错。
-- 模式 flag 之后的 flag 区**顺序无关**：`split_leading_flags` 循环剥离 `--stats` / `--resume [<id>]`，
-  两者都只认「模式 flag 之后、任务文本之前」的位置；任务文本从第一个非 flag 起**逐字保留**。
-  重复 flag last-wins 且静默丢弃。
+- 模式 flag 之后的 flag 区**顺序无关**：`split_leading_flags` 循环剥离 `--stats` / `--debug` /
+  `--resume [<id>]`，三者都只认「模式 flag 之后、任务文本之前」的位置；任务文本从第一个非 flag 起
+  **逐字保留**。重复 flag last-wins 且静默丢弃。
+- `--` 终止 flag 剥离且自身不进任务文本：`-p --stats -- x` = stats + 任务 `x`，`-p -- --stats`
+  = 裸 `-p` + 任务 `--stats`；`--` 之后为空按缺任务报错。**只在 `-p` / `--json` 的 flag 区生效**
+  （含 `worktree create|attach` 带这二者时的 flag 区），`worktree` 的名字参数位置不接受 `--`。
+- `--version` 打印 `<bin> <version>` 一行后 exit 0（无 `-V` 别名），与 `--help` 同一落点：
+  不读凭证、不建 debug sink、不建 runtime。
 - `-p` / `--json` 下任务文本**必需** ⇒ `--resume` 只在**其后还留着任务文本**时才把紧跟的 token
   当 id（`--resume <id> <任务>`）；`--resume <任务>`（其后无 token）是裸 flag + 任务文本。
 

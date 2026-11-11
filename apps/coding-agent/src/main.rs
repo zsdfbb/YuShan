@@ -141,6 +141,11 @@ enum Mode {
     Interactive,
     /// 打印帮助文档后退出（`--help` / `-h` / `help`）。
     Help,
+    /// 打印版本后退出（`--version`）。
+    ///
+    /// **无别名的单形态**：没有 `-V`。输出恰好一行 `<bin> <version>` 走 stdout，
+    /// 不读凭证、不建 debug sink、不建 runtime。
+    Version,
 }
 
 /// 启动期会话形态。
@@ -202,6 +207,11 @@ struct Args {
 ///
 /// `--debug` 只认 flag 区：任务文本一旦开始就不再剥离（`-p "任务 --debug"` 的任务文本
 /// 逐字保留 `--debug`）。
+///
+/// `--` 是**终止符**：它结束 flag 剥离，自身不进入任务文本，其后的一切（含 `--stats` /
+/// `--debug` / `--resume`）逐字成为任务文本。故 `-p --stats -- x` 是 stats + `x`，
+/// 而 `-p -- --stats` 是裸 `-p` + 任务文本 `--stats`。`--` 之后为空（`-p --`）⇒ 任务为空
+/// ⇒ 交给调用方报「需要一个任务参数」。
 fn split_leading_flags(rest: &[String]) -> Result<(bool, bool, Resume, &[String]), String> {
     let mut stats = false;
     let mut debug = false;
@@ -238,6 +248,11 @@ fn split_leading_flags(rest: &[String]) -> Result<(bool, bool, Resume, &[String]
                 return Err("--resume 改为空格形态：`--resume <id>`（不再支持 `=`）。\
                      例如：-p --resume 2026-10-07-abc \"任务\""
                     .into());
+            }
+            // 终止符：跳过自身后停止剥离，剩余 token（可能为空）全部归任务文本。
+            "--" => {
+                idx += 1;
+                break;
             }
             _ => break,
         }
@@ -308,6 +323,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     match first {
         "help" | "--help" | "-h" => Ok(Args {
             mode: Mode::Help,
+            stats: false,
+            debug,
+            resume,
+            worktree: None,
+        }),
+        "--version" => Ok(Args {
+            mode: Mode::Version,
             stats: false,
             debug,
             resume,
@@ -3333,6 +3355,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exit_with_debug(&mut None, 0);
     }
 
+    // version 同样是**纯打印**：恰好一行 `<bin> <version>` 走 stdout，stderr 一个字节都不打。
+    // 与 help 同一落点 ⇒ 无凭证也能跑、也不留下日志文件。
+    // 命令名取 `CARGO_BIN_NAME`（编译期常量）：包无 `[lib]` / `[[bin]]` 覆盖 ⇒ 与默认 bin 名一致。
+    if let Mode::Version = args.mode {
+        println!(
+            "{}",
+            concat!(env!("CARGO_BIN_NAME"), " ", env!("CARGO_PKG_VERSION"))
+        );
+        exit_with_debug(&mut None, 0);
+    }
+
     let mut config = config::Config::from_env()?;
 
     // 从 auth.json 加载已保存的凭证
@@ -3967,6 +4000,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // `main` 在 `parse_args` 之后立即打印并退出，不应到达此处。
         Mode::Help => unreachable!("Help 已由 main 提前处理，不应到达此处"),
+        Mode::Version => unreachable!("Version 已由 main 提前处理，不应到达此处"),
     }
 
     Ok(())
@@ -4383,6 +4417,85 @@ mod tests {
         );
     }
 
+    /// T3：`--version` 只在**首个位置**成立，且无 `-V` 别名。
+    ///
+    /// 跟在 `-p` 之后时它是任务文本（与 `--help` / `--stats` 同一套剥离规则）。
+    #[test]
+    fn parse_version_is_only_a_leading_mode_flag() {
+        let args = parse_args(&s(&["--version"])).unwrap();
+        assert_eq!(args.mode, Mode::Version);
+        assert!(!args.stats);
+        assert!(!args.debug);
+        assert_eq!(args.resume, Resume::New);
+
+        assert_eq!(
+            parse_args(&s(&["-p", "--version"])).unwrap().mode,
+            Mode::Print("--version".into())
+        );
+        // 无 `-V` 别名：它落在未知参数臂。
+        assert!(parse_args(&s(&["-V"])).is_err());
+        // 首部 flag 区之后才出现 ⇒ 仍按首位置判定。
+        assert_eq!(
+            parse_args(&s(&["--debug", "--version"])).unwrap().mode,
+            Mode::Version
+        );
+    }
+
+    /// T4：`--` 终止 flag 剥离且自身不进任务文本。
+    ///
+    /// `--stats` 出现在 `--` 之后 ⇒ 不剥离（stats 保持 false）、逐字进任务文本。
+    /// 变异：删掉 `split_leading_flags` 里的 `"--"` 分支 ⇒ `--stats` 被当成 flag 吃掉，
+    /// 本用例变红。
+    #[test]
+    fn double_dash_terminates_flag_stripping() {
+        let args = parse_args(&s(&["--json", "--", "--stats"])).unwrap();
+        assert_eq!(args.mode, Mode::Json("--stats".into()));
+        assert!(!args.stats);
+    }
+
+    /// T5：`--` 之后的 `--stats` / `--debug` 一律当任务文本。
+    #[test]
+    fn flags_after_double_dash_become_task_text() {
+        let args = parse_args(&s(&["-p", "--", "--stats", "--debug"])).unwrap();
+        assert_eq!(args.mode, Mode::Print("--stats --debug".into()));
+        assert!(!args.stats);
+        assert!(!args.debug);
+    }
+
+    /// T6：`--` 只终止剥离，已有 flag 区语义不变 —— `--resume <id>` 仍取到 id，
+    /// `--` 之后的任务文本仍逐字保留。
+    #[test]
+    fn double_dash_after_resume_keeps_id_and_task() {
+        let args = parse_args(&s(&["-p", "--resume", "2026-10-07-abc", "--", "x"])).unwrap();
+        assert_eq!(args.mode, Mode::Print("x".into()));
+        assert_eq!(args.resume, Resume::Id("2026-10-07-abc".into()));
+        assert!(!args.stats);
+    }
+
+    /// T7：回归 —— `--` 不得改变既有三条语义（flag 剥离 / 文本逐字 / `--` 自身不入文本）。
+    #[test]
+    fn double_dash_does_not_disturb_existing_flag_semantics() {
+        let args = parse_args(&s(&["-p", "--stats", "hi"])).unwrap();
+        assert_eq!(args.mode, Mode::Print("hi".into()));
+        assert!(args.stats);
+
+        let args = parse_args(&s(&["-p", "hi --stats"])).unwrap();
+        assert_eq!(args.mode, Mode::Print("hi --stats".into()));
+        assert!(!args.stats);
+
+        // 第二个 `--` 已是任务文本（终止符只认 flag 区里的第一个）。
+        let args = parse_args(&s(&["-p", "--", "--"])).unwrap();
+        assert_eq!(args.mode, Mode::Print("--".into()));
+    }
+
+    /// `--` 之后为空 ⇒ 任务为空 ⇒ 沿用既有的「需要一个任务参数」错误。
+    #[test]
+    fn double_dash_without_task_is_an_error() {
+        let err = parse_args(&s(&["-p", "--"])).unwrap_err();
+        assert!(err.contains("需要一个任务参数"), "实得：{err}");
+        assert!(parse_args(&s(&["--json", "--"])).is_err());
+    }
+
     /// 帮助文案：三种触发形态 + 公共 flag + worktree 四动词。
     #[test]
     fn help_text_mentions_cli_shapes_and_flags() {
@@ -4397,6 +4510,8 @@ mod tests {
             "--resume [<id>]",
             "--debug",
             "--stats",
+            "--version",
+            "--              终止 flag 解析",
             "create",
             "attach",
             "list",
@@ -4700,6 +4815,33 @@ mod tests {
         assert_eq!(j.mode, Mode::Json("do".into()));
         assert_eq!(j.resume, Resume::Id("x".into()));
         assert_eq!(j.worktree, Some(WorktreeCmd::Attach(None)));
+    }
+
+    /// `worktree` 的 `-p` / `--json` 与顶层共用 `split_leading_flags` ⇒ `--` 语义自动一致。
+    ///
+    /// 守的是「**只有一份** flag 剥离循环」：若将来给 `parse_mode_tail` 单开一份剥离循环，
+    /// 下面的两条会变成「`--stats` 被吃掉、stats 为 true」 ⇒ 本用例变红。
+    #[test]
+    fn worktree_mode_tail_shares_double_dash_semantics() {
+        let p = parse_args(&s(&["worktree", "create", "-p", "--", "--stats"])).unwrap();
+        assert_eq!(p.mode, Mode::Print("--stats".into()));
+        assert!(!p.stats);
+        assert_eq!(p.worktree, Some(WorktreeCmd::Create(None)));
+
+        let j = parse_args(&s(&["worktree", "attach", "--json", "--", "--stats"])).unwrap();
+        assert_eq!(j.mode, Mode::Json("--stats".into()));
+        assert!(!j.stats);
+        assert_eq!(j.worktree, Some(WorktreeCmd::Attach(None)));
+    }
+
+    /// `worktree` 的**名字参数**位置不受 `--` 影响：`--` 只在 `-p` / `--json` 的 flag 区生效。
+    ///
+    /// `worktree create -- x` 的 `--` 是名参位置的首 token（以 `-` 开头 ⇒ 视为无名），
+    /// 随后落进 `parse_mode_tail` 的未知参数臂 ⇒ 报错。
+    #[test]
+    fn worktree_name_position_rejects_double_dash() {
+        assert!(parse_args(&s(&["worktree", "create", "--", "x"])).is_err());
+        assert!(parse_args(&s(&["worktree", "attach", "--", "x"])).is_err());
     }
 
     /// N11 回归：**非 flag 首 token 的既有静默 Interactive 行为不变**。

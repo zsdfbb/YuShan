@@ -26,12 +26,17 @@ const HELP_TEXT: &str = r#"ys-coding-agent —— 轻量、组件化的 Agent �
                                         create / attach 可带 -p / --json / --resume；
                                         create 建完树即以新树为工作区启动
   ys-coding-agent --help | -h | help     打印本帮助后退出（不读凭证、不建运行时）
+  ys-coding-agent --version              打印版本后退出
 
 公共 flag：
   --debug         兼容旧脚本；结构化执行日志默认开启，设置 YUSHAN_DEBUG=0 可关闭
   --resume [<id>] 恢复既有会话；空格形态 <id>，旧的 `--resume=<id>` 已移除
   --stats         把背压统计摘要写到 stderr（仅 `-p` / `--json` 的 flag 区）
   -h              `--help` 的别名
+  --version       打印版本后退出（不读凭证、不建运行时）
+  --              终止 flag 解析：其后的全部 token 逐字当任务文本，本身不进文本。
+                  只在 -p / --json 的 flag 区（含 worktree create|attach 带二者的 flag 区）
+                  生效；worktree 的名字参数位置不接受 --
 
 环境变量：
   YUSHAN_API_BASE              模型 API base URL

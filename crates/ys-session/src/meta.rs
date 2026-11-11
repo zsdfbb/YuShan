@@ -62,6 +62,13 @@ pub struct SessionMeta {
     /// `#[serde(default)]` 是**回写兼容契约**：早期 JSONL 首行无此键 ⇒ `None`，仍可反序列化。
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// 会话运行时的进程 cwd（启动时的绝对路径）。**仅供外部工具按目录筛选会话**。
+    ///
+    /// 与 [`Self::workspace`] **职责分离**：本字段是「会话在哪个目录跑过」的记录，
+    /// 读取方**绝不可**据此切换工作区 —— 工作区切换只认 `workspace`。
+    /// `None` = 未记录（早期会话）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 impl SessionMeta {
@@ -105,6 +112,41 @@ mod tests {
             serde_json::from_str::<SessionMeta>(null).unwrap().workspace,
             None
         );
+    }
+
+    /// `cwd` 是**可缺省**字段且与 `workspace` 互不影响：无该键的旧首行 ⇒ `None`；
+    /// 带该键 ⇒ `Some`；`None` 时**不落盘**（`skip_serializing_if`，不往旧形状里加 `null` 噪声）。
+    #[test]
+    fn cwd_is_optional_and_independent_from_workspace() {
+        // 旧首行：完全不含 `cwd` 键。
+        let old = r#"{"type":"meta","v":1,"title":"t","provider":"p","model":"m",
+            "thinking_visible":false,"input_tokens":3,"output_tokens":4,"turns":1,"created_at":42}"#;
+        let meta: SessionMeta = serde_json::from_str(old).expect("旧首行应仍可反序列化");
+        assert_eq!(meta.cwd, None, "无 cwd 键 ⇒ None");
+        assert_eq!(meta.workspace, None, "无 workspace 键 ⇒ None");
+
+        // 只带 `cwd`：`workspace` 保持 `None` ⇒ 二者不互相填充。
+        let with = r#"{"type":"meta","cwd":"/tmp/ys-cwd/A","created_at":7}"#;
+        let meta: SessionMeta = serde_json::from_str(with).unwrap();
+        assert_eq!(meta.cwd.as_deref(), Some(Path::new("/tmp/ys-cwd/A")));
+        assert_eq!(meta.workspace, None, "cwd 不得被读成 workspace");
+
+        // 只带 `workspace`：`cwd` 不得被推导出来。
+        let only_ws = r#"{"type":"meta","workspace":"/tmp/yushan/tree","created_at":7}"#;
+        let meta: SessionMeta = serde_json::from_str(only_ws).unwrap();
+        assert_eq!(meta.cwd, None, "workspace 不得被读成 cwd");
+
+        // `None` 不回写该键（旧形状不因本字段变宽）。
+        let json = serde_json::to_string(&SessionMeta::new(7)).unwrap();
+        assert!(!json.contains("\"cwd\""), "cwd 为 None 时不应落盘：{json}");
+
+        // `Some` 时落盘且可往返。
+        let mut m = SessionMeta::new(7);
+        m.cwd = Some(PathBuf::from("/tmp/ys-cwd/A"));
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"cwd\":\"/tmp/ys-cwd/A\""), "{json}");
+        let back: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cwd, m.cwd);
     }
 
     /// `effort` 的 serde 往返：`Some(High)` 必须精确回到原值。

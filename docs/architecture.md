@@ -664,9 +664,14 @@ flowchart TB
 整体替换、内存里的旧 transcript 被丢弃、**磁盘上的旧文件不删**（`/new`、`/clear` 同此）。
 
 **meta 首行**（可缺省）：形状
-`{"type":"meta","v":1,"title":…,"provider":…,"model":…,"thinking_visible":…,"input_tokens":…,"output_tokens":…,"turns":…,"created_at":…}`；
+`{"type":"meta","v":1,"title":…,"provider":…,"model":…,"thinking_visible":…,"input_tokens":…,"output_tokens":…,"turns":…,"created_at":…,"workspace":…,"cwd":…}`；
 `type` 是**必填**判别键。逐行判别：先按 `Message` 解析 → 失败再按 `SessionMeta` → 皆失败走既有
 「坏行跳过 + 告警」。判别安全的依赖是 **`Message` 无顶层 `type`**（有契约快照用例钉住）。
+
+- **`workspace` 与 `cwd` 职责分离**：`workspace` 是**工作树绑定**（`worktree attach` 时才写，`--resume`
+  据此切回那棵树）；`cwd` 是**启动时的进程 cwd 记录**（三模式都写，仅 `None` 时不落盘）。
+  读取方**绝不可**据 `cwd` 切换工作区 —— 共享工作区不是一次「恢复」。`cwd` 的用途只是外部工具
+  按工作目录筛选会话。
 
 - **C1 · meta 永不因重写丢失**：`flush_to_file` 是唯一落盘点，**先写 meta 行、再写消息**；
   `append` / `clear` / `replace_all` / `set_meta` 全经它 ⇒ `/compact`（走 `replace_all`）也保住 meta。

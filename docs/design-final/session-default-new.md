@@ -20,9 +20,13 @@
 
 交互式启动从「无条件恢复最近会话」改为**默认新会话**；恢复收进显式 `--resume [<id>]`
 （裸 flag = 列表选择，`=<id>` = 指定）。会话状态（title / provider / model / thinking /
-tokens / turns）写进**同一 JSONL 文件的首行 meta**（无 sidecar）—— `JsonlSession` 全量重写时
+tokens / turns / cwd）写进**同一 JSONL 文件的首行 meta**（无 sidecar）—— `JsonlSession` 全量重写时
 先写 meta 再写消息，故 `/compact` 也不会丢。三模式（TUI / `-p` / `--json`）统一持久化，
 共用唯一 meta 写入点 `finalize_turn_meta`。
+
+**`cwd` 与 `workspace` 分开两个字段**：`cwd` 是启动期进程 cwd 的只读记录（三模式都写，供外部工具
+按目录筛选会话）；`workspace` 是工作树绑定（仅 attach 时写，`--resume` 据此切回那棵树）。
+在「恢复」这件事上二者不可互换。
 
 ## 不变量（C1–C8）与实现落点
 

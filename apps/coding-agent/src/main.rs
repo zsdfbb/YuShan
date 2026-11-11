@@ -1549,6 +1549,9 @@ pub(crate) fn seed_stats(wiring: &Wiring) -> status::TurnStats {
 /// - `workspace`：**仅某种 attach 状态时写**（`Some` = 本次工作区绑定到该树路径）。
 ///   `None`（共享工作区）**不写** —— 把共享工作区（= 启动 cwd）记进 meta 是无用噪声，
 ///   且下次 `--resume` 会据此做一次无意义的「恢复」。
+/// - `cwd`：**仅 `Some` 时写**，三模式都写（TUI / `-p` / `--json`）—— 它是外部工具
+///   （bridge 的 `/resume`）按工作目录筛选会话的依据。与 `workspace` 职责分离：
+///   本字段只作记录，任何读取方都**不得**据此切换工作区。
 /// - tokens / turns：无条件写 `stats`。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_turn_meta(
@@ -1559,6 +1562,7 @@ pub(crate) async fn finalize_turn_meta(
     thinking_visible: Option<bool>,
     effort: Option<Option<EffortLevel>>,
     workspace: Option<&Path>,
+    cwd: Option<&Path>,
     stats: &status::TurnStats,
 ) -> Result<(), SessionError> {
     let title = raw_user_text
@@ -1585,6 +1589,9 @@ pub(crate) async fn finalize_turn_meta(
             }
             if let Some(w) = workspace {
                 meta.workspace = Some(w.to_path_buf());
+            }
+            if let Some(c) = cwd {
+                meta.cwd = Some(c.to_path_buf());
             }
             meta.input_tokens = stats.total_input_tokens;
             meta.output_tokens = stats.total_output_tokens;
@@ -2027,6 +2034,7 @@ async fn persist_single_turn(
     raw_task: &str,
     provider: Option<&str>,
     binding: Option<&app_loop::WorktreeBinding>,
+    cwd: Option<&Path>,
     result: &RunResult,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stats = seed_stats(wiring);
@@ -2041,6 +2049,8 @@ async fn persist_single_turn(
         // `-p` / `--json` 不写档位（不改变既有会话 meta 里的值）。
         None,
         binding.map(|b| b.path.as_path()),
+        // 启动 cwd 三模式都写（与 `workspace` 无关，仅供外部工具按目录筛选会话）。
+        cwd,
         &stats,
     )
     .await?;
@@ -3866,6 +3876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &raw_task,
                 config.provider.as_deref(),
                 binding.as_ref(),
+                Some(config.cwd.as_path()),
                 &result,
             )) {
                 eprintln!("Error: {e:?}");
@@ -3955,6 +3966,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &raw_task,
                 config.provider.as_deref(),
                 binding.as_ref(),
+                Some(config.cwd.as_path()),
                 &result,
             )) {
                 eprintln!("Error: {e:?}");
@@ -6799,7 +6811,10 @@ mod tests {
     }
 
     /// `finalize_turn_meta`：首行为 meta、title 折叠空白取展开前原文、provider/model
-    /// 与 tokens 落盘、title 幂等。
+    /// 与 tokens 落盘、title 幂等；`workspace` 与 `cwd` 各存一份、互不覆盖。
+    ///
+    /// 变异：把 `if let Some(c) = cwd` 删掉或改成无条件赋值 ⇒ `cwd` 的两条断言变红
+    /// （前者从未落盘，后者被 `None` 清空）。
     #[tokio::test]
     async fn finalize_turn_meta_writes_title_once_and_refreshes_stats() {
         let dir = unique_tmp_dir("finalize");
@@ -6822,6 +6837,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/tmp/yushan-tree")),
+            Some(Path::new("/tmp/ys-cwd/A")),
             &stats,
         )
         .await
@@ -6843,6 +6859,11 @@ mod tests {
             Some(Path::new("/tmp/yushan-tree")),
             "attach 状态应把工作树路径写进 meta"
         );
+        assert_eq!(
+            meta.cwd.as_deref(),
+            Some(Path::new("/tmp/ys-cwd/A")),
+            "启动 cwd 应写进 meta（与 workspace 各存一份）"
+        );
 
         // 第二次：title 幂等，tokens / turns 刷新；workspace 传 `None`（共享工作区）
         // **不写**，故已落盘的记录**不得被清空**（与 provider/model 同语义）。
@@ -6856,6 +6877,7 @@ mod tests {
             Some("第二条"),
             Some("deepseek"),
             Some("deepseek-chat"),
+            None,
             None,
             None,
             None,
@@ -6875,6 +6897,11 @@ mod tests {
             meta.workspace.as_deref(),
             Some(Path::new("/tmp/yushan-tree")),
             "workspace 传 None 不得清空已记录的工作树"
+        );
+        assert_eq!(
+            meta.cwd.as_deref(),
+            Some(Path::new("/tmp/ys-cwd/A")),
+            "cwd 传 None 不得清空已记录的值（与 workspace 同语义）"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6908,6 +6935,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &stats,
         )
         .await
@@ -6925,6 +6953,7 @@ mod tests {
         finalize_turn_meta(
             &mut wiring,
             Some("第二条"),
+            None,
             None,
             None,
             None,
@@ -6975,6 +7004,7 @@ mod tests {
             None,
             Some(Some(EffortLevel::High)),
             None,
+            None,
             &stats,
         )
         .await
@@ -6982,9 +7012,19 @@ mod tests {
         assert_eq!(wiring.meta().unwrap().effort, Some(EffortLevel::High));
 
         // 2) 外层 None ⇒ 不改动（仍是 High）。
-        finalize_turn_meta(&mut wiring, None, None, None, None, None, None, &stats)
-            .await
-            .unwrap();
+        finalize_turn_meta(
+            &mut wiring,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &stats,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             wiring.meta().unwrap().effort,
             Some(EffortLevel::High),
@@ -6999,6 +7039,7 @@ mod tests {
             None,
             None,
             Some(None),
+            None,
             None,
             &stats,
         )
@@ -7072,6 +7113,9 @@ mod tests {
 
     /// `persist_single_turn`（`-p`/`--json` 收尾路径）：落盘首行为 meta，title 取
     /// **展开前**原文，model 来自接线器、tokens 来自 `RunResult.usage`。
+    ///
+    /// 变异：把 `run_print_mode` / `run_json_mode` 两处的 `Some(config.cwd.as_path())`
+    /// 改成 `None`（照 `effort` 那样按模式置空）⇒ `cwd` 断言变红。
     #[tokio::test]
     async fn persist_single_turn_writes_meta_with_title_model_tokens() {
         let dir = unique_tmp_dir("persist_single");
@@ -7096,9 +7140,16 @@ mod tests {
             final_message: None,
         };
 
-        persist_single_turn(&mut wiring, "展开前的原文", Some("deepseek"), None, &result)
-            .await
-            .unwrap();
+        persist_single_turn(
+            &mut wiring,
+            "展开前的原文",
+            Some("deepseek"),
+            None,
+            Some(Path::new("/tmp/ys-cwd/B")),
+            &result,
+        )
+        .await
+        .unwrap();
 
         let path = wiring.session_path().unwrap().to_path_buf();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -7110,6 +7161,15 @@ mod tests {
         assert_eq!(meta.input_tokens, 7);
         assert_eq!(meta.output_tokens, 5);
         assert_eq!(meta.turns, 1);
+        assert_eq!(
+            meta.cwd.as_deref(),
+            Some(Path::new("/tmp/ys-cwd/B")),
+            "`-p` / `--json` 路径也要把启动 cwd 写进 meta（三模式一致）"
+        );
+        assert_eq!(
+            meta.workspace, None,
+            "无工作区绑定时 cwd 不得被写成 workspace"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

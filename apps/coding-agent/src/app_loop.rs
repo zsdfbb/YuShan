@@ -2023,6 +2023,8 @@ async fn run_turn_chain(
                         // TUI 模式：档位随回合末写穿会话 meta。
                         Some(ctx.config.effort),
                         ws.as_ref().map(|b| b.path.as_path()),
+                        // 启动 cwd 三模式都写（与工作区绑定无关，仅供外部工具筛选会话）。
+                        Some(ctx.config.cwd.as_path()),
                         ctx.stats,
                     )
                     .await

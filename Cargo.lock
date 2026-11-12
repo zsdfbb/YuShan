@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "ys-coding-agent"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -2357,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "ys-component"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "tokio",
  "ys-core",
@@ -2370,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "ys-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "ys-event"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "ys-loop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "ys-model"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "ys-model-openai-compat"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "ys-protocol"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "ys-runtime"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "ys-session"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "ys-tool"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "ys-tools-basic"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -2510,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "ys-tools-todo"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -2522,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "ys-tools-web"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "htmd",
@@ -2537,7 +2537,7 @@ dependencies = [
 
 [[package]]
 name = "ys-tui-coding"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crossterm",
  "libc",

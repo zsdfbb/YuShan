@@ -24,9 +24,10 @@ tokens / turns / cwd）写进**同一 JSONL 文件的首行 meta**（无 sidecar
 先写 meta 再写消息，故 `/compact` 也不会丢。三模式（TUI / `-p` / `--json`）统一持久化，
 共用唯一 meta 写入点 `finalize_turn_meta`。
 
-**`cwd` 与 `workspace` 分开两个字段**：`cwd` 是启动期进程 cwd 的只读记录（三模式都写，供外部工具
-按目录筛选会话）；`workspace` 是工作树绑定（仅 attach 时写，`--resume` 据此切回那棵树）。
-在「恢复」这件事上二者不可互换。
+**`cwd` 与 `workspace` 分开两个字段**：`cwd` 是**会话归属目录**（首次创建时写一次，之后不再变，
+供外部工具按目录筛选会话）；`workspace` 是工作树绑定（仅 attach 时写，`--resume` 据此切回那棵树）。
+在「恢复」这件事上二者不可互换：`cwd` **不随 `--resume` 刷新** —— 在 B 目录恢复一个在 A 创建的会话，
+归属仍是 A，否则会话会从 A 的列表凭空漂到 B 的。
 
 ## 不变量（C1–C8）与实现落点
 

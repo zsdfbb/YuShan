@@ -1549,9 +1549,11 @@ pub(crate) fn seed_stats(wiring: &Wiring) -> status::TurnStats {
 /// - `workspace`：**仅某种 attach 状态时写**（`Some` = 本次工作区绑定到该树路径）。
 ///   `None`（共享工作区）**不写** —— 把共享工作区（= 启动 cwd）记进 meta 是无用噪声，
 ///   且下次 `--resume` 会据此做一次无意义的「恢复」。
-/// - `cwd`：**仅 `Some` 时写**，三模式都写（TUI / `-p` / `--json`）—— 它是外部工具
-///   （bridge 的 `/resume`）按工作目录筛选会话的依据。与 `workspace` 职责分离：
-///   本字段只作记录，任何读取方都**不得**据此切换工作区。
+/// - `cwd`：**仅首次时写**（`meta.cwd.is_none()`，与 `title` 同语义），三模式都写
+///   （TUI / `-p` / `--json`）。它是**会话归属目录**，外部工具（bridge 的 `/resume`）
+///   据此按工作目录筛选会话 ⇒ 一旦写入就不再变：在 B 目录 `--resume` 一个在 A 目录
+///   创建的会话，归属仍是 A（否则会话会从 A 的列表凭空漂到 B 的）。
+///   与 `workspace` 职责分离：本字段只作记录，任何读取方都**不得**据此切换工作区。
 /// - tokens / turns：无条件写 `stats`。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize_turn_meta(
@@ -1590,7 +1592,9 @@ pub(crate) async fn finalize_turn_meta(
             if let Some(w) = workspace {
                 meta.workspace = Some(w.to_path_buf());
             }
-            if let Some(c) = cwd {
+            if meta.cwd.is_none()
+                && let Some(c) = cwd
+            {
                 meta.cwd = Some(c.to_path_buf());
             }
             meta.input_tokens = stats.total_input_tokens;
@@ -6813,8 +6817,9 @@ mod tests {
     /// `finalize_turn_meta`：首行为 meta、title 折叠空白取展开前原文、provider/model
     /// 与 tokens 落盘、title 幂等；`workspace` 与 `cwd` 各存一份、互不覆盖。
     ///
-    /// 变异：把 `if let Some(c) = cwd` 删掉或改成无条件赋值 ⇒ `cwd` 的两条断言变红
-    /// （前者从未落盘，后者被 `None` 清空）。
+    /// 变异：① 把 `if let Some(c) = cwd` 删掉 ⇒ `cwd` 从未落盘，首条断言变红；
+    /// ② 去掉 `meta.cwd.is_none()` 守卫（改成无条件赋值）⇒ 第二次传 `/tmp/ys-cwd/B`
+    /// 会把归属改写成 B，末条断言变红（会话会从 A 的 `/resume` 列表凭空漂到 B 的）。
     #[tokio::test]
     async fn finalize_turn_meta_writes_title_once_and_refreshes_stats() {
         let dir = unique_tmp_dir("finalize");
@@ -6867,6 +6872,8 @@ mod tests {
 
         // 第二次：title 幂等，tokens / turns 刷新；workspace 传 `None`（共享工作区）
         // **不写**，故已落盘的记录**不得被清空**（与 provider/model 同语义）。
+        // `cwd` 传**另一个目录**：这是方案 A 的核心 —— 归属目录写一次就不再变
+        // （在 B 目录 `--resume` 一个在 A 创建的会话，归属仍是 A）。
         stats.record(&Usage {
             input_tokens: 1,
             output_tokens: 1,
@@ -6880,7 +6887,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(Path::new("/tmp/ys-cwd/B")),
             &stats,
         )
         .await
@@ -6901,7 +6908,7 @@ mod tests {
         assert_eq!(
             meta.cwd.as_deref(),
             Some(Path::new("/tmp/ys-cwd/A")),
-            "cwd 传 None 不得清空已记录的值（与 workspace 同语义）"
+            "cwd 只写一次：后续回合传另一目录不得改写归属"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7114,8 +7121,9 @@ mod tests {
     /// `persist_single_turn`（`-p`/`--json` 收尾路径）：落盘首行为 meta，title 取
     /// **展开前**原文，model 来自接线器、tokens 来自 `RunResult.usage`。
     ///
-    /// 变异：把 `run_print_mode` / `run_json_mode` 两处的 `Some(config.cwd.as_path())`
-    /// 改成 `None`（照 `effort` 那样按模式置空）⇒ `cwd` 断言变红。
+    /// 变异：① 把 `run_print_mode` / `run_json_mode` 两处的 `Some(config.cwd.as_path())`
+    /// 改成 `None`（照 `effort` 那样按模式置空）⇒ `cwd` 断言变红；
+    /// ② 去掉 `meta.cwd.is_none()` 守卫 ⇒ 第二次以 C 收尾会把归属改写成 C，末条变红。
     #[tokio::test]
     async fn persist_single_turn_writes_meta_with_title_model_tokens() {
         let dir = unique_tmp_dir("persist_single");
@@ -7169,6 +7177,24 @@ mod tests {
         assert_eq!(
             meta.workspace, None,
             "无工作区绑定时 cwd 不得被写成 workspace"
+        );
+
+        // 第二次以**另一个目录**收尾（模拟在别的目录 `--resume` 同一会话）：
+        // 归属目录不得被改写 —— 与 TUI 路径的守卫同源。
+        persist_single_turn(
+            &mut wiring,
+            "第二条原文",
+            Some("deepseek"),
+            None,
+            Some(Path::new("/tmp/ys-cwd/C")),
+            &result,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wiring.meta().unwrap().cwd.as_deref(),
+            Some(Path::new("/tmp/ys-cwd/B")),
+            "cwd 写一次：再以 C 目录收尾不得把归属改写成 C"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

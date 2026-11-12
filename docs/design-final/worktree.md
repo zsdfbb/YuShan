@@ -102,9 +102,10 @@ linked worktree 内返回**树根**，派生落点会多一层错名，`worktree
   **不重新扫描 skill 根**（`assembly.rs:49-50,96-98`）。影响面仅限项目级 skill 段。
 - **`SessionMeta.workspace` 只写不清**（`None` 不写）：`finalize_turn_meta` 仅在 `workspace` 为 `Some`
   时写入（`main.rs:664-666` / `631-633`）；若将来允许「同一会话退回共享工作区」，旧记录会残留。
-- **`SessionMeta.cwd` 不参与工作区恢复**：它是启动期 `config.cwd` 的**只读记录**（三模式都写），
-  `--resume` / 启动期恢复**只读 `workspace`**。两个字段职责分离：把共享工作区记进 `workspace`
-  会触发一次无意义的「恢复」，把工作树路径记进 `cwd` 则会让外部工具把树内的会话归错目录。
+- **`SessionMeta.cwd` 不参与工作区恢复**：它是会话归属目录的**只读记录**（首次写一次，
+  `--resume` 不刷新），`--resume` / 启动期恢复**只读 `workspace`**。两个字段职责分离：把共享工作区
+  记进 `workspace` 会触发一次无意义的「恢复」，把工作树路径记进 `cwd` 则会让外部工具把树内的
+  会话归错目录。
 - **`SubagentSetup::model_cache` 每次重建即重置**：`shared()` 新建一份
   `Arc::new(Mutex::new(HashMap::new()))`（`subagent.rs:245-260`）；`/resume` 换工作区重建时模型缓存清空，
   仅一次轻量重建，无正确性影响。

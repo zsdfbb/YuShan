@@ -1144,13 +1144,24 @@ fn u3_explicit_attach_wins_over_recorded_worktree() {
         stderr.contains("已按显式指定的工作树使用"),
         "显式指定与记录不同时应说明：\n{stderr}"
     );
-    // 显式指定优先于 meta 记录：落盘事实是 meta 已改写为 `bug`（退出行在非 TTY 静默）。
+    // 显式指定优先于 meta 记录：落盘事实是 `workspace` 已改写为 `bug`（退出行在非 TTY 静默）。
+    //
+    // 必须按字段判，不能拿整行字符串搜 —— `cwd` 是**会话归属目录**（首次写一次、
+    // 不随 `--resume` 刷新），在 `feat` 树里首跑时就已记下 `feat` 的路径，整行里
+    // 必然含 `feat`。两个字段职责不同，断言也必须分开。
     let sessions = session_files(&sb.sessions);
     let content = std::fs::read_to_string(&sessions[0]).unwrap();
     let first = content.lines().next().expect("首行应存在");
+    let meta: serde_json::Value = serde_json::from_str(first).expect("首行应是 meta JSON");
+    let workspace = meta.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
-        first.contains("bug") && !first.contains("feat"),
-        "显式 attach 的树应胜出并写进 meta：\n{first}"
+        workspace.contains("bug"),
+        "显式 attach 的树应胜出并写进 meta.workspace：\n{first}"
+    );
+    let cwd = meta.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        cwd.contains("feat"),
+        "cwd 是归属目录，首跑在 feat 树里 ⇒ 不应被这次 --resume 改写：\n{first}"
     );
     assert!(
         !stderr.contains("worktree: "),

@@ -62,9 +62,11 @@ pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 
 /// journal 单文件上限。触顶后停写并留一条标记行，不轮转、不新建文件。
-/// 取值参照 `debug_log::DEFAULT_FILE_LIMIT_BYTES`（64 MiB），但 journal 是临时现场
-/// 而非长期档案，故取更小的 8 MiB。
-const JOURNAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+///
+/// 取 **8 GiB**：一次 `General` 派发实测可达 116 轮、单条工具输出数十 KB，
+/// 长派发加上多模态载荷会远超百 MiB；上限的作用是**兜住失控增长**，不是裁剪现场，
+/// 故取一个正常派发触不到的量级。触顶语义（停写 + 一次性标记行）不变。
+const JOURNAL_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// journal 里 `ToolResult` 正文的上限。崩溃现场的价值在于「跑到哪、调了什么」，
 /// 不在于完整工具输出。

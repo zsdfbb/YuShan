@@ -100,9 +100,9 @@ pub enum AdviceKind {
 
 三条限制同时生效：
 
-1. **单文件上限 `JOURNAL_MAX_BYTES = 8 MiB`**（照 `debug_log` 的 `DEFAULT_FILE_LIMIT_BYTES`
-   先例，取更小的值 —— journal 是临时现场，不是长期档案）。触顶后**停写**并追加一条
-   `{"truncated":true}` 标记行，不轮转、不新建文件。
+1. **单文件上限 `JOURNAL_MAX_BYTES = 8 GiB`**（取值依据：一次 `General` 派发实测可达
+   116 轮、单条工具输出数十 KB ⇒ 上限只能承担「兜住失控增长」的职责，不得裁剪正常现场）。
+   触顶后**停写**并追加一条 `{"truncated":true}` 标记行，不轮转、不新建文件。
 2. **`ToolResult` 正文截断到 `JOURNAL_MAX_TOOL_RESULT_BYTES = 4 KiB`**（照
    `bash.rs` 的 `STDERR_KEEP` 先例）。截断标记为 `…[truncated N bytes]`，原长度记入字段。
    ⇒ 崩溃现场的价值在于「跑到哪、调了什么」，不在于完整输出。
@@ -152,7 +152,7 @@ round=100 kind=soft_round threshold=100
 | `transcript_renders_advice_section` | 有提醒 ⇒ 有 `## Advice`；无提醒 ⇒ **整节不出现** |
 | `journaling_sink_writes_on_emit_only` | `try_emit` 不写盘、`emit` 才写盘 |
 | `journal_truncates_large_tool_results` | 超大 `ToolResult` 被截到 4 KiB 且带标记；截断按 UTF-8 字符边界 |
-| `journal_stops_at_size_limit` | 超 8 MiB 后停写并留 `truncated` 标记 |
+| `journal_stops_at_size_limit` | 超 8 GiB 后停写并留 `truncated` 标记 |
 | `journal_kept_when_transcript_write_fails` | md 写失败 ⇒ journal 仍在（不销毁唯一残留记录） |
 | `journal_location_reported_only_when_bytes_exist` | 诊断只在 journal 真有字节时给路径，否则说 `journal unavailable` |
 | `journal_never_appends_to_existing_file` | `create_new` + 换号：不追加到既有（可能是上次崩溃的）文件 |
@@ -181,7 +181,7 @@ round=100 kind=soft_round threshold=100
   12 / 12 / 60（`limits.rs:234`、`config.rs:383`、`config.rs:394`）。
 - **journal 的价值是「跑到哪」，不是「完整输出」**：正文截断到 4 KiB。
 - 崩溃残留与正常转录共用 7 天保留期，不区分；且 `.live.jsonl` 也在这期间占空间
-  （上限 8 MiB/次派发）。
+  （上限 8 GiB/次派发）。
 - **优雅 Abort 不留 journal**：它走 `Ok` 分支、md 正常写出，journal 按规则删除。
   现场由 md 提供 —— 这本来就够。
 - `AdviceInjected` 会出现在 `--json` 输出里，是新增的可观测面；对既有脚本是增量，
